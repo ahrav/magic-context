@@ -134,6 +134,65 @@ describe("memory authority protocol", () => {
         });
     });
 
+    test("privileged mirror writes keep the note search projection synchronized", () => {
+        const database = db();
+        const localStoreUuid = ensureContextStoreUuid(database);
+        const projected = (query: string) =>
+            (
+                database
+                    .prepare("SELECT rowid AS id FROM notes_fts WHERE notes_fts MATCH ?")
+                    .all(query) as Array<{ id: number }>
+            ).map((row) => row.id);
+
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO notes (id, type, status, content, project_path, session_id,
+                     created_at, updated_at)
+                     VALUES (61, 'smart', 'ready', 'mirrored note about sharding', '/repo',
+                     'session', 100, 200)`,
+                )
+                .run();
+        });
+        expect(projected('"sharding"')).toEqual([61]);
+
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "notes",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "notes",
+                        op: "insert",
+                        module_row_id: 9,
+                        full_row_snapshot: {
+                            context_store_uuid: localStoreUuid,
+                            context_row_id: 61,
+                            project_path: "/repo",
+                            session_id: "session",
+                            content: "mirrored note about compaction",
+                            status: "active",
+                            updated_at_ms: 300,
+                        },
+                        content_hash: null,
+                    },
+                ],
+            },
+        });
+
+        expect(projected('"sharding"')).toEqual([]);
+        expect(projected('"compaction"')).toEqual([61]);
+
+        withPrivilegedWriter(database, () => {
+            database.prepare("DELETE FROM notes WHERE id = ?").run(61);
+        });
+        expect(projected('"compaction"')).toEqual([]);
+    });
+
     test("repeated note drains replace a re-minted module row for the same context note", async () => {
         const database = db();
         const contextStoreUuid = ensureContextStoreUuid(database);
@@ -163,7 +222,7 @@ describe("memory authority protocol", () => {
                 return {
                     authority: {
                         ...authority(state, 1),
-                        domain: args.domain,
+                        domain: args.domain as "memories" | "notes",
                         captured_upper_bound: feedSeq,
                         coordinator_token: "note-drain-token",
                     },

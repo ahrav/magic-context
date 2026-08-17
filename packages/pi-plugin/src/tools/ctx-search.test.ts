@@ -143,6 +143,50 @@ describe("createCtxSearchTool", () => {
 		}
 	});
 
+	it("invokes normal search exactly once when every requested id is missing (Pi parity)", async () => {
+		const db = createTestDb();
+		let calls = 0;
+		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+			async () => {
+				calls += 1;
+				return [
+					{
+						source: "memory",
+						content: "Fallback text search hit.",
+						score: 0.5,
+						memoryId: 1,
+						category: "USER_DIRECTIVES",
+						matchType: "fts",
+					},
+				] as UnifiedSearchResult[];
+			},
+		);
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+			});
+
+			const result = await tool.execute(
+				"call-id",
+				{ query: "999999 888888" },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search", process.cwd()) as never,
+			);
+
+			expect(result.content[0]?.text ?? "").toContain(
+				"Fallback text search hit.",
+			);
+			expect(calls).toBe(1);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
 	it("resolves a `#1234` query directly without calling unifiedSearch (Pi parity)", async () => {
 		const db = createTestDb();
 		// Dynamically import `insertMemory` to seed a memory for this test,

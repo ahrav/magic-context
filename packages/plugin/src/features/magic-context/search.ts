@@ -10,6 +10,7 @@ import {
     ensureMemoryEmbeddings,
     getMemoriesByProject,
     getMemoriesByProjects,
+    getMemoriesByRequestedIds,
     getProjectEmbeddings,
     type Memory,
     ModuleMemoryAuthorityError,
@@ -23,7 +24,13 @@ import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./me
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import { recordShadowMeasurement } from "./search-measurement";
-import { getNotes, type Note } from "./storage-notes";
+import {
+    countSearchableNotes,
+    getNotes,
+    getSearchableNotesByIds,
+    type Note,
+    selectNoteCandidateIds,
+} from "./storage-notes";
 import { getActivePrimers, type Primer } from "./storage-primers";
 import {
     expandWorkspaceIdentitySetWithAliases,
@@ -57,7 +64,10 @@ interface MessageSearchRow {
     messageOrdinal?: number | string;
     messageId?: string;
     role?: string;
-    content?: string;
+    /** Bounded FTS snippet (R34) — never the full message body. */
+    fragment?: string;
+    /** `verbatim0..N` full-body probe-containment flags (KTD2). */
+    [verbatimFlag: string]: unknown;
 }
 
 interface BatchedMessageSearchRow extends MessageSearchRow {
@@ -74,6 +84,27 @@ const messageSearchStatements = new WeakMap<Database, PreparedStatement>();
 const messageSearchStatementsWithCutoff = new WeakMap<Database, PreparedStatement>();
 const batchedMessageSearchStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
 const batchedFtsCountStatements = new WeakMap<Database, Map<string, PreparedStatement>>();
+
+/** R34 fragment bound: at most this many FTS tokens per message hit. */
+const MESSAGE_FRAGMENT_TOKENS = 32;
+const MESSAGE_FRAGMENT_START_MARKER = "<<";
+const MESSAGE_FRAGMENT_END_MARKER = ">>";
+const MESSAGE_FRAGMENT_OMISSION = " ... ";
+/** `content` is column 4 of message_history_fts (session_id, message_ordinal, message_id, role, content). */
+const MESSAGE_FRAGMENT_COLUMN = 4;
+/** Identical snippet parameters for the single and batched statements (KTD2). */
+const MESSAGE_FRAGMENT_SQL = `snippet(message_history_fts, ${MESSAGE_FRAGMENT_COLUMN}, '${MESSAGE_FRAGMENT_START_MARKER}', '${MESSAGE_FRAGMENT_END_MARKER}', '${MESSAGE_FRAGMENT_OMISSION}', ${MESSAGE_FRAGMENT_TOKENS}) AS fragment`;
+
+/** Per-probe full-body containment flags, so a verbatim bonus survives even when
+ *  the probe falls outside the returned fragment (AE2). SQLite `lower()` folds
+ *  ASCII only; probes are ASCII identifier shapes by construction
+ *  (`extractLiteralProbes`), and the JS-side probe is lowercased by the caller. */
+function verbatimFlagSql(probeCount: number): string {
+    return Array.from(
+        { length: probeCount },
+        (_, index) => `, instr(lower(content), ?) > 0 AS verbatim${index}`,
+    ).join("");
+}
 
 export type SearchSource = "memory" | "message" | "git_commit" | "primer" | "note";
 
@@ -336,7 +367,7 @@ function getMessageSearchStatement(db: Database): PreparedStatement {
     let stmt = messageSearchStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT message_ordinal AS messageOrdinal, message_id AS messageId, role, content FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC LIMIT ?",
+            `SELECT message_ordinal AS messageOrdinal, message_id AS messageId, role, ${MESSAGE_FRAGMENT_SQL} FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC LIMIT ?`,
         );
         messageSearchStatements.set(db, stmt);
     }
@@ -355,7 +386,7 @@ function getMessageSearchStatementWithCutoff(db: Database): PreparedStatement {
     let stmt = messageSearchStatementsWithCutoff.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT message_ordinal AS messageOrdinal, message_id AS messageId, role, content FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? AND CAST(message_ordinal AS INTEGER) <= ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC LIMIT ?",
+            `SELECT message_ordinal AS messageOrdinal, message_id AS messageId, role, ${MESSAGE_FRAGMENT_SQL} FROM message_history_fts WHERE session_id = ? AND message_history_fts MATCH ? AND CAST(message_ordinal AS INTEGER) <= ? ORDER BY bm25(message_history_fts), CAST(message_ordinal AS INTEGER) ASC LIMIT ?`,
         );
         messageSearchStatementsWithCutoff.set(db, stmt);
     }
@@ -748,20 +779,25 @@ interface NormalizedMessageRow {
     messageOrdinal: number;
     messageId: string;
     role: string;
-    content: string;
+    /** Bounded FTS fragment (R34), not the full body. */
+    fragment: string;
+    /** Full-body verbatim containment per sanitized probe, parallel to the
+     *  probe list passed to the query (empty on the single-query path). */
+    verbatim: boolean[];
 }
 
 /** Convert one FTS row into the validated shape consumed by message ranking. */
 function normalizeMessageSearchRow(
     row: MessageSearchRow,
     cutoff: number | null,
+    probeCount: number,
 ): NormalizedMessageRow | null {
     const messageOrdinal = getMessageOrdinal(row.messageOrdinal);
     if (
         messageOrdinal === null ||
         typeof row.messageId !== "string" ||
         typeof row.role !== "string" ||
-        typeof row.content !== "string"
+        typeof row.fragment !== "string"
     ) {
         return null;
     }
@@ -771,7 +807,10 @@ function normalizeMessageSearchRow(
         messageOrdinal,
         messageId: row.messageId,
         role: row.role,
-        content: row.content,
+        fragment: row.fragment,
+        verbatim: Array.from({ length: probeCount }, (_, index) =>
+            Boolean(Number(row[`verbatim${index}`] ?? 0)),
+        ),
     };
 }
 
@@ -795,7 +834,7 @@ function runMessageFtsQuery(
 
     const result: NormalizedMessageRow[] = [];
     for (const row of rows) {
-        const normalized = normalizeMessageSearchRow(row, cutoff);
+        const normalized = normalizeMessageSearchRow(row, cutoff, 0);
         if (normalized) result.push(normalized);
     }
     return result;
@@ -805,13 +844,14 @@ function getBatchedMessageSearchStatement(
     db: Database,
     queryCount: number,
     cutoff: number | null,
+    probeCount: number,
 ): PreparedStatement {
     let statements = batchedMessageSearchStatements.get(db);
     if (!statements) {
         statements = new Map();
         batchedMessageSearchStatements.set(db, statements);
     }
-    const key = `${queryCount}:${cutoff === null ? "all" : "cutoff"}`;
+    const key = `${queryCount}:${cutoff === null ? "all" : "cutoff"}:${probeCount}`;
     let statement = statements.get(key);
     if (!statement) {
         const cutoffSql = cutoff === null ? "" : " AND CAST(message_ordinal AS INTEGER) <= ?";
@@ -822,7 +862,7 @@ function getBatchedMessageSearchStatement(
                        message_ordinal AS messageOrdinal,
                        message_id AS messageId,
                        role,
-                       content,
+                       ${MESSAGE_FRAGMENT_SQL}${verbatimFlagSql(probeCount)},
                        bm25(message_history_fts) AS ftsRank
                   FROM message_history_fts
                  WHERE session_id = ? AND message_history_fts MATCH ?${cutoffSql}
@@ -838,24 +878,32 @@ function getBatchedMessageSearchStatement(
     return statement;
 }
 
-/** Run all base/probe result queries as one compound SQLite statement. */
+/** Run all base/probe result queries as one compound SQLite statement.
+ *  `lowercasedProbes` drive the KTD2 full-body verbatim flags. */
 function runMessageFtsQueriesBatch(
     db: Database,
     sessionId: string,
     ftsQueries: readonly string[],
     fetchLimit: number,
     cutoff: number | null,
+    lowercasedProbes: readonly string[],
 ): NormalizedMessageRow[][] {
     if (ftsQueries.length === 0) return [];
     const bindings: unknown[] = [];
     for (const query of ftsQueries) {
+        // Parameter order follows appearance in the SQL text: the select-list
+        // verbatim flags bind before the WHERE clause and LIMIT.
+        bindings.push(...lowercasedProbes);
         bindings.push(sessionId, query);
         if (cutoff !== null) bindings.push(cutoff);
         bindings.push(fetchLimit);
     }
-    const rows = getBatchedMessageSearchStatement(db, ftsQueries.length, cutoff).all(
-        ...bindings,
-    ) as BatchedMessageSearchRow[];
+    const rows = getBatchedMessageSearchStatement(
+        db,
+        ftsQueries.length,
+        cutoff,
+        lowercasedProbes.length,
+    ).all(...bindings) as BatchedMessageSearchRow[];
     const result = Array.from({ length: ftsQueries.length }, () => [] as NormalizedMessageRow[]);
     for (const row of rows) {
         if (
@@ -865,7 +913,7 @@ function runMessageFtsQueriesBatch(
         ) {
             continue;
         }
-        const normalized = normalizeMessageSearchRow(row, cutoff);
+        const normalized = normalizeMessageSearchRow(row, cutoff, lowercasedProbes.length);
         if (normalized) result[row.queryIndex].push(normalized);
     }
     return result;
@@ -926,7 +974,7 @@ function searchMessages(args: {
         ).slice(0, args.limit);
         return filtered.map((row, rank) => ({
             source: "message" as const,
-            content: previewText(row.content),
+            content: previewText(row.fragment),
             score: linearDecayScore(rank, filtered.length),
             messageOrdinal: row.messageOrdinal,
             messageId: row.messageId,
@@ -957,6 +1005,7 @@ function searchMessages(args: {
         searchQueries,
         fetchLimit,
         cutoff,
+        sanitizedProbes.map((entry) => entry.probe.toLowerCase()),
     );
 
     const queryLists: Array<{ rows: NormalizedMessageRow[]; weight: number }> = [];
@@ -969,10 +1018,10 @@ function searchMessages(args: {
         });
         queryIndex += 1;
     }
-    const probeWeights = new Map<string, number>();
-    sanitizedProbes.forEach((entry, probeIndex) => {
+    const probeWeightByIndex: number[] = [];
+    sanitizedProbes.forEach((_entry, probeIndex) => {
         const weight = probeDiscriminationWeight(probeCounts[probeIndex] ?? 0, corpusSize);
-        probeWeights.set(entry.probe, weight);
+        probeWeightByIndex.push(weight);
         queryLists.push({ rows: rowsByQuery[queryIndex] ?? [], weight });
         queryIndex += 1;
     });
@@ -994,14 +1043,16 @@ function searchMessages(args: {
     // a symbol/command lookup wants surfaced first. Worth one rank-0 appearance
     // of the BEST (most discriminative) matching probe — rank-domain currency,
     // so it reorders within the band instead of saturating the scale.
+    // Flags cover sanitized probes only: an unsanitized probe carries weight 0
+    // and can never win.
     for (const entry of fused.values()) {
         let best = 0;
-        for (const probe of probes) {
-            const weight = probeWeights.get(probe) ?? 0;
-            if (weight > best && containsProbeVerbatim(entry.row.content, [probe])) {
+        entry.row.verbatim.forEach((matched, probeIndex) => {
+            const weight = probeWeightByIndex[probeIndex] ?? 0;
+            if (matched && weight > best) {
                 best = weight;
             }
-        }
+        });
         if (best > 0) {
             entry.score += best * VERBATIM_RANK_BONUS;
         }
@@ -1019,7 +1070,7 @@ function searchMessages(args: {
     // what RRF actually determines; the band keeps cross-source comparability.
     return ranked.map((entry, rank) => ({
         source: "message" as const,
-        content: previewText(entry.row.content),
+        content: previewText(entry.row.fragment),
         score: linearDecayScore(rank, ranked.length),
         messageOrdinal: entry.row.messageOrdinal,
         messageId: entry.row.messageId,
@@ -1091,6 +1142,70 @@ function rankNotesForNeedle(notes: readonly Note[], needle: string): RankedNoteM
     });
 }
 
+/** FTS5's trigram tokenizer cannot represent an atom shorter than this. */
+const NOTE_FTS_MIN_ATOM_LENGTH = 3;
+
+/**
+ * The OR-joined trigram query covering every atom `rankNotesForNeedle` scores:
+ * the whole needle (its exact-substring test) and each keyword token (its
+ * coverage test). Substring matching makes the result a superset of the scored
+ * matches, so pruning cannot drop a note the scorer would have kept.
+ *
+ * Returns null when any atom is too short to represent, and "" for an empty
+ * needle, which the scorer never matches.
+ */
+function noteFtsQueryForNeedle(needle: string): string | null {
+    const normalized = needle.trim().toLowerCase();
+    if (normalized.length === 0) return "";
+    const atoms = [normalized, ...tokenizeKeywordNeedle(normalized)];
+    if (atoms.some((atom) => atom.length < NOTE_FTS_MIN_ATOM_LENGTH)) return null;
+    return atoms.map((atom) => `"${atom.replace(/"/g, '""')}"`).join(" OR ");
+}
+
+function scopedNoteScan(db: Database, sessionId: string, projectPath: string): Note[] {
+    return [
+        ...getNotes(db, {
+            sessionId,
+            type: "session",
+            status: NOTE_SEARCHABLE_STATUSES,
+        }),
+        ...getNotes(db, {
+            projectPath,
+            type: "smart",
+            status: NOTE_SEARCHABLE_STATUSES,
+        }),
+    ];
+}
+
+/** Candidate superset for every needle, falling back to the scoped scan when a
+ *  needle is not representable or the projection is unavailable. */
+function loadNoteSearchCorpus(args: {
+    db: Database;
+    sessionId: string;
+    projectPath: string;
+    needles: readonly string[];
+}): Note[] {
+    const queries = args.needles.map(noteFtsQueryForNeedle);
+    if (queries.some((query) => query === null)) {
+        return scopedNoteScan(args.db, args.sessionId, args.projectPath);
+    }
+    const candidateIds = new Set<number>();
+    for (const query of queries) {
+        if (!query) continue;
+        const ids = selectNoteCandidateIds(args.db, query);
+        if (ids === null) {
+            return scopedNoteScan(args.db, args.sessionId, args.projectPath);
+        }
+        for (const id of ids) candidateIds.add(id);
+    }
+    if (candidateIds.size === 0) return [];
+    return getSearchableNotesByIds(args.db, {
+        ids: [...candidateIds],
+        sessionId: args.sessionId,
+        projectPath: args.projectPath,
+    });
+}
+
 function searchNotes(args: {
     db: Database;
     sessionId: string;
@@ -1103,24 +1218,27 @@ function searchNotes(args: {
         return [];
     }
 
-    const notes = [
-        ...getNotes(args.db, {
-            sessionId: args.sessionId,
-            type: "session",
-            status: NOTE_SEARCHABLE_STATUSES,
-        }),
-        ...getNotes(args.db, {
-            projectPath: args.projectPath,
-            type: "smart",
-            status: NOTE_SEARCHABLE_STATUSES,
-        }),
-    ];
+    const probes = args.probes ?? [];
+    // Probe discrimination weighs a probe against the whole scoped corpus, so the
+    // denominator comes from an indexed count rather than the hydrated rows.
+    const corpusSize = countSearchableNotes(args.db, {
+        sessionId: args.sessionId,
+        projectPath: args.projectPath,
+    });
+    if (corpusSize === 0) {
+        return [];
+    }
+    const notes = loadNoteSearchCorpus({
+        db: args.db,
+        sessionId: args.sessionId,
+        projectPath: args.projectPath,
+        needles: [args.query, ...probes],
+    });
     if (notes.length === 0) {
         return [];
     }
 
     const baseList = rankNotesForNeedle(notes, args.query);
-    const probes = args.probes ?? [];
 
     if (probes.length === 0) {
         const ranked = baseList.slice(0, args.limit);
@@ -1146,7 +1264,7 @@ function searchNotes(args: {
         if (rows.length === 0) {
             continue;
         }
-        const weight = probeDiscriminationWeight(rows.length, notes.length);
+        const weight = probeDiscriminationWeight(rows.length, corpusSize);
         probeWeights.set(probe, weight);
         queryLists.push({ rows, weight });
     }
@@ -1257,7 +1375,63 @@ function searchCompartmentChunks(args: {
         }));
 }
 
-function mergeMessageAndCompartmentResults(args: {
+/** Assign each message ordinal to its containing compartment with one ordered
+ *  interval sweep instead of scanning every compartment range per message.
+ *
+ *  Assignment order and fusion order are deliberately separate (KTD5): the sweep
+ *  walks ordinal-sorted copies, while overlap ties are still resolved by the
+ *  compartment's original semantic rank, so a boundary message lands in the
+ *  earliest-ranked containing compartment exactly as a rank-ordered scan did.
+ *  Returned map keys are the caller's message array indexes. */
+export function assignMessagesToCompartments(
+    messages: readonly MessageSearchResult[],
+    compartments: readonly CompartmentSearchResult[],
+): Map<number, CompartmentSearchResult> {
+    const assignment = new Map<number, CompartmentSearchResult>();
+    if (messages.length === 0 || compartments.length === 0) return assignment;
+
+    const ranges = compartments
+        .map((compartment, rank) => ({ compartment, rank }))
+        .sort(
+            (left, right) =>
+                left.compartment.startOrdinal - right.compartment.startOrdinal ||
+                left.compartment.endOrdinal - right.compartment.endOrdinal ||
+                left.rank - right.rank,
+        );
+    const ordered = messages
+        .map((message, index) => ({ message, index }))
+        .sort(
+            (left, right) =>
+                left.message.messageOrdinal - right.message.messageOrdinal ||
+                left.index - right.index,
+        );
+
+    // Ranges whose start is already reached and whose end has not been passed.
+    // Messages advance monotonically, so a range dropped here can never contain
+    // a later ordinal.
+    let active: Array<{ compartment: CompartmentSearchResult; rank: number }> = [];
+    let cursor = 0;
+    for (const { message, index } of ordered) {
+        const ordinal = message.messageOrdinal;
+        while (cursor < ranges.length && ranges[cursor].compartment.startOrdinal <= ordinal) {
+            active.push(ranges[cursor]);
+            cursor += 1;
+        }
+        if (active.length > 0) {
+            active = active.filter((entry) => entry.compartment.endOrdinal >= ordinal);
+        }
+        let best: { compartment: CompartmentSearchResult; rank: number } | null = null;
+        for (const entry of active) {
+            if (!best || entry.rank < best.rank) best = entry;
+        }
+        if (best) assignment.set(index, best.compartment);
+    }
+    return assignment;
+}
+
+/** Exported for the KTD1 characterization tests, which differential-check the
+ *  interval sweep against a local reference of the former per-message scan. */
+export function mergeMessageAndCompartmentResults(args: {
     messages: MessageSearchResult[];
     compartments: CompartmentSearchResult[];
     limit: number;
@@ -1300,12 +1474,10 @@ function mergeMessageAndCompartmentResults(args: {
         );
     });
 
+    const containingByMessageIndex = assignMessagesToCompartments(args.messages, args.compartments);
+
     for (const [rank, message] of args.messages.entries()) {
-        const containing = args.compartments.find(
-            (compartment) =>
-                message.messageOrdinal >= compartment.startOrdinal &&
-                message.messageOrdinal <= compartment.endOrdinal,
-        );
+        const containing = containingByMessageIndex.get(rank);
         const contribution = 1 / (RRF_K + rank);
         if (!containing) {
             add(`message:${message.messageId}`, message, contribution, message.messageOrdinal);
@@ -1554,25 +1726,17 @@ export function resolveMemoriesByIdsForSearch(args: {
         return null;
     }
     const workspace = resolveSearchWorkspaceContext(args.db, args.projectPath);
-    const fetched = workspace.isWorkspaced
-        ? getMemoriesByProjects(
-              args.db,
-              workspace.expandedIdentities,
-              ["active", "permanent", "archived"],
-              Date.now(),
-              workspace.ownIdentities,
-              workspace.shareCategories,
-          )
-        : getMemoriesByProject(args.db, args.projectPath, ["active", "permanent", "archived"]);
-    if (fetched.length === 0) {
-        return null;
-    }
-    const memoriesById = new Map(fetched.map((memory) => [memory.id, memory]));
+    const fetched = getMemoriesByRequestedIds(args.db, {
+        ids: args.ids,
+        identities: workspace.isWorkspaced ? workspace.expandedIdentities : [args.projectPath],
+        statuses: ["active", "permanent", "archived"],
+        expiryCutoff: Date.now(),
+        ownIdentities: workspace.isWorkspaced ? workspace.ownIdentities : undefined,
+        shareCategories: workspace.isWorkspaced ? workspace.shareCategories : null,
+    });
     const ordered: Memory[] = [];
-    for (const id of args.ids) {
-        const memory = memoriesById.get(id);
-        if (!memory) continue;
-        if (args.visibleMemoryIds?.has(id)) continue;
+    for (const memory of fetched) {
+        if (args.visibleMemoryIds?.has(memory.id)) continue;
         ordered.push(memory);
         if (ordered.length >= args.limit) break;
     }

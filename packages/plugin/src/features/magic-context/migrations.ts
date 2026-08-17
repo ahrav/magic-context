@@ -213,6 +213,83 @@ function installLatestAuthorityTriggers(db: Database): void {
     }
 }
 
+function noteColumnExists(db: Database, column: string): boolean {
+    const rows = db.prepare("PRAGMA table_info(notes)").all() as Array<{ name?: string }>;
+    return rows.some((row) => row.name === column);
+}
+
+function noteSearchableTextSql(source: string, withReadyReason: boolean): string {
+    if (!withReadyReason) return `${source}.content`;
+    return `CASE
+                WHEN ${source}.ready_reason IS NOT NULL AND trim(${source}.ready_reason) <> ''
+                THEN ${source}.content || char(10) || 'Reason: ' || trim(${source}.ready_reason)
+                ELSE ${source}.content
+            END`;
+}
+
+export function installNotesSearchProjection(db: Database): void {
+    if (!tableExists(db, "notes")) return;
+    // Legacy `notes` tables can lack `ready_reason`.
+    const withReadyReason = noteColumnExists(db, "ready_reason");
+    const updateColumns = withReadyReason ? "content, ready_reason" : "content";
+    db.exec(`
+        DROP TRIGGER IF EXISTS notes_fts_ai;
+        DROP TRIGGER IF EXISTS notes_fts_ad;
+        DROP TRIGGER IF EXISTS notes_fts_au;
+        DROP VIEW IF EXISTS notes_search_view;
+        DROP TABLE IF EXISTS notes_fts;
+
+        CREATE VIEW notes_search_view AS
+            SELECT id AS id, ${noteSearchableTextSql("notes", withReadyReason)} AS searchable_text
+              FROM notes;
+
+        CREATE VIRTUAL TABLE notes_fts USING fts5(
+            searchable_text,
+            content='notes_search_view',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+
+        INSERT INTO notes_fts(rowid, searchable_text)
+            SELECT id, searchable_text FROM notes_search_view;
+
+        CREATE TRIGGER notes_fts_ai AFTER INSERT ON notes BEGIN
+            INSERT INTO notes_fts(rowid, searchable_text)
+                VALUES (new.id, ${noteSearchableTextSql("new", withReadyReason)});
+        END;
+
+        CREATE TRIGGER notes_fts_ad AFTER DELETE ON notes BEGIN
+            INSERT INTO notes_fts(notes_fts, rowid, searchable_text)
+                VALUES ('delete', old.id, ${noteSearchableTextSql("old", withReadyReason)});
+        END;
+
+        CREATE TRIGGER notes_fts_au AFTER UPDATE OF ${updateColumns} ON notes BEGIN
+            INSERT INTO notes_fts(notes_fts, rowid, searchable_text)
+                VALUES ('delete', old.id, ${noteSearchableTextSql("old", withReadyReason)});
+            INSERT INTO notes_fts(rowid, searchable_text)
+                VALUES (new.id, ${noteSearchableTextSql("new", withReadyReason)});
+        END;
+    `);
+    validateNotesSearchProjection(db);
+}
+
+export function validateNotesSearchProjection(db: Database): void {
+    // rank 1 compares the index against the content view; the default rank 0 only
+    // checks internal consistency and accepts a posting with no content row.
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
+    const counts = db
+        .prepare(
+            `SELECT (SELECT COUNT(*) FROM notes) AS notes,
+                    (SELECT COUNT(*) FROM notes_fts) AS projected`,
+        )
+        .get() as { notes: number; projected: number } | null;
+    if (!counts || counts.notes !== counts.projected) {
+        throw new Error(
+            `notes_fts projection validation failed: expected ${counts?.notes ?? "?"} rows, got ${counts?.projected ?? "?"}`,
+        );
+    }
+}
+
 export const MIGRATIONS: Migration[] = [
     {
         version: 1,
@@ -2816,6 +2893,13 @@ export const MIGRATIONS: Migration[] = [
                     created_at INTEGER NOT NULL
                 );
             `);
+        },
+    },
+    {
+        version: 79,
+        description: "add notes_fts trigram candidate projection for note search",
+        up(db: Database): void {
+            installNotesSearchProjection(db);
         },
     },
 ];
