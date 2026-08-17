@@ -92,3 +92,6 @@ tests/docker/.generated/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+docs/plans/
+docs/fork-hardening-audit.md
