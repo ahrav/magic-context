@@ -86,3 +86,9 @@ packages/plugin/scripts/mural-test-output/
 AgentLogs/
 .agent-logs/
 tests/docker/.generated/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
