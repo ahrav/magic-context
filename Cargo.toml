@@ -5,7 +5,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/mc-core", "crates/mc-store", "crates/mc-module", "crates/mc-tokenizer"]
-exclude = ["packages/dashboard/src-tauri"]
+# The evidence probe depends on the PUBLISHED subc crates from crates.io rather than the
+# sibling sources, so it must never join this workspace's dependency graph.
+exclude = ["packages/dashboard/src-tauri", "docs/evidence/subc-surface-probe"]
 
 [workspace.dependencies]
 # CortexKit cache-stability core + storage substrate. Sibling path-deps for local

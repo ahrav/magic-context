@@ -1,0 +1,36 @@
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient.connect
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient.routeOpen
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient.request
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient.call
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient.catalogList
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient.closeRoute
+PRESENT  @cortexkit/subc-client@0.4.1  SubcClient.close
+PRESENT  @cortexkit/subc-client@0.4.1  BindIdentity
+PRESENT  @cortexkit/subc-client@0.4.1  RouteTarget
+PRESENT  @cortexkit/subc-client@0.4.1  RouteHandle
+PRESENT  @cortexkit/subc-client@0.4.1  RequestOptions
+PRESENT  @cortexkit/subc-client@0.4.1  ManagedCallOptions
+PRESENT  @cortexkit/subc-client@0.4.1  ManagedCallOptions.targetKind
+PRESENT  @cortexkit/subc-client@0.4.1  ManagedCallOptions.identity
+PRESENT  @cortexkit/subc-client@0.4.1  ConnectOptions.handshakeTimeoutMs
+PRESENT  @cortexkit/subc-client@0.4.1  CatalogEntry.control_ops
+PRESENT  @cortexkit/subc-client@0.4.1  Priority
+PRESENT  @cortexkit/subc-client@0.4.1  AdmissionClass
+PRESENT  @cortexkit/subc-client@0.4.1  SubcCallError
+PRESENT  @cortexkit/subc-client@0.4.1  SubcCallError.kind
+PRESENT  @cortexkit/subc-client@0.4.1  SubcCallErrorKind values
+PRESENT  @cortexkit/subc-client@0.4.1  StaleRouteHandleError
+PRESENT  @cortexkit/subc-client@0.4.1  SocketClosedError
+PRESENT  @cortexkit/subc-client@0.4.1  SocketTimeoutError
+PRESENT  @cortexkit/subc-client@0.4.1  isConsumerReconnectTransient
+PRESENT  @cortexkit/subc-client@0.4.1  connectionFileExists
+PRESENT  @cortexkit/subc-client@0.4.1  HEADER_LEN
+PRESENT  @cortexkit/subc-client@0.4.1  PROTOCOL_VERSION
+PRESENT  @cortexkit/subc-client@0.4.1  SERVER_PROOF_DOMAIN
+PRESENT  @cortexkit/subc-client@0.4.1  SubcProvider
+PRESENT  @cortexkit/subc-client@0.4.1  managementSurfaceManifest
+PRESENT  @cortexkit/subc-client@0.4.1  ProviderRequestContext
+PRESENT  @cortexkit/subc-client@0.4.1  RouteBindRequest
+
+ABSENT: none
