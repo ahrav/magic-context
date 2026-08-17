@@ -59,8 +59,8 @@ flowchart TB
 - **Route handle:** `(channel, epoch)` created by the host before invoking handler bind and published to the client only after bind succeeds. A rejected bind still observed the handle, which is why route-gone fires exactly once on rejection (Section 8.2).
 - **Live channel:** nonzero `u16` route slot from one host-global namespace across all consumer connections.
 - **Route epoch:** nonzero `u32` incarnation of a channel. Reuse is allowed only after prior cleanup and at a strictly higher epoch.
-- **Correlation:** nonzero `u64` request identity allocated monotonically within one connection generation.
-- **Full request identity:** `(connection generation, channel, epoch, correlation)`.
+- **Correlation:** nonzero `u64` request identity allocated monotonically within one connection generation. Each direction owns an independent correlation namespace: host-originated correlations (`Ping`) and consumer-originated correlations never collide even when numerically equal.
+- **Full request identity:** `(connection generation, direction, channel, epoch, correlation)`. Direction is implied on wire by frame type, never encoded as bytes.
 - **Terminal frame:** first matching `Response`, `Error`, or `StreamEnd` for a correlation.
 - **`not_sent`:** sender proves zero bytes of the request frame reached the socket.
 - **`outcome_unknown`:** any request with a partial, completed, or uncertain write whose terminal frame was not observed.
@@ -106,7 +106,7 @@ Published Rust accepts key lengths of at least 32; this profile narrows publicat
 The host MUST acquire a single-instance lock before minting credentials, binding, publishing, or removing the file. The runtime directory and lock MUST be owner-controlled. Publication MUST:
 
 1. generate a fresh 32-byte key and 16-byte daemon ID for every host incarnation;
-2. create a unique owner-only temporary regular file in the runtime directory (`${dataDir}/cortexkit/run/`, the same filesystem as the canonical path, so `rename(2)` cannot fail `EXDEV`) without following links;
+2. create a unique owner-only temporary regular file in the directory containing the resolved canonical path (by default `${dataDir}/cortexkit/run/`; a configured equivalent path per Section 4.1 uses its own directory), so both names share one filesystem and `rename(2)` cannot fail `EXDEV`, without following links;
 3. write complete JSON, flush it as required by deployment durability policy, and atomically rename it over the canonical path;
 4. leave the final file mode `0600` with no group or other permission bits;
 5. redact key bytes in logs, errors, panic formatting, metrics, and diagnostics.
@@ -129,15 +129,17 @@ Each authentication message is `u32` little-endian byte length followed by that 
 
 ### 5.2 Messages and proofs
 
-Constants from published `subc-transport` 0.5.0:
+Fixed parameters from published `subc-transport` 0.5.0:
 
-| Constant | Value |
+| Parameter | Value |
 | --- | --- |
 | Client nonce | 32 OS-CSPRNG bytes |
 | Server nonce | 32 OS-CSPRNG bytes |
 | Proof | 32-byte HMAC-SHA256 |
 | Server domain | ASCII `subc-server-v1` |
 | Client domain | ASCII `subc-client-v1` |
+
+Only lengths and domains are constants. Both nonces MUST be freshly generated from the OS CSPRNG for every handshake attempt and MUST NOT be reused within or across connections or host incarnations. Server-nonce freshness is the replay defense: a reused server nonce would let an observer replay a previously captured `client_auth` under a replayed client nonce.
 
 Exchange:
 
@@ -205,7 +207,7 @@ Flags:
 | 4-5 | admission class | 0 Normal, 1 Expedite, 2 Sheddable; 3 invalid |
 | 6-7 | reserved | MUST be zero |
 
-`Sheddable` is legal only on `Push` and `StreamData`. Admission classes are preserved and validated for numeric compatibility; this single-module profile defines no deployment admission policy from them.
+`Sheddable` is legal only on `Push` and `StreamData`; a `Sheddable` admission class on any other frame type is invalid flags and closes the generation (Section 6.3). Pure-header frames (`Cancel`, `Ping`, `Pong`, `Goodbye`) MUST set `binary = 0`, `last = 0`, and admission class `Normal`; priority MAY be any valid value. A conforming `Ping` therefore never carries flags whose mandated `Pong` echo the host would have to reject. Admission classes are preserved and validated for numeric compatibility; this single-module profile defines no deployment admission policy from them.
 
 ### 6.2 Frame types and direct-profile classification
 
@@ -278,7 +280,7 @@ A routed 44-byte Background/Normal request on channel 7, epoch 77, correlation 2
 
 ### 7.1 Body rules and metadata bounds
 
-Channel 0 accepts UTF-8 JSON only (`binary = 0`), with tagged request and response objects using the `op` field. The direct profile caps a channel-0 body at 65,536 bytes even though framing permits more. Oversize complete control requests receive terminal `Error{code:"invalid_control_request"}`. Routed application request and response bodies remain opaque to transport and may be JSON or binary as flags indicate.
+Channel 0 accepts UTF-8 JSON only (`binary = 0`), with tagged request and response objects using the `op` field. The direct profile caps a channel-0 body at 65,536 bytes even though framing permits more. Oversize control requests receive terminal `Error{code:"invalid_control_request"}`. A channel-0 header declaring `len` greater than 65,536 already proves the violation: the host MAY emit that terminal as soon as header validation completes, MUST NOT buffer the oversize body, and drains and discards the declared bytes under the frame's absolute deadline to preserve stream alignment (deadline expiry closes the generation as usual). This early rejection does not violate the Section 6.3 acceptance requirement, which applies to otherwise valid frames. Routed application request and response bodies remain opaque to transport and may be JSON or binary as flags indicate.
 
 Before filesystem work or handler bind, host MUST enforce these UTF-8 byte limits:
 
@@ -426,7 +428,7 @@ Local close racing `route.open` wins. A late successful bind MUST NOT enter clie
 
 ### 8.3 Request identity and allocation
 
-Each sender allocates correlations monotonically from 1 within a connection generation. A correlation MUST NOT be reused, even after terminal completion. `u64::MAX` may identify one final request; before another request, sender MUST retire the generation and reconnect. Published `HistorianProducer` currently saturates at `u64::MAX`; compatibility work in `magic-context-c50.4` MUST replace saturation with checked exhaustion and generation retirement.
+Each sender allocates correlations monotonically from 1 within a connection generation. The two directions are independent namespaces: a host `Ping` correlation MAY be numerically equal to a pending consumer correlation on the same connection, and neither affects the other. Matching is direction-scoped by frame type — `Response`, `Error`, `StreamData`, and `StreamEnd` settle only consumer-originated requests; `Pong` settles only host-originated `Ping`. The no-reuse rule applies within one sender's namespace. A correlation MUST NOT be reused, even after terminal completion. `u64::MAX` may identify one final request; before another request, sender MUST retire the generation and reconnect. Published `HistorianProducer` currently saturates at `u64::MAX`; compatibility work in `magic-context-c50.4` MUST replace saturation with checked exhaustion and generation retirement.
 
 Host pending state is keyed by full request identity. For ingress, a routed `Request` to an absent or stale route gets terminal `unknown_channel` and never reaches handler; stale or unknown `Cancel`/`Goodbye` is an idempotent no-op. For client ingress, unmatched or stale response/stream frames are dropped with redacted rate-limited diagnostics. First terminal wins; duplicate or late terminals are dropped. No frame from an old generation, wrong channel/epoch, unknown correlation, or terminal correlation may affect current work.
 
@@ -648,10 +650,11 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | V40 | Catalog filters | Unfiltered/exact filter returns linked entry; unknown filter returns empty list |
 | V41 | Unsupported control op | One `unsupported_operation` terminal; connection remains usable; no handler callback |
 | V42 | Host sends structurally valid `Request` | Client closes generation without dispatching or responding |
+| V43 | Host `Ping` correlation numerically equals a pending consumer correlation | `Pong` settles only the Ping; consumer terminals settle only the consumer request; no cross-settlement |
 
 ### 14.1 Downstream fixture oracle
 
-Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V42 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
+Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V43 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
 
 ## 15. Consumer traceability
 
@@ -672,7 +675,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | --- | --- | --- |
 | R1 single normative owner | 1, 17 | AE1-AE13 |
 | R2 terms, authority, verified/private distinction | 1-3, 18 | AE1, AE4, AE7 |
-| R3 byte/JSON examples and scenario tables | 4-7, 13-14 | AE1-AE13, V1-V42 |
+| R3 byte/JSON examples and scenario tables | 4-7, 13-14 | AE1-AE13, V1-V43 |
 | R4 no executable fixtures/implementation | 1, 17 | AE1-AE13 |
 | R5 discovery schema/endpoints | 4.1 | AE1, AE7, V1-V4 |
 | R6 publication/cleanup/redaction | 4.2, 12 | AE7, AE13, V5-V7, V24 |
@@ -681,7 +684,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | R9 frame/control classification/catalog | 6.2, 7 | AE9, AE10, V17, V40-V42 |
 | R10 tagged control and opaque application bodies | 7, 9.1 | AE1, V16, V38, V41 |
 | R11 route/bind/direct lifecycle | 8.1-8.2 | AE3, AE8, AE11-AE13, V20, V27, V31-V36 |
-| R12 request identity/counters | 8.3 | AE5, AE7, AE11, V18-V22, V31-V32 |
+| R12 request identity/counters | 8.3 | AE5, AE7, AE11, V18-V22, V31-V32, V43 |
 | R13 terminal/cancel/close/health | 9 | AE8, AE9, AE12, AE13, V19, V25-V26, V33-V35, V38 |
 | R14 deadlines/outcomes | 10-11 | AE2, AE4-AE6, V23, V29-V30, V37 |
 | R15 reconnect/rotation/stale state | 12 | AE7, AE13, V7, V22 |
