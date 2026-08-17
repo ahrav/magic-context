@@ -56,7 +56,7 @@ flowchart TB
 - **Host incarnation:** one process lifetime with one fresh key and daemon ID.
 - **Connection generation:** client-local identity for one authenticated TCP connection. It is not sent on wire.
 - **Catalog generation:** `u64` catalog-state version returned by `catalog.list`; unrelated to connection generation.
-- **Route handle:** `(channel, epoch)` assigned by host after handler bind succeeds.
+- **Route handle:** `(channel, epoch)` created by the host before invoking handler bind and published to the client only after bind succeeds. A rejected bind still observed the handle, which is why route-gone fires exactly once on rejection (Section 8.2).
 - **Live channel:** nonzero `u16` route slot from one host-global namespace across all consumer connections.
 - **Route epoch:** nonzero `u32` incarnation of a channel. Reuse is allowed only after prior cleanup and at a strictly higher epoch.
 - **Correlation:** nonzero `u64` request identity allocated monotonically within one connection generation.
@@ -106,7 +106,7 @@ Published Rust accepts key lengths of at least 32; this profile narrows publicat
 The host MUST acquire a single-instance lock before minting credentials, binding, publishing, or removing the file. The runtime directory and lock MUST be owner-controlled. Publication MUST:
 
 1. generate a fresh 32-byte key and 16-byte daemon ID for every host incarnation;
-2. create a unique owner-only temporary regular file without following links;
+2. create a unique owner-only temporary regular file in the runtime directory (`${dataDir}/cortexkit/run/`, the same filesystem as the canonical path, so `rename(2)` cannot fail `EXDEV`) without following links;
 3. write complete JSON, flush it as required by deployment durability policy, and atomically rename it over the canonical path;
 4. leave the final file mode `0600` with no group or other permission bits;
 5. redact key bytes in logs, errors, panic formatting, metrics, and diagnostics.
@@ -243,7 +243,7 @@ Frame legality after header decoding:
 | route `Goodbye` | current `nonzero / nonzero / 0` | empty | stale/unknown route is idempotent no-op |
 | connection `Goodbye` | `0 / 0 / 0` | empty | orderly generation close |
 
-Any structurally illegal channel, epoch, correlation, body, or direction closes the generation. Valid but stale state uses the explicit dispositions above; it is not framing corruption.
+Any structurally illegal channel, epoch, correlation, body, or direction closes the generation. `StreamEnd` is not a pure-header frame at the framing layer, but the direct profile requires an empty `StreamEnd` body: receiving `StreamEnd` with `len > 0` is a structurally illegal body under the table above and closes the generation, even though frame alignment itself is intact. Valid but stale state uses the explicit dispositions above; it is not framing corruption.
 
 ### 6.3 Reading, limits, and corruption
 
@@ -284,7 +284,7 @@ Before filesystem work or handler bind, host MUST enforce these UTF-8 byte limit
 
 | Field | Limit and validation |
 | --- | --- |
-| `op` | 64 bytes; known direct-profile value |
+| `op` | 64 bytes; nonempty; no NUL. Value recognition is not structural validation: an unrecognized `op` dispatches to operation classification (Section 7.4) and gets terminal `unsupported_operation`, not `invalid_control_request` |
 | `module_id` | 128 bytes; nonempty; no NUL |
 | `project_root` | 4,096 bytes; absolute platform path; no NUL |
 | `harness` | 128 bytes; nonempty; no NUL |
@@ -313,6 +313,8 @@ Successful response MUST retain the tag:
 ```
 
 The only current successful target is linked module ID `magic-context` with a role supported by its manifest. Other module IDs receive terminal `unknown_module`; unsupported target kinds receive terminal `target_unavailable`. Dynamic routing, provider discovery, `internal_service`, and model-runner routing are outside this single-module document; `magic-context-c50.11` owns model-runner route integration required by the Rust historian.
+
+This exclusion has one known in-repo casualty: `RealSessionResolver` (`crates/mc-module/src/session_resolver.rs`), constructed whenever `McHandler` receives a connection file, unconditionally opens a `management_surface` route to module `thalamus`, and the linked manifest consumes that service. Against a conforming direct host that `route.open` receives a terminal error (`target_unavailable` for the unsupported `management_surface` kind), so stateful facade calls that resolve sessions fail at route-open. This contract deliberately does not add a thalamus-compatible route; `magic-context-c50.4` owns replacing or disabling that resolver path (for example, a host-served session-resolve equivalent or the existing `MissingSessionResolver` fallback) before mc-module runs against this profile.
 
 ### 7.3 `catalog.list`
 
@@ -483,6 +485,8 @@ Current `SubcModuleTransport.call()` retries broad request-side connection failu
 | `target_unavailable` | yes | same |
 | `module_timeout` | yes | same; old control RPC remains terminal |
 | `unknown_channel` on routed request | yes; host proves no handler dispatch | managed SDK MAY evict route and retry once on fresh route |
+| `server_busy` | yes; host proves no handler dispatch (limit exhaustion before dispatch, Section 8.3) | managed SDK MAY retry with backoff and a new correlation under its owning request deadline |
+| `cancelled` | yes; cancellation won (Section 9.2) | no generic retry; caller requested cancellation, only explicit application policy may issue a fresh RPC |
 | `invalid_control_request`, `unsupported_operation`, bind rejection | yes | no generic retry |
 | `store_unavailable` | yes, application error | caller MAY issue later fresh application request; transport stays connected |
 | application `Error` | yes | application-specific only |
@@ -537,8 +541,8 @@ Graceful host shutdown order:
 
 1. stop accepting connections and route opens;
 2. while holding instance lock, daemon-ID-fenced remove own connection file;
-3. send best-effort connection Goodbye;
-4. drain or cancel work within finite shutdown deadline;
+3. drain or cancel work within finite shutdown deadline, emitting terminal `Response`, `StreamEnd`, or `Error{code:"cancelled"}` frames while generations are still live;
+4. send best-effort connection Goodbye; receiving it retires the generation client-side (Section 6.2), so it MUST follow the drain, or drain-phase terminals would arrive on a retired generation and be dropped;
 5. invoke route-gone exactly once for every handler-visible route;
 6. drop handler only after all route-gone callbacks complete;
 7. close sockets/listener;
@@ -653,7 +657,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts` | managed call and `not_sent` / `outcome_unknown` / `terminal` distinction | `magic-context-c50.5` |
 | `packages/plugin/src/features/magic-context/smart-notes/wake-plane.ts` | tagged truthful catalog; absent `wake.create` fails open | `magic-context-c50.5` |
 | `crates/mc-module/src/historian_producer.rs` | raw auth, first endpoint, route open, monotonic correlation, streaming, Error, Goodbye | `magic-context-c50.4`, route target in `magic-context-c50.11` |
-| `crates/mc-module/src/session_resolver.rs` | managed Rust route-open deadline and terminal module errors | `magic-context-c50.4` |
+| `crates/mc-module/src/session_resolver.rs` | managed Rust route-open deadline and terminal module errors; its thalamus `management_surface` target is unsupported by this profile and MUST be replaced or disabled (Section 7.2) | `magic-context-c50.4` |
 | `crates/mc-module/src/lib.rs` | initialize once, bind before response, route-gone once, atomics-only health, store readiness | `magic-context-c50.3` / `.4` |
 | `packages/e2e-tests/tests/rust-park-self-heal.test.ts` | existing module-restart/park-heal evidence only; whole-host credential-rotation case still required | `magic-context-c50.9`, after `.11` |
 | `scripts/drive-rig/*` | trusted credential mount and loopback proxy exception | drive-rig validation in downstream E2E |
