@@ -2,6 +2,7 @@ import type { Database, Statement as PreparedStatement } from "../../../shared/s
 import {
     buildWorkspaceMemorySqlFilter,
     getMemorySelectColumns,
+    getStatsDependentStatement,
     memoryRowsFromQuery,
     registerStatsDependentStatementCache,
 } from "./storage-memory";
@@ -16,14 +17,11 @@ const searchStatements = registerStatsDependentStatementCache(
 const unionSearchStatements = new Map<number, WeakMap<Database, PreparedStatement>>();
 
 function getSearchStatement(db: Database): PreparedStatement {
-    let stmt = searchStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
+    return getStatsDependentStatement(db, searchStatements, () =>
+        db.prepare(
             `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path = ? AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
-        );
-        searchStatements.set(db, stmt);
-    }
-    return stmt;
+        ),
+    );
 }
 
 /**
@@ -42,15 +40,12 @@ function getUnionSearchStatement(db: Database, arity: number): PreparedStatement
         );
         unionSearchStatements.set(arity, statements);
     }
-    let stmt = statements.get(db);
-    if (!stmt) {
+    return getStatsDependentStatement(db, statements, () => {
         const placeholders = Array.from({ length: arity }, () => "?").join(", ");
-        stmt = db.prepare(
+        return db.prepare(
             `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${placeholders}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
         );
-        statements.set(db, stmt);
-    }
-    return stmt;
+    });
 }
 
 function uniqueProjectPaths(projectPaths: readonly string[]): string[] {

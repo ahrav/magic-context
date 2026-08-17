@@ -598,24 +598,25 @@ describe("migration v80: memory_stats telemetry side table", () => {
                 content: "probe memory",
                 seenCount: 2,
             });
-            // Probe and prepare telemetry statements while the handle is v79:
-            // the probe must not freeze `false`, and the cached legacy UPDATE
-            // must not outlive the migration.
+            // Probe and prepare telemetry + read statements while the handle
+            // is v79: the probe must not freeze `false`, and the cached legacy
+            // statements must not outlive the migration.
             updateMemorySeenCount(db, id);
-            expect(
-                (
-                    db.prepare("SELECT seen_count FROM memories WHERE id = ?").get(id) as {
-                        seen_count: number;
-                    }
-                ).seen_count,
-            ).toBe(3);
+            expect(getMemoryById(db, id)?.seenCount).toBe(3);
 
             runMigrations(db);
+
+            // Advance the stats row without touching the helper layer, so the
+            // next helper call is the first one after migration. A stale
+            // cached SELECT would execute before any probe and report the
+            // frozen legacy counter.
+            db.prepare("UPDATE memory_stats SET seen_count = 9 WHERE memory_id = ?").run(id);
+            expect(getMemoryById(db, id)?.seenCount).toBe(9);
 
             // Post-migration the same handle must route the bump into
             // memory_stats; a stale cached branch would hit the freeze guard.
             updateMemorySeenCount(db, id);
-            expect(statsRow(db, id)?.seen_count).toBe(4);
+            expect(statsRow(db, id)?.seen_count).toBe(10);
             expect(
                 (
                     db.prepare("SELECT seen_count FROM memories WHERE id = ?").get(id) as {

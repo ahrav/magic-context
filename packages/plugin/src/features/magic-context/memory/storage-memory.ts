@@ -100,6 +100,26 @@ export function registerStatsDependentStatementCache<T extends { delete(db: Data
     return cache;
 }
 
+/**
+ * Fetch (or prepare) a stats-dependent statement, probing the schema FIRST:
+ * the probe's first positive observation drops the registered caches, so a
+ * statement prepared against the pre-v80 shape is discarded before it can
+ * execute once more against the migrated schema.
+ */
+export function getStatsDependentStatement(
+    db: Database,
+    cache: WeakMap<Database, PreparedStatement>,
+    prepare: (db: Database) => PreparedStatement,
+): PreparedStatement {
+    hasMemoryStatsTable(db);
+    let stmt = cache.get(db);
+    if (!stmt) {
+        stmt = prepare(db);
+        cache.set(db, stmt);
+    }
+    return stmt;
+}
+
 const insertMemoryStatements = new WeakMap<Database, PreparedStatement>();
 const getMemoryByHashStatements = registerStatsDependentStatementCache(
     new WeakMap<Database, PreparedStatement>(),
@@ -442,23 +462,17 @@ function getInsertMemoryStatement(db: Database): PreparedStatement {
 }
 
 function getMemoryByHashStatement(db: Database): PreparedStatement {
-    let stmt = getMemoryByHashStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
+    return getStatsDependentStatement(db, getMemoryByHashStatements, () =>
+        db.prepare(
             `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ?`,
-        );
-        getMemoryByHashStatements.set(db, stmt);
-    }
-    return stmt;
+        ),
+    );
 }
 
 function getMemoryByIdStatement(db: Database): PreparedStatement {
-    let stmt = getMemoryByIdStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id = ?`);
-        getMemoryByIdStatements.set(db, stmt);
-    }
-    return stmt;
+    return getStatsDependentStatement(db, getMemoryByIdStatements, () =>
+        db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id = ?`),
+    );
 }
 
 function getMemoriesByIdsStatement(db: Database, idCount: number): PreparedStatement {
@@ -468,15 +482,12 @@ function getMemoriesByIdsStatement(db: Database, idCount: number): PreparedState
         map = registerStatsDependentStatementCache(new WeakMap<Database, PreparedStatement>());
         getMemoriesByIdsStatements.set(key, map);
     }
-    let stmt = map.get(db);
-    if (!stmt) {
+    return getStatsDependentStatement(db, map, () => {
         const placeholders = new Array(idCount).fill("?").join(", ");
-        stmt = db.prepare(
+        return db.prepare(
             `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id IN (${placeholders})`,
         );
-        map.set(db, stmt);
-    }
-    return stmt;
+    });
 }
 
 function getMemoriesByProjectStatement(db: Database, statuses: MemoryStatus[]): PreparedStatement {
@@ -488,64 +499,50 @@ function getMemoriesByProjectStatement(db: Database, statuses: MemoryStatus[]): 
         );
         memoriesByProjectStatements.set(key, statements);
     }
-
-    let stmt = statements.get(db);
-    if (!stmt) {
+    return getStatsDependentStatement(db, statements, () => {
         const placeholders = statuses.map(() => "?").join(", ");
         // ORDER BY uses projection aliases so the maximum base or stats update
         // time determines v80 ordering.
-        stmt = db.prepare(
+        return db.prepare(
             `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status IN (${placeholders}) AND (expires_at IS NULL OR expires_at > ?) ORDER BY category ASC, updatedAt DESC, id ASC`,
         );
-        statements.set(db, stmt);
-    }
-
-    return stmt;
+    });
 }
 
 /** All `active` rows for a project with NO expiry filter — for the destructive
  *  migration path only (see getAllActiveMemoriesForMigration). */
 function getActiveMemoriesNoExpiryStatement(db: Database): PreparedStatement {
-    let stmt = activeMemoriesNoExpiryStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
+    return getStatsDependentStatement(db, activeMemoriesNoExpiryStatements, () =>
+        db.prepare(
             `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status = 'active' ORDER BY category ASC, updatedAt DESC, id ASC`,
-        );
-        activeMemoriesNoExpiryStatements.set(db, stmt);
-    }
-    return stmt;
+        ),
+    );
 }
 
 function getUpdateMemorySeenCountStatement(db: Database): PreparedStatement {
-    let stmt = updateMemorySeenCountStatements.get(db);
-    if (!stmt) {
+    return getStatsDependentStatement(db, updateMemorySeenCountStatements, () =>
         // When memory_stats exists, telemetry writes update memory_stats
         // instead of memories.
-        stmt = hasMemoryStatsTable(db)
+        hasMemoryStatsTable(db)
             ? db.prepare(
                   "UPDATE memory_stats SET seen_count = seen_count + 1, last_seen_at = ?, updated_at = ? WHERE memory_id = ?",
               )
             : db.prepare(
                   "UPDATE memories SET seen_count = seen_count + 1, last_seen_at = ?, updated_at = ? WHERE id = ?",
-              );
-        updateMemorySeenCountStatements.set(db, stmt);
-    }
-    return stmt;
+              ),
+    );
 }
 
 function getUpdateMemoryRetrievalCountStatement(db: Database): PreparedStatement {
-    let stmt = updateMemoryRetrievalCountStatements.get(db);
-    if (!stmt) {
-        stmt = hasMemoryStatsTable(db)
+    return getStatsDependentStatement(db, updateMemoryRetrievalCountStatements, () =>
+        hasMemoryStatsTable(db)
             ? db.prepare(
                   "UPDATE memory_stats SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?, updated_at = ? WHERE memory_id = ?",
               )
             : db.prepare(
                   "UPDATE memories SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?, updated_at = ? WHERE id = ?",
-              );
-        updateMemoryRetrievalCountStatements.set(db, stmt);
-    }
-    return stmt;
+              ),
+    );
 }
 
 function getUpdateMemoryStatusStatement(db: Database): PreparedStatement {
