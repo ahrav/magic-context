@@ -84,13 +84,39 @@ const VERIFICATION_STATUS_LOOKUP = {
     flagged: true,
 } satisfies Record<VerificationStatus, true>;
 
+/**
+ * Statement caches whose prepared SQL depends on the memory_stats probe
+ * (directly or via getMemorySelectColumns). The first positive probe on a
+ * handle drops these so statements prepared against the pre-v80 shape
+ * re-prepare against the side table. Statement getters that branch at CALL
+ * time on hasMemoryStatsTable (fixed SQL per cache) do not register.
+ */
+const statsDependentStatementCaches: Array<{ delete(db: Database): boolean }> = [];
+
+export function registerStatsDependentStatementCache<T extends { delete(db: Database): boolean }>(
+    cache: T,
+): T {
+    statsDependentStatementCaches.push(cache);
+    return cache;
+}
+
 const insertMemoryStatements = new WeakMap<Database, PreparedStatement>();
-const getMemoryByHashStatements = new WeakMap<Database, PreparedStatement>();
-const getMemoryByIdStatements = new WeakMap<Database, PreparedStatement>();
+const getMemoryByHashStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
+const getMemoryByIdStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
 const getMemoriesByIdsStatements = new Map<string, WeakMap<Database, PreparedStatement>>();
-const activeMemoriesNoExpiryStatements = new WeakMap<Database, PreparedStatement>();
-const updateMemorySeenCountStatements = new WeakMap<Database, PreparedStatement>();
-const updateMemoryRetrievalCountStatements = new WeakMap<Database, PreparedStatement>();
+const activeMemoriesNoExpiryStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
+const updateMemorySeenCountStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
+const updateMemoryRetrievalCountStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
 const updateMemoryStatusStatements = new WeakMap<Database, PreparedStatement>();
 const updateArchivedMemoryStatements = new WeakMap<Database, PreparedStatement>();
 const updateMemoryVerificationStatements = new WeakMap<Database, PreparedStatement>();
@@ -183,8 +209,18 @@ export function hasMemoryStatsTable(db: Database): boolean {
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_stats'")
             .get(),
     );
-    memoryStatsTableCache.set(db, present);
-    return present;
+    // Never cache a negative probe: v80 can install memory_stats later on
+    // this same handle (probe before runMigrations, or a sibling process
+    // migrating a shared file), and a frozen `false` would route telemetry
+    // writes into the legacy columns that the freeze guard now rejects.
+    if (!present) return false;
+    // First positive observation. Statements prepared while earlier probes
+    // saw no table still target the legacy shape — drop them so they
+    // re-prepare against the side table. The table is never dropped, so the
+    // positive result is safe to cache and this runs at most once per handle.
+    for (const cache of statsDependentStatementCaches) cache.delete(db);
+    memoryStatsTableCache.set(db, true);
+    return true;
 }
 
 export class MemoryStatsIntegrityError extends Error {
@@ -429,7 +465,7 @@ function getMemoriesByIdsStatement(db: Database, idCount: number): PreparedState
     const key = `n${idCount}`;
     let map = getMemoriesByIdsStatements.get(key);
     if (!map) {
-        map = new WeakMap<Database, PreparedStatement>();
+        map = registerStatsDependentStatementCache(new WeakMap<Database, PreparedStatement>());
         getMemoriesByIdsStatements.set(key, map);
     }
     let stmt = map.get(db);
@@ -447,7 +483,9 @@ function getMemoriesByProjectStatement(db: Database, statuses: MemoryStatus[]): 
     const key = statuses.join(",");
     let statements = memoriesByProjectStatements.get(key);
     if (!statements) {
-        statements = new WeakMap<Database, PreparedStatement>();
+        statements = registerStatsDependentStatementCache(
+            new WeakMap<Database, PreparedStatement>(),
+        );
         memoriesByProjectStatements.set(key, statements);
     }
 

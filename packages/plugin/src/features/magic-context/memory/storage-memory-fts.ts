@@ -3,11 +3,16 @@ import {
     buildWorkspaceMemorySqlFilter,
     getMemorySelectColumns,
     memoryRowsFromQuery,
+    registerStatsDependentStatementCache,
 } from "./storage-memory";
 import type { Memory } from "./types";
 
 const DEFAULT_SEARCH_LIMIT = 10;
-const searchStatements = new WeakMap<Database, PreparedStatement>();
+// getMemorySelectColumns embeds the memory_stats projection, so these caches
+// register for invalidation when the stats-table probe first turns positive.
+const searchStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
 const unionSearchStatements = new Map<number, WeakMap<Database, PreparedStatement>>();
 
 function getSearchStatement(db: Database): PreparedStatement {
@@ -32,7 +37,9 @@ function getSearchStatement(db: Database): PreparedStatement {
 function getUnionSearchStatement(db: Database, arity: number): PreparedStatement {
     let statements = unionSearchStatements.get(arity);
     if (!statements) {
-        statements = new WeakMap<Database, PreparedStatement>();
+        statements = registerStatsDependentStatementCache(
+            new WeakMap<Database, PreparedStatement>(),
+        );
         unionSearchStatements.set(arity, statements);
     }
     let stmt = statements.get(db);

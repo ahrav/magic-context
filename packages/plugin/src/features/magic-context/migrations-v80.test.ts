@@ -590,6 +590,44 @@ describe("migration v80: memory_stats telemetry side table", () => {
         expect(statsRow(migrator, id)?.seen_count).toBe(4);
     });
 
+    test("a negative stats-table probe does not survive v80 on the same handle", () => {
+        const db = v79Database();
+        try {
+            const id = insertLegacyMemory(db, {
+                projectPath: "git:probe",
+                content: "probe memory",
+                seenCount: 2,
+            });
+            // Probe and prepare telemetry statements while the handle is v79:
+            // the probe must not freeze `false`, and the cached legacy UPDATE
+            // must not outlive the migration.
+            updateMemorySeenCount(db, id);
+            expect(
+                (
+                    db.prepare("SELECT seen_count FROM memories WHERE id = ?").get(id) as {
+                        seen_count: number;
+                    }
+                ).seen_count,
+            ).toBe(3);
+
+            runMigrations(db);
+
+            // Post-migration the same handle must route the bump into
+            // memory_stats; a stale cached branch would hit the freeze guard.
+            updateMemorySeenCount(db, id);
+            expect(statsRow(db, id)?.seen_count).toBe(4);
+            expect(
+                (
+                    db.prepare("SELECT seen_count FROM memories WHERE id = ?").get(id) as {
+                        seen_count: number;
+                    }
+                ).seen_count,
+            ).toBe(3);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("memory_stats has no session ownership and survives durable-memory expectations", () => {
         const db = migratedDb();
         try {
