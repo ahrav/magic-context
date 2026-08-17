@@ -187,7 +187,7 @@ export function hasMemoryStatsTable(db: Database): boolean {
     return present;
 }
 
-class MemoryStatsIntegrityError extends Error {
+export class MemoryStatsIntegrityError extends Error {
     constructor(memoryId: number) {
         super(
             `memory_stats row missing for memory ${memoryId}: context.db failed v80 integrity ` +

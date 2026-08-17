@@ -2624,4 +2624,104 @@ describe("memory authority protocol", () => {
             .get() as { c: number };
         expect(after.c).toBe(before.c);
     });
+
+    test("sparse mirror update preserves an advanced stats timestamp", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash,
+                        seen_count, retrieval_count, first_seen_at, created_at, updated_at,
+                        last_seen_at, status
+                     ) VALUES (7, '/repo', 'CONSTRAINTS', 'sparse memory', 'sparse-hash',
+                               1, 0, 100, 100, 100, 100, 'active')`,
+                )
+                .run();
+            // Telemetry has advanced the stats clock past the frozen base row.
+            database.prepare("UPDATE memory_stats SET updated_at = 500 WHERE memory_id = 7").run();
+        });
+        applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [
+                    {
+                        feed_seq: 1,
+                        domain: "memories",
+                        op: "update",
+                        module_row_id: 70,
+                        content_hash: "sparse-hash",
+                        // Sparse legacy snapshot: bumps a telemetry field but
+                        // omits updated_at ("unchanged").
+                        full_row_snapshot: {
+                            id: 70,
+                            project_path: "/repo",
+                            category: "CONSTRAINTS",
+                            normalized_hash: "sparse-hash",
+                            seen_count: 3,
+                            context_store_uuid: storeUuid,
+                            context_row_id: 7,
+                        },
+                    },
+                ],
+            },
+        });
+        expect(
+            database
+                .prepare("SELECT seen_count, updated_at FROM memory_stats WHERE memory_id = 7")
+                .get(),
+        ).toEqual({ seen_count: 3, updated_at: 500 });
+    });
+
+    test("a mirror telemetry write onto a missing stats row surfaces as corruption", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(
+                        id, project_path, category, content, normalized_hash,
+                        seen_count, retrieval_count, first_seen_at, created_at, updated_at,
+                        last_seen_at, status
+                     ) VALUES (8, '/repo', 'CONSTRAINTS', 'orphan memory', 'orphan-hash',
+                               1, 0, 100, 100, 100, 100, 'active')`,
+                )
+                .run();
+            database.prepare("DELETE FROM memory_stats WHERE memory_id = 8").run();
+        });
+        expect(() =>
+            applyMirrorPage({
+                db: database,
+                page: {
+                    domain: "memories",
+                    cursor: 0,
+                    next_cursor: 1,
+                    has_more: false,
+                    rows: [
+                        {
+                            feed_seq: 1,
+                            domain: "memories",
+                            op: "update",
+                            module_row_id: 80,
+                            content_hash: "orphan-hash",
+                            full_row_snapshot: {
+                                id: 80,
+                                project_path: "/repo",
+                                category: "CONSTRAINTS",
+                                normalized_hash: "orphan-hash",
+                                seen_count: 5,
+                                context_store_uuid: storeUuid,
+                                context_row_id: 8,
+                            },
+                        },
+                    ],
+                },
+            }),
+        ).toThrow(/memory_stats row missing for memory 8/);
+    });
 });

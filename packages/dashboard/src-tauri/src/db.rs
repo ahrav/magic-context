@@ -3268,6 +3268,47 @@ pub fn get_memories(
         "0 AS has_embedding"
     };
 
+    // v80 (plugin migration) moves live telemetry into the memory_stats side
+    // table and freezes the retained memories columns at their migration-time
+    // values. Read through the side table when it exists so counters and the
+    // effective update time reflect post-migration activity; a missing stats
+    // row falls back to the frozen baseline (the read-only viewer degrades
+    // rather than erroring — corruption reporting is the plugin's job).
+    // Pre-v80 DBs keep the single-table shape. Mapper indices stay stable
+    // either way.
+    let (telemetry_cols, stats_join, order_recent) = if table_exists(conn, "memory_stats") {
+        (
+            "COALESCE(s.seen_count, m.seen_count) AS seen_count,
+                    COALESCE(s.retrieval_count, m.retrieval_count) AS retrieval_count,
+                    m.first_seen_at, m.created_at,
+                    MAX(m.updated_at, COALESCE(s.updated_at, m.updated_at)) AS updated_at,
+                    COALESCE(s.last_seen_at, m.last_seen_at) AS last_seen_at,
+                    COALESCE(s.last_retrieved_at, m.last_retrieved_at) AS last_retrieved_at,",
+            "LEFT JOIN memory_stats s ON s.memory_id = m.id",
+            "ORDER BY MAX(m.updated_at, COALESCE(s.updated_at, m.updated_at)) DESC",
+        )
+    } else {
+        (
+            "m.seen_count, m.retrieval_count,
+                    m.first_seen_at, m.created_at, m.updated_at, m.last_seen_at,
+                    m.last_retrieved_at,",
+            "",
+            "ORDER BY m.updated_at DESC",
+        )
+    };
+
+    // Shared 25-column projection: every variant below must produce the same
+    // column positions because map_memory_row reads by index.
+    let select_head = format!(
+        "SELECT m.id, m.project_path, m.category, m.content, m.normalized_hash,
+                m.source_session_id, m.source_type, {telemetry_cols}
+                m.status, m.expires_at, m.verification_status,
+                m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
+                {classify_cols}
+                {has_embedding}",
+        has_embedding = has_embedding_select,
+    );
+
     let raw_search = search_query.unwrap_or("").trim().to_string();
     let has_search = !raw_search.is_empty();
 
@@ -3352,62 +3393,38 @@ pub fn get_memories(
     let sql = if use_fts && !use_like_fallback {
         // FTS5 search with sanitized query
         format!(
-            "SELECT m.id, m.project_path, m.category, m.content, m.normalized_hash,
-                    m.source_session_id, m.source_type, m.seen_count, m.retrieval_count,
-                    m.first_seen_at, m.created_at, m.updated_at, m.last_seen_at,
-                    m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
-                    m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
-                    {classify_cols}
-                    {has_embedding}
+            "{select_head}
              FROM memories m
+             {stats_join}
              INNER JOIN memories_fts ON memories_fts.rowid = m.id
              WHERE memories_fts MATCH ?1
              {}
              ORDER BY rank
              LIMIT ?{} OFFSET ?{}",
-            where_extra,
-            limit_idx,
-            offset_idx,
-            has_embedding = has_embedding_select,
+            where_extra, limit_idx, offset_idx,
         )
     } else if has_search {
         // LIKE fallback for short queries or special-character-heavy input
         format!(
-            "SELECT m.id, m.project_path, m.category, m.content, m.normalized_hash,
-                    m.source_session_id, m.source_type, m.seen_count, m.retrieval_count,
-                    m.first_seen_at, m.created_at, m.updated_at, m.last_seen_at,
-                    m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
-                    m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
-                    {classify_cols}
-                    {has_embedding}
+            "{select_head}
              FROM memories m
+             {stats_join}
              WHERE (m.content LIKE ?1 ESCAPE '\\' OR m.category LIKE ?1 ESCAPE '\\')
              {}
-             ORDER BY m.updated_at DESC
+             {order_recent}
               LIMIT ?{} OFFSET ?{}",
-            where_extra,
-            limit_idx,
-            offset_idx,
-            has_embedding = has_embedding_select,
+            where_extra, limit_idx, offset_idx,
         )
     } else {
         format!(
-            "SELECT m.id, m.project_path, m.category, m.content, m.normalized_hash,
-                    m.source_session_id, m.source_type, m.seen_count, m.retrieval_count,
-                    m.first_seen_at, m.created_at, m.updated_at, m.last_seen_at,
-                    m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
-                    m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
-                    {classify_cols}
-                    {has_embedding}
+            "{select_head}
              FROM memories m
+             {stats_join}
              WHERE 1=1
              {}
-             ORDER BY m.updated_at DESC
+             {order_recent}
               LIMIT ?{} OFFSET ?{}",
-            where_extra,
-            limit_idx,
-            offset_idx,
-            has_embedding = has_embedding_select,
+            where_extra, limit_idx, offset_idx,
         )
     };
 
@@ -3428,22 +3445,14 @@ pub fn get_memories(
         Ok(_empty) if use_fts && !use_like_fallback => {
             // FTS returned nothing — retry with LIKE for better partial matching
             let like_sql = format!(
-                "SELECT m.id, m.project_path, m.category, m.content, m.normalized_hash,
-                        m.source_session_id, m.source_type, m.seen_count, m.retrieval_count,
-                        m.first_seen_at, m.created_at, m.updated_at, m.last_seen_at,
-                        m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
-                        m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
-                        {classify_cols}
-                        {has_embedding}
+                "{select_head}
                  FROM memories m
+                 {stats_join}
                  WHERE (m.content LIKE ?1 ESCAPE '\\' OR m.category LIKE ?1 ESCAPE '\\')
                  {}
-                 ORDER BY m.updated_at DESC
+                 {order_recent}
                  LIMIT ?{} OFFSET ?{}",
-                where_extra,
-                limit_idx,
-                offset_idx,
-                has_embedding = has_embedding_select,
+                where_extra, limit_idx, offset_idx,
             );
             // Rebuild params with LIKE pattern instead of FTS query.
             // Project filter uses the same resolved_paths set computed at the
@@ -3476,22 +3485,14 @@ pub fn get_memories(
             // FTS query failed — fall back to LIKE
             eprintln!("FTS search failed, falling back to LIKE: {}", e);
             let like_sql = format!(
-                "SELECT m.id, m.project_path, m.category, m.content, m.normalized_hash,
-                        m.source_session_id, m.source_type, m.seen_count, m.retrieval_count,
-                        m.first_seen_at, m.created_at, m.updated_at, m.last_seen_at,
-                        m.last_retrieved_at, m.status, m.expires_at, m.verification_status,
-                        m.verified_at, m.superseded_by_memory_id, m.merged_from, m.metadata_json,
-                        {classify_cols}
-                        {has_embedding}
+                "{select_head}
                  FROM memories m
+                 {stats_join}
                  WHERE (m.content LIKE ?1 ESCAPE '\\' OR m.category LIKE ?1 ESCAPE '\\')
                  {}
-                 ORDER BY m.updated_at DESC
+                 {order_recent}
                  LIMIT ?{} OFFSET ?{}",
-                where_extra,
-                limit_idx,
-                offset_idx,
-                has_embedding = has_embedding_select,
+                where_extra, limit_idx, offset_idx,
             );
             let mut like_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             like_params.push(Box::new(like_pattern));

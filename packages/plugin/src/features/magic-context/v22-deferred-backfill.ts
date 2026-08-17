@@ -9,7 +9,7 @@ import {
     resolveProjectIdentityStrict,
 } from "./memory/project-identity";
 import { rekeyMemoryRowWithCollisionMerge } from "./memory/relocate-memory";
-import { hasMemoryStatsTable } from "./memory/storage-memory";
+import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 
 export const BATCH_SIZE = 25;
@@ -324,6 +324,15 @@ export async function runDeferredV22Backfill(
                     row.category,
                     row.normalized_hash,
                 ) as { id: number; seen_count: number } | undefined;
+                // On a v80 database the scalar subquery yields NULL when the
+                // stats row is missing; abort the batch transaction before the
+                // merge substitutes a default count and deletes the source row.
+                if (statsBacked) {
+                    if (row.seen_count === null) throw new MemoryStatsIntegrityError(row.id);
+                    if (collision && collision.seen_count === null) {
+                        throw new MemoryStatsIntegrityError(collision.id);
+                    }
+                }
                 if (collision && collision.id !== row.id) {
                     // Merge into the surviving target: keep the larger seen_count,
                     // delete the source legacy row. The embedding row FK-cascades on

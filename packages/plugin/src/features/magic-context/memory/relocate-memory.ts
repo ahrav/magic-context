@@ -1,5 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
-import { hasMemoryStatsTable } from "./storage-memory";
+import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./storage-memory";
 import type { MemoryStatus } from "./types";
 
 /**
@@ -80,6 +80,16 @@ export function rekeyMemoryRowWithCollisionMerge(
         .get(toIdentity, row.category, row.normalized_hash) as
         | { id: number; seen_count: number }
         | undefined;
+
+    // On a v80 database the scalar subquery yields NULL when the stats row is
+    // missing; that is corruption and must surface before the merge computes a
+    // default count and deletes the source row.
+    if (statsBacked) {
+        if (row.seen_count === null) throw new MemoryStatsIntegrityError(rowId);
+        if (collision && collision.seen_count === null) {
+            throw new MemoryStatsIntegrityError(collision.id);
+        }
+    }
 
     if (collision && collision.id !== rowId) {
         const mergedSeen = Math.max(collision.seen_count ?? 1, row.seen_count ?? 1);

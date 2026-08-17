@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { log } from "../../shared/logger";
 import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
-import { hasMemoryStatsTable } from "./memory/storage-memory";
+import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
@@ -1643,7 +1643,13 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
             ? rowNumber(row, "last_seen_at")
             : (existing?.last_seen_at ?? 0),
         last_retrieved_at: nullableNumber("last_retrieved_at", existing?.last_retrieved_at),
-        updated_at: has("updated_at") ? rowNumber(row, "updated_at") : (existing?.updated_at ?? 0),
+        // An absent field means "unchanged". The stats-side timestamp may have
+        // advanced past the frozen base-row value, so a sparse snapshot must
+        // fall back to it first — falling back to the base timestamp would move
+        // memory_stats.updated_at backward and reorder effective-updatedAt reads.
+        updated_at: has("updated_at")
+            ? rowNumber(row, "updated_at")
+            : (existingStatsUpdatedAt ?? existing?.updated_at ?? 0),
     };
 
     if (statements.updateMemoryStats) {
@@ -1696,14 +1702,22 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
             !same(nextStats.last_retrieved_at, existing.last_retrieved_at) ||
             !same(nextStats.updated_at, existingStatsUpdatedAt);
         if (statsChanged) {
-            statements.updateMemoryStats.run(
+            const result = statements.updateMemoryStats.run(
                 nextStats.seen_count,
                 nextStats.retrieval_count,
                 nextStats.last_seen_at,
                 nextStats.last_retrieved_at,
                 nextStats.updated_at,
                 contextId,
-            );
+            ) as { changes?: number };
+            // Zero rows updated means the memories row has no memory_stats row —
+            // a broken v80 one-row-per-memory invariant. Surface it instead of
+            // reporting a successful mirror write that persisted nothing; the
+            // read contract treats a missing stats row as corruption, never
+            // healed by writers.
+            if ((result.changes ?? 0) === 0) {
+                throw new MemoryStatsIntegrityError(contextId);
+            }
         }
     } else {
         statements.updateMemory.run(

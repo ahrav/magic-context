@@ -149,8 +149,13 @@ function countBroadCycleCandidates(
 
 function countCueCandidates(db: Database, projectPath: string): number {
     if (!hasMuralCueColumns(db)) return countActiveMemories(db, projectPath);
+    // COALESCE to the base timestamp when the stats row is missing: a NULL
+    // subquery would make `NULL > mural_cue_at` falsy and silently drop the
+    // memory from this gate count. This is a scheduling heuristic, not a
+    // telemetry read — keeping the row counted leaves the corruption visible
+    // to the downstream work, which surfaces it via memoryRowsFromQuery.
     const effectiveUpdatedAt = hasMemoryStatsTable(db)
-        ? "(SELECT MAX(memories.updated_at, s.updated_at) FROM memory_stats s WHERE s.memory_id = memories.id)"
+        ? "COALESCE((SELECT MAX(memories.updated_at, s.updated_at) FROM memory_stats s WHERE s.memory_id = memories.id), memories.updated_at)"
         : "updated_at";
     const row = db
         .prepare<[string], { cnt: number }>(
