@@ -16,6 +16,7 @@ import {
     replaceCompartmentChunkEmbeddings,
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments, replaceSessionFacts } from "./compartment-storage";
+import { upsertCommits } from "./git-commits";
 import { getMemoryById, insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
@@ -23,7 +24,17 @@ import {
     _resetProjectEmbeddingRegistryForTests,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
-import { parseIdShapedQuery, unifiedSearch } from "./search";
+import {
+    assignMessagesToCompartments,
+    type CompartmentSearchResult,
+    type MessageSearchResult,
+    mergeMessageAndCompartmentResults,
+    parseIdShapedQuery,
+    resolveMemoriesByIdsForSearch,
+    type UnifiedSearchResult,
+    unifiedSearch,
+} from "./search";
+import { countingDatabase } from "./sql-counters";
 import { initializeDatabase } from "./storage-db";
 import { addNote, dismissNote, updateNote } from "./storage-notes";
 import { createPrimer } from "./storage-primers";
@@ -1174,8 +1185,9 @@ describe("unifiedSearch", () => {
         expect(results.some((result) => result.source === "message")).toBe(false);
         const compartment = results.find((result) => result.source === "compartment");
         expect(compartment).toMatchObject({ source: "compartment", matchType: "hybrid" });
-        expect(compartment && "snippet" in compartment ? compartment.snippet : "").toContain(
-            "bounded drains",
+        // The snippet is the marked FTS fragment, not the message body.
+        expect(compartment && "snippet" in compartment ? compartment.snippet : "").toBe(
+            "<<bounded>> <<drains>> with backpressure",
         );
     });
 
@@ -1244,5 +1256,1052 @@ describe("parseIdShapedQuery", () => {
         expect(parseIdShapedQuery("-1")).toBeNull();
         expect(parseIdShapedQuery("0x10")).toBeNull();
         expect(parseIdShapedQuery("id 7234")).toBeNull();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// U1 — frozen ranking projection (KTD1).
+//
+// The hot-path fixes in this task must not move a single rank. These fixtures
+// record source, stable result identity, score, match type, and order for both
+// the automatic single-query path and the explicit multi-probe path over one
+// fixed mixed-source corpus. Content is asserted separately because R34
+// deliberately replaces full message bodies with bounded FTS fragments.
+// ---------------------------------------------------------------------------
+
+const FIXTURE_PROJECT = "git:projection-fixture";
+const FIXTURE_SESSION = "ses-projection-fixture";
+const FIXTURE_MODEL = "mock:model";
+/** Fixed clock so note createdAt ties (and their id tie-break) are deterministic. */
+const FIXTURE_NOTE_CREATED_AT = Date.UTC(2026, 1, 1);
+
+interface ProjectionRow {
+    source: string;
+    id: string;
+    score: number;
+    matchType?: string;
+}
+
+function projectionOf(results: readonly UnifiedSearchResult[]): ProjectionRow[] {
+    return results.map((result) => {
+        const row: ProjectionRow = {
+            source: result.source,
+            id: stableResultId(result),
+            score: result.score,
+        };
+        if ("matchType" in result && result.matchType) row.matchType = result.matchType;
+        return row;
+    });
+}
+
+function stableResultId(result: UnifiedSearchResult): string {
+    switch (result.source) {
+        case "memory":
+            return `memory:${result.memoryId}`;
+        case "message":
+            return `message:${result.messageId}`;
+        case "compartment":
+            return `compartment:${result.compartmentId}`;
+        case "git_commit":
+            return `git_commit:${result.sha}`;
+        case "primer":
+            return `primer:${result.primerId}`;
+        case "note":
+            return `note:${result.noteId}`;
+    }
+}
+
+function seedProjectionCorpus(db: Database): {
+    memoryId: number;
+    primerId: number;
+    noteIds: number[];
+    sha: string;
+} {
+    const memory = insertMemory(db, {
+        projectPath: FIXTURE_PROJECT,
+        category: "ARCHITECTURE_DECISIONS",
+        content:
+            "The queue drain path applies backpressure through applyBackpressure() before the retry budget resets.",
+    });
+    saveEmbedding(db, memory.id, new Float32Array([1, 0]), FIXTURE_MODEL);
+
+    const primerId = createPrimer(db, {
+        projectPath: FIXTURE_PROJECT,
+        question: "How does the queue drain handle backpressure?",
+        answer: "It applies backpressure through applyBackpressure() before the retry budget resets.",
+        totalSupport: 3,
+        lastObservedAt: Date.UTC(2026, 0, 8),
+        sourceCandidateIds: [1, 2],
+    });
+
+    rawMessagesBySession.set(FIXTURE_SESSION, [
+        {
+            ordinal: 1,
+            id: "fx-m1",
+            role: "user",
+            parts: [
+                {
+                    type: "text",
+                    text: `${"filler prose about unrelated scheduling work. ".repeat(40)}Please make the queue drain apply backpressure before the retry budget resets, through applyBackpressure().`,
+                },
+            ],
+        },
+        {
+            ordinal: 2,
+            id: "fx-m2",
+            role: "assistant",
+            parts: [
+                {
+                    type: "text",
+                    text: "Done: the queue drain now applies backpressure on every batch through applyBackpressure().",
+                },
+            ],
+        },
+        {
+            ordinal: 3,
+            id: "fx-m3",
+            role: "user",
+            parts: [{ type: "text", text: "Also document the queue drain retry budget." }],
+        },
+    ]);
+    ensureMessagesIndexed(db, FIXTURE_SESSION, readMessages);
+
+    const commits = [
+        {
+            sha: "a".repeat(40),
+            shortSha: "aaaaaaa",
+            message:
+                "fix(queue): drain applies backpressure through applyBackpressure() before retry budget reset",
+            author: "dev@example.com",
+            committedAtMs: 1_700_000_000_000,
+        },
+        {
+            sha: "b".repeat(40),
+            shortSha: "bbbbbbb",
+            message: "docs(queue): describe drain ordering",
+            author: "dev@example.com",
+            committedAtMs: 1_700_000_100_000,
+        },
+    ];
+    upsertCommits(db, FIXTURE_PROJECT, commits);
+
+    const firstNote = addNote(db, "session", {
+        sessionId: FIXTURE_SESSION,
+        content: "Queue drain backpressure needs a regression test.",
+        anchorOrdinal: 2,
+    });
+    const secondNote = addNote(db, "session", {
+        sessionId: FIXTURE_SESSION,
+        content: "Queue drain backpressure ordering matters for the retry budget.",
+        anchorOrdinal: 3,
+    });
+    // Force a createdAt tie so the note id tie-break is actually exercised.
+    db.prepare("UPDATE notes SET created_at = ?, updated_at = ? WHERE id IN (?, ?)").run(
+        FIXTURE_NOTE_CREATED_AT,
+        FIXTURE_NOTE_CREATED_AT,
+        firstNote.id,
+        secondNote.id,
+    );
+
+    return {
+        memoryId: memory.id,
+        primerId,
+        noteIds: [firstNote.id, secondNote.id],
+        sha: commits[0].sha,
+    };
+}
+
+describe("search ranking projection (KTD1 characterization)", () => {
+    let db: Database;
+
+    beforeEach(() => {
+        db = createTestDb();
+    });
+
+    afterEach(() => {
+        closeQuietly(db);
+    });
+
+    const searchOptions = (explicit: boolean) => ({
+        limit: 10,
+        memoryEnabled: true,
+        embeddingEnabled: false,
+        gitCommitsEnabled: true,
+        explicitSearch: explicit,
+        countRetrievals: false,
+        measurementDisabled: true,
+        readMessages,
+        embedQuery,
+        isEmbeddingRuntimeEnabled,
+    });
+
+    it("freezes the automatic single-query projection across sources", async () => {
+        const seeded = seedProjectionCorpus(db);
+
+        const results = await unifiedSearch(
+            db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain backpressure",
+            searchOptions(false),
+        );
+
+        expect(projectionOf(results)).toEqual([
+            { source: "primer", id: `primer:${seeded.primerId}`, score: 1, matchType: "fts" },
+            { source: "message", id: "message:fx-m2", score: 1 },
+            { source: "memory", id: `memory:${seeded.memoryId}`, score: 0.8, matchType: "fts" },
+            { source: "note", id: `note:${seeded.noteIds[0]}`, score: 1 },
+            { source: "git_commit", id: `git_commit:${seeded.sha}`, score: 0.8, matchType: "fts" },
+            { source: "message", id: "message:fx-m1", score: 0.5 },
+            { source: "note", id: `note:${seeded.noteIds[1]}`, score: 0.5 },
+        ]);
+    });
+
+    it("freezes the explicit multi-probe projection across sources", async () => {
+        const seeded = seedProjectionCorpus(db);
+
+        const results = await unifiedSearch(
+            db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain applyBackpressure()",
+            searchOptions(true),
+        );
+
+        expect(projectionOf(results)).toEqual([
+            { source: "primer", id: `primer:${seeded.primerId}`, score: 1, matchType: "fts" },
+            { source: "message", id: "message:fx-m2", score: 1 },
+            { source: "memory", id: `memory:${seeded.memoryId}`, score: 0.8, matchType: "fts" },
+            { source: "note", id: `note:${seeded.noteIds[0]}`, score: 1 },
+            { source: "git_commit", id: `git_commit:${seeded.sha}`, score: 0.8, matchType: "fts" },
+            { source: "message", id: "message:fx-m1", score: 0.5 },
+            { source: "note", id: `note:${seeded.noteIds[1]}`, score: 0.5 },
+        ]);
+    });
+
+    it("is deterministic across repeated runs", async () => {
+        seedProjectionCorpus(db);
+        const first = await unifiedSearch(
+            db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain backpressure",
+            searchOptions(false),
+        );
+        const second = await unifiedSearch(
+            db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain backpressure",
+            searchOptions(false),
+        );
+        expect(projectionOf(second)).toEqual(projectionOf(first));
+    });
+
+    it("counts only the selected SQL without changing statement behavior", async () => {
+        seedProjectionCorpus(db);
+        const counter = countingDatabase(db);
+
+        const counted = await unifiedSearch(
+            counter.db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain backpressure",
+            searchOptions(false),
+        );
+        const direct = await unifiedSearch(
+            db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain backpressure",
+            searchOptions(false),
+        );
+
+        expect(projectionOf(counted)).toEqual(projectionOf(direct));
+        expect(counter.count("message_history_fts")).toBeGreaterThan(0);
+        expect(counter.rows("message_history_fts")).toBeGreaterThan(0);
+        expect(counter.count("no_such_table_anywhere")).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// U2 — bounded message fragments (R34) and the compartment interval sweep (R37).
+// ---------------------------------------------------------------------------
+
+const FRAGMENT_TOKEN_LIMIT = 32;
+
+function fragmentTokenCount(text: string): number {
+    return text
+        .replace(/<<|>>/g, "")
+        .split(/\s+/)
+        .filter((token) => token.length > 0 && token !== "...").length;
+}
+
+describe("message search fragments (R34)", () => {
+    let db: Database;
+
+    beforeEach(() => {
+        db = createTestDb();
+    });
+
+    afterEach(() => {
+        closeQuietly(db);
+    });
+
+    const longBody = (tail: string) =>
+        `${"unrelated scheduling prose about caches and queues. ".repeat(60)}${tail}`;
+
+    it("returns a marked bounded fragment for a match at the end of a long body", async () => {
+        rawMessagesBySession.set("ses-frag", [
+            {
+                ordinal: 1,
+                id: "frag-1",
+                role: "user",
+                parts: [
+                    {
+                        type: "text",
+                        text: longBody("finally: the sentinel token appears right here."),
+                    },
+                ],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-frag", readMessages);
+
+        const results = await unifiedSearch(db, "ses-frag", "git:frag", "sentinel", {
+            limit: 5,
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            sources: ["message"],
+        });
+
+        expect(results).toHaveLength(1);
+        const [hit] = results;
+        expect(hit.content).toContain("<<sentinel>>");
+        expect(hit.content).not.toContain("unrelated scheduling prose about caches and queues. un");
+        expect(fragmentTokenCount(hit.content)).toBeLessThanOrEqual(FRAGMENT_TOKEN_LIMIT);
+        expect(hit.content.length).toBeLessThan(400);
+    });
+
+    it("keeps the verbatim bonus for a probe that falls outside the fragment", async () => {
+        // "earlyMarker" sits at the start of a long body and "sentinelToken" at
+        // its end, farther apart than one fragment can span.
+        const body = `earlyMarker begins the story. ${"filler words about queues and caches. ".repeat(60)} closing with sentinelToken here.`;
+        rawMessagesBySession.set("ses-verbatim", [
+            {
+                ordinal: 1,
+                id: "verbatim-1",
+                role: "user",
+                parts: [{ type: "text", text: body }],
+            },
+            {
+                ordinal: 2,
+                id: "verbatim-2",
+                role: "assistant",
+                parts: [{ type: "text", text: "sentinelToken acknowledged, earlyMarker noted." }],
+            },
+            {
+                ordinal: 3,
+                id: "verbatim-3",
+                role: "user",
+                parts: [
+                    {
+                        type: "text",
+                        text: `earlyMarker only here. ${"padding text. ".repeat(40)} sentinelTokens plural stem only.`,
+                    },
+                ],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-verbatim", readMessages);
+
+        const results = await unifiedSearch(
+            db,
+            "ses-verbatim",
+            "git:verbatim",
+            "earlyMarker and sentinelToken",
+            {
+                limit: 10,
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                explicitSearch: true,
+                sources: ["message"],
+            },
+        );
+
+        expect(projectionOf(results)).toEqual([
+            { source: "message", id: "message:verbatim-1", score: 1 },
+            { source: "message", id: "message:verbatim-2", score: 0.6666666666666667 },
+            { source: "message", id: "message:verbatim-3", score: 0.33333333333333337 },
+        ]);
+        // The winner's fragment cannot span both probes, yet its full-body
+        // containment of both still decides the top rank.
+        const winner = results[0];
+        expect(winner.content).toContain("<<sentinelToken>>");
+        expect(winner.content).not.toContain("earlyMarker");
+        expect(fragmentTokenCount(winner.content)).toBeLessThanOrEqual(FRAGMENT_TOKEN_LIMIT);
+    });
+
+    it("uses a bounded prefix for a role-only match and never the full body", async () => {
+        rawMessagesBySession.set("ses-roleonly", [
+            {
+                ordinal: 1,
+                id: "role-1",
+                role: "assistant",
+                parts: [{ type: "text", text: longBody("tail sentence with no query token.") }],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-roleonly", readMessages);
+
+        const results = await unifiedSearch(db, "ses-roleonly", "git:role", "assistant", {
+            limit: 5,
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            sources: ["message"],
+        });
+
+        expect(results).toHaveLength(1);
+        expect(results[0].content).not.toContain("<<");
+        expect(fragmentTokenCount(results[0].content)).toBeLessThanOrEqual(FRAGMENT_TOKEN_LIMIT);
+    });
+
+    it("never projects full message content, on the single or batched path", async () => {
+        rawMessagesBySession.set("ses-spy", [
+            {
+                ordinal: 1,
+                id: "spy-1",
+                role: "user",
+                parts: [{ type: "text", text: longBody("spyToken lives at the end.") }],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-spy", readMessages);
+
+        for (const explicitSearch of [false, true]) {
+            const counter = countingDatabase(db);
+            await unifiedSearch(counter.db, "ses-spy", "git:spy", "spyToken", {
+                limit: 5,
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                explicitSearch,
+                sources: ["message"],
+            });
+            const selects = counter.matching(/FROM message_history_fts/);
+            expect(selects.length).toBeGreaterThan(0);
+            for (const execution of selects) {
+                if (!execution.sql.includes("snippet(")) continue;
+                expect(execution.sql).toContain(
+                    "snippet(message_history_fts, 4, '<<', '>>', ' ... ', 32)",
+                );
+                // No bare `content` projection survives on either path.
+                expect(/,\s*content\b/.test(execution.sql)).toBe(false);
+            }
+        }
+    });
+
+    it("applies the ordinal cutoff before LIMIT so history is not displaced", async () => {
+        const messages = Array.from({ length: 12 }, (_, index) => ({
+            ordinal: index + 1,
+            id: `cut-${index + 1}`,
+            role: "user",
+            parts: [{ type: "text", text: `cutoffToken occurrence number ${index + 1}` }],
+        }));
+        rawMessagesBySession.set("ses-cut", messages);
+        ensureMessagesIndexed(db, "ses-cut", readMessages);
+
+        const results = await unifiedSearch(db, "ses-cut", "git:cut", "cutoffToken", {
+            limit: 2,
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            sources: ["message"],
+            maxMessageOrdinal: 3,
+        });
+
+        const ordinals = results.map((result) =>
+            result.source === "message" ? result.messageOrdinal : -1,
+        );
+        expect(ordinals.length).toBeGreaterThan(0);
+        expect(Math.max(...ordinals)).toBeLessThanOrEqual(3);
+    });
+});
+
+describe("compartment interval sweep (R37)", () => {
+    const message = (ordinal: number, score: number): MessageSearchResult => ({
+        source: "message",
+        content: `fragment ${ordinal}`,
+        score,
+        messageOrdinal: ordinal,
+        messageId: `m${ordinal}`,
+        role: "user",
+    });
+
+    const compartment = (
+        id: number,
+        startOrdinal: number,
+        endOrdinal: number,
+        score: number,
+    ): CompartmentSearchResult => ({
+        source: "compartment",
+        content: `compartment ${id}`,
+        score,
+        compartmentId: id,
+        sessionId: "ses-sweep",
+        title: `compartment ${id}`,
+        startOrdinal,
+        endOrdinal,
+        matchType: "semantic",
+    });
+
+    /** The former per-message scan, kept as a differential reference. */
+    function referenceAssignment(
+        messages: readonly MessageSearchResult[],
+        compartments: readonly CompartmentSearchResult[],
+    ): Map<number, CompartmentSearchResult> {
+        const assignment = new Map<number, CompartmentSearchResult>();
+        messages.forEach((entry, index) => {
+            const containing = compartments.find(
+                (candidate) =>
+                    entry.messageOrdinal >= candidate.startOrdinal &&
+                    entry.messageOrdinal <= candidate.endOrdinal,
+            );
+            if (containing) assignment.set(index, containing);
+        });
+        return assignment;
+    }
+
+    function referenceMerge(args: {
+        messages: MessageSearchResult[];
+        compartments: CompartmentSearchResult[];
+        limit: number;
+    }): Array<MessageSearchResult | CompartmentSearchResult> {
+        const reference = referenceAssignment(args.messages, args.compartments);
+        const fused = new Map<
+            string,
+            {
+                result: MessageSearchResult | CompartmentSearchResult;
+                score: number;
+                tieOrdinal: number;
+                snippetScore: number;
+            }
+        >();
+        const add = (
+            key: string,
+            result: MessageSearchResult | CompartmentSearchResult,
+            score: number,
+            tieOrdinal: number,
+        ) => {
+            const existing = fused.get(key);
+            if (existing) {
+                existing.score += score;
+                return existing;
+            }
+            const entry = { result, score, tieOrdinal, snippetScore: -1 };
+            fused.set(key, entry);
+            return entry;
+        };
+        args.compartments.forEach((entry, rank) => {
+            add(`compartment:${entry.compartmentId}`, entry, 1 / (60 + rank), entry.startOrdinal);
+        });
+        args.messages.forEach((entry, rank) => {
+            const containing = reference.get(rank);
+            const contribution = 1 / (60 + rank);
+            if (!containing) {
+                add(`message:${entry.messageId}`, entry, contribution, entry.messageOrdinal);
+                return;
+            }
+            const fusedEntry = add(
+                `compartment:${containing.compartmentId}`,
+                containing,
+                contribution,
+                containing.startOrdinal,
+            );
+            if (
+                entry.score > fusedEntry.snippetScore &&
+                fusedEntry.result.source === "compartment"
+            ) {
+                fusedEntry.snippetScore = entry.score;
+                fusedEntry.result = {
+                    ...fusedEntry.result,
+                    matchType: "hybrid",
+                    snippet: entry.content,
+                };
+            }
+        });
+        const ranked = [...fused.values()]
+            .sort((left, right) =>
+                right.score !== left.score
+                    ? right.score - left.score
+                    : left.tieOrdinal - right.tieOrdinal,
+            )
+            .slice(0, args.limit);
+        return ranked.map((entry, rank) => ({
+            ...entry.result,
+            score: rank >= args.limit ? 0 : Math.max(0, 1 - rank / ranked.length),
+        }));
+    }
+
+    it("matches the former scan for boundaries, gaps, and outside ordinals", () => {
+        const compartments = [compartment(1, 5, 10, 0.9), compartment(2, 12, 15, 0.8)];
+        const messages = [
+            message(5, 1), // range start
+            message(10, 0.9), // range end
+            message(11, 0.8), // gap
+            message(12, 0.7), // next range start
+            message(99, 0.6), // outside every range
+        ];
+        expect(assignMessagesToCompartments(messages, compartments)).toEqual(
+            referenceAssignment(messages, compartments),
+        );
+    });
+
+    it("prefers the earliest semantic-ranked compartment for overlaps and shared endpoints", () => {
+        // Compartment 2 is ranked first (higher score) but starts later; the
+        // shared endpoint 10 belongs to whichever range ranks first.
+        const compartments = [
+            compartment(2, 10, 20, 0.95),
+            compartment(1, 1, 10, 0.9),
+            compartment(3, 8, 12, 0.7),
+        ];
+        const messages = [message(10, 1), message(9, 0.9), message(12, 0.8), message(1, 0.7)];
+        expect(assignMessagesToCompartments(messages, compartments)).toEqual(
+            referenceAssignment(messages, compartments),
+        );
+    });
+
+    it("is unaffected by message input order differing from ordinal order", () => {
+        const compartments = [compartment(1, 1, 5, 0.9), compartment(2, 3, 9, 0.8)];
+        const shuffled = [message(9, 0.5), message(3, 1), message(1, 0.7), message(6, 0.6)];
+        expect(assignMessagesToCompartments(shuffled, compartments)).toEqual(
+            referenceAssignment(shuffled, compartments),
+        );
+    });
+
+    it("keeps fusion scores, tie ordinals, and snippet winners identical to the former merge", () => {
+        const compartments = [compartment(1, 1, 10, 0.9), compartment(2, 5, 20, 0.8)];
+        const messages = [
+            message(7, 1),
+            message(2, 0.9),
+            message(15, 0.8),
+            message(30, 0.7),
+            message(5, 0.7),
+        ];
+        expect(mergeMessageAndCompartmentResults({ messages, compartments, limit: 10 })).toEqual(
+            referenceMerge({ messages, compartments, limit: 10 }),
+        );
+    });
+
+    it("does not scan every compartment range per message", () => {
+        const compartments = Array.from({ length: 25 }, (_, index) =>
+            compartment(index + 1, index * 10 + 1, index * 10 + 10, 1 - index / 100),
+        );
+        const messages = Array.from({ length: 40 }, (_, index) =>
+            message(index * 6 + 1, 1 - index / 100),
+        );
+
+        let ordinalReads = 0;
+        const watched = compartments.map(
+            (entry) =>
+                new Proxy(entry, {
+                    get(target, prop, receiver) {
+                        if (prop === "startOrdinal" || prop === "endOrdinal") ordinalReads += 1;
+                        return Reflect.get(target, prop, receiver);
+                    },
+                }) as CompartmentSearchResult,
+        );
+
+        const swept = assignMessagesToCompartments(messages, watched);
+        expect(swept.size).toBeGreaterThan(0);
+        // A per-message scan costs at least one boundary read per (message, range)
+        // pair; the sweep stays far below that product.
+        expect(ordinalReads).toBeLessThan(messages.length * compartments.length);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// U3 — exact memory-ID resolution through an indexed visibility query (R35).
+// ---------------------------------------------------------------------------
+
+describe("resolveMemoriesByIdsForSearch (R35)", () => {
+    let db: Database;
+
+    beforeEach(() => {
+        db = createTestDb();
+    });
+
+    afterEach(() => {
+        closeQuietly(db);
+    });
+
+    function seedWorkspace() {
+        db.exec(`
+            INSERT INTO workspaces (id, name, share_categories, created_at, updated_at)
+            VALUES (1, 'ws', '["CONSTRAINTS"]', 1, 1);
+            INSERT INTO workspace_members (workspace_id, project_path, display_name, display_path, added_at)
+            VALUES (1, 'git:own', 'Own', '/own', 1), (1, 'git:foreign', 'Foreign', '/foreign', 1);
+        `);
+        const allowedForeign = insertMemory(db, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "allowed foreign row",
+        });
+        const ownArchived = insertMemory(db, {
+            projectPath: "git:own",
+            category: "CONSTRAINTS",
+            content: "own archived row",
+        });
+        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(allowedForeign.id);
+        db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(ownArchived.id);
+        return { allowedForeign: allowedForeign.id, ownArchived: ownArchived.id };
+    }
+
+    it("returns the three visible occurrences in caller order (AE3)", () => {
+        const seeded = seedWorkspace();
+
+        const resolved = resolveMemoriesByIdsForSearch({
+            db,
+            projectPath: "git:own",
+            ids: [seeded.allowedForeign, 999999, seeded.ownArchived, seeded.allowedForeign],
+            limit: 10,
+        });
+
+        expect(resolved?.map((result) => result.memoryId)).toEqual([
+            seeded.allowedForeign,
+            seeded.ownArchived,
+            seeded.allowedForeign,
+        ]);
+        expect(resolved?.map((result) => result.sourceName)).toEqual([
+            "Foreign",
+            undefined,
+            "Foreign",
+        ]);
+    });
+
+    it("returns the null fallback sentinel when every id is missing or hidden", () => {
+        const seeded = seedWorkspace();
+        db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(seeded.allowedForeign);
+
+        expect(
+            resolveMemoriesByIdsForSearch({
+                db,
+                projectPath: "git:own",
+                ids: [999999, seeded.allowedForeign],
+                limit: 10,
+            }),
+        ).toBeNull();
+        expect(
+            resolveMemoriesByIdsForSearch({ db, projectPath: "git:own", ids: [], limit: 10 }),
+        ).toBeNull();
+    });
+
+    it("applies visibleMemoryIds before the limit without widening scope", () => {
+        const seeded = seedWorkspace();
+
+        const resolved = resolveMemoriesByIdsForSearch({
+            db,
+            projectPath: "git:own",
+            ids: [seeded.allowedForeign, seeded.ownArchived],
+            limit: 1,
+            visibleMemoryIds: new Set([seeded.allowedForeign]),
+        });
+
+        expect(resolved?.map((result) => result.memoryId)).toEqual([seeded.ownArchived]);
+    });
+
+    it("no longer executes the broad project or workspace memory query", () => {
+        const seeded = seedWorkspace();
+        const counter = countingDatabase(db);
+
+        resolveMemoriesByIdsForSearch({
+            db: counter.db,
+            projectPath: "git:own",
+            ids: [seeded.allowedForeign, seeded.ownArchived],
+            limit: 10,
+        });
+
+        const memoryReads = counter.matching(/(FROM|JOIN) memories\b/);
+        expect(memoryReads.length).toBe(1);
+        expect(memoryReads[0].sql).toContain("json_each");
+        expect(memoryReads[0].sql).toContain(
+            "CROSS JOIN memories ON memories.id = requested.value",
+        );
+        expect(counter.matching(/FROM memories\s+WHERE project_path/).length).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// U4 — note candidate pruning through the FTS projection (R36).
+// ---------------------------------------------------------------------------
+
+const NOTE_SESSION = "ses-note-fts";
+const NOTE_PROJECT = "git:note-fts";
+
+/** Deterministic timestamps keep the createdAt tie-break stable across runs. */
+function pinNoteTimestamps(db: Database): void {
+    db.exec(
+        "UPDATE notes SET created_at = 1700000000000 + id * 1000, updated_at = 1700000000000 + id * 1000",
+    );
+}
+
+function seedNoteCorpus(db: Database) {
+    const matching = addNote(db, "session", {
+        sessionId: NOTE_SESSION,
+        content: "Queue drain backpressure ordering matters for the retry budget.",
+    });
+    const ready = addNote(db, "smart", {
+        content: "Retry the queue benchmark after the release.",
+        projectPath: NOTE_PROJECT,
+        sessionId: NOTE_SESSION,
+        surfaceCondition: "When the release ships",
+    });
+    updateNote(
+        db,
+        ready.id,
+        { status: "ready", readyReason: "Release shipped with the drain fix." },
+        { sessionId: NOTE_SESSION, projectPath: NOTE_PROJECT },
+    );
+    const unrelated = Array.from({ length: 12 }, (_, index) =>
+        addNote(db, "session", {
+            sessionId: NOTE_SESSION,
+            content: `Unrelated telemetry dashboard note number ${index}.`,
+        }),
+    );
+    const foreignSession = addNote(db, "session", {
+        sessionId: "other-session",
+        content: "Foreign session note about queue drain backpressure.",
+    });
+    const foreignProject = addNote(db, "smart", {
+        content: "Foreign project note about queue drain backpressure.",
+        projectPath: "git:other",
+        sessionId: "other-session",
+        surfaceCondition: "cond",
+    });
+    pinNoteTimestamps(db);
+    return { matching, ready, unrelated, foreignSession, foreignProject };
+}
+
+const noteSearchOptions = (explicit = false) => ({
+    limit: 10,
+    memoryEnabled: false,
+    embeddingEnabled: false,
+    sources: ["note" as const],
+    explicitSearch: explicit,
+    countRetrievals: false,
+    measurementDisabled: true,
+});
+
+describe("note candidate pruning (R36)", () => {
+    let db: Database;
+
+    beforeEach(() => {
+        db = createTestDb();
+    });
+
+    afterEach(() => {
+        closeQuietly(db);
+    });
+
+    it("surfaces matching notes without hydrating non-matching scoped notes", async () => {
+        const seeded = seedNoteCorpus(db);
+        const counter = countingDatabase(db);
+
+        const results = await unifiedSearch(
+            counter.db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "backpressure",
+            noteSearchOptions(),
+        );
+
+        expect(results.map((result) => (result.source === "note" ? result.noteId : -1))).toEqual([
+            seeded.matching.id,
+        ]);
+        // Candidate selection runs against the projection, and hydration asks for
+        // only the candidate rowids.
+        expect(counter.count("notes_fts")).toBeGreaterThan(0);
+        const hydrations = counter.matching(/CROSS JOIN notes ON notes\.id = requested\.value/);
+        expect(hydrations).toHaveLength(1);
+        expect(hydrations[0].rowCount).toBe(1);
+        // The former per-query scoped scan is gone.
+        expect(counter.matching(/SELECT \* FROM notes WHERE/).length).toBe(0);
+    });
+
+    it("keeps foreign session and project notes out of scope", async () => {
+        seedNoteCorpus(db);
+
+        const results = await unifiedSearch(
+            db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "queue drain backpressure",
+            noteSearchOptions(),
+        );
+
+        const contents = results.map((result) => result.content);
+        expect(contents.some((content) => content.includes("Foreign session"))).toBe(false);
+        expect(contents.some((content) => content.includes("Foreign project"))).toBe(false);
+    });
+
+    it("uses an indexed count for the probe-discrimination denominator", async () => {
+        seedNoteCorpus(db);
+        const counter = countingDatabase(db);
+
+        await unifiedSearch(
+            counter.db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "queue drain applyBackpressure()",
+            noteSearchOptions(true),
+        );
+
+        const counts = counter.matching(/COUNT\(\*\) FROM notes/);
+        expect(counts.length).toBeGreaterThan(0);
+        expect(counts[0].sql).toContain("type = 'session'");
+        expect(counts[0].sql).toContain("type = 'smart'");
+    });
+
+    it("falls back to the scoped scan for a needle shorter than a trigram", async () => {
+        const short = addNote(db, "session", {
+            sessionId: NOTE_SESSION,
+            content: "ab tiny token note.",
+        });
+        seedNoteCorpus(db);
+        const counter = countingDatabase(db);
+
+        const results = await unifiedSearch(
+            counter.db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "ab",
+            noteSearchOptions(),
+        );
+
+        expect(results.map((result) => (result.source === "note" ? result.noteId : -1))).toContain(
+            short.id,
+        );
+        // A two-character atom is unrepresentable, so the characterized scan runs.
+        expect(counter.matching(/SELECT \* FROM notes WHERE/).length).toBeGreaterThan(0);
+        expect(counter.matching(/CROSS JOIN notes ON notes\.id = requested\.value/).length).toBe(0);
+    });
+
+    it("falls back to the scoped scan when the projection is absent", async () => {
+        const bare = new Database(":memory:");
+        try {
+            initializeDatabase(bare);
+            runMigrations(bare);
+            bare.exec(`
+                DROP TRIGGER IF EXISTS notes_fts_ai;
+                DROP TRIGGER IF EXISTS notes_fts_ad;
+                DROP TRIGGER IF EXISTS notes_fts_au;
+                DROP VIEW IF EXISTS notes_search_view;
+                DROP TABLE IF EXISTS notes_fts;
+            `);
+            const note = addNote(bare, "session", {
+                sessionId: NOTE_SESSION,
+                content: "Projection-free note about backpressure.",
+            });
+
+            const results = await unifiedSearch(
+                bare,
+                NOTE_SESSION,
+                NOTE_PROJECT,
+                "backpressure",
+                noteSearchOptions(),
+            );
+
+            expect(
+                results.map((result) => (result.source === "note" ? result.noteId : -1)),
+            ).toEqual([note.id]);
+        } finally {
+            closeQuietly(bare);
+        }
+    });
+
+    it("selects candidates through the projection and hydrates notes by rowid", () => {
+        seedNoteCorpus(db);
+
+        const candidatePlan = (
+            db
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT rowid AS id FROM notes_fts WHERE notes_fts MATCH ?",
+                )
+                .all('"backpressure"') as Array<{ detail: string }>
+        )
+            .map((row) => row.detail)
+            .join(" | ");
+        expect(candidatePlan).toContain("notes_fts");
+
+        const hydrationPlan = (
+            db
+                .prepare(
+                    `EXPLAIN QUERY PLAN
+                     SELECT notes.* FROM json_each(?) AS requested
+                       CROSS JOIN notes ON notes.id = requested.value
+                      WHERE notes.status IN ('active', 'pending', 'ready', 'dismissed')
+                        AND ((notes.type = 'session' AND notes.session_id = ?)
+                          OR (notes.type = 'smart' AND notes.project_path = ?))
+                      ORDER BY notes.created_at ASC, notes.id ASC`,
+                )
+                .all("[1]", NOTE_SESSION, NOTE_PROJECT) as Array<{ detail: string }>
+        )
+            .map((row) => row.detail)
+            .join(" | ");
+        expect(hydrationPlan).toContain("PRIMARY KEY");
+        expect(hydrationPlan).not.toContain("SCAN notes");
+    });
+
+    it("changes eligibility through the authoritative join, not the projection", async () => {
+        const seeded = seedNoteCorpus(db);
+        const visible = async () =>
+            (
+                await unifiedSearch(
+                    db,
+                    NOTE_SESSION,
+                    NOTE_PROJECT,
+                    "release shipped",
+                    noteSearchOptions(),
+                )
+            ).map((result) => (result.source === "note" ? result.noteId : -1));
+
+        expect(await visible()).toEqual([seeded.ready.id]);
+
+        // Moving the note out of project scope leaves its text projected but makes
+        // it ineligible.
+        db.prepare("UPDATE notes SET project_path = ? WHERE id = ?").run(
+            "git:elsewhere",
+            seeded.ready.id,
+        );
+        expect(
+            (
+                db
+                    .prepare("SELECT rowid AS id FROM notes_fts WHERE notes_fts MATCH ?")
+                    .all('"reason: release shipped"') as Array<{ id: number }>
+            ).map((row) => row.id),
+        ).toEqual([seeded.ready.id]);
+        expect(await visible()).toEqual([]);
+    });
+
+    it("freezes the note projection for automatic and explicit search", async () => {
+        const seeded = seedNoteCorpus(db);
+
+        const automatic = await unifiedSearch(
+            db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "queue drain backpressure",
+            noteSearchOptions(),
+        );
+        expect(projectionOf(automatic)).toEqual([
+            { source: "note", id: `note:${seeded.matching.id}`, score: 1 },
+            { source: "note", id: `note:${seeded.ready.id}`, score: 0.5 },
+        ]);
+
+        const explicit = await unifiedSearch(
+            db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "queue drain applyBackpressure()",
+            noteSearchOptions(true),
+        );
+        expect(projectionOf(explicit)).toEqual([
+            { source: "note", id: `note:${seeded.ready.id}`, score: 1 },
+            { source: "note", id: `note:${seeded.matching.id}`, score: 0.5 },
+        ]);
     });
 });

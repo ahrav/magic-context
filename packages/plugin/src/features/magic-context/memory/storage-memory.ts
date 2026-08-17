@@ -774,6 +774,128 @@ export function buildWorkspaceMemorySqlFilter(args: {
     };
 }
 
+export interface MemoryVisibilityScope {
+    clause: string;
+    params: Array<string | number>;
+}
+
+/**
+ * The canonical own-vs-foreign visibility predicate for a set of workspace
+ * identities: own rows keep the caller's status set (which may include
+ * `archived`), foreign rows always use the complete canonical predicate
+ * (active/permanent, unexpired, shared category, shareable, non-private scope).
+ *
+ * Returns null when no predicate can match, so callers skip the query instead of
+ * running `WHERE 0 = 1`.
+ */
+function buildMemoryVisibilityScope(
+    db: Database,
+    args: {
+        identities: readonly string[];
+        statuses: readonly MemoryStatus[];
+        expiryCutoff: number;
+        ownIdentities?: readonly string[];
+        shareCategories?: readonly string[] | null;
+        tableName?: string;
+    },
+): MemoryVisibilityScope | null {
+    const identities = uniqueValues(args.identities);
+    if (identities.length === 0 || args.statuses.length === 0) return null;
+    const qualifier = args.tableName ? `${args.tableName}.` : "";
+    const identitySet = new Set(identities);
+    const ownSet = new Set(
+        uniqueValues(args.ownIdentities ?? []).filter((identity) => identitySet.has(identity)),
+    );
+    const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
+    const ownIdentities = identities.filter((identity) => ownSet.has(identity));
+
+    if (
+        foreignIdentities.length === 0 ||
+        args.shareCategories === null ||
+        args.shareCategories === undefined
+    ) {
+        return {
+            clause: `(${qualifier}project_path IN (${sqlPlaceholders(identities)})
+                     AND ${qualifier}status IN (${sqlPlaceholders(args.statuses)})
+                     AND (${qualifier}expires_at IS NULL OR ${qualifier}expires_at > ?))`,
+            params: [...identities, ...args.statuses, args.expiryCutoff],
+        };
+    }
+
+    const shareCats = uniqueValues([...args.shareCategories]);
+    const hasClassification = hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db);
+    const predicates: string[] = [];
+    const params: Array<string | number> = [];
+    if (ownIdentities.length > 0) {
+        predicates.push(
+            `(${qualifier}project_path IN (${sqlPlaceholders(ownIdentities)})
+              AND ${qualifier}status IN (${sqlPlaceholders(args.statuses)})
+              AND (${qualifier}expires_at IS NULL OR ${qualifier}expires_at > ?))`,
+        );
+        params.push(...ownIdentities, ...args.statuses, args.expiryCutoff);
+    }
+    if (foreignIdentities.length > 0 && shareCats.length > 0) {
+        const classification = hasClassification
+            ? ` AND ${qualifier}shareable = 1 AND ${qualifier}scope IN ('project','ecosystem','universe')`
+            : "";
+        predicates.push(
+            `(${qualifier}project_path IN (${sqlPlaceholders(foreignIdentities)})
+              AND ${qualifier}status IN ('active','permanent')
+              AND (${qualifier}expires_at IS NULL OR ${qualifier}expires_at > ?)
+              AND ${qualifier}category IN (${sqlPlaceholders(shareCats)})${classification})`,
+        );
+        params.push(...foreignIdentities, args.expiryCutoff, ...shareCats);
+    }
+    if (predicates.length === 0) return null;
+    // Retain the canonical foreign-visibility SQL constant so this path stays aligned
+    // with mc-store's FOREIGN_VISIBLE_SQL (status/expiry/shareable/scope/category).
+    void FOREIGN_VISIBLE_SQL;
+    return { clause: `(${predicates.join(" OR ")})`, params };
+}
+
+/**
+ * Resolve specific memory ids through the same visibility predicate the scoped
+ * reads use, in the caller's request order, keeping duplicate requests.
+ *
+ * `json_each` drives an integer-primary-key lookup per requested id, so this
+ * costs one indexed probe per id instead of loading every visible memory. A
+ * hidden or expired row is indistinguishable from a missing one, exactly as when
+ * the caller filtered a fully loaded set in memory.
+ */
+export function getMemoriesByRequestedIds(
+    db: Database,
+    args: {
+        ids: readonly number[];
+        identities: readonly string[];
+        statuses?: readonly MemoryStatus[];
+        expiryCutoff?: number;
+        ownIdentities?: readonly string[];
+        shareCategories?: readonly string[] | null;
+    },
+): Memory[] {
+    if (args.ids.length === 0) return [];
+    const scope = buildMemoryVisibilityScope(db, {
+        identities: args.identities,
+        statuses: args.statuses ?? ["active", "permanent"],
+        expiryCutoff: args.expiryCutoff ?? Date.now(),
+        ownIdentities: args.ownIdentities,
+        shareCategories: args.shareCategories,
+        tableName: "memories",
+    });
+    if (!scope) return [];
+    const rows = db
+        .prepare(
+            `SELECT ${getMemorySelectColumns(db)}
+               FROM json_each(?) AS requested
+               CROSS JOIN memories ON memories.id = requested.value
+              WHERE ${scope.clause}
+              ORDER BY requested.key ASC`,
+        )
+        .all(JSON.stringify([...args.ids]), ...scope.params)
+        .filter(isMemoryRow);
+    return rows.map(toMemory);
+}
+
 export function getMemoriesByProjects(
     db: Database,
     projectPaths: readonly string[],
@@ -789,68 +911,32 @@ export function getMemoriesByProjects(
         uniqueValues(ownIdentities ?? []).filter((identity) => identitySet.has(identity)),
     );
     const foreignIdentities = identities.filter((identity) => !ownSet.has(identity));
-    const ownIdentitiesResolved = identities.filter((identity) => ownSet.has(identity));
     // Single-project own-only path keeps the caller's status set (including archived).
     if (
-        foreignIdentities.length === 0 ||
-        shareCategories === null ||
-        shareCategories === undefined
+        (foreignIdentities.length === 0 ||
+            shareCategories === null ||
+            shareCategories === undefined) &&
+        identities.length === 1
     ) {
-        if (identities.length === 1) {
-            return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
-        }
-        const rows = db
-            .prepare(
-                `SELECT ${getMemorySelectColumns(db)}
-                   FROM memories
-                  WHERE project_path IN (${sqlPlaceholders(identities)})
-                    AND status IN (${sqlPlaceholders(statuses)})
-                    AND (expires_at IS NULL OR expires_at > ?)
-                  ORDER BY category ASC, updated_at DESC, id ASC`,
-            )
-            .all(...identities, ...statuses, expiryCutoff)
-            .filter(isMemoryRow);
-        return rows.map(toMemory);
+        return getMemoriesByProject(db, identities[0], statuses, expiryCutoff);
     }
 
-    // Foreign rows always use the complete canonical visibility predicate, independent
-    // of the caller's own-row status set (which may include archived for local reads).
-    const shareCats = uniqueValues([...shareCategories]);
-    const hasClassification = hasMemoryShareableColumn(db) && hasMemoryScopeColumn(db);
-    const predicates: string[] = [];
-    const params: Array<string | number> = [];
-    if (ownIdentitiesResolved.length > 0) {
-        predicates.push(
-            `(project_path IN (${sqlPlaceholders(ownIdentitiesResolved)})
-              AND status IN (${sqlPlaceholders(statuses)})
-              AND (expires_at IS NULL OR expires_at > ?))`,
-        );
-        params.push(...ownIdentitiesResolved, ...statuses, expiryCutoff);
-    }
-    if (foreignIdentities.length > 0 && shareCats.length > 0) {
-        const classification = hasClassification
-            ? " AND shareable = 1 AND scope IN ('project','ecosystem','universe')"
-            : "";
-        predicates.push(
-            `(project_path IN (${sqlPlaceholders(foreignIdentities)})
-              AND status IN ('active','permanent')
-              AND (expires_at IS NULL OR expires_at > ?)
-              AND category IN (${sqlPlaceholders(shareCats)})${classification})`,
-        );
-        params.push(...foreignIdentities, expiryCutoff, ...shareCats);
-    }
-    if (predicates.length === 0) return [];
-    // Retain the canonical foreign-visibility SQL constant so this path stays aligned
-    // with mc-store's FOREIGN_VISIBLE_SQL (status/expiry/shareable/scope/category).
-    void FOREIGN_VISIBLE_SQL;
+    const scope = buildMemoryVisibilityScope(db, {
+        identities,
+        statuses,
+        expiryCutoff,
+        ownIdentities,
+        shareCategories,
+    });
+    if (!scope) return [];
     const rows = db
         .prepare(
             `SELECT ${getMemorySelectColumns(db)}
                FROM memories
-              WHERE (${predicates.join(" OR ")})
+              WHERE ${scope.clause}
               ORDER BY category ASC, updated_at DESC, id ASC`,
         )
-        .all(...params)
+        .all(...scope.params)
         .filter(isMemoryRow);
     return rows.map(toMemory);
 }

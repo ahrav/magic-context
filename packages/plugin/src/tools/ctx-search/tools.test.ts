@@ -150,8 +150,9 @@ describe("createCtxSearchTools", () => {
 
         expect(result).toContain("[1] [message] score=1.00 ordinal=6 range=3-9 role=user");
         expect(result).toContain("[2] [message] score=0.50 ordinal=5 range=2-8 role=assistant");
-        expect(result.split(EXPAND_HINT).length - 1).toBe(1);
-        expect(result.endsWith(EXPAND_HINT)).toBe(true);
+        const messageText = String(result);
+        expect(messageText.split(EXPAND_HINT).length - 1).toBe(1);
+        expect(messageText.endsWith(EXPAND_HINT)).toBe(true);
         expect(result).not.toContain("Expand with ctx_expand(start=");
     });
 
@@ -316,6 +317,58 @@ describe("createCtxSearchTools", () => {
             // reach the normal text lanes (which we mocked here).
             expect(result).toContain("[1] [memory]");
             expect(result).toContain("Numeric query that survived into text search.");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("invokes normal search exactly once when every requested id is missing or hidden", async () => {
+        const hidden = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "Hidden because it is already rendered.",
+        });
+        let calls = 0;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            calls += 1;
+            return [
+                {
+                    source: "memory",
+                    content: "Fallback text search hit.",
+                    score: 0.5,
+                    memoryId: 1,
+                    category: "USER_DIRECTIVES",
+                    matchType: "fts",
+                },
+            ] as UnifiedSearchResult[];
+        });
+        try {
+            const tools = createCtxSearchTools({
+                db,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+
+            const missing = await tools.ctx_search.execute(
+                { query: "999999 888888" },
+                toolContext(),
+            );
+            expect(missing).toContain("Fallback text search hit.");
+            expect(calls).toBe(1);
+
+            // A row outside the project scope is as invisible as a missing one.
+            db.prepare("UPDATE memories SET project_path = ? WHERE id = ?").run(
+                "/repo/other",
+                hidden.id,
+            );
+            const hiddenResult = await tools.ctx_search.execute(
+                { query: `#${hidden.id}` },
+                toolContext(),
+            );
+            expect(hiddenResult).toContain("Fallback text search hit.");
+            expect(calls).toBe(2);
         } finally {
             spy.mockRestore();
         }

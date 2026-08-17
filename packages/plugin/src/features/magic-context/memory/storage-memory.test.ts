@@ -3,6 +3,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { countingDatabase } from "../sql-counters";
+import { initializeDatabase } from "../storage-db";
 import {
     archiveMemory,
     clearEmbeddingsForProject,
@@ -11,6 +13,7 @@ import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
     getMemoriesByProjects,
+    getMemoriesByRequestedIds,
     getMemoryByHash,
     getMemoryById,
     getMemoryCount,
@@ -509,5 +512,209 @@ describe("storage-memory", () => {
             expect(getMemoryCount(db)).toBe(2);
             expect(getMemoryById(db, memoryA.id)).toBeNull();
         });
+    });
+});
+
+describe("getMemoriesByRequestedIds", () => {
+    let scoped: Database;
+
+    function makeFullSchemaDatabase(): Database {
+        const database = new Database(":memory:");
+        initializeDatabase(database);
+        return database;
+    }
+
+    afterEach(() => {
+        closeQuietly(scoped);
+    });
+
+    function seedVisibilityMatrix(scopedDatabase: Database) {
+        const own = insertMemory(scopedDatabase, {
+            projectPath: "git:own",
+            category: "CONSTRAINTS",
+            content: "own active row",
+        });
+        const ownArchived = insertMemory(scopedDatabase, {
+            projectPath: "git:own",
+            category: "CONSTRAINTS",
+            content: "own archived row",
+        });
+        scopedDatabase
+            .prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+            .run(ownArchived.id);
+        const foreignShared = insertMemory(scopedDatabase, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "foreign shared row",
+        });
+        const foreignWrongCategory = insertMemory(scopedDatabase, {
+            projectPath: "git:foreign",
+            category: "NAMING",
+            content: "foreign wrong category row",
+        });
+        const foreignArchived = insertMemory(scopedDatabase, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "foreign archived row",
+        });
+        const foreignExpired = insertMemory(scopedDatabase, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "foreign expired row",
+        });
+        const foreignUnshareable = insertMemory(scopedDatabase, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "foreign unshareable row",
+        });
+        const foreignPrivate = insertMemory(scopedDatabase, {
+            projectPath: "git:foreign",
+            category: "CONSTRAINTS",
+            content: "foreign private row",
+        });
+        const setShareable = scopedDatabase.prepare(
+            "UPDATE memories SET shareable = ? WHERE id = ?",
+        );
+        setShareable.run(1, foreignShared.id);
+        setShareable.run(1, foreignWrongCategory.id);
+        setShareable.run(1, foreignArchived.id);
+        setShareable.run(1, foreignExpired.id);
+        setShareable.run(0, foreignUnshareable.id);
+        setShareable.run(1, foreignPrivate.id);
+        scopedDatabase
+            .prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+            .run(foreignArchived.id);
+        scopedDatabase
+            .prepare("UPDATE memories SET expires_at = 1 WHERE id = ?")
+            .run(foreignExpired.id);
+        scopedDatabase
+            .prepare("UPDATE memories SET scope = 'private' WHERE id = ?")
+            .run(foreignPrivate.id);
+        return {
+            own: own.id,
+            ownArchived: ownArchived.id,
+            foreignShared: foreignShared.id,
+            foreignWrongCategory: foreignWrongCategory.id,
+            foreignArchived: foreignArchived.id,
+            foreignExpired: foreignExpired.id,
+            foreignUnshareable: foreignUnshareable.id,
+            foreignPrivate: foreignPrivate.id,
+        };
+    }
+
+    const workspaceScope = {
+        identities: ["git:own", "git:foreign"],
+        ownIdentities: ["git:own"],
+        shareCategories: ["CONSTRAINTS"],
+        statuses: ["active", "permanent", "archived"] as const,
+    };
+
+    it("returns requested ids in caller order, keeping duplicates", () => {
+        scoped = makeFullSchemaDatabase();
+        const seeded = seedVisibilityMatrix(scoped);
+
+        const resolved = getMemoriesByRequestedIds(scoped, {
+            ids: [seeded.foreignShared, 9999, seeded.ownArchived, seeded.foreignShared],
+            identities: workspaceScope.identities,
+            ownIdentities: workspaceScope.ownIdentities,
+            shareCategories: workspaceScope.shareCategories,
+            statuses: [...workspaceScope.statuses],
+        });
+
+        expect(resolved.map((memory) => memory.id)).toEqual([
+            seeded.foreignShared,
+            seeded.ownArchived,
+            seeded.foreignShared,
+        ]);
+    });
+
+    it("hides foreign rows that fail any visibility rule and keeps own archived rows", () => {
+        scoped = makeFullSchemaDatabase();
+        const seeded = seedVisibilityMatrix(scoped);
+
+        const resolved = getMemoriesByRequestedIds(scoped, {
+            ids: [
+                seeded.own,
+                seeded.ownArchived,
+                seeded.foreignShared,
+                seeded.foreignWrongCategory,
+                seeded.foreignArchived,
+                seeded.foreignExpired,
+                seeded.foreignUnshareable,
+                seeded.foreignPrivate,
+            ],
+            identities: workspaceScope.identities,
+            ownIdentities: workspaceScope.ownIdentities,
+            shareCategories: workspaceScope.shareCategories,
+            statuses: [...workspaceScope.statuses],
+            expiryCutoff: Date.now(),
+        });
+
+        expect(resolved.map((memory) => memory.id)).toEqual([
+            seeded.own,
+            seeded.ownArchived,
+            seeded.foreignShared,
+        ]);
+    });
+
+    it("returns [] for an empty id list without running a lookup", () => {
+        scoped = makeFullSchemaDatabase();
+        seedVisibilityMatrix(scoped);
+        const counter = countingDatabase(scoped);
+
+        expect(
+            getMemoriesByRequestedIds(counter.db, {
+                ids: [],
+                identities: ["git:own"],
+                statuses: ["active", "permanent", "archived"],
+            }),
+        ).toEqual([]);
+        expect(counter.count("FROM memories")).toBe(0);
+        expect(counter.count("json_each")).toBe(0);
+    });
+
+    it("reaches memories through the integer primary key with no full table scan", () => {
+        scoped = makeFullSchemaDatabase();
+        const seeded = seedVisibilityMatrix(scoped);
+        const captured: string[] = [];
+        const spy = new Proxy(scoped, {
+            get(target, prop) {
+                if (prop === "prepare") {
+                    return (sql: string) => {
+                        captured.push(sql);
+                        return target.prepare(sql);
+                    };
+                }
+                const value = (target as unknown as Record<string | symbol, unknown>)[prop];
+                return typeof value === "function" ? value.bind(target) : value;
+            },
+        }) as Database;
+
+        getMemoriesByRequestedIds(spy, {
+            ids: [seeded.own, seeded.foreignShared],
+            identities: workspaceScope.identities,
+            ownIdentities: workspaceScope.ownIdentities,
+            shareCategories: workspaceScope.shareCategories,
+            statuses: [...workspaceScope.statuses],
+        });
+
+        const lookupSql = captured.find((sql) => sql.includes("json_each"));
+        expect(lookupSql).toBeDefined();
+        const plan = scoped
+            .prepare(`EXPLAIN QUERY PLAN ${lookupSql}`)
+            .all(
+                JSON.stringify([seeded.own, seeded.foreignShared]),
+                "git:own",
+                "active",
+                "permanent",
+                "archived",
+                Date.now(),
+                "git:foreign",
+                Date.now(),
+                "CONSTRAINTS",
+            ) as Array<{ detail: string }>;
+        const detail = plan.map((row) => row.detail).join(" | ");
+        expect(detail).toContain("USING INTEGER PRIMARY KEY");
+        expect(detail).not.toContain("SCAN memories");
     });
 });

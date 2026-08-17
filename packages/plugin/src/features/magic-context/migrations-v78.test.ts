@@ -46,7 +46,6 @@ describe("migration v78: migration_pending journal", () => {
                 "phase",
                 "created_at",
             ]);
-            expect(LATEST_SUPPORTED_VERSION).toBe(78);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);
