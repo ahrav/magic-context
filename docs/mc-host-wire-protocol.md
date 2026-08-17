@@ -316,6 +316,8 @@ The only current successful target is linked module ID `magic-context` with a ro
 
 This exclusion has one known in-repo casualty: `RealSessionResolver` (`crates/mc-module/src/session_resolver.rs`), constructed whenever `McHandler` receives a connection file, unconditionally opens a `management_surface` route to module `thalamus`, and the linked manifest consumes that service. Against a conforming direct host that `route.open` receives a terminal error (`target_unavailable` for the unsupported `management_surface` kind), so stateful facade calls that resolve sessions fail at route-open. This contract deliberately does not add a thalamus-compatible route; `magic-context-c50.4` owns replacing or disabling that resolver path (for example, a host-served session-resolve equivalent or the existing `MissingSessionResolver` fallback) before mc-module runs against this profile.
 
+The Synapse embedding lane has the same shape: when `embedding.provider` is `synapse`, `embedding-synapse.ts` opens a `management_surface` route to module `synapse` for every operation. Against this profile that route receives terminal `target_unavailable`, so the discovery probe fails over to the configured fallback embedding provider. That fail-over is the intended interim behavior, not silent breakage: `magic-context-c50.6` owns porting the synapse embedding service (`embed.batch`, `models.list`) to the Rust host, and until it lands the configured Synapse lane is unavailable against this host by design.
+
 ### 7.3 `catalog.list`
 
 Requests MAY omit `module_id` to list all entries or supply a filter. Unknown filters return an empty `modules` array, not an error:
@@ -450,6 +452,8 @@ Client sends pure-header `Cancel` with target route and correlation. If request 
 ### 9.3 Liveness and health
 
 Consumer liveness uses pure-header `Ping`/`Pong`, not a channel-0 JSON health operation. Host sends Ping on channel 0; client returns Pong with identical version, flags, channel, epoch, and correlation. A missed Pong invalidates the connection only under host's bounded liveness policy.
+
+Compatibility note: current `HistorianProducer` (`crates/mc-module/src/historian_producer.rs`) implements no Ping handling — both receive loops discard every frame that does not match the awaited route and correlation, so it can never answer a host Ping. `magic-context-c50.4` owns adding the Pong echo to that client. Until it lands, a host deployment MUST NOT enable missed-Pong connection invalidation, or it will terminate healthy long-running historian awaits (up to 600 s) as dead peers.
 
 Handler health is host-internal. Host invokes `McHandler::health` on a dedicated control task, never as an ordinary routed request and never while holding handler/store locks. Current handler health is atomics-only and returns `ok`, `degraded`, or `failing` plus optional detail and metrics. Waiting for a predecessor's storage lease reports `degraded` without making transport unready.
 
@@ -654,9 +658,9 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | Consumer | Required contract | Verification owner |
 | --- | --- | --- |
 | `packages/plugin/src/hooks/magic-context/module-transport.ts` | v2 auth/frame, route cache by generation, opaque bodies, close race, outcome-safe retry | `magic-context-c50.5` |
-| `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts` | managed call and `not_sent` / `outcome_unknown` / `terminal` distinction | `magic-context-c50.5` |
+| `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts` | managed call and `not_sent` / `outcome_unknown` / `terminal` distinction; its synapse `management_surface` route is unavailable under this profile until the Rust port lands (Section 7.2) | `magic-context-c50.5`, synapse route in `magic-context-c50.6` |
 | `packages/plugin/src/features/magic-context/smart-notes/wake-plane.ts` | tagged truthful catalog; absent `wake.create` fails open | `magic-context-c50.5` |
-| `crates/mc-module/src/historian_producer.rs` | raw auth, first endpoint, route open, monotonic correlation, streaming, Error, Goodbye | `magic-context-c50.4`, route target in `magic-context-c50.11` |
+| `crates/mc-module/src/historian_producer.rs` | raw auth, first endpoint, route open, monotonic correlation, streaming, Error, Goodbye; Ping/Pong echo required (Section 9.3, currently missing) | `magic-context-c50.4`, route target in `magic-context-c50.11` |
 | `crates/mc-module/src/session_resolver.rs` | managed Rust route-open deadline and terminal module errors; its thalamus `management_surface` target is unsupported by this profile and MUST be replaced or disabled (Section 7.2) | `magic-context-c50.4` |
 | `crates/mc-module/src/lib.rs` | initialize once, bind before response, route-gone once, atomics-only health, store readiness | `magic-context-c50.3` / `.4` |
 | `packages/e2e-tests/tests/rust-park-self-heal.test.ts` | existing module-restart/park-heal evidence only; whole-host credential-rotation case still required | `magic-context-c50.9`, after `.11` |
