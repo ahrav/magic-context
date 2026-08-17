@@ -91,7 +91,7 @@ Session discovery follows the active host. Relative `pi.subagent_extensions` are
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
+  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json",
   "enabled": true,
   "historian": {
     "model": "anthropic/claude-haiku-4-5"
@@ -102,7 +102,7 @@ Session discovery follows the active host. Relative `pi.subagent_extensions` are
 }
 ```
 
-For the full configuration reference (including dreamer, sidekick, auto-search, and experimental features), see [CONFIGURATION.md](https://github.com/cortexkit/magic-context/blob/master/CONFIGURATION.md) in the main repository — OpenCode, Pi, and OMP share the same schema.
+For the full configuration reference (including dreamer, sidekick, auto-search, and experimental features), see [CONFIGURATION.md](https://github.com/cortexkit/magic-context/blob/main/CONFIGURATION.md) in the main repository — OpenCode, Pi, and OMP share the same schema.
 
 ---
 
@@ -183,10 +183,10 @@ This package is part of the [magic-context monorepo](https://github.com/cortexki
 
 The unified [`@cortexkit/magic-context`](https://www.npmjs.com/package/@cortexkit/magic-context) CLI exposes separate `pi` and `omp` setup/doctor pipelines while both use this runtime adapter.
 
-For deeper architectural detail, see the main repo's [ARCHITECTURE.md](https://github.com/cortexkit/magic-context/blob/master/ARCHITECTURE.md).
+For deeper architectural detail, see the main repo's [ARCHITECTURE.md](https://github.com/cortexkit/magic-context/blob/main/ARCHITECTURE.md).
 
 ---
 
 ## License
 
-MIT — see [LICENSE](https://github.com/cortexkit/magic-context/blob/master/LICENSE).
+MIT — see [LICENSE](https://github.com/cortexkit/magic-context/blob/main/LICENSE).

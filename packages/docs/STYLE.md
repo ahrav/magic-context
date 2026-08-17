@@ -12,7 +12,7 @@ Read this before writing or editing any page. It is the contract reviewers hold 
 
 ## Truth rules (hard)
 
-- Every behavioral claim must be true of CURRENT source on master. When unsure, read the source — never write from memory of how it "probably" works.
+- Every behavioral claim must be true of CURRENT source on main. When unsure, read the source — never write from memory of how it "probably" works.
 - Internal jargon is allowed ONLY where the concept page defines it first (e.g. "compartment" is defined in concepts/historian). Never use undefined internal terms: m[0]/m[1], SOFT/HARD bust, watermark, tagger, sentinel — these may appear ONLY in concepts/cache-architecture, defined inline.
 - No internal process references: no audit/council/Oracle/plan-version mentions, no issue numbers as explanation, no commit hashes.
 - Config keys, defaults, and ranges must match `packages/plugin/src/config/schema/magic-context.ts` exactly. The configuration reference page is GENERATED — do not hand-write config tables on other pages; link to the reference instead.

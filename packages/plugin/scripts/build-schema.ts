@@ -20,7 +20,7 @@ import { z } from "zod";
 import { MagicContextConfigSchema } from "../src/config/schema/magic-context";
 
 const SCHEMA_ID =
-    "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json";
+    "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json";
 
 export function buildSchema(): Record<string, unknown> {
     // `io: "input"` so optional/defaulted fields render as accepted INPUT (a

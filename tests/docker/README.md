@@ -46,7 +46,7 @@ Requires Docker with Linux/amd64 emulation. On Apple Silicon, this means `--plat
 ## Running in CI
 
 `.github/workflows/e2e-docker.yml` runs both jobs on:
-- pushes to `master`
+- pushes to `main`
 - pull requests touching `packages/plugin/**`, `packages/pi-plugin/**`, or `tests/docker/**`
 - `v*` tag pushes (release gate)
 - manual `workflow_dispatch`

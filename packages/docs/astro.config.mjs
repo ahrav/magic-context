@@ -28,7 +28,7 @@ export default defineConfig({
                 { icon: "discord", label: "Discord", href: "https://discord.gg/DSa65w8wuf" },
             ],
             editLink: {
-                baseUrl: "https://github.com/cortexkit/magic-context/edit/master/packages/docs/",
+                baseUrl: "https://github.com/cortexkit/magic-context/edit/main/packages/docs/",
             },
             sidebar: [
                 {

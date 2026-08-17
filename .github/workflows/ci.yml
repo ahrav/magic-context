@@ -2,13 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [main]
   pull_request:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Pipeline shape on every push to master and on every PR:
+# Pipeline shape on every push to main and on every PR:
 #
 #   check-plugin, check-pi-plugin                          (unit tests + lint + typecheck, parallel)
 #                  ↓
@@ -25,7 +25,7 @@ env:
 #     Catches cache-stability + correctness regressions that the smoke layer cannot see.
 #
 # Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here means
-# every PR and master push exercises the full unit → Docker → host gauntlet.
+# every PR and main push exercises the full unit → Docker → host gauntlet.
 
 jobs:
   check-plugin:

@@ -229,7 +229,7 @@ export function writeMagicContextConfig(
 
     if (!config.$schema) {
         config.$schema =
-            "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json";
+            "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json";
     }
 
     // Model pickers return harness-native provider IDs. Persist only canonical

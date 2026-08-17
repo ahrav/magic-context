@@ -102,7 +102,7 @@ Then create `magic-context.jsonc` with the one setting the historian needs:
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
+  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json",
   "historian": { "model": "provider/model-id" }
 }
 ```

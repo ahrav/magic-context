@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Magic Context — Interactive Setup
-# Usage: curl -fsSL https://raw.githubusercontent.com/cortexkit/magic-context/master/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/cortexkit/magic-context/main/scripts/install.sh | bash
 
 PACKAGE="@cortexkit/magic-context"
 MIN_NODE_MAJOR=20

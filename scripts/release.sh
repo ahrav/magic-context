@@ -72,10 +72,10 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-# Check we're on main/master
+# Check we're on main
 BRANCH=$(git branch --show-current)
-if [[ "$BRANCH" != "main" && "$BRANCH" != "master" ]]; then
-  echo "Warning: releasing from '$BRANCH' (not main/master)"
+if [[ "$BRANCH" != "main" ]]; then
+  echo "Warning: releasing from '$BRANCH' (not main)"
   read -rp "Continue? [y/N] " confirm
   if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     echo "Aborted."
