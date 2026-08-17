@@ -315,10 +315,14 @@ directly from `historian_producer.rs` rather than only through the SDK:
 - the module registration handshake HELLO{manifest} → HELLO_ACK{storage descriptor};
 - a channel-0 health probe answered on a lane independent of the request path;
 - the pre-envelope auth handshake and connection-file format (`SERVER_PROOF_DOMAIN`,
-  `CLIENT_AUTH_DOMAIN`, `schema`, `endpoints`, `key`, `daemon_id`, `pid`, `daemon_ver`) —
-  the TS test suite pins `SERVER_PROOF_DOMAIN` and `HEADER_LEN` directly;
-- `unknown_module` must remain a **terminal** control-plane reject, not a transport
-  failure: `tests/real_daemon.rs` relies on route-retry *not* covering it.
+  `CLIENT_AUTH_DOMAIN`, `schema`, `endpoints`, `key`, `daemon_id`, `pid`, `daemon_ver`).
+  The TS fake-peer test exercises these exports but imports the package's own proof/header
+  helpers, so independent conformance vectors must pin their literal bytes;
+- `unknown_module` remains a **terminal** Error for one `route.open` correlation,
+  not a transport failure. Published `subc-client-rs` 0.3.0 may issue a fresh
+  `route.open` with a new correlation under its bounded route-retry policy; the
+  private 0.3.1 behavior described by `tests/real_daemon.rs` is unverified drift,
+  not authority for disabling managed retries.
 
 MIT source for all of the above is in the four published crates, so c50.2 is a
 *confirm-and-trim* exercise rather than a design-from-scratch one.
