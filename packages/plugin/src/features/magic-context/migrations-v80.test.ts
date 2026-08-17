@@ -15,7 +15,6 @@ import {
     updateMemoryRetrievalCount,
     updateMemorySeenCount,
 } from "./memory/storage-memory";
-import type { Memory } from "./memory/types";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 

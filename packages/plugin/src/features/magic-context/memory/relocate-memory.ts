@@ -1,5 +1,9 @@
 import type { Database } from "../../../shared/sqlite";
-import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./storage-memory";
+import {
+    effectiveSeenCountSql,
+    hasMemoryStatsTable,
+    requireEffectiveSeenCount,
+} from "./storage-memory";
 import type { MemoryStatus } from "./types";
 
 /**
@@ -61,13 +65,11 @@ export function rekeyMemoryRowWithCollisionMerge(
     toIdentity: string,
 ): boolean {
     const statsBacked = hasMemoryStatsTable(db);
-    const seenCountSql = statsBacked
-        ? "(SELECT s.seen_count FROM memory_stats s WHERE s.memory_id = memories.id) AS seen_count"
-        : "seen_count";
+    const seenCountSql = effectiveSeenCountSql(db);
     const row = db
         .prepare(`SELECT category, normalized_hash, ${seenCountSql} FROM memories WHERE id = ?`)
         .get(rowId) as
-        | { category: string; normalized_hash: string; seen_count: number }
+        | { category: string; normalized_hash: string; seen_count: number | null }
         | undefined;
     if (!row) return false;
 
@@ -78,22 +80,19 @@ export function rekeyMemoryRowWithCollisionMerge(
              LIMIT 1`,
         )
         .get(toIdentity, row.category, row.normalized_hash) as
-        | { id: number; seen_count: number }
+        | { id: number; seen_count: number | null }
         | undefined;
 
-    // On a v80 database the scalar subquery yields NULL when the stats row is
-    // missing; that is corruption and must surface before the merge computes a
-    // default count and deletes the source row.
-    if (statsBacked) {
-        if (row.seen_count === null) throw new MemoryStatsIntegrityError(rowId);
-        if (collision && collision.seen_count === null) {
-            throw new MemoryStatsIntegrityError(collision.id);
-        }
-    }
-
     if (collision && collision.id !== rowId) {
-        const mergedSeen = Math.max(collision.seen_count ?? 1, row.seen_count ?? 1);
-        if (mergedSeen !== (collision.seen_count ?? 1)) {
+        // requireEffectiveSeenCount rejects a NULL stats read on a v80 database
+        // (a missing stats row is corruption) before the merge computes a
+        // default count and deletes the source row. The check lives inside the
+        // merge branch so a plain rekey — which never consumes seen_count —
+        // still succeeds for such a row.
+        const sourceSeen = requireEffectiveSeenCount(db, rowId, row.seen_count);
+        const targetSeen = requireEffectiveSeenCount(db, collision.id, collision.seen_count);
+        const mergedSeen = Math.max(targetSeen, sourceSeen);
+        if (mergedSeen !== targetSeen) {
             if (statsBacked) {
                 db.prepare("UPDATE memory_stats SET seen_count = ? WHERE memory_id = ?").run(
                     mergedSeen,

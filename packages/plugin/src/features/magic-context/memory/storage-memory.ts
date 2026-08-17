@@ -254,6 +254,30 @@ export class MemoryStatsIntegrityError extends Error {
 }
 
 /**
+ * SQL fragment projecting the effective seen_count: the memory_stats value on
+ * a v80 database (NULL when the stats row is missing — corruption the caller
+ * must reject via {@link requireEffectiveSeenCount}), the base column pre-v80.
+ */
+export function effectiveSeenCountSql(db: Database, tableName = "memories"): string {
+    return hasMemoryStatsTable(db)
+        ? `(SELECT s.seen_count FROM memory_stats s WHERE s.memory_id = ${tableName}.id) AS seen_count`
+        : "seen_count";
+}
+
+/**
+ * Coerce an effective seen_count read for a merge decision. On a stats-backed
+ * database a NULL/undefined value means the one-row-per-memory invariant
+ * broke; that must surface before a defaulted count feeds a destructive
+ * merge-and-delete. Pre-v80 the legacy default of 1 applies.
+ */
+export function requireEffectiveSeenCount(db: Database, memoryId: number, value: unknown): number {
+    if (hasMemoryStatsTable(db) && value == null) {
+        throw new MemoryStatsIntegrityError(memoryId);
+    }
+    return Number(value ?? 1);
+}
+
+/**
  * Map raw projection rows to `Memory` values. On a v80 database a row whose
  * stats tuple came back NULL means the one-row-per-memory invariant broke;
  * that is corruption and must surface, never be silently filtered or healed
@@ -316,28 +340,44 @@ export function getMemorySelectColumns(db: Database, tableName = "memories"): st
                 return `COALESCE(${tableName}.${column}, 0) AS ${property}`;
             }
             if (statsBacked) {
-                // Effective-memory projection: mutable telemetry comes from
-                // memory_stats and the effective update time is the later of the
-                // base and stats timestamps, so ordering still reflects telemetry
-                // activity. No per-field fallback to the frozen legacy columns:
-                // a missing stats row surfaces as NULL and is rejected as
+                // Effective-memory projection: mutable telemetry comes from the
+                // memory_stats row supplied by getMemoryStatsJoin (one PK seek
+                // per row instead of five correlated subqueries) and the
+                // effective update time is the later of the base and stats
+                // timestamps, so ordering still reflects telemetry activity.
+                // No per-field fallback to the frozen legacy columns: a missing
+                // stats row surfaces as NULL through the LEFT JOIN (scalar MAX
+                // yields NULL when either operand is NULL) and is rejected as
                 // corruption in memoryRowsFromQuery.
                 if (property === "seenCount" || property === "retrievalCount") {
                     const statsColumn = property === "seenCount" ? "seen_count" : "retrieval_count";
-                    return `(SELECT s.${statsColumn} FROM memory_stats s WHERE s.memory_id = ${tableName}.id) AS ${property}`;
+                    return `mstats.${statsColumn} AS ${property}`;
                 }
                 if (property === "lastSeenAt" || property === "lastRetrievedAt") {
                     const statsColumn =
                         property === "lastSeenAt" ? "last_seen_at" : "last_retrieved_at";
-                    return `(SELECT s.${statsColumn} FROM memory_stats s WHERE s.memory_id = ${tableName}.id) AS ${property}`;
+                    return `mstats.${statsColumn} AS ${property}`;
                 }
                 if (property === "updatedAt") {
-                    return `(SELECT MAX(${tableName}.${column}, s.updated_at) FROM memory_stats s WHERE s.memory_id = ${tableName}.id) AS ${property}`;
+                    return `MAX(${tableName}.${column}, mstats.updated_at) AS ${property}`;
                 }
             }
             return `${tableName}.${column} AS ${property}`;
         })
         .join(", ");
+}
+
+/**
+ * Join clause pairing the stats-backed projection from
+ * {@link getMemorySelectColumns} with the `memory_stats` side table (aliased
+ * `mstats`). Callers embed it directly after the memories table reference;
+ * empty on pre-v80 databases. A missing stats row yields NULL telemetry
+ * through the LEFT JOIN, which memoryRowsFromQuery rejects as corruption.
+ */
+export function getMemoryStatsJoin(db: Database, tableName = "memories"): string {
+    return hasMemoryStatsTable(db)
+        ? `LEFT JOIN memory_stats mstats ON mstats.memory_id = ${tableName}.id`
+        : "";
 }
 
 function isMemoryCategory(value: unknown): value is MemoryCategory {
@@ -417,7 +457,7 @@ export function isMemoryRow(row: unknown): row is Memory {
     );
 }
 
-export function toMemory(row: Memory): Memory {
+function toMemory(row: Memory): Memory {
     return {
         id: row.id,
         projectPath: row.projectPath,
@@ -464,14 +504,16 @@ function getInsertMemoryStatement(db: Database): PreparedStatement {
 function getMemoryByHashStatement(db: Database): PreparedStatement {
     return getStatsDependentStatement(db, getMemoryByHashStatements, () =>
         db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ?`,
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE project_path = ? AND category = ? AND normalized_hash = ?`,
         ),
     );
 }
 
 function getMemoryByIdStatement(db: Database): PreparedStatement {
     return getStatsDependentStatement(db, getMemoryByIdStatements, () =>
-        db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id = ?`),
+        db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE id = ?`,
+        ),
     );
 }
 
@@ -485,7 +527,7 @@ function getMemoriesByIdsStatement(db: Database, idCount: number): PreparedState
     return getStatsDependentStatement(db, map, () => {
         const placeholders = new Array(idCount).fill("?").join(", ");
         return db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id IN (${placeholders})`,
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE id IN (${placeholders})`,
         );
     });
 }
@@ -504,7 +546,7 @@ function getMemoriesByProjectStatement(db: Database, statuses: MemoryStatus[]): 
         // ORDER BY uses projection aliases so the maximum base or stats update
         // time determines v80 ordering.
         return db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status IN (${placeholders}) AND (expires_at IS NULL OR expires_at > ?) ORDER BY category ASC, updatedAt DESC, id ASC`,
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE project_path = ? AND status IN (${placeholders}) AND (expires_at IS NULL OR expires_at > ?) ORDER BY category ASC, updatedAt DESC, id ASC`,
         );
     });
 }
@@ -514,7 +556,7 @@ function getMemoriesByProjectStatement(db: Database, statuses: MemoryStatus[]): 
 function getActiveMemoriesNoExpiryStatement(db: Database): PreparedStatement {
     return getStatsDependentStatement(db, activeMemoriesNoExpiryStatements, () =>
         db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status = 'active' ORDER BY category ASC, updatedAt DESC, id ASC`,
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE project_path = ? AND status = 'active' ORDER BY category ASC, updatedAt DESC, id ASC`,
         ),
     );
 }
@@ -1031,6 +1073,7 @@ export function getMemoriesByRequestedIds(
             `SELECT ${getMemorySelectColumns(db)}
                FROM json_each(?) AS requested
                CROSS JOIN memories ON memories.id = requested.value
+               ${getMemoryStatsJoin(db)}
               WHERE ${scope.clause}
               ORDER BY requested.key ASC`,
         )
@@ -1075,6 +1118,7 @@ export function getMemoriesByProjects(
         .prepare(
             `SELECT ${getMemorySelectColumns(db)}
                FROM memories
+               ${getMemoryStatsJoin(db)}
               WHERE ${scope.clause}
               ORDER BY category ASC, updatedAt DESC, id ASC`,
         )
@@ -1131,6 +1175,7 @@ export function readNewMemoriesForM1Union(
         .prepare(
             `SELECT ${getMemorySelectColumns(db)}
                FROM memories
+               ${getMemoryStatsJoin(db)}
               WHERE project_path IN (${sqlPlaceholders(identities)})
                 AND id > ?
                 AND status IN ('active', 'permanent')
@@ -1369,8 +1414,24 @@ export function mergeMemoryStats(
         // Base and stats update times come from one clock read; the canonical
         // row's last-seen and last-retrieved event timestamps stay untouched.
         db.transaction(() => {
-            getMergeMemoryBaseStatement(db).run(mergedFrom, status, now, id);
-            getMergeMemoryStatsCountersStatement(db).run(seenCount, retrievalCount, now, id);
+            const base = getMergeMemoryBaseStatement(db).run(mergedFrom, status, now, id) as {
+                changes?: number;
+            };
+            const stats = getMergeMemoryStatsCountersStatement(db).run(
+                seenCount,
+                retrievalCount,
+                now,
+                id,
+            ) as { changes?: number };
+            // A base row without a stats row is a broken v80 one-row-per-memory
+            // invariant. Throwing rolls the base write back — committing it
+            // alone would durably mark the memory merged while dropping the
+            // merged counters. (Both affecting zero rows means the memory does
+            // not exist; that stays a no-op, matching the legacy single-table
+            // statement.)
+            if ((base.changes ?? 0) > 0 && (stats.changes ?? 0) === 0) {
+                throw new MemoryStatsIntegrityError(id);
+            }
         })();
         return;
     }

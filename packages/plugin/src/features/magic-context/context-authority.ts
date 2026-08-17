@@ -1105,6 +1105,82 @@ function markMemoryRepairPending(db: Database): void {
     );
 }
 
+/**
+ * Column order for the stats-backed mirror base-row UPDATE. The SET list and
+ * the runtime argument list are both derived from this one array (values come
+ * from `nextBase`, whose keys are exactly these names), so a column edit
+ * cannot leave the SQL and the positional binds disagreeing — adjacent
+ * columns share types, and a one-off mismatch would silently write wrong
+ * values rather than fail on arity.
+ */
+const MEMORY_BASE_UPDATE_COLUMNS = [
+    "project_path",
+    "category",
+    "content",
+    "normalized_hash",
+    "importance",
+    "scope",
+    "shareable",
+    "source_session_id",
+    "source_type",
+    "first_seen_at",
+    "created_at",
+    "updated_at",
+    "status",
+    "expires_at",
+    "verification_status",
+    "verified_at",
+    "classified_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
+] as const;
+
+/**
+ * Column order for the legacy (pre-v80) full-row mirror UPDATE: the base
+ * columns with the four telemetry columns interleaved at their historical
+ * positions. Values are read from `{ ...nextStats, ...nextBase }`, so the
+ * telemetry keys resolve to stats values and `updated_at` to the base value.
+ */
+const MEMORY_LEGACY_UPDATE_COLUMNS = [
+    "project_path",
+    "category",
+    "content",
+    "normalized_hash",
+    "importance",
+    "scope",
+    "shareable",
+    "source_session_id",
+    "source_type",
+    "seen_count",
+    "retrieval_count",
+    "first_seen_at",
+    "created_at",
+    "updated_at",
+    "last_seen_at",
+    "last_retrieved_at",
+    "status",
+    "expires_at",
+    "verification_status",
+    "verified_at",
+    "classified_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
+] as const;
+
+function memoryUpdateSql(columns: readonly string[]): string {
+    return `UPDATE memories SET ${columns.map((column) => `${column} = ?`).join(", ")} WHERE id = ?`;
+}
+
 function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
     const statsBacked = hasMemoryStatsTable(db);
     return {
@@ -1175,23 +1251,8 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
                  full_row_snapshot = excluded.full_row_snapshot`,
         ),
         updateMemory: statsBacked
-            ? db.prepare(
-                  `UPDATE memories SET project_path = ?, category = ?, content = ?, normalized_hash = ?,
-                   importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
-                   first_seen_at = ?, created_at = ?, updated_at = ?, status = ?, expires_at = ?,
-                    verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
-                    merged_from = ?, metadata_json = ?, mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ?,
-                    mural_cue_rejection_count = ? WHERE id = ?`,
-              )
-            : db.prepare(
-                  `UPDATE memories SET project_path = ?, category = ?, content = ?, normalized_hash = ?,
-             importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
-             seen_count = ?, retrieval_count = ?, first_seen_at = ?, created_at = ?, updated_at = ?,
-             last_seen_at = ?, last_retrieved_at = ?, status = ?, expires_at = ?,
-              verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
-              merged_from = ?, metadata_json = ?, mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ?,
-              mural_cue_rejection_count = ? WHERE id = ?`,
-              ),
+            ? db.prepare(memoryUpdateSql(MEMORY_BASE_UPDATE_COLUMNS))
+            : db.prepare(memoryUpdateSql(MEMORY_LEGACY_UPDATE_COLUMNS)),
         updateMemoryStats: statsBacked
             ? db.prepare(
                   `UPDATE memory_stats SET seen_count = ?, retrieval_count = ?, last_seen_at = ?,
@@ -1667,30 +1728,7 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
             });
         if (baseChanged) {
             statements.updateMemory.run(
-                nextBase.project_path,
-                nextBase.category,
-                nextBase.content,
-                nextBase.normalized_hash,
-                nextBase.importance,
-                nextBase.scope,
-                nextBase.shareable,
-                nextBase.source_session_id,
-                nextBase.source_type,
-                nextBase.first_seen_at,
-                nextBase.created_at,
-                nextBase.updated_at,
-                nextBase.status,
-                nextBase.expires_at,
-                nextBase.verification_status,
-                nextBase.verified_at,
-                nextBase.classified_at,
-                nextBase.superseded_by_memory_id,
-                nextBase.merged_from,
-                nextBase.metadata_json,
-                nextBase.mural_cue,
-                nextBase.mural_cue_hash,
-                nextBase.mural_cue_at,
-                nextBase.mural_cue_rejection_count,
+                ...MEMORY_BASE_UPDATE_COLUMNS.map((column) => nextBase[column]),
                 contextId,
             );
         }
@@ -1720,35 +1758,11 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
             }
         }
     } else {
+        // Legacy single-table write: telemetry keys resolve to stats values,
+        // updated_at to the base value (nextBase spreads last).
+        const legacyRow = { ...nextStats, ...nextBase };
         statements.updateMemory.run(
-            nextBase.project_path,
-            nextBase.category,
-            nextBase.content,
-            nextBase.normalized_hash,
-            nextBase.importance,
-            nextBase.scope,
-            nextBase.shareable,
-            nextBase.source_session_id,
-            nextBase.source_type,
-            nextStats.seen_count,
-            nextStats.retrieval_count,
-            nextBase.first_seen_at,
-            nextBase.created_at,
-            nextBase.updated_at,
-            nextStats.last_seen_at,
-            nextStats.last_retrieved_at,
-            nextBase.status,
-            nextBase.expires_at,
-            nextBase.verification_status,
-            nextBase.verified_at,
-            nextBase.classified_at,
-            nextBase.superseded_by_memory_id,
-            nextBase.merged_from,
-            nextBase.metadata_json,
-            nextBase.mural_cue,
-            nextBase.mural_cue_hash,
-            nextBase.mural_cue_at,
-            nextBase.mural_cue_rejection_count,
+            ...MEMORY_LEGACY_UPDATE_COLUMNS.map((column) => legacyRow[column]),
             contextId,
         );
     }

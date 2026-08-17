@@ -1,5 +1,5 @@
 import type { Database } from "../../shared/sqlite";
-import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
+import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 
 const IDENTITY_COLUMNS = new Set(["project_path", "project_identity"]);
 const DERIVED_TABLE_SUFFIXES = [
@@ -198,10 +198,10 @@ function mergeMemoryRow(
         const stats = db
             .prepare("SELECT seen_count FROM memory_stats WHERE memory_id = ?")
             .get(memoryId) as { seen_count?: number } | undefined;
-        // A missing stats row on a v80 database is corruption; a defaulted
-        // count would merge wrong telemetry and then delete the source row.
-        if (stats?.seen_count == null) throw new MemoryStatsIntegrityError(memoryId);
-        return Number(stats.seen_count);
+        // requireEffectiveSeenCount rejects a missing stats row as corruption —
+        // a defaulted count would merge wrong telemetry and then delete the
+        // source row.
+        return requireEffectiveSeenCount(db, memoryId, stats?.seen_count);
     };
     const collision = db
         .prepare(

@@ -9,7 +9,11 @@ import {
     resolveProjectIdentityStrict,
 } from "./memory/project-identity";
 import { rekeyMemoryRowWithCollisionMerge } from "./memory/relocate-memory";
-import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
+import {
+    effectiveSeenCountSql,
+    hasMemoryStatsTable,
+    requireEffectiveSeenCount,
+} from "./memory/storage-memory";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 
 export const BATCH_SIZE = 25;
@@ -26,7 +30,9 @@ interface LegacyMemoryRow {
     project_path: string;
     category: string;
     normalized_hash: string;
-    seen_count: number;
+    /** NULL on a v80 database whose memory_stats row is missing (corruption —
+     *  rejected by requireEffectiveSeenCount before any merge consumes it). */
+    seen_count: number | null;
 }
 
 interface ResolvedBackfillRow extends LegacyMemoryRow {
@@ -243,9 +249,7 @@ export async function runDeferredV22Backfill(
     await yieldToEventLoop();
 
     const statsBacked = hasMemoryStatsTable(db);
-    const seenCountSql = statsBacked
-        ? "(SELECT s.seen_count FROM memory_stats s WHERE s.memory_id = memories.id) AS seen_count"
-        : "seen_count";
+    const seenCountSql = effectiveSeenCountSql(db);
 
     while (true) {
         const batch = db
@@ -323,23 +327,25 @@ export async function runDeferredV22Backfill(
                     row.identity,
                     row.category,
                     row.normalized_hash,
-                ) as { id: number; seen_count: number } | undefined;
-                // On a v80 database the scalar subquery yields NULL when the
-                // stats row is missing; abort the batch transaction before the
-                // merge substitutes a default count and deletes the source row.
-                if (statsBacked) {
-                    if (row.seen_count === null) throw new MemoryStatsIntegrityError(row.id);
-                    if (collision && collision.seen_count === null) {
-                        throw new MemoryStatsIntegrityError(collision.id);
-                    }
-                }
+                ) as { id: number; seen_count: number | null } | undefined;
                 if (collision && collision.id !== row.id) {
                     // Merge into the surviving target: keep the larger seen_count,
                     // delete the source legacy row. The embedding row FK-cascades on
                     // delete. The mutation log is unaffected (no render-visible
                     // change — both rows held identical content).
-                    const mergedSeen = Math.max(collision.seen_count ?? 1, row.seen_count ?? 1);
-                    if (mergedSeen !== (collision.seen_count ?? 1)) {
+                    // requireEffectiveSeenCount aborts the batch transaction when a
+                    // v80 stats read is NULL (a missing stats row is corruption),
+                    // before the merge substitutes a default count and deletes the
+                    // source row. The check lives inside the merge branch so rows
+                    // that only need a project_path rekey do not stall the cursor.
+                    const sourceSeen = requireEffectiveSeenCount(db, row.id, row.seen_count);
+                    const targetSeen = requireEffectiveSeenCount(
+                        db,
+                        collision.id,
+                        collision.seen_count,
+                    );
+                    const mergedSeen = Math.max(targetSeen, sourceSeen);
+                    if (mergedSeen !== targetSeen) {
                         bumpSeenCount.run(mergedSeen, collision.id);
                     }
                     preserveEmbedding.run(collision.id, row.id);

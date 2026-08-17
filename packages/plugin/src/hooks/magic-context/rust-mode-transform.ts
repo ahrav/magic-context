@@ -13,7 +13,10 @@ import {
 } from "../../features/magic-context/context-authority";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import { hasMemoryStatsTable } from "../../features/magic-context/memory/storage-memory";
+import {
+    hasMemoryStatsTable,
+    MemoryStatsIntegrityError,
+} from "../../features/magic-context/memory/storage-memory";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -901,9 +904,7 @@ function authoritySeedRows(
                           ...base
                       } = raw as Record<string, unknown>;
                       if (__stats_seen_count === null || __stats_seen_count === undefined) {
-                          throw new Error(
-                              `memory_stats row missing for memory ${String(base.id)}: context.db failed v80 integrity`,
-                          );
+                          throw new MemoryStatsIntegrityError(Number(base.id));
                       }
                       return {
                           ...base,

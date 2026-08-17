@@ -33,7 +33,11 @@ import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-per
 import { ensureContextStoreUuid } from "./context-authority";
 import type { FailClosedBlockingProcess, FailClosedProcessKind } from "./fail-closed-block";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations, runMigrationsWithRetry } from "./migrations";
-import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import {
+    ensureColumn,
+    healAllNullColumns,
+    MEMORIES_AU_TRIGGER_BODY,
+} from "./storage-schema-helpers";
 import {
     loadToolDefinitionMeasurements,
     setDatabase as setToolDefinitionDatabase,
@@ -1351,16 +1355,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     END;
 
     -- Value-sensitive fallback definition for pre-v80 initialization; migration
-    -- v80 drops and re-creates the identical trigger so fresh and upgraded
-    -- databases converge. The v80 stats objects themselves (memory_stats, its
-    -- guards, and memories_stats_ai) are migration-owned and are never created
-    -- here.
-    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE OF content, category ON memories
-    WHEN OLD.content IS NOT NEW.content OR OLD.category IS NOT NEW.category
-    BEGIN
-      INSERT INTO memories_fts(memories_fts, rowid, content, category) VALUES ('delete', old.id, old.content, old.category);
-      INSERT INTO memories_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
-    END;
+    -- v80 drops and re-creates the trigger from the same shared body so fresh
+    -- and upgraded databases converge. The v80 stats objects themselves
+    -- (memory_stats, its guards, and memories_stats_ai) are migration-owned
+    -- and are never created here.
+    CREATE TRIGGER IF NOT EXISTS memories_au ${MEMORIES_AU_TRIGGER_BODY};
 
     CREATE TABLE IF NOT EXISTS session_meta (
       session_id TEXT PRIMARY KEY,

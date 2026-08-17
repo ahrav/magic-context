@@ -2,6 +2,7 @@ import type { Database, Statement as PreparedStatement } from "../../../shared/s
 import {
     buildWorkspaceMemorySqlFilter,
     getMemorySelectColumns,
+    getMemoryStatsJoin,
     getStatsDependentStatement,
     memoryRowsFromQuery,
     registerStatsDependentStatementCache,
@@ -19,7 +20,7 @@ const unionSearchStatements = new Map<number, WeakMap<Database, PreparedStatemen
 function getSearchStatement(db: Database): PreparedStatement {
     return getStatsDependentStatement(db, searchStatements, () =>
         db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path = ? AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
+            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid ${getMemoryStatsJoin(db)} WHERE memories.project_path = ? AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
         ),
     );
 }
@@ -43,7 +44,7 @@ function getUnionSearchStatement(db: Database, arity: number): PreparedStatement
     return getStatsDependentStatement(db, statements, () => {
         const placeholders = Array.from({ length: arity }, () => "?").join(", ");
         return db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${placeholders}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
+            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid ${getMemoryStatsJoin(db)} WHERE memories.project_path IN (${placeholders}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
         );
     });
 }
@@ -118,7 +119,7 @@ export function searchMemoriesFTSUnion(
     const rows = sharingFilter.active
         ? db
               .prepare(
-                  `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
+                  `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid ${getMemoryStatsJoin(db)} WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
               )
               .all(...identities, Date.now(), sanitized, ...sharingFilter.params, limit)
         : getUnionSearchStatement(db, identities.length).all(

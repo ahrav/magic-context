@@ -1,7 +1,11 @@
 import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import {
+    ensureColumn,
+    healAllNullColumns,
+    MEMORIES_AU_TRIGGER_BODY,
+} from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
 /** First version reserved for downstream migrations; upstream versions stay below it. */
@@ -228,12 +232,7 @@ function noteColumnExists(db: Database, column: string): boolean {
 function installValueSensitiveMemoriesFtsUpdateTrigger(db: Database): void {
     db.exec(`
         DROP TRIGGER IF EXISTS memories_au;
-        CREATE TRIGGER memories_au AFTER UPDATE OF content, category ON memories
-        WHEN OLD.content IS NOT NEW.content OR OLD.category IS NOT NEW.category
-        BEGIN
-          INSERT INTO memories_fts(memories_fts, rowid, content, category) VALUES ('delete', old.id, old.content, old.category);
-          INSERT INTO memories_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
-        END;
+        CREATE TRIGGER memories_au ${MEMORIES_AU_TRIGGER_BODY};
     `);
 }
 
