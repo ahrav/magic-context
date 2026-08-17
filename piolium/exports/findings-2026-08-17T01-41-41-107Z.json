@@ -1,0 +1,47 @@
+{
+  "generated_at": "2026-08-17T01:41:41.110Z",
+  "findings": [
+    {
+      "id": "M1",
+      "slug": "project-config-autonomous-shell-agent",
+      "title": "Repository configuration can activate an unattended shell-capable agent",
+      "severity": "medium",
+      "status": "valid",
+      "owners": [],
+      "labels": [
+        "severity:medium"
+      ],
+      "files": [
+        "packages/pi-plugin/src/dreamer/index.ts",
+        "packages/pi-plugin/src/subagent-runner.ts",
+        "packages/plugin/src/agents/hidden-agent-registrations.ts",
+        "packages/plugin/src/agents/permissions.ts",
+        "packages/plugin/src/config/agent-disable.ts",
+        "packages/plugin/src/config/index.ts",
+        "packages/plugin/src/config/project-security.ts",
+        "packages/plugin/src/config/schema/magic-context.ts",
+        "packages/plugin/src/features/magic-context/dreamer/task-config.ts",
+        "packages/plugin/src/features/magic-context/dreamer/task-executor.ts",
+        "packages/plugin/src/features/magic-context/dreamer/task-gates.ts",
+        "packages/plugin/src/features/magic-context/dreamer/task-prompts.ts",
+        "packages/plugin/src/features/magic-context/dreamer/task-scheduler.ts"
+      ],
+      "findingDir": "/local/home/ahrav/scratch/magic-context/piolium/findings/M1-project-config-autonomous-shell-agent",
+      "draftPath": "/local/home/ahrav/scratch/magic-context/piolium/findings/M1-project-config-autonomous-shell-agent/draft.md",
+      "reportPath": "/local/home/ahrav/scratch/magic-context/piolium/findings/M1-project-config-autonomous-shell-agent/report.md",
+      "updatedAt": "2026-08-17T01:33:50.569Z",
+      "frontmatter": {
+        "id": "M1",
+        "phase": "L5",
+        "slug": "project-config-autonomous-shell-agent",
+        "severity": "medium",
+        "status": "valid",
+        "source_drafts": [
+          "p4-001-project-config-enables-shell-agent.md",
+          "l4-001-project-config-autonomous-shell-agent.md"
+        ],
+        "original_id": "p8-001"
+      }
+    }
+  ]
+}

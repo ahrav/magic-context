@@ -1,0 +1,93 @@
+{
+	"audits": [
+		{
+			"audit_id": "2026-08-16T23:52:23.547Z",
+			"mode": "balanced",
+			"started_at": "2026-08-16T23:52:23.547Z",
+			"completed_at": "2026-08-17T01:35:04.589Z",
+			"status": "complete",
+			"phases": {
+				"L1": {
+					"status": "complete",
+					"attempt": 1,
+					"max_attempts": 6,
+					"started_at": "2026-08-16T23:52:23.576Z",
+					"completed_at": "2026-08-16T23:59:03.747Z"
+				},
+				"L2": {
+					"status": "complete",
+					"attempt": 2,
+					"max_attempts": 6,
+					"started_at": "2026-08-16T23:59:03.748Z",
+					"completed_at": "2026-08-17T00:17:41.186Z"
+				},
+				"L3": {
+					"status": "complete",
+					"attempt": 1,
+					"max_attempts": 6,
+					"started_at": "2026-08-17T00:17:41.188Z",
+					"completed_at": "2026-08-17T00:30:16.584Z"
+				},
+				"L4": {
+					"status": "complete",
+					"attempt": 3,
+					"max_attempts": 6,
+					"started_at": "2026-08-17T00:17:41.299Z",
+					"completed_at": "2026-08-17T00:45:47.254Z"
+				},
+				"L5": {
+					"status": "complete",
+					"attempt": 2,
+					"max_attempts": 6,
+					"started_at": "2026-08-17T00:45:47.255Z",
+					"completed_at": "2026-08-17T00:52:51.404Z"
+				},
+				"L6": {
+					"status": "complete",
+					"started_at": "2026-08-17T00:52:51.458Z",
+					"completed_at": "2026-08-17T01:32:34.321Z"
+				},
+				"L6b": {
+					"status": "complete",
+					"started_at": "2026-08-17T01:32:34.321Z",
+					"completed_at": "2026-08-17T01:34:04.387Z"
+				},
+				"L6c": {
+					"status": "complete",
+					"attempt": 1,
+					"max_attempts": 6,
+					"started_at": "2026-08-17T01:34:04.388Z",
+					"completed_at": "2026-08-17T01:35:04.564Z"
+				},
+				"L7": {
+					"status": "complete",
+					"started_at": "2026-08-17T01:35:04.570Z",
+					"completed_at": "2026-08-17T01:35:04.589Z"
+				},
+				"L6:M1": {
+					"status": "complete",
+					"attempt": 1,
+					"max_attempts": 6,
+					"started_at": "2026-08-17T00:52:51.466Z",
+					"completed_at": "2026-08-17T01:32:34.320Z"
+				},
+				"L6b:M1": {
+					"status": "in_progress",
+					"attempt": 1,
+					"max_attempts": 6,
+					"started_at": "2026-08-17T01:32:34.367Z",
+					"heartbeat_at": "2026-08-17T01:34:04.384Z",
+					"last_event_at": "2026-08-17T01:34:04.336Z",
+					"last_tool": "bash",
+					"last_tool_summary": "set -euo pipefail report='piolium/findings/M1-project-config-autonomous-shell-agent/repor…",
+					"run_id": "l6b:m1-2026-08-16T23-52-23-547Z-a1-ceaee723"
+				}
+			},
+			"agent_sdk": "pi",
+			"commit": "085f659b76fcaf4bf8da2d005b89a5e6dc4e486c",
+			"branch": "master",
+			"repository": "ahrav/magic-context",
+			"history_available": true
+		}
+	]
+}

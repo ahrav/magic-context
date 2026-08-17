@@ -1,0 +1,61 @@
+=== project security policy deliberately preserves dreamer schedules ===
+packages/plugin/src/config/index.ts:20:    stripUnsafeProjectConfigFields,
+packages/plugin/src/config/index.ts:570:        for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
+packages/plugin/src/config/project-security.ts:38: * Dreamer model/cadence fields are deliberately NOT stripped: a repo may tune
+packages/plugin/src/config/project-security.ts:228:export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknown>): string[] {
+
+=== maintain-docs is a configurable task whose default schedule is off ===
+177:    "maintain-docs": "",
+219:        "maintain-docs": DreamTaskBaseConfigSchema.default(() =>
+
+=== hidden agent receives bash/write/edit ===
+123-            lockPermissions: true,
+124-        },
+125-        {
+126:            id: "dreamer-docs",
+127-            mode: "primary",
+128-            hidden: true,
+129-            description: HIDDEN_AGENT_DESCRIPTION,
+--
+136-                "read",
+137-                "grep",
+138-                "glob",
+139:                "bash",
+140:                "write",
+141:                "edit",
+142-                "aft_outline",
+143-                "aft_zoom",
+144-                "aft_search",
+
+=== project-driven task selects that hidden agent ===
+72-    buildRetrospectivePrompt,
+73-    CURATE_SYSTEM_PROMPT,
+74-    type CuratePromptMemory,
+75-    FRICTION_GATE_SYSTEM_PROMPT,
+76:    MAINTAIN_DOCS_SYSTEM_PROMPT,
+77-    RETROSPECTIVE_SYSTEM_PROMPT,
+78-    type RetrospectivePromptEvent,
+79-} from "./task-prompts";
+80-import {
+--
+1214-                    // it never sees another task's tools/rules: curate runs on the
+1215-                    // base `dreamer` (ctx_memory only, no codebase tools);
+1216-                    // maintain-docs runs on `dreamer-docs` (file read/write/bash, no
+1217-                    // memory machinery).
+1218:                    agent: task === "maintain-docs" ? DREAMER_DOCS_AGENT : DREAMER_AGENT,
+1219-                    system:
+1220-                        task === "maintain-docs"
+1221:                            ? MAINTAIN_DOCS_SYSTEM_PROMPT
+1222-                            : withContentLanguageDirective(
+1223-                                  CURATE_SYSTEM_PROMPT,
+1224-                                  config.language ?? deps.language,
+1225-                              ),
+
+=== Pi child inherits the full parent environment ===
+954-						// through for provider extensions. The guard only disables Magic
+955-						// Context's full entry; it must not replace the process env.
+956-						env: {
+957:							...process.env,
+958-							[MAGIC_CONTEXT_PI_SUBAGENT_ENV]: "1",
+959-						},
+960-						// stdout = JSON events; stderr = diagnostics. stdin is a pipe

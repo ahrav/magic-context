@@ -1,0 +1,18 @@
+{
+	"generated_at": "2026-08-17T01:30:49.409Z",
+	"source_prefixes": [
+		"p8-"
+	],
+	"promoted": [
+		{
+			"id": "M1",
+			"slug": "project-config-autonomous-shell-agent",
+			"severity": "medium",
+			"original_id": "p8-001",
+			"phase": "L5",
+			"source_path": "/local/home/ahrav/scratch/magic-context/piolium/findings-draft/p8-001-project-config-autonomous-shell-agent.md",
+			"finding_dir": "/local/home/ahrav/scratch/magic-context/piolium/findings/M1-project-config-autonomous-shell-agent"
+		}
+	],
+	"dropped": []
+}

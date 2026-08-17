@@ -1,0 +1,506 @@
+### entrypoints
+packages/pi-plugin/src/index.ts:723:export default async function (pi: ExtensionAPI): Promise<void> {
+packages/dashboard/src-tauri/src/serve/mod.rs:136:pub fn build_router(app_state: Arc<AppState>, options: &ServeOptions, token: String) -> Router {
+packages/dashboard/src-tauri/src/serve/mod.rs:148:    let api = Router::new()
+packages/dashboard/src-tauri/src/serve/mod.rs:149:        .route("/invoke", post(invoke_handler))
+packages/dashboard/src-tauri/src/serve/mod.rs:158:    Router::new()
+packages/dashboard/src-tauri/src/serve/mod.rs:161:        .route("/assets/*path", get(asset_handler))
+packages/dashboard/src-tauri/src/serve/mod.rs:169:    let listener = tokio::net::TcpListener::bind(addr)
+packages/dashboard/src-tauri/src/serve/mod.rs:606:        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+packages/plugin/src/shared/rpc-server.ts:74: * `Bun.serve` to host BOTH:
+packages/plugin/src/shared/rpc-server.ts:80: *    of idle TUI CPU (#200). Pi never imports this module, so `Bun.serve` is safe.
+packages/plugin/src/shared/rpc-server.ts:114:            // is no consumer, and Bun.serve would throw — skip cleanly instead of
+packages/plugin/src/shared/rpc-server.ts:121:        const server = Bun.serve<WsData>({
+packages/plugin/src/shared/rpc-server.ts:259:        if (url.pathname === "/ws") {
+packages/plugin/src/shared/rpc-server.ts:270:        if (req.method === "GET" && url.pathname === "/health") {
+crates/mc-module/src/main.rs:15:async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+packages/cli/src/index.ts:93:export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+packages/plugin/src/index.ts:71:const server: Plugin = async (ctx) => {
+packages/plugin/src/index.ts:832:export default plugin;
+### auth guards
+packages/plugin/src/shared/rpc-server.ts:50:function tokensMatch(presented: string, expected: string): boolean {
+packages/plugin/src/shared/rpc-server.ts:57:function bearerToken(req: Request): string {
+packages/plugin/src/shared/rpc-server.ts:63:    const headerToken = bearerToken(req);
+packages/plugin/src/shared/rpc-server.ts:75: *  - HTTP request/reply routes (`/health`, `/rpc/<method>`) — the TUI's snapshot
+packages/plugin/src/shared/rpc-server.ts:77: *  - a WebSocket endpoint (`/ws`) — a single persistent connection per TUI over
+packages/plugin/src/shared/rpc-server.ts:123:            hostname: "127.0.0.1",
+packages/plugin/src/shared/rpc-server.ts:162:                mkdirSync(dir, { recursive: true, mode: 0o700 });
+packages/plugin/src/shared/rpc-server.ts:193:                    ? { encoding: "utf-8", mode: 0o600 }
+packages/plugin/src/shared/rpc-server.ts:259:        if (url.pathname === "/ws") {
+packages/plugin/src/shared/rpc-server.ts:260:            if (!tokensMatch(websocketToken(req), this.token)) {
+packages/plugin/src/shared/rpc-server.ts:270:        if (req.method === "GET" && url.pathname === "/health") {
+packages/plugin/src/shared/rpc-server.ts:274:        if (req.method !== "POST" || !url.pathname.startsWith("/rpc/")) {
+packages/plugin/src/shared/rpc-server.ts:279:        if (!tokensMatch(bearerToken(req), this.token)) {
+packages/plugin/src/shared/rpc-server.ts:283:        const method = url.pathname.slice(5); // strip "/rpc/"
+packages/plugin/src/shared/rpc-server.ts:335:            if (!tokensMatch(typeof msg.token === "string" ? msg.token : "", this.token)) {
+packages/dashboard/src-tauri/src/serve/mod.rs:243:async fn api_guard(State(state): State<ServeState>, request: Request, next: Next) -> Response {
+packages/dashboard/src-tauri/src/serve/mod.rs:244:    if !host_allowed(request.headers(), &state) {
+packages/dashboard/src-tauri/src/serve/mod.rs:247:    if !origin_allowed(request.headers(), &state) {
+packages/dashboard/src-tauri/src/serve/mod.rs:250:    if !authorization_valid(request.headers(), &state.token) {
+packages/dashboard/src-tauri/src/serve/mod.rs:256:    if request.method() == Method::POST && !content_type_is_json(request.headers()) {
+packages/dashboard/src-tauri/src/serve/mod.rs:403:fn host_allowed(headers: &HeaderMap, state: &ServeState) -> bool {
+packages/dashboard/src-tauri/src/serve/mod.rs:415:fn origin_allowed(headers: &HeaderMap, state: &ServeState) -> bool {
+packages/dashboard/src-tauri/src/serve/mod.rs:444:pub(crate) fn authorization_valid(headers: &HeaderMap, expected_token: &str) -> bool {
+packages/dashboard/src-tauri/src/serve/mod.rs:468:fn content_type_is_json(headers: &HeaderMap) -> bool {
+packages/dashboard/src-tauri/src/serve/mod.rs:698:        assert!(!authorization_valid(&headers, &token));
+packages/dashboard/src-tauri/src/serve/mod.rs:703:        assert!(authorization_valid(&headers, &token));
+packages/dashboard/src-tauri/src/serve/mod.rs:708:        assert!(!authorization_valid(&headers, &token));
+### project config
+packages/pi-plugin/src/config/index.ts:14:	constrainProjectThresholdOverrides,
+packages/pi-plugin/src/config/index.ts:16:	stripUnsafeProjectConfigFields,
+packages/pi-plugin/src/config/index.ts:23:import { substituteConfigVariables } from "@magic-context/core/config/variable";
+packages/pi-plugin/src/config/index.ts:111:		const substituted = substituteConfigVariables({
+packages/pi-plugin/src/config/index.ts:116:			isProjectConfig: scope === "project",
+packages/pi-plugin/src/config/index.ts:125:				`Ignored unsafe config key "${keyPath}" (security: prototype-pollution keys are not allowed).`,
+packages/pi-plugin/src/config/index.ts:403:			for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
+packages/pi-plugin/src/config/index.ts:414:			for (const warning of constrainProjectThresholdOverrides({
+packages/pi-plugin/src/config/index.ts:575:			for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
+packages/pi-plugin/src/config/index.ts:586:			for (const warning of constrainProjectThresholdOverrides({
+packages/plugin/src/config/index.ts:18:    constrainProjectThresholdOverrides,
+packages/plugin/src/config/index.ts:20:    stripUnsafeProjectConfigFields,
+packages/plugin/src/config/index.ts:25:import { substituteConfigVariables } from "./variable";
+packages/plugin/src/config/index.ts:126:        const substituted = substituteConfigVariables({
+packages/plugin/src/config/index.ts:129:            isProjectConfig: source === "project",
+packages/plugin/src/config/index.ts:137:                `Ignored unsafe config key "${path}" (security: prototype-pollution keys are not allowed).`,
+packages/plugin/src/config/index.ts:570:        for (const warning of stripUnsafeProjectConfigFields(projectRaw)) {
+packages/plugin/src/config/index.ts:581:        for (const warning of constrainProjectThresholdOverrides({
+packages/plugin/src/config/variable.ts:22:    isProjectConfig?: boolean;
+packages/plugin/src/config/variable.ts:79:export function substituteConfigVariables(input: SubstituteInput): SubstituteResult {
+packages/plugin/src/config/variable.ts:83:    if (input.isProjectConfig) {
+packages/plugin/src/config/variable.ts:96:                `Project-level config no longer supports ${tokenTypes} tokens for security reasons; leaving tokens literal. Move secret expansion to user-level config.`,
+packages/plugin/src/config/project-security.ts:44:const AGENT_ESCALATION_FIELDS = ["prompt", "permission", "tools", "system_prompt"] as const;
+packages/plugin/src/config/project-security.ts:212: *    the trust boundary for embedding destinations.
+packages/plugin/src/config/project-security.ts:228:export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknown>): string[] {
+packages/plugin/src/config/project-security.ts:401:        for (const field of AGENT_ESCALATION_FIELDS) {
+packages/plugin/src/config/project-security.ts:424:export function constrainProjectThresholdOverrides(args: {
+### sandbox
+packages/plugin/src/features/magic-context/memory/embedding-openai.ts:305:                // redirects, so `redirect: "error"` rejects the response instead.
+packages/plugin/src/features/magic-context/memory/embedding-openai.ts:306:                redirect: "error",
+packages/plugin/src/features/magic-context/smart-notes/ssrf-guard.ts:82:        throw new SmartNoteSecurityError("smart-note httpGet only permits https URLs");
+packages/plugin/src/features/magic-context/smart-notes/ssrf-guard.ts:105:export async function guardedSmartNoteHttpGet(
+packages/plugin/src/features/magic-context/smart-notes/ssrf-guard.ts:186:        throw new SmartNoteSecurityError("URL resolves to a non-global/internal address");
+packages/plugin/src/features/magic-context/smart-notes/ssrf-guard.ts:210:export function createPinnedLookup(candidate: { address: string; family: 4 | 6 }): LookupFunction {
+packages/plugin/src/features/magic-context/smart-notes/ssrf-guard.ts:261:                lookup: createPinnedLookup(candidate),
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:110:const DEFAULT_TIMEOUT_MS = 2_000;
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:111:const DEFAULT_HEAP_LIMIT_BYTES = 8 * 1024 * 1024;
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:112:const DEFAULT_STACK_LIMIT_BYTES = 512 * 1024;
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:113:const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:143:    if (Buffer.byteLength(options.compiledCheck, "utf8") > MAX_COMPILED_CHECK_BYTES) {
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:157:    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:178:            context.runtime.setMemoryLimit(options.heapLimitBytes ?? DEFAULT_HEAP_LIMIT_BYTES);
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:179:            context.runtime.setMaxStackSize(options.stackLimitBytes ?? DEFAULT_STACK_LIMIT_BYTES);
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:180:            context.runtime.setInterruptHandler(
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:184:            disableAmbientDynamicCode(context);
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:244:        context.setProp(context.global, "__mcHostCap", capObject);
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:277:function disableAmbientDynamicCode(context: QuickJSAsyncContext): void {
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:288:  const hostCap = __mcHostCap;
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:289:  delete globalThis.__mcHostCap;
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:290:  if (Object.prototype.hasOwnProperty.call(globalThis, "__mcHostCap")) {
+packages/plugin/src/features/magic-context/smart-notes/sandbox-runner.ts:291:    globalThis.__mcHostCap = undefined;
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:7:import { guardedSmartNoteHttpGet, type SmartNoteResolver } from "./ssrf-guard";
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:10:const execFileAsync = promisify(execFile);
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:53:            guardedSmartNoteHttpGet(url, { signal: options.signal, resolver: options.resolver }),
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:59:export function isSecretDeniedPath(repoRelativePath: string): boolean {
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:130:    if (!normalized || isSecretDeniedPath(normalized)) return null;
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:149:        isSecretDeniedPath(canonicalRelative)
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:161:    const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:232:        if (!normalized || isSecretDeniedPath(normalized)) return [];
+packages/plugin/src/features/magic-context/smart-notes/capabilities.ts:250:        const result = await execFileAsync("git", ["-C", projectRoot, ...args], {
+### agent
+packages/plugin/src/config/project-security.ts:220: *  - `pi.subagent_extensions` — a cloned repo must not choose which extensions
+packages/plugin/src/config/project-security.ts:326:    if (isPlainObject(pi) && "subagent_extensions" in pi) {
+packages/plugin/src/config/project-security.ts:327:        delete pi.subagent_extensions;
+packages/plugin/src/config/project-security.ts:329:            "Ignoring pi.subagent_extensions from project config (security: only user-level config may choose extensions loaded by Pi subagent children).",
+packages/pi-plugin/src/subagent-runner.ts:295:const DREAMER_ACTION_AGENTS: ReadonlySet<string> = new Set([
+packages/pi-plugin/src/subagent-runner.ts:304:	// DREAMER_ACTION_AGENTS — that would add ctx_memory, whose mutations bump the
+packages/pi-plugin/src/subagent-runner.ts:324: * HOST CAVEAT — this is a capability boundary on Pi only. OMP applies
+packages/pi-plugin/src/subagent-runner.ts:329:const STRICT_TOOL_ALLOWLIST_ENTRIES: readonly (readonly [
+packages/pi-plugin/src/subagent-runner.ts:381:	// DREAMER_ACTION_AGENTS so the lean extension registers ctx_memory; this
+packages/pi-plugin/src/subagent-runner.ts:387:	// DREAMER_ACTION_AGENTS (every member needs a strict entry).
+packages/pi-plugin/src/subagent-runner.ts:391:const STRICT_TOOL_ALLOWLIST: ReadonlyMap<string, readonly string[]> = new Map(
+packages/pi-plugin/src/subagent-runner.ts:392:	STRICT_TOOL_ALLOWLIST_ENTRIES,
+packages/pi-plugin/src/subagent-runner.ts:396:	STRICT_TOOL_ALLOWLIST_ENTRIES.filter(([, tools]) => tools.length === 0).map(
+packages/pi-plugin/src/subagent-runner.ts:406: * This narrows OMP's built-in surface only. OMP does not set
+packages/pi-plugin/src/subagent-runner.ts:468:	disableDiscoveredExtensions: boolean;
+packages/pi-plugin/src/subagent-runner.ts:636:						{ disableDiscoveredExtensions: true },
+packages/pi-plugin/src/subagent-runner.ts:658:		const primaryRunMode: PiRunMode = { disableDiscoveredExtensions: false };
+packages/pi-plugin/src/subagent-runner.ts:675:			{ disableDiscoveredExtensions: true },
+packages/pi-plugin/src/subagent-runner.ts:748:			runMode.disableDiscoveredExtensions ||
+packages/pi-plugin/src/subagent-runner.ts:896:			disableDiscoveredExtensions: runMode.disableDiscoveredExtensions,
+packages/pi-plugin/src/subagent-runner.ts:1610:		disableDiscoveredExtensions?: boolean;
+packages/pi-plugin/src/subagent-runner.ts:1652:		opts?.disableDiscoveredExtensions ||
+packages/pi-plugin/src/subagent-runner.ts:1688:			DREAMER_ACTION_AGENTS.has(options.agent));
+packages/pi-plugin/src/subagent-runner.ts:1695:		if (DREAMER_ACTION_AGENTS.has(options.agent)) {
+packages/pi-plugin/src/subagent-runner.ts:1703:	const strictTools = STRICT_TOOL_ALLOWLIST.get(options.agent);
+packages/pi-plugin/src/subagent-runner.ts:1904:	DREAMER_ACTION_AGENTS,
+packages/pi-plugin/src/subagent-runner.ts:1907:	STRICT_TOOL_ALLOWLIST,
+packages/plugin/src/agents/permissions.ts:9: * registered with `mode: "primary"` and `hidden: true`: primary mode keeps
+packages/plugin/src/agents/permissions.ts:88:    allowedTools: readonly string[] | undefined,
+packages/plugin/src/agents/permissions.ts:93:    // crashes with "undefined is not an object (evaluating 'allowedTools')", and
+packages/plugin/src/agents/permissions.ts:97:    if (allowedTools === undefined) {
+packages/plugin/src/agents/permissions.ts:106:    for (const tool of allowedTools ?? []) {
+packages/plugin/src/agents/permissions.ts:221:export function applyDisallowedTools(
+packages/plugin/src/agents/hidden-agent-registrations.ts:1:import { applyDisallowedTools, buildAllowOnlyPermission } from "./permissions";
+packages/plugin/src/agents/hidden-agent-registrations.ts:17: * `applyDisallowedTools([...], undefined)` throws
+packages/plugin/src/agents/hidden-agent-registrations.ts:64:    mode: "primary";
+packages/plugin/src/agents/hidden-agent-registrations.ts:66:    hidden: true;
+packages/plugin/src/agents/hidden-agent-registrations.ts:70:    allowedTools: readonly string[];
+packages/plugin/src/agents/hidden-agent-registrations.ts:74:    lockPermissions?: boolean;
+packages/plugin/src/agents/hidden-agent-registrations.ts:96:    const historianAllowedTools = applyDisallowedTools(
+packages/plugin/src/agents/hidden-agent-registrations.ts:103:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:104:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:115:            allowedTools: ["ctx_memory"],
+packages/plugin/src/agents/hidden-agent-registrations.ts:123:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:127:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:128:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:135:            allowedTools: [
+packages/plugin/src/agents/hidden-agent-registrations.ts:151:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:155:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:156:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:162:            allowedTools: [],
+packages/plugin/src/agents/hidden-agent-registrations.ts:165:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:169:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:170:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:173:            allowedTools: ["ctx_search"],
+packages/plugin/src/agents/hidden-agent-registrations.ts:179:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:183:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:184:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:192:            allowedTools: [
+packages/plugin/src/agents/hidden-agent-registrations.ts:208:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:212:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:213:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:222:            allowedTools: ["read", "grep", "glob", "aft_outline", "aft_zoom", "aft_search"],
+packages/plugin/src/agents/hidden-agent-registrations.ts:230:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:234:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:235:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:242:            allowedTools: [],
+packages/plugin/src/agents/hidden-agent-registrations.ts:245:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:249:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:250:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:253:            allowedTools: [],
+packages/plugin/src/agents/hidden-agent-registrations.ts:258:            lockPermissions: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:262:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:263:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:266:            allowedTools: historianAllowedTools,
+packages/plugin/src/agents/hidden-agent-registrations.ts:272:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:273:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:276:            allowedTools: historianAllowedTools,
+packages/plugin/src/agents/hidden-agent-registrations.ts:282:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:283:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:286:            allowedTools: historianAllowedTools,
+packages/plugin/src/agents/hidden-agent-registrations.ts:292:            mode: "primary",
+packages/plugin/src/agents/hidden-agent-registrations.ts:293:            hidden: true,
+packages/plugin/src/agents/hidden-agent-registrations.ts:296:            allowedTools: ["ctx_search", "aft_outline", "aft_zoom"],
+packages/plugin/src/agents/hidden-agent-registrations.ts:310:    allowedTools: readonly string[],
+packages/plugin/src/agents/hidden-agent-registrations.ts:314:    lockPermissions = false,
+packages/plugin/src/agents/hidden-agent-registrations.ts:320:        // Pulled out so they can be conditionally re-added: under lockPermissions
+packages/plugin/src/agents/hidden-agent-registrations.ts:341:    const promptOverrides: Record<string, unknown> = lockPermissions
+packages/plugin/src/agents/hidden-agent-registrations.ts:347:    const restOverrides: Record<string, unknown> = lockPermissions
+packages/plugin/src/agents/hidden-agent-registrations.ts:354:    const basePermission = buildAllowOnlyPermission(allowedTools, agentLabel);
+packages/plugin/src/agents/hidden-agent-registrations.ts:366:        // then layered on top — UNLESS lockPermissions is set, in which case the
+packages/plugin/src/agents/hidden-agent-registrations.ts:367:        // user override is dropped entirely. lockPermissions is for
+packages/plugin/src/agents/hidden-agent-registrations.ts:373:            ...(lockPermissions ? {} : (overridePermission ?? {})),
+packages/plugin/src/agents/hidden-agent-registrations.ts:375:        mode: "primary" as const,
+packages/plugin/src/agents/hidden-agent-registrations.ts:376:        hidden: true,
+### dashboard tauri
+packages/dashboard/src-tauri/Cargo.toml:6:version = "0.1.0"
+packages/dashboard/src-tauri/Cargo.toml:8:rust-version = "1.77"
+packages/dashboard/src-tauri/Cargo.toml:15:tauri-build = { version = "2", features = [] }
+packages/dashboard/src-tauri/Cargo.toml:18:tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+packages/dashboard/src-tauri/Cargo.toml:19:serde = { version = "1", features = ["derive"] }
+packages/dashboard/src-tauri/Cargo.toml:21:rusqlite = { version = "0.31", features = ["bundled"] }
+packages/dashboard/src-tauri/Cargo.toml:22:notify = { version = "6", features = ["macos_fsevent"] }
+packages/dashboard/src-tauri/Cargo.toml:23:chrono = { version = "0.4", features = ["serde"] }
+packages/dashboard/src-tauri/Cargo.toml:28:tokio = { version = "1", features = ["fs", "io-util", "sync", "macros", "process", "time", "rt-multi-thread", "net"] }
+packages/dashboard/src-tauri/Cargo.toml:29:reqwest = { version = "0.12", features = ["json"] }
+packages/dashboard/src-tauri/Cargo.toml:34:image = { version = "0.25.6", default-features = false, features = ["png"] }
+packages/dashboard/src-tauri/tauri.conf.json:14:    "windows": [
+packages/dashboard/src-tauri/tauri.conf.json:27:      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https:"
+packages/dashboard/src-tauri/tauri.conf.json:48:      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY5MUNBMDIxNjUxMEM2MkYKUldRdnhoQmxJYUFjYVU0SlNNbzRWMGJ3MndKOENIVDR0N0N6b0Jyd1l6TUNFTlpZTzV3RXlRYkEK",
+packages/dashboard/src-tauri/tauri.conf.json:49:      "endpoints": [
+packages/dashboard/src-tauri/capabilities/default.json:5:  "windows": ["*"],
+packages/dashboard/src-tauri/capabilities/default.json:6:  "permissions": [
+packages/dashboard/src-tauri/src/main.rs:1:#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+packages/dashboard/src-tauri/src/main.rs:37:        // shell plugin removed — no shell:default capability needed
+packages/dashboard/src-tauri/src/main.rs:38:        .plugin(tauri_plugin_updater::Builder::new().build())
+packages/dashboard/src-tauri/src/main.rs:39:        .plugin(tauri_plugin_process::init())
+packages/dashboard/src-tauri/src/main.rs:40:        .plugin(tauri_plugin_dialog::init())
+packages/dashboard/src-tauri/src/main.rs:42:        .invoke_handler(tauri::generate_handler![
+### serve args
+packages/dashboard/src-tauri/src/serve/mod.rs:9:use axum::extract::{DefaultBodyLimit, Path, Request, State};
+packages/dashboard/src-tauri/src/serve/mod.rs:23:const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+packages/dashboard/src-tauri/src/serve/mod.rs:24:const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
+packages/dashboard/src-tauri/src/serve/mod.rs:25:const SUBPROCESS_CONCURRENCY_LIMIT: usize = 2;
+packages/dashboard/src-tauri/src/serve/mod.rs:27:const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+packages/dashboard/src-tauri/src/serve/mod.rs:62:    let mut host = DEFAULT_HOST;
+packages/dashboard/src-tauri/src/serve/mod.rs:83:            "--allow-remote" => {
+packages/dashboard/src-tauri/src/serve/mod.rs:107:            "Refusing to bind {host}. Serve mode exposes write access and subprocess spawning over plain bearer-token HTTP. Use SSH tunneling, or pass --allow-remote only on a trusted network."
+packages/dashboard/src-tauri/src/serve/mod.rs:145:        subprocess_limit: Arc::new(Semaphore::new(SUBPROCESS_CONCURRENCY_LIMIT)),
+packages/dashboard/src-tauri/src/serve/mod.rs:154:        // cacheable; only this sub-tree is marked no-store.
+packages/dashboard/src-tauri/src/serve/mod.rs:156:        .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES));
+packages/dashboard/src-tauri/src/serve/mod.rs:172:    let token = generate_token()?;
+packages/dashboard/src-tauri/src/serve/mod.rs:173:    let url = launch_url(options.host, options.port, &token);
+packages/dashboard/src-tauri/src/serve/mod.rs:177:            "Warning: serve mode exposes write access and subprocess spawning over plain bearer-token HTTP. Prefer SSH tunneling for remote access."
+packages/dashboard/src-tauri/src/serve/mod.rs:275:        header::HeaderValue::from_static("no-store"),
+packages/dashboard/src-tauri/src/serve/mod.rs:354:            header::HeaderValue::from_static("no-store"),
+packages/dashboard/src-tauri/src/serve/mod.rs:370:        header::CONTENT_SECURITY_POLICY,
+packages/dashboard/src-tauri/src/serve/mod.rs:371:        header::HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+packages/dashboard/src-tauri/src/serve/mod.rs:483:        return Ok(DEFAULT_HOST);
+packages/dashboard/src-tauri/src/serve/mod.rs:500:fn generate_token() -> Result<String, String> {
+packages/dashboard/src-tauri/src/serve/mod.rs:517:fn launch_url(host: IpAddr, port: u16, token: &str) -> String {
+packages/dashboard/src-tauri/src/serve/mod.rs:523:    format!("http://{display_host}:{port}/#token={token}")
+packages/dashboard/src-tauri/src/serve/mod.rs:598:        spawn_test_server_with_options(DEFAULT_HOST, false).await
+packages/dashboard/src-tauri/src/serve/mod.rs:659:        assert_eq!(parsed.host, DEFAULT_HOST);
+packages/dashboard/src-tauri/src/serve/mod.rs:676:        assert!(err.contains("Refusing to bind"));
+packages/dashboard/src-tauri/src/serve/mod.rs:681:        let parsed = parse_serve_args(&args(&["--serve", "--host", "0.0.0.0", "--allow-remote"]))
+packages/dashboard/src-tauri/src/serve/mod.rs:713:        let token = generate_token().expect("token");
+packages/dashboard/src-tauri/src/serve/mod.rs:719:    fn launch_url_uses_fragment_token() {
+packages/dashboard/src-tauri/src/serve/mod.rs:720:        let url = launch_url(DEFAULT_HOST, 9077, "abc");
+packages/dashboard/src-tauri/src/serve/mod.rs:721:        assert_eq!(url, "http://127.0.0.1:9077/#token=abc");
+packages/dashboard/src-tauri/src/serve/mod.rs:772:            Some("no-store".to_string()),
+packages/dashboard/src-tauri/src/serve/mod.rs:775:        // Error responses are no-store too (they can echo arguments back).
+packages/dashboard/src-tauri/src/serve/mod.rs:781:            Some("no-store".to_string()),
+### transport
+packages/plugin/src/hooks/magic-context/module-transport.ts:8:    type RouteHandle,
+packages/plugin/src/hooks/magic-context/module-transport.ts:12:    StaleRouteHandleError,
+packages/plugin/src/hooks/magic-context/module-transport.ts:27:const HANDSHAKE_TIMEOUT_MS = 2_000;
+packages/plugin/src/hooks/magic-context/module-transport.ts:32:const SERIAL_LANE_MAX_WAITERS = 16;
+packages/plugin/src/hooks/magic-context/module-transport.ts:33:const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
+packages/plugin/src/hooks/magic-context/module-transport.ts:37:function getDefaultConnectionFile(): string {
+packages/plugin/src/hooks/magic-context/module-transport.ts:70:            name === "StaleRouteHandleError" ||
+packages/plugin/src/hooks/magic-context/module-transport.ts:71:            /route handle \(\d+,\s*\d+\) is not live on the current connection/i.test(message) ||
+packages/plugin/src/hooks/magic-context/module-transport.ts:81:        error instanceof StaleRouteHandleError ||
+packages/plugin/src/hooks/magic-context/module-transport.ts:108:    route: RouteHandle;
+packages/plugin/src/hooks/magic-context/module-transport.ts:114:    route: RouteHandle;
+packages/plugin/src/hooks/magic-context/module-transport.ts:214:        const epochs = isRecord(value.epochs) ? value.epochs : {};
+packages/plugin/src/hooks/magic-context/module-transport.ts:215:        const capabilities = { state_sync_deltas: epochs.state_sync_deltas === true };
+packages/plugin/src/hooks/magic-context/module-transport.ts:226:        this.connectionFile = connectionFile ?? getDefaultConnectionFile();
+packages/plugin/src/hooks/magic-context/module-transport.ts:347:            this.queuedLaneWaiters >= SERIAL_LANE_MAX_WAITERS ||
+packages/plugin/src/hooks/magic-context/module-transport.ts:348:            lane.waiters.length >= SERIAL_LANE_MAX_WAITERS_PER_SESSION
+packages/plugin/src/hooks/magic-context/module-transport.ts:473:                    ensuredRoute = await this.ensureRoute(
+packages/plugin/src/hooks/magic-context/module-transport.ts:691:    private async ensureRoute(
+packages/plugin/src/hooks/magic-context/module-transport.ts:752:    private dropRoute(routeKey: string, route?: RouteHandle): void {
+packages/plugin/src/hooks/magic-context/module-transport.ts:785:            handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+crates/mc-module/src/lib.rs:83:    RouteBindRequest, RouteHandle,
+crates/mc-module/src/lib.rs:134:/// the store. The project is NEVER taken from a per-pass request field — a crafted request could
+crates/mc-module/src/lib.rs:495:/// Render-config epoch members, co-owned with the byte-splice consumer (thalamus gateway).
+crates/mc-module/src/lib.rs:498:/// and forces a HARD fold on any change. Bumping an epoch here is therefore the
+crates/mc-module/src/lib.rs:502:/// with their hardcoded fallbacks, so a diverged epoch map cannot silently skip the
+crates/mc-module/src/lib.rs:508:/// `<compartment>` elements with markdown headings in m0 and m1; epoch 2 sanitizes
+crates/mc-module/src/lib.rs:512:/// profile; epoch 1 includes covered system messages in m0 instead of sending them as
+crates/mc-module/src/lib.rs:516:/// fold on the first pass under the new binary, per the epoch contract above.
+crates/mc-module/src/lib.rs:524:/// The module-owned rendered-prefix format epoch for a serializer profile.
+crates/mc-module/src/lib.rs:526:/// Future profile-specific m0 format epochs slot in here so the module folds them into
+crates/mc-module/src/lib.rs:528:pub const fn profile_render_epoch(profile: SerializerProfile) -> u32 {
+crates/mc-module/src/lib.rs:558:pub const fn tagger_feature_epoch(tagging_surface_active: bool) -> u32 {
+crates/mc-module/src/lib.rs:682:    project_memory_epoch: Option<u64>,
+crates/mc-module/src/lib.rs:1979:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:1994:    revert_epoch: u64,
+crates/mc-module/src/lib.rs:2090:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:2112:                revert_epoch,
+crates/mc-module/src/lib.rs:2136:                revert_epoch,
+crates/mc-module/src/lib.rs:2154:                    revert_epoch: *revert_epoch,
+crates/mc-module/src/lib.rs:2454:    profile_epoch: u32,
+crates/mc-module/src/lib.rs:2651:    revert_epoch: u64,
+crates/mc-module/src/lib.rs:2702:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:2707:            .is_some_and(|session| session.revert_epoch != revert_epoch)
+crates/mc-module/src/lib.rs:2720:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:2727:            .is_some_and(|session| session.revert_epoch != revert_epoch)
+crates/mc-module/src/lib.rs:2751:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:2786:                revert_epoch,
+crates/mc-module/src/lib.rs:2829:    profile_epoch: u32,
+crates/mc-module/src/lib.rs:2872:    revert_epoch: u64,
+crates/mc-module/src/lib.rs:2918:    fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> Option<ProjectionCacheSnapshot> {
+crates/mc-module/src/lib.rs:2925:            .is_some_and(|session| session.revert_epoch != revert_epoch)
+crates/mc-module/src/lib.rs:2940:    fn replace(&mut self, session_id: &str, revert_epoch: u64, snapshot: ProjectionCacheSnapshot) {
+crates/mc-module/src/lib.rs:2953:                revert_epoch,
+crates/mc-module/src/lib.rs:2995:    prompt_surface_epochs: Mutex<HashMap<String, PromptSurfaceSelection>>,
+crates/mc-module/src/lib.rs:3023:    /// `on_route_gone`. The SDK validates the route handle's epoch before dispatching a
+crates/mc-module/src/lib.rs:3434:            prompt_surface_epochs: Mutex::new(HashMap::new()),
+crates/mc-module/src/lib.rs:3697:            prompt_surface_epochs: Mutex::new(HashMap::new()),
+crates/mc-module/src/lib.rs:3772:            self.prompt_surface_epochs
+crates/mc-module/src/lib.rs:3774:                .expect("prompt surface epoch mutex")
+crates/mc-module/src/lib.rs:3888:        // A store-side rewrite can advance the epoch without updating this process's request
+crates/mc-module/src/lib.rs:3889:        // snapshot. Load the persisted epoch first, then inspect the bounded projection and native
+crates/mc-module/src/lib.rs:3891:        let current_revert_epoch = self
+crates/mc-module/src/lib.rs:3897:            .revert_epoch;
+crates/mc-module/src/lib.rs:3900:            current_revert_epoch,
+crates/mc-module/src/lib.rs:3931:                    current_revert_epoch,
+crates/mc-module/src/lib.rs:3974:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:3982:            .snapshot(&request.session_id, revert_epoch)
+crates/mc-module/src/lib.rs:3993:        let revert_epoch = self
+crates/mc-module/src/lib.rs:3999:            .revert_epoch;
+crates/mc-module/src/lib.rs:4002:            revert_epoch,
+crates/mc-module/src/lib.rs:4023:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:4054:                revert_epoch,
+crates/mc-module/src/lib.rs:4134:            self.prompt_surface_epochs
+crates/mc-module/src/lib.rs:4136:                .expect("prompt surface epoch mutex")
+crates/mc-module/src/lib.rs:4171:                code: "route_unbound".to_string(),
+crates/mc-module/src/lib.rs:4177:                    code: "session_mismatch".to_string(),
+crates/mc-module/src/lib.rs:5441:                    code: "route_unbound".to_string(),
+crates/mc-module/src/lib.rs:5448:                    code: "session_mismatch".to_string(),
+crates/mc-module/src/lib.rs:5600:                    code: "route_unbound".to_string(),
+crates/mc-module/src/lib.rs:5606:                    code: "session_mismatch".to_string(),
+crates/mc-module/src/lib.rs:5703:                    code: "route_unbound".to_string(),
+crates/mc-module/src/lib.rs:5709:                    code: "session_mismatch".to_string(),
+crates/mc-module/src/lib.rs:5884:        // a ready snapshot after the durable revert epoch has been bumped.
+crates/mc-module/src/lib.rs:6152:            "epochs": {
+crates/mc-module/src/lib.rs:6153:                "memory_render_epoch": MEMORY_RENDER_FORMAT_EPOCH,
+crates/mc-module/src/lib.rs:6154:                "compartment_render_epoch": COMPARTMENT_RENDER_FORMAT_EPOCH,
+crates/mc-module/src/lib.rs:6155:                "profile_epoch": PROFILE_EPOCH_CLAUDE_CODE_ANTHROPIC,
+crates/mc-module/src/lib.rs:6156:                "tagger_epoch": TAGGER_FEATURE_EPOCH,
+crates/mc-module/src/lib.rs:6202:        revert_epoch: u64,
+crates/mc-module/src/lib.rs:6212:        Ok(store.load(session_id)?.meta.revert_epoch == revert_epoch)
+crates/mc-module/src/lib.rs:6233:        expected_revert_epoch: u64,
+crates/mc-module/src/lib.rs:6264:                Ok(current) if current.meta.revert_epoch == expected_revert_epoch => current,
+crates/mc-module/src/lib.rs:6295:                expected_revert_epoch,
+crates/mc-module/src/lib.rs:6504:        if ready.revert_epoch != initial_snapshot.revert_epoch {
+crates/mc-module/src/lib.rs:6551:            ready.revert_epoch,
+crates/mc-module/src/lib.rs:6575:                ready.revert_epoch,
+crates/mc-module/src/lib.rs:6628:            if current_state.meta.revert_epoch != ready.revert_epoch {
+crates/mc-module/src/lib.rs:6664:            // that snapshot's revert epoch, and publication loads the current row version
+crates/mc-module/src/lib.rs:6838:                ready.revert_epoch,
+crates/mc-module/src/lib.rs:6864:                ready.revert_epoch,
+### filesystem subprocess
+packages/dashboard/src-tauri/src/commands.rs:7:use std::path::{Path, PathBuf};
+packages/dashboard/src-tauri/src/commands.rs:599:    home: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:600:    appdata: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:601:    localappdata: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:602:    xdg_config_home: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:603:    xdg_data_home: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:604:    mac_system_applications: PathBuf,
+packages/dashboard/src-tauri/src/commands.rs:627:        home: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:628:        appdata: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:629:        localappdata: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:630:        xdg_config_home: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:631:        xdg_data_home: Option<PathBuf>,
+packages/dashboard/src-tauri/src/commands.rs:642:            mac_system_applications: PathBuf::from("/Applications"),
+packages/dashboard/src-tauri/src/commands.rs:647:fn env_path(name: &str) -> Option<PathBuf> {
+packages/dashboard/src-tauri/src/commands.rs:652:            Some(PathBuf::from(value))
+packages/dashboard/src-tauri/src/commands.rs:668:    // GUI apps do not inherit every shell PATH, so keep this list in one place
+packages/dashboard/src-tauri/src/commands.rs:692:/// work even though a GUI launch does not inherit the user's shell PATH). Pure
+packages/dashboard/src-tauri/src/commands.rs:715:        // pnpm: both the bin-link dir (on PATH for shells) and the store root.
+packages/dashboard/src-tauri/src/commands.rs:734:) -> Vec<PathBuf> {
+packages/dashboard/src-tauri/src/commands.rs:755:fn opencode_desktop_app_paths(platform: DesktopPlatform, env: &OpencodeDesktopEnv) -> Vec<PathBuf> {
+packages/dashboard/src-tauri/src/commands.rs:820:    let fut = tokio::process::Command::new(program)
+packages/dashboard/src-tauri/src/commands.rs:833:/// Run `command` through the user's login shell and return its stdout on
+packages/dashboard/src-tauri/src/commands.rs:834:/// success. GUI apps don't inherit the shell PATH, and version managers
+packages/dashboard/src-tauri/src/commands.rs:836:/// that cannot be hardcoded — but a login shell resolves them exactly as the
+packages/dashboard/src-tauri/src/commands.rs:837:/// user's terminal does. Bounded by a timeout so a slow/misconfigured shell rc
+packages/dashboard/src-tauri/src/commands.rs:840:/// portable Windows shell idiom.
+packages/dashboard/src-tauri/src/commands.rs:845:async fn run_via_login_shell(command: String) -> Option<String> {
+packages/dashboard/src-tauri/src/commands.rs:846:    // Only the user's real login shell carries their version-manager PATH; a
+packages/dashboard/src-tauri/src/commands.rs:848:    let shell = std::env::var("SHELL").ok()?;
+packages/dashboard/src-tauri/src/commands.rs:849:    let fut = tokio::process::Command::new(&shell)
+packages/dashboard/src-tauri/src/commands.rs:865:async fn run_via_login_shell(_command: String) -> Option<String> {
+packages/dashboard/src-tauri/src/commands.rs:881:    let fut = tokio::process::Command::new("where.exe")
+packages/dashboard/src-tauri/src/commands.rs:915:    run_via_login_shell("opencode --version".to_string())
+packages/dashboard/src-tauri/src/commands.rs:969:    // Login-shell fallback for version-manager (mise/nvm/fnm) installs the
+packages/dashboard/src-tauri/src/commands.rs:970:    // hardcoded candidates can't enumerate — see run_via_login_shell.
+packages/dashboard/src-tauri/src/commands.rs:971:    if let Some(text) = run_via_login_shell("opencode models".to_string()).await {
+packages/dashboard/src-tauri/src/commands.rs:1119:    if let Some(text) = run_via_login_shell("omp models --json".to_string()).await {
+packages/dashboard/src-tauri/src/commands.rs:1138:    // GUI apps on macOS don't inherit shell PATH; try common locations.
+packages/dashboard/src-tauri/src/commands.rs:1143:    // installs, custom installs, Homebrew on Intel + ARM, and shell-PATH
+packages/dashboard/src-tauri/src/commands.rs:1208:    // Resolve Pi through the user's login shell before falling back to OMP.
+packages/dashboard/src-tauri/src/commands.rs:1210:    // uncommon version manager whose shims are only present in login-shell PATH.
+packages/dashboard/src-tauri/src/commands.rs:1211:    if let Some(text) = run_via_login_shell("pi --list-models".to_string()).await {
+packages/dashboard/src-tauri/src/commands.rs:1248:    config_dir: &Path,
+packages/dashboard/src-tauri/src/commands.rs:1277:    // secret on one "Test Connection" click. Default-deny: only an explicit
+packages/dashboard/src-tauri/src/commands.rs:1294:        .map(Path::to_path_buf)
+packages/dashboard/src-tauri/src/commands.rs:1295:        .unwrap_or_else(|| PathBuf::from("."));
+packages/dashboard/src-tauri/src/commands.rs:1426:    use std::path::{Path, PathBuf};
+packages/dashboard/src-tauri/src/commands.rs:1429:    fn test_desktop_env(root: &Path) -> OpencodeDesktopEnv {
+packages/dashboard/src-tauri/src/commands.rs:1440:    fn write_file(path: PathBuf) {
+packages/retina-local-fs/src/path-fence.ts:6:export interface ResolveProviderPathOptions {
+packages/retina-local-fs/src/path-fence.ts:13:export async function resolveAndFenceProviderPath(
+packages/retina-local-fs/src/path-fence.ts:14:    configuredPath: string,
+packages/retina-local-fs/src/path-fence.ts:15:    options: ResolveProviderPathOptions,
+packages/retina-local-fs/src/path-fence.ts:18:    const expanded = configuredPath.startsWith("~/")
+packages/retina-local-fs/src/path-fence.ts:19:        ? join(home, configuredPath.slice(2))
+packages/retina-local-fs/src/path-fence.ts:20:        : configuredPath === "~"
+packages/retina-local-fs/src/path-fence.ts:22:          : configuredPath;
+packages/retina-local-fs/src/path-fence.ts:26:    const canonical = await canonicalPath(absolute, options.allowMissing);
+packages/retina-local-fs/src/path-fence.ts:27:    if (isFencedPath(canonical, home, dataDirectory)) {
+packages/retina-local-fs/src/path-fence.ts:33:export async function revalidateProviderPath(
+packages/retina-local-fs/src/path-fence.ts:34:    canonicalPath: string,
+packages/retina-local-fs/src/path-fence.ts:35:    options: ResolveProviderPathOptions,
+packages/retina-local-fs/src/path-fence.ts:37:    const revalidated = await resolveAndFenceProviderPath(canonicalPath, options);
+packages/retina-local-fs/src/path-fence.ts:38:    if (revalidated !== canonicalPath) {
+packages/retina-local-fs/src/path-fence.ts:41:            `Refusing path changed after fence check: ${canonicalPath}`,
+packages/retina-local-fs/src/path-fence.ts:48:    options: ResolveProviderPathOptions,
+packages/retina-local-fs/src/path-fence.ts:50:    const configuredHomePath = resolve(options.homeDirectory ?? process.env.HOME ?? homedir());
+packages/retina-local-fs/src/path-fence.ts:53:        home = await realpath(configuredHomePath);
+packages/retina-local-fs/src/path-fence.ts:55:        throw fsError(configuredHomePath, error);
+packages/retina-local-fs/src/path-fence.ts:63:    const dataDirectory = await canonicalPath(configuredDataDirectory, true);
+packages/retina-local-fs/src/path-fence.ts:67:async function canonicalPath(path: string, allowMissing: boolean): Promise<string> {
+packages/retina-local-fs/src/path-fence.ts:83:                    return canonicalPath(join(resolvedTarget, ...suffix), true);
+packages/retina-local-fs/src/path-fence.ts:108:export function isFencedPath(
+packages/retina-local-fs/src/path-fence.ts:109:    canonicalPath: string,
+packages/retina-local-fs/src/path-fence.ts:114:    const relativeToCortexkit = relative(cortexkitRoot, canonicalPath);
+packages/retina-local-fs/src/path-fence.ts:121:    const pathParts = canonicalPath.split(sep).filter(Boolean);
+packages/retina-local-fs/src/path-fence.ts:122:    const name = basename(canonicalPath);
+packages/retina-local-fs/src/provider.ts:7:import { resolveAndFenceProviderPath, revalidateProviderPath } from "./path-fence";
+packages/retina-local-fs/src/provider.ts:10:export { isFencedPath } from "./path-fence";
+packages/retina-local-fs/src/provider.ts:12:const execFileAsync = promisify(execFile);
+packages/retina-local-fs/src/provider.ts:67:    beforePathUseForTests?: (canonicalPath: string) => void | Promise<void>;
+packages/retina-local-fs/src/provider.ts:95:        const canonicalPath = await resolveAndFenceProviderPath(
+packages/retina-local-fs/src/provider.ts:99:        let beforePathUseForTests = options.beforePathUseForTests;
+packages/retina-local-fs/src/provider.ts:101:            const beforeUse = beforePathUseForTests;
+packages/retina-local-fs/src/provider.ts:102:            beforePathUseForTests = undefined;
+packages/retina-local-fs/src/provider.ts:103:            await beforeUse?.(canonicalPath);
+packages/retina-local-fs/src/provider.ts:104:            return revalidateProviderPath(canonicalPath, pathOptions);
+packages/retina-local-fs/src/provider.ts:114:                id: sha256(`local-fs:${canonicalPath}:${predicateHash}:${occurrence.marker}`),
+packages/retina-local-fs/src/provider.ts:116:                path: canonicalPath,
+packages/retina-local-fs/src/provider.ts:282:    const repoPath = await pathAtUse();
+packages/retina-local-fs/src/provider.ts:284:        const { stdout } = await execFileAsync("git", ["-C", repoPath, ...args], {
+packages/retina-local-fs/src/provider.ts:297:        throw new ProviderError("git_error", `Could not inspect ${repoPath}: ${message}`);
+packages/retina-local-fs/src/provider.ts:306:    const repoPath = await pathAtUse();
+packages/retina-local-fs/src/provider.ts:308:        await execFileAsync(
+packages/retina-local-fs/src/provider.ts:310:            ["-C", repoPath, "merge-base", "--is-ancestor", ancestor, descendant],
+packages/retina-local-fs/src/provider.ts:329:            `Could not compare commits in ${repoPath}: ${message}`,
+packages/retina-local-fs/src/provider.ts:422:    requireOnlyKeys(request, ["scalar", "config"], "request");
+packages/retina-local-fs/src/provider.ts:435:        requireOnlyKeys(config, ["any"], "compound config");
+packages/retina-local-fs/src/provider.ts:451:            requireOnlyKeys(
+packages/retina-local-fs/src/provider.ts:466:            requireOnlyKeys(
+packages/retina-local-fs/src/provider.ts:480:            requireOnlyKeys(
+packages/retina-local-fs/src/provider.ts:492:            requireOnlyKeys(
+packages/retina-local-fs/src/provider.ts:507:            requireOnlyKeys(
+packages/retina-local-fs/src/provider.ts:535:    requireOnlyKeys(scalar, ["version", "predicates"], "scalar");
+packages/retina-local-fs/src/provider.ts:543:        requireOnlyKeys(entry, ["state", "occurrence"], `scalar.predicates.${key}`);
+packages/retina-local-fs/src/provider.ts:562:function requireOnlyKeys(value: Record<string, unknown>, allowed: string[], field: string): void {
+### ci docs
+packages/docs/package.json:11:    "deploy": "npm run build && wrangler deploy"
+packages/docs/package.json:21:    "wrangler": "^4.105.0"
+packages/docs/wrangler.jsonc:2:    "$schema": "./node_modules/wrangler/config-schema.json",
+packages/docs/wrangler.jsonc:5:    // Static Starlight site served via Workers static assets — no Worker script.
+packages/docs/wrangler.jsonc:7:        // Built site lives under /magic-context (Astro `base`) so sibling
+.github/workflows/ci.yml:6:  pull_request:
+.github/workflows/ci.yml:35:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:37:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:43:      - uses: actions/setup-node@v4
+.github/workflows/ci.yml:48:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:103:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:105:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:110:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:128:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:130:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:135:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:160:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:161:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:166:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:193:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:194:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:199:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:230:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:231:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:236:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:265:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:267:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:272:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:286:          curl -fsSL https://opencode.ai/install | bash
+.github/workflows/ci.yml:327:      - uses: actions/checkout@v5
+.github/workflows/ci.yml:329:      - uses: oven-sh/setup-bun@v2
+.github/workflows/ci.yml:337:        run: bun install --frozen-lockfile
+.github/workflows/ci.yml:345:          curl -fsSL https://opencode.ai/install | bash
+packages/docs/astro.config.mjs:8:    site: "https://docs.cortexkit.io",
+packages/docs/astro.config.mjs:10:    // Nest output under /magic-context so the deployed asset tree matches the
