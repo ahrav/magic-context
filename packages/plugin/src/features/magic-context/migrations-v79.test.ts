@@ -35,18 +35,24 @@ function migratedDb(): Database {
     return db;
 }
 
-/** Retains migration state through v78 after removing the v79 projection objects. */
+/** Retains migration state through v78 after removing the v79/v80 objects. */
 function v78DatabaseWithNotes(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
-    db.exec("DELETE FROM schema_migrations WHERE version = 79");
+    db.exec("DELETE FROM schema_migrations WHERE version IN (79, 80)");
     db.exec(`
         DROP TRIGGER IF EXISTS notes_fts_ai;
         DROP TRIGGER IF EXISTS notes_fts_ad;
         DROP TRIGGER IF EXISTS notes_fts_au;
         DROP VIEW IF EXISTS notes_search_view;
         DROP TABLE IF EXISTS notes_fts;
+        DROP TRIGGER IF EXISTS memories_stats_ai;
+        DROP TRIGGER IF EXISTS memories_telemetry_freeze_guard;
+        DROP TRIGGER IF EXISTS memory_stats_authority_guard_insert;
+        DROP TRIGGER IF EXISTS memory_stats_authority_guard_update;
+        DROP TRIGGER IF EXISTS memory_stats_authority_guard_delete;
+        DROP TABLE IF EXISTS memory_stats;
     `);
     return db;
 }
@@ -116,7 +122,6 @@ describe("migration v79: notes_fts candidate projection", () => {
             expect(objectExists(db, "notes_search_view")).toBe(true);
             expect(triggerNames(db)).toEqual(["notes_fts_ad", "notes_fts_ai", "notes_fts_au"]);
             expect(appliedVersionCount(db, 79)).toBe(1);
-            expect(LATEST_SUPPORTED_VERSION).toBe(79);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);

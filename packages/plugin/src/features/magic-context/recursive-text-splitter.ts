@@ -41,39 +41,52 @@ function splitOnSeparator(text: string, separator: string): string[] {
  * `lengthFunction`), joining with `separator`. Ported from upstream
  * `mergeSplits` with `chunkOverlap = 0` (so the overlap shift loop reduces to
  * "drain currentDoc once the running total exceeds the budget").
+ *
+ * `lens[i]` caches `lengthFunction(splits[i])`, measured once per split level
+ * in `splitTextRecursive`. The merge window is tracked with indices into
+ * `splits` instead of a mutated array front, replacing the upstream `shift()`
+ * drain — which re-tokenized and re-copied the accumulated window on every
+ * flush — with O(1) index arithmetic. Drain semantics are replicated exactly
+ * (including the `total > 0` stop condition, which can leave zero-length-
+ * measured fragments in the window), so emitted chunks are byte-identical to
+ * the upstream algorithm.
  */
 function mergeSplits(
     splits: string[],
+    lens: number[],
     separator: string,
     chunkSize: number,
-    lengthFunction: LengthFunction,
 ): string[] {
     const docs: string[] = [];
-    const currentDoc: string[] = [];
+    const separatorLength = separator.length;
+    let start = 0;
+    let end = 0;
     let total = 0;
-    const joinDocs = (docsToJoin: string[]): string | null => {
-        const joined = docsToJoin.join(separator).trim();
+    const joinDocs = (from: number, to: number): string | null => {
+        const joined = splits.slice(from, to).join(separator).trim();
         return joined === "" ? null : joined;
     };
-    for (const d of splits) {
-        const len = lengthFunction(d);
-        if (total + len + currentDoc.length * separator.length > chunkSize) {
-            if (currentDoc.length > 0) {
-                const doc = joinDocs(currentDoc);
+    for (let i = 0; i < splits.length; i += 1) {
+        const len = lens[i];
+        if (total + len + (end - start) * separatorLength > chunkSize) {
+            if (end - start > 0) {
+                const doc = joinDocs(start, end);
                 if (doc !== null) docs.push(doc);
                 // chunkOverlap = 0: upstream's drain loop condition
                 // `while (total > chunkOverlap || ...)` reduces to `while (total > 0)`,
-                // i.e. fully flush the accumulated window before starting the next.
-                while (total > 0 && currentDoc.length > 0) {
-                    total -= lengthFunction(currentDoc[0]);
-                    currentDoc.shift();
+                // i.e. flush the accumulated window before starting the next.
+                // `total > 0` preserves zero-length-measured fragments after the
+                // drain, matching upstream.
+                while (total > 0 && end - start > 0) {
+                    total -= lens[start];
+                    start += 1;
                 }
             }
         }
-        currentDoc.push(d);
+        end = i + 1;
         total += len;
     }
-    const doc = joinDocs(currentDoc);
+    const doc = joinDocs(start, end);
     if (doc !== null) docs.push(doc);
     return docs;
 }
@@ -103,14 +116,18 @@ function splitTextRecursive(
 
     const splits = splitOnSeparator(text, separator);
     let goodSplits: string[] = [];
+    let goodLens: number[] = [];
     // keepSeparator = false → join merged pieces with the separator.
     for (const s of splits) {
-        if (lengthFunction(s) < chunkSize) {
+        const len = lengthFunction(s);
+        if (len < chunkSize) {
             goodSplits.push(s);
+            goodLens.push(len);
         } else {
             if (goodSplits.length) {
-                finalChunks.push(...mergeSplits(goodSplits, separator, chunkSize, lengthFunction));
+                finalChunks.push(...mergeSplits(goodSplits, goodLens, separator, chunkSize));
                 goodSplits = [];
+                goodLens = [];
             }
             if (!newSeparators) {
                 // No finer separator left — emit as-is (caller applies a hard
@@ -124,7 +141,7 @@ function splitTextRecursive(
         }
     }
     if (goodSplits.length) {
-        finalChunks.push(...mergeSplits(goodSplits, separator, chunkSize, lengthFunction));
+        finalChunks.push(...mergeSplits(goodSplits, goodLens, separator, chunkSize));
     }
     return finalChunks;
 }

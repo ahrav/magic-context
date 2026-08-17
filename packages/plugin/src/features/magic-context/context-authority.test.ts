@@ -986,6 +986,150 @@ describe("memory authority protocol", () => {
         ).toEqual({ count: 0 });
     });
 
+    test("telemetry-only mirror snapshots update memory_stats without touching the base row", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        const snapshot = (extra: Record<string, unknown> = {}) => ({
+            id: 1,
+            project_path: "/repo",
+            category: "CONSTRAINTS",
+            content: "stable content",
+            normalized_hash: "h1",
+            importance: 50,
+            scope: "project",
+            shareable: 0,
+            source_session_id: null,
+            source_type: "agent",
+            seen_count: 1,
+            retrieval_count: 0,
+            first_seen_at: 0,
+            created_at: 0,
+            updated_at: 1,
+            last_seen_at: 1,
+            last_retrieved_at: null,
+            status: "active",
+            expires_at: null,
+            verification_status: "unverified",
+            verified_at: null,
+            classified_at: null,
+            superseded_by_memory_id: null,
+            merged_from: null,
+            metadata_json: null,
+            context_store_uuid: storeUuid,
+            context_row_id: 1,
+            ...extra,
+        });
+        const page = (
+            cursor: number,
+            next_cursor: number,
+            rows: ChangefeedPage["rows"],
+        ): ChangefeedPage => ({ domain: "memories", cursor, next_cursor, has_more: false, rows });
+        applyMirrorPage({
+            db: database,
+            page: page(0, 1, [
+                {
+                    feed_seq: 1,
+                    domain: "memories",
+                    op: "insert",
+                    module_row_id: 1,
+                    full_row_snapshot: snapshot(),
+                    content_hash: "h1",
+                },
+            ]),
+        });
+        const contextId = (
+            database
+                .prepare(
+                    "SELECT context_row_id AS id FROM mirror_identity WHERE domain = 'memories' AND module_row_id = 1",
+                )
+                .get() as { id: number }
+        ).id;
+        const baseBefore = database
+            .prepare(
+                "SELECT content, updated_at, seen_count, retrieval_count FROM memories WHERE id = ?",
+            )
+            .get(contextId);
+        database.exec(`
+            CREATE TABLE test_base_update_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id INTEGER);
+            CREATE TRIGGER test_memories_update_audit AFTER UPDATE ON memories BEGIN
+                INSERT INTO test_base_update_audit (memory_id) VALUES (NEW.id);
+            END;
+        `);
+
+        applyMirrorPage({
+            db: database,
+            page: page(1, 2, [
+                {
+                    feed_seq: 2,
+                    domain: "memories",
+                    op: "update",
+                    module_row_id: 1,
+                    full_row_snapshot: snapshot({
+                        seen_count: 6,
+                        retrieval_count: 2,
+                        last_seen_at: 9,
+                        last_retrieved_at: 8,
+                        updated_at: 9,
+                    }),
+                    content_hash: "h1",
+                },
+            ]),
+        });
+
+        expect(database.prepare("SELECT COUNT(*) AS n FROM test_base_update_audit").get()).toEqual({
+            n: 0,
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT content, updated_at, seen_count, retrieval_count FROM memories WHERE id = ?",
+                )
+                .get(contextId),
+        ).toEqual(baseBefore);
+        expect(
+            database
+                .prepare(
+                    "SELECT seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at FROM memory_stats WHERE memory_id = ?",
+                )
+                .get(contextId),
+        ).toEqual({
+            seen_count: 6,
+            retrieval_count: 2,
+            last_seen_at: 9,
+            last_retrieved_at: 8,
+            updated_at: 9,
+        });
+
+        // A content change still updates the base row (and fires the audit).
+        applyMirrorPage({
+            db: database,
+            page: page(2, 3, [
+                {
+                    feed_seq: 3,
+                    domain: "memories",
+                    op: "update",
+                    module_row_id: 1,
+                    full_row_snapshot: snapshot({
+                        content: "replaced content",
+                        normalized_hash: "h2",
+                        seen_count: 6,
+                        retrieval_count: 2,
+                        last_seen_at: 9,
+                        last_retrieved_at: 8,
+                        updated_at: 12,
+                    }),
+                    content_hash: "h2",
+                },
+            ]),
+        });
+        expect(
+            database.prepare("SELECT content FROM memories WHERE id = ?").get(contextId),
+        ).toEqual({ content: "replaced content" });
+        expect(database.prepare("SELECT COUNT(*) AS n FROM test_base_update_audit").get()).toEqual({
+            n: 1,
+        });
+    });
+
     test("mirror-back keeps same content in separate project rows", () => {
         const database = db();
         withPrivilegedWriter(database, () => {

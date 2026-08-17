@@ -9,6 +9,7 @@ import {
     resolveProjectIdentityStrict,
 } from "./memory/project-identity";
 import { rekeyMemoryRowWithCollisionMerge } from "./memory/relocate-memory";
+import { hasMemoryStatsTable } from "./memory/storage-memory";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 
 export const BATCH_SIZE = 25;
@@ -241,10 +242,15 @@ export async function runDeferredV22Backfill(
 
     await yieldToEventLoop();
 
+    const statsBacked = hasMemoryStatsTable(db);
+    const seenCountSql = statsBacked
+        ? "(SELECT s.seen_count FROM memory_stats s WHERE s.memory_id = memories.id) AS seen_count"
+        : "seen_count";
+
     while (true) {
         const batch = db
             .prepare(
-                `SELECT id, project_path, category, normalized_hash, seen_count
+                `SELECT id, project_path, category, normalized_hash, ${seenCountSql}
                  FROM memories
                  WHERE id > ?
                    AND project_path NOT LIKE 'git:%'
@@ -293,11 +299,13 @@ export async function runDeferredV22Backfill(
             // written under multiple raw legacy paths (e.g. symlinked / pre-identity
             // paths) that all resolve to the same git:/dir: identity.
             const findCollision = db.prepare(
-                `SELECT id, seen_count FROM memories
+                `SELECT id, ${seenCountSql} FROM memories
                  WHERE project_path = ? AND category = ? AND normalized_hash = ?
                  LIMIT 1`,
             );
-            const bumpSeenCount = db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?");
+            const bumpSeenCount = statsBacked
+                ? db.prepare("UPDATE memory_stats SET seen_count = ? WHERE memory_id = ?")
+                : db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?");
             // Preserve an embedding on the surviving target BEFORE the source row's
             // embedding FK-cascades away on DELETE. Same fix as the live
             // collision-merge path (rekeyMemoryRowWithCollisionMerge): the two rows

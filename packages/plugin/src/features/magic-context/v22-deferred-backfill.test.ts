@@ -83,7 +83,9 @@ describe("runDeferredV22Backfill", () => {
         const summary = await runDeferredV22Backfill(database, {
             resolveIdentity: (raw) => `git:${raw.split("-").at(-1)}`,
             yieldToEventLoop: async () => {},
-            onBatchResolved: (batch) => batchSizes.push(batch.length),
+            onBatchResolved: (batch) => {
+                batchSizes.push(batch.length);
+            },
         });
 
         expect(summary.changedRows).toBe(100);
@@ -151,7 +153,9 @@ describe("runDeferredV22Backfill", () => {
         const firstId = insertMemory(database, "/proj/canonical", "dup-hash");
         const secondId = insertMemory(database, "/proj/symlinked", "dup-hash");
         // Give the second (later) row a higher seen_count to verify merge keeps max.
-        database.prepare("UPDATE memories SET seen_count = 9 WHERE id = ?").run(secondId);
+        database
+            .prepare("UPDATE memory_stats SET seen_count = 9 WHERE memory_id = ?")
+            .run(secondId);
 
         const summary = await runDeferredV22Backfill(database, {
             resolveIdentity: () => "git:sharedidentity",
@@ -163,7 +167,7 @@ describe("runDeferredV22Backfill", () => {
         // Exactly one surviving row under the shared identity.
         const survivors = database
             .prepare(
-                "SELECT id, seen_count FROM memories WHERE project_path = 'git:sharedidentity' AND normalized_hash = 'dup-hash'",
+                "SELECT m.id, s.seen_count FROM memories m JOIN memory_stats s ON s.memory_id = m.id WHERE m.project_path = 'git:sharedidentity' AND m.normalized_hash = 'dup-hash'",
             )
             .all() as Array<{ id: number; seen_count: number }>;
         expect(survivors).toHaveLength(1);
