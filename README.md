@@ -2,16 +2,14 @@
 
 <p align="center">
   <strong>Unbounded context. Memory that manages itself. One session, for life.</strong><br>
-  The hippocampus for coding agents, part of CortexKit.
+  The hippocampus for coding agents.
 </p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@cortexkit/magic-context"><img src="https://img.shields.io/npm/v/@cortexkit/magic-context?label=cli&color=orange&style=flat-square" alt="npm @cortexkit/magic-context"></a>
   <a href="https://www.npmjs.com/package/@cortexkit/opencode-magic-context"><img src="https://img.shields.io/npm/v/@cortexkit/opencode-magic-context?label=opencode&color=blue&style=flat-square" alt="npm @cortexkit/opencode-magic-context"></a>
   <a href="https://www.npmjs.com/package/@cortexkit/pi-magic-context"><img src="https://img.shields.io/npm/v/@cortexkit/pi-magic-context?label=pi&color=purple&style=flat-square" alt="npm @cortexkit/pi-magic-context"></a>
-  <a href="https://discord.gg/DSa65w8wuf"><img src="https://img.shields.io/discord/1488852091056295957?style=flat-square&logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Discord"></a>
-  <a href="https://github.com/cortexkit/magic-context/stargazers"><img src="https://img.shields.io/github/stars/cortexkit/magic-context?style=flat-square&color=yellow" alt="stars"></a>
-  <a href="https://github.com/cortexkit/magic-context/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License"></a>
+  <a href="https://github.com/ahrav/magic-context/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License"></a>
 </p>
 
 <p align="center">
@@ -21,15 +19,13 @@
 <p align="center">
   <a href="#what-is-magic-context">What is Magic Context?</a> ·
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#part-of-cortexkit">CortexKit</a> ·
   <a href="#-context-management">Context</a> ·
   <a href="#-capture">Capture</a> ·
   <a href="#-consolidate">Consolidate</a> ·
   <a href="#-recall">Recall</a> ·
   <a href="https://docs.cortexkit.io/magic-context">Docs</a> ·
   <a href="./CONFIGURATION.md">Configuration</a> ·
-  <a href="https://github.com/cortexkit/magic-context/releases?q=dashboard&expanded=true">Dashboard</a> ·
-  <a href="https://discord.gg/DSa65w8wuf">💬 Discord</a>
+  <a href="https://github.com/cortexkit/magic-context/releases?q=dashboard&expanded=true">Dashboard</a>
 </p>
 
 ---
@@ -58,12 +54,12 @@ Run the interactive setup wizard. It detects your models, configures everything,
 
 **macOS / Linux:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cortexkit/magic-context/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ahrav/magic-context/main/scripts/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/cortexkit/magic-context/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/ahrav/magic-context/main/scripts/install.ps1 | iex
 ```
 
 **Or run directly (any OS):**
@@ -92,7 +88,7 @@ Then create `magic-context.jsonc` with the one setting the historian needs:
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json",
+  "$schema": "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
   "historian": { "model": "provider/model-id" }
 }
 ```
@@ -130,22 +126,6 @@ Magic Context owns context management end to end, so it **disables itself** if a
 Run `npx @cortexkit/magic-context@latest doctor` any time to re-check and auto-fix.
 
 </details>
-
----
-
-## Part of CortexKit
-
-A brain isn't one organ. Neither is a capable coding agent.
-
-**CortexKit** is a family of plugins, each modeled on a different region of the brain. Install one and your agent gets sharper. Install all three and it has a brain.
-
-| Plugin | Region | What it does |
-|---|---|---|
-| **Magic Context** *(you are here)* | Hippocampus & medial temporal lobe | Self-managing context and long-term memory. Keeps sessions running with no compaction pauses while it forms, consolidates, and recalls project knowledge across them. |
-| **[AFT](https://github.com/cortexkit/aft)** | Sensorimotor cortex | Perceives code structure and acts on it precisely. A proper IDE and OS for your agent. |
-| **Alfonso** *(coming soon)* | Prefrontal cortex | Executive control. Plans, decomposes work, chooses agents and models, and decides when to ask, verify, and commit. |
-
-Magic Context is **1 of the 3 plugins you'll ever need.** It remembers; AFT perceives and acts; Alfonso decides. They share one CortexKit store, so memory pools across harnesses and tools.
 
 ---
 
@@ -290,18 +270,6 @@ Magic Context also writes to a few other locations:
 | `$MAGIC_CONTEXT_LOG_PATH` (default: `${TMPDIR}/opencode/magic-context/magic-context.log`, `pi/` for Pi) | Diagnostic log. Set `MAGIC_CONTEXT_LOG_PATH` to redirect it (e.g. to a persistent path in a container). | Disposable. |
 
 **Sandboxed / ephemeral environments (Docker, CI, disposable containers):** mount the `~/.local/share/cortexkit/magic-context/` directory on a persistent volume so the database and model cache survive between runs. If only the model cache is ephemeral, the model is simply re-downloaded; if the database is ephemeral, memory and history don't accumulate. To avoid the ~90 MB model download entirely, set `memory.enabled: false` or point `embedding` at a remote `openai_compatible`/`ollama` backend.
-
----
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=cortexkit%2Fmagic-context&type=date&legend=bottom-right">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=cortexkit/magic-context&type=date&theme=dark&legend=bottom-right&sealed_token=8tgpBwlCfG4Vl1P1ink58E2ocwGiJZ7EfwQLdovNyFh8gqF6In4EhvfaIx8p_C6KztsJtU389KpouCB0HKrjDqN06WULjeHrc1uGhnHHpqDJHv_eAa2zWA" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=cortexkit/magic-context&type=date&legend=bottom-right&sealed_token=8tgpBwlCfG4Vl1P1ink58E2ocwGiJZ7EfwQLdovNyFh8gqF6In4EhvfaIx8p_C6KztsJtU389KpouCB0HKrjDqN06WULjeHrc1uGhnHHpqDJHv_eAa2zWA" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=cortexkit/magic-context&type=date&legend=bottom-right&sealed_token=8tgpBwlCfG4Vl1P1ink58E2ocwGiJZ7EfwQLdovNyFh8gqF6In4EhvfaIx8p_C6KztsJtU389KpouCB0HKrjDqN06WULjeHrc1uGhnHHpqDJHv_eAa2zWA" />
- </picture>
-</a>
 
 ---
 

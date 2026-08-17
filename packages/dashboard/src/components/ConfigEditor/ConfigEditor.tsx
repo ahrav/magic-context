@@ -22,7 +22,7 @@ import PerModelField from "./PerModelField";
 
 const CONFIG_TAB_STORAGE_KEY = "magic-context-dashboard.config-tab";
 const MAGIC_CONTEXT_SCHEMA_URL =
-  "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json";
+  "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json";
 const USER_DEFAULT_CONFIG = `{
   "$schema": "${MAGIC_CONTEXT_SCHEMA_URL}",
   "enabled": true

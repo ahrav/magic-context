@@ -37,9 +37,9 @@ describe("detectRecentCommit", () => {
 	});
 
 	it("recognizes 'committed' (past tense) as a commit verb", () => {
-		expect(
-			detectRecentCommit([assistant("I committed 1234abc to master")]),
-		).toBe(true);
+		expect(detectRecentCommit([assistant("I committed 1234abc to main")])).toBe(
+			true,
+		);
 	});
 
 	it("recognizes 'merge' / 'rebase' / 'cherry-pick' as commit verbs", () => {

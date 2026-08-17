@@ -54,7 +54,7 @@ describe("parseCompartmentOutput — v2 5-category facts", () => {
 * Keep the magic-context rename broad.
 </USER_DIRECTIVES>
 <WORKFLOW_RULES>
-* Use scripts/release.sh.
+* Follow the project release checklist.
 </WORKFLOW_RULES>
 <ARCHITECTURE_DECISIONS>
 * This should not parse as a fact.
@@ -348,7 +348,7 @@ describe("parseCompartmentOutput — fact scoping (audit Fix 6)", () => {
         const parsed = parseCompartmentOutput(`
 <output>
 <PROJECT_RULES>
-* Use scripts/release.sh for releases.
+* Follow the project release checklist.
 </PROJECT_RULES>
 <events>
 <trajectory_correction at_compartment="1">

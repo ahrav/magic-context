@@ -1,6 +1,6 @@
 {
   "artifactId": "prompt-surface-budget",
-  "revision": "s2-r1",
+  "revision": "s2-r2",
   "status": "PENDING-RATIFICATION",
   "policy": {
     "expression": "floor(0.50 * mutableProseBaseline)",
@@ -37,14 +37,14 @@
   ],
   "fullMeasurements": {
     "guidance": {
-      "primary-full-reduce-memory-on": { "chars": 8714, "tokens": 2003 },
+      "primary-full-reduce-memory-on": { "chars": 8727, "tokens": 2002 },
       "primary-full-reduce-memory-off": { "chars": 7679, "tokens": 1744 },
-      "primary-full-no-reduce-memory-on": { "chars": 6429, "tokens": 1477 },
+      "primary-full-no-reduce-memory-on": { "chars": 6442, "tokens": 1476 },
       "primary-full-no-reduce-memory-off": { "chars": 5394, "tokens": 1218 },
-      "primary-full-reduce-dreamer-off": { "chars": 8385, "tokens": 1926 },
-      "primary-full-reduce-temporal-off": { "chars": 8279, "tokens": 1896 },
-      "primary-full-reduce-caveman-on": { "chars": 9329, "tokens": 2129 },
-      "primary-full-reduce-language-on": { "chars": 8914, "tokens": 2049 },
+      "primary-full-reduce-dreamer-off": { "chars": 8398, "tokens": 1925 },
+      "primary-full-reduce-temporal-off": { "chars": 8292, "tokens": 1895 },
+      "primary-full-reduce-caveman-on": { "chars": 9342, "tokens": 2128 },
+      "primary-full-reduce-language-on": { "chars": 8927, "tokens": 2048 },
       "subagent-reduce": { "chars": 679, "tokens": 185 }
     },
     "toolDescriptions": {
@@ -62,9 +62,9 @@
       "ctx_search": { "chars": 777, "tokens": 184 },
       "totalTokens": 910
     },
-    "builtInProviderVisibleTotal": 4560
+    "builtInProviderVisibleTotal": 4559
   },
-  "mutableProseBaseline": 3650,
+  "mutableProseBaseline": 3649,
   "integerLightCeiling": 1825,
   "includedSurfaces": [
     "The primary built-in full guidance section for the exact feature variant above.",

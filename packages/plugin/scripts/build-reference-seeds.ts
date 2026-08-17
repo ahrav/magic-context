@@ -78,11 +78,11 @@ writeFileSync(OUT, header, "utf-8");
 
 // Format the emitted file with biome so it matches repo style (4-space indent).
 // The template above is hand-indented 2-space and JSON.stringify uses 2-space;
-// without this, the generated file fails the lint gate. release.sh lints BEFORE
+// without this, the generated file fails the lint gate. Release checks lint before
 // regenerating, so an unformatted emit would otherwise only surface in CI.
 // biome resolves its config + include scope from cwd, so run it with cwd set to
 // the plugin package root (where biome.json lives and src/** is in scope) — the
-// script may be invoked from the repo root (e.g. release.sh) where the plugin's
+// script may be invoked from the repo root where the plugin's
 // generated path is not in biome's include set and the format would be a no-op.
 const pluginRoot = resolve(here, "..");
 const fmt = spawnSync("bunx", ["biome", "check", "--write", OUT], {

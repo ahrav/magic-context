@@ -18,7 +18,7 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 │   ├── dashboard/          # Dashboard (Tauri-based)
 │   ├── docs/               # Project documentation website
 │   └── e2e-tests/          # End-to-end integration tests
-├── scripts/                # Local maintenance, release, and install scripts
+├── scripts/                # Local maintenance and install scripts
 ├── docs/                   # Workspace design references for major subsystems
 ├── Cargo.toml              # Rust workspace configuration
 ├── package.json            # Monorepo workspace configuration
@@ -84,9 +84,9 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 - Key files: `src/shared/logger.ts`, `src/shared/data-path.ts`, `src/shared/jsonc-parser.ts`, `src/shared/sqlite.ts`, `src/shared/rpc-server.ts`, `src/shared/rpc-client.ts`, `src/shared/conflict-detector.ts`, `src/shared/model-suggestion-retry.ts`, `src/shared/resolve-fallbacks.ts`, `src/shared/harness.ts`, `src/shared/tag-transcript.ts`, `src/shared/commit-detection.ts`, `src/shared/harness-provider-map.ts`, `src/shared/exit-abort-registry.ts`, `src/shared/redaction.ts`, `src/shared/escalation-bands.ts`, `src/shared/context-limit-provenance.ts`, `src/shared/storage-permissions.ts`, `src/shared/tui-runtime-specifiers.ts`, `src/shared/prompt-surface.ts`, `src/shared/prompt-surface-runtime.ts`, `src/shared/prompt-surface-a1-golden.ts`
 
 **`scripts/`:**
-- Purpose: Support local inspection and maintenance outside the plugin runtime.
-- Contains: Bun and shell scripts for dumps, release coordination, and version sync; package-specific inspection and benchmark scripts live under `packages/plugin/scripts/`.
-- Key files: `scripts/context-dump.ts`, `scripts/release.sh`, `scripts/version-sync.mjs`, `packages/plugin/scripts/tail-view.ts`, `packages/plugin/scripts/backfill-embeddings.ts`, `packages/plugin/scripts/build-schema.ts`, `packages/plugin/scripts/benchmark-tag-queries.ts`, `packages/plugin/scripts/benchmark-message-fts.ts`, `packages/plugin/scripts/export-project-identities.ts`
+- Purpose: Support local inspection, installation, and maintenance outside the plugin runtime.
+- Contains: Bun and shell scripts for dumps and installation; package-specific inspection and benchmark scripts live under `packages/plugin/scripts/`.
+- Key files: `scripts/context-dump.ts`, `scripts/install.sh`, `scripts/install.ps1`, `packages/plugin/scripts/tail-view.ts`, `packages/plugin/scripts/backfill-embeddings.ts`, `packages/plugin/scripts/build-schema.ts`, `packages/plugin/scripts/benchmark-tag-queries.ts`, `packages/plugin/scripts/benchmark-message-fts.ts`, `packages/plugin/scripts/export-project-identities.ts`
 
 **`docs/`:**
 - Purpose: Keep longer-lived subsystem design references, specs, and operational audit notes separate from root operational docs.
@@ -125,7 +125,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/config/schema/agent-overrides.ts`: Define overridable built-in agents.
 - `src/config/transform-mode.ts`: Resolve transform mode (TS vs Rust) based on configuration and system capabilities.
 - `src/shared/prompt-surface.ts` and `src/shared/prompt-surface-runtime.ts` (with golden accessors in `src/shared/prompt-surface-a1-golden.ts`): Resolve prompt surface presets ("full" vs "light", 1825-token ceiling) and guidance selection.
-- `assets/magic-context.schema.json`: Generated JSON schema, kept in sync via `packages/plugin/scripts/build-schema.ts` and `scripts/release.sh`.
+- `assets/magic-context.schema.json`: Generated JSON schema, kept in sync via `packages/plugin/scripts/build-schema.ts`.
 
 **Core Logic:**
 - `src/hooks/magic-context/transform.ts`: Run the turn transform; orchestrate tagging, replay paths, prepareCompartmentInjection, and downstream postprocess hand-off.

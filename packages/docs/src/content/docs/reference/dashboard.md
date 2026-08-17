@@ -15,7 +15,7 @@ Prebuilt installers for every release are on the [dashboard releases page](https
 
 Grab the file for your platform from the newest `dashboard-vX.Y.Z` release. The dashboard reads the same SQLite store as the plugin, so it is safe to run alongside any plugin version (it degrades gracefully if your database predates the plugin features it surfaces).
 
-You can also build from source: see the dashboard `README` in the [magic-context](https://github.com/cortexkit/magic-context) repo (`packages/dashboard`).
+You can also build from source: see the dashboard `README` in the [magic-context](https://github.com/ahrav/magic-context) repo (`packages/dashboard`).
 
 ## Browser mode (`--serve`)
 

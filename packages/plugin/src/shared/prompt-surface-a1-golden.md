@@ -5,7 +5,7 @@ Token counts are Claude BPE estimates on the raw text.
 
 ## 1. System-prompt guidance section
 
-### PRIMARY full (reduce=on, memory=on, dreamer=on, temporal=on) — 8714 chars, ~2003 tokens
+### PRIMARY full (reduce=on, memory=on, dreamer=on, temporal=on) — 8727 chars, ~2002 tokens
 
 ```markdown
 ## Magic Context
@@ -30,7 +30,7 @@ Use `ctx_memory` for durable project knowledge: write what future sessions must 
 Memories are grouped by category as `#id: fact` lines; pass the numeric id to `ctx_memory` actions.
 **Save to memory proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), save it with `ctx_memory` so future sessions don't repeat the search. Examples:
 - Found a project's source code path after searching → `ctx_memory(action="write", category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode")`
-- Discovered a non-obvious build/test command → `ctx_memory(action="write", category="PROJECT_RULES", content="Always use scripts/release.sh for releases")`
+- Discovered a non-obvious build/test command → `ctx_memory(action="write", category="PROJECT_RULES", content="Always run the full release checklist before publishing")`
 - Learned a constraint the hard way → `ctx_memory(action="write", category="CONSTRAINTS", content="Dashboard Tauri build needs RGBA PNGs, not grayscale")`
 Use `ctx_search` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use `ctx_expand` to recover the raw conversation behind a summary under a `## start-end · date · title` heading inside `<session-history>` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
@@ -131,7 +131,7 @@ Example: `ctx_note(action="write", content="Implement X because Y", surface_cond
 Prefer many small targeted operations over one large blanket operation, and keep the working set tidy as routine maintenance.
 ```
 
-### PRIMARY reduce-off (reduce=off, memory=on) — 6429 chars, ~1477 tokens
+### PRIMARY reduce-off (reduce=off, memory=on) — 6442 chars, ~1476 tokens
 
 ```markdown
 ## Magic Context
@@ -153,7 +153,7 @@ Use `ctx_memory` for durable project knowledge: write what future sessions must 
 Memories are grouped by category as `#id: fact` lines; pass the numeric id to `ctx_memory` actions.
 **Save to memory proactively**: If you spent multiple turns finding something (a file path, a DB location, a config pattern, a workaround), save it with `ctx_memory` so future sessions don't repeat the search. Examples:
 - Found a project's source code path after searching → `ctx_memory(action="write", category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode")`
-- Discovered a non-obvious build/test command → `ctx_memory(action="write", category="PROJECT_RULES", content="Always use scripts/release.sh for releases")`
+- Discovered a non-obvious build/test command → `ctx_memory(action="write", category="PROJECT_RULES", content="Always run the full release checklist before publishing")`
 - Learned a constraint the hard way → `ctx_memory(action="write", category="CONSTRAINTS", content="Dashboard Tauri build needs RGBA PNGs, not grayscale")`
 Use `ctx_search` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.
 Use `ctx_expand` to recover the raw conversation behind a summary under a `## start-end · date · title` heading inside `<session-history>` — pass the heading's start/end range when the summary is not enough (exact wording, values, error text).
@@ -450,9 +450,9 @@ The hash handler persists the MD5 of `output.system.join("\\n")`. The values bel
 
 | Variant | Guidance bytes | MD5 system-prompt hash |
 |---|---:|---|
-| PRIMARY full | 8778 | `e8606e8e36cf19f5588ae0a76ce23b0e` |
+| PRIMARY full | 8791 | `7c7e856f46d797f0a912884ae44d0f30` |
 | PRIMARY memory-off | 7737 | `4d528493cac10523f815689677c46ea1` |
-| PRIMARY reduce-off | 6471 | `f5e8089b0ec037f8a81c648edd141913` |
+| PRIMARY reduce-off | 6484 | `d10f4adc89d492244af2fbef8217e423` |
 | SUBAGENT minimal | 691 | `83d69748f204fff98249565d5a31aa99` |
 
 The OpenCode and Pi runtime compatibility tests consume this snapshot for omitted `prompt_surface` and explicit `{ default: "full" }`: both assert guidance, registered tool descriptions, tool IDs, and hashes; OpenCode also asserts these parameter schemas directly, while Pi asserts its TypeBox-owned schemas stay byte-identical across both config forms.

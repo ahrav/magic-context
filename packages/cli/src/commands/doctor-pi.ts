@@ -874,7 +874,7 @@ function writeDefaultMagicContextConfig(path: string): void {
     mkdirSync(dirname(path), { recursive: true });
     const config = {
         $schema:
-            "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json",
+            "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
         ...MagicContextConfigSchema.parse({}),
     };
     writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`);

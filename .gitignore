@@ -32,7 +32,7 @@ packages/dashboard/dist/
 packages/dashboard/node_modules/
 packages/dashboard/src-tauri/target/
 
-# Plugin README is copied from root at release time
+# Plugin README is generated from the root README when packaging.
 packages/plugin/README.md
 .bg-shell/
 
@@ -41,21 +41,14 @@ packages/plugin/docs/animation[0-9]*/
 
 .pi/
 
-# Local agent task outputs, scratch state, and MC's own dogfooding runtime
-# artifacts (historian dumps, fenced .gitignore) — local state, never source.
-# Selectively expose .cortexkit/alfonso/release-notes/ — CI reads it for the
-# release body + Discord announcement. Must use `dir/*` rather than `dir/` so
-# git descends into the directory and can re-include nested paths.
-.cortexkit/*
-!.cortexkit/alfonso/
-.cortexkit/alfonso/*
-!.cortexkit/alfonso/release-notes/
+# Local agent task outputs and Magic Context dogfooding state.
+.cortexkit/
 
 # Prompt/model experiment harnesses (model-dispatch, replay, migration validation).
 # Kept on disk for reuse but excluded from git + CI typecheck: they intentionally
 # track in-flight prompt/signature shapes that drift faster than production src,
 # so committing them would couple CI to experiment state. Production generators
-# (scripts/build-*.ts) stay tracked — they are wired into release.sh.
+# (scripts/build-*.ts) stay tracked because builds and tests use them.
 packages/plugin/scripts/experiments/
 scripts/experiments/
 # Same experiment harnesses when dropped at scripts/ root (not under experiments/).
@@ -78,27 +71,9 @@ docs/specs/
 # Rust workspace build output
 /target
 
-# Keep the reproducible visual-memory v3 inputs and latest report while leaving
-# generated model responses and PNG trial artifacts local.
-!packages/plugin/scripts/experiments/
-!packages/plugin/scripts/experiments/visual-memory/
-!packages/plugin/scripts/experiments/visual-memory/run-palace-trial.ts
-!packages/plugin/scripts/experiments/visual-memory/corpus/
-packages/plugin/scripts/experiments/visual-memory/corpus/*
-!packages/plugin/scripts/experiments/visual-memory/trials/
-packages/plugin/scripts/experiments/visual-memory/trials/*
-!packages/plugin/scripts/experiments/visual-memory/trials/REPORT.md
-
-# Palace experiment outputs derive from the real project memory pool — never public.
-packages/plugin/scripts/experiments/visual-memory/palace.txt
-packages/plugin/scripts/experiments/visual-memory/coverage.json
-packages/plugin/scripts/experiments/visual-memory/spec-*.json
-packages/plugin/scripts/experiments/visual-memory/TRIAL-REPORT.md
-
 # Local experiment scratch under scripts/experiments/ — dev-only harnesses and
-# their outputs, several run against REAL session/memory data and must never be
-# tracked. The visual-memory harness CODE is tracked explicitly; everything else
-# here stays local.
+# their outputs, several run against real session/memory data and must never be
+# tracked.
 packages/plugin/scripts/experiments/gap-heal/
 packages/plugin/scripts/experiments/language/
 packages/plugin/scripts/experiments/maintain-memory/
@@ -107,8 +82,6 @@ packages/plugin/scripts/experiments/smart-drops/
 packages/plugin/scripts/experiments/caveman/
 packages/plugin/scripts/experiments/bench-local-embed.ts
 packages/plugin/scripts/experiments/issue-195-repro.mjs
-packages/plugin/scripts/experiments/visual-memory/render-trimmed-memories.ts
-packages/plugin/scripts/experiments/visual-memory/trials/REPORT.md
 packages/plugin/scripts/mural-test-output/
 AgentLogs/
 .agent-logs/

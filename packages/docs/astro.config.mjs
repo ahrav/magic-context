@@ -23,12 +23,12 @@ export default defineConfig({
                 {
                     icon: "github",
                     label: "GitHub",
-                    href: "https://github.com/cortexkit/magic-context",
+                    href: "https://github.com/ahrav/magic-context",
                 },
                 { icon: "discord", label: "Discord", href: "https://discord.gg/DSa65w8wuf" },
             ],
             editLink: {
-                baseUrl: "https://github.com/cortexkit/magic-context/edit/main/packages/docs/",
+                baseUrl: "https://github.com/ahrav/magic-context/edit/main/packages/docs/",
             },
             sidebar: [
                 {

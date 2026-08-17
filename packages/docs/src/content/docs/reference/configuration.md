@@ -18,7 +18,7 @@ Add the schema line for editor validation and autocomplete:
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json"
+  "$schema": "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json"
 }
 ```
 

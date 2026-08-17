@@ -250,7 +250,7 @@ export function writeMagicContextConfig(
     // Always set $schema for editor autocomplete/validation
     if (!config.$schema) {
         config.$schema =
-            "https://raw.githubusercontent.com/cortexkit/magic-context/main/assets/magic-context.schema.json";
+            "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json";
     }
 
     if (options.historianModel) {
@@ -596,23 +596,6 @@ export async function runSetup(dryRun = false): Promise<number> {
     if (dryRun) {
         outro("Dry run complete — nothing was written.");
         return 0;
-    }
-
-    // Ask user to star the repo
-    const shouldStar = await confirm("★ Star the repo on GitHub?", true);
-    if (shouldStar) {
-        try {
-            const { execSync } = await import("node:child_process");
-            execSync("gh api --silent --method PUT /user/starred/cortexkit/magic-context", {
-                stdio: "ignore",
-                timeout: 10_000,
-            });
-            log.success("Thanks for starring! ★");
-        } catch {
-            log.info(
-                "Couldn't star automatically. You can star manually:\n  https://github.com/cortexkit/magic-context",
-            );
-        }
     }
 
     outro("Run 'opencode' to start!");

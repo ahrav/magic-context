@@ -62,7 +62,7 @@ RUN git config --global user.email "test@cortexkit.local" && \
 COPY packages/plugin/dist/ /test/mc-opencode/dist/
 COPY packages/plugin/package.json /test/mc-opencode/package.json
 # README is intentionally NOT copied — it's gitignored locally (regenerated
-# by scripts/release.sh from root README at publish time) and unused inside
+# from the root README when packaging) and unused inside
 # the image. Pinning a COPY here would break CI on main where the file
 # doesn't exist on disk.
 

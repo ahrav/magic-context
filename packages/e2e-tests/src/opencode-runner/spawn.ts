@@ -189,7 +189,7 @@ function writeConfigs(
     // by project-security hardening).
     const magicContext: Record<string, unknown> = {
         $schema:
-            "https://raw.githubusercontent.com/cortexkit/opencode-magic-context/master/assets/magic-context.schema.json",
+            "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
         execute_threshold_percentage: 40,
         history_budget_percentage: 0.15,
         dreamer: { disable: true },
@@ -230,7 +230,7 @@ function writeConfigs(
             JSON.stringify(
                 {
                     $schema:
-                        "https://raw.githubusercontent.com/cortexkit/opencode-magic-context/master/assets/magic-context.schema.json",
+                        "https://raw.githubusercontent.com/ahrav/magic-context/main/assets/magic-context.schema.json",
                     ...opts.projectMagicContextConfig,
                 },
                 null,

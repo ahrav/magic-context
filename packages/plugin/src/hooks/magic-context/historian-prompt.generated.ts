@@ -433,7 +433,7 @@ A durable behavioral expectation for the project — how the developer/agent sho
 - "Use AFT tools for code investigation, not shell commands."
 - "Disable explore and general agents for fair AFT benchmark comparison."
 - "Run benchmark runners from a fresh terminal outside an active OpenCode session."
-- "Use scripts/release.sh VERSION for releases."
+- "Run the full release checklist before publishing."
 
 **Negative examples (do NOT extract as PROJECT_RULES)**:
 - "Run npm install" — one-time action, not a recurring rule.
