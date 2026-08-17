@@ -3278,12 +3278,17 @@ pub fn get_memories(
     // either way.
     let (telemetry_cols, stats_join, order_recent) = if table_exists(conn, "memory_stats") {
         (
+            // `last_retrieved_at` is the one nullable stats column, so NULL is a
+            // legitimate live value (an explicitly cleared retrieval time), not
+            // evidence of a missing row — gate the fallback on row presence
+            // (s.memory_id IS NULL) instead of COALESCE for that column.
             "COALESCE(s.seen_count, m.seen_count) AS seen_count,
                     COALESCE(s.retrieval_count, m.retrieval_count) AS retrieval_count,
                     m.first_seen_at, m.created_at,
                     MAX(m.updated_at, COALESCE(s.updated_at, m.updated_at)) AS updated_at,
                     COALESCE(s.last_seen_at, m.last_seen_at) AS last_seen_at,
-                    COALESCE(s.last_retrieved_at, m.last_retrieved_at) AS last_retrieved_at,",
+                    CASE WHEN s.memory_id IS NULL THEN m.last_retrieved_at
+                         ELSE s.last_retrieved_at END AS last_retrieved_at,",
             "LEFT JOIN memory_stats s ON s.memory_id = m.id",
             "ORDER BY MAX(m.updated_at, COALESCE(s.updated_at, m.updated_at)) DESC",
         )
