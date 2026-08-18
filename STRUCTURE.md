@@ -6,11 +6,12 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 
 ```text
 [project-root]/
-├── crates/                 # Harness-agnostic Rust workspace (runs under subc daemon)
+├── crates/                 # Harness-agnostic Rust workspace
 │   ├── mc-core/            # Cache-stability core transform & classifier
 │   ├── mc-store/           # Durable cache-state store (SQLite backed)
 │   ├── mc-tokenizer/       # Claude BPE token estimator
-│   └── mc-module/          # The subc module (CK-in/CK-out protocol handler)
+│   ├── mc-host/            # Direct-linked authenticated loopback host runtime
+│   └── mc-module/          # Current subc module and future mc-host adapter
 ├── packages/               # TypeScript packages
 │   ├── plugin/             # OpenCode plugin package (published as @cortexkit/opencode-magic-context)
 │   ├── pi-plugin/          # Pi plugin package (published as @cortexkit/pi-magic-context)
@@ -107,12 +108,13 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 
 **Rust Workspace (`crates/`):**
 
-- Purpose: Implement the harness-agnostic core transform, tokenizer, state database, and subc communication module in Rust.
+- Purpose: Implement the harness-agnostic core transform, tokenizer, state database, direct-linked host runtime, and current subc communication module in Rust.
 - Contains: The following Rust packages:
   - `crates/mc-core/`: Core cache-stability transform and classification logic.
   - `crates/mc-store/`: Durable SQLite session database schema, metadata, and CAS transitions.
   - `crates/mc-tokenizer/`: tiktoken BPE-based token count estimator.
-  - `crates/mc-module/`: The `subc` protocol adapter, autonomous historian coordinator, and client.
+  - `crates/mc-host/`: Generic direct-linked host library. Owns secure instance publication, HMAC authentication, wire-v2 framing, control/catalog handling, process-global routes and epochs, bounded request settlement, Ping/Pong capability, and ordered shutdown behind repo-owned handler types. Production `McHandler` adaptation and client cutover are not in this crate.
+  - `crates/mc-module/`: The current `subc` protocol adapter, autonomous historian coordinator, and client; a later task adds the one-way adapter from `mc-module` to `mc-host`.
 
 **Pi Sibling Package (`packages/pi-plugin/`):**
 
@@ -132,7 +134,9 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `packages/cli/src/commands/migrate.ts`: Migrate OpenCode sessions to Pi or OMP format with phase-tracked `migration_pending` recovery journaling.
 - `packages/cli/src/lib/embedding-runtime.ts`: Probe the presence of the `onnxruntime-node` package and native platform binaries to verify local embedding runtime health.
 - `packages/pi-plugin/src/index.ts`: Entry point for the Pi-specific plugin registering context handlers and hooks.
-- `crates/mc-module/src/main.rs`: Entry point for the `subc` daemon module.
+- `crates/mc-host/src/`: Generic host ownership boundaries (`instance`, `wire`, `control`, `routing`, `dispatch`, `connection`, and `runtime`) plus the public handler and limit contracts.
+- `crates/mc-host/tests/`: Independent raw-client, protocol-vector, filesystem-security, routing, dispatch, lifecycle, and real-loopback composition tests.
+- `crates/mc-module/src/main.rs`: Entry point for the current `subc` daemon module; direct-host production wiring remains deferred.
 
 **Configuration:**
 
@@ -241,7 +245,9 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 
 **New Rust transform logic or state mutation:** add it in `crates/mc-core/src/` if it is general cache-stability or classification math, or `crates/mc-store/src/` if it affects durable schemas or database mutations, or `crates/mc-module/src/transform.rs` if it is a transform pass operation.
 
-**New Rust subc route handler or daemon command:** add it in `crates/mc-module/src/lib.rs` and wire it from `crates/mc-module/src/main.rs`.
+**New Rust handler operation:** add module business logic in `crates/mc-module/src/lib.rs`. Keep socket framing, authentication, route allocation, correlations, settlement, and shutdown ownership in `crates/mc-host/`. Production adapter or binary wiring belongs in `mc-module`; `mc-host` must not depend on `mc-module`.
+
+**New direct-host protocol behavior:** add it at the owning boundary in `crates/mc-host/src/` and prove it with the independent raw client under `crates/mc-host/tests/`. Do not add client-only retry policy or module business logic to the host.
 
 **New Pi-plugin specific hook or adapter:** add it in `packages/pi-plugin/src/` (and ensure parity with OpenCode counterparts under `packages/plugin/`).
 
