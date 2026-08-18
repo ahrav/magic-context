@@ -49,7 +49,11 @@ const NAMESPACE_DIALECTS: Record<string, string> = {
     ...BENCHMARK_DIALECTS,
 };
 
-function dialectNamespace(raw: string): string | null {
+/** Canonicalize a dialect namespace spelling, or null for unknown ones.
+ *  Exported so contract validation shadows aliases with the SAME
+ *  canonicalization the resolver applies (compartment and chunk are one
+ *  namespace, not two). */
+export function dialectNamespace(raw: string): string | null {
     return Object.hasOwn(NAMESPACE_DIALECTS, raw) ? NAMESPACE_DIALECTS[raw] : null;
 }
 

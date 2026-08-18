@@ -357,6 +357,9 @@ describe("collectSessionCandidates", () => {
                     },
                     { type: "tool", tool: "ctx_search", state: { status: "completed", input: null } },
                     { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: 123 } } },
+                    // ID-shaped queries can short-circuit past the measured
+                    // search path; provenance is unknowable, so skipped.
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: "9101" } } },
                     // Never-executed lifecycle states must not become candidates.
                     { type: "tool", tool: "ctx_search", state: { status: "pending", input: { query: "never ran" } } },
                     { type: "tool", tool: "ctx_search", state: { status: "error", input: { query: "failed run" } } },
@@ -432,21 +435,31 @@ describe("staging safety", () => {
         const root = ensureStagingRoot(join(tempDir("staging-purge-"), "root"), []);
         const past = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
         // Recovery-owned entries age out...
-        const staleRun = join(root, "run-stale");
+        const staleRun = join(root, "run-abc123");
         mkdirSync(staleRun, { mode: 0o700 });
         utimesSync(staleRun, past, past);
         const staleLegacy = join(root, "draft.json");
         writeFileSync(staleLegacy, "{}");
         utimesSync(staleLegacy, past, past);
-        // ...but unrelated files are not ours to delete, however old.
+        // ...but unrelated entries are not ours to delete, however old:
+        // arbitrary names, run-prefixed files, and run-prefixed directories
+        // that do not match the mkdtemp shape all survive.
         const unrelated = join(root, "precious-notes.txt");
         writeFileSync(unrelated, "keep me");
         utimesSync(unrelated, past, past);
+        const runFile = join(root, "run-notes.txt");
+        writeFileSync(runFile, "keep me too");
+        utimesSync(runFile, past, past);
+        const runNamed = join(root, "run-production");
+        mkdirSync(runNamed, { mode: 0o700 });
+        utimesSync(runNamed, past, past);
         writeStagedFileAtomically(root, "fresh.json", "{}");
         purgeStaleDrafts(root, Date.now());
         expect(existsSync(staleRun)).toBe(false);
         expect(existsSync(staleLegacy)).toBe(false);
         expect(existsSync(unrelated)).toBe(true);
+        expect(existsSync(runFile)).toBe(true);
+        expect(existsSync(runNamed)).toBe(true);
         expect(existsSync(join(root, "fresh.json"))).toBe(true);
     });
 });

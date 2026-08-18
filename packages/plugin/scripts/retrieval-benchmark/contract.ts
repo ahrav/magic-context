@@ -20,7 +20,7 @@ import {
 } from "../../src/hooks/magic-context/auto-search-prompt";
 import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
 import { canonicalFingerprint } from "./canonical-json";
-import { relevanceIdentity } from "./identity";
+import { dialectNamespace, relevanceIdentity } from "./identity";
 
 export const CORPUS_SCHEMA_VERSION = "retrieval-benchmark-corpus/v1";
 export const JUDGMENTS_SCHEMA_VERSION = "retrieval-benchmark-judgments/v1";
@@ -548,11 +548,19 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
     // a project-scoped alias whose (namespace, locator, project) is claimed
     // by ANOTHER document for the scenario's session can never resolve to
     // this document under that scenario.
+    // Keys use the resolver's namespace canonicalization: `compartment` and
+    // `chunk` are one namespace, so a dialect spelling shadows exactly like
+    // the production spelling does.
     const aliasOwner = new Map<string, string>();
     for (const doc of corpus.documents) {
         for (const alias of doc.aliases) {
             aliasOwner.set(
-                JSON.stringify([alias.namespace, alias.locator, alias.projectScope, alias.sessionScope]),
+                JSON.stringify([
+                    dialectNamespace(alias.namespace) ?? alias.namespace,
+                    alias.locator,
+                    alias.projectScope,
+                    alias.sessionScope,
+                ]),
                 doc.id,
             );
         }
@@ -601,7 +609,7 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                 if (scope.sessionScope !== null) {
                     const shadowOwner = aliasOwner.get(
                         JSON.stringify([
-                            alias.namespace,
+                            dialectNamespace(alias.namespace) ?? alias.namespace,
                             alias.locator,
                             alias.projectScope,
                             scope.sessionScope,
@@ -630,12 +638,17 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     document.kind === "compartment" ||
                     document.kind === "primer" ||
                     document.kind === "note";
-                // Canonical decimal only: production interpolates the numeric
-                // id, so `memory:042` can never byte-match an emitted locator.
+                // Canonical decimal AND exactly representable: production
+                // interpolates the numeric id through a JS number, so
+                // `memory:042` and `memory:9007199254740993` (above
+                // MAX_SAFE_INTEGER, rounds on read) can never byte-match an
+                // emitted locator. Number->String round-trip covers both.
                 const producible = reachableAliases.filter(
                     (alias) =>
                         alias.namespace === producibleNamespace &&
-                        (!numericLocator || /^(?:0|[1-9]\d*)$/.test(alias.locator)),
+                        (!numericLocator ||
+                            (/^\d+$/.test(alias.locator) &&
+                                String(Number(alias.locator)) === alias.locator)),
                 );
                 if (producible.length === 0) {
                     diagnostics.push(

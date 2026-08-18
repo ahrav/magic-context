@@ -476,6 +476,18 @@ describe("validateRelease", () => {
         );
     });
 
+    it("rejects numeric aliases above the exactly-representable range", () => {
+        const { corpus, judgments } = makeValidRelease();
+        const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
+        if (!document) throw new Error("fixture document missing");
+        // 2^53 + 1: a valid SQLite INTEGER that rounds when read as a JS
+        // number, so the emitted locator would differ from the alias.
+        document.aliases[0].locator = "9007199254740993";
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+        );
+    });
+
     it("rejects a positive alias shadowed by another document's session alias", () => {
         const { corpus, judgments } = makeValidRelease();
         const query = corpus.queries.find((q) => q.id === "q-exact-symbol-path-dev");
@@ -494,6 +506,29 @@ describe("validateRelease", () => {
         });
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target has no alias in scenario scope (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+        );
+    });
+
+    it("shadows across namespace dialects exactly like the resolver", () => {
+        const { corpus, judgments } = makeValidRelease();
+        const query = corpus.queries.find((q) => q.id === "q-architecture-rationale-dev");
+        const target = corpus.documents.find((d) => d.id === "d-architecture-rationale-dev");
+        const other = corpus.documents.find((d) => d.id === "d-error-message-dev");
+        if (!query || !target || !other) throw new Error("fixture entries missing");
+        if (target.kind !== "compartment") throw new Error("expected a compartment target");
+        // The target's production alias is chunk:<id>; another document
+        // claims the SAME key via the dialect spelling "compartment" under
+        // the scenario's session — the resolver canonicalizes both, so the
+        // session alias shadows the project fallback.
+        query.fixtureScope.sessionScope = "ses-fixture-1";
+        other.aliases.push({
+            namespace: "compartment",
+            locator: target.aliases[0].locator,
+            projectScope: target.aliases[0].projectScope,
+            sessionScope: "ses-fixture-1",
+        });
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no alias in scenario scope (q-architecture-rationale-dev, d-architecture-rationale-dev)",
         );
     });
 

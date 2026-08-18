@@ -63,6 +63,9 @@ const WINDOWS_PATH = /(?:[A-Za-z]:[\\/][^\\/\r\n]+[\\/]|\\\\[\w.-]+\\[^\\\r\n]+)
 // A file: URI is a local absolute path in URI clothing; the triple-slash
 // form defeats the delimiter-anchored POSIX arm, so name it directly.
 const FILE_URI = /\bfile:\/\//i;
+// Extended-length Windows prefix (\\?\C:\..., \\?\UNC\server\share):
+// always a path, and the `?` defeats the server-name class above.
+const EXTENDED_LENGTH_PATH = /\\\\\?\\/;
 // No ":" in this delimiter class: `scheme://host/...` URLs must not read as
 // forward-slash UNC shares.
 const UNC_FORWARD = /(?:^|[\s"'`=([])\/\/[\w.-]+\/[^/\s]+/;
@@ -71,7 +74,14 @@ const UNC_FORWARD = /(?:^|[\s"'`=([])\/\/[\w.-]+\/[^/\s]+/;
 const POSIX_PATH_CANDIDATE = /(?:^|[\s"'`=:([])((?:\/[^/\r\n]+){2,})/g;
 
 function hasAbsolutePath(value: string): boolean {
-    if (WINDOWS_PATH.test(value) || UNC_FORWARD.test(value) || FILE_URI.test(value)) return true;
+    if (
+        WINDOWS_PATH.test(value) ||
+        UNC_FORWARD.test(value) ||
+        FILE_URI.test(value) ||
+        EXTENDED_LENGTH_PATH.test(value)
+    ) {
+        return true;
+    }
     for (const match of value.matchAll(POSIX_PATH_CANDIDATE)) {
         const segments = match[1].split("/").slice(1);
         // Real path components carry no leading/trailing whitespace; prose

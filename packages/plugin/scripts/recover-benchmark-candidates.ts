@@ -53,6 +53,7 @@ import {
     type RawMessage,
     readRawSessionMessagesFromDb,
 } from "../src/hooks/magic-context/read-session-raw";
+import { parseIdShapedQuery } from "../src/features/magic-context/search";
 import type { Database } from "../src/shared/sqlite";
 import { CTX_SEARCH_TOOL_NAME } from "../src/tools/ctx-search/constants";
 import { extractCtxSearchQueryInput } from "../src/tools/ctx-search/query-input";
@@ -150,6 +151,11 @@ export function collectSessionCandidates(
             if (input === null || typeof input !== "object") continue;
             const preflight = extractCtxSearchQueryInput(input as CtxSearchArgs);
             if (preflight.ok && preflight.query.length > 0) {
+                // ID-shaped queries can short-circuit to direct memory
+                // lookup without ever reaching the measurement-producing
+                // search path; whether they measured is unknowable from
+                // history, so they are never candidates.
+                if (parseIdShapedQuery(preflight.query) !== null) continue;
                 candidates.push({ text: preflight.query, mode: "explicit" });
             }
         }
@@ -378,12 +384,17 @@ export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_
         return;
     }
     for (const entry of entries) {
-        if (!/^run-/.test(entry) && entry !== "draft.json" && entry !== "report.json") {
-            continue;
-        }
         const path = join(root, entry);
         try {
-            if (nowMs - lstatSync(path).mtimeMs > ttlMs) {
+            const stat = lstatSync(path);
+            // Recovery-generated entries only: mkdtemp appends exactly six
+            // characters to the "run-" prefix and creates a directory, so a
+            // shared root's "run-notes.txt" or "run-production" is not ours.
+            const isRunDir = /^run-[A-Za-z0-9]{6}$/.test(entry) && stat.isDirectory();
+            const isLegacyDraft =
+                (entry === "draft.json" || entry === "report.json") && stat.isFile();
+            if (!isRunDir && !isLegacyDraft) continue;
+            if (nowMs - stat.mtimeMs > ttlMs) {
                 rmSync(path, { force: true, recursive: true });
             }
         } catch {
