@@ -38,6 +38,16 @@ pub type PendingKey = (u16, u32, u64);
 /// exhausted AND egress is contended; beyond it the reader emits inline.
 const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 
+/// One outstanding host Ping. `written` flips when the writer reports the
+/// frame fully on the socket: a Pong may only clear a written probe, or a
+/// peer predicting the correlation sequence could pre-answer Pings it never
+/// received and defeat read-liveness detection.
+pub struct PingProbe {
+    pub flags: u8,
+    pub sent: Instant,
+    pub written: bool,
+}
+
 pub struct PendingEntry {
     pub cancel: CancellationToken,
     pub settlement: Arc<crate::dispatch::Settlement>,
@@ -64,7 +74,7 @@ pub struct GenerationCore {
     pub membership: Mutex<HashMap<u16, u32>>,
     pub pending: Mutex<HashMap<PendingKey, PendingEntry>>,
     /// Outstanding host-originated Pings: correlation -> (flags byte, sent at).
-    pub pings: Mutex<HashMap<u64, (u8, Instant)>>,
+    pub pings: Mutex<HashMap<u64, PingProbe>>,
     /// Bounds concurrent off-reader `server_busy` rejection emissions so a
     /// client flooding control frames past global capacity cannot grow
     /// unbounded tasks through them.
@@ -157,15 +167,16 @@ pub async fn run_connection<H: McHostHandler>(
         );
     }
 
-    read_task.await;
+    let read_exit = read_task.await;
     gen.read_cancel.cancel();
-    if !shared.draining.load(Ordering::SeqCst) {
-        // Peer-initiated or error retirement closes silently: cancelling the
-        // generation token makes queued off-reader emissions fail closed,
-        // and discarding the writer drops frames already queued — a client
-        // that sent a corrupt frame must not receive terminals after the
-        // close decision (protocol §6.3). Host drain skips both so queued
-        // terminals and Goodbye flush in protocol order.
+    if matches!(read_exit, ReadExit::Peer) {
+        // Peer-initiated or error retirement closes silently — even while
+        // the host is draining: cancelling the generation token makes queued
+        // off-reader emissions fail closed, and discarding the writer drops
+        // frames already queued, so a client that sent a corrupt frame never
+        // receives terminals or a Goodbye after the close decision
+        // (protocol §6.3). Only a host-cancelled read keeps the writer
+        // draining in protocol order.
         gen.token.cancel();
         gen.writer.discard();
     }
@@ -192,12 +203,20 @@ pub async fn run_connection<H: McHostHandler>(
     let _ = (&mut writer_task).await;
 }
 
+/// Why the read side of a connection stopped. Only a host-cancelled read may
+/// keep the writer draining: every peer-driven exit (EOF, corruption, peer
+/// Goodbye, protocol violation) retires silently, even mid-shutdown.
+enum ReadExit {
+    HostCancelled,
+    Peer,
+}
+
 /// Serves validated frames until close. Returning retires the generation.
 async fn read_loop<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
     mut reader: tokio::net::tcp::OwnedReadHalf,
-) {
+) -> ReadExit {
     // Highest consumer Request correlation seen; any non-increasing Request
     // closes the generation before dispatch (protocol §8.3, V44).
     let mut watermark: u64 = 0;
@@ -212,9 +231,10 @@ async fn read_loop<H: McHostHandler>(
         .await
         {
             Ok(event) => event,
-            Err(ReadClose::CleanEof) => return,
-            Err(ReadClose::Cancelled) => return,
-            Err(ReadClose::Corrupt(_)) | Err(ReadClose::Io(_)) => return,
+            Err(ReadClose::Cancelled) => return ReadExit::HostCancelled,
+            Err(ReadClose::CleanEof) | Err(ReadClose::Corrupt(_)) | Err(ReadClose::Io(_)) => {
+                return ReadExit::Peer
+            }
         };
 
         match event {
@@ -223,7 +243,7 @@ async fn read_loop<H: McHostHandler>(
                 // early terminal is authoritative even if the drain then fails
                 // (protocol §7.1). The watermark still applies first.
                 if header.corr <= watermark {
-                    return;
+                    return ReadExit::Peer;
                 }
                 watermark = header.corr;
                 emit_error_terminal(
@@ -238,7 +258,7 @@ async fn read_loop<H: McHostHandler>(
                     .await
                     .is_err()
                 {
-                    return;
+                    return ReadExit::Peer;
                 }
             }
             ReadEvent::Frame(frame) => {
@@ -246,14 +266,14 @@ async fn read_loop<H: McHostHandler>(
                 match header.ty {
                     FrameType::Request => {
                         if header.corr <= watermark {
-                            return;
+                            return ReadExit::Peer;
                         }
                         watermark = header.corr;
                         if header.channel == 0 {
                             handle_control(shared, gen, frame).await;
                         } else {
                             if header.epoch == 0 {
-                                return;
+                                return ReadExit::Peer;
                             }
                             dispatch_request(shared, gen, frame).await;
                         }
@@ -262,20 +282,22 @@ async fn read_loop<H: McHostHandler>(
                         // Structural shape: current nonzero route, nonzero
                         // correlation (protocol §6.2 table).
                         if header.channel == 0 || header.epoch == 0 || header.corr == 0 {
-                            return;
+                            return ReadExit::Peer;
                         }
                         handle_cancel(gen, (header.channel, header.epoch, header.corr));
                     }
                     FrameType::Pong => {
                         if header.channel != 0 || header.corr == 0 {
-                            return;
+                            return ReadExit::Peer;
                         }
                         let mut pings = gen.pings.lock().expect("pings lock");
                         match pings.get(&header.corr) {
                             // The echo must match what we sent exactly
-                            // (protocol V35); anything else is unmatched and
-                            // dropped (protocol §6.2 table).
-                            Some((flags, _)) if *flags == header.flags.0 => {
+                            // (protocol V35) AND the Ping must have reached
+                            // the socket — a predictable-correlation Pong
+                            // sent before its Ping is unmatched and dropped
+                            // (protocol §6.2 table).
+                            Some(probe) if probe.flags == header.flags.0 && probe.written => {
                                 pings.remove(&header.corr);
                             }
                             _ => {}
@@ -284,13 +306,13 @@ async fn read_loop<H: McHostHandler>(
                     FrameType::Goodbye => {
                         if header.channel == 0 {
                             if header.corr != 0 {
-                                return;
+                                return ReadExit::Peer;
                             }
                             // Orderly connection close (protocol §9.4).
-                            return;
+                            return ReadExit::Peer;
                         }
                         if header.epoch == 0 || header.corr != 0 {
-                            return;
+                            return ReadExit::Peer;
                         }
                         // The Closing transition is synchronous, so any later
                         // frame on this route observes `unknown_channel`; the
@@ -331,7 +353,7 @@ async fn read_loop<H: McHostHandler>(
                     | FrameType::Push
                     | FrameType::Hello
                     | FrameType::HelloAck
-                    | FrameType::Ping => return,
+                    | FrameType::Ping => return ReadExit::Peer,
                 }
             }
         }
@@ -507,7 +529,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
             let pings = gen.pings.lock().expect("pings lock");
             pings
                 .values()
-                .map(|(_, sent)| *sent + policy.pong_deadline)
+                .map(|probe| probe.sent + policy.pong_deadline)
                 .min()
                 .map_or(next_ping_at, |deadline| deadline.min(next_ping_at))
         };
@@ -520,7 +542,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
             let pings = gen.pings.lock().expect("pings lock");
             pings
                 .values()
-                .any(|(_, sent)| now.duration_since(*sent) >= policy.pong_deadline)
+                .any(|probe| now.duration_since(probe.sent) >= policy.pong_deadline)
         };
         if expired && policy.invalidate_on_missed {
             gen.token.cancel();
@@ -549,10 +571,14 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         let flags = pure_header_flags();
         // The entry must exist before the Ping can reach the wire, or the
         // read loop would drop a fast Pong as unmatched.
-        gen.pings
-            .lock()
-            .expect("pings lock")
-            .insert(corr, (flags.0, Instant::now()));
+        gen.pings.lock().expect("pings lock").insert(
+            corr,
+            PingProbe {
+                flags: flags.0,
+                sent: Instant::now(),
+                written: false,
+            },
+        );
         let bytes = crate::wire::encode_owned_frame(
             FrameType::Ping,
             flags,
@@ -584,8 +610,9 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
                     // Writer retired before the Ping reached the socket.
                     return;
                 }
-                if let Some(entry) = gen.pings.lock().expect("pings lock").get_mut(&corr) {
-                    entry.1 = Instant::now();
+                if let Some(probe) = gen.pings.lock().expect("pings lock").get_mut(&corr) {
+                    probe.sent = Instant::now();
+                    probe.written = true;
                 }
             }
         }
