@@ -527,28 +527,34 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         const query = queryById.get(queryId);
         if (!query) continue;
         for (const [documentId, judgment] of byDoc) {
-            if (judgment.grade === 0) continue;
             const document = documentById.get(documentId);
             if (!document) continue;
             const kind = document.kind;
             const laneFilter = kind === "compartment" ? "message" : kind;
-            if (
-                query.visibleState.messageOrdinalCutoff === 0 &&
-                (kind === "message" || kind === "compartment")
-            ) {
-                diagnostics.push(
-                    `corpus: target unreachable under zero message cutoff (${queryId}, ${documentId})`,
-                );
-            }
-            if (query.sourceFilters !== null && !query.sourceFilters.includes(laneFilter)) {
-                diagnostics.push(
-                    `corpus: target excluded by source filters (${queryId}, ${documentId})`,
-                );
-            }
-            if (query.mode === "automatic" && !automaticSources.has(laneFilter)) {
-                diagnostics.push(
-                    `corpus: target outside automatic search sources (${queryId}, ${documentId})`,
-                );
+            // Reachability-of-intent checks apply to POSITIVE targets: an
+            // unreachable positive is a structural recall loss. Alias scope
+            // and producibility below apply to EVERY judged document — a
+            // grade-0 distractor with an unresolvable alias would surface as
+            // unjudged instead of applying its reviewed grade.
+            if (judgment.grade > 0) {
+                if (
+                    query.visibleState.messageOrdinalCutoff === 0 &&
+                    (kind === "message" || kind === "compartment")
+                ) {
+                    diagnostics.push(
+                        `corpus: target unreachable under zero message cutoff (${queryId}, ${documentId})`,
+                    );
+                }
+                if (query.sourceFilters !== null && !query.sourceFilters.includes(laneFilter)) {
+                    diagnostics.push(
+                        `corpus: target excluded by source filters (${queryId}, ${documentId})`,
+                    );
+                }
+                if (query.mode === "automatic" && !automaticSources.has(laneFilter)) {
+                    diagnostics.push(
+                        `corpus: target outside automatic search sources (${queryId}, ${documentId})`,
+                    );
+                }
             }
             const scope = query.fixtureScope;
             const reachableAliases = document.aliases.filter(
@@ -561,6 +567,7 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     `corpus: target has no alias in scenario scope (${queryId}, ${documentId})`,
                 );
             } else {
+                // (applies to every judged document, grade 0 included)
                 // At least one scoped alias must be producible by the CURRENT
                 // search path: production encodes results as
                 // SOURCE_LOCATOR_KIND[kind]:<locator>, with numeric ids for
@@ -592,6 +599,7 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                 // spelling survives, because production cannot emit it.
                 const visible = new Set(query.visibleState.visibleMemoryIds.map(String));
                 const allHidden =
+                    judgment.grade > 0 &&
                     document.kind === "memory" &&
                     producible.length > 0 &&
                     producible.every((alias) => visible.has(alias.locator));

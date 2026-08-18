@@ -62,6 +62,10 @@ function makeMeasurementDb(): Database {
             updated_at INTEGER NOT NULL,
             PRIMARY KEY(session_id, harness)
         );
+        CREATE TABLE session_meta (
+            session_id TEXT PRIMARY KEY,
+            auto_search_hint_decisions TEXT NOT NULL DEFAULT '[]'
+        );
     `);
     return db;
 }
@@ -90,7 +94,7 @@ function makeHistoryDb(): Database {
 
 let messageCounter = 0;
 
-function insertUserMessage(db: Database, sessionId: string, text: string): void {
+function insertUserMessage(db: Database, sessionId: string, text: string): string {
     messageCounter += 1;
     const messageId = `msg_${messageCounter}`;
     db.prepare(
@@ -106,6 +110,18 @@ function insertUserMessage(db: Database, sessionId: string, text: string): void 
         JSON.stringify({ type: "text", text }),
         messageCounter,
     );
+    return messageId;
+}
+
+/** Persisted evidence that auto-search ran past its gates for a message. */
+function recordHintDecision(db: Database, sessionId: string, messageId: string): void {
+    db.prepare(
+        `INSERT INTO session_meta (session_id, auto_search_hint_decisions)
+         VALUES (?, json_array(json_object('messageId', ?, 'decision', 'hint', 'text', 'hint text')))
+         ON CONFLICT(session_id) DO UPDATE SET auto_search_hint_decisions =
+             json_insert(auto_search_hint_decisions, '$[#]',
+                 json_object('messageId', ?, 'decision', 'hint', 'text', 'hint text'))`,
+    ).run(sessionId, messageId, messageId);
 }
 
 function bindSession(db: Database, sessionId: string, harness: string): void {
@@ -287,6 +303,29 @@ describe("collectSessionCandidates", () => {
         expect(candidates).toEqual([{ text: "a real user question", mode: "automatic" }]);
     });
 
+    it("requires persisted run evidence for automatic candidates when provided", () => {
+        const messages = [
+            {
+                ordinal: 1,
+                id: "msg_ran",
+                role: "user",
+                parts: [{ type: "text", text: "prompt that ran auto search" }],
+            },
+            {
+                ordinal: 2,
+                id: "msg_norun",
+                role: "user",
+                parts: [{ type: "text", text: "prompt with no decision record" }],
+            },
+        ];
+        const candidates = collectSessionCandidates(messages, {
+            autoSearchRanMessageIds: new Set(["msg_ran"]),
+        });
+        expect(candidates).toEqual([
+            { text: "prompt that ran auto search", mode: "automatic" },
+        ]);
+    });
+
     it("skips ignored parts, unwraps imitated-reduced args, and drops malformed input", () => {
         const candidates = collectSessionCandidates([
             {
@@ -309,15 +348,19 @@ describe("collectSessionCandidates", () => {
                         type: "tool",
                         tool: "ctx_search",
                         state: {
+                            status: "completed",
                             input: {
                                 reduced: true,
                                 summary: JSON.stringify({ query: "nested lookup" }),
                             },
                         },
                     },
-                    { type: "tool", tool: "ctx_search", state: { input: null } },
-                    { type: "tool", tool: "ctx_search", state: { input: { query: 123 } } },
-                    { type: "tool", tool: "other_tool", state: { input: { query: "not ours" } } },
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: null } },
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: 123 } } },
+                    // Never-executed lifecycle states must not become candidates.
+                    { type: "tool", tool: "ctx_search", state: { status: "pending", input: { query: "never ran" } } },
+                    { type: "tool", tool: "ctx_search", state: { status: "error", input: { query: "failed run" } } },
+                    { type: "tool", tool: "other_tool", state: { status: "completed", input: { query: "not ours" } } },
                 ],
             },
         ]);
@@ -334,7 +377,7 @@ describe("collectSessionCandidates", () => {
                     {
                         type: "tool",
                         tool: "ctx_search",
-                        state: { input: { query: "x".repeat(17 * 1024) } },
+                        state: { status: "completed", input: { query: "x".repeat(17 * 1024) } },
                     },
                 ],
             },
@@ -387,13 +430,23 @@ describe("staging safety", () => {
 
     it("purges drafts older than the TTL and keeps fresh ones", () => {
         const root = ensureStagingRoot(join(tempDir("staging-purge-"), "root"), []);
-        const stale = join(root, "stale.json");
-        writeFileSync(stale, "{}");
         const past = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
-        utimesSync(stale, past, past);
+        // Recovery-owned entries age out...
+        const staleRun = join(root, "run-stale");
+        mkdirSync(staleRun, { mode: 0o700 });
+        utimesSync(staleRun, past, past);
+        const staleLegacy = join(root, "draft.json");
+        writeFileSync(staleLegacy, "{}");
+        utimesSync(staleLegacy, past, past);
+        // ...but unrelated files are not ours to delete, however old.
+        const unrelated = join(root, "precious-notes.txt");
+        writeFileSync(unrelated, "keep me");
+        utimesSync(unrelated, past, past);
         writeStagedFileAtomically(root, "fresh.json", "{}");
         purgeStaleDrafts(root, Date.now());
-        expect(existsSync(stale)).toBe(false);
+        expect(existsSync(staleRun)).toBe(false);
+        expect(existsSync(staleLegacy)).toBe(false);
+        expect(existsSync(unrelated)).toBe(true);
         expect(existsSync(join(root, "fresh.json"))).toBe(true);
     });
 });
@@ -407,7 +460,8 @@ describe("runRecovery", () => {
         insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
         bindSession(measurementDb, "s2", "pi");
         insertMeasurement(measurementDb, "s2", normalizedQueryHash("pi query"));
-        insertUserMessage(historyDb, "s1", text);
+        const messageId = insertUserMessage(historyDb, "s1", text);
+        recordHintDecision(measurementDb, "s1", messageId);
         return { measurementDb, historyDb, text };
     }
 
@@ -452,7 +506,8 @@ describe("runRecovery", () => {
         const canaryText = "find sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345 in the config";
         bindSession(measurementDb, "ses_canary_owner", "opencode");
         insertMeasurement(measurementDb, "ses_canary_owner", normalizedQueryHash(canaryText));
-        insertUserMessage(historyDb, "ses_canary_owner", canaryText);
+        const canaryMsg = insertUserMessage(historyDb, "ses_canary_owner", canaryText);
+        recordHintDecision(measurementDb, "ses_canary_owner", canaryMsg);
         const root = join(tempDir("run-canary-"), "root");
         const result = await runRecovery({
             measurementDb,
@@ -503,7 +558,8 @@ describe("runRecovery", () => {
         const text = "how does the acme-internal launch flow work";
         bindSession(measurementDb, "s1", "opencode");
         insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
-        insertUserMessage(historyDb, "s1", text);
+        const tokenMsg = insertUserMessage(historyDb, "s1", text);
+        recordHintDecision(measurementDb, "s1", tokenMsg);
         const root = join(tempDir("run-tokens-"), "root");
         const result = await runRecovery({
             measurementDb,
@@ -553,8 +609,10 @@ describe("runRecovery", () => {
         insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
         bindSession(measurementDb, "s2", "opencode");
         insertMeasurement(measurementDb, "s2", normalizedQueryHash("s2 own query"));
-        insertUserMessage(historyDb, "s2", text);
-        insertUserMessage(historyDb, "s2", "s2 own query");
+        const crossMsg = insertUserMessage(historyDb, "s2", text);
+        recordHintDecision(measurementDb, "s2", crossMsg);
+        const ownMsg = insertUserMessage(historyDb, "s2", "s2 own query");
+        recordHintDecision(measurementDb, "s2", ownMsg);
         const root = join(tempDir("run-crosssession-"), "root");
         const result = await runRecovery({
             measurementDb,
@@ -617,6 +675,10 @@ describe("runRecovery", () => {
                     project_path TEXT NOT NULL,
                     updated_at INTEGER NOT NULL,
                     PRIMARY KEY(session_id, harness)
+                );
+                CREATE TABLE session_meta (
+                    session_id TEXT PRIMARY KEY,
+                    auto_search_hint_decisions TEXT NOT NULL DEFAULT '[]'
                 );
             `);
             bindSession(seedMeasurement, "s1", "opencode");

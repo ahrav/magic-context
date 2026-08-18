@@ -42,6 +42,7 @@ import {
     normalizeQueryText,
     normalizedQueryHash,
 } from "../src/features/magic-context/storage-embedding-measurements";
+import { getAutoSearchHintDecisions } from "../src/features/magic-context/storage-meta-persisted";
 import { extractBoundedAutoSearchQuery } from "../src/hooks/magic-context/auto-search-prompt";
 import {
     collectUserPromptParts,
@@ -101,7 +102,18 @@ export interface RecoveryDraft {
 
 /** Candidate queries from one session's raw history, in message order,
  *  through the same extraction the live automatic and explicit paths use. */
-export function collectSessionCandidates(messages: readonly RawMessage[]): QueryCandidate[] {
+export function collectSessionCandidates(
+    messages: readonly RawMessage[],
+    options: {
+        /** Message ids with persisted evidence that the automatic path ran
+         *  past its gates (a recorded hint/no-hint decision other than
+         *  stacked/too-short). When provided, only those messages yield
+         *  automatic candidates: configuration-dependent gates (auto-search
+         *  disabled, minPromptChars) cannot be re-derived from text alone,
+         *  and guessing records phantom automatic candidates. */
+        autoSearchRanMessageIds?: ReadonlySet<string>;
+    } = {},
+): QueryCandidate[] {
     const candidates: QueryCandidate[] = [];
     for (const message of messages) {
         // Same eligibility gates as the live automatic path: messages that
@@ -109,7 +121,12 @@ export function collectSessionCandidates(messages: readonly RawMessage[]): Query
         // augmentation never ran auto-search in production, so recording
         // them here could misclassify a same-text explicit measurement as
         // mode-ambiguous or recover it under the wrong mode.
-        if (message.role === "user" && hasMeaningfulUserText(message.parts)) {
+        if (
+            message.role === "user" &&
+            hasMeaningfulUserText(message.parts) &&
+            (options.autoSearchRanMessageIds === undefined ||
+                options.autoSearchRanMessageIds.has(message.id))
+        ) {
             const collected = collectUserPromptParts({
                 info: { role: message.role, id: message.id },
                 parts: message.parts,
@@ -125,6 +142,10 @@ export function collectSessionCandidates(messages: readonly RawMessage[]): Query
             if (p.type !== "tool" || p.tool !== CTX_SEARCH_TOOL_NAME) continue;
             const state = p.state as Record<string, unknown> | null;
             if (!state || typeof state !== "object") continue;
+            // Only completed calls: pending, running, canceled, and errored
+            // parts never executed a search, so their input must not become
+            // an explicit candidate.
+            if (state.status !== "completed") continue;
             const input = state.input;
             if (input === null || typeof input !== "object") continue;
             const preflight = extractCtxSearchQueryInput(input as CtxSearchArgs);
@@ -346,7 +367,9 @@ export function writeStagedFileAtomically(root: string, name: string, content: s
     return destination;
 }
 
-/** Delete staged entries older than the TTL. */
+/** Delete recovery-owned staged entries (`run-*` directories and their
+ *  legacy flat-file predecessors) older than the TTL. Anything else in the
+ *  root is not ours to remove, even in an otherwise-valid staging root. */
 export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_MS): void {
     let entries: string[];
     try {
@@ -355,6 +378,9 @@ export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_
         return;
     }
     for (const entry of entries) {
+        if (!/^run-/.test(entry) && entry !== "draft.json" && entry !== "report.json") {
+            continue;
+        }
         const path = join(root, entry);
         try {
             if (nowMs - lstatSync(path).mtimeMs > ttlMs) {
@@ -375,6 +401,7 @@ export function defaultStagingRoot(): string {
 const REQUIRED_TABLES: Record<string, readonly string[]> = {
     embedding_measurement_corpus: ["id", "session_id", "project_path", "query_text_hash"],
     session_projects: ["session_id", "harness", "project_path"],
+    session_meta: ["session_id", "auto_search_hint_decisions"],
 };
 
 /** Validate schema and bounded row shapes before any reconstruction. */
@@ -495,9 +522,24 @@ export async function runRecovery(args: {
         // bound — labeling it would require hydrating the entire history
         // database for a diagnostic count that recovers nothing either way.
         for (const [sessionId, rowHashes] of rowHashesBySession) {
+            // Persisted decision provenance: reasons recorded BEFORE the
+            // search gate (stacked, too-short) mean no automatic query ran;
+            // every other recorded decision means it did. Messages with no
+            // decision at all yield no automatic candidate — recovery
+            // requires evidence, not inference.
+            const ranIds = new Set<string>();
+            for (const decision of getAutoSearchHintDecisions(args.measurementDb, sessionId)) {
+                if (
+                    decision.decision === "hint" ||
+                    (decision.reason !== "stacked" && decision.reason !== "too-short")
+                ) {
+                    ranIds.add(decision.messageId);
+                }
+            }
             const kept: QueryCandidate[] = [];
             for (const candidate of collectSessionCandidates(
                 readRawSessionMessagesFromDb(args.historyDb, sessionId),
+                { autoSearchRanMessageIds: ranIds },
             )) {
                 const hash = normalizedQueryHash(candidate.text);
                 allCandidateHashes.add(hash);
