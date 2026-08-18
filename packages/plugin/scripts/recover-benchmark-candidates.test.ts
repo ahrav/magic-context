@@ -255,6 +255,38 @@ describe("collectSessionCandidates", () => {
         ]);
     });
 
+    it("applies the live eligibility gates to automatic candidates", () => {
+        const candidates = collectSessionCandidates([
+            {
+                ordinal: 1,
+                id: "m1",
+                role: "user",
+                // Stacked augmentation: the live path skips this message
+                // entirely, so recovery must not record it as automatic.
+                parts: [
+                    {
+                        type: "text",
+                        text: "<ctx-search-hint>old hint</ctx-search-hint>how does compaction work",
+                    },
+                ],
+            },
+            {
+                ordinal: 2,
+                id: "m2",
+                role: "user",
+                // Ignored notification: hasMeaningfulUserText rejects it.
+                parts: [{ type: "text", text: "plugin announcement", ignored: true }],
+            },
+            {
+                ordinal: 3,
+                id: "m3",
+                role: "user",
+                parts: [{ type: "text", text: "a real user question" }],
+            },
+        ]);
+        expect(candidates).toEqual([{ text: "a real user question", mode: "automatic" }]);
+    });
+
     it("skips ignored parts, unwraps imitated-reduced args, and drops malformed input", () => {
         const candidates = collectSessionCandidates([
             {

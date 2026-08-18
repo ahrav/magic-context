@@ -81,6 +81,15 @@ describe("iterateSyntheticDocuments", () => {
         expect(SYNTHETIC_GENERATOR_VERSION).toBe(profile().generatorVersion);
     });
 
+    it("rejects word counts above the generator's practical ceiling", () => {
+        expect(() => [
+            ...iterateSyntheticDocuments({
+                ...profile(),
+                textSize: { minWords: 8, maxWords: 10_000_000 },
+            }),
+        ]).toThrow(/text-size-exceeds-generator-limit/);
+    });
+
     it("rejects a source distribution whose total weight overflows", () => {
         // Each weight passes the positive-finite schema, but the sum is
         // Infinity: every draw would silently land on the last source kind.

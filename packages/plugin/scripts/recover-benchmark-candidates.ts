@@ -43,7 +43,11 @@ import {
     normalizedQueryHash,
 } from "../src/features/magic-context/storage-embedding-measurements";
 import { extractBoundedAutoSearchQuery } from "../src/hooks/magic-context/auto-search-prompt";
-import { collectUserPromptParts } from "../src/hooks/magic-context/auto-search-runner";
+import {
+    collectUserPromptParts,
+    hasStackedAugmentation,
+} from "../src/hooks/magic-context/auto-search-runner";
+import { hasMeaningfulUserText } from "../src/hooks/magic-context/read-session-formatting";
 import {
     type RawMessage,
     readRawSessionMessagesFromDb,
@@ -100,13 +104,20 @@ export interface RecoveryDraft {
 export function collectSessionCandidates(messages: readonly RawMessage[]): QueryCandidate[] {
     const candidates: QueryCandidate[] = [];
     for (const message of messages) {
-        if (message.role === "user") {
+        // Same eligibility gates as the live automatic path: messages that
+        // are ignored/system-directive-only or already carry a stacked
+        // augmentation never ran auto-search in production, so recording
+        // them here could misclassify a same-text explicit measurement as
+        // mode-ambiguous or recover it under the wrong mode.
+        if (message.role === "user" && hasMeaningfulUserText(message.parts)) {
             const collected = collectUserPromptParts({
                 info: { role: message.role, id: message.id },
                 parts: message.parts,
             });
-            const auto = extractBoundedAutoSearchQuery(collected);
-            if (auto.length > 0) candidates.push({ text: auto, mode: "automatic" });
+            if (!hasStackedAugmentation(collected)) {
+                const auto = extractBoundedAutoSearchQuery(collected);
+                if (auto.length > 0) candidates.push({ text: auto, mode: "automatic" });
+            }
         }
         for (const part of message.parts) {
             if (part === null || typeof part !== "object") continue;

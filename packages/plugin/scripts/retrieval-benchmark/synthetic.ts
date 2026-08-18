@@ -11,6 +11,11 @@ import { type DocumentKind, SYNTHETIC_SCALES, type SyntheticProfile } from "./co
 
 export const SYNTHETIC_GENERATOR_VERSION = "synthetic-generator/v1";
 
+/** Practical per-document ceiling for the generator: schema-valid but
+ *  enormous word counts would make even the first yielded document hang the
+ *  consumer or exhaust memory. */
+export const SYNTHETIC_MAX_WORDS_PER_DOCUMENT = 1_024;
+
 export interface SyntheticDocument {
     id: string;
     kind: DocumentKind;
@@ -70,6 +75,9 @@ export function checkSyntheticProfile(profile: SyntheticProfile): void {
     }
     if (profile.textSize.minWords > profile.textSize.maxWords) {
         throw new SyntheticProfileError("invalid-text-size-distribution");
+    }
+    if (profile.textSize.maxWords > SYNTHETIC_MAX_WORDS_PER_DOCUMENT) {
+        throw new SyntheticProfileError("text-size-exceeds-generator-limit");
     }
     if (Object.keys(profile.sourceDistribution).length === 0) {
         throw new SyntheticProfileError("empty-source-distribution");

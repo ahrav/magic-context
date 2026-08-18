@@ -128,8 +128,9 @@ export function collectUserPromptParts(message: MessageLike): string {
 /** Tests whether the user message already carries a stacked plugin augmentation
  *  or auto-hint block — in which case auto-search should skip so we don't double
  *  up. This runs on the RAW text (before stripping) because the whole point is
- *  to detect what the stripper would remove. */
-function hasStackedAugmentation(rawText: string): boolean {
+ *  to detect what the stripper would remove. Exported so candidate recovery
+ *  applies the same eligibility gate the live path applies. */
+export function hasStackedAugmentation(rawText: string): boolean {
     return (
         rawText.includes("<sidekick-augmentation>") ||
         rawText.includes("<ctx-search-hint>") ||
