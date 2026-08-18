@@ -105,11 +105,22 @@ function readJson(dir: string, name: string): unknown {
     } catch {
         throw new ContractError([`release.${name}: unreadable`]);
     }
+    let parsed: unknown;
     try {
-        return JSON.parse(text);
+        parsed = JSON.parse(text);
     } catch {
         throw new ContractError([`release.${name}: invalid-json`]);
     }
+    // The parsed view must account for every byte on disk. JSON.parse keeps
+    // the LAST of duplicate object members, so a duplicated key could hide
+    // sensitive plaintext in the file bytes while the scan, schema, and
+    // recomputed fingerprints all see only the clean survivor. Requiring the
+    // exact promoter serialization (stringify + trailing newline) makes any
+    // dropped or reformatted byte a rejection.
+    if (`${JSON.stringify(parsed, null, 2)}\n` !== text) {
+        throw new ContractError([`release.${name}: non-canonical-bytes`]);
+    }
+    return parsed;
 }
 
 /**

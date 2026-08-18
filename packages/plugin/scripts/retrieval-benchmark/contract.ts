@@ -7,6 +7,10 @@
  */
 
 import { z } from "zod";
+import {
+    prepareAutomaticQuery,
+    prepareExplicitQuery,
+} from "../../src/features/magic-context/search-bounds";
 import { AUTO_SEARCH_SOURCES } from "../../src/hooks/magic-context/auto-search-prompt";
 import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
 import { canonicalFingerprint } from "./canonical-json";
@@ -222,6 +226,22 @@ export function parseCorpus(value: unknown): CorpusArtifact {
     for (const [i, query] of corpus.queries.entries()) {
         if (queryIds.has(query.id)) diagnostics.push(`corpus.queries[${i}].id: duplicate`);
         queryIds.add(query.id);
+        // A query production search cannot execute as written is a structural
+        // defect, not a ranking signal: explicit mode rejects out-of-bounds
+        // queries (QueryBoundsError) and trims whitespace-only ones to no
+        // results; automatic mode silently truncates, which would replay a
+        // DIFFERENT query than the one that was judged.
+        if (query.mode === "explicit") {
+            const prepared = prepareExplicitQuery(query.queryText);
+            if (!prepared.ok || prepared.query.length === 0) {
+                diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
+            }
+        } else {
+            const prepared = prepareAutomaticQuery(query.queryText);
+            if (prepared.length === 0 || prepared !== query.queryText.trim()) {
+                diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
+            }
+        }
     }
     const documentIds = new Set<string>();
     const documentByIdentity = new Map<string, number>();
@@ -457,15 +477,28 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                 );
             }
             const scope = query.fixtureScope;
-            const reachableAlias = document.aliases.some(
+            const reachableAliases = document.aliases.filter(
                 (alias) =>
                     alias.projectScope === scope.projectScope &&
                     (alias.sessionScope === null || alias.sessionScope === scope.sessionScope),
             );
-            if (!reachableAlias) {
+            if (reachableAliases.length === 0) {
                 diagnostics.push(
                     `corpus: target has no alias in scenario scope (${queryId}, ${documentId})`,
                 );
+            } else {
+                // Production memory search hard-filters every id in
+                // visibleMemoryIds; a memory target whose reachable aliases
+                // are all hidden is as unretrievable as a filtered source.
+                const visible = new Set(query.visibleState.visibleMemoryIds.map(String));
+                const allHidden = reachableAliases.every(
+                    (alias) => alias.namespace === "memory" && visible.has(alias.locator),
+                );
+                if (allHidden) {
+                    diagnostics.push(
+                        `corpus: target hidden by visible memories (${queryId}, ${documentId})`,
+                    );
+                }
             }
         }
     }

@@ -49,6 +49,44 @@ describe("parseCorpus", () => {
         );
     });
 
+    it("rejects queries production search cannot execute as written", () => {
+        // Whitespace-only explicit query: schema-valid, but production trims
+        // it to nothing.
+        const blank = corpusJson();
+        (blank.queries as Record<string, unknown>[])[0].queryText = "   ";
+        expect(diagnosticsOf(() => parseCorpus(blank))).toContain(
+            "corpus.queries[0].queryText: not-executable",
+        );
+        // Over-bounds explicit query: production rejects with QueryBoundsError.
+        const oversized = corpusJson();
+        (oversized.queries as Record<string, unknown>[])[0].queryText = "x".repeat(17 * 1024);
+        expect(diagnosticsOf(() => parseCorpus(oversized))).toContain(
+            "corpus.queries[0].queryText: not-executable",
+        );
+        // Over-bounds automatic query: production silently truncates, which
+        // would replay a different query than the judged one.
+        const truncated = corpusJson();
+        const autoQuery = (truncated.queries as Record<string, unknown>[]).find(
+            (q) => q.mode === "automatic",
+        );
+        const explicitOnly = autoQuery === undefined;
+        if (!explicitOnly) {
+            autoQuery.queryText = "word ".repeat(8 * 1024);
+            expect(diagnosticsOf(() => parseCorpus(truncated)).join(";")).toContain(
+                "not-executable",
+            );
+        } else {
+            // Fixture corpus is explicit-only: exercise the automatic arm via
+            // a mode flip on the first query.
+            const q = (truncated.queries as Record<string, unknown>[])[0];
+            q.mode = "automatic";
+            q.queryText = "word ".repeat(8 * 1024);
+            expect(diagnosticsOf(() => parseCorpus(truncated)).join(";")).toContain(
+                "not-executable",
+            );
+        }
+    });
+
     it("rejects duplicate ids", () => {
         const corpus = corpusJson();
         const queries = corpus.queries as Record<string, unknown>[];
@@ -265,6 +303,20 @@ describe("validateRelease", () => {
         }
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target has no alias in scenario scope (q-error-message-dev, d-error-message-dev)",
+        );
+    });
+
+    it("rejects a memory target hidden by the scenario's visible-memory set", () => {
+        const { corpus, judgments } = makeValidRelease();
+        // exact-symbol-path pairs with a "memory"-kind document whose single
+        // alias locator is a numeric memory id; hiding that id makes the
+        // target structurally unretrievable (production hard-filters it).
+        const query = corpus.queries.find((q) => q.id === "q-exact-symbol-path-dev");
+        const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
+        if (!query || !document) throw new Error("fixture entries missing");
+        query.visibleState.visibleMemoryIds = [Number(document.aliases[0].locator)];
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target hidden by visible memories (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
     });
 

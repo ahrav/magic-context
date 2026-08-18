@@ -136,6 +136,31 @@ describe("promoteRelease", () => {
         expect(readdirSync(root)).toEqual([]);
     });
 
+    it("rejects release bytes the parsed view does not account for", () => {
+        const root = releasesRoot();
+        const { releaseDir } = promoteRelease(promotableInput(root));
+        const corpusPath = join(releaseDir, "corpus.json");
+        const original = readFileSync(corpusPath, "utf8");
+
+        // Duplicate object member: JSON.parse keeps the last value, so the
+        // scan, schema, and recomputed fingerprints all see the clean
+        // survivor while the leaked first member stays in the file bytes.
+        const smuggled = original.replace(
+            '{\n  "schemaVersion":',
+            '{\n  "schemaVersion": "leaked-secret-payload",\n  "schemaVersion":',
+        );
+        expect(smuggled).not.toBe(original);
+        writeFileSync(corpusPath, smuggled);
+        expect(() => loadReviewedRelease(releaseDir)).toThrow(/non-canonical-bytes/);
+
+        // Any unaccounted byte rejects, not only duplicate keys.
+        writeFileSync(corpusPath, `${original}\n`);
+        expect(() => loadReviewedRelease(releaseDir)).toThrow(/non-canonical-bytes/);
+
+        writeFileSync(corpusPath, original);
+        expect(() => loadReviewedRelease(releaseDir)).not.toThrow();
+    });
+
     it("preserves the prior release byte-identically on failure and interruption", () => {
         const root = releasesRoot();
         const { releaseDir } = promoteRelease(promotableInput(root));
