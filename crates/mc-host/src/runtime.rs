@@ -200,6 +200,17 @@ pub async fn run<H: McHostHandler>(
             "linked manifest exceeds the frame limit".to_owned(),
         ));
     }
+    // `route.open` admits only manifest-supported roles (protocol §7.2); a
+    // manifest without the tool_provider role would publish a catalog that
+    // says the role is unavailable while route admission still accepted it.
+    if !manifest.provides.iter().any(|entry| {
+        entry.get("role").and_then(|role| role.as_str())
+            == Some(crate::control::TARGET_KIND_TOOL_PROVIDER)
+    }) {
+        return Err(HostError::InitFailed(
+            "linked manifest does not advertise a tool_provider role".to_owned(),
+        ));
+    }
 
     // Initialization runs exactly once, before bind; failure or deadline
     // overrun prevents publication entirely (protocol §8.1).
@@ -403,7 +414,17 @@ async fn shutdown_sequence<H: McHostHandler>(
     if timeout_at(deadline, shared.tracker.wait()).await.is_err() {
         shared.abort_all();
         force_close_all_routes(shared).await;
-        let _ = timeout(shared.timing.route_close_budget, shared.tracker.wait()).await;
+        // Abort-exempt lifecycle callbacks self-bound at
+        // lifecycle_callback_deadline, which can exceed the shutdown
+        // deadline. Wait that long before returning: `run` releases the
+        // instance lock when it returns, and releasing it while a route-gone
+        // callback still owns the handler would let a successor start
+        // against the predecessor's in-flight cleanup.
+        let _ = timeout(
+            shared.timing.lifecycle_callback_deadline,
+            shared.tracker.wait(),
+        )
+        .await;
         return false;
     }
     drained_in_time

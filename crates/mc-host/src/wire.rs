@@ -379,6 +379,11 @@ pub fn pure_header_flags() -> Flags {
 pub struct OutboundFrame {
     pub bytes: Vec<u8>,
     pub charge: ByteCharge,
+    /// Fired once the frame's bytes have fully reached the socket. Senders
+    /// that anchor deadlines on delivery (Ping/Pong liveness) pass a sender;
+    /// everything else passes `None`. Dropped unfired if the writer retires
+    /// before writing the frame.
+    pub written: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Sender half of one connection's serialized writer.
@@ -464,12 +469,19 @@ where
     let task = async move {
         let mut stream = stream;
         while let Some(frame) = rx.recv().await {
-            let OutboundFrame { bytes, charge } = frame;
-            let written = tokio::time::timeout(write_deadline, stream.write_all(&bytes)).await;
-            if !matches!(written, Ok(Ok(()))) {
+            let OutboundFrame {
+                bytes,
+                charge,
+                written,
+            } = frame;
+            let result = tokio::time::timeout(write_deadline, stream.write_all(&bytes)).await;
+            if !matches!(result, Ok(Ok(()))) {
                 retired.cancel();
                 generation.cancel();
                 break;
+            }
+            if let Some(written) = written {
+                let _ = written.send(());
             }
             drop(bytes);
             drop(charge);
@@ -717,6 +729,7 @@ mod tests {
                 .send(OutboundFrame {
                     bytes: encoded,
                     charge: ByteCharge::none(),
+                    written: None,
                 })
                 .await
                 .expect("queue frame");
@@ -747,6 +760,7 @@ mod tests {
                 .send(OutboundFrame {
                     bytes,
                     charge: ByteCharge::none(),
+                    written: None,
                 })
                 .await
                 .expect("send");
@@ -784,7 +798,11 @@ mod tests {
         )
         .expect("frame encodes");
         handle
-            .send(OutboundFrame { bytes, charge })
+            .send(OutboundFrame {
+                bytes,
+                charge,
+                written: None,
+            })
             .await
             .expect("queued");
         drop(handle);
@@ -816,6 +834,7 @@ mod tests {
             .send(OutboundFrame {
                 bytes,
                 charge: ByteCharge::none(),
+                written: None,
             })
             .await
             .expect("queued before failure observed");
@@ -826,6 +845,7 @@ mod tests {
             .send(OutboundFrame {
                 bytes: Vec::new(),
                 charge: ByteCharge::none(),
+                written: None,
             })
             .await
             .is_err());

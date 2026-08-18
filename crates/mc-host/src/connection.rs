@@ -18,8 +18,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::control::{parse_control, ControlAction, CODE_INVALID_CONTROL_REQUEST};
 use crate::dispatch::{
-    close_generation, close_route_owned, dispatch_request, emit_error_terminal, emit_frame,
-    handle_cancel, open_route,
+    close_generation, dispatch_request, emit_error_terminal, emit_frame, handle_cancel, open_route,
 };
 use crate::handler::McHostHandler;
 use crate::runtime::HostShared;
@@ -121,9 +120,8 @@ pub async fn run_connection<H: McHostHandler>(
 
     if let Some(liveness) = shared.liveness.clone() {
         let gen_ping = Arc::clone(&gen);
-        let budget = shared.egress_budget.clone();
         shared.spawn_tracked(async move {
-            liveness_loop(gen_ping, budget, liveness).await;
+            liveness_loop(gen_ping, liveness).await;
         });
     }
 
@@ -240,15 +238,23 @@ async fn read_loop<H: McHostHandler>(
                         if header.epoch == 0 || header.corr != 0 {
                             return;
                         }
-                        close_route_owned(
-                            shared,
-                            crate::handler::RouteHandle {
-                                channel: header.channel,
-                                epoch: header.epoch,
-                            },
-                            gen.id,
-                        )
-                        .await;
+                        // The Closing transition is synchronous, so any later
+                        // frame on this route observes `unknown_channel`; the
+                        // drain and route-gone callback run on a tracked task
+                        // because awaiting them here would stall every other
+                        // frame on this connection — including Pong replies,
+                        // which missed-Pong invalidation would misread as a
+                        // dead peer.
+                        let handle = crate::handler::RouteHandle {
+                            channel: header.channel,
+                            epoch: header.epoch,
+                        };
+                        let decision = shared.registry.begin_close_owned(handle, gen.id);
+                        let shared_task = Arc::clone(shared);
+                        shared.spawn_tracked(async move {
+                            crate::dispatch::close_route_decision(&shared_task, handle, decision)
+                                .await;
+                        });
                     }
                     // Consumer-originated role violations close the generation
                     // rather than extend the profile (protocol §6.2). Ping is
@@ -295,7 +301,20 @@ async fn handle_control<H: McHostHandler>(
         }
         ControlAction::CatalogList { module_id_filter } => {
             // Catalog stays serviceable during drain (protocol §12 step 1
-            // freezes routes and dispatch, not control reads).
+            // freezes routes and dispatch, not control reads), but it is
+            // still one consumer request: it consumes pending admission so
+            // the global unsettled-request bound holds across all frames.
+            let Ok(_pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
+                emit_error_terminal(
+                    &shared.egress_budget,
+                    gen,
+                    FrameId::control(corr),
+                    crate::control::CODE_SERVER_BUSY,
+                    "pending request capacity exhausted",
+                )
+                .await;
+                return;
+            };
             let body = crate::control::catalog_response_json(
                 &shared.manifest,
                 module_id_filter.as_deref(),
@@ -341,16 +360,13 @@ async fn handle_control<H: McHostHandler>(
 /// independent of consumer correlations (protocol §8.3): a Ping correlation
 /// numerically equal to a pending consumer correlation cannot cross-settle
 /// because Pongs only match this map.
-async fn liveness_loop(
-    gen: Arc<GenerationCore>,
-    budget: crate::wire::ByteBudget,
-    policy: crate::config::LivenessPolicy,
-) {
+async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::LivenessPolicy) {
     let mut next_ping_at = Instant::now() + policy.ping_interval;
     loop {
         // Wake at the sooner of the next Ping tick and the earliest
-        // outstanding Pong deadline, so invalidation honors `pong_deadline`
-        // rather than overshooting to the next `ping_interval` tick.
+        // outstanding Pong deadline: the deadline wake honors
+        // `pong_deadline` exactly, and the tick wake notices an answered
+        // Pong so the next Ping is not delayed until the old deadline.
         let wake_at = {
             let pings = gen.pings.lock().expect("pings lock");
             pings
@@ -379,34 +395,62 @@ async fn liveness_loop(
             if expired {
                 pings.clear();
             } else if !pings.is_empty() {
-                // An unexpired Ping is outstanding; wake again at its deadline.
+                // An unexpired Ping is outstanding; no new Ping is added
+                // beside it. Advance the tick so the next wake makes
+                // progress — re-arming a past tick would spin this task
+                // until the Pong arrived or its deadline expired.
+                next_ping_at = now + policy.ping_interval;
                 continue;
             }
         }
         if now < next_ping_at {
-            // Woke for a Pong deadline that was answered (or cleared) in time;
-            // the next Ping still waits for its tick.
+            // Woke for a Pong deadline that was answered in time; the next
+            // Ping still waits for its tick.
             continue;
         }
         next_ping_at = now + policy.ping_interval;
         let corr = gen.next_ping_corr.fetch_add(1, Ordering::SeqCst);
         let flags = pure_header_flags();
+        // The entry must exist before the Ping can reach the wire, or the
+        // read loop would drop a fast Pong as unmatched.
         gen.pings
             .lock()
             .expect("pings lock")
             .insert(corr, (flags.0, Instant::now()));
-        if emit_frame(
-            &budget,
-            &gen,
+        let bytes = crate::wire::encode_owned_frame(
             FrameType::Ping,
             flags,
-            FrameId::control(corr),
+            crate::wire::FrameId::control(corr),
             Vec::new(),
         )
-        .await
-        .is_err()
+        .expect("header-only Ping always encodes");
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        if gen
+            .writer
+            .send(crate::wire::OutboundFrame {
+                bytes,
+                charge: crate::wire::ByteCharge::none(),
+                written: Some(written_tx),
+            })
+            .await
+            .is_err()
         {
             return;
+        }
+        // Anchor the Pong deadline at write completion: the queue may hold
+        // large frames ahead of the Ping, and a deadline measured from
+        // enqueue would invalidate a healthy peer that never saw the Ping.
+        tokio::select! {
+            () = gen.token.cancelled() => return,
+            written = written_rx => {
+                if written.is_err() {
+                    // Writer retired before the Ping reached the socket.
+                    return;
+                }
+                if let Some(entry) = gen.pings.lock().expect("pings lock").get_mut(&corr) {
+                    entry.1 = Instant::now();
+                }
+            }
         }
     }
 }

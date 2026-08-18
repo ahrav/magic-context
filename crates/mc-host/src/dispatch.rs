@@ -58,6 +58,13 @@ pub enum Terminal {
 }
 
 fn bounded_error_body(code: &str, message: &str) -> Vec<u8> {
+    // Input-length gate before serialization: handler-controlled code and
+    // message are otherwise materialized twice (JSON `Value`, then `Vec`)
+    // before any limit applies, so oversized inputs could allocate multiples
+    // of the frame limit outside the byte budget.
+    if code.len().saturating_add(message.len()) > crate::wire::MAX_BODY_LEN as usize {
+        return error_body_json(CODE_INTERNAL_ERROR, "handler error exceeds frame limit");
+    }
     let body = error_body_json(code, message);
     if body.len() <= crate::wire::MAX_BODY_LEN as usize {
         body
@@ -100,7 +107,11 @@ pub async fn emit_frame(
     };
     let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
-        .send(OutboundFrame { bytes, charge })
+        .send(OutboundFrame {
+            bytes,
+            charge,
+            written: None,
+        })
         .await
         .map_err(|_| ())
 }
@@ -534,21 +545,11 @@ pub async fn close_route<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: 
     close_route_decision(shared, handle, shared.registry.begin_close(handle)).await;
 }
 
-/// `gen_id` fences the close to its owning generation.
-pub async fn close_route_owned<H: McHostHandler>(
-    shared: &Arc<HostShared<H>>,
-    handle: RouteHandle,
-    gen_id: u64,
-) {
-    close_route_decision(
-        shared,
-        handle,
-        shared.registry.begin_close_owned(handle, gen_id),
-    )
-    .await;
-}
-
-async fn close_route_decision<H: McHostHandler>(
+/// `gen_id` fences the close to its owning generation. The state transition
+/// happens synchronously in `begin_close_owned` (later frames on the route
+/// get `unknown_channel` immediately); callers run the returned drain off
+/// their own loop when cleanup latency must not stall them.
+pub(crate) async fn close_route_decision<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,
     decision: CloseDecision,
@@ -636,6 +637,7 @@ pub async fn send_connection_goodbye(gen: &GenerationCore) {
         .send(OutboundFrame {
             bytes,
             charge: crate::wire::ByteCharge::none(),
+            written: None,
         })
         .await;
 }

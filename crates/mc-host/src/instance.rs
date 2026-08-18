@@ -124,8 +124,11 @@ pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, Ins
 /// One secured host incarnation: validated directory descriptor, held lock,
 /// fresh credentials, and (after `publish`) the retained publication identity.
 ///
-/// Dropping the guard releases the lock; callers must keep it alive through
-/// handler drop (protocol §12 step 8).
+/// Dropping the guard removes its own publication (best-effort, fenced) and
+/// releases the lock; callers must keep it alive through handler drop
+/// (protocol §12 step 8). The `Drop` cleanup covers abnormal exits — a
+/// cancelled or aborted `run` future must not leave a stale connection file
+/// advertising a listener that no longer exists.
 pub struct InstanceGuard {
     dir: OwnedFd,
     dir_path: PathBuf,
@@ -298,6 +301,16 @@ impl InstanceGuard {
             return;
         }
         let _ = unlinkat(&self.dir, CONNECTION_FILE_NAME, AtFlags::empty());
+    }
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        // Idempotent: the graceful path already removed the publication and
+        // took the retained identity, making this a no-op. All fencing
+        // (dev/ino and daemon-ID match) applies, so a successor's file is
+        // never touched.
+        self.remove_publication();
     }
 }
 

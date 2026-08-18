@@ -21,6 +21,12 @@ pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 pub const OP_ROUTE_OPEN: &str = subc_control::ops::ROUTE_OPEN;
 pub const OP_CATALOG_LIST: &str = subc_control::ops::CATALOG_LIST;
 
+/// The only routable target kind in the direct profile. `route.open` succeeds
+/// only for a role the linked manifest actually advertises, so startup
+/// rejects a manifest without it rather than publishing a catalog that
+/// contradicts route admission (protocol §7.2).
+pub const TARGET_KIND_TOOL_PROVIDER: &str = "tool_provider";
+
 const MAX_OP_LEN: usize = 64;
 const MAX_MODULE_ID_LEN: usize = 128;
 const MAX_PROJECT_ROOT_LEN: usize = 4096;
@@ -237,7 +243,7 @@ fn parse_route_open(
 
     // Classification runs only after every bound held, so a hostile body
     // cannot pick its rejection code to probe the catalog cheaply.
-    if kind != "tool_provider" {
+    if kind != TARGET_KIND_TOOL_PROVIDER {
         return ControlAction::Reject {
             code: CODE_TARGET_UNAVAILABLE,
             message: "target kind is not routable on this host".to_owned(),
