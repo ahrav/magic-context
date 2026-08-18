@@ -2290,6 +2290,35 @@ describe("note candidate pruning (R36)", () => {
         expect(contents.some((content) => content.includes("Foreign project"))).toBe(false);
     });
 
+    it("finds old notes through queries carrying an unrepresentable short token", async () => {
+        // "to" is below the trigram minimum. The query must still select on
+        // its representable atoms instead of degrading to the recency window,
+        // or any note older than the newest MAX_LANE_CANDIDATES is unfindable.
+        const matching = addNote(db, "session", {
+            sessionId: NOTE_SESSION,
+            content: "Deploy sentinel rollout checklist for the gateway.",
+        });
+        for (let index = 0; index < 160; index += 1) {
+            addNote(db, "session", {
+                sessionId: NOTE_SESSION,
+                content: `Unrelated filler telemetry entry number ${index}.`,
+            });
+        }
+        pinNoteTimestamps(db);
+
+        const results = await unifiedSearch(
+            db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "how to deploy sentinel",
+            noteSearchOptions(),
+        );
+
+        expect(
+            results.some((result) => result.source === "note" && result.noteId === matching.id),
+        ).toBe(true);
+    });
+
     it("uses an indexed count for the probe-discrimination denominator", async () => {
         seedNoteCorpus(db);
         const counter = countingDatabase(db);

@@ -1163,19 +1163,28 @@ function rankNotesForNeedle(notes: readonly Note[], needle: string): RankedNoteM
 const NOTE_FTS_MIN_ATOM_LENGTH = 3;
 
 /**
- * The OR-joined trigram query covering every atom `rankNotesForNeedle` scores:
+ * The OR-joined trigram query covering the atoms `rankNotesForNeedle` scores:
  * the whole needle (its exact-substring test) and each keyword token (its
- * coverage test). Substring matching makes the result a superset of the scored
- * matches, so pruning cannot drop a note the scorer would have kept.
+ * coverage test). Substring matching makes the result a superset of the
+ * scored matches for every representable atom, so pruning cannot drop a note
+ * the scorer would keep through those atoms.
  *
- * Returns null when any atom is too short to represent, and "" for an empty
- * needle, which the scorer never matches.
+ * Atoms below the trigram minimum are dropped from the query rather than
+ * disabling it: "how to deploy sentinel" must still select older notes
+ * containing "deploy sentinel" even though "to" cannot be represented. The
+ * only recall cost is a note matching NOTHING but unrepresentable short
+ * tokens — the weakest possible hit — which is reachable only through the
+ * recency window. Returns null when no atom is representable (the caller
+ * falls back to that window), and "" for an empty needle, which the scorer
+ * never matches.
  */
 function noteFtsQueryForNeedle(needle: string): string | null {
     const normalized = needle.trim().toLowerCase();
     if (normalized.length === 0) return "";
-    const atoms = [normalized, ...tokenizeKeywordNeedle(normalized)];
-    if (atoms.some((atom) => atom.length < NOTE_FTS_MIN_ATOM_LENGTH)) return null;
+    const atoms = [normalized, ...tokenizeKeywordNeedle(normalized)].filter(
+        (atom) => atom.length >= NOTE_FTS_MIN_ATOM_LENGTH,
+    );
+    if (atoms.length === 0) return null;
     return atoms.map((atom) => `"${atom.replace(/"/g, '""')}"`).join(" OR ");
 }
 
