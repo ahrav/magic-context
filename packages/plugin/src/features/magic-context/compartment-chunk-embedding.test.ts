@@ -25,6 +25,86 @@ import {
 import { initializeDatabase } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
 
+function referenceRecursiveSplit(text: string, chunkSize: number): string[] {
+    const lengthFunction = estimateTokens;
+    const separators = ["\n\n", "\n", " ", ""];
+
+    const splitOnSeparator = (input: string, separator: string): string[] => {
+        const splits = separator ? input.split(separator) : input.split("");
+        return splits.filter((s) => s !== "");
+    };
+
+    const mergeSplits = (splits: string[], separator: string): string[] => {
+        const docs: string[] = [];
+        const currentDoc: string[] = [];
+        let total = 0;
+        const joinDocs = (docsToJoin: string[]): string | null => {
+            const joined = docsToJoin.join(separator).trim();
+            return joined === "" ? null : joined;
+        };
+        for (const d of splits) {
+            const len = lengthFunction(d);
+            if (total + len + currentDoc.length * separator.length > chunkSize) {
+                if (currentDoc.length > 0) {
+                    const doc = joinDocs(currentDoc);
+                    if (doc !== null) docs.push(doc);
+                    while (total > 0 && currentDoc.length > 0) {
+                        total -= lengthFunction(currentDoc[0]);
+                        currentDoc.shift();
+                    }
+                }
+            }
+            currentDoc.push(d);
+            total += len;
+        }
+        const doc = joinDocs(currentDoc);
+        if (doc !== null) docs.push(doc);
+        return docs;
+    };
+
+    const splitTextRecursive = (input: string, seps: string[]): string[] => {
+        const finalChunks: string[] = [];
+        let separator = seps[seps.length - 1];
+        let newSeparators: string[] | undefined;
+        for (let i = 0; i < seps.length; i += 1) {
+            const s = seps[i];
+            if (s === "") {
+                separator = s;
+                break;
+            }
+            if (input.includes(s)) {
+                separator = s;
+                newSeparators = seps.slice(i + 1);
+                break;
+            }
+        }
+        const splits = splitOnSeparator(input, separator);
+        let goodSplits: string[] = [];
+        for (const s of splits) {
+            if (lengthFunction(s) < chunkSize) {
+                goodSplits.push(s);
+            } else {
+                if (goodSplits.length) {
+                    finalChunks.push(...mergeSplits(goodSplits, separator));
+                    goodSplits = [];
+                }
+                if (!newSeparators) {
+                    finalChunks.push(s);
+                } else {
+                    finalChunks.push(...splitTextRecursive(s, newSeparators));
+                }
+            }
+        }
+        if (goodSplits.length) {
+            finalChunks.push(...mergeSplits(goodSplits, separator));
+        }
+        return finalChunks;
+    };
+
+    if (text.length === 0) return [];
+    return splitTextRecursive(text, separators);
+}
+
 class CapturingEmbeddingProvider implements EmbeddingProvider {
     readonly modelId = "mock:model";
     readonly maxInputTokens = 10_000;
@@ -201,6 +281,25 @@ describe("compartment chunk embedding core", () => {
         }
         // windowIndex stays 1-based and contiguous (stable chunk identity).
         expect(windows.map((w) => w.windowIndex)).toEqual(windows.map((_, i) => i + 1));
+    });
+
+    test("one-megabyte single-line fixture yields the same slices and window metadata as the frozen pre-change splitter", () => {
+        const maxInputTokens = 512;
+        const effective = Math.floor(maxInputTokens * CHUNK_WINDOW_SAFETY_RATIO);
+        const huge = Array.from({ length: 180_000 }, (_, i) => `w${String(i % 9973)}`).join(" ");
+        const line = `[7] A: ${huge}`;
+        expect(line.length).toBeGreaterThan(1_000_000);
+
+        const windows = chunkCanonicalText(line, 7, 7, maxInputTokens);
+        const referenceSlices = referenceRecursiveSplit(line, effective);
+
+        expect(windows.map((w) => w.text)).toEqual(referenceSlices);
+        expect(windows.map((w) => w.windowIndex)).toEqual(windows.map((_, i) => i + 1));
+        for (const window of windows) {
+            expect(window.startOrdinal).toBe(7);
+            expect(window.endOrdinal).toBe(7);
+            expect(estimateTokens(window.text)).toBeLessThanOrEqual(effective);
+        }
     });
 
     test("mixes split sub-windows with normal line windows without index gaps", () => {

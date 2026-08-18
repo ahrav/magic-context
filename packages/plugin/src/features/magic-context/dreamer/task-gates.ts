@@ -1,5 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
-import { hasMemoryClassifiedAtColumn } from "../memory/storage-memory";
+import { hasMemoryClassifiedAtColumn, hasMemoryStatsTable } from "../memory/storage-memory";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
 import {
     getSmartNotesNeedingCompilation,
@@ -149,13 +149,21 @@ function countBroadCycleCandidates(
 
 function countCueCandidates(db: Database, projectPath: string): number {
     if (!hasMuralCueColumns(db)) return countActiveMemories(db, projectPath);
+    // COALESCE to the base timestamp when the stats row is missing: a NULL
+    // subquery would make `NULL > mural_cue_at` falsy and silently drop the
+    // memory from this gate count. This is a scheduling heuristic, not a
+    // telemetry read — keeping the row counted leaves the corruption visible
+    // to the downstream work, which surfaces it via memoryRowsFromQuery.
+    const effectiveUpdatedAt = hasMemoryStatsTable(db)
+        ? "COALESCE((SELECT MAX(memories.updated_at, s.updated_at) FROM memory_stats s WHERE s.memory_id = memories.id), memories.updated_at)"
+        : "updated_at";
     const row = db
         .prepare<[string], { cnt: number }>(
             `SELECT COUNT(*) AS cnt
                FROM memories
               WHERE project_path = ?
                 AND status IN ('active','permanent')
-                AND (mural_cue IS NULL OR mural_cue_hash IS NULL OR updated_at > mural_cue_at)`,
+                AND (mural_cue IS NULL OR mural_cue_hash IS NULL OR ${effectiveUpdatedAt} > mural_cue_at)`,
         )
         .get(projectPath);
     return row?.cnt ?? 0;

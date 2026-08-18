@@ -84,13 +84,59 @@ const VERIFICATION_STATUS_LOOKUP = {
     flagged: true,
 } satisfies Record<VerificationStatus, true>;
 
+/**
+ * Statement caches whose prepared SQL depends on the memory_stats probe
+ * (directly or via getMemorySelectColumns). The first positive probe on a
+ * handle drops these so statements prepared against the pre-v80 shape
+ * re-prepare against the side table. Statement getters that branch at CALL
+ * time on hasMemoryStatsTable (fixed SQL per cache) do not register.
+ */
+const statsDependentStatementCaches: Array<{ delete(db: Database): boolean }> = [];
+
+export function registerStatsDependentStatementCache<T extends { delete(db: Database): boolean }>(
+    cache: T,
+): T {
+    statsDependentStatementCaches.push(cache);
+    return cache;
+}
+
+/**
+ * Fetch (or prepare) a stats-dependent statement, probing the schema FIRST:
+ * the probe's first positive observation drops the registered caches, so a
+ * statement prepared against the pre-v80 shape is discarded before it can
+ * execute once more against the migrated schema.
+ */
+export function getStatsDependentStatement(
+    db: Database,
+    cache: WeakMap<Database, PreparedStatement>,
+    prepare: (db: Database) => PreparedStatement,
+): PreparedStatement {
+    hasMemoryStatsTable(db);
+    let stmt = cache.get(db);
+    if (!stmt) {
+        stmt = prepare(db);
+        cache.set(db, stmt);
+    }
+    return stmt;
+}
+
 const insertMemoryStatements = new WeakMap<Database, PreparedStatement>();
-const getMemoryByHashStatements = new WeakMap<Database, PreparedStatement>();
-const getMemoryByIdStatements = new WeakMap<Database, PreparedStatement>();
+const getMemoryByHashStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
+const getMemoryByIdStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
 const getMemoriesByIdsStatements = new Map<string, WeakMap<Database, PreparedStatement>>();
-const activeMemoriesNoExpiryStatements = new WeakMap<Database, PreparedStatement>();
-const updateMemorySeenCountStatements = new WeakMap<Database, PreparedStatement>();
-const updateMemoryRetrievalCountStatements = new WeakMap<Database, PreparedStatement>();
+const activeMemoriesNoExpiryStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
+const updateMemorySeenCountStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
+const updateMemoryRetrievalCountStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
 const updateMemoryStatusStatements = new WeakMap<Database, PreparedStatement>();
 const updateArchivedMemoryStatements = new WeakMap<Database, PreparedStatement>();
 const updateMemoryVerificationStatements = new WeakMap<Database, PreparedStatement>();
@@ -108,6 +154,7 @@ const memoryImportanceColumnCache = new WeakMap<Database, boolean>();
 const memoryScopeColumnCache = new WeakMap<Database, boolean>();
 const memoryShareableColumnCache = new WeakMap<Database, boolean>();
 const memoryClassifiedAtColumnCache = new WeakMap<Database, boolean>();
+const memoryStatsTableCache = new WeakMap<Database, boolean>();
 
 export interface MemoryCountsByStatus {
     total: number;
@@ -167,6 +214,93 @@ export function hasMemoryClassifiedAtColumn(db: Database): boolean {
     return hasColumn;
 }
 
+/**
+ * Whether this database has migrated to v80, where mutable memory telemetry
+ * (seen/retrieval counters and their event timestamps) lives in the
+ * `memory_stats` side table and the legacy `memories` telemetry columns are a
+ * frozen migration baseline. Pre-v80 databases (including raw test fixtures
+ * that never ran migrations) keep the legacy single-table contract.
+ */
+export function hasMemoryStatsTable(db: Database): boolean {
+    const cached = memoryStatsTableCache.get(db);
+    if (cached !== undefined) return cached;
+    const present = Boolean(
+        db
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_stats'")
+            .get(),
+    );
+    // Never cache a negative probe: v80 can install memory_stats later on
+    // this same handle (probe before runMigrations, or a sibling process
+    // migrating a shared file), and a frozen `false` would route telemetry
+    // writes into the legacy columns that the freeze guard now rejects.
+    if (!present) return false;
+    // First positive observation. Statements prepared while earlier probes
+    // saw no table still target the legacy shape — drop them so they
+    // re-prepare against the side table. The table is never dropped, so the
+    // positive result is safe to cache and this runs at most once per handle.
+    for (const cache of statsDependentStatementCaches) cache.delete(db);
+    memoryStatsTableCache.set(db, true);
+    return true;
+}
+
+export class MemoryStatsIntegrityError extends Error {
+    constructor(memoryId: number) {
+        super(
+            `memory_stats row missing for memory ${memoryId}: context.db failed v80 integrity ` +
+                "(repair from an authoritative module snapshot or restore a backup with writers stopped)",
+        );
+        this.name = "MemoryStatsIntegrityError";
+    }
+}
+
+/**
+ * SQL fragment projecting the effective seen_count: the memory_stats value on
+ * a v80 database (NULL when the stats row is missing — corruption the caller
+ * must reject via {@link requireEffectiveSeenCount}), the base column pre-v80.
+ */
+export function effectiveSeenCountSql(db: Database, tableName = "memories"): string {
+    return hasMemoryStatsTable(db)
+        ? `(SELECT s.seen_count FROM memory_stats s WHERE s.memory_id = ${tableName}.id) AS seen_count`
+        : "seen_count";
+}
+
+/**
+ * Coerce an effective seen_count read for a merge decision. On a stats-backed
+ * database a NULL/undefined value means the one-row-per-memory invariant
+ * broke; that must surface before a defaulted count feeds a destructive
+ * merge-and-delete. Pre-v80 the legacy default of 1 applies.
+ */
+export function requireEffectiveSeenCount(db: Database, memoryId: number, value: unknown): number {
+    if (hasMemoryStatsTable(db) && value == null) {
+        throw new MemoryStatsIntegrityError(memoryId);
+    }
+    return Number(value ?? 1);
+}
+
+/**
+ * Map raw projection rows to `Memory` values. On a v80 database a row whose
+ * stats tuple came back NULL means the one-row-per-memory invariant broke;
+ * that is corruption and must surface, never be silently filtered or healed
+ * from the frozen legacy columns.
+ */
+export function memoryRowsFromQuery(db: Database, rows: readonly unknown[]): Memory[] {
+    const out: Memory[] = [];
+    const statsBacked = hasMemoryStatsTable(db);
+    for (const row of rows) {
+        if (isMemoryRow(row)) {
+            out.push(toMemory(row));
+            continue;
+        }
+        if (statsBacked && row !== null && typeof row === "object") {
+            const candidate = row as Record<string, unknown>;
+            if (typeof candidate.id === "number" && candidate.seenCount === null) {
+                throw new MemoryStatsIntegrityError(candidate.id);
+            }
+        }
+    }
+    return out;
+}
+
 /** Memory ids (from the given set) that have never been classified — the
  *  classify-memories run-gate + Stage-3 "to-classify" partition. */
 export function getUnclassifiedMemoryIds(db: Database, memoryIds: readonly number[]): number[] {
@@ -184,6 +318,7 @@ export function getUnclassifiedMemoryIds(db: Database, memoryIds: readonly numbe
 }
 
 export function getMemorySelectColumns(db: Database, tableName = "memories"): string {
+    const statsBacked = hasMemoryStatsTable(db);
     return Object.entries(COLUMN_MAP)
         .map(([property, column]) => {
             if (property === "importance" && !hasMemoryImportanceColumn(db)) {
@@ -204,9 +339,45 @@ export function getMemorySelectColumns(db: Database, tableName = "memories"): st
             if (property === "shareable") {
                 return `COALESCE(${tableName}.${column}, 0) AS ${property}`;
             }
+            if (statsBacked) {
+                // Effective-memory projection: mutable telemetry comes from the
+                // memory_stats row supplied by getMemoryStatsJoin (one PK seek
+                // per row instead of five correlated subqueries) and the
+                // effective update time is the later of the base and stats
+                // timestamps, so ordering still reflects telemetry activity.
+                // No per-field fallback to the frozen legacy columns: a missing
+                // stats row surfaces as NULL through the LEFT JOIN (scalar MAX
+                // yields NULL when either operand is NULL) and is rejected as
+                // corruption in memoryRowsFromQuery.
+                if (property === "seenCount" || property === "retrievalCount") {
+                    const statsColumn = property === "seenCount" ? "seen_count" : "retrieval_count";
+                    return `mstats.${statsColumn} AS ${property}`;
+                }
+                if (property === "lastSeenAt" || property === "lastRetrievedAt") {
+                    const statsColumn =
+                        property === "lastSeenAt" ? "last_seen_at" : "last_retrieved_at";
+                    return `mstats.${statsColumn} AS ${property}`;
+                }
+                if (property === "updatedAt") {
+                    return `MAX(${tableName}.${column}, mstats.updated_at) AS ${property}`;
+                }
+            }
             return `${tableName}.${column} AS ${property}`;
         })
         .join(", ");
+}
+
+/**
+ * Join clause pairing the stats-backed projection from
+ * {@link getMemorySelectColumns} with the `memory_stats` side table (aliased
+ * `mstats`). Callers embed it directly after the memories table reference;
+ * empty on pre-v80 databases. A missing stats row yields NULL telemetry
+ * through the LEFT JOIN, which memoryRowsFromQuery rejects as corruption.
+ */
+export function getMemoryStatsJoin(db: Database, tableName = "memories"): string {
+    return hasMemoryStatsTable(db)
+        ? `LEFT JOIN memory_stats mstats ON mstats.memory_id = ${tableName}.id`
+        : "";
 }
 
 function isMemoryCategory(value: unknown): value is MemoryCategory {
@@ -286,7 +457,7 @@ export function isMemoryRow(row: unknown): row is Memory {
     );
 }
 
-export function toMemory(row: Memory): Memory {
+function toMemory(row: Memory): Memory {
     return {
         id: row.id,
         projectPath: row.projectPath,
@@ -331,96 +502,89 @@ function getInsertMemoryStatement(db: Database): PreparedStatement {
 }
 
 function getMemoryByHashStatement(db: Database): PreparedStatement {
-    let stmt = getMemoryByHashStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ?`,
-        );
-        getMemoryByHashStatements.set(db, stmt);
-    }
-    return stmt;
+    return getStatsDependentStatement(db, getMemoryByHashStatements, () =>
+        db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE project_path = ? AND category = ? AND normalized_hash = ?`,
+        ),
+    );
 }
 
 function getMemoryByIdStatement(db: Database): PreparedStatement {
-    let stmt = getMemoryByIdStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id = ?`);
-        getMemoryByIdStatements.set(db, stmt);
-    }
-    return stmt;
+    return getStatsDependentStatement(db, getMemoryByIdStatements, () =>
+        db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE id = ?`,
+        ),
+    );
 }
 
 function getMemoriesByIdsStatement(db: Database, idCount: number): PreparedStatement {
     const key = `n${idCount}`;
     let map = getMemoriesByIdsStatements.get(key);
     if (!map) {
-        map = new WeakMap<Database, PreparedStatement>();
+        map = registerStatsDependentStatementCache(new WeakMap<Database, PreparedStatement>());
         getMemoriesByIdsStatements.set(key, map);
     }
-    let stmt = map.get(db);
-    if (!stmt) {
+    return getStatsDependentStatement(db, map, () => {
         const placeholders = new Array(idCount).fill("?").join(", ");
-        stmt = db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE id IN (${placeholders})`,
+        return db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE id IN (${placeholders})`,
         );
-        map.set(db, stmt);
-    }
-    return stmt;
+    });
 }
 
 function getMemoriesByProjectStatement(db: Database, statuses: MemoryStatus[]): PreparedStatement {
     const key = statuses.join(",");
     let statements = memoriesByProjectStatements.get(key);
     if (!statements) {
-        statements = new WeakMap<Database, PreparedStatement>();
+        statements = registerStatsDependentStatementCache(
+            new WeakMap<Database, PreparedStatement>(),
+        );
         memoriesByProjectStatements.set(key, statements);
     }
-
-    let stmt = statements.get(db);
-    if (!stmt) {
+    return getStatsDependentStatement(db, statements, () => {
         const placeholders = statuses.map(() => "?").join(", ");
-        stmt = db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status IN (${placeholders}) AND (expires_at IS NULL OR expires_at > ?) ORDER BY category ASC, updated_at DESC, id ASC`,
+        // ORDER BY uses projection aliases so the maximum base or stats update
+        // time determines v80 ordering.
+        return db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE project_path = ? AND status IN (${placeholders}) AND (expires_at IS NULL OR expires_at > ?) ORDER BY category ASC, updatedAt DESC, id ASC`,
         );
-        statements.set(db, stmt);
-    }
-
-    return stmt;
+    });
 }
 
 /** All `active` rows for a project with NO expiry filter — for the destructive
  *  migration path only (see getAllActiveMemoriesForMigration). */
 function getActiveMemoriesNoExpiryStatement(db: Database): PreparedStatement {
-    let stmt = activeMemoriesNoExpiryStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories WHERE project_path = ? AND status = 'active' ORDER BY category ASC, updated_at DESC, id ASC`,
-        );
-        activeMemoriesNoExpiryStatements.set(db, stmt);
-    }
-    return stmt;
+    return getStatsDependentStatement(db, activeMemoriesNoExpiryStatements, () =>
+        db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories ${getMemoryStatsJoin(db)} WHERE project_path = ? AND status = 'active' ORDER BY category ASC, updatedAt DESC, id ASC`,
+        ),
+    );
 }
 
 function getUpdateMemorySeenCountStatement(db: Database): PreparedStatement {
-    let stmt = updateMemorySeenCountStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            "UPDATE memories SET seen_count = seen_count + 1, last_seen_at = ?, updated_at = ? WHERE id = ?",
-        );
-        updateMemorySeenCountStatements.set(db, stmt);
-    }
-    return stmt;
+    return getStatsDependentStatement(db, updateMemorySeenCountStatements, () =>
+        // When memory_stats exists, telemetry writes update memory_stats
+        // instead of memories.
+        hasMemoryStatsTable(db)
+            ? db.prepare(
+                  "UPDATE memory_stats SET seen_count = seen_count + 1, last_seen_at = ?, updated_at = ? WHERE memory_id = ?",
+              )
+            : db.prepare(
+                  "UPDATE memories SET seen_count = seen_count + 1, last_seen_at = ?, updated_at = ? WHERE id = ?",
+              ),
+    );
 }
 
 function getUpdateMemoryRetrievalCountStatement(db: Database): PreparedStatement {
-    let stmt = updateMemoryRetrievalCountStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            "UPDATE memories SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?, updated_at = ? WHERE id = ?",
-        );
-        updateMemoryRetrievalCountStatements.set(db, stmt);
-    }
-    return stmt;
+    return getStatsDependentStatement(db, updateMemoryRetrievalCountStatements, () =>
+        hasMemoryStatsTable(db)
+            ? db.prepare(
+                  "UPDATE memory_stats SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?, updated_at = ? WHERE memory_id = ?",
+              )
+            : db.prepare(
+                  "UPDATE memories SET retrieval_count = retrieval_count + 1, last_retrieved_at = ?, updated_at = ? WHERE id = ?",
+              ),
+    );
 }
 
 function getUpdateMemoryStatusStatement(db: Database): PreparedStatement {
@@ -483,6 +647,31 @@ function getMergeMemoryStatsStatement(db: Database): PreparedStatement {
             "UPDATE memories SET seen_count = ?, retrieval_count = ?, merged_from = ?, status = ?, updated_at = ? WHERE id = ?",
         );
         mergeMemoryStatsStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+const mergeMemoryBaseStatements = new WeakMap<Database, PreparedStatement>();
+const mergeMemoryStatsCountersStatements = new WeakMap<Database, PreparedStatement>();
+
+function getMergeMemoryBaseStatement(db: Database): PreparedStatement {
+    let stmt = mergeMemoryBaseStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "UPDATE memories SET merged_from = ?, status = ?, updated_at = ? WHERE id = ?",
+        );
+        mergeMemoryBaseStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getMergeMemoryStatsCountersStatement(db: Database): PreparedStatement {
+    let stmt = mergeMemoryStatsCountersStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "UPDATE memory_stats SET seen_count = ?, retrieval_count = ?, updated_at = ? WHERE memory_id = ?",
+        );
+        mergeMemoryStatsCountersStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -662,10 +851,7 @@ export function getMemoryByHash(
     normalizedHash: string,
 ): Memory | null {
     const result = getMemoryByHashStatement(db).get(projectPath, category, normalizedHash);
-    if (!isMemoryRow(result)) {
-        return null;
-    }
-    return toMemory(result);
+    return memoryRowsFromQuery(db, [result])[0] ?? null;
 }
 
 export function getMemoriesByProject(
@@ -682,11 +868,10 @@ export function getMemoriesByProject(
         return [];
     }
 
-    const rows = getMemoriesByProjectStatement(db, statuses)
-        .all(projectPath, ...statuses, expiryCutoff)
-        .filter(isMemoryRow);
-
-    return rows.map(toMemory);
+    return memoryRowsFromQuery(
+        db,
+        getMemoriesByProjectStatement(db, statuses).all(projectPath, ...statuses, expiryCutoff),
+    );
 }
 
 /**
@@ -774,7 +959,7 @@ export function buildWorkspaceMemorySqlFilter(args: {
     };
 }
 
-export interface MemoryVisibilityScope {
+interface MemoryVisibilityScope {
     clause: string;
     params: Array<string | number>;
 }
@@ -888,12 +1073,12 @@ export function getMemoriesByRequestedIds(
             `SELECT ${getMemorySelectColumns(db)}
                FROM json_each(?) AS requested
                CROSS JOIN memories ON memories.id = requested.value
+               ${getMemoryStatsJoin(db)}
               WHERE ${scope.clause}
               ORDER BY requested.key ASC`,
         )
-        .all(JSON.stringify([...args.ids]), ...scope.params)
-        .filter(isMemoryRow);
-    return rows.map(toMemory);
+        .all(JSON.stringify([...args.ids]), ...scope.params);
+    return memoryRowsFromQuery(db, rows);
 }
 
 export function getMemoriesByProjects(
@@ -933,12 +1118,12 @@ export function getMemoriesByProjects(
         .prepare(
             `SELECT ${getMemorySelectColumns(db)}
                FROM memories
+               ${getMemoryStatsJoin(db)}
               WHERE ${scope.clause}
-              ORDER BY category ASC, updated_at DESC, id ASC`,
+              ORDER BY category ASC, updatedAt DESC, id ASC`,
         )
-        .all(...scope.params)
-        .filter(isMemoryRow);
-    return rows.map(toMemory);
+        .all(...scope.params);
+    return memoryRowsFromQuery(db, rows);
 }
 
 export function getMaxMemoryIdForProjects(
@@ -990,28 +1175,24 @@ export function readNewMemoriesForM1Union(
         .prepare(
             `SELECT ${getMemorySelectColumns(db)}
                FROM memories
+               ${getMemoryStatsJoin(db)}
               WHERE project_path IN (${sqlPlaceholders(identities)})
                 AND id > ?
                 AND status IN ('active', 'permanent')
                 AND (expires_at IS NULL OR expires_at > ?)${sharingFilter.clause}
               ORDER BY ${MEMORY_CATEGORY_ORDER_SQL}, id ASC`,
         )
-        .all(...identities, afterId, expiryCutoff, ...sharingFilter.params)
-        .filter(isMemoryRow);
-    return rows.map(toMemory);
+        .all(...identities, afterId, expiryCutoff, ...sharingFilter.params);
+    return memoryRowsFromQuery(db, rows);
 }
 
 export function getAllActiveMemoriesForMigration(db: Database, projectPath: string): Memory[] {
-    const rows = getActiveMemoriesNoExpiryStatement(db).all(projectPath).filter(isMemoryRow);
-    return rows.map(toMemory);
+    return memoryRowsFromQuery(db, getActiveMemoriesNoExpiryStatement(db).all(projectPath));
 }
 
 export function getMemoryById(db: Database, id: number): Memory | null {
     const result = getMemoryByIdStatement(db).get(id);
-    if (!isMemoryRow(result)) {
-        return null;
-    }
-    return toMemory(result);
+    return memoryRowsFromQuery(db, [result])[0] ?? null;
 }
 
 /** Load multiple memories by id in one positional-bind statement.
@@ -1027,10 +1208,10 @@ export function getMemoriesByIds(db: Database, ids: readonly number[]): Memory[]
     if (uniqueIds.length === 0) {
         return [];
     }
-    const rows = getMemoriesByIdsStatement(db, uniqueIds.length)
-        .all(...uniqueIds)
-        .filter(isMemoryRow);
-    return rows.map(toMemory);
+    return memoryRowsFromQuery(
+        db,
+        getMemoriesByIdsStatement(db, uniqueIds.length).all(...uniqueIds),
+    );
 }
 
 export function updateMemorySeenCount(db: Database, id: number): void {
@@ -1228,14 +1409,33 @@ export function mergeMemoryStats(
     status: MemoryStatus,
 ): void {
     assertTsMemoryIdWriteAllowed(db, id);
-    getMergeMemoryStatsStatement(db).run(
-        seenCount,
-        retrievalCount,
-        mergedFrom,
-        status,
-        Date.now(),
-        id,
-    );
+    const now = Date.now();
+    if (hasMemoryStatsTable(db)) {
+        // Base and stats update times come from one clock read; the canonical
+        // row's last-seen and last-retrieved event timestamps stay untouched.
+        db.transaction(() => {
+            const base = getMergeMemoryBaseStatement(db).run(mergedFrom, status, now, id) as {
+                changes?: number;
+            };
+            const stats = getMergeMemoryStatsCountersStatement(db).run(
+                seenCount,
+                retrievalCount,
+                now,
+                id,
+            ) as { changes?: number };
+            // A base row without a stats row is a broken v80 one-row-per-memory
+            // invariant. Throwing rolls the base write back — committing it
+            // alone would durably mark the memory merged while dropping the
+            // merged counters. (Both affecting zero rows means the memory does
+            // not exist; that stays a no-op, matching the legacy single-table
+            // statement.)
+            if ((base.changes ?? 0) > 0 && (stats.changes ?? 0) === 0) {
+                throw new MemoryStatsIntegrityError(id);
+            }
+        })();
+        return;
+    }
+    getMergeMemoryStatsStatement(db).run(seenCount, retrievalCount, mergedFrom, status, now, id);
 }
 
 export function archiveMemory(db: Database, id: number, reason?: string): void {

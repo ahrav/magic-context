@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 
 const IDENTITY_COLUMNS = new Set(["project_path", "project_identity"]);
 const DERIVED_TABLE_SUFFIXES = [
@@ -191,6 +192,17 @@ function mergeMemoryRow(
 ): boolean {
     const sourceId = row.id;
     if (typeof sourceId !== "number") return false;
+    const statsBacked = hasMemoryStatsTable(db);
+    const effectiveSeenCount = (memoryId: number, baseValue: unknown): number => {
+        if (!statsBacked) return Number(baseValue ?? 1);
+        const stats = db
+            .prepare("SELECT seen_count FROM memory_stats WHERE memory_id = ?")
+            .get(memoryId) as { seen_count?: number } | undefined;
+        // requireEffectiveSeenCount rejects a missing stats row as corruption —
+        // a defaulted count would merge wrong telemetry and then delete the
+        // source row.
+        return requireEffectiveSeenCount(db, memoryId, stats?.seen_count);
+    };
     const collision = db
         .prepare(
             `SELECT *
@@ -201,7 +213,10 @@ function mergeMemoryRow(
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
-        const mergedSeen = Math.max(Number(collision.seen_count ?? 1), Number(row.seen_count ?? 1));
+        const mergedSeen = Math.max(
+            effectiveSeenCount(targetId, collision.seen_count),
+            effectiveSeenCount(sourceId, row.seen_count),
+        );
         const sourceClassifiedAt = Number(row.classified_at ?? 0);
         const targetClassifiedAt = Number(collision.classified_at ?? 0);
         if (sourceClassifiedAt > targetClassifiedAt) {
@@ -240,9 +255,19 @@ function mergeMemoryRow(
                 mapped_at = MAX(memory_verifications.mapped_at, excluded.mapped_at)`,
         ).run(targetId, sourceId);
         db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(sourceId);
-        db.prepare(
-            "UPDATE memories SET seen_count = ?, status = COALESCE(status, 'active') WHERE id = ?",
-        ).run(mergedSeen, targetId);
+        if (statsBacked) {
+            db.prepare("UPDATE memory_stats SET seen_count = ? WHERE memory_id = ?").run(
+                mergedSeen,
+                targetId,
+            );
+            db.prepare("UPDATE memories SET status = COALESCE(status, 'active') WHERE id = ?").run(
+                targetId,
+            );
+        } else {
+            db.prepare(
+                "UPDATE memories SET seen_count = ?, status = COALESCE(status, 'active') WHERE id = ?",
+            ).run(mergedSeen, targetId);
+        }
         db.prepare(
             `UPDATE memories
                 SET status = 'archived',
