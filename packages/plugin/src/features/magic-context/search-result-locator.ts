@@ -25,6 +25,21 @@ export const PHYSICAL_LOCATOR_KINDS = [
 
 export type PhysicalLocatorKind = (typeof PHYSICAL_LOCATOR_KINDS)[number];
 
+/**
+ * Frozen search-source -> locator-kind mapping. The single source of truth
+ * for the persisted prefix vocabulary: the encoder below and every benchmark
+ * alias table derive from this object, so a prefix change is a compile-time
+ * break instead of silent locator-resolution drift.
+ */
+export const SOURCE_LOCATOR_KIND = {
+    memory: "memory",
+    message: "message",
+    compartment: "chunk",
+    git_commit: "commit",
+    primer: "primer",
+    note: "note",
+} as const satisfies Record<UnifiedSearchResult["source"], PhysicalLocatorKind>;
+
 export interface PhysicalResultLocator {
     kind: PhysicalLocatorKind;
     /** The kind-local identifier (row id, message id, or commit sha). */
@@ -35,17 +50,17 @@ export interface PhysicalResultLocator {
 export function encodePhysicalResultLocator(result: UnifiedSearchResult): string {
     switch (result.source) {
         case "memory":
-            return `memory:${result.memoryId}`;
+            return `${SOURCE_LOCATOR_KIND.memory}:${result.memoryId}`;
         case "message":
-            return `message:${result.messageId}`;
+            return `${SOURCE_LOCATOR_KIND.message}:${result.messageId}`;
         case "compartment":
-            return `chunk:${result.compartmentId}`;
+            return `${SOURCE_LOCATOR_KIND.compartment}:${result.compartmentId}`;
         case "git_commit":
-            return `commit:${result.sha}`;
+            return `${SOURCE_LOCATOR_KIND.git_commit}:${result.sha}`;
         case "primer":
-            return `primer:${result.primerId}`;
+            return `${SOURCE_LOCATOR_KIND.primer}:${result.primerId}`;
         case "note":
-            return `note:${result.noteId}`;
+            return `${SOURCE_LOCATOR_KIND.note}:${result.noteId}`;
     }
 }
 

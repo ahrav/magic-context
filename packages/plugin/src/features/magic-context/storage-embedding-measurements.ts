@@ -157,7 +157,16 @@ function classifyOwnership(harnesses: string | null): MeasurementOwnership {
     return "ambiguous";
 }
 
-export function listMeasurementRowsWithOwnership(db: Database): OwnedMeasurementRow[] {
+/**
+ * One keyset page of measurement rows joined to session ownership. The
+ * measurement corpus grows with session count (bounded only per session), so
+ * this API forces bounded reads: callers page with `afterId`/`limit` instead
+ * of materializing the full history in one array.
+ */
+export function listMeasurementRowsWithOwnership(
+    db: Database,
+    page: { afterId: number; limit: number },
+): OwnedMeasurementRow[] {
     const rows = db
         .prepare(
             `SELECT m.id, m.session_id, m.project_path, m.query_text_hash,
@@ -165,9 +174,11 @@ export function listMeasurementRowsWithOwnership(db: Database): OwnedMeasurement
                        FROM session_projects sp
                       WHERE sp.session_id = m.session_id) AS harnesses
                FROM embedding_measurement_corpus m
-              ORDER BY m.id ASC`,
+              WHERE m.id > ?
+              ORDER BY m.id ASC
+              LIMIT ?`,
         )
-        .all() as Array<{
+        .all(page.afterId, Math.max(1, Math.floor(page.limit))) as Array<{
         id: number;
         session_id: string;
         project_path: string;

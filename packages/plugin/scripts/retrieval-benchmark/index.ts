@@ -111,16 +111,31 @@ function readJson(dir: string, name: string): unknown {
 
 /**
  * Load one reviewed release directory, failing closed before any scoring or
- * timing consumer can see inconsistent data: strict schemas, recomputed
+ * timing consumer can see inconsistent data: privacy scan first (so no later
+ * diagnostic can echo rejected content), then strict schemas, recomputed
  * fingerprints against the approved release tuple, current privacy policy and
- * sanitizer versions, approvals bound to the exact tuple, referential and
- * partition integrity, and a residual privacy scan.
+ * sanitizer versions, approvals bound to the exact tuple, and referential and
+ * partition integrity.
  */
 export function loadReviewedRelease(releaseDir: string): ReviewedRelease {
     const corpusRaw = readJson(releaseDir, RELEASE_FILES.corpus);
     const judgmentsRaw = readJson(releaseDir, RELEASE_FILES.judgments);
     const syntheticRaw = readJson(releaseDir, RELEASE_FILES.syntheticProfiles);
     const manifestRaw = readJson(releaseDir, RELEASE_FILES.manifest);
+
+    // The privacy gate runs before any parse or cross-artifact validation:
+    // no later diagnostic can echo content the scan would have rejected.
+    const violations = scanForSensitiveContent({
+        corpus: corpusRaw,
+        judgments: judgmentsRaw,
+        syntheticProfiles: syntheticRaw,
+        manifest: manifestRaw,
+    });
+    if (violations.length > 0) {
+        throw new ContractError(
+            violations.map((v) => `privacy.${v.category}: ${v.path}`).sort(),
+        );
+    }
 
     const manifest = parseManifest(manifestRaw);
     const tuple = manifest.releaseTuple;
@@ -152,18 +167,6 @@ export function loadReviewedRelease(releaseDir: string): ReviewedRelease {
     const judgments = parseJudgments(judgmentsRaw);
     const syntheticProfiles = parseSyntheticProfiles(syntheticRaw);
     validateRelease(corpus, judgments);
-
-    const violations = scanForSensitiveContent({
-        corpus: corpusRaw,
-        judgments: judgmentsRaw,
-        syntheticProfiles: syntheticRaw,
-        manifest: manifestRaw,
-    });
-    if (violations.length > 0) {
-        throw new ContractError(
-            violations.map((v) => `privacy.${v.category}: ${v.path}`).sort(),
-        );
-    }
 
     return {
         corpus,

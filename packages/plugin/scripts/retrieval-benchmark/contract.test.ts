@@ -67,6 +67,22 @@ describe("parseCorpus", () => {
         );
     });
 
+    it("rejects payload twins that collapse to one canonical relevance identity", () => {
+        const corpus = corpusJson();
+        const documents = corpus.documents as Array<{
+            id: string;
+            kind: string;
+            semanticPayload: { kind: string; title: string; body: string };
+        }>;
+        // Distinct id and locator, identical semantic payload: without the
+        // gate this re-registers one identity under a second document id.
+        documents[1].kind = documents[0].kind;
+        documents[1].semanticPayload = { ...documents[0].semanticPayload };
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus.documents[1].semanticPayload: duplicate-identity",
+        );
+    });
+
     it("does not echo field values in diagnostics", () => {
         const corpus = corpusJson();
         const canary = "sk-super-secret-value-1234567890";
@@ -118,9 +134,15 @@ describe("validateRelease", () => {
 
     it("rejects paraphrase groups that cross the partition boundary", () => {
         const { corpus, judgments } = makeValidRelease();
-        corpus.queries[1].paraphraseGroup = corpus.queries[0].paraphraseGroup;
+        const canary = "sk-canary-paraphrase-group-value";
+        corpus.queries[0].paraphraseGroup = canary;
+        corpus.queries[1].paraphraseGroup = canary;
         const diagnostics = diagnosticsOf(() => validateRelease(corpus, judgments));
         expect(diagnostics.some((d) => d.includes("paraphrase group crosses"))).toBe(true);
+        // The free-form group value is never echoed; offending queries are
+        // named by their regex-bounded ids instead.
+        expect(diagnostics.join("\n")).not.toContain(canary);
+        expect(diagnostics.some((d) => d.includes(corpus.queries[0].id))).toBe(true);
     });
 
     it("rejects target documents shared across partitions", () => {
@@ -129,6 +151,31 @@ describe("validateRelease", () => {
         judgments.judgments.push({
             queryId: corpus.queries[1].id,
             documentId: corpus.documents[0].id,
+            grade: 2,
+            provenance: { judge: "human", pooledFrom: ["manual"] },
+        });
+        const diagnostics = diagnosticsOf(() => validateRelease(corpus, judgments));
+        expect(diagnostics.some((d) => d.includes("target document crosses"))).toBe(true);
+    });
+
+    it("rejects a payload twin that re-registers holdout target content in development", () => {
+        const { corpus, judgments } = makeValidRelease();
+        // corpus.documents[i] pairs with corpus.queries[i]; queries alternate
+        // development/holdout, so documents[1] is the holdout target twinned
+        // into the development pool under a distinct document id.
+        const developmentQuery = corpus.queries[0];
+        const holdoutTarget = corpus.documents[1];
+        const twin = {
+            ...holdoutTarget,
+            id: "d-holdout-twin",
+            semanticPayload: { ...holdoutTarget.semanticPayload },
+            aliases: [{ ...holdoutTarget.aliases[0], locator: "twin-locator" }],
+        };
+        corpus.documents.push(twin);
+        judgments.pools[0].documentIds.push(twin.id);
+        judgments.judgments.push({
+            queryId: developmentQuery.id,
+            documentId: twin.id,
             grade: 2,
             provenance: { judge: "human", pooledFrom: ["manual"] },
         });

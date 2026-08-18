@@ -13,6 +13,7 @@
 
 import { dirname, resolve } from "node:path";
 
+import { SOURCE_LOCATOR_KIND } from "../src/features/magic-context/search-result-locator";
 import {
     type CorpusArtifact,
     CORPUS_SCHEMA_VERSION,
@@ -333,14 +334,9 @@ const AUTHORED: AuthoredEntry[] = [
     },
 ];
 
-const ALIAS_NAMESPACE: Record<DocumentKind, string> = {
-    memory: "memory",
-    message: "message",
-    compartment: "chunk",
-    git_commit: "commit",
-    primer: "primer",
-    note: "note",
-};
+/** Fixture alias namespaces must byte-match production-encoded locators, so
+ *  the mapping is the production codec's, not a local copy that can drift. */
+const ALIAS_NAMESPACE: Record<DocumentKind, string> = SOURCE_LOCATOR_KIND;
 
 const REFERENCE_TIME_MS = 1_755_400_000_000;
 

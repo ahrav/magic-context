@@ -7,7 +7,9 @@
  */
 
 import { z } from "zod";
+import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
 import { canonicalFingerprint } from "./canonical-json";
+import { relevanceIdentity } from "./identity";
 
 export const CORPUS_SCHEMA_VERSION = "retrieval-benchmark-corpus/v1";
 export const JUDGMENTS_SCHEMA_VERSION = "retrieval-benchmark-judgments/v1";
@@ -39,14 +41,20 @@ export const DOCUMENT_KINDS = [
 ] as const;
 export type DocumentKind = (typeof DOCUMENT_KINDS)[number];
 
-/** ctx-search source filter vocabulary (mirrors the tool's `sources` arg). */
-export const SOURCE_FILTERS = ["memory", "message", "git_commit", "primer", "note"] as const;
+/** ctx-search source filter vocabulary. `satisfies` ties this to the tool's
+ *  `sources` arg type, so vocabulary drift is a compile error. */
+export const SOURCE_FILTERS = [
+    "memory",
+    "message",
+    "git_commit",
+    "primer",
+    "note",
+] as const satisfies readonly CtxSearchSource[];
 
 const scopeSchema = z.strictObject({
     projectScope: z.string().min(1),
     sessionScope: z.string().min(1).nullable(),
 });
-export type FixtureScope = z.infer<typeof scopeSchema>;
 
 const aliasSchema = z.strictObject({
     namespace: z.string().min(1),
@@ -215,11 +223,21 @@ export function parseCorpus(value: unknown): CorpusArtifact {
         queryIds.add(query.id);
     }
     const documentIds = new Set<string>();
+    const documentByIdentity = new Map<string, number>();
     for (const [i, doc] of corpus.documents.entries()) {
         if (documentIds.has(doc.id)) diagnostics.push(`corpus.documents[${i}].id: duplicate`);
         documentIds.add(doc.id);
         if (doc.semanticPayload.kind !== doc.kind) {
             diagnostics.push(`corpus.documents[${i}].semanticPayload.kind: mismatch`);
+        }
+        // Two documents with one semantic payload collapse to one canonical
+        // relevance identity: judgments and partition checks keyed by
+        // document id would silently disagree with identity-keyed crediting.
+        const identity = relevanceIdentity(doc.semanticPayload);
+        if (documentByIdentity.has(identity)) {
+            diagnostics.push(`corpus.documents[${i}].semanticPayload: duplicate-identity`);
+        } else {
+            documentByIdentity.set(identity, i);
         }
     }
     if (diagnostics.length > 0) throw new ContractError(diagnostics.sort());
@@ -277,7 +295,11 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         const ids = new Set<string>();
         for (const [j, documentId] of pool.documentIds.entries()) {
             if (!documentIds.has(documentId)) {
+                // Dangling entries get this diagnostic only; keeping them out
+                // of the pool set stops the unjudged loop from echoing the
+                // unconstrained (non-corpus) id into diagnostics.
                 diagnostics.push(`judgments.pools[${i}].documentIds[${j}]: dangling`);
+                continue;
             }
             ids.add(documentId);
         }
@@ -325,40 +347,61 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         if (!hasPositive) diagnostics.push(`judgments: no positive judgment for ${query.id}`);
     }
 
-    const groupPartitions = new Map<string, Set<string>>();
+    // Diagnostics echo regex-bounded query ids, never the free-form
+    // paraphraseGroup value (diagnostics are an output channel too).
+    const groupPartitions = new Map<string, { partitions: Set<string>; queryIds: string[] }>();
     for (const query of corpus.queries) {
-        let partitions = groupPartitions.get(query.paraphraseGroup);
-        if (!partitions) {
-            partitions = new Set();
-            groupPartitions.set(query.paraphraseGroup, partitions);
+        let group = groupPartitions.get(query.paraphraseGroup);
+        if (!group) {
+            group = { partitions: new Set(), queryIds: [] };
+            groupPartitions.set(query.paraphraseGroup, group);
         }
-        partitions.add(query.partition);
+        group.partitions.add(query.partition);
+        group.queryIds.push(query.id);
     }
-    for (const [group, partitions] of groupPartitions) {
-        if (partitions.size > 1) {
-            diagnostics.push(`corpus: paraphrase group crosses partitions (${group})`);
+    for (const group of groupPartitions.values()) {
+        if (group.partitions.size > 1) {
+            diagnostics.push(
+                `corpus: paraphrase group crosses partitions (${group.queryIds.sort().join(", ")})`,
+            );
         }
     }
 
     // A document positively judged from both partitions leaks holdout targets
-    // into development tuning.
-    const docPartitions = new Map<string, Set<string>>();
+    // into development tuning. Keyed on the canonical relevance identity so a
+    // payload twin under a different document id cannot re-register holdout
+    // content in development (parseCorpus rejects twins; this holds even for
+    // corpora that bypassed it).
+    const identityByDocument = new Map(
+        corpus.documents.map((d) => [d.id, relevanceIdentity(d.semanticPayload)]),
+    );
+    const identityPartitions = new Map<
+        string,
+        { partitions: Set<string>; documentIds: Set<string> }
+    >();
     for (const [queryId, byDoc] of judged) {
         const query = queryById.get(queryId);
         if (!query) continue;
         for (const [documentId, judgment] of byDoc) {
             if (judgment.grade === 0) continue;
-            let partitions = docPartitions.get(documentId);
-            if (!partitions) {
-                partitions = new Set();
-                docPartitions.set(documentId, partitions);
+            const identity = identityByDocument.get(documentId);
+            if (!identity) continue;
+            let entry = identityPartitions.get(identity);
+            if (!entry) {
+                entry = { partitions: new Set(), documentIds: new Set() };
+                identityPartitions.set(identity, entry);
             }
-            partitions.add(query.partition);
+            entry.partitions.add(query.partition);
+            entry.documentIds.add(documentId);
         }
     }
-    for (const [documentId, partitions] of docPartitions) {
-        if (partitions.size > 1) {
-            diagnostics.push(`judgments: target document crosses partitions (${documentId})`);
+    for (const entry of identityPartitions.values()) {
+        if (entry.partitions.size > 1) {
+            diagnostics.push(
+                `judgments: target document crosses partitions (${[...entry.documentIds]
+                    .sort()
+                    .join(", ")})`,
+            );
         }
     }
 

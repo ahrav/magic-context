@@ -2,12 +2,15 @@
 /**
  * Recover historical benchmark query candidates from the measurement corpus.
  *
- * Query-only over one stable read snapshot: joins measurement rows to
- * `session_projects` ownership, reconstructs candidate queries from OpenCode
- * session history with the same helpers the live paths use, and accepts a
- * plaintext only when exactly one same-session candidate matches the stored
- * normalized hash. Raw text and hashes stay in memory; the only outputs are a
- * privacy-gated draft and an allowlisted status/count report, written
+ * Query-only over one stable read snapshot per database (a read transaction
+ * is held on both connections across all reads): joins measurement rows to
+ * `session_projects` ownership in bounded keyset pages, reconstructs
+ * candidate queries from OpenCode session history with the same helpers the
+ * live paths use (one session hydrated at a time, its raw messages released
+ * after candidate extraction), and accepts a plaintext only when exactly one
+ * same-session candidate matches the stored normalized hash with one
+ * unambiguous mode. Raw text and hashes stay in memory; the only outputs are
+ * a privacy-gated draft and an allowlisted status/count report, written
  * atomically to an owner-only staging directory outside every source,
  * publication, and VCS tree. Recovery has no import edge to promotion.
  *
@@ -48,6 +51,7 @@ import type { Database } from "../src/shared/sqlite";
 import { CTX_SEARCH_TOOL_NAME } from "../src/tools/ctx-search/constants";
 import { extractCtxSearchQueryInput } from "../src/tools/ctx-search/query-input";
 import type { CtxSearchArgs } from "../src/tools/ctx-search/types";
+import { hasGitAncestor } from "./retrieval-benchmark/fs-boundary";
 import { scanForSensitiveContent } from "./retrieval-benchmark/privacy";
 
 export const DRAFT_VERSION = "benchmark-draft/v1";
@@ -63,6 +67,7 @@ export const RECOVERY_STATUSES = [
     "cross-session-only",
     "normalized-collision",
     "multi-match",
+    "mode-ambiguous",
     "privacy-rejected",
 ] as const;
 export type RecoveryStatus = (typeof RECOVERY_STATUSES)[number];
@@ -160,7 +165,15 @@ export function recoverCandidates(args: {
             const hash = hashCandidate(candidate.text);
             allHashes.add(hash);
             const list = byHash.get(hash) ?? [];
-            if (!list.some((existing) => existing.text === candidate.text)) {
+            // Dedupe on (text, mode): one text seen as both an automatic
+            // prompt and an explicit tool call keeps both entries, so mode
+            // provenance is classified instead of resolved by message order.
+            if (
+                !list.some(
+                    (existing) =>
+                        existing.text === candidate.text && existing.mode === candidate.mode,
+                )
+            ) {
                 list.push(candidate);
             }
             byHash.set(hash, list);
@@ -190,8 +203,16 @@ export function recoverCandidates(args: {
             continue;
         }
         if (matches.length > 1) {
-            const collided = matches.every((m) => normalizedCompare(m.text, matches[0].text));
-            record(row.ordinal, collided ? "normalized-collision" : "multi-match");
+            const texts = new Set(matches.map((m) => m.text));
+            if (texts.size === 1) {
+                // Identical text under differing modes: provenance selects
+                // the replay path, so guessing one is not allowlisted.
+                record(row.ordinal, "mode-ambiguous");
+            } else if (matches.every((m) => normalizedCompare(m.text, matches[0].text))) {
+                record(row.ordinal, "normalized-collision");
+            } else {
+                record(row.ordinal, "multi-match");
+            }
             continue;
         }
         const match = matches[0];
@@ -211,33 +232,28 @@ export function recoverCandidates(args: {
 
 export class StagingError extends Error {}
 
-function hasGitAncestor(path: string): boolean {
-    let current = resolve(path);
-    for (;;) {
-        if (existsSync(join(current, ".git"))) return true;
-        const parent = dirname(current);
-        if (parent === current) return false;
-        current = parent;
-    }
-}
-
 /**
- * Owner-only staging root outside every forbidden tree. Rejects symlink
- * aliases (realpath must equal the resolved path), group/other-accessible
- * modes, and any root under a VCS worktree or a caller-named forbidden path.
+ * Owner-only staging root outside every forbidden tree. Rejects roots whose
+ * path traverses any symlink component (the realpath must equal the path as
+ * given), roots not owned by the calling user, group/other-accessible modes,
+ * and any root under a VCS worktree or a caller-named forbidden path.
  */
 export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[]): string {
     if (!isAbsolute(root)) throw new StagingError("staging root must be absolute");
     mkdirSync(root, { recursive: true, mode: 0o700 });
     const real = realpathSync.native(root);
-    if (real !== realpathSync.native(resolve(root))) {
+    if (real !== resolve(root)) {
         throw new StagingError("staging root resolves through an alias");
     }
     const stat = lstatSync(root);
     if (stat.isSymbolicLink() || !statSync(root).isDirectory()) {
         throw new StagingError("staging root must be a plain directory");
     }
-    if ((statSync(root).mode & 0o077) !== 0) {
+    const rootStat = statSync(root);
+    if (typeof process.getuid === "function" && rootStat.uid !== process.getuid()) {
+        throw new StagingError("staging root must be caller-owned");
+    }
+    if ((rootStat.mode & 0o077) !== 0) {
         throw new StagingError("staging root must be owner-only");
     }
     if (hasGitAncestor(real)) throw new StagingError("staging root is inside a VCS tree");
@@ -302,8 +318,10 @@ export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_
     }
 }
 
+/** Canonicalized so the symlink-alias staging check holds on platforms whose
+ *  temp directory itself sits behind a symlink (macOS `/var` -> `/private/var`). */
 export function defaultStagingRoot(): string {
-    return join(tmpdir(), "magic-context-benchmark-drafts");
+    return join(realpathSync.native(tmpdir()), "magic-context-benchmark-drafts");
 }
 
 const REQUIRED_TABLES: Record<string, readonly string[]> = {
@@ -330,19 +348,24 @@ export function validateMeasurementSchema(db: Database): void {
 
 export function boundedRowsOrThrow(
     rows: ReturnType<typeof listMeasurementRowsWithOwnership>,
+    baseOrdinal = 0,
 ): RecoveryInputRow[] {
-    return rows.map((row, ordinal) => {
+    return rows.map((row, i) => {
         if (!/^[0-9a-f]{64}$/.test(row.queryTextHash) || row.sessionId.length > 256) {
             throw new StagingError("source row shape is out of bounds");
         }
         return {
-            ordinal,
+            ordinal: baseOrdinal + i,
             sessionId: row.sessionId,
             queryTextHash: row.queryTextHash,
             ownership: row.ownership,
         };
     });
 }
+
+/** Keyset page size for the measurement-corpus read. Bounds the per-query
+ *  buffer; the read transaction held across pages keeps them one snapshot. */
+const MEASUREMENT_PAGE_SIZE = 5_000;
 
 export async function runRecovery(args: {
     measurementDb: Database;
@@ -356,21 +379,52 @@ export async function runRecovery(args: {
     purgeStaleDrafts(root, nowMs);
 
     validateMeasurementSchema(args.measurementDb);
-    args.measurementDb.exec("BEGIN");
-    let rows: RecoveryInputRow[];
-    try {
-        rows = boundedRowsOrThrow(listMeasurementRowsWithOwnership(args.measurementDb));
-    } finally {
-        args.measurementDb.exec("COMMIT");
-    }
 
+    // One read transaction per connection, held across every read on that
+    // connection, so concurrent plugin activity (corpus pruning, session
+    // purge) cannot shift rows between the corpus and history phases of one
+    // run. Read-only work: end with ROLLBACK, and never let transaction
+    // teardown mask the original error.
+    const endRead = (db: Database) => {
+        try {
+            db.exec("ROLLBACK");
+        } catch {
+            /* connection already closed or transaction never started */
+        }
+    };
+    args.measurementDb.exec("BEGIN");
+    args.historyDb.exec("BEGIN");
+    let rows: RecoveryInputRow[];
     const candidatesBySession = new Map<string, readonly QueryCandidate[]>();
-    for (const row of rows) {
-        if (row.ownership !== "opencode" || candidatesBySession.has(row.sessionId)) continue;
-        candidatesBySession.set(
-            row.sessionId,
-            collectSessionCandidates(readRawSessionMessagesFromDb(args.historyDb, row.sessionId)),
-        );
+    try {
+        rows = [];
+        let afterId = 0;
+        for (;;) {
+            const page = listMeasurementRowsWithOwnership(args.measurementDb, {
+                afterId,
+                limit: MEASUREMENT_PAGE_SIZE,
+            });
+            if (page.length === 0) break;
+            rows.push(...boundedRowsOrThrow(page, rows.length));
+            afterId = page[page.length - 1].id;
+        }
+
+        // One session hydrated at a time; its raw messages are released as
+        // soon as the bounded candidate list is extracted.
+        for (const row of rows) {
+            if (row.ownership !== "opencode" || candidatesBySession.has(row.sessionId)) {
+                continue;
+            }
+            candidatesBySession.set(
+                row.sessionId,
+                collectSessionCandidates(
+                    readRawSessionMessagesFromDb(args.historyDb, row.sessionId),
+                ),
+            );
+        }
+    } finally {
+        endRead(args.measurementDb);
+        endRead(args.historyDb);
     }
 
     const { draft, report } = recoverCandidates({ rows, candidatesBySession });

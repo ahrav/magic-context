@@ -147,7 +147,7 @@ describe("embedding measurement corpus", () => {
         record("ses-other", "other harness query");
         bind("ses-other", "mystery");
 
-        const owned = listMeasurementRowsWithOwnership(db);
+        const owned = listMeasurementRowsWithOwnership(db, { afterId: 0, limit: 100 });
         expect(owned.map((row) => [row.sessionId, row.ownership])).toEqual([
             ["ses-oc", "opencode"],
             ["ses-pi", "pi"],
@@ -156,5 +156,14 @@ describe("embedding measurement corpus", () => {
             ["ses-other", "ambiguous"],
         ]);
         expect(owned[0].queryTextHash).toBe(normalizedQueryHash("opencode query"));
+
+        // Keyset paging covers the same rows without overlap or gaps.
+        const firstPage = listMeasurementRowsWithOwnership(db, { afterId: 0, limit: 2 });
+        expect(firstPage).toHaveLength(2);
+        const secondPage = listMeasurementRowsWithOwnership(db, {
+            afterId: firstPage[1].id,
+            limit: 100,
+        });
+        expect([...firstPage, ...secondPage]).toEqual(owned);
     });
 });

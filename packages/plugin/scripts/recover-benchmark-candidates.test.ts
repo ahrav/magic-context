@@ -185,6 +185,35 @@ describe("recoverCandidates", () => {
         expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "multi-match" }]);
     });
 
+    it("reports mode ambiguity instead of resolving provenance by message order", () => {
+        const text = "same text seen through both extraction paths";
+        for (const order of [
+            [candidate(text, "automatic"), candidate(text, "explicit")],
+            [candidate(text, "explicit"), candidate(text, "automatic")],
+        ]) {
+            const outcome = recoverCandidates({
+                rows: [row(0, "s1", normalizedQueryHash(text))],
+                candidatesBySession: new Map([["s1", order]]),
+            });
+            expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "mode-ambiguous" }]);
+            expect(outcome.draft.records).toHaveLength(0);
+        }
+    });
+
+    it("recovers a repeated same-mode text as a single unambiguous candidate", () => {
+        const text = "explicit search repeated verbatim";
+        const outcome = recoverCandidates({
+            rows: [row(0, "s1", normalizedQueryHash(text))],
+            candidatesBySession: new Map([
+                ["s1", [candidate(text, "explicit"), candidate(text, "explicit")]],
+            ]),
+        });
+        expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "recovered" }]);
+        expect(outcome.draft.records).toEqual([
+            { ordinal: 0, mode: "explicit", queryText: text },
+        ]);
+    });
+
     it("privacy-rejects a matched candidate that still carries sensitive text", () => {
         const text = "token in /home/someone/.ssh/id_rsa please";
         const outcome = recoverCandidates({

@@ -1,5 +1,6 @@
 /** Test-only builders for a minimal valid release; not exported by the facade. */
 
+import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
 import { canonicalFingerprint } from "./canonical-json";
 import {
     type CorpusArtifact,
@@ -31,14 +32,7 @@ const KIND_ROTATION: DocumentKind[] = [
     "note",
 ];
 
-const ALIAS_NAMESPACE: Record<DocumentKind, string> = {
-    memory: "memory",
-    message: "message",
-    compartment: "chunk",
-    git_commit: "commit",
-    primer: "primer",
-    note: "note",
-};
+const ALIAS_NAMESPACE: Record<DocumentKind, string> = SOURCE_LOCATOR_KIND;
 
 export function makeDocument(
     slug: string,

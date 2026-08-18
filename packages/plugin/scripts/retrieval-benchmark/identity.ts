@@ -10,6 +10,10 @@
  * identity earns metric credit.
  */
 
+import {
+    PHYSICAL_LOCATOR_KINDS,
+    parsePhysicalResultLocator,
+} from "../../src/features/magic-context/search-result-locator";
 import { canonicalFingerprint } from "./canonical-json";
 import type { CorpusDocument } from "./contract";
 
@@ -23,23 +27,26 @@ export function relevanceIdentity(semanticPayload: unknown): string {
     })}`;
 }
 
+/** Benchmark-only namespace spellings (characterization tests, simulated
+ *  post-migration locators). Production spellings are NOT listed here — they
+ *  come straight from `PHYSICAL_LOCATOR_KINDS`, so a production prefix change
+ *  propagates into the dialect table instead of silently diverging. */
+const BENCHMARK_DIALECTS: Record<string, string> = {
+    compartment: "chunk",
+    git_commit: "commit",
+    claim: "claim",
+    revision: "revision",
+    "retrieval-document": "retrieval-document",
+};
+
 /** Locator-namespace spellings that name the same physical store. Keys are
  *  accepted dialects (production, characterization tests, future migration);
  *  values canonicalize dialect-specific namespace spellings.
  *  `dialectNamespace` uses `Object.hasOwn` to reject prototype-named inputs
  *  (`constructor`, `toString`). */
 const NAMESPACE_DIALECTS: Record<string, string> = {
-    memory: "memory",
-    message: "message",
-    chunk: "chunk",
-    compartment: "chunk",
-    commit: "commit",
-    git_commit: "commit",
-    primer: "primer",
-    note: "note",
-    claim: "claim",
-    revision: "revision",
-    "retrieval-document": "retrieval-document",
+    ...Object.fromEntries(PHYSICAL_LOCATOR_KINDS.map((kind) => [kind, kind])),
+    ...BENCHMARK_DIALECTS,
 };
 
 function dialectNamespace(raw: string): string | null {
@@ -114,13 +121,26 @@ export function resolveRankedLocators(
 ): ResolvedRankedResult[] {
     const seen = new Set<string>();
     return ranked.map((raw, rank) => {
-        const separator = raw.indexOf(":");
-        if (separator <= 0 || separator === raw.length - 1) {
+        // Production spellings go through the frozen production parser;
+        // benchmark-only dialect spellings fall back to the dialect table.
+        const parsed = parsePhysicalResultLocator(raw);
+        let namespace: string;
+        let locator: string;
+        if (parsed.ok) {
+            namespace = parsed.value.kind;
+            locator = parsed.value.locator;
+        } else if (parsed.reason === "unknown-kind") {
+            const separator = raw.indexOf(":");
+            if (separator === raw.length - 1) {
+                return { status: "unresolved", rank, reason: "malformed" };
+            }
+            const dialect = dialectNamespace(raw.slice(0, separator));
+            if (!dialect) return { status: "unresolved", rank, reason: "malformed" };
+            namespace = dialect;
+            locator = raw.slice(separator + 1);
+        } else {
             return { status: "unresolved", rank, reason: "malformed" };
         }
-        const namespace = dialectNamespace(raw.slice(0, separator));
-        if (!namespace) return { status: "unresolved", rank, reason: "malformed" };
-        const locator = raw.slice(separator + 1);
         const scoped =
             scope.sessionScope !== null
                 ? index.byAlias.get(aliasKey(namespace, locator, scope))

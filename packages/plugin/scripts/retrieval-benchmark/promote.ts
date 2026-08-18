@@ -2,13 +2,15 @@
  * DB-free promotion of a reviewed draft into an immutable release directory.
  *
  * The promoter validates operator-supplied artifacts and approvals against
- * the exact release tuple, materializes the full release in a hidden staging
- * directory, re-loads it through the strict consumer path, and only then
- * atomically renames it into place. It has no API for creating approvals and
- * never modifies an existing release.
+ * the exact release tuple, re-loads the full release through the strict
+ * consumer path in an owner-only review directory outside every VCS tree,
+ * and only then stages the validated bytes next to the destination and
+ * atomically renames them into place. It has no API for creating approvals
+ * and never modifies an existing release.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -27,6 +29,7 @@ import {
     SYNTHETIC_SCHEMA_VERSION,
     validateRelease,
 } from "./contract";
+import { hasGitAncestor } from "./fs-boundary";
 import { loadReviewedRelease, RELEASE_FILES } from "./index";
 import { PRIVACY_POLICY_VERSION, SANITIZER_VERSION } from "./privacy";
 
@@ -119,6 +122,11 @@ export function buildManifest(
  * Validate and atomically install a new immutable release directory.
  * Rejection, write failure, or interruption leaves the releases root without
  * a partial version directory and any prior release byte-identical.
+ *
+ * Unvetted bytes never touch the releases root: the full consumer-path
+ * re-load (fingerprints, approvals, privacy, partitions) runs against an
+ * owner-only review directory outside every VCS tree, and only content that
+ * passed every gate is staged next to the destination for the atomic rename.
  */
 export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     const corpus = parseCorpus(input.corpus);
@@ -131,26 +139,46 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
     if (existsSync(destination)) {
         throw new ContractError(["release: version already installed"]);
     }
-    mkdirSync(input.releasesRoot, { recursive: true });
-    // Unique staging directory per attempt: concurrent promotions of the same
-    // version cannot swap each other's contents between the validating
-    // re-load below and the rename.
-    const staging = mkdtempSync(join(input.releasesRoot, ".staging-"));
-    try {
-        const files: Array<[string, unknown]> = [
+    const files: Array<[string, string]> = (
+        [
             [RELEASE_FILES.corpus, input.corpus],
             [RELEASE_FILES.judgments, input.judgments],
             [RELEASE_FILES.syntheticProfiles, input.syntheticProfiles],
             [RELEASE_FILES.manifest, manifest],
-        ];
-        for (const [name, value] of files) {
-            writeFileSync(join(staging, name), `${JSON.stringify(value, null, 2)}\n`, {
-                flag: "wx",
-            });
+        ] as Array<[string, unknown]>
+    ).map(([name, value]) => [name, `${JSON.stringify(value, null, 2)}\n`]);
+
+    // Consumer-path re-load happens in an owner-only directory outside any
+    // worktree, so a crash mid-promotion cannot leave privacy-unvetted bytes
+    // where a `git add` could commit them.
+    const reviewDir = mkdtempSync(
+        join(realpathSync.native(tmpdir()), "magic-context-benchmark-promote-"),
+    );
+    try {
+        if (hasGitAncestor(reviewDir)) {
+            throw new ContractError(["release: review staging is inside a VCS tree"]);
         }
-        // Full consumer-path re-load: the staged directory must satisfy every
-        // loader gate (fingerprints, approvals, privacy, partitions) before
-        // it can become a release.
+        for (const [name, content] of files) {
+            writeFileSync(join(reviewDir, name), content, { flag: "wx" });
+        }
+        loadReviewedRelease(reviewDir);
+    } catch (error) {
+        rmSync(reviewDir, { recursive: true, force: true });
+        throw error;
+    }
+    rmSync(reviewDir, { recursive: true, force: true });
+
+    mkdirSync(input.releasesRoot, { recursive: true });
+    // Unique staging directory per attempt: concurrent promotions of the same
+    // version cannot swap each other's contents between the validating
+    // re-load below and the rename. Only gate-passing bytes reach this point.
+    const staging = mkdtempSync(join(input.releasesRoot, ".staging-"));
+    try {
+        for (const [name, content] of files) {
+            writeFileSync(join(staging, name), content, { flag: "wx" });
+        }
+        // Re-load the exact directory being renamed into place, so tampering
+        // with staged bytes between write and rename is still caught.
         loadReviewedRelease(staging);
         renameSync(staging, destination);
     } catch (error) {
