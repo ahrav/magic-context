@@ -15,7 +15,9 @@ export function formatAge(timestampMs: number): string {
     if (days < 30) return `${days}d ago`;
     const months = Math.floor(days / 30);
     if (months === 1) return "1mo ago";
-    if (months < 12) return `${months}mo ago`;
+    // Guard on days, not months: 360-364 days is months === 12 but not yet a
+    // year, and `months < 12` would fall through to a `0y ago` answer.
+    if (days < 365) return `${months}mo ago`;
     const years = Math.floor(days / 365);
     return years === 1 ? "1y ago" : `${years}y ago`;
 }

@@ -71,6 +71,15 @@ describe("collectStrippedPromptPrefix", () => {
         );
     });
 
+    it("does not open a drop block for a self-closing drop tag with a quoted > attribute", () => {
+        expect(
+            collectStrippedPromptPrefix('<instruction data=">"/> question survives').trim(),
+        ).toBe("question survives");
+        expect(
+            collectStrippedPromptPrefix("<system-reminder note='a>b'/> question survives").trim(),
+        ).toBe("question survives");
+    });
+
     it("finds the drop-block close across bare < characters in dropped content", () => {
         expect(
             collectStrippedPromptPrefix(

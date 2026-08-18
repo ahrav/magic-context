@@ -31,15 +31,26 @@ const CONTENT_DROP_TAGS = [
 
 /** Index of the tag-closing `>` at or after `start`, scanning only until the
  *  next `<` — a nested `<` means the candidate span is plain text, not a tag
- *  body. Bounding the scan at the next `<` keeps the whole stripper linear:
- *  a prompt full of `<` characters with no later `>` cannot trigger an
- *  end-of-string scan per candidate. Returns -1 when the span is not a tag
- *  body. */
+ *  body. A `>` inside a quoted attribute value (`data=">"`) is part of the
+ *  value, not the terminator. The `<` bail applies even inside quotes: it is
+ *  what keeps the whole stripper linear, because candidate spans can never
+ *  overlap and a prompt full of `<` characters (or unterminated quotes) with
+ *  no later `>` cannot trigger an end-of-string scan per candidate. Returns
+ *  -1 when the span is not a tag body. */
 function findTagClose(text: string, start: number): number {
+    let quote: "'" | '"' | null = null;
     for (let i = start; i < text.length; i += 1) {
         const char = text[i];
-        if (char === ">") return i;
         if (char === "<") return -1;
+        if (quote !== null) {
+            if (char === quote) quote = null;
+            continue;
+        }
+        if (char === "'" || char === '"') {
+            quote = char;
+            continue;
+        }
+        if (char === ">") return i;
     }
     return -1;
 }
