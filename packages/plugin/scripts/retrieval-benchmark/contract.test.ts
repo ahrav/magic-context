@@ -127,6 +127,11 @@ describe("parseCorpus", () => {
         // The exact production set (any order) is accepted.
         query.sourceFilters = ["git_commit", "memory", "message"];
         expect(() => parseCorpus(corpus)).not.toThrow();
+        // The automatic path also fixes its result limit at 10.
+        query.resultLimit = 20;
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus.queries[0].resultLimit: automatic-mismatch",
+        );
     });
 
     it("rejects duplicate ids", () => {

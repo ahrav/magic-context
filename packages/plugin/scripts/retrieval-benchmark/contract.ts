@@ -14,7 +14,10 @@ import {
 } from "../../src/features/magic-context/search-bounds";
 import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
 import { normalizeQueryText } from "../../src/features/magic-context/storage-embedding-measurements";
-import { AUTO_SEARCH_SOURCES } from "../../src/hooks/magic-context/auto-search-prompt";
+import {
+    AUTO_SEARCH_RESULT_LIMIT,
+    AUTO_SEARCH_SOURCES,
+} from "../../src/hooks/magic-context/auto-search-prompt";
 import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
 import { canonicalFingerprint } from "./canonical-json";
 import { relevanceIdentity } from "./identity";
@@ -275,6 +278,11 @@ export function parseCorpus(value: unknown): CorpusArtifact {
                 declared.some((filter, f) => filter !== required[f])
             ) {
                 diagnostics.push(`corpus.queries[${i}].sourceFilters: automatic-mismatch`);
+            }
+            // The automatic path also fixes its result limit; a different
+            // declared cutoff would change recall against production.
+            if (query.resultLimit !== AUTO_SEARCH_RESULT_LIMIT) {
+                diagnostics.push(`corpus.queries[${i}].resultLimit: automatic-mismatch`);
             }
         }
     }

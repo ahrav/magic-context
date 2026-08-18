@@ -18,7 +18,11 @@
  */
 
 import type { SearchSource } from "../../features/magic-context/search";
-import { MAX_QUERY_BYTES, prepareAutomaticQuery } from "../../features/magic-context/search-bounds";
+import {
+    DEFAULT_SEARCH_RESULT_LIMIT,
+    MAX_QUERY_BYTES,
+    prepareAutomaticQuery,
+} from "../../features/magic-context/search-bounds";
 
 /** Sources the automatic (transform-time) search path queries. Primers and
  *  notes are cache-neutral in v1: they surface via explicit ctx_search and
@@ -31,6 +35,11 @@ export const AUTO_SEARCH_SOURCES = [
     "message",
     "git_commit",
 ] as const satisfies readonly SearchSource[];
+
+/** Result limit the automatic path always requests. The runner and the
+ *  benchmark contract both derive from this value so an automatic scenario
+ *  cannot declare a cutoff production never executes. */
+export const AUTO_SEARCH_RESULT_LIMIT = DEFAULT_SEARCH_RESULT_LIMIT;
 
 /** Tags whose whole block (content included) is plugin-owned noise. The
  *  system-reminder entry legitimately nests, so all entries track depth. */

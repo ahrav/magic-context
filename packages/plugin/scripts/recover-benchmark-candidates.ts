@@ -477,8 +477,12 @@ export async function runRecovery(args: {
 
         // One session hydrated at a time; its raw messages and unreferenced
         // candidate text are released as soon as the row-referenced subset is
-        // extracted. The full hash union survives (hashes only, no text) so
-        // cross-session-only classification stays exact.
+        // extracted. The hash union (hashes only, no text) spans every
+        // measurement-referenced opencode session, so cross-session-only vs
+        // zero-match is exact WITHIN that scope; a hash that exists only in
+        // sessions with no measurement rows reports zero-match, a deliberate
+        // bound — labeling it would require hydrating the entire history
+        // database for a diagnostic count that recovers nothing either way.
         for (const [sessionId, rowHashes] of rowHashesBySession) {
             const kept: QueryCandidate[] = [];
             for (const candidate of collectSessionCandidates(
