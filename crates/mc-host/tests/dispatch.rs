@@ -710,7 +710,9 @@ async fn oversized_handler_output_cannot_corrupt_framing() {
 #[tokio::test]
 async fn concurrent_handler_output_is_reserved_before_allocation() {
     let host = TestHost::start_with(|config| {
-        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES;
+        // The cached catalog subtracts from the resident budget at startup;
+        // 64 KiB of headroom keeps the egress budget at its one-frame floor.
+        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + 64 * 1024;
     })
     .await;
     let mut client = host.client().await;
@@ -784,7 +786,7 @@ async fn concurrent_handler_output_is_reserved_before_allocation() {
 #[tokio::test]
 async fn egress_budget_deadline_retires_the_generation() {
     let host = TestHost::start_with(|config| {
-        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES;
+        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + 64 * 1024;
         config.timing.frame_deadline = Duration::from_millis(100);
     })
     .await;

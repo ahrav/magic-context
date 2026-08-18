@@ -33,6 +33,11 @@ use crate::wire::{
 /// host Pings live in their own namespace (protocol §8.3, V43).
 pub type PendingKey = (u16, u32, u64);
 
+/// Concurrent off-reader `server_busy` rejection emissions per generation.
+/// Small: rejections only queue this deep when global pending capacity is
+/// exhausted AND egress is contended; beyond it the reader emits inline.
+const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
+
 pub struct PendingEntry {
     pub cancel: CancellationToken,
     pub settlement: Arc<crate::dispatch::Settlement>,
@@ -60,6 +65,10 @@ pub struct GenerationCore {
     pub pending: Mutex<HashMap<PendingKey, PendingEntry>>,
     /// Outstanding host-originated Pings: correlation -> (flags byte, sent at).
     pub pings: Mutex<HashMap<u64, (u8, Instant)>>,
+    /// Bounds concurrent off-reader `server_busy` rejection emissions so a
+    /// client flooding control frames past global capacity cannot grow
+    /// unbounded tasks through them.
+    pub busy_rejects: Arc<tokio::sync::Semaphore>,
     pub next_ping_corr: std::sync::atomic::AtomicU64,
 }
 
@@ -123,6 +132,7 @@ pub async fn run_connection<H: McHostHandler>(
         membership: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
         pings: Mutex::new(HashMap::new()),
+        busy_rejects: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BUSY_REJECTS)),
         next_ping_corr: std::sync::atomic::AtomicU64::new(1),
     });
     // Register the read loop before publishing the generation. Its tracker
@@ -337,14 +347,39 @@ async fn handle_control<H: McHostHandler>(
     // no-dispatch `server_busy` terminal takes precedence over the semantic
     // error (protocol §8.3).
     let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
-        emit_error_terminal(
-            &shared.egress_budget,
-            gen,
-            FrameId::control(corr),
-            crate::control::CODE_SERVER_BUSY,
-            "pending request capacity exhausted",
-        )
-        .await;
+        // The rejection wait can hold the reader for a frame deadline under
+        // egress contention, starving a queued Pong into a liveness
+        // false-kill — so it runs off-reader while the per-generation bound
+        // allows. Past the bound (a client flooding control frames beyond
+        // global capacity) the inline fallback lets the reader stall
+        // throttle the offender instead of growing unbounded tasks.
+        match gen.busy_rejects.clone().try_acquire_owned() {
+            Ok(reject_permit) => {
+                let shared_task = Arc::clone(shared);
+                let gen_task = Arc::clone(gen);
+                shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                    let _reject_permit = reject_permit;
+                    emit_error_terminal(
+                        &shared_task.egress_budget,
+                        &gen_task,
+                        FrameId::control(corr),
+                        crate::control::CODE_SERVER_BUSY,
+                        "pending request capacity exhausted",
+                    )
+                    .await;
+                }));
+            }
+            Err(_) => {
+                emit_error_terminal(
+                    &shared.egress_budget,
+                    gen,
+                    FrameId::control(corr),
+                    crate::control::CODE_SERVER_BUSY,
+                    "pending request capacity exhausted",
+                )
+                .await;
+            }
+        }
         return;
     };
 
@@ -612,6 +647,7 @@ mod tests {
             membership: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pings: Mutex::new(HashMap::new()),
+            busy_rejects: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BUSY_REJECTS)),
             next_ping_corr: std::sync::atomic::AtomicU64::new(1),
         });
         let budget = crate::wire::ByteBudget::new(4096);
@@ -711,6 +747,7 @@ mod tests {
             membership: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pings: Mutex::new(HashMap::new()),
+            busy_rejects: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BUSY_REJECTS)),
             next_ping_corr: std::sync::atomic::AtomicU64::new(1),
         };
 

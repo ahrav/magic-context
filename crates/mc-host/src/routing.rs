@@ -476,6 +476,7 @@ mod tests {
             membership: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pings: Mutex::new(HashMap::new()),
+            busy_rejects: Arc::new(tokio::sync::Semaphore::new(4)),
             next_ping_corr: AtomicU64::new(1),
         })
     }

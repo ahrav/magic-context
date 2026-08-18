@@ -16,9 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::connection::{GenerationCore, PendingEntry, PendingKey};
-use crate::control::{
-    error_body_json, CODE_CANCELLED, CODE_INTERNAL_ERROR, CODE_SERVER_BUSY, CODE_UNKNOWN_CHANNEL,
-};
+use crate::control::{CODE_CANCELLED, CODE_INTERNAL_ERROR, CODE_SERVER_BUSY, CODE_UNKNOWN_CHANNEL};
 use crate::handler::{
     McHostHandler, OutputBuffer, RequestCtx, RequestOutcome, RouteHandle, StreamClosed,
 };
@@ -121,13 +119,26 @@ async fn charged_error_body(
             }
         },
     };
-    let body = error_body_json(code, message);
+    let body = error_body_json_into(Vec::with_capacity(body_len), code, message);
     debug_assert_eq!(body.len(), body_len, "escaped length model diverged");
     Ok(OutputBuffer {
         body,
         charge,
         max_len: body_len,
     })
+}
+
+/// Serializes the error envelope directly into `buf` — no intermediate
+/// `serde_json::Value` — so the only allocation is the charged output buffer.
+/// Field order and escaping match `serde_json`, which `escaped_json_len`
+/// models exactly.
+fn error_body_json_into(mut buf: Vec<u8>, code: &str, message: &str) -> Vec<u8> {
+    buf.extend_from_slice(b"{\"code\":");
+    serde_json::to_writer(&mut buf, code).expect("string serialization cannot fail");
+    buf.extend_from_slice(b",\"message\":");
+    serde_json::to_writer(&mut buf, message).expect("string serialization cannot fail");
+    buf.push(b'}');
+    buf
 }
 
 /// Queues one frame on a generation's writer. Body-bearing frames charge their

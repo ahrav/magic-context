@@ -261,6 +261,18 @@ pub async fn run<H: McHostHandler>(
             "linked manifest exceeds the frame limit".to_owned(),
         ));
     }
+    // The cached catalog stays resident for the whole incarnation outside
+    // the byte-budget semaphores; the ingress budget shrinks by it below so
+    // total resident bytes still honor max_resident_bytes. That subtraction
+    // must leave at least one maximum request body of ingress headroom.
+    let catalog_resident = catalog.resident_len() as u64;
+    if config.limits.max_resident_bytes
+        < crate::config::MIN_RESIDENT_BYTES.saturating_add(catalog_resident)
+    {
+        return Err(HostError::InitFailed(
+            "linked manifest catalog leaves no resident-byte headroom".to_owned(),
+        ));
+    }
     // `route.open` admits only manifest-supported roles (protocol §7.2); a
     // manifest without the tool_provider role would publish a catalog that
     // says the role is unavailable while route admission still accepted it.
@@ -290,7 +302,23 @@ pub async fn run<H: McHostHandler>(
             let callback = crate::panic_boundary::redact_sync(|| handler.initialize(init));
             crate::panic_boundary::redact(callback).await
         }));
-        match timeout(config.timing.lifecycle_callback_deadline, &mut init_task).await {
+        let joined = tokio::select! {
+            biased;
+            // A shutdown request during initialization must not hold the
+            // instance lock for the whole lifecycle deadline.
+            () = shutdown.cancelled() => None,
+            joined = timeout(config.timing.lifecycle_callback_deadline, &mut init_task) => {
+                Some(joined)
+            }
+        };
+        let Some(joined) = joined else {
+            init_task.abort();
+            let _ = (&mut init_task).await;
+            return Err(HostError::InitFailed(
+                "shutdown requested during initialization".to_owned(),
+            ));
+        };
+        match joined {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => return Err(HostError::InitFailed(err.0)),
             Ok(Err(join_err)) => {
@@ -309,6 +337,13 @@ pub async fn run<H: McHostHandler>(
                 ));
             }
         }
+    }
+
+    // Shutdown between initialization and publication: nothing was published
+    // and no work exists to drain, so completing without binding is the
+    // graceful outcome.
+    if shutdown.is_cancelled() {
+        return Ok(());
     }
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -331,7 +366,9 @@ pub async fn run<H: McHostHandler>(
         catalog,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
-            config.limits.max_resident_bytes - crate::config::EGRESS_RESERVED_BYTES,
+            config.limits.max_resident_bytes
+                - crate::config::EGRESS_RESERVED_BYTES
+                - catalog_resident,
         ),
         egress_budget: ByteBudget::new(crate::config::EGRESS_RESERVED_BYTES),
         pending_permits: Arc::new(Semaphore::new(config.limits.max_pending_requests)),

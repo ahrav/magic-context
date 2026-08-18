@@ -677,7 +677,9 @@ async fn control_body_at_the_profile_cap_is_read_and_over_it_is_rejected_early()
 #[tokio::test]
 async fn a_maximum_size_frame_stays_interoperable() {
     let host = TestHost::start_with(|config| {
-        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES;
+        // 64 KiB of headroom absorbs the cached catalog's resident-byte
+        // subtraction while keeping the budgets at their interop floor.
+        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + 64 * 1024;
     })
     .await;
     let mut client = host.client().await;

@@ -336,6 +336,13 @@ impl CatalogCache {
     pub fn max_body_len(&self) -> usize {
         self.full.len().max(self.empty.len())
     }
+
+    /// Bytes this cache permanently keeps resident for the incarnation; the
+    /// runtime subtracts them from the byte budgets so the configured
+    /// `max_resident_bytes` bound stays truthful.
+    pub fn resident_len(&self) -> usize {
+        self.full.len() + self.empty.len()
+    }
 }
 
 fn serialize_catalog_response(manifest: &ManifestSnapshot, include: bool) -> Box<[u8]> {
@@ -367,15 +374,6 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
         route_epoch: epoch,
     })
     .expect("route response serialization cannot fail")
-}
-
-/// Canonical `ErrorBody` JSON (protocol §7.4).
-pub fn error_body_json(code: &str, message: &str) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "code": code,
-        "message": message,
-    }))
-    .expect("error body serialization cannot fail")
 }
 
 /// Strict JSON parsing: UTF-8 only (serde_json enforces), rejects duplicate
