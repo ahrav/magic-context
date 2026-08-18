@@ -141,7 +141,9 @@ const AUTHORED: AuthoredEntry[] = [
         partition: "holdout",
         slug: "architecture-rationale-hold",
         queryText: "reason recovery drafts live outside the repository worktree",
-        mode: "automatic",
+        // Explicit, not automatic: the target is a primer, and the production
+        // automatic path never searches primers (AUTO_SEARCH_SOURCES).
+        mode: "explicit",
         sourceFilters: null,
         docKind: "primer",
         docLocator: "501",
@@ -497,13 +499,13 @@ export const OPERATOR_APPROVALS = [
         kind: "privacy",
         approver: "operator-privacy-review",
         releaseTupleFingerprint:
-            "b290a23aec27d42635c424f550ce7b39877f5db54c88af6656bd67c3a243338d",
+            "7205115e0d3a38b76a820580f72cc2d3f82badc257a5ba6115872514d2d16ab2",
     },
     {
         kind: "relevance-intent",
         approver: "operator-relevance-review",
         releaseTupleFingerprint:
-            "b290a23aec27d42635c424f550ce7b39877f5db54c88af6656bd67c3a243338d",
+            "7205115e0d3a38b76a820580f72cc2d3f82badc257a5ba6115872514d2d16ab2",
     },
 ] as const;
 

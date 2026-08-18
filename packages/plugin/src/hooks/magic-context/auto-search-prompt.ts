@@ -17,7 +17,20 @@
  * from markup-heavy prompts.
  */
 
+import type { SearchSource } from "../../features/magic-context/search";
 import { MAX_QUERY_BYTES, prepareAutomaticQuery } from "../../features/magic-context/search-bounds";
+
+/** Sources the automatic (transform-time) search path queries. Primers and
+ *  notes are cache-neutral in v1: they surface via explicit ctx_search and
+ *  the dashboard only, never auto-search prompt hints. Compartment chunks
+ *  ride the "message" lane. The runner and the benchmark contract both
+ *  derive from this value so an automatic scenario cannot positively judge
+ *  a document the production automatic path never searches. */
+export const AUTO_SEARCH_SOURCES = [
+    "memory",
+    "message",
+    "git_commit",
+] as const satisfies readonly SearchSource[];
 
 /** Tags whose whole block (content included) is plugin-owned noise. The
  *  system-reminder entry legitimately nests, so all entries track depth. */

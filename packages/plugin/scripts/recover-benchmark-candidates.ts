@@ -280,8 +280,14 @@ export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[
         } catch {
             continue;
         }
+        // Both directions: a staging root BELOW a forbidden tree could leak
+        // drafts into it, and a staging root ABOVE one would let the stale-
+        // draft purge recursively delete the forbidden tree as an old entry.
         if (real === forbiddenReal || real.startsWith(`${forbiddenReal}/`)) {
             throw new StagingError("staging root overlaps a forbidden tree");
+        }
+        if (forbiddenReal.startsWith(`${real}/`)) {
+            throw new StagingError("staging root contains a forbidden tree");
         }
     }
     return real;

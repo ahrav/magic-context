@@ -118,7 +118,7 @@
     {
       "id": "q-architecture-rationale-hold",
       "category": "architecture-rationale",
-      "mode": "automatic",
+      "mode": "explicit",
       "queryText": "reason recovery drafts live outside the repository worktree",
       "sourceFilters": null,
       "fixtureScope": {

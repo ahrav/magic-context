@@ -7,6 +7,7 @@
  */
 
 import { z } from "zod";
+import { AUTO_SEARCH_SOURCES } from "../../src/hooks/magic-context/auto-search-prompt";
 import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
 import { canonicalFingerprint } from "./canonical-json";
 import { relevanceIdentity } from "./identity";
@@ -420,16 +421,23 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
     // return is a structural recall loss, not a ranking signal: message and
     // compartment search treat the cutoff as an inclusive maximum ordinal and
     // ordinals are 1-based, so cutoff 0 excludes every such document. The
-    // same holds for source filters: compartment chunks ride the "message"
-    // lane; every other kind is its own filter name.
-    const documentKindById = new Map(corpus.documents.map((d) => [d.id, d.kind]));
+    // same holds for source filters (compartment chunks ride the "message"
+    // lane; every other kind is its own filter name), for automatic-mode
+    // scenarios (the production automatic path queries AUTO_SEARCH_SOURCES
+    // only), and for alias scope (resolution tries the scenario's session
+    // scope, then the project-only fallback — an alias bound to a different
+    // project or session can never resolve).
+    const automaticSources: ReadonlySet<string> = new Set(AUTO_SEARCH_SOURCES);
+    const documentById = new Map(corpus.documents.map((d) => [d.id, d]));
     for (const [queryId, byDoc] of judged) {
         const query = queryById.get(queryId);
         if (!query) continue;
         for (const [documentId, judgment] of byDoc) {
             if (judgment.grade === 0) continue;
-            const kind = documentKindById.get(documentId);
-            if (kind === undefined) continue;
+            const document = documentById.get(documentId);
+            if (!document) continue;
+            const kind = document.kind;
+            const laneFilter = kind === "compartment" ? "message" : kind;
             if (
                 query.visibleState.messageOrdinalCutoff === 0 &&
                 (kind === "message" || kind === "compartment")
@@ -438,13 +446,26 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     `corpus: target unreachable under zero message cutoff (${queryId}, ${documentId})`,
                 );
             }
-            if (query.sourceFilters !== null) {
-                const requiredFilter = kind === "compartment" ? "message" : kind;
-                if (!query.sourceFilters.includes(requiredFilter)) {
-                    diagnostics.push(
-                        `corpus: target excluded by source filters (${queryId}, ${documentId})`,
-                    );
-                }
+            if (query.sourceFilters !== null && !query.sourceFilters.includes(laneFilter)) {
+                diagnostics.push(
+                    `corpus: target excluded by source filters (${queryId}, ${documentId})`,
+                );
+            }
+            if (query.mode === "automatic" && !automaticSources.has(laneFilter)) {
+                diagnostics.push(
+                    `corpus: target outside automatic search sources (${queryId}, ${documentId})`,
+                );
+            }
+            const scope = query.fixtureScope;
+            const reachableAlias = document.aliases.some(
+                (alias) =>
+                    alias.projectScope === scope.projectScope &&
+                    (alias.sessionScope === null || alias.sessionScope === scope.sessionScope),
+            );
+            if (!reachableAlias) {
+                diagnostics.push(
+                    `corpus: target has no alias in scenario scope (${queryId}, ${documentId})`,
+                );
             }
         }
     }

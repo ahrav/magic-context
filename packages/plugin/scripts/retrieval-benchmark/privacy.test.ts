@@ -14,6 +14,13 @@ describe("scanForSensitiveContent", () => {
             [{ q: "use sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789AB" }, "secret-or-path"],
             [{ q: "file at /home/someone/project/notes.txt" }, "source-path"],
             [{ q: "file at C:\\Users\\someone\\notes.txt" }, "source-path"],
+            // Case-insensitive and separator-agnostic home spellings.
+            [{ q: "file at c:/users/someone/notes.txt" }, "source-path"],
+            [{ q: "file at /users/someone/notes.txt" }, "source-path"],
+            // Identifying paths outside home directories.
+            [{ q: "see /workspace/customer-x/src/main.ts" }, "source-path"],
+            [{ q: "config at /mnt/projects/acme/file.ts" }, "source-path"],
+            [{ q: "repo at D:\\repos\\private\\x.ts" }, "source-path"],
             [{ q: "endpoint http://192.168.1.10:8080/api" }, "shareability"],
             [{ q: "control\u0000char" }, "control-character"],
             [

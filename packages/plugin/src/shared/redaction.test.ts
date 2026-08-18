@@ -58,7 +58,7 @@ describe("hasShareabilitySensitiveText", () => {
         expect(hasShareabilitySensitiveText("client_secret = abcdef in the OAuth app")).toBe(true);
     });
 
-    test("flags Windows forward-slash home (sanitizePathString only rewrites backslash form)", () => {
+    test("flags Windows forward-slash home paths", () => {
         expect(hasShareabilitySensitiveText("logs are under C:/Users/ufuk/AppData/mc")).toBe(true);
     });
 

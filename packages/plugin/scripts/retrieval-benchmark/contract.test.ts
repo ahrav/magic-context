@@ -227,6 +227,47 @@ describe("validateRelease", () => {
         );
     });
 
+    it("rejects an automatic scenario whose positive target is outside automatic sources", () => {
+        const { corpus, judgments } = makeValidRelease();
+        // user-directive pairs with a "primer"-kind document in the fixture
+        // rotation; the production automatic path never searches primers.
+        const query = corpus.queries.find((q) => q.id === "q-user-directive-dev");
+        if (!query) throw new Error("fixture query missing");
+        query.mode = "automatic";
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target outside automatic search sources (q-user-directive-dev, d-user-directive-dev)",
+        );
+        // A message-kind target stays valid under automatic mode.
+        const messageQuery = corpus.queries.find((q) => q.id === "q-error-message-dev");
+        if (!messageQuery) throw new Error("fixture query missing");
+        query.mode = "explicit";
+        messageQuery.mode = "automatic";
+        expect(() => validateRelease(corpus, judgments)).not.toThrow();
+    });
+
+    it("rejects a positive target with no alias reachable from the scenario scope", () => {
+        const { corpus, judgments } = makeValidRelease();
+        const document = corpus.documents.find((d) => d.id === "d-error-message-dev");
+        if (!document) throw new Error("fixture document missing");
+        // All aliases now belong to a different project: session-scoped and
+        // project-only resolution both miss, so the target can never resolve.
+        for (const alias of document.aliases) {
+            alias.projectScope = "git:some-other-project";
+        }
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no alias in scenario scope (q-error-message-dev, d-error-message-dev)",
+        );
+        // A session-bound alias in the right project is unreachable from a
+        // session-less scenario; a session-less alias is always reachable.
+        for (const alias of document.aliases) {
+            alias.projectScope = "git:fixture-project";
+            alias.sessionScope = "ses-someone-elses";
+        }
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no alias in scenario scope (q-error-message-dev, d-error-message-dev)",
+        );
+    });
+
     it("rejects a category missing coverage in either partition", () => {
         const { corpus, judgments } = makeValidRelease();
         const removedQuery = corpus.queries.pop();

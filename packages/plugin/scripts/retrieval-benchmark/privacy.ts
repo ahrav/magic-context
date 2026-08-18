@@ -51,7 +51,14 @@ const SESSION_ID = /\bses[_-][A-Za-z0-9]{8,}/;
 // `~/` counts as a home path unless it directly follows a word character, so
 // quoted ("~/notes"), bracketed ((~/f)), and delimiter-preceded (path=~/x,
 // source:~/dir) spellings are caught, not only start-of-string/whitespace.
-const SOURCE_PATH = /(?:\/home\/|\/Users\/|C:\\Users\\|(?:^|[^\w.-])~\/)/;
+// Case-insensitive with both separators: Windows and macOS paths are
+// case-insensitive and tools emit `c:/users/...` as readily as `C:\Users\`.
+const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-])~\/)/i;
+// Identifying paths are not only home-rooted: `/workspace/customer-x/src`,
+// `/mnt/projects/acme`, or `D:\repos\x` carry the same signal. Any
+// multi-segment absolute path (or drive-rooted Windows path) rejects; this
+// is a rejecting gate, so over-matching costs a review, never a leak.
+const ABSOLUTE_PATH = /(?:(?:^|[\s"'`=:([])\/(?:[\w.@+-]+\/)+[\w.@+-]+|[A-Za-z]:[\\/][^\s\\/]+[\\/])/;
 
 function scanString(
     value: string,
@@ -74,7 +81,9 @@ function scanString(
         violations.push({ path, category: "hash-like" });
     }
     if (SESSION_ID.test(value)) violations.push({ path, category: "session-id" });
-    if (SOURCE_PATH.test(value)) violations.push({ path, category: "source-path" });
+    if (SOURCE_PATH.test(value) || ABSOLUTE_PATH.test(value)) {
+        violations.push({ path, category: "source-path" });
+    }
     const lower = value.toLowerCase();
     for (const token of forbiddenTokens) {
         if (token.length > 0 && lower.includes(token.toLowerCase())) {

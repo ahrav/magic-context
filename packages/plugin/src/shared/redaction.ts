@@ -108,14 +108,16 @@ export function isSecretKey(key: string): boolean {
 }
 
 /** Host-independent path rewriting: only the generic user-home patterns,
- *  never the running host's homedir or username. Callers that must produce
- *  identical results on every machine (release validation) use this;
+ *  never the running host's homedir or username. Case-insensitive with both
+ *  separator styles: Windows and macOS filesystems are case-insensitive and
+ *  tools emit `c:/users/...` as readily as `C:\Users\...`. Callers that must
+ *  produce identical results on every machine (release validation) use this;
  *  diagnostics that redact the local identity use `sanitizePathString`. */
 export function sanitizePathStringPortable(value: string): string {
     return value
-        .replace(/\/Users\/[^/]+\//g, "/Users/<USER>/")
-        .replace(/\/home\/[^/]+\//g, "/home/<USER>/")
-        .replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
+        .replace(/\/Users\/[^/]+\//gi, "/Users/<USER>/")
+        .replace(/\/home\/[^/]+\//gi, "/home/<USER>/")
+        .replace(/[A-Za-z]:[\\/]Users[\\/][^\\/]+[\\/]/gi, "C:\\Users\\<USER>\\");
 }
 
 export function sanitizePathString(value: string): string {
@@ -228,8 +230,8 @@ export function sanitizeDiagnosticText(value: string): string {
 // REDACTION, not share-gating) does not rewrite. Kept here, NOT in
 // sanitizeDiagnosticText, so diagnostic redaction output is unchanged.
 const SHAREABILITY_SENSITIVE_PATTERNS: RegExp[] = [
-    // Windows user home, forward- OR back-slash (sanitizePathString only rewrites
-    // the backslash form).
+    // Windows user home, forward-slash form. Redundant with the portable
+    // path sanitizer's separator-agnostic rewrite; kept as defense in depth.
     /\bC:\/Users\/[^/\s]+/i,
     // A `~`-rooted home path (personal/local).
     /(?:^|\s)~\/[^\s]+/,

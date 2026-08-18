@@ -36,7 +36,7 @@ import {
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { buildAutoSearchHint } from "./auto-search-hint";
-import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
+import { AUTO_SEARCH_SOURCES, extractBoundedAutoSearchQuery } from "./auto-search-prompt";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
@@ -271,7 +271,7 @@ export async function runAutoSearchHint(args: {
             visibleMemoryIds: options.visibleMemoryIds ?? null,
             // Primers v1 are cache-neutral: they surface via explicit ctx_search
             // and dashboard only, never transform-time auto-search prompt hints.
-            sources: ["memory", "message", "git_commit"],
+            sources: [...AUTO_SEARCH_SOURCES],
         };
         results = await unifiedSearchWithTimeout(
             db,

@@ -2,7 +2,7 @@
   "schemaVersion": "retrieval-benchmark-manifest/v1",
   "releaseVersion": "v1",
   "releaseTuple": {
-    "corpusFingerprint": "0b046d837b9e0958c18673ea2484ef1e1c48c68ea35933884a40c2fc40c785f7",
+    "corpusFingerprint": "94618fc34992f9f2f66166058015b9d9b3d0504dc0f87b9a15108ece74d32c9c",
     "judgmentsFingerprint": "f6d8ec1de0f224c6b9ab32b771a6c0695fb1b95a9b0b6bb33712994503338639",
     "syntheticProfilesFingerprint": "69e9f35251115c3ba25dc337b8416f380098f00b8642128da2d6ca4fa414cec2",
     "corpusSchemaVersion": "retrieval-benchmark-corpus/v1",
@@ -16,12 +16,12 @@
     "privacy": {
       "kind": "privacy",
       "approver": "operator-privacy-review",
-      "releaseTupleFingerprint": "b290a23aec27d42635c424f550ce7b39877f5db54c88af6656bd67c3a243338d"
+      "releaseTupleFingerprint": "7205115e0d3a38b76a820580f72cc2d3f82badc257a5ba6115872514d2d16ab2"
     },
     "relevanceIntent": {
       "kind": "relevance-intent",
       "approver": "operator-relevance-review",
-      "releaseTupleFingerprint": "b290a23aec27d42635c424f550ce7b39877f5db54c88af6656bd67c3a243338d"
+      "releaseTupleFingerprint": "7205115e0d3a38b76a820580f72cc2d3f82badc257a5ba6115872514d2d16ab2"
     }
   }
 }

@@ -334,6 +334,14 @@ describe("staging safety", () => {
             StagingError,
         );
 
+        // Reverse containment: a staging root ABOVE a forbidden tree would
+        // let the stale-draft purge recursively delete that tree.
+        const above = join(base, "above");
+        const nestedDb = join(above, "db-dir");
+        mkdirSync(nestedDb, { recursive: true, mode: 0o700 });
+        chmodSync(above, 0o700);
+        expect(() => ensureStagingRoot(above, [nestedDb])).toThrow(StagingError);
+
         expect(() => ensureStagingRoot("relative/path", [])).toThrow(StagingError);
     });
 
