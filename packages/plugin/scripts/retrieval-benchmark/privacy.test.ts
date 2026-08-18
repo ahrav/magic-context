@@ -46,6 +46,7 @@ describe("scanForSensitiveContent", () => {
             [{ q: "endpoint http://192.168.1.10:8080/api" }, "shareability"],
             [{ q: "endpoint http://[fd12:3456::1]:8080/api" }, "shareability"],
             [{ q: "endpoint http://[::1]:8080/api" }, "shareability"],
+            [{ q: "connect to ::1:8080 locally" }, "shareability"],
             [{ q: "link-local fe80::1234 on eth0" }, "shareability"],
             [{ q: "apipa 169.254.10.20 fallback" }, "shareability"],
             [{ q: "control\u0000char" }, "control-character"],
