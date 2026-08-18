@@ -4,6 +4,7 @@ import * as searchModule from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
 import { _resetAutoSearchCache, runAutoSearchHint } from "./auto-search-runner";
 import type { MessageLike } from "./transform-operations";
 
@@ -319,6 +320,31 @@ describe("auto-search-runner", () => {
         }
     });
 
+    test("truncates an oversized prompt to the shared query caps before search (AE2)", async () => {
+        let capturedPrompt = "";
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            async (_db, _s, _p, prompt) => {
+                capturedPrompt = prompt;
+                return [];
+            },
+        );
+        try {
+            const rawText = `<system-reminder>noise</system-reminder> question about caps ${"context ".repeat(30_000)}`;
+            const messages: MessageLike[] = [makeUserMsg("u-oversized", rawText)];
+
+            await runAutoSearchHint({ sessionId: "s1", db, messages, options: baseOptions });
+
+            expect(capturedPrompt).toContain("question about caps");
+            expect(Buffer.byteLength(capturedPrompt, "utf8")).toBeLessThanOrEqual(16 * 1024);
+            expect(capturedPrompt.split(/\s+/).length).toBeLessThanOrEqual(64);
+            expect(capturedPrompt).toBe(
+                extractBoundedAutoSearchQuery(findUserPromptText(messages[0])),
+            );
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
     test("strips arbitrary XML/HTML tags and HTML comments (generic, not allowlisted) before embedding", async () => {
         let capturedPrompt = "";
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
@@ -358,11 +384,12 @@ describe("auto-search-runner", () => {
             expect(capturedPrompt).not.toContain("arbitrary comment");
             expect(capturedPrompt).not.toContain("deferred_notes");
 
-            // …but text content between paired tags survives. We preserve
-            // text between paired tags because real user paste (e.g. quoted
-            // log output, code with type parameters) often contains useful
-            // semantic content that the embedding should see.
-            expect(capturedPrompt).toContain("You have 7 deferred notes");
+            // Plugin-owned blocks and their content are excluded from
+            // embeddings.
+            expect(capturedPrompt).not.toContain("You have 7 deferred notes");
+
+            // Preserve text between non-plugin paired tags because pasted
+            // code and quoted logs can contain embedding-relevant text.
             expect(capturedPrompt).toContain("data the user wants embedded");
             expect(capturedPrompt).toContain("real user question about");
             expect(capturedPrompt).toContain("usage");

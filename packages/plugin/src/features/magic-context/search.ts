@@ -23,10 +23,18 @@ import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
+import {
+    DEFAULT_SEARCH_RESULT_LIMIT,
+    MAX_LANE_CANDIDATES,
+    normalizeSearchResultLimit,
+    prepareExplicitQuery,
+    QueryBoundsError,
+} from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
 import {
+    countNoteFtsMatchesBatch,
     countSearchableNotes,
-    getNotes,
+    getRecentSearchableNotes,
     getSearchableNotesByIds,
     type Note,
     selectNoteCandidateIds,
@@ -41,8 +49,6 @@ import {
     type WorkspaceIdentitySet,
 } from "./workspaces";
 
-const DEFAULT_UNIFIED_SEARCH_LIMIT = 10;
-const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 const SEMANTIC_WEIGHT = 0.7;
 const FTS_WEIGHT = 0.3;
 const SINGLE_SOURCE_PENALTY = 0.8;
@@ -241,12 +247,7 @@ export type UnifiedSearchResult =
     | PrimerSearchResult
     | NoteSearchResult;
 
-function normalizeLimit(limit?: number): number {
-    if (typeof limit !== "number" || !Number.isFinite(limit)) {
-        return DEFAULT_UNIFIED_SEARCH_LIMIT;
-    }
-    return Math.max(1, Math.floor(limit));
-}
+const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 
 // ID-shaped short-circuit: when the whole trimmed query is one memory id (with
 // or without a leading `#`) or a comma/space-separated list of up to
@@ -469,6 +470,19 @@ function getMessageOrdinal(value: number | string | undefined): number | null {
     return null;
 }
 
+/** R37: post-score lane ceiling. Brute-force semantic scoring must visit
+ *  every cached vector, but only the strongest MAX_LANE_CANDIDATES scores may
+ *  enter fusion so downstream merge and sort work is bounded by the lane cap
+ *  rather than the corpus. Ties break toward the lower memory id, matching
+ *  the deterministic tie-break in `mergeMemoryResults`. */
+function pruneToLaneCeiling(scores: Map<number, number>): Map<number, number> {
+    if (scores.size <= MAX_LANE_CANDIDATES) return scores;
+    const top = [...scores.entries()]
+        .sort((left, right) => right[1] - left[1] || left[0] - right[0])
+        .slice(0, MAX_LANE_CANDIDATES);
+    return new Map(top);
+}
+
 async function getSemanticScores(args: {
     db: Database;
     projectPath: string;
@@ -481,6 +495,11 @@ async function getSemanticScores(args: {
     queryEmbedding: Float32Array | null;
     queryModelId?: string | null;
     workspace?: SearchWorkspaceContext;
+    /** Memories already rendered in <session-history>. They are excluded
+     *  BEFORE scoring and the lane ceiling: merge drops them anyway, so
+     *  letting them occupy pruned lane slots would evict eligible
+     *  lower-scored matches from the bounded lane entirely. */
+    visibleMemoryIds?: Set<number> | null;
 }): Promise<Map<number, number>> {
     const semanticScores = new Map<number, number>();
 
@@ -503,20 +522,23 @@ async function getSemanticScores(args: {
         });
 
         for (const memory of args.memories) {
+            if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = embeddings.get(memory.id);
             if (!memoryEmbedding) {
                 continue;
             }
 
-            semanticScores.set(
-                memory.id,
-                normalizeCosineScore(
-                    cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-                ),
+            const score = normalizeCosineScore(
+                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
             );
+            // A nonpositive score is "no semantic signal", not a semantic
+            // match: keeping it would label an FTS hit hybrid (and downweight
+            // it) or not based on which zero entries survive the lane
+            // ceiling. Mirrors the git-commit lane's admission rule.
+            if (score > 0) semanticScores.set(memory.id, score);
         }
 
-        return semanticScores;
+        return pruneToLaneCeiling(semanticScores);
     }
 
     const workspace = args.workspace;
@@ -545,18 +567,17 @@ async function getSemanticScores(args: {
         if (memberMemories.length === 0) continue;
         const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
         for (const memory of memberMemories) {
+            if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = cachedEmbeddings.get(memory.id);
             if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
-            semanticScores.set(
-                memory.id,
-                normalizeCosineScore(
-                    cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-                ),
+            const score = normalizeCosineScore(
+                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
             );
+            if (score > 0) semanticScores.set(memory.id, score);
         }
     }
 
-    return semanticScores;
+    return pruneToLaneCeiling(semanticScores);
 }
 
 function getFtsMatches(args: {
@@ -737,6 +758,7 @@ async function searchMemories(args: {
         queryEmbedding: args.queryEmbedding,
         queryModelId: args.queryModelId,
         workspace: args.workspace,
+        visibleMemoryIds: args.visibleMemoryIds,
     });
 
     return mergeMemoryResults({
@@ -956,8 +978,13 @@ function searchMessages(args: {
     probes?: string[];
 }): MessageSearchResult[] {
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
+    // Overfetch covers post-cutoff attrition, but each FTS branch's LIMIT
+    // binding stays within the shared lane ceiling regardless of the caller's
+    // (already tier-multiplied) limit.
     const fetchLimit =
-        args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.limit * 3 : args.limit;
+        args.maxOrdinal != null && args.maxOrdinal >= 0
+            ? Math.min(args.limit * 3, MAX_LANE_CANDIDATES)
+            : Math.min(args.limit, MAX_LANE_CANDIDATES);
 
     const baseQuery = sanitizeFtsQuery(args.query.trim());
     const probes = args.probes ?? [];
@@ -1078,8 +1105,6 @@ function searchMessages(args: {
     }));
 }
 
-const NOTE_SEARCHABLE_STATUSES: Note["status"][] = ["active", "pending", "ready", "dismissed"];
-
 function noteSearchText(note: Note): string {
     const reason = note.readyReason?.trim();
     return reason
@@ -1146,64 +1171,106 @@ function rankNotesForNeedle(notes: readonly Note[], needle: string): RankedNoteM
 const NOTE_FTS_MIN_ATOM_LENGTH = 3;
 
 /**
- * The OR-joined trigram query covering every atom `rankNotesForNeedle` scores:
+ * The OR-joined trigram query covering the atoms `rankNotesForNeedle` scores:
  * the whole needle (its exact-substring test) and each keyword token (its
- * coverage test). Substring matching makes the result a superset of the scored
- * matches, so pruning cannot drop a note the scorer would have kept.
+ * coverage test). Substring matching makes the result a superset of the
+ * scored matches for every representable atom, so pruning cannot drop a note
+ * the scorer would keep through those atoms.
  *
- * Returns null when any atom is too short to represent, and "" for an empty
- * needle, which the scorer never matches.
+ * Atoms below the trigram minimum are dropped from the query rather than
+ * disabling it: "how to deploy sentinel" must still select older notes
+ * containing "deploy sentinel" even though "to" cannot be represented. The
+ * only recall cost is a note matching NOTHING but unrepresentable short
+ * tokens — the weakest possible hit — which is reachable only through the
+ * recency window. Returns null when no atom is representable (the caller
+ * falls back to that window), and "" for an empty needle, which the scorer
+ * never matches.
  */
 function noteFtsQueryForNeedle(needle: string): string | null {
     const normalized = needle.trim().toLowerCase();
     if (normalized.length === 0) return "";
-    const atoms = [normalized, ...tokenizeKeywordNeedle(normalized)];
-    if (atoms.some((atom) => atom.length < NOTE_FTS_MIN_ATOM_LENGTH)) return null;
+    const atoms = [normalized, ...tokenizeKeywordNeedle(normalized)].filter(
+        (atom) => atom.length >= NOTE_FTS_MIN_ATOM_LENGTH,
+    );
+    if (atoms.length === 0) return null;
     return atoms.map((atom) => `"${atom.replace(/"/g, '""')}"`).join(" OR ");
 }
 
-function scopedNoteScan(db: Database, sessionId: string, projectPath: string): Note[] {
-    return [
-        ...getNotes(db, {
-            sessionId,
-            type: "session",
-            status: NOTE_SEARCHABLE_STATUSES,
-        }),
-        ...getNotes(db, {
-            projectPath,
-            type: "smart",
-            status: NOTE_SEARCHABLE_STATUSES,
-        }),
-    ];
-}
-
-/** Candidate superset for every needle, falling back to the scoped scan when a
- *  needle is not representable or the projection is unavailable. */
+/** The fused pool caps at MAX_LANE_CANDIDATES so scoring work stays bounded
+ *  even when many needles each fill their branch. */
 function loadNoteSearchCorpus(args: {
     db: Database;
     sessionId: string;
     projectPath: string;
     needles: readonly string[];
 }): Note[] {
+    const scope = {
+        sessionId: args.sessionId,
+        projectPath: args.projectPath,
+        limit: MAX_LANE_CANDIDATES,
+    };
     const queries = args.needles.map(noteFtsQueryForNeedle);
     if (queries.some((query) => query === null)) {
-        return scopedNoteScan(args.db, args.sessionId, args.projectPath);
+        return getRecentSearchableNotes(args.db, scope);
     }
-    const candidateIds = new Set<number>();
+    const bestRankById = new Map<number, number>();
     for (const query of queries) {
         if (!query) continue;
-        const ids = selectNoteCandidateIds(args.db, query);
+        const ids = selectNoteCandidateIds(args.db, query, scope);
         if (ids === null) {
-            return scopedNoteScan(args.db, args.sessionId, args.projectPath);
+            return getRecentSearchableNotes(args.db, scope);
         }
-        for (const id of ids) candidateIds.add(id);
+        ids.forEach((id, rank) => {
+            const existing = bestRankById.get(id);
+            if (existing === undefined || rank < existing) bestRankById.set(id, rank);
+        });
     }
-    if (candidateIds.size === 0) return [];
+    if (bestRankById.size === 0) return [];
+    const pooled = [...bestRankById.entries()]
+        .sort((left, right) => left[1] - right[1] || left[0] - right[0])
+        .slice(0, MAX_LANE_CANDIDATES)
+        .map(([id]) => id);
     return getSearchableNotesByIds(args.db, {
-        ids: [...candidateIds],
+        ids: pooled,
         sessionId: args.sessionId,
         projectPath: args.projectPath,
     });
+}
+
+/**
+ * Corpus-wide document frequency per probe for discrimination weighting. The
+ * candidate pool is capped at MAX_LANE_CANDIDATES, so counting a probe's
+ * matches inside the pool would clamp df at the cap while the weight's
+ * denominator stays corpus-wide — inflating a non-discriminative probe's
+ * weight by up to corpus/cap. Probes without an indexed count (unrepresentable
+ * atom, absent projection, malformed query) are omitted; the caller falls
+ * back to its pool-derived count for those.
+ */
+function noteProbeDocumentFrequencies(args: {
+    db: Database;
+    sessionId: string;
+    projectPath: string;
+    probes: readonly string[];
+}): Map<string, number> {
+    const frequencies = new Map<string, number>();
+    const queryByProbe = new Map<string, string>();
+    for (const probe of args.probes) {
+        if (queryByProbe.has(probe)) continue;
+        const query = noteFtsQueryForNeedle(probe);
+        if (query !== null && query.length > 0) queryByProbe.set(probe, query);
+    }
+    if (queryByProbe.size === 0) return frequencies;
+    const countable = [...queryByProbe.entries()];
+    const counts = countNoteFtsMatchesBatch(
+        args.db,
+        countable.map(([, query]) => query),
+        { sessionId: args.sessionId, projectPath: args.projectPath },
+    );
+    if (counts === null) return frequencies;
+    countable.forEach(([probe], index) => {
+        frequencies.set(probe, counts[index] ?? 0);
+    });
+    return frequencies;
 }
 
 function searchNotes(args: {
@@ -1258,13 +1325,22 @@ function searchNotes(args: {
     if (baseList.length > 0) {
         queryLists.push({ rows: baseList, weight: 1 });
     }
+    const probeFrequencies = noteProbeDocumentFrequencies({
+        db: args.db,
+        sessionId: args.sessionId,
+        projectPath: args.projectPath,
+        probes,
+    });
     const probeWeights = new Map<string, number>();
     for (const probe of probes) {
         const rows = rankNotesForNeedle(notes, probe);
         if (rows.length === 0) {
             continue;
         }
-        const weight = probeDiscriminationWeight(rows.length, corpusSize);
+        const weight = probeDiscriminationWeight(
+            probeFrequencies.get(probe) ?? rows.length,
+            corpusSize,
+        );
         probeWeights.set(probe, weight);
         queryLists.push({ rows, weight });
     }
@@ -1627,7 +1703,11 @@ function searchPrimers(args: {
                  ORDER BY rank ASC
                  LIMIT ?`,
             )
-            .all(ftsQuery, args.projectPath, args.limit * 3) as Array<{ id: number; rank: number }>;
+            .all(
+                ftsQuery,
+                args.projectPath,
+                Math.min(args.limit * 3, MAX_LANE_CANDIDATES),
+            ) as Array<{ id: number; rank: number }>;
         rows.forEach((row, index) => {
             ftsRanks.set(row.id, linearDecayScore(index, rows.length));
         });
@@ -1761,14 +1841,21 @@ export async function unifiedSearch(
     query: string,
     options: UnifiedSearchOptions = {},
 ): Promise<UnifiedSearchResult[]> {
-    const trimmedQuery = query.trim();
+    const prepared = prepareExplicitQuery(query);
+    if (!prepared.ok) {
+        throw new QueryBoundsError(prepared);
+    }
+    const trimmedQuery = prepared.query;
     const measurementStartedAt = Date.now();
     if (trimmedQuery.length === 0) {
         return [];
     }
 
-    const limit = normalizeLimit(options.limit);
-    const tierLimit = Math.max(limit * 3, DEFAULT_UNIFIED_SEARCH_LIMIT);
+    const limit = normalizeSearchResultLimit(options.limit);
+    const tierLimit = Math.min(
+        Math.max(limit * 3, DEFAULT_SEARCH_RESULT_LIMIT),
+        MAX_LANE_CANDIDATES,
+    );
 
     const embeddingEnabled = options.embeddingEnabled ?? true;
     const embedQuery = options.embedQuery ?? embedText;

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
+import { MAX_LANE_CANDIDATES } from "../search-bounds";
 import { countingDatabase } from "../sql-counters";
 import { initializeDatabase } from "../storage-db";
 import type { GitCommit } from "./git-log-reader";
@@ -53,6 +54,32 @@ describe("searchGitCommitsSync", () => {
         expect(results.map((result) => result.commit.sha)).toEqual(
             commits
                 .slice(-5)
+                .reverse()
+                .map((commit) => commit.sha),
+        );
+    });
+
+    it("clamps the requested limit and the semantic pool to the lane ceiling (R37)", () => {
+        const projectPath = "git:lane-ceiling";
+        const modelId = "mock:model";
+        const commits = Array.from({ length: 300 }, (_, index) => makeCommit(index));
+        upsertCommits(db, projectPath, commits);
+        for (const commit of commits) {
+            saveCommitEmbedding(db, commit.sha, new Float32Array([1, 0]), modelId);
+        }
+
+        const results = searchGitCommitsSync(db, projectPath, "lexical-miss-token", {
+            limit: 1_000,
+            queryEmbedding: new Float32Array([1, 0]),
+            queryModelId: modelId,
+        });
+
+        expect(results).toHaveLength(MAX_LANE_CANDIDATES);
+        // Equal similarity everywhere: the bounded pool must keep the newest
+        // commits, matching the final-rank tie-break.
+        expect(results.map((result) => result.commit.sha)).toEqual(
+            commits
+                .slice(-MAX_LANE_CANDIDATES)
                 .reverse()
                 .map((commit) => commit.sha),
         );

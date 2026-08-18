@@ -48,6 +48,58 @@ describe("createCtxSearchTools", () => {
         expect(result).toBe("Error: 'query' is required.");
     });
 
+    it("rejects an over-cap query with the native string error before any work (AE1)", async () => {
+        const searchSpy = spyOn(searchModule, "unifiedSearch");
+        const resolveCalls: string[] = [];
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: (directory) => {
+                resolveCalls.push(directory);
+                return "/repo/project";
+            },
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+        try {
+            const byteResult = await tools.ctx_search.execute(
+                { query: "a".repeat(16 * 1024 + 1) },
+                toolContext(),
+            );
+            expect(byteResult).toStartWith("Error: query is too large:");
+
+            const atomResult = await tools.ctx_search.execute(
+                { query: Array.from({ length: 65 }, (_, index) => `a${index}`).join(" ") },
+                toolContext(),
+            );
+            expect(atomResult).toStartWith("Error: query is too complex:");
+
+            expect(searchSpy).not.toHaveBeenCalled();
+            expect(resolveCalls).toHaveLength(0);
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
+    it("clamps an over-cap limit to 50 instead of rejecting", async () => {
+        const searchSpy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "/repo/project",
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+        try {
+            await tools.ctx_search.execute({ query: "clamped", limit: 10_000 }, toolContext());
+            expect(searchSpy).toHaveBeenCalledTimes(1);
+            const options = searchSpy.mock.calls[0]?.[4] as { limit?: number };
+            expect(options.limit).toBe(50);
+        } finally {
+            searchSpy.mockRestore();
+        }
+    });
+
     it("formats empty search results", async () => {
         const tools = createCtxSearchTools({
             db,

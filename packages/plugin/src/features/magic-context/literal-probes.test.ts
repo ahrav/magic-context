@@ -48,6 +48,33 @@ describe("extractLiteralProbes", () => {
         expect(new Set(lowered).size).toBe(lowered.length);
     });
 
+    it("stops accepting matches once the five prioritized slots are full", () => {
+        // Five quoted spans claim every slot; the later kebab identifiers and
+        // camelCase shapes must not displace or extend them.
+        const query =
+            '"one span" "two span" "three span" "four span" "five span" "six span" kebab-late camelLate';
+        expect(extractLiteralProbes(query)).toEqual([
+            "one span",
+            "two span",
+            "three span",
+            "four span",
+            "five span",
+        ]);
+    });
+
+    it("keeps priority order for many mixed shapes", () => {
+        const query =
+            'run /slash-cmd with "quoted text" then TS9999 plus file.name kebab-case camelCase deadbee1';
+        expect(extractLiteralProbes(query)).toEqual([
+            "quoted text",
+            "/slash-cmd",
+            "TS9999",
+            "file.name",
+            // The kebab shape re-matches the slash command without its slash.
+            "slash-cmd",
+        ]);
+    });
+
     it("ignores tokens shorter than the minimum", () => {
         // "a-b" is 3 chars (kept); bare short words are not identifiers.
         expect(extractLiteralProbes("go to it")).toEqual([]);
