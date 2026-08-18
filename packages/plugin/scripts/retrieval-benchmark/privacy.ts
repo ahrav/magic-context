@@ -69,7 +69,7 @@ const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-]
 // leading backslash (root-relative `\Client Work\repo`) counts too —
 // path.win32.isAbsolute classifies both as absolute.
 const WINDOWS_PATH =
-    /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+[\\/][^\\/\r\n]+|(?:^|[\s"'`=([<>])\\[^\s\\/][^\\/\r\n]*)/;
+    /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+[\\/][^\\/\r\n]+|(?:^|[^\w\\])\\[^\s\\/][^\\/\r\n]*)/;
 // A file: URI is a local absolute path in URI clothing; the triple-slash
 // form defeats the delimiter-anchored POSIX arm, so name it directly.
 const FILE_URI = /\bfile:\/\//i;
@@ -78,15 +78,22 @@ const FILE_URI = /\bfile:\/\//i;
 const EXTENDED_LENGTH_PATH = /\\\\\?\\/;
 // No ":" in this delimiter class: `scheme://host/...` URLs must not read as
 // forward-slash UNC shares.
-const UNC_FORWARD = /(?:^|[\s"'`=([<>])\/\/[\w.-]+\/[^/\s]+/;
+// Complement boundary (anything that cannot CONTINUE a token), not a
+// delimiter allowlist: ":" stays excluded so scheme URLs never read as
+// forward UNC.
+const UNC_FORWARD = /(?:^|[^\w:./])\/\/[\w.-]+\/[^/\s]+/;
 // Absolute POSIX paths (single components included: `/customer-x` is
 // identifying), matched broadly and then verified segment-wise so prose
 // around standalone slashes stays clean. Slash-command spellings
 // (`/like-this`) reject too — a rejecting gate trades a lost candidate for
 // never leaking a workspace name.
-// Angle brackets are delimiters too: recovered prompts wrap paths in
-// XML/HTML-style markup (`<code>/workspace/x`, `</workspace/x>`).
-const POSIX_PATH_CANDIDATE = /(?:^|[\s"'`=:([<>])((?:\/[^/\r\n]+)+)/g;
+// Complement boundary: any character that cannot continue a token starts a
+// candidate (comma, braces, markup, quotes, ...), instead of an allowlist
+// that keeps missing punctuation. Word chars keep "and/or" clean, "." keeps
+// relative "./x" clean, "*" keeps globs ("**/*.ts") clean, "/" keeps
+// mid-path positions from re-anchoring; URLs stay clean through the
+// empty-first-segment check below.
+const POSIX_PATH_CANDIDATE = /(?:^|[^\w./*-])((?:\/[^/\r\n]+)+)/g;
 
 function hasAbsolutePath(value: string): boolean {
     if (
