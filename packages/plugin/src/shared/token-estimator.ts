@@ -28,7 +28,18 @@ const TOKENIZER_PACKAGE_DIRS = [
     ["@cortexkit", "pi-magic-context"],
 ] as const;
 let tokenizer: TokenizerLike | undefined;
+/** Gate on the synchronous bare-require path (`getTokenizer`), so estimate
+ *  calls do not pay a failing `require` more than once per process. */
 let tokenizerLoadAttempted = false;
+/** Gate on the async installed-package search path (`preloadTokenizer`). Kept
+ *  separate from `tokenizerLoadAttempted`: a failed synchronous require must
+ *  not stop the preload from finding the package on disk. */
+let tokenizerPreloadAttempted = false;
+/** Set when a constructed tokenizer failed to encode. Once estimates have
+ *  been produced heuristically after such a failure, no later load may swap
+ *  the estimator back, or identical text would alternate between exact and
+ *  approximate counts across cache/budget decisions. */
+let tokenizerPoisoned = false;
 let tokenizerLoadPromise: Promise<boolean> | undefined;
 let tokenizerWarningSent = false;
 
@@ -140,7 +151,7 @@ function warnTokenizerFallback(error: unknown): void {
 
 export async function preloadTokenizer(): Promise<boolean> {
     if (tokenizer) return true;
-    if (tokenizerLoadAttempted) return false;
+    if (tokenizerPoisoned || tokenizerPreloadAttempted) return false;
     if (tokenizerLoadPromise) return tokenizerLoadPromise;
 
     tokenizerLoadPromise = (async () => {
@@ -157,6 +168,7 @@ export async function preloadTokenizer(): Promise<boolean> {
             warnTokenizerFallback(error);
             return false;
         } finally {
+            tokenizerPreloadAttempted = true;
             tokenizerLoadPromise = undefined;
         }
     })();
@@ -192,6 +204,7 @@ export function estimateTokens(text: string): number {
         // exact and approximate counts as cache/budget decisions are made.
         tokenizer = undefined;
         tokenizerLoadAttempted = true;
+        tokenizerPoisoned = true;
         warnTokenizerFallback(error);
         return estimateTokensHeuristically(text);
     }

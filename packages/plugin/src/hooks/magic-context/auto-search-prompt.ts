@@ -60,9 +60,18 @@ function matchDropTag(
     if (!text.startsWith(name, cursor)) return null;
     cursor += name.length;
     if (text[cursor] === ">") return { end: cursor + 1, closing, selfClosing: false };
+    if (closing) {
+        // `</instruction >` is a valid closing tag; without this the generic
+        // matcher would strip it while `dropStack` stays open, discarding all
+        // following user text. The scan stops at the first non-whitespace
+        // character, so it stays linear.
+        while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+        if (text[cursor] !== ">") return null;
+        return { end: cursor + 1, closing: true, selfClosing: false };
+    }
     // Opening tags may carry attributes (`<instruction context="...">`), but a
     // name prefix (`<instructions>`) is a different tag.
-    if (closing || (text[cursor] !== " " && text[cursor] !== "\t")) return null;
+    if (text[cursor] !== " " && text[cursor] !== "\t") return null;
     const close = findTagClose(text, cursor);
     if (close === -1) return null;
     // `<instruction .../>` is a complete, empty block: it must not open a
@@ -89,12 +98,19 @@ function matchGenericTag(text: string, index: number): number | null {
  * Strip plugin markup and retain at most MAX_QUERY_BYTES of the result. The
  * returned prefix is surrogate-safe: emission stops before a code point that
  * would cross the byte budget.
+ *
+ * Whitespace runs are withheld and normalized (one space, or the newline
+ * structure of the run capped at a blank line) before they are emitted, so
+ * separators between stripped plugin blocks cannot consume the byte budget
+ * that exists for user text. Leading and trailing runs never emit at all.
  */
 export function collectStrippedPromptPrefix(raw: string): string {
     let out = "";
     let outBytes = 0;
     // Stack of open content-drop tags; text is dropped while any is open.
     const dropStack: string[] = [];
+    // -1: no withheld run; 0: spaces/tabs only; 1-2: newline count in the run.
+    let pendingNewlines = -1;
     let i = 0;
     while (i < raw.length) {
         const char = raw[i];
@@ -133,10 +149,27 @@ export function collectStrippedPromptPrefix(raw: string): string {
         }
         const codePoint = raw.codePointAt(i) ?? 0;
         const charText = String.fromCodePoint(codePoint);
+        if (/\s/.test(charText)) {
+            // Withhold the run; leading whitespace (empty `out`) never pends.
+            if (out.length > 0) {
+                if (pendingNewlines === -1) pendingNewlines = 0;
+                if (charText === "\n" && pendingNewlines < 2) pendingNewlines += 1;
+            }
+            i += charText.length;
+            continue;
+        }
+        const separator =
+            pendingNewlines === -1
+                ? ""
+                : pendingNewlines === 0
+                  ? " "
+                  : "\n".repeat(pendingNewlines);
         const charBytes = Buffer.byteLength(charText, "utf8");
-        if (outBytes + charBytes > MAX_QUERY_BYTES) break;
-        out += charText;
-        outBytes += charBytes;
+        // Separators are ASCII, so string length equals UTF-8 byte length.
+        if (outBytes + separator.length + charBytes > MAX_QUERY_BYTES) break;
+        out += separator + charText;
+        outBytes += separator.length + charBytes;
+        pendingNewlines = -1;
         i += charText.length;
     }
     return out;

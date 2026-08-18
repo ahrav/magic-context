@@ -470,6 +470,19 @@ function getMessageOrdinal(value: number | string | undefined): number | null {
     return null;
 }
 
+/** R37: post-score lane ceiling. Brute-force semantic scoring must visit
+ *  every cached vector, but only the strongest MAX_LANE_CANDIDATES scores may
+ *  enter fusion so downstream merge and sort work is bounded by the lane cap
+ *  rather than the corpus. Ties break toward the lower memory id, matching
+ *  the deterministic tie-break in `mergeMemoryResults`. */
+function pruneToLaneCeiling(scores: Map<number, number>): Map<number, number> {
+    if (scores.size <= MAX_LANE_CANDIDATES) return scores;
+    const top = [...scores.entries()]
+        .sort((left, right) => right[1] - left[1] || left[0] - right[0])
+        .slice(0, MAX_LANE_CANDIDATES);
+    return new Map(top);
+}
+
 async function getSemanticScores(args: {
     db: Database;
     projectPath: string;
@@ -517,7 +530,7 @@ async function getSemanticScores(args: {
             );
         }
 
-        return semanticScores;
+        return pruneToLaneCeiling(semanticScores);
     }
 
     const workspace = args.workspace;
@@ -557,7 +570,7 @@ async function getSemanticScores(args: {
         }
     }
 
-    return semanticScores;
+    return pruneToLaneCeiling(semanticScores);
 }
 
 function getFtsMatches(args: {

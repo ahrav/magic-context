@@ -35,7 +35,7 @@ describe("collectStrippedPromptPrefix", () => {
 
     it("drops orphan closing tags silently", () => {
         expect(collectStrippedPromptPrefix("text </system-reminder> more").trim()).toBe(
-            "text  more",
+            "text more",
         );
     });
 
@@ -80,7 +80,7 @@ describe("collectStrippedPromptPrefix", () => {
     });
 
     it("removes HTML comments including multiline content", () => {
-        expect(collectStrippedPromptPrefix("a <!-- note\nacross lines --> b").trim()).toBe("a  b");
+        expect(collectStrippedPromptPrefix("a <!-- note\nacross lines --> b").trim()).toBe("a b");
     });
 
     it("keeps a bare < that is not markup", () => {
@@ -96,6 +96,27 @@ describe("collectStrippedPromptPrefix", () => {
         const markup = "<system-reminder>noise</system-reminder>".repeat(3000);
         const stripped = collectStrippedPromptPrefix(`${markup}\nthe real question survives`);
         expect(stripped).toContain("the real question survives");
+    });
+
+    it("pops the drop stack for closing tags padded with whitespace before the delimiter", () => {
+        expect(
+            collectStrippedPromptPrefix(
+                "<instruction>noise</instruction >real searchable question",
+            ).trim(),
+        ).toBe("real searchable question");
+        expect(
+            collectStrippedPromptPrefix(
+                "<system-reminder>noise</system-reminder\t > question survives",
+            ).trim(),
+        ).toBe("question survives");
+    });
+
+    it("does not let separator whitespace between dropped blocks consume the byte budget", () => {
+        // 20k newline separators exceed MAX_QUERY_BYTES on their own; they must
+        // collapse instead of crowding out the trailing user text.
+        const blocks = "<system-reminder>x</system-reminder>\n".repeat(20_000);
+        const stripped = collectStrippedPromptPrefix(`${blocks}real searchable question`);
+        expect(stripped).toBe("real searchable question");
     });
 });
 

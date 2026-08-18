@@ -107,7 +107,11 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         },
     "packages/plugin/src/shared/token-estimator.ts:tokenizerLoadAttempted": {
         classification: "VERDICT",
-        reason: "DEFECT: a failed tokenizer load permanently selects heuristic token counts even if the package becomes available.",
+        reason: "Saved: gates only the synchronous bare-require path; preloadTokenizer's installed-package search still runs after a synchronous failure.",
+    },
+    "packages/plugin/src/shared/token-estimator.ts:tokenizerPreloadAttempted": {
+        classification: "VERDICT",
+        reason: "Correct by contract: preload is a one-shot warm; after it fails the process keeps the deterministic heuristic fallback until restart, as warnTokenizerFallback documents.",
     },
     "packages/plugin/src/hooks/magic-context/module-transport.ts:stateSyncCapabilityCache": {
         classification: "VERDICT",
