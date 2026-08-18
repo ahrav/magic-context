@@ -21,6 +21,7 @@ use crate::dispatch::{
     close_generation, dispatch_request, emit_error_terminal, handle_cancel, open_route,
 };
 use crate::handler::McHostHandler;
+use crate::routing::CloseDecision;
 use crate::runtime::HostShared;
 use crate::wire::{
     drain_declared_body, encode_owned_frame, pure_header_flags, read_frame, FrameId, OutboundFrame,
@@ -162,13 +163,13 @@ pub async fn run_connection<H: McHostHandler>(
 
     close_generation(&shared, &gen, begun_closes).await;
     drop(gen);
-    if tokio::time::timeout(shared.timing.route_close_budget, &mut writer_task)
-        .await
-        .is_err()
-    {
-        writer_task.abort();
-        let _ = writer_task.await;
-    }
+    // The writer drains queued terminals and Goodbye after the handles drop.
+    // Its own per-frame stall deadline (`frame_deadline`, enforced inside the
+    // writer task) already bounds this join, so no extra budget applies here:
+    // the old `route_close_budget` cap could abort a drain that graceful
+    // shutdown promised to flush, while a stalled peer still cannot hold the
+    // join beyond the writer's self-retirement.
+    let _ = (&mut writer_task).await;
 }
 
 /// Serves validated frames until close. Returning retires the generation.
@@ -283,11 +284,21 @@ async fn read_loop<H: McHostHandler>(
                             epoch: header.epoch,
                         };
                         let decision = shared.registry.begin_close_owned(handle, gen.id);
-                        let shared_task = Arc::clone(shared);
-                        shared.spawn_tracked(gen.read_tasks.track_future(async move {
-                            crate::dispatch::close_route_decision(&shared_task, handle, decision)
+                        // Duplicate, stale, or mid-bind Goodbyes carry no
+                        // cleanup work; spawning for them would let a client
+                        // pipeline unbounded no-op tasks past the pure-header
+                        // frames' zero capacity cost.
+                        if matches!(decision, CloseDecision::Owner { .. }) {
+                            let shared_task = Arc::clone(shared);
+                            shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                                crate::dispatch::close_route_decision(
+                                    &shared_task,
+                                    handle,
+                                    decision,
+                                )
                                 .await;
-                        }));
+                            }));
+                        }
                     }
                     // Consumer-originated role violations close the generation
                     // rather than extend the profile (protocol §6.2). Ping is
@@ -339,25 +350,44 @@ async fn handle_control<H: McHostHandler>(
 
     match action {
         ControlAction::Reject { code, message } => {
-            emit_error_terminal(
-                &shared.egress_budget,
-                gen,
-                FrameId::control(corr),
-                code,
-                &message,
-            )
-            .await;
+            // Emission can wait on shared egress budget; queue it off the
+            // read loop so a contended budget cannot stall Pong reads into a
+            // liveness false-kill. Bounded: the permit was acquired above.
+            let shared_task = Arc::clone(shared);
+            let gen_task = Arc::clone(gen);
+            shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                let _pending_permit = pending_permit;
+                emit_error_terminal(
+                    &shared_task.egress_budget,
+                    &gen_task,
+                    FrameId::control(corr),
+                    code,
+                    &message,
+                )
+                .await;
+            }));
         }
         ControlAction::CatalogList { module_id_filter } => {
             // Catalog stays serviceable during drain (protocol §12 step 1
-            // freezes routes and dispatch, not control reads).
-            let body = shared.catalog.body(module_id_filter.as_deref());
-            if emit_catalog_response(&shared.egress_budget, gen, FrameId::control(corr), body)
+            // freezes routes and dispatch, not control reads). Emitted off
+            // the read loop for the same liveness reason as rejections.
+            let shared_task = Arc::clone(shared);
+            let gen_task = Arc::clone(gen);
+            shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                let _pending_permit = pending_permit;
+                let body = shared_task.catalog.body(module_id_filter.as_deref());
+                if emit_catalog_response(
+                    &shared_task.egress_budget,
+                    &gen_task,
+                    FrameId::control(corr),
+                    body,
+                )
                 .await
                 .is_err()
-            {
-                gen.token.cancel();
-            }
+                {
+                    gen_task.token.cancel();
+                }
+            }));
         }
         ControlAction::RouteOpen { identity } => {
             // Bind callbacks may be slow; never stall the read loop on them.
