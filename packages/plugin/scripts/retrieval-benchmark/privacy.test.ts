@@ -21,6 +21,10 @@ describe("scanForSensitiveContent", () => {
             [{ q: "see /workspace/customer-x/src/main.ts" }, "source-path"],
             [{ q: "config at /mnt/projects/acme/file.ts" }, "source-path"],
             [{ q: "repo at D:\\repos\\private\\x.ts" }, "source-path"],
+            // Single-component absolute roots are identifying too.
+            [{ q: "see /customer-x" }, "source-path"],
+            [{ q: "open /Client Work" }, "source-path"],
+            [{ q: "drive D:\\customer-x" }, "source-path"],
             [{ q: "share \\\\customer-server\\private-share\\repo\\main.ts" }, "source-path"],
             [{ q: "work in D:\\Client Work\\repo\\main.ts" }, "source-path"],
             [{ q: "open /Client Work/repo/main.ts" }, "source-path"],

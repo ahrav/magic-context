@@ -34,7 +34,7 @@ import {
     writeSync,
 } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
     type MeasurementOwnership,
@@ -49,10 +49,7 @@ import {
     hasStackedAugmentation,
 } from "../src/hooks/magic-context/auto-search-runner";
 import { hasMeaningfulUserText } from "../src/hooks/magic-context/read-session-formatting";
-import {
-    type RawMessage,
-    readRawSessionMessagePageFromDb,
-} from "../src/hooks/magic-context/read-session-raw";
+import type { RawMessage } from "../src/hooks/magic-context/read-session-raw";
 import { parseIdShapedQuery } from "../src/features/magic-context/search";
 import type { Database } from "../src/shared/sqlite";
 import { CTX_SEARCH_TOOL_NAME } from "../src/tools/ctx-search/constants";
@@ -323,6 +320,13 @@ export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[
         throw new StagingError("staging root must be owner-only");
     }
     if (hasGitAncestor(real)) throw new StagingError("staging root is inside a VCS tree");
+    // Component-aware containment with the platform separator: string-prefix
+    // checks with a literal "/" miss descendant/ancestor overlaps on
+    // Windows, where realpath returns backslash-separated paths.
+    const contains = (parent: string, child: string): boolean => {
+        const rel = relative(parent, child);
+        return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+    };
     for (const forbidden of forbiddenRoots) {
         let forbiddenReal: string;
         try {
@@ -333,10 +337,10 @@ export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[
         // Both directions: a staging root BELOW a forbidden tree could leak
         // drafts into it, and a staging root ABOVE one would let the stale-
         // draft purge recursively delete the forbidden tree as an old entry.
-        if (real === forbiddenReal || real.startsWith(`${forbiddenReal}/`)) {
+        if (contains(forbiddenReal, real)) {
             throw new StagingError("staging root overlaps a forbidden tree");
         }
-        if (forbiddenReal.startsWith(`${real}/`)) {
+        if (contains(real, forbiddenReal)) {
             throw new StagingError("staging root contains a forbidden tree");
         }
     }
@@ -467,6 +471,99 @@ const MEASUREMENT_PAGE_SIZE = 5_000;
  *  parts are unbounded by the measurement cap, so hydration pages too. */
 const HISTORY_PAGE_SIZE = 200;
 
+interface HistoryPageKey {
+    timeCreated: number;
+    id: string;
+}
+
+/**
+ * Keyset page of one session's raw messages, ordered like the shared
+ * readers (time_created, id). LIMIT/OFFSET paging would re-skip the whole
+ * preceding history per page — quadratic in exactly the long sessions
+ * paging exists for — so the cursor is the ordering key itself. Candidate
+ * extraction never consumes ordinals, so they are filled positionally.
+ */
+function readHistoryPageByKey(
+    db: Database,
+    sessionId: string,
+    afterKey: HistoryPageKey | null,
+    limit: number,
+): { messages: RawMessage[]; nextKey: HistoryPageKey | null } {
+    const messageRows = (
+        afterKey === null
+            ? db
+                  .prepare(
+                      `SELECT id, data, time_created FROM message
+                        WHERE session_id = ?
+                        ORDER BY time_created ASC, id ASC
+                        LIMIT ?`,
+                  )
+                  .all(sessionId, limit)
+            : db
+                  .prepare(
+                      `SELECT id, data, time_created FROM message
+                        WHERE session_id = ?
+                          AND (time_created > ? OR (time_created = ? AND id > ?))
+                        ORDER BY time_created ASC, id ASC
+                        LIMIT ?`,
+                  )
+                  .all(sessionId, afterKey.timeCreated, afterKey.timeCreated, afterKey.id, limit)
+    ) as Array<{ id: unknown; data: unknown; time_created: unknown }>;
+    const wellFormed = messageRows.filter(
+        (row): row is { id: string; data: string; time_created: number } =>
+            typeof row.id === "string" &&
+            typeof row.data === "string" &&
+            typeof row.time_created === "number",
+    );
+    if (wellFormed.length === 0) return { messages: [], nextKey: null };
+
+    const placeholders = wellFormed.map(() => "?").join(", ");
+    const partRows = db
+        .prepare(
+            `SELECT message_id, data FROM part
+              WHERE session_id = ? AND message_id IN (${placeholders})
+              ORDER BY time_created ASC, id ASC`,
+        )
+        .all(sessionId, ...wellFormed.map((row) => row.id)) as Array<{
+        message_id: unknown;
+        data: unknown;
+    }>;
+    const partsByMessageId = new Map<string, unknown[]>();
+    for (const part of partRows) {
+        if (typeof part.message_id !== "string" || typeof part.data !== "string") continue;
+        const list = partsByMessageId.get(part.message_id) ?? [];
+        try {
+            list.push(JSON.parse(part.data));
+        } catch {
+            list.push(null);
+        }
+        partsByMessageId.set(part.message_id, list);
+    }
+
+    const messages: RawMessage[] = [];
+    for (const [index, row] of wellFormed.entries()) {
+        let info: Record<string, unknown> | null = null;
+        try {
+            const parsed = JSON.parse(row.data);
+            if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+                info = parsed as Record<string, unknown>;
+            }
+        } catch {
+            /* malformed message row: candidates require a well-formed role */
+        }
+        messages.push({
+            ordinal: index + 1,
+            id: row.id,
+            role: typeof info?.role === "string" ? info.role : "unknown",
+            parts: partsByMessageId.get(row.id) ?? [],
+            createdAt: row.time_created,
+            version: null,
+        });
+    }
+    const last = wellFormed[wellFormed.length - 1];
+    return { messages, nextKey: { timeCreated: last.time_created, id: last.id } };
+}
+
 export async function runRecovery(args: {
     measurementDb: Database;
     historyDb: Database;
@@ -572,16 +669,16 @@ export async function runRecovery(args: {
             // session never materializes in full.
             const kept: QueryCandidate[] = [];
             const keptKeys = new Set<string>();
-            let afterOrdinal = 0;
+            let afterKey: HistoryPageKey | null = null;
             for (;;) {
-                const page = readRawSessionMessagePageFromDb(
+                const page = readHistoryPageByKey(
                     args.historyDb,
                     sessionId,
-                    afterOrdinal,
+                    afterKey,
                     HISTORY_PAGE_SIZE,
                 );
-                if (page.length === 0) break;
-                for (const candidate of collectSessionCandidates(page, {
+                if (page.messages.length === 0) break;
+                for (const candidate of collectSessionCandidates(page.messages, {
                     autoSearchRanMessageIds: ranIds,
                 })) {
                     const hash = normalizedQueryHash(candidate.text);
@@ -595,7 +692,7 @@ export async function runRecovery(args: {
                     keptKeys.add(key);
                     kept.push(candidate);
                 }
-                afterOrdinal = page[page.length - 1].ordinal;
+                afterKey = page.nextKey;
             }
             candidatesBySession.set(sessionId, kept);
         }

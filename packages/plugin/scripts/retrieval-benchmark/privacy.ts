@@ -59,7 +59,8 @@ const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-]
 // shares in either separator form (`\\server\share\...`,
 // `//server/share/...`) carry the same signal. This is a rejecting gate, so
 // over-matching costs a review, never a leak.
-const WINDOWS_PATH = /(?:[A-Za-z]:[\\/][^\\/\r\n]+[\\/]|\\\\[\w.-]+\\[^\\\r\n]+)/;
+// No trailing separator required: `D:\customer-x` alone is identifying.
+const WINDOWS_PATH = /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+\\[^\\\r\n]+)/;
 // A file: URI is a local absolute path in URI clothing; the triple-slash
 // form defeats the delimiter-anchored POSIX arm, so name it directly.
 const FILE_URI = /\bfile:\/\//i;
@@ -69,9 +70,12 @@ const EXTENDED_LENGTH_PATH = /\\\\\?\\/;
 // No ":" in this delimiter class: `scheme://host/...` URLs must not read as
 // forward-slash UNC shares.
 const UNC_FORWARD = /(?:^|[\s"'`=([])\/\/[\w.-]+\/[^/\s]+/;
-// Two-or-more-component absolute POSIX paths, matched broadly and then
-// verified segment-wise so prose around standalone slashes stays clean.
-const POSIX_PATH_CANDIDATE = /(?:^|[\s"'`=:([])((?:\/[^/\r\n]+){2,})/g;
+// Absolute POSIX paths (single components included: `/customer-x` is
+// identifying), matched broadly and then verified segment-wise so prose
+// around standalone slashes stays clean. Slash-command spellings
+// (`/like-this`) reject too — a rejecting gate trades a lost candidate for
+// never leaking a workspace name.
+const POSIX_PATH_CANDIDATE = /(?:^|[\s"'`=:([])((?:\/[^/\r\n]+)+)/g;
 
 function hasAbsolutePath(value: string): boolean {
     if (
