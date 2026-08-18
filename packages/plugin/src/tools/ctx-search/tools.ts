@@ -15,7 +15,7 @@ import {
 } from "../../features/magic-context/search-bounds";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION, CTX_SEARCH_TOOL_NAME } from "./constants";
-import { extractCtxSearchQueryInput, normalizeCtxSearchArgs } from "./query-input";
+import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
 import { formatSearchResults } from "./render";
 import type { CtxSearchArgs, CtxSearchSource, CtxSearchToolDeps } from "./types";
 
@@ -79,10 +79,10 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
             const parsedArgs = ctxSearchArgsSchema.safeParse(rawArgs);
             let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxSearchArgs;
             args = normalizeCtxSearchArgs(args);
-            // Type-safe extraction: a model-supplied non-string query (e.g.
-            // {"query": 123}) reads as missing instead of throwing a
-            // TypeError out of the tool execution.
-            const preflight = extractCtxSearchQueryInput(args);
+            // Exactly one normalization pass (shared with recovery), then
+            // the type-safe preflight: a model-supplied non-string query
+            // reads as missing instead of throwing out of tool execution.
+            const preflight = prepareQueryFromNormalizedArgs(args);
             if (!preflight.ok) {
                 return `Error: ${describeQueryBoundsViolation(preflight)}`;
             }

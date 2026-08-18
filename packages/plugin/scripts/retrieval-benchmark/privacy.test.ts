@@ -28,6 +28,7 @@ describe("scanForSensitiveContent", () => {
             [{ q: "open /Client Work" }, "source-path"],
             [{ q: "drive D:\\customer-x" }, "source-path"],
             [{ q: "root-relative \\Client Work\\repo" }, "source-path"],
+            [{ q: "<code>\\Client Work\\repo" }, "source-path"],
             [{ q: "mixed \\\\customer-server/private-share/repo" }, "source-path"],
             [{ q: "share \\\\customer-server\\private-share\\repo\\main.ts" }, "source-path"],
             [{ q: "work in D:\\Client Work\\repo\\main.ts" }, "source-path"],
@@ -59,6 +60,7 @@ describe("scanForSensitiveContent", () => {
                 "hash-like",
             ],
             [{ q: "session ses_331acff95fferWZOYF1pG0cjOn" }, "session-id"],
+            [{ q: "source_session_ses_331acff95fferWZOYF1pG0cjOn" }, "session-id"],
         ];
         for (const [artifact, category] of cases) {
             const violations = scanForSensitiveContent(artifact);

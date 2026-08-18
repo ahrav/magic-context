@@ -49,7 +49,9 @@ const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 // Hex-specific boundaries, not \b: underscore is a word character, so
 // `query_hash_<64hex>` would otherwise slip the boundary.
 const HASH_LIKE = /(?:^|[^0-9a-fA-F])[0-9a-fA-F]{64}(?:[^0-9a-fA-F]|$)/;
-const SESSION_ID = /\bses[_-][A-Za-z0-9]{8,}/;
+// Identifier-alphabet boundary, not \b: `source_session_ses_...` keeps the
+// id behind a word character, which \b cannot cross.
+const SESSION_ID = /(?:^|[^A-Za-z0-9])ses[_-][A-Za-z0-9]{8,}/;
 // `~/` counts as a home path unless it directly follows a word character, so
 // quoted ("~/notes"), bracketed ((~/f)), and delimiter-preceded (path=~/x,
 // source:~/dir) spellings are caught, not only start-of-string/whitespace.
@@ -67,7 +69,7 @@ const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-]
 // leading backslash (root-relative `\Client Work\repo`) counts too —
 // path.win32.isAbsolute classifies both as absolute.
 const WINDOWS_PATH =
-    /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+[\\/][^\\/\r\n]+|(?:^|[\s"'`=([])\\[^\s\\/][^\\/\r\n]*)/;
+    /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+[\\/][^\\/\r\n]+|(?:^|[\s"'`=([<>])\\[^\s\\/][^\\/\r\n]*)/;
 // A file: URI is a local absolute path in URI clothing; the triple-slash
 // form defeats the delimiter-anchored POSIX arm, so name it directly.
 const FILE_URI = /\bfile:\/\//i;

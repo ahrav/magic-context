@@ -11,7 +11,7 @@
  * policy edit makes promotion fail until new operator approvals are recorded.
  */
 
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 
 import { SOURCE_LOCATOR_KIND } from "../src/features/magic-context/search-result-locator";
 import { AUTO_SEARCH_SOURCES } from "../src/hooks/magic-context/auto-search-prompt";
@@ -559,9 +559,15 @@ function main(): void {
                 releaseVersion: RELEASE_VERSION,
             }),
         );
-        const release = loadReviewedRelease(dirname(resolve(manifestPath)), {
+        const releaseDir = dirname(resolve(manifestPath));
+        const release = loadReviewedRelease(releaseDir, {
             expectedManifestFingerprint,
         });
+        // A release selector treats the directory name as authoritative, so
+        // v1 bytes copied under a v2 directory must fail the check.
+        if (basename(releaseDir) !== release.manifest.releaseVersion) {
+            fail("check failed: directory name does not match manifest releaseVersion");
+        }
         const categories = new Set(release.corpus.queries.map((q) => q.category));
         if (categories.size !== QUERY_CATEGORIES.length) {
             fail("check failed: missing category coverage");
