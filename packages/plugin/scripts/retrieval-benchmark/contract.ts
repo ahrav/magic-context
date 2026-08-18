@@ -156,7 +156,10 @@ const syntheticProfileSchema = z.strictObject({
     id: z.string().regex(/^syn-[a-z0-9-]+$/),
     generatorVersion: z.string().min(1),
     prng: z.literal("splitmix32"),
-    seed: z.number().int().nonnegative(),
+    /** splitmix32 state is unsigned 32-bit (`seed >>> 0`): a larger seed
+     *  would silently collide with its low 32 bits, so the release would
+     *  not execute the seed it declares. */
+    seed: z.number().int().nonnegative().max(0xffff_ffff),
     scale: z.union([
         z.literal(SYNTHETIC_SCALES[0]),
         z.literal(SYNTHETIC_SCALES[1]),

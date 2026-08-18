@@ -512,6 +512,16 @@ describe("validateRelease", () => {
 });
 
 describe("parseSyntheticProfiles", () => {
+    it("rejects seeds outside the splitmix32 32-bit state range", () => {
+        const { syntheticProfiles } = makeValidRelease();
+        const oversized = JSON.parse(JSON.stringify(syntheticProfiles));
+        // 2^32 + 1 collides with seed 1 after the generator's `>>> 0`.
+        oversized.profiles[0].seed = 4_294_967_297;
+        expect(diagnosticsOf(() => parseSyntheticProfiles(oversized))).toContain(
+            "syntheticProfiles.profiles.0.seed: too_big",
+        );
+    });
+
     it("requires every synthetic scale exactly once", () => {
         const { syntheticProfiles } = makeValidRelease();
         const missing = JSON.parse(JSON.stringify(syntheticProfiles));
