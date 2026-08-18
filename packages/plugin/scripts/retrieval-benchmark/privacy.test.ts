@@ -25,6 +25,8 @@ describe("scanForSensitiveContent", () => {
             [{ q: "see /customer-x" }, "source-path"],
             [{ q: "open /Client Work" }, "source-path"],
             [{ q: "drive D:\\customer-x" }, "source-path"],
+            [{ q: "root-relative \\Client Work\\repo" }, "source-path"],
+            [{ q: "mixed \\\\customer-server/private-share/repo" }, "source-path"],
             [{ q: "share \\\\customer-server\\private-share\\repo\\main.ts" }, "source-path"],
             [{ q: "work in D:\\Client Work\\repo\\main.ts" }, "source-path"],
             [{ q: "open /Client Work/repo/main.ts" }, "source-path"],

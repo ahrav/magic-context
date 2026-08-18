@@ -60,7 +60,12 @@ const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-]
 // `//server/share/...`) carry the same signal. This is a rejecting gate, so
 // over-matching costs a review, never a leak.
 // No trailing separator required: `D:\customer-x` alone is identifying.
-const WINDOWS_PATH = /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+\\[^\\\r\n]+)/;
+// The UNC arm accepts either separator at the share boundary
+// (\\server\share and \\server/share are the same path), and a single
+// leading backslash (root-relative `\Client Work\repo`) counts too —
+// path.win32.isAbsolute classifies both as absolute.
+const WINDOWS_PATH =
+    /(?:[A-Za-z]:[\\/][^\s\\/][^\\/\r\n]*|\\\\[\w.-]+[\\/][^\\/\r\n]+|(?:^|[\s"'`=([])\\[^\s\\/][^\\/\r\n]*)/;
 // A file: URI is a local absolute path in URI clothing; the triple-slash
 // form defeats the delimiter-anchored POSIX arm, so name it directly.
 const FILE_URI = /\bfile:\/\//i;

@@ -148,8 +148,14 @@ export function collectSessionCandidates(
             if (!state || typeof state !== "object") continue;
             // Only completed calls: pending, running, canceled, and errored
             // parts never executed a search, so their input must not become
-            // an explicit candidate.
+            // an explicit candidate. A completed call whose output is an
+            // error string resolved before (or instead of) the measured
+            // search path — project-resolution and bounds failures return
+            // early with "Error: ..." — so it is no candidate either.
             if (state.status !== "completed") continue;
+            if (typeof state.output === "string" && state.output.startsWith("Error:")) {
+                continue;
+            }
             const input = state.input;
             if (input === null || typeof input !== "object") continue;
             const preflight = extractCtxSearchQueryInput(input as CtxSearchArgs);

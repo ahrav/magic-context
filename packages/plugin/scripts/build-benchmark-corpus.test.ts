@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+    OPERATOR_APPROVALS,
     RELEASES_ROOT,
     RELEASE_VERSION,
     buildCorpusArtifacts,
 } from "./build-benchmark-corpus";
+import { buildManifest } from "./retrieval-benchmark/promote";
 import { canonicalFingerprint } from "./retrieval-benchmark/canonical-json";
 import {
     ContractError,
@@ -149,7 +151,20 @@ describe("checked-in release", () => {
     });
 
     it("passes the release lint command shape used by CI", () => {
-        const release = loadReviewedRelease(RELEASE_DIR);
+        // Trust anchor recomputed from reviewed source (authored artifacts +
+        // pinned approvals): a checked-in release with fabricated approvals
+        // is internally consistent, so the unanchored load alone would
+        // accept it — this test IS the CI gate that binds the release bytes
+        // to code review.
+        const expectedManifestFingerprint = canonicalFingerprint(
+            buildManifest({
+                ...buildCorpusArtifacts(),
+                approvals: OPERATOR_APPROVALS,
+                releaseVersion: RELEASE_VERSION,
+            }),
+        );
+        const release = loadReviewedRelease(RELEASE_DIR, { expectedManifestFingerprint });
+        expect(release.fingerprints.manifest).toBe(expectedManifestFingerprint);
         expect(new Set(release.corpus.queries.map((q) => q.category)).size).toBe(
             QUERY_CATEGORIES.length,
         );

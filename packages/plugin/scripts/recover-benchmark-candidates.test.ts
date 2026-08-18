@@ -374,6 +374,9 @@ describe("collectSessionCandidates", () => {
                     // ID-shaped queries can short-circuit past the measured
                     // search path; provenance is unknowable, so skipped.
                     { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: "9101" } } },
+                    // Completed but resolved with a pre-search error string:
+                    // no measurement was produced.
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: "unresolved project" }, output: "Error: Could not resolve project identity for search." } },
                     // Never-executed lifecycle states must not become candidates.
                     { type: "tool", tool: "ctx_search", state: { status: "pending", input: { query: "never ran" } } },
                     { type: "tool", tool: "ctx_search", state: { status: "error", input: { query: "failed run" } } },
