@@ -629,6 +629,36 @@ describe("runRecovery", () => {
         expect(readdirSync(root)).toEqual([]);
     });
 
+    it("pages past malformed history rows instead of treating them as EOF", async () => {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const text = "the question after the malformed block";
+        bindSession(measurementDb, "s1", "opencode");
+        insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
+        // A full page of rows whose time_created hydrates as TEXT precedes
+        // the valid message; SQL-side shape predicates must skip them
+        // rather than reading the empty filtered page as end-of-history.
+        for (let i = 0; i < 250; i += 1) {
+            historyDb
+                .prepare(
+                    "INSERT INTO message (id, session_id, data, time_created) VALUES (?, ?, ?, ?)",
+                )
+                .run(`bad_${i}`, "s1", JSON.stringify({ role: "user", id: `bad_${i}` }), "not-a-number");
+        }
+        const goodMsg = insertUserMessage(historyDb, "s1", text);
+        recordHintDecision(measurementDb, "s1", goodMsg);
+        const root = join(tempDir("run-malformed-page-"), "root");
+        const result = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
+            { ordinal: 0, status: "recovered" },
+        ]);
+    });
+
     it("classifies cross-session-only under bounded candidate retention", async () => {
         const measurementDb = makeMeasurementDb();
         const historyDb = makeHistoryDb();

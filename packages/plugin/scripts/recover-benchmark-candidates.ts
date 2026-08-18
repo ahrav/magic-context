@@ -495,12 +495,20 @@ function readHistoryPageByKey(
     afterKey: HistoryPageKey | null,
     limit: number,
 ): { messages: RawMessage[]; nextKey: HistoryPageKey | null } {
+    // Type predicates live in SQL so a returned page is well-formed by
+    // construction: filtering in JS after the fact would let a full page of
+    // malformed rows read as end-of-history while valid messages follow,
+    // and rows with non-numeric time_created cannot join a keyset
+    // comparison anyway. Malformed rows are skipped, matching the shared
+    // readers' behavior.
+    const SHAPE = `typeof(id) = 'text' AND typeof(data) = 'text'
+                     AND typeof(time_created) IN ('integer', 'real')`;
     const messageRows = (
         afterKey === null
             ? db
                   .prepare(
                       `SELECT id, data, time_created FROM message
-                        WHERE session_id = ?
+                        WHERE session_id = ? AND ${SHAPE}
                         ORDER BY time_created ASC, id ASC
                         LIMIT ?`,
                   )
@@ -508,7 +516,7 @@ function readHistoryPageByKey(
             : db
                   .prepare(
                       `SELECT id, data, time_created FROM message
-                        WHERE session_id = ?
+                        WHERE session_id = ? AND ${SHAPE}
                           AND (time_created > ? OR (time_created = ? AND id > ?))
                         ORDER BY time_created ASC, id ASC
                         LIMIT ?`,
