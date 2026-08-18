@@ -449,13 +449,15 @@ fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
 /// metadata come from a path-based directory iterator with metadata fetched
 /// per entry, while deletion is descriptor-relative; the metadata check and
 /// unlink are not atomic. Age is the sole predicate, failures do not prevent
-/// publication (protocol §4.2).
+/// publication (protocol §4.2). The scan examines at most 1024 successfully
+/// read entries.
 fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
+    const MAX_SWEEP_ENTRIES: usize = 1024;
     let prefix = format!(".{CONNECTION_FILE_NAME}.");
     let Ok(entries) = std::fs::read_dir(dir_path) else {
         return;
     };
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(MAX_SWEEP_ENTRIES) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with(&prefix) || !name.ends_with(".tmp") {

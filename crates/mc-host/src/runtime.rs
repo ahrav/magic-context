@@ -177,6 +177,34 @@ impl<H: McHostHandler> HostShared<H> {
     }
 }
 
+/// Cancels host work if the `run` future is dropped instead of completing:
+/// `TaskTracker` does not abort tracked tasks on drop, so a supervisor that
+/// aborts `run` would otherwise leave the health loop and authenticated
+/// connections serving indefinitely while `InstanceGuard::drop` removes the
+/// publication and releases the lock for a successor. Running on the normal
+/// exit path is harmless — everything it touches has already stopped.
+struct AbandonGuard<H: McHostHandler> {
+    shared: Arc<HostShared<H>>,
+}
+
+impl<H: McHostHandler> Drop for AbandonGuard<H> {
+    fn drop(&mut self) {
+        self.shared.shutdown.cancel();
+        for gen in self
+            .shared
+            .connections
+            .lock()
+            .expect("connections lock")
+            .values()
+        {
+            gen.read_cancel.cancel();
+            gen.shutdown_complete.cancel();
+            gen.token.cancel();
+        }
+        self.shared.abort_all();
+    }
+}
+
 /// Runs one host incarnation to completion.
 ///
 /// Startup follows the protocol order (§8.1): lock and credentials, handler
@@ -288,9 +316,13 @@ pub async fn run<H: McHostHandler>(
         daemon_ver: config.daemon_ver.clone(),
     });
 
+    let abandon_guard = AbandonGuard {
+        shared: Arc::clone(&shared),
+    };
     spawn_health_task(&shared);
     accept_loop(&shared, listener).await;
     let graceful = shutdown_sequence(&shared, &mut guard).await;
+    drop(abandon_guard);
 
     // Handler drop precedes lock release: `shared` holds the last handler Arc
     // once the tracker has drained, and `guard` drops after it (protocol §12
