@@ -46,7 +46,9 @@ const FINGERPRINT_FIELDS = new Set([
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: control-character rejection is the point
 const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
-const HASH_LIKE = /\b[0-9a-f]{64}\b/i;
+// Hex-specific boundaries, not \b: underscore is a word character, so
+// `query_hash_<64hex>` would otherwise slip the boundary.
+const HASH_LIKE = /(?:^|[^0-9a-fA-F])[0-9a-fA-F]{64}(?:[^0-9a-fA-F]|$)/;
 const SESSION_ID = /\bses[_-][A-Za-z0-9]{8,}/;
 // `~/` counts as a home path unless it directly follows a word character, so
 // quoted ("~/notes"), bracketed ((~/f)), and delimiter-preceded (path=~/x,
@@ -74,13 +76,15 @@ const FILE_URI = /\bfile:\/\//i;
 const EXTENDED_LENGTH_PATH = /\\\\\?\\/;
 // No ":" in this delimiter class: `scheme://host/...` URLs must not read as
 // forward-slash UNC shares.
-const UNC_FORWARD = /(?:^|[\s"'`=([])\/\/[\w.-]+\/[^/\s]+/;
+const UNC_FORWARD = /(?:^|[\s"'`=([<>])\/\/[\w.-]+\/[^/\s]+/;
 // Absolute POSIX paths (single components included: `/customer-x` is
 // identifying), matched broadly and then verified segment-wise so prose
 // around standalone slashes stays clean. Slash-command spellings
 // (`/like-this`) reject too — a rejecting gate trades a lost candidate for
 // never leaking a workspace name.
-const POSIX_PATH_CANDIDATE = /(?:^|[\s"'`=:([])((?:\/[^/\r\n]+)+)/g;
+// Angle brackets are delimiters too: recovered prompts wrap paths in
+// XML/HTML-style markup (`<code>/workspace/x`, `</workspace/x>`).
+const POSIX_PATH_CANDIDATE = /(?:^|[\s"'`=:([<>])((?:\/[^/\r\n]+)+)/g;
 
 function hasAbsolutePath(value: string): boolean {
     if (

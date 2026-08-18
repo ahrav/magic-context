@@ -239,7 +239,9 @@ const SHAREABILITY_SENSITIVE_PATTERNS: RegExp[] = [
     // text (it keys on config OBJECT keys, not prose).
     /\b(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|access[_-]?key)\b\s*[:=]\s*\S+/i,
     // Local / private endpoints — environment-specific, not a shared truth.
-    /\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?\b/i,
+    // Per-arm boundaries: \b cannot sit next to the non-word "[", so the
+    // bracketed IPv6 loopback needs its own arm without them.
+    /(?:\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)\b|\[::1\])(?::\d+)?/i,
     /\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
     /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
     /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,

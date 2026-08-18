@@ -19,6 +19,8 @@ describe("scanForSensitiveContent", () => {
             [{ q: "file at /users/someone/notes.txt" }, "source-path"],
             // Identifying paths outside home directories.
             [{ q: "see /workspace/customer-x/src/main.ts" }, "source-path"],
+            [{ q: "<code>/workspace/customer-x</code>" }, "source-path"],
+            [{ q: "directory </workspace/customer-x>" }, "source-path"],
             [{ q: "config at /mnt/projects/acme/file.ts" }, "source-path"],
             [{ q: "repo at D:\\repos\\private\\x.ts" }, "source-path"],
             // Single-component absolute roots are identifying too.
@@ -40,12 +42,19 @@ describe("scanForSensitiveContent", () => {
             ],
             [{ q: "endpoint http://192.168.1.10:8080/api" }, "shareability"],
             [{ q: "endpoint http://[fd12:3456::1]:8080/api" }, "shareability"],
+            [{ q: "endpoint http://[::1]:8080/api" }, "shareability"],
             [{ q: "link-local fe80::1234 on eth0" }, "shareability"],
             [{ q: "apipa 169.254.10.20 fallback" }, "shareability"],
             [{ q: "control\u0000char" }, "control-character"],
             [
                 {
                     q: "hash 4ec9599fc203d176a301536c2e091a19bc852759b255bd6818810a42c5fed14a",
+                },
+                "hash-like",
+            ],
+            [
+                {
+                    q: "query_hash_4ec9599fc203d176a301536c2e091a19bc852759b255bd6818810a42c5fed14a",
                 },
                 "hash-like",
             ],
