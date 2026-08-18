@@ -25,6 +25,7 @@ import {
     type QueryCategory,
     type QueryScenario,
     RUBRIC_VERSION,
+    SYNTHETIC_SCALES,
     SYNTHETIC_SCHEMA_VERSION,
     type SyntheticProfilesArtifact,
     canonicalFingerprint,
@@ -340,6 +341,14 @@ const ALIAS_NAMESPACE: Record<DocumentKind, string> = SOURCE_LOCATOR_KIND;
 
 const REFERENCE_TIME_MS = 1_755_400_000_000;
 
+/** Scenario message-history visibility: `searchMessages` and
+ *  `searchCompartmentChunks` treat the cutoff as an inclusive maximum ordinal
+ *  (0 excludes everything — ordinals are 1-based). Authored scenarios model a
+ *  session whose seeded fixture history is fully compacted, so the cutoff
+ *  sits far above any ordinal a harness seeds; message and compartment
+ *  targets stay structurally retrievable. */
+const MESSAGE_ORDINAL_CUTOFF = 100_000;
+
 function makeScenario(
     entry: AuthoredEntry,
     id: string,
@@ -353,7 +362,7 @@ function makeScenario(
         queryText,
         sourceFilters: entry.sourceFilters,
         fixtureScope: { projectScope: FIXTURE_PROJECT_SCOPE, sessionScope: null },
-        visibleState: { visibleMemoryIds: [], messageOrdinalCutoff: 0 },
+        visibleState: { visibleMemoryIds: [], messageOrdinalCutoff: MESSAGE_ORDINAL_CUTOFF },
         referenceTimeMs: REFERENCE_TIME_MS,
         partition: entry.partition,
         paraphraseGroup: `pg-${entry.slug}`,
@@ -468,7 +477,7 @@ export function buildCorpusArtifacts(): AuthoredArtifacts {
         },
         syntheticProfiles: {
             schemaVersion: SYNTHETIC_SCHEMA_VERSION,
-            profiles: ([1_000, 10_000, 100_000, 1_000_000] as const).map((scale) => ({
+            profiles: SYNTHETIC_SCALES.map((scale) => ({
                 id: `syn-scale-${scale}`,
                 generatorVersion: SYNTHETIC_GENERATOR_VERSION,
                 prng: "splitmix32",
@@ -488,13 +497,13 @@ export const OPERATOR_APPROVALS = [
         kind: "privacy",
         approver: "operator-privacy-review",
         releaseTupleFingerprint:
-            "edf2e7329c6493be6d4a788d551e88762dfd54bab12088c78a386d0ee9748996",
+            "b290a23aec27d42635c424f550ce7b39877f5db54c88af6656bd67c3a243338d",
     },
     {
         kind: "relevance-intent",
         approver: "operator-relevance-review",
         releaseTupleFingerprint:
-            "edf2e7329c6493be6d4a788d551e88762dfd54bab12088c78a386d0ee9748996",
+            "b290a23aec27d42635c424f550ce7b39877f5db54c88af6656bd67c3a243338d",
     },
 ] as const;
 

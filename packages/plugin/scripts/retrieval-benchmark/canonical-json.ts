@@ -35,7 +35,14 @@ function canonicalize(value: unknown, path: string): string {
             throw new CanonicalJsonError(`unsupported ${typeof value} at ${path}`);
     }
     if (Array.isArray(value)) {
-        return `[${value.map((item, i) => canonicalize(item, `${path}[${i}]`)).join(",")}]`;
+        // Index loop, not .map: map skips holes in sparse arrays and join
+        // would serialize them as empty slots ("[1,,3]" — malformed JSON).
+        // Indexing a hole yields undefined, which canonicalize rejects.
+        const items: string[] = [];
+        for (let i = 0; i < value.length; i += 1) {
+            items.push(canonicalize(value[i], `${path}[${i}]`));
+        }
+        return `[${items.join(",")}]`;
     }
     if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
         throw new CanonicalJsonError(`non-plain object at ${path}`);

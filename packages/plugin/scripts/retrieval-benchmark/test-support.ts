@@ -13,12 +13,11 @@ import {
     type ManifestArtifact,
     QUERY_CATEGORIES,
     type QueryScenario,
-    type ReleaseTuple,
     RUBRIC_VERSION,
     SYNTHETIC_SCHEMA_VERSION,
     type SyntheticProfilesArtifact,
 } from "./contract";
-import { PRIVACY_POLICY_VERSION, SANITIZER_VERSION } from "./privacy";
+import { buildReleaseTuple } from "./promote";
 import { SYNTHETIC_GENERATOR_VERSION } from "./synthetic";
 
 export const FIXTURE_PROJECT_SCOPE = "git:fixture-project";
@@ -68,7 +67,9 @@ export function makeQuery(
         queryText,
         sourceFilters: null,
         fixtureScope: { projectScope: FIXTURE_PROJECT_SCOPE, sessionScope: null },
-        visibleState: { visibleMemoryIds: [], messageOrdinalCutoff: 0 },
+        // Positive cutoff: message/compartment targets must stay reachable
+        // (validateRelease rejects positive targets behind a zero cutoff).
+        visibleState: { visibleMemoryIds: [], messageOrdinalCutoff: 100_000 },
         referenceTimeMs: 1_700_000_000_000,
         partition,
         paraphraseGroup: `pg-${slug}`,
@@ -137,17 +138,9 @@ export function makeManifestFor(
     judgments: unknown,
     syntheticProfiles: unknown,
 ): ManifestArtifact {
-    const releaseTuple: ReleaseTuple = {
-        corpusFingerprint: canonicalFingerprint(corpus),
-        judgmentsFingerprint: canonicalFingerprint(judgments),
-        syntheticProfilesFingerprint: canonicalFingerprint(syntheticProfiles),
-        corpusSchemaVersion: CORPUS_SCHEMA_VERSION,
-        judgmentsSchemaVersion: JUDGMENTS_SCHEMA_VERSION,
-        syntheticSchemaVersion: SYNTHETIC_SCHEMA_VERSION,
-        rubricVersion: RUBRIC_VERSION,
-        privacyPolicyVersion: PRIVACY_POLICY_VERSION,
-        sanitizerVersion: SANITIZER_VERSION,
-    };
+    // Test-support is not the facade, so it may import the promoter: reusing
+    // buildReleaseTuple keeps this in lockstep with the ReleaseTuple shape.
+    const releaseTuple = buildReleaseTuple({ corpus, judgments, syntheticProfiles });
     const releaseTupleFingerprint = canonicalFingerprint(releaseTuple);
     return {
         schemaVersion: MANIFEST_SCHEMA_VERSION,

@@ -129,12 +129,12 @@ describe("embedding measurement corpus", () => {
                 corpusHash: "corpus",
                 coverage: {},
             });
-        const bind = (sessionId: string, harness: string) =>
+        const bind = (sessionId: string, harness: string, projectPath = "/repo") =>
             db
                 .prepare(
-                    "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, '/repo', 0)",
+                    "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, 0)",
                 )
-                .run(sessionId, harness);
+                .run(sessionId, harness, projectPath);
 
         record("ses-oc", "opencode query");
         bind("ses-oc", "opencode");
@@ -146,6 +146,11 @@ describe("embedding measurement corpus", () => {
         bind("ses-both", "pi");
         record("ses-other", "other harness query");
         bind("ses-other", "mystery");
+        // Ownership correlates on (session_id, project_path): a session that
+        // is opencode in THIS project and pi in another still resolves here.
+        record("ses-cross", "cross project query");
+        bind("ses-cross", "opencode");
+        bind("ses-cross", "pi", "/other-repo");
 
         const owned = listMeasurementRowsWithOwnership(db, { afterId: 0, limit: 100 });
         expect(owned.map((row) => [row.sessionId, row.ownership])).toEqual([
@@ -154,6 +159,7 @@ describe("embedding measurement corpus", () => {
             ["ses-none", "missing"],
             ["ses-both", "ambiguous"],
             ["ses-other", "ambiguous"],
+            ["ses-cross", "opencode"],
         ]);
         expect(owned[0].queryTextHash).toBe(normalizedQueryHash("opencode query"));
 

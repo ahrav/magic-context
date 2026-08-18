@@ -52,10 +52,10 @@ describe("iterateSyntheticDocuments", () => {
     });
 
     it("yields the first bounded page of a 1M descriptor lazily", () => {
-        const docs = firstDocuments({ ...profile(), scale: 1_000_000 }, 5);
+        const docs = firstDocuments({ ...profile(), id: "syn-smoke-1m", scale: 1_000_000 }, 5);
         expect(docs).toHaveLength(5);
-        expect(docs[0].id).toBe("syn:syn-smoke-1k:0");
-        expect(docs[4].id).toBe("syn:syn-smoke-1k:4");
+        expect(docs[0].id).toBe("syn:syn-smoke-1m:0");
+        expect(docs[4].id).toBe("syn:syn-smoke-1m:4");
     });
 
     it("emits no judgments, provenance, paths, session ids, or corpus aliases", () => {
@@ -96,6 +96,8 @@ describe("judged-loader separation", () => {
             grade: 2,
             provenance: { judge: "human", pooledFrom: ["manual"] },
         });
-        expect(() => validateRelease(corpus, judgments)).toThrow();
+        // The synthetic id is rejected as a dangling reference (it can never
+        // name a corpus document); a bare toThrow could pass for any reason.
+        expect(() => validateRelease(corpus, judgments)).toThrow(/dangling/);
     });
 });

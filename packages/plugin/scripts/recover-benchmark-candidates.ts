@@ -23,6 +23,7 @@ import {
     existsSync,
     lstatSync,
     mkdirSync,
+    mkdtempSync,
     openSync,
     readdirSync,
     realpathSync,
@@ -32,7 +33,7 @@ import {
     unlinkSync,
     writeSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -154,6 +155,11 @@ const OWNERSHIP_STATUS = {
 export function recoverCandidates(args: {
     rows: readonly RecoveryInputRow[];
     candidatesBySession: ReadonlyMap<string, readonly QueryCandidate[]>;
+    /** Identifying tokens (author-host username and home path, operator deny
+     *  list) rejected wherever they appear in candidate text. The privacy
+     *  scan itself is host-independent, so author-host identity must be
+     *  supplied here — at authoring time — or it is never checked. */
+    forbiddenTokens?: readonly string[];
     hashCandidate?: (text: string) => string;
 }): RecoveryOutcome {
     const hashCandidate = args.hashCandidate ?? normalizedQueryHash;
@@ -216,7 +222,12 @@ export function recoverCandidates(args: {
             continue;
         }
         const match = matches[0];
-        if (scanForSensitiveContent({ queryText: match.text }).length > 0) {
+        if (
+            scanForSensitiveContent(
+                { queryText: match.text },
+                { forbiddenTokens: args.forbiddenTokens },
+            ).length > 0
+        ) {
             record(row.ordinal, "privacy-rejected");
             continue;
         }
@@ -325,8 +336,8 @@ export function defaultStagingRoot(): string {
 }
 
 const REQUIRED_TABLES: Record<string, readonly string[]> = {
-    embedding_measurement_corpus: ["id", "session_id", "query_text_hash"],
-    session_projects: ["session_id", "harness"],
+    embedding_measurement_corpus: ["id", "session_id", "project_path", "query_text_hash"],
+    session_projects: ["session_id", "harness", "project_path"],
 };
 
 /** Validate schema and bounded row shapes before any reconstruction. */
@@ -372,6 +383,8 @@ export async function runRecovery(args: {
     historyDb: Database;
     stagingRoot: string;
     forbiddenRoots: readonly string[];
+    /** Passed through to the privacy gate on every recovered candidate. */
+    forbiddenTokens?: readonly string[];
     nowMs?: number;
 }): Promise<{ draftPath: string; reportPath: string; report: RecoveryReport }> {
     const nowMs = args.nowMs ?? Date.now();
@@ -427,21 +440,31 @@ export async function runRecovery(args: {
         endRead(args.historyDb);
     }
 
-    const { draft, report } = recoverCandidates({ rows, candidatesBySession });
-    const draftPath = writeStagedFileAtomically(
-        root,
-        "draft.json",
-        `${JSON.stringify(draft, null, 2)}\n`,
-    );
+    const { draft, report } = recoverCandidates({
+        rows,
+        candidatesBySession,
+        forbiddenTokens: args.forbiddenTokens,
+    });
+    // Each run stages into its own mkdtemp subdirectory (0o700), created only
+    // once there is something to write: re-running within the TTL never
+    // collides with a previous run's draft.json, failures never leave an
+    // empty run directory behind, and stale runs age out through the purge.
+    const runDir = mkdtempSync(join(root, "run-"));
+    let draftPath: string;
     let reportPath: string;
     try {
+        draftPath = writeStagedFileAtomically(
+            runDir,
+            "draft.json",
+            `${JSON.stringify(draft, null, 2)}\n`,
+        );
         reportPath = writeStagedFileAtomically(
-            root,
+            runDir,
             "report.json",
             `${JSON.stringify(report, null, 2)}\n`,
         );
     } catch (error) {
-        rmSync(draftPath, { force: true });
+        rmSync(runDir, { recursive: true, force: true });
         throw error;
     }
     return { draftPath, reportPath, report };
@@ -457,11 +480,17 @@ async function main(): Promise<void> {
     const measurementDb = new BunDatabase(measurementPath, { readonly: true });
     const historyDb = new BunDatabase(historyPath, { readonly: true });
     try {
+        // The privacy scan is host-independent by design; the author host's
+        // identity is checked here, at authoring time, as forbidden tokens.
+        const hostIdentityTokens = [userInfo().username, homedir()].filter(
+            (token) => token.length > 0,
+        );
         const { report, draftPath } = await runRecovery({
             measurementDb: measurementDb as unknown as Database,
             historyDb: historyDb as unknown as Database,
             stagingRoot: defaultStagingRoot(),
             forbiddenRoots: [dirname(measurementPath), dirname(historyPath), import.meta.dir],
+            forbiddenTokens: hostIdentityTokens,
         });
         // Allowlisted output only: status codes and counts, never text/ids.
         process.stdout.write(`${JSON.stringify(report.counts)}\ndraft: ${draftPath}\n`);

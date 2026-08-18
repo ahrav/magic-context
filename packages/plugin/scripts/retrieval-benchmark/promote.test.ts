@@ -92,6 +92,36 @@ describe("promoteRelease", () => {
                 approvals: input.approvals.map((approval) => ({ ...approval, note: "lgtm" })),
             }),
         ).toThrow(ContractError);
+        expect(readdirSync(root)).toEqual([]);
+    });
+
+    it("rejects a release whose synthetic profile violates generator invariants", () => {
+        const root = releasesRoot();
+        const input = promotableInput(root);
+        const badProfiles = JSON.parse(JSON.stringify(input.syntheticProfiles));
+        badProfiles.profiles[0].textSize = { minWords: 96, maxWords: 12 };
+        const artifacts = {
+            corpus: input.corpus,
+            judgments: input.judgments,
+            syntheticProfiles: badProfiles,
+        };
+        expect(() =>
+            promoteRelease({
+                ...input,
+                syntheticProfiles: badProfiles,
+                approvals: approvalsFor(artifacts),
+            }),
+        ).toThrow(/invalid-text-size-distribution/);
+        expect(readdirSync(root)).toEqual([]);
+    });
+
+    it("applies an operator deny list through the privacy gate", () => {
+        const root = releasesRoot();
+        const input = promotableInput(root);
+        expect(() =>
+            promoteRelease({ ...input, forbiddenTokens: ["fixture-project"] }),
+        ).toThrow(/forbidden-token/);
+        expect(readdirSync(root)).toEqual([]);
     });
 
     it("rejects a mixed artifact set with stale approvals", () => {

@@ -7,6 +7,7 @@ import {
     readFileSync,
     readdirSync,
     rmSync,
+    statSync,
     symlinkSync,
     utimesSync,
     writeFileSync,
@@ -16,6 +17,7 @@ import { join } from "node:path";
 
 import { Database } from "../src/shared/sqlite";
 import { normalizedQueryHash } from "../src/features/magic-context/storage-embedding-measurements";
+import { readRawSessionMessagesFromDb } from "../src/hooks/magic-context/read-session-raw";
 import {
     type QueryCandidate,
     type RecoveryInputRow,
@@ -113,8 +115,10 @@ function bindSession(db: Database, sessionId: string, harness: string): void {
 }
 
 function insertMeasurement(db: Database, sessionId: string, hash: string): void {
+    // project_path matches bindSession's: ownership correlates on
+    // (session_id, project_path), not session_id alone.
     db.prepare(
-        "INSERT INTO embedding_measurement_corpus (session_id, query_text_hash) VALUES (?, ?)",
+        "INSERT INTO embedding_measurement_corpus (session_id, project_path, query_text_hash) VALUES (?, 'git:proj', ?)",
     ).run(sessionId, hash);
 }
 
@@ -243,20 +247,9 @@ describe("collectSessionCandidates", () => {
             "s1",
             "<system-reminder>noise</system-reminder>How does   compaction work?",
         );
-        const messages = [
-            {
-                ordinal: 1,
-                id: "msg_x",
-                role: "user",
-                parts: [
-                    {
-                        type: "text",
-                        text: "<system-reminder>noise</system-reminder>How does   compaction work?",
-                    },
-                ],
-            },
-        ];
-        const candidates = collectSessionCandidates(messages);
+        // Rows go through the real reconstruction path runRecovery uses, so
+        // this covers row hydration, not just the extraction helpers.
+        const candidates = collectSessionCandidates(readRawSessionMessagesFromDb(db, "s1"));
         expect(candidates).toEqual([
             { text: "How does compaction work?", mode: "automatic" },
         ]);
@@ -424,12 +417,59 @@ describe("runRecovery", () => {
         expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
             { ordinal: 0, status: "privacy-rejected" },
         ]);
-        for (const file of readdirSync(root)) {
-            const content = readFileSync(join(root, file), "utf8");
+        for (const entry of readdirSync(root, { recursive: true }) as string[]) {
+            expect(entry).not.toContain("ses_canary_owner");
+            const path = join(root, entry);
+            if (!statSync(path).isFile()) continue;
+            const content = readFileSync(path, "utf8");
             expect(content).not.toContain("sk-ant");
             expect(content).not.toContain("ses_canary_owner");
-            expect(file).not.toContain("ses_canary_owner");
         }
+    });
+
+    it("re-runs within the TTL without colliding with the previous draft", async () => {
+        const { measurementDb, historyDb, text } = seededDbs();
+        const root = join(tempDir("run-rerun-"), "root");
+        const first = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        const second = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        expect(second.draftPath).not.toBe(first.draftPath);
+        expect(readFileSync(second.draftPath, "utf8")).toBe(
+            readFileSync(first.draftPath, "utf8"),
+        );
+        expect(JSON.parse(readFileSync(second.draftPath, "utf8")).records).toEqual([
+            { ordinal: 0, mode: "automatic", queryText: text },
+        ]);
+    });
+
+    it("rejects candidates carrying a forbidden identifying token", async () => {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const text = "how does the acme-internal launch flow work";
+        bindSession(measurementDb, "s1", "opencode");
+        insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
+        insertUserMessage(historyDb, "s1", text);
+        const root = join(tempDir("run-tokens-"), "root");
+        const result = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+            forbiddenTokens: ["ACME-INTERNAL"],
+        });
+        expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
+            { ordinal: 0, status: "privacy-rejected" },
+        ]);
+        expect(JSON.parse(readFileSync(result.draftPath, "utf8")).records).toEqual([]);
     });
 
     it("rejects malformed schema and out-of-bounds rows without writing anything", async () => {

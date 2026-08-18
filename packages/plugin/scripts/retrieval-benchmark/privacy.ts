@@ -1,17 +1,21 @@
 /**
  * Rejecting privacy gate for benchmark artifacts.
  *
- * Reject a field (instead of rewriting it) when sanitizeDiagnosticText would
- * change it, when it matches a shareability-sensitive pattern, or when it
- * carries a corpus-specific residual signal: normalized query hash, session
- * id, source path, control character, or seeded identifying token.
+ * Reject a field (instead of rewriting it) when the host-independent secret
+ * or path sanitizers would change it, when it matches a shareability-
+ * sensitive pattern, or when it carries a corpus-specific residual signal:
+ * normalized query hash, session id, source path, control character, or
+ * seeded identifying token. Every check is deterministic across machines —
+ * the loader host's username and home directory never participate; the
+ * author host's identity enters through `forbiddenTokens` at recovery time.
  * Violations name only the JSON path and a category code — the value itself
  * never reaches any output channel.
  */
 
 import {
-    hasShareabilitySensitiveText,
-    sanitizeDiagnosticText,
+    hasPortableSensitiveText,
+    redactSecretText,
+    sanitizePathStringPortable,
 } from "../../src/shared/redaction";
 
 export const PRIVACY_POLICY_VERSION = "privacy-policy/v1";
@@ -44,7 +48,10 @@ const FINGERPRINT_FIELDS = new Set([
 const CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const HASH_LIKE = /\b[0-9a-f]{64}\b/i;
 const SESSION_ID = /\bses[_-][A-Za-z0-9]{8,}/;
-const SOURCE_PATH = /(?:\/home\/|\/Users\/|C:\\Users\\|(?:^|\s)~\/)/;
+// `~/` counts as a home path unless it directly follows a word character, so
+// quoted ("~/notes"), bracketed ((~/f)), and delimiter-preceded (path=~/x,
+// source:~/dir) spellings are caught, not only start-of-string/whitespace.
+const SOURCE_PATH = /(?:\/home\/|\/Users\/|C:\\Users\\|(?:^|[^\w.-])~\/)/;
 
 function scanString(
     value: string,
@@ -54,9 +61,13 @@ function scanString(
     skipHashCheck = false,
 ): void {
     if (CONTROL_CHARS.test(value)) violations.push({ path, category: "control-character" });
-    if (sanitizeDiagnosticText(value) !== value) {
+    // Host-independent checks only: the same bytes must pass or fail on every
+    // machine, or release validity would depend on the loader's username and
+    // home directory. Author-host identity is checked at recovery time, where
+    // the operator supplies it through `forbiddenTokens`.
+    if (redactSecretText(sanitizePathStringPortable(value)) !== value) {
         violations.push({ path, category: "secret-or-path" });
-    } else if (hasShareabilitySensitiveText(value)) {
+    } else if (hasPortableSensitiveText(value)) {
         violations.push({ path, category: "shareability" });
     }
     if (!skipHashCheck && HASH_LIKE.test(value)) {

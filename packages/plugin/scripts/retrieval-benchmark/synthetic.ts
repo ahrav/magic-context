@@ -57,18 +57,22 @@ const WORDS = [
 
 export class SyntheticProfileError extends Error {}
 
-function checkProfile(profile: SyntheticProfile): void {
+/** Generator invariants beyond the schema: version supported by THIS
+ *  generator, non-empty source distribution, coherent text-size range.
+ *  Release loading calls this so an unusable profile rejects at load time
+ *  instead of failing mid-scale-run in a consumer. */
+export function checkSyntheticProfile(profile: SyntheticProfile): void {
     if (profile.generatorVersion !== SYNTHETIC_GENERATOR_VERSION) {
-        throw new SyntheticProfileError("unsupported generator version");
+        throw new SyntheticProfileError("unsupported-generator-version");
     }
     if (!(SYNTHETIC_SCALES as readonly number[]).includes(profile.scale)) {
-        throw new SyntheticProfileError("unsupported scale");
+        throw new SyntheticProfileError("unsupported-scale");
     }
     if (profile.textSize.minWords > profile.textSize.maxWords) {
-        throw new SyntheticProfileError("invalid text-size distribution");
+        throw new SyntheticProfileError("invalid-text-size-distribution");
     }
     if (Object.keys(profile.sourceDistribution).length === 0) {
-        throw new SyntheticProfileError("empty source distribution");
+        throw new SyntheticProfileError("empty-source-distribution");
     }
 }
 
@@ -76,7 +80,7 @@ function checkProfile(profile: SyntheticProfile): void {
 export function* iterateSyntheticDocuments(
     profile: SyntheticProfile,
 ): Generator<SyntheticDocument> {
-    checkProfile(profile);
+    checkSyntheticProfile(profile);
     const next = splitmix32(profile.seed);
     const kinds = (Object.keys(profile.sourceDistribution) as DocumentKind[]).sort((a, b) => {
         if (a < b) return -1;

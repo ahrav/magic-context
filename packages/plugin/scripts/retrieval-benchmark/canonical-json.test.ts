@@ -27,6 +27,17 @@ describe("canonicalJson", () => {
         expect(() => canonicalJson(undefined)).toThrow(CanonicalJsonError);
     });
 
+    it("rejects sparse-array holes instead of emitting malformed JSON", () => {
+        // [1, <hole>, 3]: Array.prototype.map skips the hole and join would
+        // serialize it as an empty slot ("[1,,3]").
+        const sparse = [1];
+        sparse.length = 3;
+        sparse[2] = 3;
+        expect(() => canonicalJson(sparse)).toThrow(CanonicalJsonError);
+        expect(() => canonicalJson({ a: sparse })).toThrow("$.a[1]");
+        expect(() => canonicalJson([undefined])).toThrow(CanonicalJsonError);
+    });
+
     it("rejects non-finite numbers, functions, and non-plain objects", () => {
         expect(() => canonicalJson({ n: Number.NaN })).toThrow(CanonicalJsonError);
         expect(() => canonicalJson({ n: Number.POSITIVE_INFINITY })).toThrow(CanonicalJsonError);

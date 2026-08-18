@@ -158,10 +158,13 @@ function classifyOwnership(harnesses: string | null): MeasurementOwnership {
 }
 
 /**
- * One keyset page of measurement rows joined to session ownership. The
- * measurement corpus grows with session count (bounded only per session), so
- * this API forces bounded reads: callers page with `afterId`/`limit` instead
- * of materializing the full history in one array.
+ * One keyset page of measurement rows joined to session ownership. Ownership
+ * is correlated on (session_id, project_path): a session shared across
+ * harnesses in DIFFERENT projects still resolves for the project the row was
+ * recorded in; multiple harnesses for the SAME project stay `ambiguous`.
+ * The measurement corpus grows with session count (bounded only per session),
+ * so this API forces bounded reads: callers page with `afterId`/`limit`
+ * instead of materializing the full history in one array.
  */
 export function listMeasurementRowsWithOwnership(
     db: Database,
@@ -172,7 +175,8 @@ export function listMeasurementRowsWithOwnership(
             `SELECT m.id, m.session_id, m.project_path, m.query_text_hash,
                     (SELECT GROUP_CONCAT(DISTINCT sp.harness)
                        FROM session_projects sp
-                      WHERE sp.session_id = m.session_id) AS harnesses
+                      WHERE sp.session_id = m.session_id
+                        AND sp.project_path = m.project_path) AS harnesses
                FROM embedding_measurement_corpus m
               WHERE m.id > ?
               ORDER BY m.id ASC

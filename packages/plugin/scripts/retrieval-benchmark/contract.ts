@@ -405,6 +405,25 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         }
     }
 
+    // A positive target that the scenario's own visible state can never
+    // return is a structural recall loss, not a ranking signal: message and
+    // compartment search treat the cutoff as an inclusive maximum ordinal and
+    // ordinals are 1-based, so cutoff 0 excludes every such document.
+    const documentKindById = new Map(corpus.documents.map((d) => [d.id, d.kind]));
+    for (const [queryId, byDoc] of judged) {
+        const query = queryById.get(queryId);
+        if (!query || query.visibleState.messageOrdinalCutoff > 0) continue;
+        for (const [documentId, judgment] of byDoc) {
+            if (judgment.grade === 0) continue;
+            const kind = documentKindById.get(documentId);
+            if (kind === "message" || kind === "compartment") {
+                diagnostics.push(
+                    `corpus: target unreachable under zero message cutoff (${queryId}, ${documentId})`,
+                );
+            }
+        }
+    }
+
     for (const category of QUERY_CATEGORIES) {
         for (const partition of ["development", "holdout"] as const) {
             const groups = new Set(

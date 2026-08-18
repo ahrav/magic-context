@@ -46,6 +46,10 @@ export interface PromotionInput {
     /** Operator-supplied, exactly one per kind. The promoter never creates
      *  or repairs these. */
     approvals: readonly unknown[];
+    /** Operator deny list (project codenames, customer names) applied by the
+     *  privacy gate during both validating re-loads. Optional because the
+     *  tokens are themselves sensitive and never ship with the release. */
+    forbiddenTokens?: readonly string[];
     releasesRoot: string;
     releaseVersion: string;
 }
@@ -120,8 +124,11 @@ export function buildManifest(
 
 /**
  * Validate and atomically install a new immutable release directory.
- * Rejection, write failure, or interruption leaves the releases root without
- * a partial version directory and any prior release byte-identical.
+ * Rejection, write failure, or process interruption leaves the releases root
+ * without a partial version directory and any prior release byte-identical.
+ * (Process-level atomicity only: no fsync, so a power loss can leave a
+ * renamed directory with truncated files — loadReviewedRelease then fails
+ * loudly on a fingerprint mismatch.)
  *
  * Unvetted bytes never touch the releases root: the full consumer-path
  * re-load (fingerprints, approvals, privacy, partitions) runs against an
@@ -161,7 +168,7 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         for (const [name, content] of files) {
             writeFileSync(join(reviewDir, name), content, { flag: "wx" });
         }
-        loadReviewedRelease(reviewDir);
+        loadReviewedRelease(reviewDir, { forbiddenTokens: input.forbiddenTokens });
     } catch (error) {
         rmSync(reviewDir, { recursive: true, force: true });
         throw error;
@@ -179,7 +186,7 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         }
         // Re-load the exact directory being renamed into place, so tampering
         // with staged bytes between write and rename is still caught.
-        loadReviewedRelease(staging);
+        loadReviewedRelease(staging, { forbiddenTokens: input.forbiddenTokens });
         renameSync(staging, destination);
     } catch (error) {
         rmSync(staging, { recursive: true, force: true });

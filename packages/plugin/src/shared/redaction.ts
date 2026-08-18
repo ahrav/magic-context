@@ -107,6 +107,17 @@ export function isSecretKey(key: string): boolean {
     return false;
 }
 
+/** Host-independent path rewriting: only the generic user-home patterns,
+ *  never the running host's homedir or username. Callers that must produce
+ *  identical results on every machine (release validation) use this;
+ *  diagnostics that redact the local identity use `sanitizePathString`. */
+export function sanitizePathStringPortable(value: string): string {
+    return value
+        .replace(/\/Users\/[^/]+\//g, "/Users/<USER>/")
+        .replace(/\/home\/[^/]+\//g, "/home/<USER>/")
+        .replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
+}
+
 export function sanitizePathString(value: string): string {
     const home = homedir();
     const username = userInfo().username;
@@ -114,9 +125,7 @@ export function sanitizePathString(value: string): string {
     if (home) {
         sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
     }
-    sanitized = sanitized.replace(/\/Users\/[^/]+\//g, "/Users/<USER>/");
-    sanitized = sanitized.replace(/\/home\/[^/]+\//g, "/home/<USER>/");
-    sanitized = sanitized.replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
+    sanitized = sanitizePathStringPortable(sanitized);
     if (username) {
         sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
     }
@@ -237,6 +246,19 @@ const SHAREABILITY_SENSITIVE_PATTERNS: RegExp[] = [
 export function hasShareabilitySensitiveText(text: string): boolean {
     try {
         if (sanitizeDiagnosticText(text) !== text) return true;
+        return SHAREABILITY_SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
+    } catch {
+        return true;
+    }
+}
+
+/** Host-independent variant of `hasShareabilitySensitiveText`: same secret
+ *  and shareability patterns, but never the running host's homedir or
+ *  username, so the verdict for a given string is identical on every
+ *  machine. Release-artifact validation depends on that determinism. */
+export function hasPortableSensitiveText(text: string): boolean {
+    try {
+        if (redactSecretText(sanitizePathStringPortable(text)) !== text) return true;
         return SHAREABILITY_SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
     } catch {
         return true;

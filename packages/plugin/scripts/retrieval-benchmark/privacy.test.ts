@@ -30,10 +30,32 @@ describe("scanForSensitiveContent", () => {
         }
     });
 
-    it("rejects the current OS username", () => {
+    it("rejects quoted and delimiter-preceded home paths", () => {
+        const cases = [
+            'open "~/notes.txt" first',
+            "see (~/notes/todo.md)",
+            "path=~/projects/x",
+            "source:~/dir/file",
+            "~/at-start.txt",
+            "after space ~/file",
+        ];
+        for (const q of cases) {
+            const violations = scanForSensitiveContent({ q });
+            expect(violations.map((v) => v.category)).toContain("source-path");
+        }
+    });
+
+    it("is host-independent: the loader's username alone is not a violation", () => {
+        // Release validity must be identical on every machine. The author
+        // host's identity is supplied as forbiddenTokens at recovery time.
         const username = userInfo().username;
         const violations = scanForSensitiveContent({ q: `written by ${username} today` });
-        expect(violations.length).toBeGreaterThan(0);
+        expect(violations).toEqual([]);
+        const withToken = scanForSensitiveContent(
+            { q: `written by ${username} today` },
+            { forbiddenTokens: [username] },
+        );
+        expect(withToken.map((v) => v.category)).toContain("forbidden-token");
     });
 
     it("rejects seeded corpus-specific identifying tokens", () => {

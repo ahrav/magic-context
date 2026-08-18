@@ -183,6 +183,19 @@ describe("validateRelease", () => {
         expect(diagnostics.some((d) => d.includes("target document crosses"))).toBe(true);
     });
 
+    it("rejects a positive message target behind a zero ordinal cutoff", () => {
+        const { corpus, judgments } = makeValidRelease();
+        // error-message queries pair with a "message"-kind document in the
+        // fixture rotation; cutoff 0 makes that target structurally
+        // unretrievable (ordinals are 1-based, cutoff is an inclusive max).
+        const query = corpus.queries.find((q) => q.id === "q-error-message-dev");
+        if (!query) throw new Error("fixture query missing");
+        query.visibleState.messageOrdinalCutoff = 0;
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target unreachable under zero message cutoff (q-error-message-dev, d-error-message-dev)",
+        );
+    });
+
     it("rejects a category missing coverage in either partition", () => {
         const { corpus, judgments } = makeValidRelease();
         const removedQuery = corpus.queries.pop();
@@ -260,12 +273,17 @@ describe("buildJudgmentLookup", () => {
 describe("facade boundary", () => {
     it("index.ts imports no database, recovery, or promotion code", () => {
         const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
-        const importLines = source.split("\n").filter((line) => /^import\b|^} from|from "/.test(line));
         const forbidden = ["sqlite", "storage", "promote", "recover", "bun:sqlite"];
-        for (const line of importLines) {
-            for (const term of forbidden) {
-                expect(line.includes(term)).toBe(false);
-            }
-        }
+        // Covers static imports, re-exports, dynamic import() and require().
+        const references = source
+            .split("\n")
+            .map((line, i) => ({ line, number: i + 1 }))
+            .filter(({ line }) => /^import\b|^} from|from "|import\(|require\(/.test(line));
+        const violations = references.flatMap(({ line, number }) =>
+            forbidden
+                .filter((term) => line.includes(term))
+                .map((term) => `index.ts:${number} references "${term}": ${line.trim()}`),
+        );
+        expect(violations).toEqual([]);
     });
 });

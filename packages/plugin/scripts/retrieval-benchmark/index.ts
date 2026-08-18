@@ -30,6 +30,7 @@ import {
     SANITIZER_VERSION,
     scanForSensitiveContent,
 } from "./privacy";
+import { checkSyntheticProfile, SyntheticProfileError } from "./synthetic";
 
 export {
     CORPUS_SCHEMA_VERSION,
@@ -67,9 +68,11 @@ export {
 } from "./identity";
 export { PRIVACY_POLICY_VERSION, SANITIZER_VERSION, scanForSensitiveContent } from "./privacy";
 export {
+    checkSyntheticProfile,
     iterateSyntheticDocuments,
     SYNTHETIC_GENERATOR_VERSION,
     type SyntheticDocument,
+    SyntheticProfileError,
     syntheticStreamHash,
 } from "./synthetic";
 
@@ -116,8 +119,17 @@ function readJson(dir: string, name: string): unknown {
  * fingerprints against the approved release tuple, current privacy policy and
  * sanitizer versions, approvals bound to the exact tuple, and referential and
  * partition integrity.
+ *
+ * `forbiddenTokens` is an optional operator deny list (project codenames,
+ * customer names) applied on top of the pattern gates. It is optional here
+ * because the tokens are themselves sensitive: they cannot ship inside the
+ * repository or the release, so a loader without access to the list must
+ * still be able to validate the fingerprinted bytes deterministically.
  */
-export function loadReviewedRelease(releaseDir: string): ReviewedRelease {
+export function loadReviewedRelease(
+    releaseDir: string,
+    options: { forbiddenTokens?: readonly string[] } = {},
+): ReviewedRelease {
     const corpusRaw = readJson(releaseDir, RELEASE_FILES.corpus);
     const judgmentsRaw = readJson(releaseDir, RELEASE_FILES.judgments);
     const syntheticRaw = readJson(releaseDir, RELEASE_FILES.syntheticProfiles);
@@ -125,12 +137,15 @@ export function loadReviewedRelease(releaseDir: string): ReviewedRelease {
 
     // The privacy gate runs before any parse or cross-artifact validation:
     // no later diagnostic can echo content the scan would have rejected.
-    const violations = scanForSensitiveContent({
-        corpus: corpusRaw,
-        judgments: judgmentsRaw,
-        syntheticProfiles: syntheticRaw,
-        manifest: manifestRaw,
-    });
+    const violations = scanForSensitiveContent(
+        {
+            corpus: corpusRaw,
+            judgments: judgmentsRaw,
+            syntheticProfiles: syntheticRaw,
+            manifest: manifestRaw,
+        },
+        { forbiddenTokens: options.forbiddenTokens },
+    );
     if (violations.length > 0) {
         throw new ContractError(
             violations.map((v) => `privacy.${v.category}: ${v.path}`).sort(),
@@ -166,6 +181,19 @@ export function loadReviewedRelease(releaseDir: string): ReviewedRelease {
     const corpus = parseCorpus(corpusRaw);
     const judgments = parseJudgments(judgmentsRaw);
     const syntheticProfiles = parseSyntheticProfiles(syntheticRaw);
+    // Generator invariants are enforced at load, not first iteration: a
+    // release with an unusable profile must reject here rather than pass
+    // review and then fail hours into a scale run.
+    const profileDiagnostics: string[] = [];
+    for (const [i, profile] of syntheticProfiles.profiles.entries()) {
+        try {
+            checkSyntheticProfile(profile);
+        } catch (error) {
+            const code = error instanceof SyntheticProfileError ? error.message : "invalid";
+            profileDiagnostics.push(`syntheticProfiles.profiles[${i}]: ${code}`);
+        }
+    }
+    if (profileDiagnostics.length > 0) throw new ContractError(profileDiagnostics.sort());
     validateRelease(corpus, judgments);
 
     return {
