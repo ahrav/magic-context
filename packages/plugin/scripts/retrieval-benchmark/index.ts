@@ -8,7 +8,7 @@
  * code is reachable from this module.
  */
 
-import { readFileSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { canonicalFingerprint, canonicalJson } from "./canonical-json";
@@ -137,6 +137,31 @@ function readJson(dir: string, name: string): unknown {
  * repository or the release, so a loader without access to the list must
  * still be able to validate the fingerprinted bytes deterministically.
  */
+/** Every entry in a reviewed release directory must be one of the four
+ *  reviewed artifacts, as a regular file: an extra file (a raw recovery
+ *  draft, say) would live under the approved version directory without ever
+ *  passing the privacy or approval boundary. Diagnostics carry counts, not
+ *  names — an unexpected filename is itself unreviewed content. */
+function checkReleaseEntries(releaseDir: string): void {
+    let entries: string[];
+    try {
+        entries = readdirSync(releaseDir);
+    } catch {
+        throw new ContractError(["release: unreadable"]);
+    }
+    const expected = new Set<string>(Object.values(RELEASE_FILES));
+    const unexpected = entries.filter((entry) => !expected.has(entry)).length;
+    if (unexpected > 0) {
+        throw new ContractError([`release: unexpected entries (${unexpected})`]);
+    }
+    const irregular = entries.filter(
+        (entry) => !lstatSync(join(releaseDir, entry)).isFile(),
+    ).length;
+    if (irregular > 0) {
+        throw new ContractError([`release: non-regular entries (${irregular})`]);
+    }
+}
+
 export function loadReviewedRelease(
     releaseDir: string,
     options: {
@@ -149,6 +174,7 @@ export function loadReviewedRelease(
         expectedManifestFingerprint?: string;
     } = {},
 ): ReviewedRelease {
+    checkReleaseEntries(releaseDir);
     const corpusRaw = readJson(releaseDir, RELEASE_FILES.corpus);
     const judgmentsRaw = readJson(releaseDir, RELEASE_FILES.judgments);
     const syntheticRaw = readJson(releaseDir, RELEASE_FILES.syntheticProfiles);

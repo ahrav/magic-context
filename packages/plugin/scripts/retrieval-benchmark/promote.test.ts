@@ -168,13 +168,29 @@ describe("promoteRelease", () => {
         expect(() =>
             loadReviewedRelease(releaseDir, { expectedManifestFingerprint: trusted }),
         ).not.toThrow();
-        // A directory with edited or fabricated approvals stays internally
-        // consistent; only the external expectation catches it.
+        // Forge an approval and re-bind the tuple fingerprint so the
+        // directory stays internally consistent: only the external
+        // expectation can catch it.
+        const manifestPath = join(releaseDir, "manifest.json");
+        const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+        manifest.approvals.privacy.approver = "op-forged";
+        writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+        expect(() => loadReviewedRelease(releaseDir)).not.toThrow();
+        expect(() =>
+            loadReviewedRelease(releaseDir, { expectedManifestFingerprint: trusted }),
+        ).toThrow(/fingerprint-untrusted/);
         expect(() =>
             loadReviewedRelease(releaseDir, {
                 expectedManifestFingerprint: "0".repeat(64),
             }),
         ).toThrow(/fingerprint-untrusted/);
+    });
+
+    it("rejects unreviewed files inside a release directory", () => {
+        const root = releasesRoot();
+        const { releaseDir } = promoteRelease(promotableInput(root));
+        writeFileSync(join(releaseDir, "draft.json"), "{}");
+        expect(() => loadReviewedRelease(releaseDir)).toThrow(/unexpected entries \(1\)/);
     });
 
     it("preserves the prior release byte-identically on failure and interruption", () => {

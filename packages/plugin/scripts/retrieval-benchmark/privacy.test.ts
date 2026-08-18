@@ -26,6 +26,8 @@ describe("scanForSensitiveContent", () => {
             [{ q: "open /Client Work/repo/main.ts" }, "source-path"],
             [{ q: "docs in /\u7528\u6237/\u5ba2\u6237/repo/main.ts" }, "source-path"],
             [{ q: "mounted //customer-server/private-share/repo/x.ts" }, "source-path"],
+            [{ q: "open file:///Client Work/repo/main.ts" }, "source-path"],
+            [{ q: "uri file:///opt/customer-x/repo/main.ts" }, "source-path"],
             [{ q: "endpoint http://192.168.1.10:8080/api" }, "shareability"],
             [{ q: "control\u0000char" }, "control-character"],
             [

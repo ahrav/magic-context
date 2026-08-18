@@ -135,13 +135,31 @@ describe("parseCorpus", () => {
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
             "corpus.queries[0].sourceFilters: automatic-mismatch",
         );
-        // The exact production set (any order) is accepted.
+        // The exact production set (any order) plus the unbounded cutoff
+        // production automatic search uses is accepted.
         query.sourceFilters = ["git_commit", "memory", "message"];
+        (query.visibleState as Record<string, unknown>).messageOrdinalCutoff = null;
         expect(() => parseCorpus(corpus)).not.toThrow();
         // The automatic path also fixes its result limit at 10.
         query.resultLimit = 20;
         expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
             "corpus.queries[0].resultLimit: automatic-mismatch",
+        );
+        query.resultLimit = 10;
+        // A bounded cutoff on an automatic scenario would drop competing
+        // results production automatic search returns.
+        (query.visibleState as Record<string, unknown>).messageOrdinalCutoff = 1;
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus.queries[0].visibleState.messageOrdinalCutoff: automatic-mismatch",
+        );
+    });
+
+    it("rejects an unbounded cutoff on an explicit scenario", () => {
+        const corpus = corpusJson();
+        const query = (corpus.queries as Record<string, unknown>[])[0];
+        (query.visibleState as Record<string, unknown>).messageOrdinalCutoff = null;
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus.queries[0].visibleState.messageOrdinalCutoff: explicit-unbounded",
         );
     });
 
@@ -455,6 +473,27 @@ describe("validateRelease", () => {
         });
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "judgments: positive target pooled in opposite partition (d-error-message-hold)",
+        );
+    });
+
+    it("rejects a positive alias shadowed by another document's session alias", () => {
+        const { corpus, judgments } = makeValidRelease();
+        const query = corpus.queries.find((q) => q.id === "q-exact-symbol-path-dev");
+        const target = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
+        const other = corpus.documents.find((d) => d.id === "d-error-message-dev");
+        if (!query || !target || !other) throw new Error("fixture entries missing");
+        // The scenario runs in a session; another document claims the same
+        // (namespace, locator, project) under that session, so resolution
+        // always prefers it and the positive target can never earn credit.
+        query.fixtureScope.sessionScope = "ses-fixture-1";
+        other.aliases.push({
+            namespace: target.aliases[0].namespace,
+            locator: target.aliases[0].locator,
+            projectScope: target.aliases[0].projectScope,
+            sessionScope: "ses-fixture-1",
+        });
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no alias in scenario scope (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
     });
 

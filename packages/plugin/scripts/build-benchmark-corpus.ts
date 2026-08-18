@@ -344,12 +344,13 @@ const ALIAS_NAMESPACE: Record<DocumentKind, string> = SOURCE_LOCATOR_KIND;
 
 const REFERENCE_TIME_MS = 1_755_400_000_000;
 
-/** Scenario message-history visibility: `searchMessages` and
- *  `searchCompartmentChunks` treat the cutoff as an inclusive maximum ordinal
- *  (0 excludes everything — ordinals are 1-based). Authored scenarios model a
- *  session whose seeded fixture history is fully compacted, so the cutoff
- *  sits far above any ordinal a harness seeds; message and compartment
- *  targets stay structurally retrievable. */
+/** Scenario message-history visibility for EXPLICIT scenarios:
+ *  `searchMessages` and `searchCompartmentChunks` treat the cutoff as an
+ *  inclusive maximum ordinal (0 excludes everything — ordinals are 1-based).
+ *  Authored scenarios model a session whose seeded fixture history is fully
+ *  compacted, so the cutoff sits far above any ordinal a harness seeds.
+ *  Automatic scenarios carry null: the production automatic path searches
+ *  all indexed history with no cutoff. */
 const MESSAGE_ORDINAL_CUTOFF = 100_000;
 
 function makeScenario(
@@ -370,7 +371,10 @@ function makeScenario(
         sourceFilters:
             entry.mode === "automatic" ? [...AUTO_SEARCH_SOURCES] : entry.sourceFilters,
         fixtureScope: { projectScope: FIXTURE_PROJECT_SCOPE, sessionScope: null },
-        visibleState: { visibleMemoryIds: [], messageOrdinalCutoff: MESSAGE_ORDINAL_CUTOFF },
+        visibleState: {
+            visibleMemoryIds: [],
+            messageOrdinalCutoff: entry.mode === "automatic" ? null : MESSAGE_ORDINAL_CUTOFF,
+        },
         referenceTimeMs: REFERENCE_TIME_MS,
         partition: entry.partition,
         paraphraseGroup: `pg-${entry.slug}`,
@@ -505,13 +509,13 @@ export const OPERATOR_APPROVALS = [
         kind: "privacy",
         approver: "operator-privacy-review",
         releaseTupleFingerprint:
-            "c797b7db8a14adf4e57c3c2eb89aa92d25b1a5cf1fdc85d433b4db966b919a61",
+            "f741478715e7c32184bc1b1cf067d460c70ce2078109f5042ba7e2d2c338f06d",
     },
     {
         kind: "relevance-intent",
         approver: "operator-relevance-review",
         releaseTupleFingerprint:
-            "c797b7db8a14adf4e57c3c2eb89aa92d25b1a5cf1fdc85d433b4db966b919a61",
+            "f741478715e7c32184bc1b1cf067d460c70ce2078109f5042ba7e2d2c338f06d",
     },
 ] as const;
 

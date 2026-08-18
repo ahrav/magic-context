@@ -31,7 +31,11 @@ import {
 } from "./contract";
 import { hasGitAncestor } from "./fs-boundary";
 import { loadReviewedRelease, RELEASE_FILES } from "./index";
-import { PRIVACY_POLICY_VERSION, SANITIZER_VERSION } from "./privacy";
+import {
+    PRIVACY_POLICY_VERSION,
+    SANITIZER_VERSION,
+    scanForSensitiveContent,
+} from "./privacy";
 
 const approvalFileSchema = z.strictObject({
     kind: z.enum(["privacy", "relevance-intent"]),
@@ -138,6 +142,27 @@ export function buildManifest(
  * passed every gate is staged next to the destination for the atomic rename.
  */
 export function promoteRelease(input: PromotionInput): { releaseDir: string } {
+    // The privacy gate runs before any parser or validator: schema and
+    // release diagnostics interpolate regex-bounded artifact ids, so an
+    // identifying id in an invalid draft would otherwise reach exception
+    // messages (and CI or terminal logs) before the deny lists ever ran.
+    const violations = scanForSensitiveContent(
+        {
+            corpus: input.corpus,
+            judgments: input.judgments,
+            syntheticProfiles: input.syntheticProfiles,
+            approvals: input.approvals,
+        },
+        {
+            forbiddenTokens: input.forbiddenTokens,
+            forbiddenIdentifiers: input.forbiddenIdentifiers,
+        },
+    );
+    if (violations.length > 0) {
+        throw new ContractError(
+            violations.map((v) => `privacy.${v.category}: ${v.path}`).sort(),
+        );
+    }
     const corpus = parseCorpus(input.corpus);
     const judgments = parseJudgments(input.judgments);
     parseSyntheticProfiles(input.syntheticProfiles);

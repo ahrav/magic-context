@@ -63,7 +63,7 @@
       },
       "visibleState": {
         "visibleMemoryIds": [],
-        "messageOrdinalCutoff": 100000
+        "messageOrdinalCutoff": null
       },
       "referenceTimeMs": 1755400000000,
       "partition": "development",
@@ -204,7 +204,7 @@
       },
       "visibleState": {
         "visibleMemoryIds": [],
-        "messageOrdinalCutoff": 100000
+        "messageOrdinalCutoff": null
       },
       "referenceTimeMs": 1755400000000,
       "partition": "development",
@@ -274,7 +274,7 @@
       },
       "visibleState": {
         "visibleMemoryIds": [],
-        "messageOrdinalCutoff": 100000
+        "messageOrdinalCutoff": null
       },
       "referenceTimeMs": 1755400000000,
       "partition": "holdout",
@@ -346,7 +346,7 @@
       },
       "visibleState": {
         "visibleMemoryIds": [],
-        "messageOrdinalCutoff": 100000
+        "messageOrdinalCutoff": null
       },
       "referenceTimeMs": 1755400000000,
       "partition": "development",
@@ -418,7 +418,7 @@
       },
       "visibleState": {
         "visibleMemoryIds": [],
-        "messageOrdinalCutoff": 100000
+        "messageOrdinalCutoff": null
       },
       "referenceTimeMs": 1755400000000,
       "partition": "holdout",

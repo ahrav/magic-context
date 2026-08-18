@@ -85,7 +85,11 @@ const querySchema = z.strictObject({
     fixtureScope: scopeSchema,
     visibleState: z.strictObject({
         visibleMemoryIds: z.array(z.number().int().nonnegative()),
-        messageOrdinalCutoff: z.number().int().nonnegative(),
+        /** Inclusive maximum message ordinal, or null for no cutoff. The
+         *  production automatic path searches ALL indexed history (null);
+         *  the explicit path always computes a compartment-boundary cutoff
+         *  (non-null). parseCorpus enforces the mode pairing. */
+        messageOrdinalCutoff: z.number().int().nonnegative().nullable(),
     }),
     referenceTimeMs: z.number().int().nonnegative(),
     partition: z.enum(["development", "holdout"]),
@@ -288,6 +292,20 @@ export function parseCorpus(value: unknown): CorpusArtifact {
             if (query.resultLimit !== AUTO_SEARCH_RESULT_LIMIT) {
                 diagnostics.push(`corpus.queries[${i}].resultLimit: automatic-mismatch`);
             }
+            // Production automatic search applies NO message cutoff; a
+            // bounded replay would drop competing results above it.
+            if (query.visibleState.messageOrdinalCutoff !== null) {
+                diagnostics.push(
+                    `corpus.queries[${i}].visibleState.messageOrdinalCutoff: automatic-mismatch`,
+                );
+            }
+        }
+        // The explicit path always computes a compartment-boundary cutoff;
+        // an unbounded explicit scenario cannot occur in production.
+        if (query.mode === "explicit" && query.visibleState.messageOrdinalCutoff === null) {
+            diagnostics.push(
+                `corpus.queries[${i}].visibleState.messageOrdinalCutoff: explicit-unbounded`,
+            );
         }
     }
     const documentIds = new Set<string>();
@@ -523,6 +541,19 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
     // project or session can never resolve).
     const automaticSources: ReadonlySet<string> = new Set(AUTO_SEARCH_SOURCES);
     const documentById = new Map(corpus.documents.map((d) => [d.id, d]));
+    // Resolution prefers a session-scoped alias over the project fallback:
+    // a project-scoped alias whose (namespace, locator, project) is claimed
+    // by ANOTHER document for the scenario's session can never resolve to
+    // this document under that scenario.
+    const aliasOwner = new Map<string, string>();
+    for (const doc of corpus.documents) {
+        for (const alias of doc.aliases) {
+            aliasOwner.set(
+                JSON.stringify([alias.namespace, alias.locator, alias.projectScope, alias.sessionScope]),
+                doc.id,
+            );
+        }
+    }
     for (const [queryId, byDoc] of judged) {
         const query = queryById.get(queryId);
         if (!query) continue;
@@ -557,11 +588,26 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                 }
             }
             const scope = query.fixtureScope;
-            const reachableAliases = document.aliases.filter(
-                (alias) =>
-                    alias.projectScope === scope.projectScope &&
-                    (alias.sessionScope === null || alias.sessionScope === scope.sessionScope),
-            );
+            const reachableAliases = document.aliases.filter((alias) => {
+                if (alias.projectScope !== scope.projectScope) return false;
+                if (alias.sessionScope !== null) {
+                    return alias.sessionScope === scope.sessionScope;
+                }
+                // Project fallback: unreachable when a session-scoped alias
+                // of a DIFFERENT document shadows the same key.
+                if (scope.sessionScope !== null) {
+                    const shadowOwner = aliasOwner.get(
+                        JSON.stringify([
+                            alias.namespace,
+                            alias.locator,
+                            alias.projectScope,
+                            scope.sessionScope,
+                        ]),
+                    );
+                    if (shadowOwner !== undefined && shadowOwner !== documentId) return false;
+                }
+                return true;
+            });
             if (reachableAliases.length === 0) {
                 diagnostics.push(
                     `corpus: target has no alias in scenario scope (${queryId}, ${documentId})`,
