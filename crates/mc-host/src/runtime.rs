@@ -434,14 +434,21 @@ fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
             // joining loop is aborted.
             let probe = shared.spawn_lifecycle(async move {
                 let callback = crate::panic_boundary::redact_sync(|| handler.health());
-                match timeout(deadline, crate::panic_boundary::redact(callback)).await {
-                    Ok(report) => Some(report),
-                    Err(_) => {
-                        watchdog.fatal.trip(
-                            &watchdog.shutdown,
-                            "health callback deadline expired".to_owned(),
-                        );
-                        None
+                tokio::select! {
+                    biased;
+                    // The probe is informational (protocol §9.3): shutdown
+                    // cancels it without ceremony, and that cancellation is
+                    // not a lifecycle failure — an abort-exempt probe that
+                    // ignored shutdown would hold the tracker past the whole
+                    // shutdown budget.
+                    () = watchdog.shutdown.cancelled() => {}
+                    result = timeout(deadline, crate::panic_boundary::redact(callback)) => {
+                        if result.is_err() {
+                            watchdog.fatal.trip(
+                                &watchdog.shutdown,
+                                "health callback deadline expired".to_owned(),
+                            );
+                        }
                     }
                 }
             });

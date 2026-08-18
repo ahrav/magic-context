@@ -82,25 +82,52 @@ fn escaped_json_len(s: &str) -> usize {
         .sum()
 }
 
-fn bounded_error_body(code: &str, message: &str) -> Vec<u8> {
-    // Encoded-size gate before serialization: handler-controlled code and
-    // message are otherwise materialized twice (JSON `Value`, then `Vec`)
-    // before any limit applies, and escaping can multiply control-heavy
-    // input several-fold, so the gate must measure the escaped form.
+/// Builds an error terminal body under a pre-acquired egress reservation.
+/// The encoded size is computed exactly from the escaped field lengths, so
+/// the charge exists BEFORE the body materializes — concurrent handler
+/// errors wait on the budget as bytes, not as retained encoded buffers.
+/// `Err` means the generation can no longer emit.
+async fn charged_error_body(
+    budget: &crate::wire::ByteBudget,
+    gen: &GenerationCore,
+    code: &str,
+    message: &str,
+) -> Result<OutputBuffer, ()> {
     const ERROR_ENVELOPE_OVERHEAD: usize = r#"{"code":"","message":""}"#.len();
-    if escaped_json_len(code)
-        .saturating_add(escaped_json_len(message))
-        .saturating_add(ERROR_ENVELOPE_OVERHEAD)
-        > crate::wire::MAX_BODY_LEN as usize
-    {
-        return error_body_json(CODE_INTERNAL_ERROR, "handler error exceeds frame limit");
-    }
-    let body = error_body_json(code, message);
-    if body.len() <= crate::wire::MAX_BODY_LEN as usize {
-        body
+    let encoded_len = |code: &str, message: &str| {
+        escaped_json_len(code)
+            .saturating_add(escaped_json_len(message))
+            .saturating_add(ERROR_ENVELOPE_OVERHEAD)
+    };
+    let (code, message) = if encoded_len(code, message) > crate::wire::MAX_BODY_LEN as usize {
+        (CODE_INTERNAL_ERROR, "handler error exceeds frame limit")
     } else {
-        error_body_json(CODE_INTERNAL_ERROR, "handler error exceeds frame limit")
+        (code, message)
+    };
+    let body_len = encoded_len(code, message);
+    if gen.writer.is_retired() || gen.token.is_cancelled() {
+        return Err(());
     }
+    let frame_bytes = u32::try_from(body_len + subc_protocol::HEADER_LEN).map_err(|_| ())?;
+    let deadline = gen.writer.admission_deadline();
+    let charge = tokio::select! {
+        biased;
+        () = gen.token.cancelled() => return Err(()),
+        charge = tokio::time::timeout_at(deadline, budget.charge(frame_bytes)) => match charge {
+            Ok(charge) => charge,
+            Err(_) => {
+                gen.token.cancel();
+                return Err(());
+            }
+        },
+    };
+    let body = error_body_json(code, message);
+    debug_assert_eq!(body.len(), body_len, "escaped length model diverged");
+    Ok(OutputBuffer {
+        body,
+        charge,
+        max_len: body_len,
+    })
 }
 
 /// Queues one frame on a generation's writer. Body-bearing frames charge their
@@ -197,17 +224,13 @@ pub async fn emit_error_terminal(
     code: &str,
     message: &str,
 ) {
-    let body = bounded_error_body(code, message);
-    if emit_frame(
-        budget,
-        gen,
-        FrameType::Error,
-        response_flags(false, true),
-        id,
-        body,
-    )
-    .await
-    .is_err()
+    let Ok(body) = charged_error_body(budget, gen, code, message).await else {
+        gen.token.cancel();
+        return;
+    };
+    if emit_reserved_frame(gen, FrameType::Error, response_flags(false, true), id, body)
+        .await
+        .is_err()
     {
         gen.token.cancel();
     }
@@ -244,11 +267,25 @@ pub async fn settle(
             }
             return true;
         }
-        Terminal::Error { code, message } => (
-            FrameType::Error,
-            response_flags(false, true),
-            bounded_error_body(&code, &message),
-        ),
+        Terminal::Error { code, message } => {
+            let Ok(body) = charged_error_body(budget, gen, &code, &message).await else {
+                gen.token.cancel();
+                return true;
+            };
+            if emit_reserved_frame(
+                gen,
+                FrameType::Error,
+                response_flags(false, true),
+                FrameId::routed(route, corr),
+                body,
+            )
+            .await
+            .is_err()
+            {
+                gen.token.cancel();
+            }
+            return true;
+        }
         Terminal::StreamEnd => (
             FrameType::StreamEnd,
             response_flags(false, true),

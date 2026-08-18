@@ -39,7 +39,7 @@ pub struct RouteHandle {
 
 /// Caller-supplied route scope. Every field is an unverified claim: it scopes
 /// handler state and never grants authority (protocol §2, §7.1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RouteIdentity {
     pub project_root: PathBuf,
     pub harness: String,
@@ -48,6 +48,25 @@ pub struct RouteIdentity {
     pub consumer_launch_nonce: Option<String>,
     pub consumer_capabilities: Vec<String>,
     pub admission_facts: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for RouteIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Identity claims are sensitive diagnostics (protocol V24): report
+        // bounded structural metadata only, never the values.
+        f.debug_struct("RouteIdentity")
+            .field("project_root_len", &self.project_root.as_os_str().len())
+            .field("harness_len", &self.harness.len())
+            .field("session_len", &self.session.len())
+            .field("consumer_module_id", &self.consumer_module_id.is_some())
+            .field(
+                "consumer_launch_nonce",
+                &self.consumer_launch_nonce.is_some(),
+            )
+            .field("consumer_capabilities", &self.consumer_capabilities.len())
+            .field("admission_facts", &self.admission_facts.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +119,6 @@ impl HealthReport {
 ///     binary: false,
 /// };
 /// ```
-#[derive(Debug)]
 pub enum RequestOutcome {
     /// Unary success; the host emits one `Response` terminal whose wire
     /// `binary` flag mirrors `binary`, exactly like [`RequestCtx::stream`]
@@ -111,6 +129,27 @@ pub enum RequestOutcome {
     /// Stream items were emitted through [`RequestCtx::stream`]; the host
     /// emits the `StreamEnd` terminal.
     Streamed,
+}
+
+impl std::fmt::Debug for RequestOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Error code and message are handler-controlled and can carry
+        // request or identity data; diagnostics get lengths only (protocol
+        // V24), matching OutputBuffer and RequestCtx.
+        match self {
+            Self::Response { body, binary } => f
+                .debug_struct("Response")
+                .field("body", body)
+                .field("binary", binary)
+                .finish(),
+            Self::Error { code, message } => f
+                .debug_struct("Error")
+                .field("code_len", &code.len())
+                .field("message_len", &message.len())
+                .finish(),
+            Self::Streamed => f.write_str("Streamed"),
+        }
+    }
 }
 
 /// Host-reserved output storage.
