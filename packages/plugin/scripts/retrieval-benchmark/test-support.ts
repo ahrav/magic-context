@@ -14,6 +14,7 @@ import {
     QUERY_CATEGORIES,
     type QueryScenario,
     RUBRIC_VERSION,
+    SYNTHETIC_SCALES,
     SYNTHETIC_SCHEMA_VERSION,
     type SyntheticProfilesArtifact,
 } from "./contract";
@@ -85,7 +86,11 @@ export function makeValidCorpus(): CorpusArtifact {
     QUERY_CATEGORIES.forEach((category, c) => {
         for (const partition of ["development", "holdout"] as const) {
             const slug = `${category}-${partition === "development" ? "dev" : "hold"}`;
-            queries.push(makeQuery(slug, category, partition, `how does ${category} work`));
+            // Partition-distinct text: reusing one normalized query text
+            // across partitions is itself a contract violation.
+            queries.push(
+                makeQuery(slug, category, partition, `how does ${category} work in ${partition}`),
+            );
             documents.push(
                 makeDocument(
                     slug,
@@ -116,20 +121,27 @@ export function makeValidJudgments(corpus: CorpusArtifact): JudgmentsArtifact {
     };
 }
 
+const SCALE_LABELS: Record<number, string> = {
+    1_000: "1k",
+    10_000: "10k",
+    100_000: "100k",
+    1_000_000: "1m",
+};
+
 export function makeValidSyntheticProfiles(): SyntheticProfilesArtifact {
     return {
         schemaVersion: SYNTHETIC_SCHEMA_VERSION,
-        profiles: [
-            {
-                id: "syn-smoke-1k",
-                generatorVersion: SYNTHETIC_GENERATOR_VERSION,
-                prng: "splitmix32",
-                seed: 1337,
-                scale: 1_000,
-                sourceDistribution: { memory: 3, message: 5, compartment: 2 },
-                textSize: { minWords: 8, maxWords: 64 },
-            },
-        ],
+        // Every scale exactly once — parseSyntheticProfiles enforces full
+        // scale coverage so U5 always has a descriptor per required run.
+        profiles: SYNTHETIC_SCALES.map((scale) => ({
+            id: `syn-smoke-${SCALE_LABELS[scale]}`,
+            generatorVersion: SYNTHETIC_GENERATOR_VERSION,
+            prng: "splitmix32",
+            seed: 1337,
+            scale,
+            sourceDistribution: { memory: 3, message: 5, compartment: 2 },
+            textSize: { minWords: 8, maxWords: 64 },
+        })),
     };
 }
 

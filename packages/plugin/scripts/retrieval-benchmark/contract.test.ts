@@ -7,6 +7,7 @@ import {
     parseCorpus,
     parseJudgments,
     parseManifest,
+    parseSyntheticProfiles,
     validateRelease,
 } from "./contract";
 import { buildJudgmentLookup } from "./index";
@@ -85,6 +86,28 @@ describe("parseCorpus", () => {
                 "not-executable",
             );
         }
+    });
+
+    it("rejects a query text reused across partitions", () => {
+        const corpus = corpusJson();
+        const queries = corpus.queries as Record<string, unknown>[];
+        const dev = queries.find((q) => q.id === "q-error-message-dev");
+        const hold = queries.find((q) => q.id === "q-error-message-hold");
+        if (!dev || !hold) throw new Error("fixture queries missing");
+        // Different paraphrase groups, same normalized text: the holdout
+        // intent is already exposed to development tuning.
+        hold.queryText = `  ${String(dev.queryText).toUpperCase()} `;
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus: query text reused across partitions (q-error-message-dev, q-error-message-hold)",
+        );
+    });
+
+    it("rejects a result limit above the production ceiling", () => {
+        const corpus = corpusJson();
+        (corpus.queries as Record<string, unknown>[])[0].resultLimit = 51;
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus.queries.0.resultLimit: too_big",
+        );
     });
 
     it("rejects duplicate ids", () => {
@@ -330,6 +353,28 @@ describe("validateRelease", () => {
         const diagnostics = diagnosticsOf(() => validateRelease(corpus, judgments));
         expect(diagnostics).toContain(
             "corpus: no holdout base intent for paraphrased-decision",
+        );
+    });
+});
+
+describe("parseSyntheticProfiles", () => {
+    it("requires every synthetic scale exactly once", () => {
+        const { syntheticProfiles } = makeValidRelease();
+        const missing = JSON.parse(JSON.stringify(syntheticProfiles));
+        missing.profiles = missing.profiles.filter(
+            (p: { scale: number }) => p.scale !== 1_000_000,
+        );
+        expect(diagnosticsOf(() => parseSyntheticProfiles(missing))).toContain(
+            "syntheticProfiles.profiles: missing scale 1000000",
+        );
+
+        const duplicated = JSON.parse(JSON.stringify(syntheticProfiles));
+        duplicated.profiles.push({
+            ...duplicated.profiles[0],
+            id: "syn-smoke-1000-twin",
+        });
+        expect(diagnosticsOf(() => parseSyntheticProfiles(duplicated))).toContain(
+            "syntheticProfiles.profiles: duplicate scale 1000",
         );
     });
 });

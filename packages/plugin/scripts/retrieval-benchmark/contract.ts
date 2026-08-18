@@ -8,9 +8,11 @@
 
 import { z } from "zod";
 import {
+    MAX_SEARCH_RESULT_LIMIT,
     prepareAutomaticQuery,
     prepareExplicitQuery,
 } from "../../src/features/magic-context/search-bounds";
+import { normalizeQueryText } from "../../src/features/magic-context/storage-embedding-measurements";
 import { AUTO_SEARCH_SOURCES } from "../../src/hooks/magic-context/auto-search-prompt";
 import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
 import { canonicalFingerprint } from "./canonical-json";
@@ -85,7 +87,10 @@ const querySchema = z.strictObject({
     partition: z.enum(["development", "holdout"]),
     /** Base-intent group: paraphrases of one intent share this value. */
     paraphraseGroup: z.string().min(1),
-    resultLimit: z.number().int().positive(),
+    /** Bounded by the production ceiling: unifiedSearch silently clamps to
+     *  MAX_SEARCH_RESULT_LIMIT, so a larger declared limit would execute
+     *  fewer results than the approved scenario states. */
+    resultLimit: z.number().int().positive().max(MAX_SEARCH_RESULT_LIMIT),
     provenance: z.strictObject({
         origin: z.enum(["recovered", "curated"]),
     }),
@@ -223,9 +228,26 @@ export function parseCorpus(value: unknown): CorpusArtifact {
     const corpus = parseArtifact(corpusSchema, "corpus", value);
     const diagnostics: string[] = [];
     const queryIds = new Set<string>();
+    const partitionByNormalizedText = new Map<string, { partition: string; queryId: string }>();
     for (const [i, query] of corpus.queries.entries()) {
         if (queryIds.has(query.id)) diagnostics.push(`corpus.queries[${i}].id: duplicate`);
         queryIds.add(query.id);
+        // The same query text in both partitions exposes the holdout intent
+        // to development tuning even when the paraphrase groups differ.
+        const normalized = normalizeQueryText(query.queryText);
+        const existing = partitionByNormalizedText.get(normalized);
+        if (existing && existing.partition !== query.partition) {
+            diagnostics.push(
+                `corpus: query text reused across partitions (${[existing.queryId, query.id]
+                    .sort()
+                    .join(", ")})`,
+            );
+        } else if (!existing) {
+            partitionByNormalizedText.set(normalized, {
+                partition: query.partition,
+                queryId: query.id,
+            });
+        }
         // A query production search cannot execute as written is a structural
         // defect, not a ranking signal: explicit mode rejects out-of-bounds
         // queries (QueryBoundsError) and trims whitespace-only ones to no
@@ -270,7 +292,22 @@ export function parseJudgments(value: unknown): JudgmentsArtifact {
 }
 
 export function parseSyntheticProfiles(value: unknown): SyntheticProfilesArtifact {
-    return parseArtifact(syntheticProfilesSchema, "syntheticProfiles", value);
+    const artifact = parseArtifact(syntheticProfilesSchema, "syntheticProfiles", value);
+    // Every scale exactly once: a release missing a scale leaves U5 without
+    // a descriptor for a required run, and a duplicate makes the run set
+    // ambiguous — both despite the release otherwise loading successfully.
+    const diagnostics: string[] = [];
+    const seen = new Map<number, number>();
+    for (const profile of artifact.profiles) {
+        seen.set(profile.scale, (seen.get(profile.scale) ?? 0) + 1);
+    }
+    for (const scale of SYNTHETIC_SCALES) {
+        const count = seen.get(scale) ?? 0;
+        if (count === 0) diagnostics.push(`syntheticProfiles.profiles: missing scale ${scale}`);
+        if (count > 1) diagnostics.push(`syntheticProfiles.profiles: duplicate scale ${scale}`);
+    }
+    if (diagnostics.length > 0) throw new ContractError(diagnostics.sort());
+    return artifact;
 }
 
 export function parseManifest(value: unknown): ManifestArtifact {

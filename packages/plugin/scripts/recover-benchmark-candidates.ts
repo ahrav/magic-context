@@ -435,6 +435,11 @@ export async function runRecovery(args: {
         for (const db of [args.measurementDb, args.historyDb]) {
             db.exec("BEGIN");
             began.push(db);
+            // Deferred BEGIN takes its snapshot on the FIRST READ, not at
+            // BEGIN. Pin both snapshots now, so history written during the
+            // (potentially long) measurement page scan cannot make the
+            // history phase see a different database state than the rows.
+            db.prepare("SELECT COUNT(*) AS n FROM sqlite_master").get();
         }
         rows = [];
         let afterId = 0;
