@@ -139,7 +139,15 @@ function readJson(dir: string, name: string): unknown {
  */
 export function loadReviewedRelease(
     releaseDir: string,
-    options: { forbiddenTokens?: readonly string[] } = {},
+    options: {
+        forbiddenTokens?: readonly string[];
+        forbiddenIdentifiers?: readonly string[];
+        /** Trust anchor from OUTSIDE the release directory (reviewed source,
+         *  CI config): the recomputed manifest fingerprint must match, which
+         *  binds the approval records themselves — a release directory is
+         *  otherwise self-consistent under fabricated approvals. */
+        expectedManifestFingerprint?: string;
+    } = {},
 ): ReviewedRelease {
     const corpusRaw = readJson(releaseDir, RELEASE_FILES.corpus);
     const judgmentsRaw = readJson(releaseDir, RELEASE_FILES.judgments);
@@ -155,7 +163,10 @@ export function loadReviewedRelease(
             syntheticProfiles: syntheticRaw,
             manifest: manifestRaw,
         },
-        { forbiddenTokens: options.forbiddenTokens },
+        {
+            forbiddenTokens: options.forbiddenTokens,
+            forbiddenIdentifiers: options.forbiddenIdentifiers,
+        },
     );
     if (violations.length > 0) {
         throw new ContractError(
@@ -180,6 +191,16 @@ export function loadReviewedRelease(
     }
     if (fingerprints.syntheticProfiles !== tuple.syntheticProfilesFingerprint) {
         diagnostics.push("release.synthetic-profiles: fingerprint-mismatch");
+    }
+    // The tuple binds the three artifacts, and approvals bind to the tuple —
+    // but nothing inside the directory can authenticate the approvals
+    // themselves. When the caller supplies a trusted manifest fingerprint,
+    // the whole manifest (approval records included) must match it.
+    if (
+        options.expectedManifestFingerprint !== undefined &&
+        fingerprints.manifest !== options.expectedManifestFingerprint
+    ) {
+        diagnostics.push("release.manifest: fingerprint-untrusted");
     }
     if (tuple.privacyPolicyVersion !== PRIVACY_POLICY_VERSION) {
         diagnostics.push("release.manifest: stale-privacy-policy");

@@ -14,6 +14,7 @@
 import { dirname, resolve } from "node:path";
 
 import { SOURCE_LOCATOR_KIND } from "../src/features/magic-context/search-result-locator";
+import { AUTO_SEARCH_SOURCES } from "../src/hooks/magic-context/auto-search-prompt";
 import {
     type CorpusArtifact,
     CORPUS_SCHEMA_VERSION,
@@ -31,7 +32,7 @@ import {
     canonicalFingerprint,
     loadReviewedRelease,
 } from "./retrieval-benchmark/index";
-import { buildReleaseTuple, promoteRelease } from "./retrieval-benchmark/promote";
+import { buildManifest, buildReleaseTuple, promoteRelease } from "./retrieval-benchmark/promote";
 import { SYNTHETIC_GENERATOR_VERSION } from "./retrieval-benchmark/synthetic";
 
 export const FIXTURE_PROJECT_SCOPE = "git:benchmark-fixture-project";
@@ -362,7 +363,12 @@ function makeScenario(
         category: entry.category,
         mode: entry.mode,
         queryText,
-        sourceFilters: entry.sourceFilters,
+        // Automatic scenarios declare the exact production source set: the
+        // automatic path always searches AUTO_SEARCH_SOURCES, so a narrower
+        // authored filter would remove competing lanes and inflate the
+        // target's rank against the real baseline.
+        sourceFilters:
+            entry.mode === "automatic" ? [...AUTO_SEARCH_SOURCES] : entry.sourceFilters,
         fixtureScope: { projectScope: FIXTURE_PROJECT_SCOPE, sessionScope: null },
         visibleState: { visibleMemoryIds: [], messageOrdinalCutoff: MESSAGE_ORDINAL_CUTOFF },
         referenceTimeMs: REFERENCE_TIME_MS,
@@ -499,13 +505,13 @@ export const OPERATOR_APPROVALS = [
         kind: "privacy",
         approver: "operator-privacy-review",
         releaseTupleFingerprint:
-            "7205115e0d3a38b76a820580f72cc2d3f82badc257a5ba6115872514d2d16ab2",
+            "c797b7db8a14adf4e57c3c2eb89aa92d25b1a5cf1fdc85d433b4db966b919a61",
     },
     {
         kind: "relevance-intent",
         approver: "operator-relevance-review",
         releaseTupleFingerprint:
-            "7205115e0d3a38b76a820580f72cc2d3f82badc257a5ba6115872514d2d16ab2",
+            "c797b7db8a14adf4e57c3c2eb89aa92d25b1a5cf1fdc85d433b4db966b919a61",
     },
 ] as const;
 
@@ -536,7 +542,22 @@ function main(): void {
     if (command === "check") {
         const manifestPath = process.argv[3];
         if (!manifestPath) fail("usage: build-benchmark-corpus.ts check <manifest.json>");
-        const release = loadReviewedRelease(dirname(resolve(manifestPath)));
+        // Trust anchor: the manifest fingerprint recomputed from THIS
+        // reviewed source (authored artifacts + pinned approvals), not from
+        // the release directory. A release with edited or fabricated
+        // approval records is internally consistent, so only an external
+        // expectation can authenticate them.
+        const artifacts = buildCorpusArtifacts();
+        const expectedManifestFingerprint = canonicalFingerprint(
+            buildManifest({
+                ...artifacts,
+                approvals: OPERATOR_APPROVALS,
+                releaseVersion: RELEASE_VERSION,
+            }),
+        );
+        const release = loadReviewedRelease(dirname(resolve(manifestPath)), {
+            expectedManifestFingerprint,
+        });
         const categories = new Set(release.corpus.queries.map((q) => q.category));
         if (categories.size !== QUERY_CATEGORIES.length) {
             fail("check failed: missing category coverage");

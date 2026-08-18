@@ -50,6 +50,8 @@ export interface PromotionInput {
      *  privacy gate during both validating re-loads. Optional because the
      *  tokens are themselves sensitive and never ship with the release. */
     forbiddenTokens?: readonly string[];
+    /** Word-bounded operator deny list (usernames). */
+    forbiddenIdentifiers?: readonly string[];
     releasesRoot: string;
     releaseVersion: string;
 }
@@ -168,7 +170,10 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         for (const [name, content] of files) {
             writeFileSync(join(reviewDir, name), content, { flag: "wx" });
         }
-        loadReviewedRelease(reviewDir, { forbiddenTokens: input.forbiddenTokens });
+        loadReviewedRelease(reviewDir, {
+            forbiddenTokens: input.forbiddenTokens,
+            forbiddenIdentifiers: input.forbiddenIdentifiers,
+        });
     } catch (error) {
         rmSync(reviewDir, { recursive: true, force: true });
         throw error;
@@ -186,7 +191,10 @@ export function promoteRelease(input: PromotionInput): { releaseDir: string } {
         }
         // Re-load the exact directory being renamed into place, so tampering
         // with staged bytes between write and rename is still caught.
-        loadReviewedRelease(staging, { forbiddenTokens: input.forbiddenTokens });
+        loadReviewedRelease(staging, {
+            forbiddenTokens: input.forbiddenTokens,
+            forbiddenIdentifiers: input.forbiddenIdentifiers,
+        });
         renameSync(staging, destination);
     } catch (error) {
         rmSync(staging, { recursive: true, force: true });

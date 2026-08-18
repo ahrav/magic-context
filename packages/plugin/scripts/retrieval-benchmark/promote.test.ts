@@ -161,6 +161,22 @@ describe("promoteRelease", () => {
         expect(() => loadReviewedRelease(releaseDir)).not.toThrow();
     });
 
+    it("authenticates the whole manifest against an external trust anchor", () => {
+        const root = releasesRoot();
+        const { releaseDir } = promoteRelease(promotableInput(root));
+        const trusted = loadReviewedRelease(releaseDir).fingerprints.manifest;
+        expect(() =>
+            loadReviewedRelease(releaseDir, { expectedManifestFingerprint: trusted }),
+        ).not.toThrow();
+        // A directory with edited or fabricated approvals stays internally
+        // consistent; only the external expectation catches it.
+        expect(() =>
+            loadReviewedRelease(releaseDir, {
+                expectedManifestFingerprint: "0".repeat(64),
+            }),
+        ).toThrow(/fingerprint-untrusted/);
+    });
+
     it("preserves the prior release byte-identically on failure and interruption", () => {
         const root = releasesRoot();
         const { releaseDir } = promoteRelease(promotableInput(root));

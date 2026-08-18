@@ -110,6 +110,25 @@ describe("parseCorpus", () => {
         );
     });
 
+    it("requires automatic queries to declare the exact production source set", () => {
+        const corpus = corpusJson();
+        const query = (corpus.queries as Record<string, unknown>[])[0];
+        query.mode = "automatic";
+        // Narrower than AUTO_SEARCH_SOURCES: drops competing lanes.
+        query.sourceFilters = ["memory"];
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus.queries[0].sourceFilters: automatic-mismatch",
+        );
+        // null (all enabled sources) is broader than the automatic path.
+        query.sourceFilters = null;
+        expect(diagnosticsOf(() => parseCorpus(corpus))).toContain(
+            "corpus.queries[0].sourceFilters: automatic-mismatch",
+        );
+        // The exact production set (any order) is accepted.
+        query.sourceFilters = ["git_commit", "memory", "message"];
+        expect(() => parseCorpus(corpus)).not.toThrow();
+    });
+
     it("rejects duplicate ids", () => {
         const corpus = corpusJson();
         const queries = corpus.queries as Record<string, unknown>[];
@@ -340,6 +359,23 @@ describe("validateRelease", () => {
         query.visibleState.visibleMemoryIds = [Number(document.aliases[0].locator)];
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target hidden by visible memories (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+        );
+    });
+
+    it("rejects a positive target with no production-producible alias", () => {
+        const { corpus, judgments } = makeValidRelease();
+        const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
+        if (!document) throw new Error("fixture document missing");
+        // Memory results encode as memory:<numeric id>; a migration-only or
+        // non-numeric alias can never appear in production output.
+        document.aliases[0].locator = "not-a-memory-id";
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+        );
+        document.aliases[0].locator = "42";
+        document.aliases[0].namespace = "claim";
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
     });
 

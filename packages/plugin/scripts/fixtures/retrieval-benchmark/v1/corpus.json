@@ -52,7 +52,11 @@
       "category": "error-message",
       "mode": "automatic",
       "queryText": "SQLITE_BUSY thrown during shadow measurement write",
-      "sourceFilters": null,
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
       "fixtureScope": {
         "projectScope": "git:benchmark-fixture-project",
         "sessionScope": null
@@ -190,7 +194,9 @@
       "mode": "automatic",
       "queryText": "directive to use graded judgments instead of binary labels",
       "sourceFilters": [
-        "memory"
+        "memory",
+        "message",
+        "git_commit"
       ],
       "fixtureScope": {
         "projectScope": "git:benchmark-fixture-project",
@@ -257,7 +263,11 @@
       "category": "current-constraint",
       "mode": "automatic",
       "queryText": "per session row cap on the measurement corpus",
-      "sourceFilters": null,
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
       "fixtureScope": {
         "projectScope": "git:benchmark-fixture-project",
         "sessionScope": null
@@ -326,6 +336,8 @@
       "mode": "automatic",
       "queryText": "what changed in the search pipeline last sprint",
       "sourceFilters": [
+        "memory",
+        "message",
         "git_commit"
       ],
       "fixtureScope": {
@@ -395,7 +407,11 @@
       "category": "contradictory-memory",
       "mode": "automatic",
       "queryText": "is an unjudged pair scored as nonrelevant",
-      "sourceFilters": null,
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
       "fixtureScope": {
         "projectScope": "git:benchmark-fixture-project",
         "sessionScope": null

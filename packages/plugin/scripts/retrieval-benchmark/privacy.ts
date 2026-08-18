@@ -60,10 +60,15 @@ const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-]
 // is a rejecting gate, so over-matching costs a review, never a leak.
 const ABSOLUTE_PATH = /(?:(?:^|[\s"'`=:([])\/(?:[\w.@+-]+\/)+[\w.@+-]+|[A-Za-z]:[\\/][^\s\\/]+[\\/])/;
 
+interface ForbiddenMatchers {
+    tokens: readonly string[];
+    identifiers: readonly RegExp[];
+}
+
 function scanString(
     value: string,
     path: string,
-    forbiddenTokens: readonly string[],
+    forbidden: ForbiddenMatchers,
     violations: PrivacyViolation[],
     skipHashCheck = false,
 ): void {
@@ -85,26 +90,30 @@ function scanString(
         violations.push({ path, category: "source-path" });
     }
     const lower = value.toLowerCase();
-    for (const token of forbiddenTokens) {
-        if (token.length > 0 && lower.includes(token.toLowerCase())) {
-            violations.push({ path, category: "forbidden-token" });
-            break;
-        }
+    const tokenHit = forbidden.tokens.some(
+        (token) => token.length > 0 && lower.includes(token.toLowerCase()),
+    );
+    // Identifiers match as bounded words, not substrings: a username "dev"
+    // must not reject "development" or "device". A username that is itself
+    // an ordinary standalone word still rejects — the safe direction for a
+    // rejecting gate.
+    if (tokenHit || forbidden.identifiers.some((pattern) => pattern.test(value))) {
+        violations.push({ path, category: "forbidden-token" });
     }
 }
 
 function scanValue(
     value: unknown,
     path: string,
-    forbiddenTokens: readonly string[],
+    forbidden: ForbiddenMatchers,
     violations: PrivacyViolation[],
 ): void {
     if (typeof value === "string") {
-        scanString(value, path, forbiddenTokens, violations);
+        scanString(value, path, forbidden, violations);
         return;
     }
     if (Array.isArray(value)) {
-        value.forEach((item, i) => scanValue(item, `${path}[${i}]`, forbiddenTokens, violations));
+        value.forEach((item, i) => scanValue(item, `${path}[${i}]`, forbidden, violations));
         return;
     }
     if (value !== null && typeof value === "object") {
@@ -113,16 +122,20 @@ function scanValue(
             // (paths are an output channel), so its own violation and every
             // descendant path use a redacted segment instead of the literal.
             const keyProbe: PrivacyViolation[] = [];
-            scanString(key, `${path}.<redacted-key>`, forbiddenTokens, keyProbe);
+            scanString(key, `${path}.<redacted-key>`, forbidden, keyProbe);
             violations.push(...keyProbe);
             const segment = keyProbe.length > 0 ? "<redacted-key>" : key;
             if (typeof child === "string" && FINGERPRINT_FIELDS.has(key)) {
-                scanString(child, `${path}.${segment}`, forbiddenTokens, violations, true);
+                scanString(child, `${path}.${segment}`, forbidden, violations, true);
                 continue;
             }
-            scanValue(child, `${path}.${segment}`, forbiddenTokens, violations);
+            scanValue(child, `${path}.${segment}`, forbidden, violations);
         }
     }
+}
+
+function escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** Return detected path/category violations; empty means promotable under
@@ -130,9 +143,23 @@ function scanValue(
  *  review still gates promotion. */
 export function scanForSensitiveContent(
     artifact: unknown,
-    options: { forbiddenTokens?: readonly string[] } = {},
+    options: {
+        /** Substring deny list (project codenames, home-directory paths). */
+        forbiddenTokens?: readonly string[];
+        /** Word-bounded deny list (usernames): matches only as a standalone
+         *  identifier or path component, never inside a longer word. */
+        forbiddenIdentifiers?: readonly string[];
+    } = {},
 ): PrivacyViolation[] {
     const violations: PrivacyViolation[] = [];
-    scanValue(artifact, "$", options.forbiddenTokens ?? [], violations);
+    const identifiers = (options.forbiddenIdentifiers ?? [])
+        .filter((token) => token.length > 0)
+        .map((token) => new RegExp(`(?:^|[^A-Za-z0-9_])${escapeRegex(token)}(?:[^A-Za-z0-9_]|$)`, "i"));
+    scanValue(
+        artifact,
+        "$",
+        { tokens: options.forbiddenTokens ?? [], identifiers },
+        violations,
+    );
     return violations;
 }

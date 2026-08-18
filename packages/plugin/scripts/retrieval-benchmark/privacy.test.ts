@@ -73,6 +73,22 @@ describe("scanForSensitiveContent", () => {
         expect(violations.map((v) => v.category)).toContain("forbidden-token");
     });
 
+    it("matches forbidden identifiers as bounded words, not substrings", () => {
+        // Username "dev" must not reject ordinary words containing it.
+        for (const clean of ["development work", "the device driver", "devops handbook"]) {
+            expect(
+                scanForSensitiveContent({ q: clean }, { forbiddenIdentifiers: ["dev"] }),
+            ).toEqual([]);
+        }
+        for (const hit of ["logged in as dev", "dev@host session", "chown dev:staff x"]) {
+            expect(
+                scanForSensitiveContent({ q: hit }, { forbiddenIdentifiers: ["dev"] }).map(
+                    (v) => v.category,
+                ),
+            ).toContain("forbidden-token");
+        }
+    });
+
     it("scans object keys and nested arrays", () => {
         const violations = scanForSensitiveContent({
             list: [{ "ses_0123456789abcdef": "value" }],

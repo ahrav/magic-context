@@ -160,11 +160,14 @@ export function recoverCandidates(args: {
      *  candidates per session), so cross-session-only vs zero-match stays
      *  exact under bounded retention. */
     knownHashes?: ReadonlySet<string>;
-    /** Identifying tokens (author-host username and home path, operator deny
-     *  list) rejected wherever they appear in candidate text. The privacy
-     *  scan itself is host-independent, so author-host identity must be
-     *  supplied here — at authoring time — or it is never checked. */
+    /** Substring deny list (home paths, operator codenames) rejected
+     *  wherever it appears in candidate text. The privacy scan itself is
+     *  host-independent, so author-host identity must be supplied here — at
+     *  authoring time — or it is never checked. */
     forbiddenTokens?: readonly string[];
+    /** Word-bounded deny list (usernames): rejects standalone occurrences
+     *  only, so a short username does not reject every word containing it. */
+    forbiddenIdentifiers?: readonly string[];
     hashCandidate?: (text: string) => string;
 }): RecoveryOutcome {
     const hashCandidate = args.hashCandidate ?? normalizedQueryHash;
@@ -230,7 +233,10 @@ export function recoverCandidates(args: {
         if (
             scanForSensitiveContent(
                 { queryText: match.text },
-                { forbiddenTokens: args.forbiddenTokens },
+                {
+                    forbiddenTokens: args.forbiddenTokens,
+                    forbiddenIdentifiers: args.forbiddenIdentifiers,
+                },
             ).length > 0
         ) {
             record(row.ordinal, "privacy-rejected");
@@ -405,6 +411,7 @@ export async function runRecovery(args: {
     forbiddenRoots: readonly string[];
     /** Passed through to the privacy gate on every recovered candidate. */
     forbiddenTokens?: readonly string[];
+    forbiddenIdentifiers?: readonly string[];
     nowMs?: number;
 }): Promise<{ draftPath: string; reportPath: string; report: RecoveryReport }> {
     const nowMs = args.nowMs ?? Date.now();
@@ -492,6 +499,7 @@ export async function runRecovery(args: {
         candidatesBySession,
         knownHashes: allCandidateHashes,
         forbiddenTokens: args.forbiddenTokens,
+        forbiddenIdentifiers: args.forbiddenIdentifiers,
     });
     // Each run stages into its own mkdtemp subdirectory (0o700), created only
     // once there is something to write: re-running within the TTL never
@@ -529,16 +537,16 @@ async function main(): Promise<void> {
     const historyDb = new BunDatabase(historyPath, { readonly: true });
     try {
         // The privacy scan is host-independent by design; the author host's
-        // identity is checked here, at authoring time, as forbidden tokens.
-        const hostIdentityTokens = [userInfo().username, homedir()].filter(
-            (token) => token.length > 0,
-        );
+        // identity is checked here, at authoring time. The home path matches
+        // as a substring; the username matches as a bounded identifier so a
+        // short account name does not reject every word containing it.
         const { report, draftPath } = await runRecovery({
             measurementDb: measurementDb as unknown as Database,
             historyDb: historyDb as unknown as Database,
             stagingRoot: defaultStagingRoot(),
             forbiddenRoots: [dirname(measurementPath), dirname(historyPath), import.meta.dir],
-            forbiddenTokens: hostIdentityTokens,
+            forbiddenTokens: [homedir()].filter((token) => token.length > 0),
+            forbiddenIdentifiers: [userInfo().username].filter((token) => token.length > 0),
         });
         // Allowlisted output only: status codes and counts, never text/ids.
         process.stdout.write(`${JSON.stringify(report.counts)}\ndraft: ${draftPath}\n`);

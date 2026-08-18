@@ -12,6 +12,7 @@ import {
     prepareAutomaticQuery,
     prepareExplicitQuery,
 } from "../../src/features/magic-context/search-bounds";
+import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
 import { normalizeQueryText } from "../../src/features/magic-context/storage-embedding-measurements";
 import { AUTO_SEARCH_SOURCES } from "../../src/hooks/magic-context/auto-search-prompt";
 import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
@@ -262,6 +263,18 @@ export function parseCorpus(value: unknown): CorpusArtifact {
             const prepared = prepareAutomaticQuery(query.queryText);
             if (prepared.length === 0 || prepared !== query.queryText.trim()) {
                 diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
+            }
+            // The production automatic path always searches exactly
+            // AUTO_SEARCH_SOURCES; a narrower declared filter would drop
+            // competing lanes and inflate the target's rank, a broader or
+            // null one would not benchmark automatic behavior at all.
+            const declared = [...(query.sourceFilters ?? [])].sort();
+            const required = [...AUTO_SEARCH_SOURCES].sort();
+            if (
+                declared.length !== required.length ||
+                declared.some((filter, f) => filter !== required[f])
+            ) {
+                diagnostics.push(`corpus.queries[${i}].sourceFilters: automatic-mismatch`);
             }
         }
     }
@@ -524,6 +537,23 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     `corpus: target has no alias in scenario scope (${queryId}, ${documentId})`,
                 );
             } else {
+                // At least one scoped alias must be producible by the CURRENT
+                // search path: production encodes results as
+                // SOURCE_LOCATOR_KIND[kind]:<locator> (numeric ids for
+                // memories), so a target carrying only migration-dialect or
+                // wrong-shape aliases can never resolve. Migration aliases
+                // remain valid as ADDITIONAL spellings.
+                const producibleNamespace = SOURCE_LOCATOR_KIND[document.kind];
+                const producible = reachableAliases.filter(
+                    (alias) =>
+                        alias.namespace === producibleNamespace &&
+                        (document.kind !== "memory" || /^\d+$/.test(alias.locator)),
+                );
+                if (producible.length === 0) {
+                    diagnostics.push(
+                        `corpus: target has no production-producible alias (${queryId}, ${documentId})`,
+                    );
+                }
                 // Production memory search hard-filters every id in
                 // visibleMemoryIds; a memory target whose reachable aliases
                 // are all hidden is as unretrievable as a filtered source.
