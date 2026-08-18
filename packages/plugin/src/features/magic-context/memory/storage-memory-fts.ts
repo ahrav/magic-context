@@ -2,24 +2,27 @@ import type { Database, Statement as PreparedStatement } from "../../../shared/s
 import {
     buildWorkspaceMemorySqlFilter,
     getMemorySelectColumns,
-    isMemoryRow,
-    toMemory,
+    getMemoryStatsJoin,
+    getStatsDependentStatement,
+    memoryRowsFromQuery,
+    registerStatsDependentStatementCache,
 } from "./storage-memory";
 import type { Memory } from "./types";
 
 const DEFAULT_SEARCH_LIMIT = 10;
-const searchStatements = new WeakMap<Database, PreparedStatement>();
+// getMemorySelectColumns embeds the memory_stats projection, so these caches
+// register for invalidation when the stats-table probe first turns positive.
+const searchStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
 const unionSearchStatements = new Map<number, WeakMap<Database, PreparedStatement>>();
 
 function getSearchStatement(db: Database): PreparedStatement {
-    let stmt = searchStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path = ? AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`,
-        );
-        searchStatements.set(db, stmt);
-    }
-    return stmt;
+    return getStatsDependentStatement(db, searchStatements, () =>
+        db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid ${getMemoryStatsJoin(db)} WHERE memories.project_path = ? AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
+        ),
+    );
 }
 
 /**
@@ -33,18 +36,17 @@ function getSearchStatement(db: Database): PreparedStatement {
 function getUnionSearchStatement(db: Database, arity: number): PreparedStatement {
     let statements = unionSearchStatements.get(arity);
     if (!statements) {
-        statements = new WeakMap<Database, PreparedStatement>();
+        statements = registerStatsDependentStatementCache(
+            new WeakMap<Database, PreparedStatement>(),
+        );
         unionSearchStatements.set(arity, statements);
     }
-    let stmt = statements.get(db);
-    if (!stmt) {
+    return getStatsDependentStatement(db, statements, () => {
         const placeholders = Array.from({ length: arity }, () => "?").join(", ");
-        stmt = db.prepare(
-            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${placeholders}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`,
+        return db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid ${getMemoryStatsJoin(db)} WHERE memories.project_path IN (${placeholders}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
         );
-        statements.set(db, stmt);
-    }
-    return stmt;
+    });
 }
 
 function uniqueProjectPaths(projectPaths: readonly string[]): string[] {
@@ -74,11 +76,10 @@ export function searchMemoriesFTS(
         return [];
     }
 
-    const rows = getSearchStatement(db)
-        .all(projectPath, Date.now(), sanitized, limit)
-        .filter(isMemoryRow);
-
-    return rows.map(toMemory);
+    return memoryRowsFromQuery(
+        db,
+        getSearchStatement(db).all(projectPath, Date.now(), sanitized, limit),
+    );
 }
 
 export function searchMemoriesFTSUnion(
@@ -118,13 +119,15 @@ export function searchMemoriesFTSUnion(
     const rows = sharingFilter.active
         ? db
               .prepare(
-                  `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), memories.updated_at DESC, memories.id ASC LIMIT ?`,
+                  `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid ${getMemoryStatsJoin(db)} WHERE memories.project_path IN (${identities.map(() => "?").join(", ")}) AND memories.status IN ('active', 'permanent') AND (memories.expires_at IS NULL OR memories.expires_at > ?) AND memories_fts MATCH ?${sharingFilter.clause} ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
               )
               .all(...identities, Date.now(), sanitized, ...sharingFilter.params, limit)
-              .filter(isMemoryRow)
-        : getUnionSearchStatement(db, identities.length)
-              .all(...identities, Date.now(), sanitized, limit)
-              .filter(isMemoryRow);
+        : getUnionSearchStatement(db, identities.length).all(
+              ...identities,
+              Date.now(),
+              sanitized,
+              limit,
+          );
 
-    return rows.map(toMemory);
+    return memoryRowsFromQuery(db, rows);
 }

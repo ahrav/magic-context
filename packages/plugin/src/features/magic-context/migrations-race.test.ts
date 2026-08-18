@@ -15,6 +15,7 @@ import {
     MigrationLockBusyError,
     runMigrations,
     runMigrationsWithRetry,
+    validateNotesSearchProjection,
 } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
@@ -102,6 +103,19 @@ describe("migration race tolerance", () => {
                     )
                     .get(),
             ).toEqual({ count: 1 });
+            expect(
+                verify
+                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 79")
+                    .get(),
+            ).toEqual({ count: 1 });
+            expect(
+                verify
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='trigger' AND name LIKE 'notes_fts_%'",
+                    )
+                    .get(),
+            ).toEqual({ count: 3 });
+            expect(() => validateNotesSearchProjection(verify)).not.toThrow();
             closeQuietly(verify);
         } finally {
             rmSync(dir, { recursive: true, force: true });
@@ -371,7 +385,7 @@ describe("migration race tolerance", () => {
                 db.close();
             `;
             holder = Bun.spawn(["bun", "-e", holderScript], { stdout: "pipe", stderr: "inherit" });
-            await holder.stdout?.getReader().read();
+            await (holder.stdout as ReadableStream<Uint8Array>).getReader().read();
 
             const db = new Database(path);
             db.exec("PRAGMA busy_timeout=10");

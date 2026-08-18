@@ -13,6 +13,10 @@ import {
 } from "../../features/magic-context/context-authority";
 import { DEFAULT_PROTECTED_TAGS } from "../../features/magic-context/defaults";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    hasMemoryStatsTable,
+    MemoryStatsIntegrityError,
+} from "../../features/magic-context/memory/storage-memory";
 import { getMemoryVerifications } from "../../features/magic-context/memory/storage-memory-verifications";
 import { resolveMuralWire } from "../../features/magic-context/mural/render-trigger";
 import type { getOrCreateSessionMeta } from "../../features/magic-context/storage";
@@ -874,11 +878,43 @@ function authoritySeedRows(
     projectPath: string,
     domain: "memories" | "notes",
 ): Record<string, unknown>[] {
+    const memoriesSeedSql = hasMemoryStatsTable(db)
+        ? `SELECT m.*,
+                  s.seen_count AS __stats_seen_count,
+                  s.retrieval_count AS __stats_retrieval_count,
+                  s.last_seen_at AS __stats_last_seen_at,
+                  s.last_retrieved_at AS __stats_last_retrieved_at,
+                  MAX(m.updated_at, s.updated_at) AS __stats_effective_updated_at
+             FROM memories m LEFT JOIN memory_stats s ON s.memory_id = m.id
+            WHERE m.project_path = ? ORDER BY m.id ASC`
+        : "SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC";
     const snapshots =
         domain === "memories"
             ? db
-                  .prepare("SELECT * FROM memories WHERE project_path = ? ORDER BY id ASC")
+                  .prepare(memoriesSeedSql)
                   .all(projectPath)
+                  .map((raw) => {
+                      if (!isRecord(raw) || !("__stats_seen_count" in raw)) return raw;
+                      const {
+                          __stats_seen_count,
+                          __stats_retrieval_count,
+                          __stats_last_seen_at,
+                          __stats_last_retrieved_at,
+                          __stats_effective_updated_at,
+                          ...base
+                      } = raw as Record<string, unknown>;
+                      if (__stats_seen_count === null || __stats_seen_count === undefined) {
+                          throw new MemoryStatsIntegrityError(Number(base.id));
+                      }
+                      return {
+                          ...base,
+                          seen_count: __stats_seen_count,
+                          retrieval_count: __stats_retrieval_count,
+                          last_seen_at: __stats_last_seen_at,
+                          last_retrieved_at: __stats_last_retrieved_at,
+                          updated_at: __stats_effective_updated_at,
+                      };
+                  })
             : db
                   .prepare(
                       `SELECT n.*
@@ -1137,7 +1173,14 @@ export function applyNativeMessagesVerbatim(
 ): unknown[] {
     const nativeMessages = response.native_messages;
     if (typeof nativeMessages === "string") {
-        const parsed = JSON.parse(nativeMessages) as unknown;
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(nativeMessages) as unknown;
+        } catch (error) {
+            throw new Error(
+                `rust transform native_messages string was not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
         if (!Array.isArray(parsed))
             throw new Error("rust transform native_messages string was not an array");
         return replaceMessagesInPlace(output, parsed);

@@ -1,4 +1,9 @@
 import type { Database } from "../../../shared/sqlite";
+import {
+    effectiveSeenCountSql,
+    hasMemoryStatsTable,
+    requireEffectiveSeenCount,
+} from "./storage-memory";
 import type { MemoryStatus } from "./types";
 
 /**
@@ -59,30 +64,46 @@ export function rekeyMemoryRowWithCollisionMerge(
     fromProjectPath: string,
     toIdentity: string,
 ): boolean {
+    const statsBacked = hasMemoryStatsTable(db);
+    const seenCountSql = effectiveSeenCountSql(db);
     const row = db
-        .prepare("SELECT category, normalized_hash, seen_count FROM memories WHERE id = ?")
+        .prepare(`SELECT category, normalized_hash, ${seenCountSql} FROM memories WHERE id = ?`)
         .get(rowId) as
-        | { category: string; normalized_hash: string; seen_count: number }
+        | { category: string; normalized_hash: string; seen_count: number | null }
         | undefined;
     if (!row) return false;
 
     const collision = db
         .prepare(
-            `SELECT id, seen_count FROM memories
+            `SELECT id, ${seenCountSql} FROM memories
              WHERE project_path = ? AND category = ? AND normalized_hash = ?
              LIMIT 1`,
         )
         .get(toIdentity, row.category, row.normalized_hash) as
-        | { id: number; seen_count: number }
+        | { id: number; seen_count: number | null }
         | undefined;
 
     if (collision && collision.id !== rowId) {
-        const mergedSeen = Math.max(collision.seen_count ?? 1, row.seen_count ?? 1);
-        if (mergedSeen !== (collision.seen_count ?? 1)) {
-            db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?").run(
-                mergedSeen,
-                collision.id,
-            );
+        // requireEffectiveSeenCount rejects a NULL stats read on a v80 database
+        // (a missing stats row is corruption) before the merge computes a
+        // default count and deletes the source row. The check lives inside the
+        // merge branch so a plain rekey — which never consumes seen_count —
+        // still succeeds for such a row.
+        const sourceSeen = requireEffectiveSeenCount(db, rowId, row.seen_count);
+        const targetSeen = requireEffectiveSeenCount(db, collision.id, collision.seen_count);
+        const mergedSeen = Math.max(targetSeen, sourceSeen);
+        if (mergedSeen !== targetSeen) {
+            if (statsBacked) {
+                db.prepare("UPDATE memory_stats SET seen_count = ? WHERE memory_id = ?").run(
+                    mergedSeen,
+                    collision.id,
+                );
+            } else {
+                db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?").run(
+                    mergedSeen,
+                    collision.id,
+                );
+            }
         }
         // Preserve an embedding on the surviving target BEFORE the source row's
         // embedding FK-cascades away on DELETE (memory_embeddings.memory_id
@@ -182,6 +203,15 @@ export function copyMemoriesToProject(
         `INSERT OR IGNORE INTO memory_embeddings (memory_id, embedding, model_id)
          SELECT ?, embedding, model_id FROM memory_embeddings WHERE memory_id = ?`,
     );
+    const copyStatsStmt = hasMemoryStatsTable(db)
+        ? db.prepare(
+              `UPDATE memory_stats
+                  SET (seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at) =
+                      (SELECT seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at
+                         FROM memory_stats WHERE memory_id = ?)
+                WHERE memory_id = ?`,
+          )
+        : null;
     let relocated = 0;
     let skipped = 0;
     for (const id of ids) {
@@ -192,6 +222,7 @@ export function copyMemoriesToProject(
         if ((result.changes ?? 0) > 0) {
             relocated += 1;
             copyEmbeddingStmt.run(Number(result.lastInsertRowid), id);
+            copyStatsStmt?.run(id, Number(result.lastInsertRowid));
         } else {
             skipped += 1;
         }

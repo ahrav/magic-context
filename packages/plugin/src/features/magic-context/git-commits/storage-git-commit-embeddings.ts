@@ -13,6 +13,14 @@ interface CommitEmbeddingRow {
     sha: string;
     embedding: Uint8Array;
     model_id: string;
+    committed_at: number;
+}
+
+/** `CommitEmbeddingCandidate` carries `committedAtMs` so ranking can complete
+ *  before metadata hydration. */
+export interface CommitEmbeddingCandidate {
+    vector: Float32Array;
+    committedAtMs: number;
 }
 
 interface UnembeddedRow {
@@ -44,7 +52,8 @@ function getLoadProjectStatement(db: Database): PreparedStatement {
     let stmt = loadProjectStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            `SELECT e.sha AS sha, e.embedding AS embedding, e.model_id AS model_id
+            `SELECT e.sha AS sha, e.embedding AS embedding, e.model_id AS model_id,
+                    c.committed_at AS committed_at
              FROM git_commit_embeddings e
              JOIN git_commits c ON c.sha = e.sha
              WHERE c.project_path = ? AND e.model_id = ?`,
@@ -92,19 +101,24 @@ export function saveCommitEmbedding(
     getSaveStatement(db).run(sha, bytes, modelId, Date.now());
 }
 
+/** The join to `git_commits` drops embeddings whose commit row is gone, so an
+ *  orphan vector can never reach ranking. */
 export function loadProjectCommitEmbeddings(
     db: Database,
     projectPath: string,
     modelId: string,
-): Map<string, Float32Array> {
+): Map<string, CommitEmbeddingCandidate> {
     const rows = getLoadProjectStatement(db).all(projectPath, modelId) as CommitEmbeddingRow[];
-    const map = new Map<string, Float32Array>();
+    const map = new Map<string, CommitEmbeddingCandidate>();
     for (const row of rows) {
         const buffer = row.embedding.buffer.slice(
             row.embedding.byteOffset,
             row.embedding.byteOffset + row.embedding.byteLength,
         );
-        map.set(row.sha, new Float32Array(buffer));
+        map.set(row.sha, {
+            vector: new Float32Array(buffer),
+            committedAtMs: row.committed_at,
+        });
     }
     return map;
 }

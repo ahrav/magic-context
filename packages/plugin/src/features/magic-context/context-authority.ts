@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { log } from "../../shared/logger";
 import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
+import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
@@ -1059,6 +1060,8 @@ interface MirrorPageStatements {
     liveMemorySnapshot: Statement;
     upsertLiveMemory: Statement;
     updateMemory: Statement;
+    /** Null when the memory_stats table is absent. */
+    updateMemoryStats: Statement | null;
     updateSuperseded: Statement;
     deletePendingReference: Statement;
     upsertPendingReference: Statement;
@@ -1102,7 +1105,84 @@ function markMemoryRepairPending(db: Database): void {
     );
 }
 
+/**
+ * Column order for the stats-backed mirror base-row UPDATE. The SET list and
+ * the runtime argument list are both derived from this one array (values come
+ * from `nextBase`, whose keys are exactly these names), so a column edit
+ * cannot leave the SQL and the positional binds disagreeing — adjacent
+ * columns share types, and a one-off mismatch would silently write wrong
+ * values rather than fail on arity.
+ */
+const MEMORY_BASE_UPDATE_COLUMNS = [
+    "project_path",
+    "category",
+    "content",
+    "normalized_hash",
+    "importance",
+    "scope",
+    "shareable",
+    "source_session_id",
+    "source_type",
+    "first_seen_at",
+    "created_at",
+    "updated_at",
+    "status",
+    "expires_at",
+    "verification_status",
+    "verified_at",
+    "classified_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
+] as const;
+
+/**
+ * Column order for the legacy (pre-v80) full-row mirror UPDATE: the base
+ * columns with the four telemetry columns interleaved at their historical
+ * positions. Values are read from `{ ...nextStats, ...nextBase }`, so the
+ * telemetry keys resolve to stats values and `updated_at` to the base value.
+ */
+const MEMORY_LEGACY_UPDATE_COLUMNS = [
+    "project_path",
+    "category",
+    "content",
+    "normalized_hash",
+    "importance",
+    "scope",
+    "shareable",
+    "source_session_id",
+    "source_type",
+    "seen_count",
+    "retrieval_count",
+    "first_seen_at",
+    "created_at",
+    "updated_at",
+    "last_seen_at",
+    "last_retrieved_at",
+    "status",
+    "expires_at",
+    "verification_status",
+    "verified_at",
+    "classified_at",
+    "superseded_by_memory_id",
+    "merged_from",
+    "metadata_json",
+    "mural_cue",
+    "mural_cue_hash",
+    "mural_cue_at",
+    "mural_cue_rejection_count",
+] as const;
+
+function memoryUpdateSql(columns: readonly string[]): string {
+    return `UPDATE memories SET ${columns.map((column) => `${column} = ?`).join(", ")} WHERE id = ?`;
+}
+
 function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
+    const statsBacked = hasMemoryStatsTable(db);
     return {
         identityByModule: db.prepare(
             "SELECT context_row_id FROM mirror_identity WHERE domain = ? AND module_project = ? AND module_row_id = ?",
@@ -1125,15 +1205,25 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
         sharedIdentity: db.prepare(
             "SELECT 1 FROM mirror_identity WHERE domain = ? AND context_row_id = ? LIMIT 1",
         ),
-        memoryById: db.prepare(
-            `SELECT project_path, category, content, normalized_hash, importance, scope, shareable,
+        memoryById: statsBacked
+            ? db.prepare(
+                  `SELECT m.project_path, m.category, m.content, m.normalized_hash, m.importance, m.scope, m.shareable,
+                          m.source_session_id, m.source_type, s.seen_count, s.retrieval_count, m.first_seen_at,
+                          m.created_at, m.updated_at, s.last_seen_at, s.last_retrieved_at, m.status, m.expires_at,
+                          m.verification_status, m.verified_at, m.classified_at, m.superseded_by_memory_id,
+                          m.merged_from, m.metadata_json, m.mural_cue, m.mural_cue_hash, m.mural_cue_at,
+                          m.mural_cue_rejection_count, s.updated_at AS stats_updated_at
+                     FROM memories m LEFT JOIN memory_stats s ON s.memory_id = m.id WHERE m.id = ?`,
+              )
+            : db.prepare(
+                  `SELECT project_path, category, content, normalized_hash, importance, scope, shareable,
                     source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
                     created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at,
                      verification_status, verified_at, classified_at, superseded_by_memory_id,
                      merged_from, metadata_json, mural_cue, mural_cue_hash, mural_cue_at,
                      mural_cue_rejection_count
                 FROM memories WHERE id = ?`,
-        ),
+              ),
         memoryIdByStoreId: db.prepare("SELECT id FROM memories WHERE id = ? AND project_path = ?"),
         memoryCandidates: db.prepare(
             "SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? ORDER BY id",
@@ -1160,15 +1250,15 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
                  normalized_hash = excluded.normalized_hash,
                  full_row_snapshot = excluded.full_row_snapshot`,
         ),
-        updateMemory: db.prepare(
-            `UPDATE memories SET project_path = ?, category = ?, content = ?, normalized_hash = ?,
-             importance = ?, scope = ?, shareable = ?, source_session_id = ?, source_type = ?,
-             seen_count = ?, retrieval_count = ?, first_seen_at = ?, created_at = ?, updated_at = ?,
-             last_seen_at = ?, last_retrieved_at = ?, status = ?, expires_at = ?,
-              verification_status = ?, verified_at = ?, classified_at = ?, superseded_by_memory_id = ?,
-              merged_from = ?, metadata_json = ?, mural_cue = ?, mural_cue_hash = ?, mural_cue_at = ?,
-              mural_cue_rejection_count = ? WHERE id = ?`,
-        ),
+        updateMemory: statsBacked
+            ? db.prepare(memoryUpdateSql(MEMORY_BASE_UPDATE_COLUMNS))
+            : db.prepare(memoryUpdateSql(MEMORY_LEGACY_UPDATE_COLUMNS)),
+        updateMemoryStats: statsBacked
+            ? db.prepare(
+                  `UPDATE memory_stats SET seen_count = ?, retrieval_count = ?, last_seen_at = ?,
+                   last_retrieved_at = ?, updated_at = ? WHERE memory_id = ?`,
+              )
+            : null,
         updateSuperseded: db.prepare(
             "UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?",
         ),
@@ -1556,56 +1646,126 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         has(key) ? rowNullableString(row, key) : (previous ?? null);
     const hasSuperseded = has("superseded_by_memory_id");
     const previousHash = existing?.normalized_hash;
+    const existingStatsUpdatedAt = (existing as { stats_updated_at?: number | null } | undefined)
+        ?.stats_updated_at;
 
     // A feed update is allowed to be a sparse legacy snapshot. An absent property means
     // "unchanged"; only a property explicitly present as null is a genuine clear.
-    statements.updateMemory.run(
-        has("project_path")
+    const nextBase = {
+        project_path: has("project_path")
             ? rowString(row, "project_path")
             : (existing?.project_path ?? moduleProject),
-        has("category")
+        category: has("category")
             ? rowString(row, "category", "CONSTRAINTS")
             : (existing?.category ?? "CONSTRAINTS"),
-        has("content") ? rowString(row, "content") : (existing?.content ?? ""),
-        has("normalized_hash")
+        content: has("content") ? rowString(row, "content") : (existing?.content ?? ""),
+        normalized_hash: has("normalized_hash")
             ? rowString(row, "normalized_hash")
             : (existing?.normalized_hash ?? ""),
-        has("importance")
+        importance: has("importance")
             ? typeof row.importance === "number" && Number.isFinite(row.importance)
                 ? row.importance
                 : null
             : (existing?.importance ?? null),
-        has("scope") ? rowString(row, "scope", "project") : (existing?.scope ?? "project"),
-        has("shareable") ? rowNumber(row, "shareable") : (existing?.shareable ?? 0),
-        nullableString("source_session_id", existing?.source_session_id),
-        nullableString("source_type", existing?.source_type),
-        has("seen_count") ? rowNumber(row, "seen_count", 1) : (existing?.seen_count ?? 1),
-        has("retrieval_count")
-            ? rowNumber(row, "retrieval_count")
-            : (existing?.retrieval_count ?? 0),
-        has("first_seen_at") ? rowNumber(row, "first_seen_at") : (existing?.first_seen_at ?? 0),
-        has("created_at") ? rowNumber(row, "created_at") : (existing?.created_at ?? 0),
-        has("updated_at") ? rowNumber(row, "updated_at") : (existing?.updated_at ?? 0),
-        has("last_seen_at") ? rowNumber(row, "last_seen_at") : (existing?.last_seen_at ?? 0),
-        nullableNumber("last_retrieved_at", existing?.last_retrieved_at),
-        has("status") ? rowString(row, "status", "active") : (existing?.status ?? "active"),
-        nullableNumber("expires_at", existing?.expires_at),
-        has("verification_status")
+        scope: has("scope") ? rowString(row, "scope", "project") : (existing?.scope ?? "project"),
+        shareable: has("shareable") ? rowNumber(row, "shareable") : (existing?.shareable ?? 0),
+        source_session_id: nullableString("source_session_id", existing?.source_session_id),
+        source_type: nullableString("source_type", existing?.source_type),
+        first_seen_at: has("first_seen_at")
+            ? rowNumber(row, "first_seen_at")
+            : (existing?.first_seen_at ?? 0),
+        created_at: has("created_at") ? rowNumber(row, "created_at") : (existing?.created_at ?? 0),
+        updated_at: has("updated_at") ? rowNumber(row, "updated_at") : (existing?.updated_at ?? 0),
+        status: has("status") ? rowString(row, "status", "active") : (existing?.status ?? "active"),
+        expires_at: nullableNumber("expires_at", existing?.expires_at),
+        verification_status: has("verification_status")
             ? rowString(row, "verification_status", "unverified")
             : (existing?.verification_status ?? "unverified"),
-        nullableNumber("verified_at", existing?.verified_at),
-        nullableNumber("classified_at", existing?.classified_at),
-        hasSuperseded ? null : (existing?.superseded_by_memory_id ?? null),
-        nullableString("merged_from", existing?.merged_from),
-        nullableString("metadata_json", existing?.metadata_json),
-        nullableString("mural_cue", existing?.mural_cue),
-        nullableString("mural_cue_hash", existing?.mural_cue_hash),
-        nullableNumber("mural_cue_at", existing?.mural_cue_at),
-        has("mural_cue_rejection_count")
+        verified_at: nullableNumber("verified_at", existing?.verified_at),
+        classified_at: nullableNumber("classified_at", existing?.classified_at),
+        superseded_by_memory_id: hasSuperseded ? null : (existing?.superseded_by_memory_id ?? null),
+        merged_from: nullableString("merged_from", existing?.merged_from),
+        metadata_json: nullableString("metadata_json", existing?.metadata_json),
+        mural_cue: nullableString("mural_cue", existing?.mural_cue),
+        mural_cue_hash: nullableString("mural_cue_hash", existing?.mural_cue_hash),
+        mural_cue_at: nullableNumber("mural_cue_at", existing?.mural_cue_at),
+        mural_cue_rejection_count: has("mural_cue_rejection_count")
             ? rowNumber(row, "mural_cue_rejection_count")
             : (existing?.mural_cue_rejection_count ?? 0),
-        contextId,
-    );
+    };
+    const nextStats = {
+        seen_count: has("seen_count")
+            ? rowNumber(row, "seen_count", 1)
+            : (existing?.seen_count ?? 1),
+        retrieval_count: has("retrieval_count")
+            ? rowNumber(row, "retrieval_count")
+            : (existing?.retrieval_count ?? 0),
+        last_seen_at: has("last_seen_at")
+            ? rowNumber(row, "last_seen_at")
+            : (existing?.last_seen_at ?? 0),
+        last_retrieved_at: nullableNumber("last_retrieved_at", existing?.last_retrieved_at),
+        // An absent field means "unchanged". The stats-side timestamp may have
+        // advanced past the frozen base-row value, so a sparse snapshot must
+        // fall back to it first — falling back to the base timestamp would move
+        // memory_stats.updated_at backward and reorder effective-updatedAt reads.
+        updated_at: has("updated_at")
+            ? rowNumber(row, "updated_at")
+            : (existingStatsUpdatedAt ?? existing?.updated_at ?? 0),
+    };
+
+    if (statements.updateMemoryStats) {
+        const same = (left: unknown, right: unknown): boolean => (left ?? null) === (right ?? null);
+        // The base row is compared field-by-field against the prior logical
+        // row, so a telemetry-only feed event skips the base UPDATE (and its
+        // triggers) entirely. updated_at alone never forces a base write
+        // because the stats row carries the newest update time and reads take
+        // the maximum of the two.
+        const baseChanged =
+            !existing ||
+            Object.entries(nextBase).some(([key, value]) => {
+                if (key === "updated_at") return false;
+                return !same(value, (existing as Record<string, unknown>)[key]);
+            });
+        if (baseChanged) {
+            statements.updateMemory.run(
+                ...MEMORY_BASE_UPDATE_COLUMNS.map((column) => nextBase[column]),
+                contextId,
+            );
+        }
+        const statsChanged =
+            !existing ||
+            !same(nextStats.seen_count, existing.seen_count) ||
+            !same(nextStats.retrieval_count, existing.retrieval_count) ||
+            !same(nextStats.last_seen_at, existing.last_seen_at) ||
+            !same(nextStats.last_retrieved_at, existing.last_retrieved_at) ||
+            !same(nextStats.updated_at, existingStatsUpdatedAt);
+        if (statsChanged) {
+            const result = statements.updateMemoryStats.run(
+                nextStats.seen_count,
+                nextStats.retrieval_count,
+                nextStats.last_seen_at,
+                nextStats.last_retrieved_at,
+                nextStats.updated_at,
+                contextId,
+            ) as { changes?: number };
+            // Zero rows updated means the memories row has no memory_stats row —
+            // a broken v80 one-row-per-memory invariant. Surface it instead of
+            // reporting a successful mirror write that persisted nothing; the
+            // read contract treats a missing stats row as corruption, never
+            // healed by writers.
+            if ((result.changes ?? 0) === 0) {
+                throw new MemoryStatsIntegrityError(contextId);
+            }
+        }
+    } else {
+        // Legacy single-table write: telemetry keys resolve to stats values,
+        // updated_at to the base value (nextBase spreads last).
+        const legacyRow = { ...nextStats, ...nextBase };
+        statements.updateMemory.run(
+            ...MEMORY_LEGACY_UPDATE_COLUMNS.map((column) => legacyRow[column]),
+            contextId,
+        );
+    }
     if (hasSuperseded && typeof row.superseded_by_memory_id === "number") {
         const translated = mirrorIdentity(
             db,

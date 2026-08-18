@@ -3,6 +3,10 @@
  *
  * Returns raw scored matches; the caller (unifiedSearch) slots these into
  * the existing merged ranking with source boosts.
+ *
+ * Lanes emit compact candidates (SHA, lane scores, `committed_at`, discovery
+ * ordinal); only the selected top-K SHAs are hydrated into full commit records,
+ * so a large candidate pool never pays for metadata it cannot return.
  */
 
 import { log } from "../../../shared/logger";
@@ -26,6 +30,20 @@ interface CommitRow {
     indexed_at: number;
 }
 
+interface CandidateRow {
+    sha: string;
+    committed_at: number;
+}
+
+interface CommitCandidate {
+    sha: string;
+    committedAtMs: number;
+    /** Discovery position: FTS candidates first, then semantic-only ones. */
+    ordinal: number;
+    ftsScore?: number;
+    semanticScore?: number;
+}
+
 function rowToCommit(row: CommitRow): StoredGitCommit {
     return {
         sha: row.sha,
@@ -42,9 +60,7 @@ function getFtsStatement(db: Database): PreparedStatement {
     let stmt = ftsStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            `SELECT c.sha AS sha, c.project_path AS project_path, c.short_sha AS short_sha,
-                    c.message AS message, c.author AS author,
-                    c.committed_at AS committed_at, c.indexed_at AS indexed_at
+            `SELECT c.sha AS sha, c.committed_at AS committed_at
              FROM git_commits_fts
              INNER JOIN git_commits c ON c.sha = git_commits_fts.sha
              WHERE c.project_path = ? AND git_commits_fts MATCH ?
@@ -59,7 +75,7 @@ function getLikeFallbackStatement(db: Database): PreparedStatement {
     let stmt = ftsPlainStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            `SELECT sha, project_path, short_sha, message, author, committed_at, indexed_at
+            `SELECT sha, committed_at
              FROM git_commits
              WHERE project_path = ? AND lower(message) LIKE '%' || lower(?) || '%'
              ORDER BY committed_at DESC LIMIT ?`,
@@ -110,6 +126,36 @@ function clamp01(value: number): number {
     return Math.min(1, Math.max(0, value));
 }
 
+interface ScoredCandidate {
+    candidate: CommitCandidate;
+    score: number;
+    matchType: GitCommitSearchHit["matchType"];
+}
+
+function scoreCandidate(
+    candidate: CommitCandidate,
+    weights: { semanticWeight: number; ftsWeight: number; singleSourcePenalty: number },
+): ScoredCandidate | null {
+    const sem = candidate.semanticScore;
+    const fts = candidate.ftsScore;
+    let score = 0;
+    let matchType: GitCommitSearchHit["matchType"] = "fts";
+
+    if (sem !== undefined && fts !== undefined) {
+        score = weights.semanticWeight * sem + weights.ftsWeight * fts;
+        matchType = "hybrid";
+    } else if (sem !== undefined) {
+        score = sem * weights.singleSourcePenalty;
+        matchType = "semantic";
+    } else if (fts !== undefined) {
+        score = fts * weights.singleSourcePenalty;
+        matchType = "fts";
+    }
+
+    if (score <= 0) return null;
+    return { candidate, score, matchType };
+}
+
 /**
  * Return top-K commits matching `query` for `projectPath`, combining FTS
  * and semantic ranks. Falls back to LIKE when FTS fails (e.g. short queries).
@@ -123,100 +169,106 @@ export function searchGitCommitsSync(
     const trimmed = query.trim();
     if (trimmed.length === 0 || options.limit <= 0) return [];
 
-    const semanticWeight = options.semanticWeight ?? 0.7;
-    const ftsWeight = options.ftsWeight ?? 0.3;
-    const singleSourcePenalty = options.singleSourcePenalty ?? 0.8;
+    const weights = {
+        semanticWeight: options.semanticWeight ?? 0.7,
+        ftsWeight: options.ftsWeight ?? 0.3,
+        singleSourcePenalty: options.singleSourcePenalty ?? 0.8,
+    };
     const fetchLimit = Math.max(options.limit * 3, 30);
 
-    // ---- FTS pass -------------------------------------------------------
-    const ftsCandidates: StoredGitCommit[] = [];
-    const sanitized = sanitizeFtsQuery(trimmed);
-    if (sanitized.length > 0) {
-        try {
-            for (const row of getFtsStatement(db).all(
-                projectPath,
-                sanitized,
-                fetchLimit,
-            ) as CommitRow[]) {
-                ftsCandidates.push(rowToCommit(row));
+    // Selection and hydration read one snapshot, so a concurrent indexer cannot
+    // make the hydrated rows disagree with the ranked candidates.
+    return db.transaction((): GitCommitSearchHit[] => {
+        const candidates = new Map<string, CommitCandidate>();
+        const addCandidate = (sha: string, committedAtMs: number): CommitCandidate => {
+            const existing = candidates.get(sha);
+            if (existing) return existing;
+            const candidate: CommitCandidate = {
+                sha,
+                committedAtMs,
+                ordinal: candidates.size,
+            };
+            candidates.set(sha, candidate);
+            return candidate;
+        };
+
+        // ---- FTS pass ---------------------------------------------------
+        const lexicalRows: CandidateRow[] = [];
+        const sanitized = sanitizeFtsQuery(trimmed);
+        if (sanitized.length > 0) {
+            try {
+                lexicalRows.push(
+                    ...(getFtsStatement(db).all(
+                        projectPath,
+                        sanitized,
+                        fetchLimit,
+                    ) as CandidateRow[]),
+                );
+            } catch (error) {
+                log(
+                    `[git-commits] FTS query failed for "${trimmed}": ${error instanceof Error ? error.message : String(error)}`,
+                );
             }
-        } catch (error) {
-            log(
-                `[git-commits] FTS query failed for "${trimmed}": ${error instanceof Error ? error.message : String(error)}`,
+        }
+
+        // LIKE fallback when FTS returned nothing (short tokens, exact-substring queries)
+        if (lexicalRows.length === 0) {
+            lexicalRows.push(
+                ...(getLikeFallbackStatement(db).all(
+                    projectPath,
+                    trimmed,
+                    fetchLimit,
+                ) as CandidateRow[]),
             );
         }
-    }
 
-    // LIKE fallback when FTS returned nothing (short tokens, exact-substring queries)
-    if (ftsCandidates.length === 0) {
-        for (const row of getLikeFallbackStatement(db).all(
-            projectPath,
-            trimmed,
-            fetchLimit,
-        ) as CommitRow[]) {
-            ftsCandidates.push(rowToCommit(row));
-        }
-    }
+        lexicalRows.forEach((row, rank) => {
+            const candidate = addCandidate(row.sha, row.committed_at);
+            if (candidate.ftsScore === undefined) candidate.ftsScore = 1 / (rank + 1);
+        });
 
-    const ftsScores = new Map<string, number>();
-    ftsCandidates.forEach((commit, rank) => {
-        ftsScores.set(commit.sha, 1 / (rank + 1));
-    });
-
-    // ---- Semantic pass --------------------------------------------------
-    const semanticScores = new Map<string, number>();
-    if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
-        const embeddings = loadProjectCommitEmbeddings(db, projectPath, options.queryModelId);
-        for (const [sha, embedding] of embeddings.entries()) {
-            const similarity = clamp01(cosineSimilarity(options.queryEmbedding, embedding));
-            if (similarity > 0) {
-                semanticScores.set(sha, similarity);
+        // ---- Semantic pass ----------------------------------------------
+        if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
+            const embeddings = loadProjectCommitEmbeddings(db, projectPath, options.queryModelId);
+            for (const [sha, entry] of embeddings.entries()) {
+                const similarity = clamp01(cosineSimilarity(options.queryEmbedding, entry.vector));
+                if (similarity <= 0) continue;
+                const candidate = addCandidate(sha, entry.committedAtMs);
+                candidate.semanticScore = similarity;
             }
         }
-    }
 
-    // ---- Merge + rank ---------------------------------------------------
-    const bySha = new Map<string, StoredGitCommit>();
-    for (const commit of ftsCandidates) bySha.set(commit.sha, commit);
+        // ---- Select top-K before any metadata read ----------------------
+        const scored: ScoredCandidate[] = [];
+        for (const candidate of candidates.values()) {
+            const entry = scoreCandidate(candidate, weights);
+            if (entry) scored.push(entry);
+        }
+        scored.sort((left, right) => {
+            if (right.score !== left.score) return right.score - left.score;
+            // Newer commits win ties
+            if (right.candidate.committedAtMs !== left.candidate.committedAtMs) {
+                return right.candidate.committedAtMs - left.candidate.committedAtMs;
+            }
+            return left.candidate.ordinal - right.candidate.ordinal;
+        });
+        const selected = scored.slice(0, options.limit);
+        if (selected.length === 0) return [];
 
-    // Pull all semantic-only commit metadata in one statement. JSON avoids
-    // SQLite's positional-parameter limit for large semantic pools.
-    const semanticOnlyShas = [...semanticScores.keys()].filter((sha) => !bySha.has(sha));
-    if (semanticOnlyShas.length > 0) {
+        // ---- Hydrate only the winners -----------------------------------
         const rows = getBySHAsStatement(db).all(
             projectPath,
-            JSON.stringify(semanticOnlyShas),
+            JSON.stringify(selected.map((entry) => entry.candidate.sha)),
         ) as CommitRow[];
-        for (const row of rows) bySha.set(row.sha, rowToCommit(row));
-    }
+        const commitBySha = new Map(rows.map((row) => [row.sha, rowToCommit(row)]));
 
-    const results: GitCommitSearchHit[] = [];
-    for (const [sha, commit] of bySha.entries()) {
-        const sem = semanticScores.get(sha);
-        const fts = ftsScores.get(sha);
-        let score = 0;
-        let matchType: GitCommitSearchHit["matchType"] = "fts";
-
-        if (sem !== undefined && fts !== undefined) {
-            score = semanticWeight * sem + ftsWeight * fts;
-            matchType = "hybrid";
-        } else if (sem !== undefined) {
-            score = sem * singleSourcePenalty;
-            matchType = "semantic";
-        } else if (fts !== undefined) {
-            score = fts * singleSourcePenalty;
-            matchType = "fts";
+        // `IN` result order is not authoritative, so restore the selected order.
+        const hits: GitCommitSearchHit[] = [];
+        for (const entry of selected) {
+            const commit = commitBySha.get(entry.candidate.sha);
+            if (!commit) continue;
+            hits.push({ commit, score: entry.score, matchType: entry.matchType });
         }
-
-        if (score <= 0) continue;
-        results.push({ commit, score, matchType });
-    }
-
-    results.sort((left, right) => {
-        if (right.score !== left.score) return right.score - left.score;
-        // Newer commits win ties
-        return right.commit.committedAtMs - left.commit.committedAtMs;
-    });
-
-    return results.slice(0, options.limit);
+        return hits;
+    })();
 }

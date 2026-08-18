@@ -9,6 +9,11 @@ import {
     resolveProjectIdentityStrict,
 } from "./memory/project-identity";
 import { rekeyMemoryRowWithCollisionMerge } from "./memory/relocate-memory";
+import {
+    effectiveSeenCountSql,
+    hasMemoryStatsTable,
+    requireEffectiveSeenCount,
+} from "./memory/storage-memory";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 
 export const BATCH_SIZE = 25;
@@ -25,7 +30,9 @@ interface LegacyMemoryRow {
     project_path: string;
     category: string;
     normalized_hash: string;
-    seen_count: number;
+    /** NULL on a v80 database whose memory_stats row is missing (corruption —
+     *  rejected by requireEffectiveSeenCount before any merge consumes it). */
+    seen_count: number | null;
 }
 
 interface ResolvedBackfillRow extends LegacyMemoryRow {
@@ -241,10 +248,13 @@ export async function runDeferredV22Backfill(
 
     await yieldToEventLoop();
 
+    const statsBacked = hasMemoryStatsTable(db);
+    const seenCountSql = effectiveSeenCountSql(db);
+
     while (true) {
         const batch = db
             .prepare(
-                `SELECT id, project_path, category, normalized_hash, seen_count
+                `SELECT id, project_path, category, normalized_hash, ${seenCountSql}
                  FROM memories
                  WHERE id > ?
                    AND project_path NOT LIKE 'git:%'
@@ -293,11 +303,13 @@ export async function runDeferredV22Backfill(
             // written under multiple raw legacy paths (e.g. symlinked / pre-identity
             // paths) that all resolve to the same git:/dir: identity.
             const findCollision = db.prepare(
-                `SELECT id, seen_count FROM memories
+                `SELECT id, ${seenCountSql} FROM memories
                  WHERE project_path = ? AND category = ? AND normalized_hash = ?
                  LIMIT 1`,
             );
-            const bumpSeenCount = db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?");
+            const bumpSeenCount = statsBacked
+                ? db.prepare("UPDATE memory_stats SET seen_count = ? WHERE memory_id = ?")
+                : db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?");
             // Preserve an embedding on the surviving target BEFORE the source row's
             // embedding FK-cascades away on DELETE. Same fix as the live
             // collision-merge path (rekeyMemoryRowWithCollisionMerge): the two rows
@@ -315,14 +327,25 @@ export async function runDeferredV22Backfill(
                     row.identity,
                     row.category,
                     row.normalized_hash,
-                ) as { id: number; seen_count: number } | undefined;
+                ) as { id: number; seen_count: number | null } | undefined;
                 if (collision && collision.id !== row.id) {
                     // Merge into the surviving target: keep the larger seen_count,
                     // delete the source legacy row. The embedding row FK-cascades on
                     // delete. The mutation log is unaffected (no render-visible
                     // change — both rows held identical content).
-                    const mergedSeen = Math.max(collision.seen_count ?? 1, row.seen_count ?? 1);
-                    if (mergedSeen !== (collision.seen_count ?? 1)) {
+                    // requireEffectiveSeenCount aborts the batch transaction when a
+                    // v80 stats read is NULL (a missing stats row is corruption),
+                    // before the merge substitutes a default count and deletes the
+                    // source row. The check lives inside the merge branch so rows
+                    // that only need a project_path rekey do not stall the cursor.
+                    const sourceSeen = requireEffectiveSeenCount(db, row.id, row.seen_count);
+                    const targetSeen = requireEffectiveSeenCount(
+                        db,
+                        collision.id,
+                        collision.seen_count,
+                    );
+                    const mergedSeen = Math.max(targetSeen, sourceSeen);
+                    if (mergedSeen !== targetSeen) {
                         bumpSeenCount.run(mergedSeen, collision.id);
                     }
                     preserveEmbedding.run(collision.id, row.id);

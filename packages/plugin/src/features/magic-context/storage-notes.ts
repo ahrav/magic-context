@@ -285,6 +285,87 @@ export function getNotes(db: Database, options: GetNotesOptions = {}): Note[] {
         .map(toNote);
 }
 
+const NOTE_SEARCH_STATUSES: NoteStatus[] = ["active", "pending", "ready", "dismissed"];
+
+function notesProjectionExists(db: Database): boolean {
+    const row = db
+        .prepare(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'notes_fts' LIMIT 1",
+        )
+        .get() as { present?: number } | null;
+    return row?.present === 1;
+}
+
+/** Candidate rowids for one FTS query, or null when the projection is absent so
+ *  the caller falls back to a scoped scan. */
+export function selectNoteCandidateIds(db: Database, ftsQuery: string): number[] | null {
+    if (!notesProjectionExists(db)) return null;
+    if (ftsQuery.length === 0) return [];
+    try {
+        const rows = db
+            .prepare("SELECT rowid AS id FROM notes_fts WHERE notes_fts MATCH ?")
+            .all(ftsQuery) as Array<{ id?: number }>;
+        return rows
+            .map((row) => row.id)
+            .filter((id): id is number => typeof id === "number" && Number.isFinite(id));
+    } catch {
+        return null;
+    }
+}
+
+/** Notes in the caller's search scope restricted to `ids`, ordered as a scoped
+ *  scan would return them. */
+export function getSearchableNotesByIds(
+    db: Database,
+    options: { ids: readonly number[]; sessionId: string; projectPath: string },
+): Note[] {
+    if (options.ids.length === 0) return [];
+    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
+    return (
+        db
+            .prepare(
+                `SELECT notes.* FROM json_each(?) AS requested
+                  CROSS JOIN notes ON notes.id = requested.value
+                  WHERE notes.status IN (${statusPlaceholders})
+                    AND ((notes.type = 'session' AND notes.session_id = ?)
+                      OR (notes.type = 'smart' AND notes.project_path = ?))
+                  ORDER BY notes.created_at ASC, notes.id ASC`,
+            )
+            .all(
+                JSON.stringify([...options.ids]),
+                ...NOTE_SEARCH_STATUSES,
+                options.sessionId,
+                options.projectPath,
+            ) as unknown[]
+    )
+        .filter(isNoteRow)
+        .map(toNote);
+}
+
+/** Size of the scoped searchable corpus. */
+export function countSearchableNotes(
+    db: Database,
+    options: { sessionId: string; projectPath: string },
+): number {
+    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
+    const row = db
+        .prepare(
+            `SELECT (SELECT COUNT(*) FROM notes
+                      WHERE type = 'session' AND session_id = ?
+                        AND status IN (${statusPlaceholders}))
+                  + (SELECT COUNT(*) FROM notes
+                      WHERE type = 'smart' AND project_path = ?
+                        AND status IN (${statusPlaceholders})) AS count`,
+        )
+        .get(
+            options.sessionId,
+            ...NOTE_SEARCH_STATUSES,
+            options.projectPath,
+            ...NOTE_SEARCH_STATUSES,
+        ) as { count?: number } | null;
+    return typeof row?.count === "number" ? row.count : 0;
+}
+
 export function addNote(db: Database, type: "session", options: SessionNoteInput): Note;
 export function addNote(db: Database, type: "smart", options: SmartNoteInput): Note;
 export function addNote(

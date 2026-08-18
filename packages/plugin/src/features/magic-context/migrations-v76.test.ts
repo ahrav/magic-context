@@ -43,7 +43,6 @@ describe("migration v76: retina condition compilation", () => {
                     "compile_status",
                 ]),
             );
-            expect(LATEST_SUPPORTED_VERSION).toBe(78);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(() =>
                 db

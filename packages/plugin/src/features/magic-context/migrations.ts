@@ -1,7 +1,11 @@
 import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import {
+    ensureColumn,
+    healAllNullColumns,
+    MEMORIES_AU_TRIGGER_BODY,
+} from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
 /** First version reserved for downstream migrations; upstream versions stay below it. */
@@ -210,6 +214,168 @@ function installLatestAuthorityTriggers(db: Database): void {
             WHEN ${managedOld} AND ${privilegeCheck}
             BEGIN SELECT RAISE(ABORT, 'context.db note writes are managed by the Rust module'); END;
         `);
+    }
+}
+
+function noteColumnExists(db: Database, column: string): boolean {
+    const rows = db.prepare("PRAGMA table_info(notes)").all() as Array<{ name?: string }>;
+    return rows.some((row) => row.name === column);
+}
+
+/**
+ * Replace `memories_au` with a value-sensitive definition scoped to the two
+ * FTS-indexed columns. `UPDATE OF` alone still fires when an unchanged
+ * content/category value appears in the SET list (mirror full-row snapshots do
+ * exactly that), so the WHEN clause compares old and new values — an update
+ * that changes neither indexed value performs no FTS maintenance.
+ */
+function installValueSensitiveMemoriesFtsUpdateTrigger(db: Database): void {
+    db.exec(`
+        DROP TRIGGER IF EXISTS memories_au;
+        CREATE TRIGGER memories_au ${MEMORIES_AU_TRIGGER_BODY};
+    `);
+}
+
+interface InvalidTelemetryRow {
+    id: number;
+    reason: string;
+}
+
+const INVALID_TELEMETRY_SAMPLE_LIMIT = 20;
+
+/**
+ * Classify v79 telemetry rows that cannot backfill `memory_stats` under its
+ * constraints. Fails closed with a bounded, non-sensitive diagnostic — the
+ * total count plus at most the first {@link INVALID_TELEMETRY_SAMPLE_LIMIT}
+ * `(memory_id, reason)` pairs ordered by id, never content or metadata.
+ * Recovery is stopped-writer and backup-first; the migration does not coerce.
+ */
+function assertValidV79MemoryTelemetry(db: Database): void {
+    const classifier = `
+        SELECT id, CASE
+            WHEN seen_count IS NULL OR typeof(seen_count) != 'integer' OR seen_count < 0
+                THEN 'seen_count-not-nonnegative-integer'
+            WHEN retrieval_count IS NULL OR typeof(retrieval_count) != 'integer' OR retrieval_count < 0
+                THEN 'retrieval_count-not-nonnegative-integer'
+            WHEN last_seen_at IS NULL OR typeof(last_seen_at) != 'integer'
+                THEN 'last_seen_at-not-integer'
+            WHEN last_retrieved_at IS NOT NULL AND typeof(last_retrieved_at) != 'integer'
+                THEN 'last_retrieved_at-not-integer-or-null'
+            WHEN updated_at IS NULL OR typeof(updated_at) != 'integer'
+                THEN 'updated_at-not-integer'
+        END AS reason
+        FROM memories`;
+    const totalRow = db
+        .prepare(`SELECT COUNT(*) AS total FROM (${classifier}) WHERE reason IS NOT NULL`)
+        .get() as { total?: number } | undefined;
+    const total = typeof totalRow?.total === "number" ? totalRow.total : 0;
+    if (total === 0) return;
+    const sample = db
+        .prepare(
+            `SELECT id, reason FROM (${classifier}) WHERE reason IS NOT NULL ORDER BY id ASC LIMIT ?`,
+        )
+        .all(INVALID_TELEMETRY_SAMPLE_LIMIT) as InvalidTelemetryRow[];
+    const rendered = sample.map((row) => `(${row.id}, ${row.reason})`).join(", ");
+    throw new Error(
+        `migration v80 aborted: ${total} memories row(s) carry invalid legacy telemetry; ` +
+            `first ${sample.length} as (memory_id, reason): ${rendered}. ` +
+            "Correct the rows from known source data or restore a known-good backup with all writers stopped, then rerun.",
+    );
+}
+
+/** Structural validation for the v80 backfill: one stats row per memory. */
+function assertMemoryStatsCardinality(db: Database): void {
+    const counts = db
+        .prepare(
+            `SELECT (SELECT COUNT(*) FROM memories) AS memories,
+                    (SELECT COUNT(*) FROM memory_stats) AS stats,
+                    (SELECT COUNT(*) FROM memories m
+                      WHERE NOT EXISTS (SELECT 1 FROM memory_stats s WHERE s.memory_id = m.id)) AS missing`,
+        )
+        .get() as { memories: number; stats: number; missing: number } | null;
+    if (!counts || counts.memories !== counts.stats || counts.missing !== 0) {
+        throw new Error(
+            `memory_stats backfill validation failed: ${counts?.memories ?? "?"} memories, ` +
+                `${counts?.stats ?? "?"} stats rows, ${counts?.missing ?? "?"} missing`,
+        );
+    }
+    const violations = db.prepare("PRAGMA foreign_key_check(memory_stats)").all() as unknown[];
+    if (violations.length > 0) {
+        throw new Error(
+            `memory_stats foreign_key_check failed (${violations.length} violation(s))`,
+        );
+    }
+}
+
+function noteSearchableTextSql(source: string, withReadyReason: boolean): string {
+    if (!withReadyReason) return `${source}.content`;
+    return `CASE
+                WHEN ${source}.ready_reason IS NOT NULL AND trim(${source}.ready_reason) <> ''
+                THEN ${source}.content || char(10) || 'Reason: ' || trim(${source}.ready_reason)
+                ELSE ${source}.content
+            END`;
+}
+
+export function installNotesSearchProjection(db: Database): void {
+    if (!tableExists(db, "notes")) return;
+    // Legacy `notes` tables can lack `ready_reason`.
+    const withReadyReason = noteColumnExists(db, "ready_reason");
+    const updateColumns = withReadyReason ? "content, ready_reason" : "content";
+    db.exec(`
+        DROP TRIGGER IF EXISTS notes_fts_ai;
+        DROP TRIGGER IF EXISTS notes_fts_ad;
+        DROP TRIGGER IF EXISTS notes_fts_au;
+        DROP VIEW IF EXISTS notes_search_view;
+        DROP TABLE IF EXISTS notes_fts;
+
+        CREATE VIEW notes_search_view AS
+            SELECT id AS id, ${noteSearchableTextSql("notes", withReadyReason)} AS searchable_text
+              FROM notes;
+
+        CREATE VIRTUAL TABLE notes_fts USING fts5(
+            searchable_text,
+            content='notes_search_view',
+            content_rowid='id',
+            tokenize='trigram'
+        );
+
+        INSERT INTO notes_fts(rowid, searchable_text)
+            SELECT id, searchable_text FROM notes_search_view;
+
+        CREATE TRIGGER notes_fts_ai AFTER INSERT ON notes BEGIN
+            INSERT INTO notes_fts(rowid, searchable_text)
+                VALUES (new.id, ${noteSearchableTextSql("new", withReadyReason)});
+        END;
+
+        CREATE TRIGGER notes_fts_ad AFTER DELETE ON notes BEGIN
+            INSERT INTO notes_fts(notes_fts, rowid, searchable_text)
+                VALUES ('delete', old.id, ${noteSearchableTextSql("old", withReadyReason)});
+        END;
+
+        CREATE TRIGGER notes_fts_au AFTER UPDATE OF ${updateColumns} ON notes BEGIN
+            INSERT INTO notes_fts(notes_fts, rowid, searchable_text)
+                VALUES ('delete', old.id, ${noteSearchableTextSql("old", withReadyReason)});
+            INSERT INTO notes_fts(rowid, searchable_text)
+                VALUES (new.id, ${noteSearchableTextSql("new", withReadyReason)});
+        END;
+    `);
+    validateNotesSearchProjection(db);
+}
+
+export function validateNotesSearchProjection(db: Database): void {
+    // rank 1 compares the index against the content view; the default rank 0 only
+    // checks internal consistency and accepts a posting with no content row.
+    db.exec("INSERT INTO notes_fts(notes_fts, rank) VALUES('integrity-check', 1)");
+    const counts = db
+        .prepare(
+            `SELECT (SELECT COUNT(*) FROM notes) AS notes,
+                    (SELECT COUNT(*) FROM notes_fts) AS projected`,
+        )
+        .get() as { notes: number; projected: number } | null;
+    if (!counts || counts.notes !== counts.projected) {
+        throw new Error(
+            `notes_fts projection validation failed: expected ${counts?.notes ?? "?"} rows, got ${counts?.projected ?? "?"}`,
+        );
     }
 }
 
@@ -2816,6 +2982,102 @@ export const MIGRATIONS: Migration[] = [
                     created_at INTEGER NOT NULL
                 );
             `);
+        },
+    },
+    {
+        version: 79,
+        description: "add notes_fts trigram candidate projection for note search",
+        up(db: Database): void {
+            installNotesSearchProjection(db);
+        },
+    },
+    {
+        version: 80,
+        description: "move mutable memory telemetry into the memory_stats side table",
+        up(db: Database): void {
+            if (!tableExists(db, "memories")) return;
+            if (tableExists(db, "memory_stats")) return;
+            const columns = new Set(
+                (db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>).map(
+                    (row) => row.name,
+                ),
+            );
+            for (const column of [
+                "seen_count",
+                "retrieval_count",
+                "last_seen_at",
+                "last_retrieved_at",
+                "updated_at",
+            ]) {
+                if (!columns.has(column)) return;
+            }
+            // Fail closed before creating any v80 object so a rollback leaves an
+            // intact v79 database.
+            assertValidV79MemoryTelemetry(db);
+
+            db.exec(`
+                CREATE TABLE memory_stats (
+                    memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                    seen_count INTEGER NOT NULL CHECK (typeof(seen_count) = 'integer' AND seen_count >= 0),
+                    retrieval_count INTEGER NOT NULL CHECK (typeof(retrieval_count) = 'integer' AND retrieval_count >= 0),
+                    last_seen_at INTEGER NOT NULL,
+                    last_retrieved_at INTEGER,
+                    updated_at INTEGER NOT NULL
+                );
+            `);
+            // Backfill runs before the authority guards are installed: the
+            // migration transaction is schema-owned and must copy managed
+            // projects' rows too.
+            db.exec(`
+                INSERT INTO memory_stats (memory_id, seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at)
+                SELECT id, seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at FROM memories;
+            `);
+            assertMemoryStatsCardinality(db);
+
+            const privilegeCheck = authorityPrivilegeCheck();
+            const managedStats = (ref: string): string => `(
+                EXISTS (SELECT 1 FROM authority_managed am JOIN memories m ON m.project_path = am.project_path WHERE m.id = ${ref}.memory_id)
+                OR EXISTS (SELECT 1 FROM authority_repair_pending arp JOIN memories m ON m.project_path = arp.project_path WHERE m.id = ${ref}.memory_id)
+            )`;
+            db.exec(`
+                CREATE TRIGGER memory_stats_authority_guard_insert
+                BEFORE INSERT ON memory_stats
+                WHEN ${managedStats("NEW")} AND ${privilegeCheck}
+                BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+                CREATE TRIGGER memory_stats_authority_guard_update
+                BEFORE UPDATE ON memory_stats
+                WHEN (${managedStats("OLD")} OR ${managedStats("NEW")}) AND ${privilegeCheck}
+                BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+                CREATE TRIGGER memory_stats_authority_guard_delete
+                BEFORE DELETE ON memory_stats
+                WHEN ${managedStats("OLD")} AND ${privilegeCheck}
+                BEGIN SELECT RAISE(ABORT, 'context.db memory writes are managed by the Rust module'); END;
+            `);
+            // The frozen-baseline guard applies to every writer, privileged or
+            // not: after v80 no path may mutate the retained legacy columns. A
+            // full-row UPDATE that binds the old values back is allowed (the
+            // WHEN clause compares values), so held-open statements that do not
+            // change telemetry keep working.
+            db.exec(`
+                CREATE TRIGGER memories_telemetry_freeze_guard
+                BEFORE UPDATE OF seen_count, retrieval_count, last_seen_at, last_retrieved_at ON memories
+                WHEN NEW.seen_count IS NOT OLD.seen_count
+                  OR NEW.retrieval_count IS NOT OLD.retrieval_count
+                  OR NEW.last_seen_at IS NOT OLD.last_seen_at
+                  OR NEW.last_retrieved_at IS NOT OLD.last_retrieved_at
+                BEGIN SELECT RAISE(ABORT, 'memories telemetry columns are frozen at v80; write memory_stats instead'); END;
+            `);
+            // One mechanism for every inserter (held-open v79 statements, v80
+            // TypeScript, privileged module mirrors): the base insert's
+            // telemetry values are the stats baseline. No OR IGNORE — an
+            // invalid tuple aborts the owning insert.
+            db.exec(`
+                CREATE TRIGGER memories_stats_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memory_stats (memory_id, seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at)
+                    VALUES (NEW.id, COALESCE(NEW.seen_count, 1), COALESCE(NEW.retrieval_count, 0), NEW.last_seen_at, NEW.last_retrieved_at, NEW.updated_at);
+                END;
+            `);
+            installValueSensitiveMemoriesFtsUpdateTrigger(db);
         },
     },
 ];

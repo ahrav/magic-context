@@ -28,21 +28,49 @@ function cloneVector(vector: Float32Array | null): Float32Array | null {
     return vector ? new Float32Array(vector) : null;
 }
 
-function averageVectors(vectors: Float32Array[]): Float32Array | null {
-    if (vectors.length === 0) return null;
-    const dims = vectors[0].length;
-    if (dims === 0) return null;
-    const out = new Float32Array(dims);
-    for (const vector of vectors) {
-        if (vector.length !== dims) return null;
-        for (let i = 0; i < dims; i += 1) out[i] += vector[i];
-    }
-    for (let i = 0; i < dims; i += 1) out[i] /= vectors.length;
-    return out;
-}
-
 function candidateSortKey(candidate: PrimerCandidate): string {
     return `${primerOccurrenceKey(candidate)}\u001f${candidate.id}`;
+}
+
+/** `invalid` latches the zero-dimension and dimension-mismatch cases, which
+ *  yield no centroid however many vectors follow. */
+interface CentroidAccumulator {
+    sum: Float32Array | null;
+    count: number;
+    dims: number;
+    invalid: boolean;
+}
+
+function createAccumulator(): CentroidAccumulator {
+    return { sum: null, count: 0, dims: 0, invalid: false };
+}
+
+/** `accumulateVector` preserves caller order so Float32 rounding matches a
+ *  left-to-right sum over the candidate sequence. */
+function accumulateVector(state: CentroidAccumulator, vector: Float32Array): void {
+    state.count += 1;
+    if (state.sum === null) {
+        state.dims = vector.length;
+        if (vector.length === 0) {
+            state.invalid = true;
+            return;
+        }
+        state.sum = new Float32Array(vector.length);
+    }
+    if (state.invalid) return;
+    if (vector.length !== state.dims) {
+        state.invalid = true;
+        return;
+    }
+    const sum = state.sum;
+    for (let i = 0; i < state.dims; i += 1) sum[i] += vector[i];
+}
+
+function accumulatorCentroid(state: CentroidAccumulator): Float32Array | null {
+    if (state.invalid || state.sum === null || state.count === 0) return null;
+    const out = new Float32Array(state.dims);
+    for (let i = 0; i < state.dims; i += 1) out[i] = state.sum[i] / state.count;
+    return out;
 }
 
 function sameEmbeddingSpace(candidate: PrimerCandidate, modelId: string | null): boolean {
@@ -58,14 +86,9 @@ function candidateAlreadyInPrimer(candidate: PrimerCandidate, primer: Primer): b
     return primer.sourceCandidateIds.includes(candidate.id);
 }
 
-function recomputeClusterCentroid(cluster: PrimerCluster): void {
-    const modelId = cluster.modelId;
-    const vectors = cluster.candidates
-        .filter((candidate) => sameEmbeddingSpace(candidate, modelId))
-        .map((candidate) => candidate.questionEmbedding)
-        .filter((vector): vector is Float32Array => Boolean(vector));
-    if (vectors.length > 0) {
-        cluster.centroid = averageVectors(vectors);
+function applyClusterCentroid(cluster: PrimerCluster, state: CentroidAccumulator): void {
+    if (state.count > 0) {
+        cluster.centroid = accumulatorCentroid(state);
         return;
     }
     if (cluster.primer?.questionEmbedding) {
@@ -96,10 +119,24 @@ export function buildPrimerClusters(args: {
             centroid: cloneVector(primer.questionEmbedding),
             modelId: primer.questionEmbeddingModelId,
         }));
+    // `CentroidAccumulator` never re-accumulates a divided centroid.
+    const accumulators = new Map<PrimerCluster, CentroidAccumulator>();
+    for (const cluster of clusters) accumulators.set(cluster, createAccumulator());
 
     const sorted = args.candidates
         .slice()
         .sort((a, b) => candidateSortKey(a).localeCompare(candidateSortKey(b)));
+
+    const accumulateCandidate = (
+        cluster: PrimerCluster,
+        state: CentroidAccumulator,
+        candidate: PrimerCandidate,
+    ): void => {
+        const vector = candidate.questionEmbedding;
+        if (vector && sameEmbeddingSpace(candidate, cluster.modelId)) {
+            accumulateVector(state, vector);
+        }
+    };
 
     for (const candidate of sorted) {
         let best: { cluster: PrimerCluster; score: number } | null = null;
@@ -125,16 +162,23 @@ export function buildPrimerClusters(args: {
 
         if (best) {
             best.cluster.candidates.push(candidate);
-            recomputeClusterCentroid(best.cluster);
+            const state = accumulators.get(best.cluster) ?? createAccumulator();
+            accumulators.set(best.cluster, state);
+            accumulateCandidate(best.cluster, state, candidate);
+            applyClusterCentroid(best.cluster, state);
             continue;
         }
 
-        clusters.push({
+        const created: PrimerCluster = {
             primer: null,
             candidates: [candidate],
             centroid: cloneVector(candidate.questionEmbedding),
             modelId: candidate.questionEmbeddingModelId,
-        });
+        };
+        const createdState = createAccumulator();
+        accumulateCandidate(created, createdState, candidate);
+        accumulators.set(created, createdState);
+        clusters.push(created);
     }
 
     return clusters;
