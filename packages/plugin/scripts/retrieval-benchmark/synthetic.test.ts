@@ -80,6 +80,20 @@ describe("iterateSyntheticDocuments", () => {
         ]).toThrow(SyntheticProfileError);
         expect(SYNTHETIC_GENERATOR_VERSION).toBe(profile().generatorVersion);
     });
+
+    it("rejects a source distribution whose total weight overflows", () => {
+        // Each weight passes the positive-finite schema, but the sum is
+        // Infinity: every draw would silently land on the last source kind.
+        expect(() => [
+            ...iterateSyntheticDocuments({
+                ...profile(),
+                sourceDistribution: {
+                    memory: Number.MAX_VALUE,
+                    message: Number.MAX_VALUE,
+                },
+            }),
+        ]).toThrow(/non-finite-source-distribution/);
+    });
 });
 
 describe("judged-loader separation", () => {

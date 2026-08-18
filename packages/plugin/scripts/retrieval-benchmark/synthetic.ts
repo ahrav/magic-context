@@ -74,6 +74,16 @@ export function checkSyntheticProfile(profile: SyntheticProfile): void {
     if (Object.keys(profile.sourceDistribution).length === 0) {
         throw new SyntheticProfileError("empty-source-distribution");
     }
+    // Each weight is schema-checked positive and finite, but the SUM can
+    // still overflow to Infinity, which would silently send every draw to
+    // the last source kind instead of the approved distribution.
+    const totalWeight = Object.values(profile.sourceDistribution).reduce(
+        (sum, weight) => sum + (weight ?? 0),
+        0,
+    );
+    if (!Number.isFinite(totalWeight)) {
+        throw new SyntheticProfileError("non-finite-source-distribution");
+    }
 }
 
 /** Lazily yield the profile's ordered unlabeled document stream. */

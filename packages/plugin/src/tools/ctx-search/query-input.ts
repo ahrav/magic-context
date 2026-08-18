@@ -19,5 +19,9 @@ export function normalizeCtxSearchArgs(rawArgs: CtxSearchArgs): CtxSearchArgs {
 }
 
 export function extractCtxSearchQueryInput(rawArgs: CtxSearchArgs): ExplicitQueryPreparation {
-    return prepareExplicitQuery(normalizeCtxSearchArgs(rawArgs).query ?? "");
+    // Persisted or model-supplied args can carry a non-string query (e.g.
+    // { "query": 123 }); treat it like a missing query instead of letting
+    // Buffer.byteLength throw a TypeError through every caller.
+    const query = normalizeCtxSearchArgs(rawArgs).query;
+    return prepareExplicitQuery(typeof query === "string" ? query : "");
 }

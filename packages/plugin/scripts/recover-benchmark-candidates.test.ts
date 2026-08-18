@@ -284,6 +284,7 @@ describe("collectSessionCandidates", () => {
                         },
                     },
                     { type: "tool", tool: "ctx_search", state: { input: null } },
+                    { type: "tool", tool: "ctx_search", state: { input: { query: 123 } } },
                     { type: "tool", tool: "other_tool", state: { input: { query: "not ours" } } },
                 ],
             },

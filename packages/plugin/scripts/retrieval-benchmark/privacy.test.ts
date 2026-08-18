@@ -21,6 +21,8 @@ describe("scanForSensitiveContent", () => {
             [{ q: "see /workspace/customer-x/src/main.ts" }, "source-path"],
             [{ q: "config at /mnt/projects/acme/file.ts" }, "source-path"],
             [{ q: "repo at D:\\repos\\private\\x.ts" }, "source-path"],
+            [{ q: "share \\\\customer-server\\private-share\\repo\\main.ts" }, "source-path"],
+            [{ q: "work in D:\\Client Work\\repo\\main.ts" }, "source-path"],
             [{ q: "endpoint http://192.168.1.10:8080/api" }, "shareability"],
             [{ q: "control\u0000char" }, "control-character"],
             [

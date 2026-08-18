@@ -382,6 +382,56 @@ describe("validateRelease", () => {
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
+        // Compartments, primers, and notes carry numeric production ids too.
+        const noteRelease = makeValidRelease();
+        const noteDoc = noteRelease.corpus.documents.find(
+            (d) => d.id === "d-current-constraint-dev",
+        );
+        if (!noteDoc || noteDoc.kind !== "note") throw new Error("fixture note doc missing");
+        noteDoc.aliases[0].locator = "not-a-number";
+        expect(
+            diagnosticsOf(() => validateRelease(noteRelease.corpus, noteRelease.judgments)),
+        ).toContain(
+            "corpus: target has no production-producible alias (q-current-constraint-dev, d-current-constraint-dev)",
+        );
+    });
+
+    it("counts only producible memory aliases for visible-memory hiding", () => {
+        const { corpus, judgments } = makeValidRelease();
+        const query = corpus.queries.find((q) => q.id === "q-exact-symbol-path-dev");
+        const document = corpus.documents.find((d) => d.id === "d-exact-symbol-path-dev");
+        if (!query || !document) throw new Error("fixture entries missing");
+        // A migration alias production cannot emit must not rescue a memory
+        // target whose only producible alias is hidden.
+        document.aliases.push({
+            namespace: "claim",
+            locator: "migration-spelling",
+            projectScope: document.aliases[0].projectScope,
+            sessionScope: null,
+        });
+        query.visibleState.visibleMemoryIds = [Number(document.aliases[0].locator)];
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target hidden by visible memories (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+        );
+    });
+
+    it("rejects a positive target pooled in the opposite partition", () => {
+        const { corpus, judgments } = makeValidRelease();
+        // d-error-message-hold is positive for its holdout query; adding it
+        // to a development pool with grade 0 exposes the holdout target's
+        // content to development tuning as a labeled distractor.
+        const devPool = judgments.pools.find((p) => p.queryId === "q-error-message-dev");
+        if (!devPool) throw new Error("fixture pool missing");
+        devPool.documentIds.push("d-error-message-hold");
+        judgments.judgments.push({
+            queryId: "q-error-message-dev",
+            documentId: "d-error-message-hold",
+            grade: 0,
+            provenance: { judge: "human", pooledFrom: ["manual"] },
+        });
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "judgments: positive target pooled in opposite partition (d-error-message-hold)",
+        );
     });
 
     it("rejects a category missing coverage in either partition", () => {

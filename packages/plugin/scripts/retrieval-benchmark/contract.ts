@@ -461,34 +461,46 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
     // into development tuning. Keyed on the canonical relevance identity so a
     // payload twin under a different document id cannot re-register holdout
     // content in development (parseCorpus rejects twins; this holds even for
-    // corpora that bypassed it).
+    // corpora that bypassed it). Grade-0 occurrences count as exposure too:
+    // a holdout target sitting in a development pool as a labeled distractor
+    // reveals its exact content and identity to development tuning.
     const identityByDocument = new Map(
         corpus.documents.map((d) => [d.id, relevanceIdentity(d.semanticPayload)]),
     );
     const identityPartitions = new Map<
         string,
-        { partitions: Set<string>; documentIds: Set<string> }
+        { positive: Set<string>; judged: Set<string>; documentIds: Set<string> }
     >();
     for (const [queryId, byDoc] of judged) {
         const query = queryById.get(queryId);
         if (!query) continue;
         for (const [documentId, judgment] of byDoc) {
-            if (judgment.grade === 0) continue;
             const identity = identityByDocument.get(documentId);
             if (!identity) continue;
             let entry = identityPartitions.get(identity);
             if (!entry) {
-                entry = { partitions: new Set(), documentIds: new Set() };
+                entry = { positive: new Set(), judged: new Set(), documentIds: new Set() };
                 identityPartitions.set(identity, entry);
             }
-            entry.partitions.add(query.partition);
-            entry.documentIds.add(documentId);
+            entry.judged.add(query.partition);
+            if (judgment.grade > 0) {
+                entry.positive.add(query.partition);
+                entry.documentIds.add(documentId);
+            }
         }
     }
     for (const entry of identityPartitions.values()) {
-        if (entry.partitions.size > 1) {
+        if (entry.positive.size > 1) {
             diagnostics.push(
                 `judgments: target document crosses partitions (${[...entry.documentIds]
+                    .sort()
+                    .join(", ")})`,
+            );
+        } else if (entry.positive.size === 1 && entry.judged.size > 1) {
+            diagnostics.push(
+                `judgments: positive target pooled in opposite partition (${[
+                    ...entry.documentIds,
+                ]
                     .sort()
                     .join(", ")})`,
             );
@@ -547,15 +559,21 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
             } else {
                 // At least one scoped alias must be producible by the CURRENT
                 // search path: production encodes results as
-                // SOURCE_LOCATOR_KIND[kind]:<locator> (numeric ids for
-                // memories), so a target carrying only migration-dialect or
-                // wrong-shape aliases can never resolve. Migration aliases
-                // remain valid as ADDITIONAL spellings.
+                // SOURCE_LOCATOR_KIND[kind]:<locator>, with numeric ids for
+                // memories, compartments, primers, and notes — so a target
+                // carrying only migration-dialect or wrong-shape aliases can
+                // never resolve. Migration aliases remain valid as
+                // ADDITIONAL spellings.
                 const producibleNamespace = SOURCE_LOCATOR_KIND[document.kind];
+                const numericLocator =
+                    document.kind === "memory" ||
+                    document.kind === "compartment" ||
+                    document.kind === "primer" ||
+                    document.kind === "note";
                 const producible = reachableAliases.filter(
                     (alias) =>
                         alias.namespace === producibleNamespace &&
-                        (document.kind !== "memory" || /^\d+$/.test(alias.locator)),
+                        (!numericLocator || /^\d+$/.test(alias.locator)),
                 );
                 if (producible.length === 0) {
                     diagnostics.push(
@@ -563,12 +581,14 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     );
                 }
                 // Production memory search hard-filters every id in
-                // visibleMemoryIds; a memory target whose reachable aliases
-                // are all hidden is as unretrievable as a filtered source.
+                // visibleMemoryIds; a memory target whose PRODUCIBLE aliases
+                // are all hidden is unretrievable even when a migration
+                // spelling survives, because production cannot emit it.
                 const visible = new Set(query.visibleState.visibleMemoryIds.map(String));
-                const allHidden = reachableAliases.every(
-                    (alias) => alias.namespace === "memory" && visible.has(alias.locator),
-                );
+                const allHidden =
+                    document.kind === "memory" &&
+                    producible.length > 0 &&
+                    producible.every((alias) => visible.has(alias.locator));
                 if (allHidden) {
                     diagnostics.push(
                         `corpus: target hidden by visible memories (${queryId}, ${documentId})`,

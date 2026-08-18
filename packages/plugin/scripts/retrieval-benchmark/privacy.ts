@@ -55,10 +55,13 @@ const SESSION_ID = /\bses[_-][A-Za-z0-9]{8,}/;
 // case-insensitive and tools emit `c:/users/...` as readily as `C:\Users\`.
 const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-])~\/)/i;
 // Identifying paths are not only home-rooted: `/workspace/customer-x/src`,
-// `/mnt/projects/acme`, or `D:\repos\x` carry the same signal. Any
-// multi-segment absolute path (or drive-rooted Windows path) rejects; this
-// is a rejecting gate, so over-matching costs a review, never a leak.
-const ABSOLUTE_PATH = /(?:(?:^|[\s"'`=:([])\/(?:[\w.@+-]+\/)+[\w.@+-]+|[A-Za-z]:[\\/][^\s\\/]+[\\/])/;
+// `/mnt/projects/acme`, `D:\Client Work\repo`, or a UNC share
+// `\\server\share\...` carry the same signal. Any multi-segment absolute
+// path, drive-rooted Windows path (spaces allowed inside components), or
+// UNC server+share prefix rejects; this is a rejecting gate, so
+// over-matching costs a review, never a leak.
+const ABSOLUTE_PATH =
+    /(?:(?:^|[\s"'`=:([])\/(?:[\w.@+-]+\/)+[\w.@+-]+|[A-Za-z]:[\\/][^\\/\r\n]+[\\/]|\\\\[\w.-]+\\[^\\\r\n]+)/;
 
 interface ForbiddenMatchers {
     tokens: readonly string[];
