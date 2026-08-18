@@ -149,7 +149,7 @@ function atomEndOffsets(text: string): number[] {
 /** Largest index in [0, upper] whose prefix satisfies `fits`, assuming `fits`
  *  is monotone (a longer prefix never has fewer tokens). Returns -1 when even
  *  index 0 does not fit. */
-function binarySearchLargestFit(upper: number, fits: (index: number) => boolean): number {
+export function binarySearchLargestFit(upper: number, fits: (index: number) => boolean): number {
     let low = 0;
     let high = upper;
     let best = -1;

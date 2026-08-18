@@ -29,13 +29,28 @@ const CONTENT_DROP_TAGS = [
     "instruction",
 ] as const;
 
+/** Index of the tag-closing `>` at or after `start`, scanning only until the
+ *  next `<` — a nested `<` means the candidate span is plain text, not a tag
+ *  body. Bounding the scan at the next `<` keeps the whole stripper linear:
+ *  a prompt full of `<` characters with no later `>` cannot trigger an
+ *  end-of-string scan per candidate. Returns -1 when the span is not a tag
+ *  body. */
+function findTagClose(text: string, start: number): number {
+    for (let i = start; i < text.length; i += 1) {
+        const char = text[i];
+        if (char === ">") return i;
+        if (char === "<") return -1;
+    }
+    return -1;
+}
+
 /** `<name ...>` / `</name>` at `index`, returning the tag end and whether it
- *  closes, or null when `text` does not carry that tag here. */
+ *  closes or self-closes, or null when `text` does not carry that tag here. */
 function matchDropTag(
     text: string,
     index: number,
     name: string,
-): { end: number; closing: boolean } | null {
+): { end: number; closing: boolean; selfClosing: boolean } | null {
     let cursor = index + 1;
     let closing = false;
     if (text[cursor] === "/") {
@@ -44,13 +59,15 @@ function matchDropTag(
     }
     if (!text.startsWith(name, cursor)) return null;
     cursor += name.length;
-    if (text[cursor] === ">") return { end: cursor + 1, closing };
+    if (text[cursor] === ">") return { end: cursor + 1, closing, selfClosing: false };
     // Opening tags may carry attributes (`<instruction context="...">`), but a
     // name prefix (`<instructions>`) is a different tag.
     if (closing || (text[cursor] !== " " && text[cursor] !== "\t")) return null;
-    const close = text.indexOf(">", cursor);
-    if (close === -1 || text.slice(cursor, close).includes("<")) return null;
-    return { end: close + 1, closing: false };
+    const close = findTagClose(text, cursor);
+    if (close === -1) return null;
+    // `<instruction .../>` is a complete, empty block: it must not open a
+    // content-drop span, or everything after it would be silently discarded.
+    return { end: close + 1, closing: false, selfClosing: text[close - 1] === "/" };
 }
 
 /** Generic `<...>` markup span at `index`, or null when the `<` is plain text. */
@@ -63,9 +80,8 @@ function matchGenericTag(text: string, index: number): number | null {
         const second = text[index + 2];
         if (!((second >= "a" && second <= "z") || (second >= "A" && second <= "Z"))) return null;
     }
-    const close = text.indexOf(">", index + 1);
+    const close = findTagClose(text, index + 1);
     if (close === -1) return null;
-    if (text.slice(index + 1, close).includes("<")) return null;
     return close + 1;
 }
 
@@ -97,7 +113,7 @@ export function collectStrippedPromptPrefix(raw: string): string {
                     // malformed input cannot bleed into the embedded text.
                     const openIndex = dropStack.lastIndexOf(name);
                     if (openIndex !== -1) dropStack.length = openIndex;
-                } else {
+                } else if (!tag.selfClosing) {
                     dropStack.push(name);
                 }
                 i = tag.end;

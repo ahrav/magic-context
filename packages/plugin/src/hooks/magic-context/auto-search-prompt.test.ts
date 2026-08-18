@@ -54,6 +54,31 @@ describe("collectStrippedPromptPrefix", () => {
         expect(stripped).toBe("keep me");
     });
 
+    it("does not open a drop block for a self-closing attributed drop tag", () => {
+        expect(
+            collectStrippedPromptPrefix(
+                '<instruction name="x"/> why does the retry loop deadlock?',
+            ).trim(),
+        ).toBe("why does the retry loop deadlock?");
+        expect(
+            collectStrippedPromptPrefix('<system-reminder foo="1"/> question survives').trim(),
+        ).toBe("question survives");
+    });
+
+    it("does not open a drop block for a bare self-closing drop tag", () => {
+        expect(collectStrippedPromptPrefix("<instruction/> question survives").trim()).toBe(
+            "question survives",
+        );
+    });
+
+    it("finds the drop-block close across bare < characters in dropped content", () => {
+        expect(
+            collectStrippedPromptPrefix(
+                "<instruction>x < y and a<b comparisons</instruction> keep this",
+            ).trim(),
+        ).toBe("keep this");
+    });
+
     it("removes HTML comments including multiline content", () => {
         expect(collectStrippedPromptPrefix("a <!-- note\nacross lines --> b").trim()).toBe("a  b");
     });

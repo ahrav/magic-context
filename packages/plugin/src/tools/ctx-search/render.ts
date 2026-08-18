@@ -11,29 +11,17 @@
 
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import {
+    binarySearchLargestFit,
     boundDynamicField,
     MAX_RENDERED_RESULT_TOKENS,
 } from "../../features/magic-context/search-bounds";
+import { formatAge } from "../../shared/format-age";
 import { estimateTokens } from "../../shared/token-estimator";
 
 const NOTE_EXPAND_HINT =
     "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 const MESSAGE_EXPAND_HINT =
     "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.";
-
-function formatAge(committedAtMs: number): string {
-    const ageMs = Date.now() - committedAtMs;
-    if (ageMs < 0) return "future";
-    const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
-    if (days <= 0) return "today";
-    if (days === 1) return "1d ago";
-    if (days < 30) return `${days}d ago`;
-    const months = Math.floor(days / 30);
-    if (months === 1) return "1mo ago";
-    if (months < 12) return `${months}mo ago`;
-    const years = Math.floor(days / 365);
-    return years === 1 ? "1y ago" : `${years}y ago`;
-}
 
 function formatResult(
     result: UnifiedSearchResult,
@@ -143,27 +131,24 @@ export function formatSearchResults(
         return full;
     }
 
-    for (let kept = results.length - 1; kept >= 0; kept -= 1) {
-        const omitted = results.length - kept;
-        const notice = `(${omitted} result${omitted === 1 ? "" : "s"} omitted to fit the output budget — refine the query or lower the limit)`;
-        const parts =
-            kept === 0
-                ? [notice]
-                : [
-                      ...bodyPartsFor(
-                          blocks.slice(0, kept),
-                          results.slice(0, kept),
-                          currentSessionId,
-                      ),
-                      notice,
-                  ];
-        const candidate = assemble(header, parts);
-        if (estimateTokens(candidate) <= MAX_RENDERED_RESULT_TOKENS) {
-            return candidate;
-        }
+    const noticeFor = (omitted: number) =>
+        `(${omitted} result${omitted === 1 ? "" : "s"} omitted to fit the output budget — refine the query or lower the limit)`;
+    const candidateFor = (kept: number) =>
+        assemble(header, [
+            ...bodyPartsFor(blocks.slice(0, kept), results.slice(0, kept), currentSessionId),
+            noticeFor(results.length - kept),
+        ]);
+
+    // Token count grows monotonically with the kept prefix, so the largest
+    // fitting prefix is found by binary search instead of re-tokenizing the
+    // whole candidate once per dropped block.
+    const bestIndex = binarySearchLargestFit(
+        results.length - 2,
+        (index) => estimateTokens(candidateFor(index + 1)) <= MAX_RENDERED_RESULT_TOKENS,
+    );
+    if (bestIndex >= 0) {
+        return candidateFor(bestIndex + 1);
     }
 
-    return assemble(header, [
-        `(${results.length} result${results.length === 1 ? "" : "s"} omitted to fit the output budget — refine the query or lower the limit)`,
-    ]);
+    return assemble(header, [noticeFor(results.length)]);
 }

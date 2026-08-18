@@ -32,6 +32,7 @@ import {
 } from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
 import {
+    countNoteFtsMatchesBatch,
     countSearchableNotes,
     getRecentSearchableNotes,
     getSearchableNotesByIds,
@@ -1206,6 +1207,42 @@ function loadNoteSearchCorpus(args: {
     });
 }
 
+/**
+ * Corpus-wide document frequency per probe for discrimination weighting. The
+ * candidate pool is capped at MAX_LANE_CANDIDATES, so counting a probe's
+ * matches inside the pool would clamp df at the cap while the weight's
+ * denominator stays corpus-wide — inflating a non-discriminative probe's
+ * weight by up to corpus/cap. Probes without an indexed count (unrepresentable
+ * atom, absent projection, malformed query) are omitted; the caller falls
+ * back to its pool-derived count for those.
+ */
+function noteProbeDocumentFrequencies(args: {
+    db: Database;
+    sessionId: string;
+    projectPath: string;
+    probes: readonly string[];
+}): Map<string, number> {
+    const frequencies = new Map<string, number>();
+    const queryByProbe = new Map<string, string>();
+    for (const probe of args.probes) {
+        if (queryByProbe.has(probe)) continue;
+        const query = noteFtsQueryForNeedle(probe);
+        if (query !== null && query.length > 0) queryByProbe.set(probe, query);
+    }
+    if (queryByProbe.size === 0) return frequencies;
+    const countable = [...queryByProbe.entries()];
+    const counts = countNoteFtsMatchesBatch(
+        args.db,
+        countable.map(([, query]) => query),
+        { sessionId: args.sessionId, projectPath: args.projectPath },
+    );
+    if (counts === null) return frequencies;
+    countable.forEach(([probe], index) => {
+        frequencies.set(probe, counts[index] ?? 0);
+    });
+    return frequencies;
+}
+
 function searchNotes(args: {
     db: Database;
     sessionId: string;
@@ -1258,13 +1295,22 @@ function searchNotes(args: {
     if (baseList.length > 0) {
         queryLists.push({ rows: baseList, weight: 1 });
     }
+    const probeFrequencies = noteProbeDocumentFrequencies({
+        db: args.db,
+        sessionId: args.sessionId,
+        projectPath: args.projectPath,
+        probes,
+    });
     const probeWeights = new Map<string, number>();
     for (const probe of probes) {
         const rows = rankNotesForNeedle(notes, probe);
         if (rows.length === 0) {
             continue;
         }
-        const weight = probeDiscriminationWeight(rows.length, corpusSize);
+        const weight = probeDiscriminationWeight(
+            probeFrequencies.get(probe) ?? rows.length,
+            corpusSize,
+        );
         probeWeights.set(probe, weight);
         queryLists.push({ rows, weight });
     }

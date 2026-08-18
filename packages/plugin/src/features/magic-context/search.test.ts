@@ -37,7 +37,13 @@ import {
 import { QueryBoundsError } from "./search-bounds";
 import { countingDatabase } from "./sql-counters";
 import { initializeDatabase } from "./storage-db";
-import { addNote, dismissNote, updateNote } from "./storage-notes";
+import {
+    addNote,
+    countNoteFtsMatchesBatch,
+    dismissNote,
+    selectNoteCandidateIds,
+    updateNote,
+} from "./storage-notes";
 import { createPrimer } from "./storage-primers";
 
 const readMessages = (sessionId: string) => rawMessagesBySession.get(sessionId) ?? [];
@@ -2300,6 +2306,46 @@ describe("note candidate pruning (R36)", () => {
         expect(counts.length).toBeGreaterThan(0);
         expect(counts[0].sql).toContain("type = 'session'");
         expect(counts[0].sql).toContain("type = 'smart'");
+    });
+
+    it("uses an indexed corpus-wide count for the probe-discrimination numerator", async () => {
+        seedNoteCorpus(db);
+        const counter = countingDatabase(db);
+
+        await unifiedSearch(
+            counter.db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "queue drain applyBackpressure()",
+            noteSearchOptions(true),
+        );
+
+        // Probe document frequencies count over the whole eligible corpus via
+        // the projection — not the capped candidate pool.
+        const probeCounts = counter.matching(/queryIndex/);
+        expect(probeCounts.length).toBeGreaterThan(0);
+        expect(probeCounts[0].sql).toContain("COUNT(*)");
+        expect(probeCounts[0].sql).toContain("notes_fts MATCH");
+    });
+
+    it("counts probe document frequency beyond the candidate-pool cap", () => {
+        const total = 180;
+        for (let index = 0; index < total; index += 1) {
+            addNote(db, "session", {
+                sessionId: NOTE_SESSION,
+                content: `Common telemetry counter note number ${index}.`,
+            });
+        }
+        const scope = { sessionId: NOTE_SESSION, projectPath: NOTE_PROJECT };
+
+        const pool = selectNoteCandidateIds(db, '"telemetry"', { ...scope, limit: 150 });
+        expect(pool).not.toBeNull();
+        expect(pool).toHaveLength(150);
+
+        // The df numerator must not clamp at the pool cap, or a common probe
+        // regains up to corpus/cap of the weight the IDF falloff removes.
+        const counts = countNoteFtsMatchesBatch(db, ['"telemetry"'], scope);
+        expect(counts).toEqual([total]);
     });
 
     it("falls back to the scoped scan for a needle shorter than a trigram", async () => {

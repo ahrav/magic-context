@@ -27,12 +27,12 @@ import {
     boundDynamicField,
     MAX_AUTO_HINT_TOKENS,
 } from "../../features/magic-context/search-bounds";
+import { formatAge } from "../../shared/format-age";
 import { estimateTokens } from "../../shared/token-estimator";
 import { cavemanCompress } from "./caveman";
 
 const MAX_FRAGMENTS = 3;
 const FRAGMENT_CHAR_CAP = 80; // ~20 tokens at 3.5 chars/token
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 export interface AutoSearchHintOptions {
     maxFragments?: number;
@@ -43,20 +43,6 @@ function truncate(text: string, limit: number): string {
     const normalized = text.replace(/\s+/g, " ").trim();
     if (normalized.length <= limit) return normalized;
     return `${normalized.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
-}
-
-function formatAge(committedAtMs: number): string {
-    const delta = Date.now() - committedAtMs;
-    if (delta < 0) return "future";
-    const days = Math.floor(delta / MS_PER_DAY);
-    if (days <= 0) return "today";
-    if (days === 1) return "1d ago";
-    if (days < 30) return `${days}d ago`;
-    const months = Math.floor(days / 30);
-    if (months === 1) return "1mo ago";
-    if (months < 12) return `${months}mo ago`;
-    const years = Math.floor(days / 365);
-    return years === 1 ? "1y ago" : `${years}y ago`;
 }
 
 function renderFragment(result: UnifiedSearchResult, charCap: number): string {

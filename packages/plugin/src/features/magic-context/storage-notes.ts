@@ -287,6 +287,30 @@ export function getNotes(db: Database, options: GetNotesOptions = {}): Note[] {
 
 const NOTE_SEARCH_STATUSES: NoteStatus[] = ["active", "pending", "ready", "dismissed"];
 
+/**
+ * Shared searchable-note eligibility predicate (status + session/smart scope).
+ * Candidate selection, hydration, the recency fallback, and the corpus counts
+ * all build from this one fragment so eligibility cannot drift between them —
+ * a divergence would silently drop selected candidates at hydration or give
+ * the FTS and fallback paths different eligible universes.
+ * Bind with `searchableNoteScopeParams` immediately after any preceding
+ * placeholders in the statement.
+ */
+function searchableNoteScopeSql(prefix: string): string {
+    const col = (name: string) => (prefix.length > 0 ? `${prefix}.${name}` : name);
+    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
+    return `${col("status")} IN (${statusPlaceholders})
+                    AND ((${col("type")} = 'session' AND ${col("session_id")} = ?)
+                      OR (${col("type")} = 'smart' AND ${col("project_path")} = ?))`;
+}
+
+function searchableNoteScopeParams(scope: {
+    sessionId: string;
+    projectPath: string;
+}): Array<string | number> {
+    return [...NOTE_SEARCH_STATUSES, scope.sessionId, scope.projectPath];
+}
+
 function notesProjectionExists(db: Database): boolean {
     const row = db
         .prepare(
@@ -305,7 +329,6 @@ export function selectNoteCandidateIds(
 ): number[] | null {
     if (!notesProjectionExists(db)) return null;
     if (ftsQuery.length === 0) return [];
-    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
     try {
         const rows = db
             .prepare(
@@ -313,22 +336,62 @@ export function selectNoteCandidateIds(
                    FROM notes_fts
                    JOIN notes ON notes.id = notes_fts.rowid
                   WHERE notes_fts MATCH ?
-                    AND notes.status IN (${statusPlaceholders})
-                    AND ((notes.type = 'session' AND notes.session_id = ?)
-                      OR (notes.type = 'smart' AND notes.project_path = ?))
+                    AND ${searchableNoteScopeSql("notes")}
                   ORDER BY bm25(notes_fts), notes.id ASC
                   LIMIT ?`,
             )
-            .all(
-                ftsQuery,
-                ...NOTE_SEARCH_STATUSES,
-                scope.sessionId,
-                scope.projectPath,
-                scope.limit,
-            ) as Array<{ id?: number }>;
+            .all(ftsQuery, ...searchableNoteScopeParams(scope), scope.limit) as Array<{
+            id?: number;
+        }>;
         return rows
             .map((row) => row.id)
             .filter((id): id is number => typeof id === "number" && Number.isFinite(id));
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Eligible-corpus document frequency for each FTS query, in query order, or
+ * null when the projection is absent or a query is malformed so the caller
+ * falls back to its pool-derived counts. Counting runs over the whole scoped
+ * corpus — not the capped candidate pool — so probe-discrimination weights
+ * keep a corpus-wide numerator to match their corpus-wide denominator.
+ */
+export function countNoteFtsMatchesBatch(
+    db: Database,
+    ftsQueries: readonly string[],
+    scope: { sessionId: string; projectPath: string },
+): number[] | null {
+    if (!notesProjectionExists(db)) return null;
+    if (ftsQueries.length === 0) return [];
+    const branch = `SELECT COUNT(*) AS count
+               FROM notes_fts
+               JOIN notes ON notes.id = notes_fts.rowid
+              WHERE notes_fts MATCH ?
+                AND ${searchableNoteScopeSql("notes")}`;
+    try {
+        const rows = db
+            .prepare(
+                ftsQueries
+                    .map((_, index) => `SELECT ${index} AS queryIndex, count FROM (${branch})`)
+                    .join("\nUNION ALL\n"),
+            )
+            .all(
+                ...ftsQueries.flatMap((query) => [query, ...searchableNoteScopeParams(scope)]),
+            ) as Array<{ queryIndex?: number; count?: number }>;
+        const counts = ftsQueries.map(() => 0);
+        for (const row of rows) {
+            if (
+                typeof row.queryIndex === "number" &&
+                row.queryIndex >= 0 &&
+                row.queryIndex < counts.length &&
+                typeof row.count === "number"
+            ) {
+                counts[row.queryIndex] = row.count;
+            }
+        }
+        return counts;
     } catch {
         return null;
     }
@@ -341,22 +404,17 @@ export function getSearchableNotesByIds(
     options: { ids: readonly number[]; sessionId: string; projectPath: string },
 ): Note[] {
     if (options.ids.length === 0) return [];
-    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
     return (
         db
             .prepare(
                 `SELECT notes.* FROM json_each(?) AS requested
                   CROSS JOIN notes ON notes.id = requested.value
-                  WHERE notes.status IN (${statusPlaceholders})
-                    AND ((notes.type = 'session' AND notes.session_id = ?)
-                      OR (notes.type = 'smart' AND notes.project_path = ?))
+                  WHERE ${searchableNoteScopeSql("notes")}
                   ORDER BY notes.created_at ASC, notes.id ASC`,
             )
             .all(
                 JSON.stringify([...options.ids]),
-                ...NOTE_SEARCH_STATUSES,
-                options.sessionId,
-                options.projectPath,
+                ...searchableNoteScopeParams(options),
             ) as unknown[]
     )
         .filter(isNoteRow)
@@ -367,23 +425,15 @@ export function getRecentSearchableNotes(
     db: Database,
     options: { sessionId: string; projectPath: string; limit: number },
 ): Note[] {
-    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
     return (
         db
             .prepare(
                 `SELECT * FROM notes
-                  WHERE status IN (${statusPlaceholders})
-                    AND ((type = 'session' AND session_id = ?)
-                      OR (type = 'smart' AND project_path = ?))
+                  WHERE ${searchableNoteScopeSql("")}
                   ORDER BY created_at DESC, id DESC
                   LIMIT ?`,
             )
-            .all(
-                ...NOTE_SEARCH_STATUSES,
-                options.sessionId,
-                options.projectPath,
-                options.limit,
-            ) as unknown[]
+            .all(...searchableNoteScopeParams(options), options.limit) as unknown[]
     )
         .filter(isNoteRow)
         .map(toNote);
@@ -394,22 +444,12 @@ export function countSearchableNotes(
     db: Database,
     options: { sessionId: string; projectPath: string },
 ): number {
-    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
     const row = db
         .prepare(
             `SELECT (SELECT COUNT(*) FROM notes
-                      WHERE type = 'session' AND session_id = ?
-                        AND status IN (${statusPlaceholders}))
-                  + (SELECT COUNT(*) FROM notes
-                      WHERE type = 'smart' AND project_path = ?
-                        AND status IN (${statusPlaceholders})) AS count`,
+                      WHERE ${searchableNoteScopeSql("")}) AS count`,
         )
-        .get(
-            options.sessionId,
-            ...NOTE_SEARCH_STATUSES,
-            options.projectPath,
-            ...NOTE_SEARCH_STATUSES,
-        ) as { count?: number } | null;
+        .get(...searchableNoteScopeParams(options)) as { count?: number } | null;
     return typeof row?.count === "number" ? row.count : 0;
 }
 
