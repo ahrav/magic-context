@@ -107,6 +107,9 @@ export interface AutoSearchRunnerOptions {
 export function collectUserPromptParts(message: MessageLike): string {
     let collected = "";
     for (const part of message.parts) {
+        // Persisted parts can hydrate as null (invalid JSON or a literal
+        // "null" row); one malformed part must not abort the whole message.
+        if (part === null || typeof part !== "object") continue;
         const p = part as { type?: string; text?: string; ignored?: boolean };
         if (p.type !== "text" || typeof p.text !== "string") continue;
         // Skip plugin-internal ignored notifications (conflict warnings, TUI setup

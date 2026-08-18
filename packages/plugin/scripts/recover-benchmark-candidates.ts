@@ -155,6 +155,11 @@ const OWNERSHIP_STATUS = {
 export function recoverCandidates(args: {
     rows: readonly RecoveryInputRow[];
     candidatesBySession: ReadonlyMap<string, readonly QueryCandidate[]>;
+    /** Candidate hashes known beyond `candidatesBySession` (a streaming
+     *  caller passes the full union while supplying only row-referenced
+     *  candidates per session), so cross-session-only vs zero-match stays
+     *  exact under bounded retention. */
+    knownHashes?: ReadonlySet<string>;
     /** Identifying tokens (author-host username and home path, operator deny
      *  list) rejected wherever they appear in candidate text. The privacy
      *  scan itself is host-independent, so author-host identity must be
@@ -164,7 +169,7 @@ export function recoverCandidates(args: {
 }): RecoveryOutcome {
     const hashCandidate = args.hashCandidate ?? normalizedQueryHash;
     const hashesBySession = new Map<string, Map<string, QueryCandidate[]>>();
-    const allHashes = new Set<string>();
+    const allHashes = new Set<string>(args.knownHashes ?? []);
     for (const [sessionId, candidates] of args.candidatesBySession) {
         const byHash = new Map<string, QueryCandidate[]>();
         for (const candidate of candidates) {
@@ -292,7 +297,16 @@ export function writeStagedFileAtomically(root: string, name: string, content: s
     let fd: number | null = null;
     try {
         fd = openSync(temp, "wx", 0o600);
-        writeSync(fd, content);
+        // writeSync can return short without throwing (signal interruption,
+        // filesystem pressure); publishing a truncated draft would silently
+        // lose records, so loop until every encoded byte is persisted.
+        const bytes = Buffer.from(content, "utf8");
+        let written = 0;
+        while (written < bytes.length) {
+            const n = writeSync(fd, bytes, written, bytes.length - written);
+            if (n <= 0) throw new StagingError("staging write made no progress");
+            written += n;
+        }
         closeSync(fd);
         fd = null;
         chmodSync(temp, 0o600);
@@ -397,7 +411,9 @@ export async function runRecovery(args: {
     // connection, so concurrent plugin activity (corpus pruning, session
     // purge) cannot shift rows between the corpus and history phases of one
     // run. Read-only work: end with ROLLBACK, and never let transaction
-    // teardown mask the original error.
+    // teardown mask the original error. Only connections whose BEGIN
+    // completed are rolled back — a failed second BEGIN must not leave the
+    // first connection holding an open transaction.
     const endRead = (db: Database) => {
         try {
             db.exec("ROLLBACK");
@@ -405,11 +421,15 @@ export async function runRecovery(args: {
             /* connection already closed or transaction never started */
         }
     };
-    args.measurementDb.exec("BEGIN");
-    args.historyDb.exec("BEGIN");
+    const began: Database[] = [];
     let rows: RecoveryInputRow[];
     const candidatesBySession = new Map<string, readonly QueryCandidate[]>();
+    const allCandidateHashes = new Set<string>();
     try {
+        for (const db of [args.measurementDb, args.historyDb]) {
+            db.exec("BEGIN");
+            began.push(db);
+        }
         rows = [];
         let afterId = 0;
         for (;;) {
@@ -422,27 +442,44 @@ export async function runRecovery(args: {
             afterId = page[page.length - 1].id;
         }
 
-        // One session hydrated at a time; its raw messages are released as
-        // soon as the bounded candidate list is extracted.
+        // Hashes each session's rows actually reference: candidate plaintext
+        // outside this set is released immediately after hashing, so retained
+        // text is bounded by the measurement rows (which the report already
+        // scales with), not by total session history.
+        const rowHashesBySession = new Map<string, Set<string>>();
         for (const row of rows) {
-            if (row.ownership !== "opencode" || candidatesBySession.has(row.sessionId)) {
-                continue;
+            if (row.ownership !== "opencode") continue;
+            let hashes = rowHashesBySession.get(row.sessionId);
+            if (!hashes) {
+                hashes = new Set();
+                rowHashesBySession.set(row.sessionId, hashes);
             }
-            candidatesBySession.set(
-                row.sessionId,
-                collectSessionCandidates(
-                    readRawSessionMessagesFromDb(args.historyDb, row.sessionId),
-                ),
-            );
+            hashes.add(row.queryTextHash);
+        }
+
+        // One session hydrated at a time; its raw messages and unreferenced
+        // candidate text are released as soon as the row-referenced subset is
+        // extracted. The full hash union survives (hashes only, no text) so
+        // cross-session-only classification stays exact.
+        for (const [sessionId, rowHashes] of rowHashesBySession) {
+            const kept: QueryCandidate[] = [];
+            for (const candidate of collectSessionCandidates(
+                readRawSessionMessagesFromDb(args.historyDb, sessionId),
+            )) {
+                const hash = normalizedQueryHash(candidate.text);
+                allCandidateHashes.add(hash);
+                if (rowHashes.has(hash)) kept.push(candidate);
+            }
+            candidatesBySession.set(sessionId, kept);
         }
     } finally {
-        endRead(args.measurementDb);
-        endRead(args.historyDb);
+        for (const db of began) endRead(db);
     }
 
     const { draft, report } = recoverCandidates({
         rows,
         candidatesBySession,
+        knownHashes: allCandidateHashes,
         forbiddenTokens: args.forbiddenTokens,
     });
     // Each run stages into its own mkdtemp subdirectory (0o700), created only

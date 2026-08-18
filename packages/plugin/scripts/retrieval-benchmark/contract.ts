@@ -349,20 +349,31 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
 
     // Diagnostics echo regex-bounded query ids, never the free-form
     // paraphraseGroup value (diagnostics are an output channel too).
-    const groupPartitions = new Map<string, { partitions: Set<string>; queryIds: string[] }>();
+    const groupPartitions = new Map<
+        string,
+        { partitions: Set<string>; categories: Set<string>; queryIds: string[] }
+    >();
     for (const query of corpus.queries) {
         let group = groupPartitions.get(query.paraphraseGroup);
         if (!group) {
-            group = { partitions: new Set(), queryIds: [] };
+            group = { partitions: new Set(), categories: new Set(), queryIds: [] };
             groupPartitions.set(query.paraphraseGroup, group);
         }
         group.partitions.add(query.partition);
+        group.categories.add(query.category);
         group.queryIds.push(query.id);
     }
     for (const group of groupPartitions.values()) {
         if (group.partitions.size > 1) {
             diagnostics.push(
                 `corpus: paraphrase group crosses partitions (${group.queryIds.sort().join(", ")})`,
+            );
+        }
+        // One base intent has one category; a mixed group would count the
+        // same intent toward multiple category-coverage cells.
+        if (group.categories.size > 1) {
+            diagnostics.push(
+                `corpus: paraphrase group mixes categories (${group.queryIds.sort().join(", ")})`,
             );
         }
     }
@@ -408,18 +419,32 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
     // A positive target that the scenario's own visible state can never
     // return is a structural recall loss, not a ranking signal: message and
     // compartment search treat the cutoff as an inclusive maximum ordinal and
-    // ordinals are 1-based, so cutoff 0 excludes every such document.
+    // ordinals are 1-based, so cutoff 0 excludes every such document. The
+    // same holds for source filters: compartment chunks ride the "message"
+    // lane; every other kind is its own filter name.
     const documentKindById = new Map(corpus.documents.map((d) => [d.id, d.kind]));
     for (const [queryId, byDoc] of judged) {
         const query = queryById.get(queryId);
-        if (!query || query.visibleState.messageOrdinalCutoff > 0) continue;
+        if (!query) continue;
         for (const [documentId, judgment] of byDoc) {
             if (judgment.grade === 0) continue;
             const kind = documentKindById.get(documentId);
-            if (kind === "message" || kind === "compartment") {
+            if (kind === undefined) continue;
+            if (
+                query.visibleState.messageOrdinalCutoff === 0 &&
+                (kind === "message" || kind === "compartment")
+            ) {
                 diagnostics.push(
                     `corpus: target unreachable under zero message cutoff (${queryId}, ${documentId})`,
                 );
+            }
+            if (query.sourceFilters !== null) {
+                const requiredFilter = kind === "compartment" ? "message" : kind;
+                if (!query.sourceFilters.includes(requiredFilter)) {
+                    diagnostics.push(
+                        `corpus: target excluded by source filters (${queryId}, ${documentId})`,
+                    );
+                }
             }
         }
     }

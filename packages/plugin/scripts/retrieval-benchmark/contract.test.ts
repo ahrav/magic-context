@@ -196,6 +196,37 @@ describe("validateRelease", () => {
         );
     });
 
+    it("rejects a positive target excluded by the scenario's source filters", () => {
+        const { corpus, judgments } = makeValidRelease();
+        const query = corpus.queries.find((q) => q.id === "q-error-message-dev");
+        if (!query) throw new Error("fixture query missing");
+        // The paired document is "message"-kind; filters omitting "message"
+        // make the target structurally unreachable in production search.
+        query.sourceFilters = ["memory"];
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target excluded by source filters (q-error-message-dev, d-error-message-dev)",
+        );
+        // Compartment chunks ride the "message" lane: a compartment target
+        // is reachable iff "message" is present.
+        const compartmentQuery = corpus.queries.find((q) => q.id === "q-architecture-rationale-dev");
+        if (!compartmentQuery) throw new Error("fixture query missing");
+        compartmentQuery.sourceFilters = ["message"];
+        query.sourceFilters = ["message"];
+        expect(() => validateRelease(corpus, judgments)).not.toThrow();
+    });
+
+    it("rejects a paraphrase group whose queries disagree on category", () => {
+        const { corpus, judgments } = makeValidRelease();
+        // Same partition, same group, different categories.
+        const a = corpus.queries.find((q) => q.id === "q-error-message-dev");
+        const b = corpus.queries.find((q) => q.id === "q-temporal-dev");
+        if (!a || !b) throw new Error("fixture queries missing");
+        b.paraphraseGroup = a.paraphraseGroup;
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: paraphrase group mixes categories (q-error-message-dev, q-temporal-dev)",
+        );
+    });
+
     it("rejects a category missing coverage in either partition", () => {
         const { corpus, judgments } = makeValidRelease();
         const removedQuery = corpus.queries.pop();

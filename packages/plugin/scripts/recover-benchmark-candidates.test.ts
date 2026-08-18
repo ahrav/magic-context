@@ -261,7 +261,12 @@ describe("collectSessionCandidates", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                parts: [{ type: "text", text: "ignored notification", ignored: true }],
+                parts: [
+                    // A persisted part row holding invalid JSON hydrates as
+                    // null; it must be skipped, not crash the whole message.
+                    null,
+                    { type: "text", text: "ignored notification", ignored: true },
+                ],
             },
             {
                 ordinal: 2,
@@ -470,6 +475,56 @@ describe("runRecovery", () => {
             { ordinal: 0, status: "privacy-rejected" },
         ]);
         expect(JSON.parse(readFileSync(result.draftPath, "utf8")).records).toEqual([]);
+    });
+
+    it("rolls back the first transaction when the second BEGIN fails", async () => {
+        const measurementDb = makeMeasurementDb();
+        const failingHistory = {
+            exec(sql: string): void {
+                if (sql === "BEGIN") throw new Error("history connection busy");
+            },
+        } as unknown as Database;
+        const root = join(tempDir("run-beginfail-"), "root");
+        await expect(
+            runRecovery({
+                measurementDb,
+                historyDb: failingHistory,
+                stagingRoot: root,
+                forbiddenRoots: [],
+            }),
+        ).rejects.toThrow("history connection busy");
+        // A leaked read transaction would make this BEGIN throw ("cannot
+        // start a transaction within a transaction").
+        expect(() => {
+            measurementDb.exec("BEGIN");
+            measurementDb.exec("ROLLBACK");
+        }).not.toThrow();
+        expect(readdirSync(root)).toEqual([]);
+    });
+
+    it("classifies cross-session-only under bounded candidate retention", async () => {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const text = "query that only ever ran in the other session";
+        // s1's row references a hash whose plaintext exists only in s2's
+        // history; the streaming pass must still see s2's hash union.
+        bindSession(measurementDb, "s1", "opencode");
+        insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
+        bindSession(measurementDb, "s2", "opencode");
+        insertMeasurement(measurementDb, "s2", normalizedQueryHash("s2 own query"));
+        insertUserMessage(historyDb, "s2", text);
+        insertUserMessage(historyDb, "s2", "s2 own query");
+        const root = join(tempDir("run-crosssession-"), "root");
+        const result = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
+            { ordinal: 0, status: "cross-session-only" },
+            { ordinal: 1, status: "recovered" },
+        ]);
     });
 
     it("rejects malformed schema and out-of-bounds rows without writing anything", async () => {
