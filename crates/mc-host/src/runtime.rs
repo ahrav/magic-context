@@ -361,12 +361,18 @@ pub async fn run<H: McHostHandler>(
         .publish(port, &config.daemon_ver)
         .map_err(HostError::Instance)?;
 
+    // Only the module ID outlives startup; the snapshot's provides tree can
+    // approach the frame limit and must not stay resident beside budgets
+    // that only subtract the serialized catalog.
+    let module_id: Arc<str> = Arc::from(manifest.module_id.as_str());
+    drop(manifest);
+
     let shared = Arc::new(HostShared {
         handler,
         limits: config.limits.clone(),
         timing: config.timing.clone(),
         liveness: config.liveness.clone(),
-        module_id: Arc::from(manifest.module_id.as_str()),
+        module_id,
         catalog,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(

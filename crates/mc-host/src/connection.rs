@@ -159,6 +159,14 @@ pub async fn run_connection<H: McHostHandler>(
 
     read_task.await;
     gen.read_cancel.cancel();
+    if !shared.draining.load(Ordering::SeqCst) {
+        // Peer-initiated or error retirement closes silently: cancelling the
+        // generation token now makes queued off-reader emissions fail closed
+        // instead of flushing frames after the close decision or delaying
+        // closure by a frame deadline (protocol §6.3). Host drain keeps the
+        // token live so queued terminals and Goodbye flush in protocol order.
+        gen.token.cancel();
+    }
     // Mark generation-owned routes closing BEFORE waiting for in-flight
     // binds: the route.open wrappers below run inside `read_tasks`, and a
     // bind completing during that wait must observe `close_requested`

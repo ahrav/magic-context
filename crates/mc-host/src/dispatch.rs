@@ -84,13 +84,16 @@ fn escaped_json_len(s: &str) -> usize {
 /// The encoded size is computed exactly from the escaped field lengths, so
 /// the charge exists BEFORE the body materializes — concurrent handler
 /// errors wait on the budget as bytes, not as retained encoded buffers.
-/// `Err` means the generation can no longer emit.
+/// Returns the buffer with the admission deadline the budget wait ran under:
+/// serialization and queueing are contiguous, so the whole error emission is
+/// one bounded operation rather than two stacked frame deadlines. `Err`
+/// means the generation can no longer emit.
 async fn charged_error_body(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
     code: &str,
     message: &str,
-) -> Result<OutputBuffer, ()> {
+) -> Result<(OutputBuffer, Instant), ()> {
     const ERROR_ENVELOPE_OVERHEAD: usize = r#"{"code":"","message":""}"#.len();
     let encoded_len = |code: &str, message: &str| {
         escaped_json_len(code)
@@ -128,11 +131,14 @@ async fn charged_error_body(
         message,
     );
     debug_assert_eq!(body.len(), body_len, "escaped length model diverged");
-    Ok(OutputBuffer {
-        body,
-        charge,
-        max_len: body_len,
-    })
+    Ok((
+        OutputBuffer {
+            body,
+            charge,
+            max_len: body_len,
+        },
+        deadline,
+    ))
 }
 
 /// Serializes the error envelope directly into `buf` — no intermediate
@@ -205,16 +211,18 @@ pub async fn emit_frame(
 
 /// Queues a handler body whose resident-byte reservation was acquired before
 /// allocation. The charge transfers directly to the writer with no second
-/// budget acquisition. Writer admission is timed from submission here — a
-/// handler may legitimately spend longer than one admission window filling
-/// its reservation, and a deadline captured at reserve time would retire a
-/// healthy generation when the completed buffer finally arrives.
+/// budget acquisition. `deadline` is the caller's admission window: handler
+/// outputs pass a fresh one at submission (a handler may validly compute
+/// longer than one window after reserving), while error emission passes the
+/// deadline its budget wait already ran under so the whole emission stays
+/// one bounded operation.
 async fn emit_reserved_frame(
     gen: &GenerationCore,
     ty: FrameType,
     flags: subc_protocol::Flags,
     id: FrameId,
     body: OutputBuffer,
+    deadline: Instant,
 ) -> Result<(), ()> {
     if gen.writer.is_retired() || gen.token.is_cancelled() {
         return Err(());
@@ -222,11 +230,14 @@ async fn emit_reserved_frame(
     let (body, charge) = body.into_parts();
     let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
-        .send(OutboundFrame {
-            bytes,
-            charge,
-            written: None,
-        })
+        .send_before(
+            OutboundFrame {
+                bytes,
+                charge,
+                written: None,
+            },
+            deadline,
+        )
         .await
         .map_err(|_| ())
 }
@@ -242,13 +253,20 @@ pub async fn emit_error_terminal(
     code: &str,
     message: &str,
 ) {
-    let Ok(body) = charged_error_body(budget, gen, code, message).await else {
+    let Ok((body, deadline)) = charged_error_body(budget, gen, code, message).await else {
         gen.token.cancel();
         return;
     };
-    if emit_reserved_frame(gen, FrameType::Error, response_flags(false, true), id, body)
-        .await
-        .is_err()
+    if emit_reserved_frame(
+        gen,
+        FrameType::Error,
+        response_flags(false, true),
+        id,
+        body,
+        deadline,
+    )
+    .await
+    .is_err()
     {
         gen.token.cancel();
     }
@@ -277,6 +295,7 @@ pub async fn settle(
                 response_flags(binary, true),
                 FrameId::routed(route, corr),
                 body,
+                gen.writer.admission_deadline(),
             )
             .await
             .is_err()
@@ -286,7 +305,8 @@ pub async fn settle(
             return true;
         }
         Terminal::Error { code, message } => {
-            let Ok(body) = charged_error_body(budget, gen, &code, &message).await else {
+            let Ok((body, deadline)) = charged_error_body(budget, gen, &code, &message).await
+            else {
                 gen.token.cancel();
                 return true;
             };
@@ -296,6 +316,7 @@ pub async fn settle(
                 response_flags(false, true),
                 FrameId::routed(route, corr),
                 body,
+                deadline,
             )
             .await
             .is_err()
@@ -385,6 +406,7 @@ impl StreamSink {
                 response_flags(binary, false),
                 FrameId::routed(self.route, self.corr),
                 item,
+                self.gen.writer.admission_deadline(),
             ) => match result {
                 Ok(()) => {
                     self.settlement.streamed.store(true, Ordering::SeqCst);
