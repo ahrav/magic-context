@@ -104,7 +104,7 @@ export interface AutoSearchRunnerOptions {
     visibleMemoryIds?: Set<number>;
 }
 
-function collectUserPromptParts(message: MessageLike): string {
+export function collectUserPromptParts(message: MessageLike): string {
     let collected = "";
     for (const part of message.parts) {
         const p = part as { type?: string; text?: string; ignored?: boolean };

@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "retrieval-benchmark-manifest/v1",
+  "releaseVersion": "v1",
+  "releaseTuple": {
+    "corpusFingerprint": "672ce2614ee4bad67a041d86a8c182398cb1f1845ac5ba872c7b4a4490f45764",
+    "judgmentsFingerprint": "f6d8ec1de0f224c6b9ab32b771a6c0695fb1b95a9b0b6bb33712994503338639",
+    "syntheticProfilesFingerprint": "69e9f35251115c3ba25dc337b8416f380098f00b8642128da2d6ca4fa414cec2",
+    "corpusSchemaVersion": "retrieval-benchmark-corpus/v1",
+    "judgmentsSchemaVersion": "retrieval-benchmark-judgments/v1",
+    "syntheticSchemaVersion": "retrieval-benchmark-synthetic/v1",
+    "rubricVersion": "graded-pooled/v1",
+    "privacyPolicyVersion": "privacy-policy/v1",
+    "sanitizerVersion": "sanitizer/v1"
+  },
+  "approvals": {
+    "privacy": {
+      "kind": "privacy",
+      "approver": "operator-privacy-review",
+      "releaseTupleFingerprint": "edf2e7329c6493be6d4a788d551e88762dfd54bab12088c78a386d0ee9748996"
+    },
+    "relevanceIntent": {
+      "kind": "relevance-intent",
+      "approver": "operator-relevance-review",
+      "releaseTupleFingerprint": "edf2e7329c6493be6d4a788d551e88762dfd54bab12088c78a386d0ee9748996"
+    }
+  }
+}

@@ -15,8 +15,8 @@ import {
     prepareExplicitQuery,
 } from "../../features/magic-context/search-bounds";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
-import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_SEARCH_DESCRIPTION, CTX_SEARCH_TOOL_NAME } from "./constants";
+import { normalizeCtxSearchArgs } from "./query-input";
 import { formatSearchResults } from "./render";
 import type { CtxSearchArgs, CtxSearchSource, CtxSearchToolDeps } from "./types";
 
@@ -79,16 +79,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
         async execute(rawArgs: CtxSearchArgs, toolContext) {
             const parsedArgs = ctxSearchArgsSchema.safeParse(rawArgs);
             let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxSearchArgs;
-            args = unwrapImitatedReducedArgs(args, ["query"], {
-                query: "string",
-                limit: "number",
-                sources: {
-                    type: "array",
-                    items: "string",
-                    maxItems: 5,
-                    values: ["memory", "message", "git_commit", "primer", "note"],
-                },
-            });
+            args = normalizeCtxSearchArgs(args);
             const preflight = prepareExplicitQuery(args.query ?? "");
             if (!preflight.ok) {
                 return `Error: ${describeQueryBoundsViolation(preflight)}`;

@@ -1,0 +1,428 @@
+{
+  "schemaVersion": "retrieval-benchmark-judgments/v1",
+  "rubricVersion": "graded-pooled/v1",
+  "pools": [
+    {
+      "queryId": "q-exact-symbol-path-dev",
+      "documentIds": [
+        "d-exact-symbol-path-dev",
+        "d-exact-symbol-path-dev-distractor"
+      ]
+    },
+    {
+      "queryId": "q-exact-symbol-path-hold",
+      "documentIds": [
+        "d-exact-symbol-path-hold"
+      ]
+    },
+    {
+      "queryId": "q-error-message-dev",
+      "documentIds": [
+        "d-error-message-dev"
+      ]
+    },
+    {
+      "queryId": "q-error-message-hold",
+      "documentIds": [
+        "d-error-message-hold",
+        "d-error-message-hold-distractor"
+      ]
+    },
+    {
+      "queryId": "q-architecture-rationale-dev",
+      "documentIds": [
+        "d-architecture-rationale-dev"
+      ]
+    },
+    {
+      "queryId": "q-architecture-rationale-hold",
+      "documentIds": [
+        "d-architecture-rationale-hold"
+      ]
+    },
+    {
+      "queryId": "q-debugging-history-dev",
+      "documentIds": [
+        "d-debugging-history-dev"
+      ]
+    },
+    {
+      "queryId": "q-debugging-history-hold",
+      "documentIds": [
+        "d-debugging-history-hold"
+      ]
+    },
+    {
+      "queryId": "q-user-directive-dev",
+      "documentIds": [
+        "d-user-directive-dev"
+      ]
+    },
+    {
+      "queryId": "q-user-directive-hold",
+      "documentIds": [
+        "d-user-directive-hold"
+      ]
+    },
+    {
+      "queryId": "q-current-constraint-dev",
+      "documentIds": [
+        "d-current-constraint-dev"
+      ]
+    },
+    {
+      "queryId": "q-current-constraint-hold",
+      "documentIds": [
+        "d-current-constraint-hold"
+      ]
+    },
+    {
+      "queryId": "q-benchmark-result-dev",
+      "documentIds": [
+        "d-benchmark-result-dev"
+      ]
+    },
+    {
+      "queryId": "q-benchmark-result-hold",
+      "documentIds": [
+        "d-benchmark-result-hold"
+      ]
+    },
+    {
+      "queryId": "q-temporal-dev",
+      "documentIds": [
+        "d-temporal-dev"
+      ]
+    },
+    {
+      "queryId": "q-temporal-hold",
+      "documentIds": [
+        "d-temporal-hold"
+      ]
+    },
+    {
+      "queryId": "q-contradictory-memory-dev",
+      "documentIds": [
+        "d-contradictory-memory-dev"
+      ]
+    },
+    {
+      "queryId": "q-contradictory-memory-hold",
+      "documentIds": [
+        "d-contradictory-memory-hold"
+      ]
+    },
+    {
+      "queryId": "q-paraphrased-decision-dev",
+      "documentIds": [
+        "d-paraphrased-decision-dev"
+      ]
+    },
+    {
+      "queryId": "q-paraphrased-decision-dev-p2",
+      "documentIds": [
+        "d-paraphrased-decision-dev"
+      ]
+    },
+    {
+      "queryId": "q-paraphrased-decision-hold",
+      "documentIds": [
+        "d-paraphrased-decision-hold"
+      ]
+    },
+    {
+      "queryId": "q-paraphrased-decision-hold-p2",
+      "documentIds": [
+        "d-paraphrased-decision-hold"
+      ]
+    }
+  ],
+  "judgments": [
+    {
+      "queryId": "q-exact-symbol-path-dev",
+      "documentId": "d-exact-symbol-path-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-exact-symbol-path-dev",
+      "documentId": "d-exact-symbol-path-dev-distractor",
+      "grade": 0,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "shadow"
+        ]
+      }
+    },
+    {
+      "queryId": "q-exact-symbol-path-hold",
+      "documentId": "d-exact-symbol-path-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-error-message-dev",
+      "documentId": "d-error-message-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-error-message-hold",
+      "documentId": "d-error-message-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-error-message-hold",
+      "documentId": "d-error-message-hold-distractor",
+      "grade": 0,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "shadow"
+        ]
+      }
+    },
+    {
+      "queryId": "q-architecture-rationale-dev",
+      "documentId": "d-architecture-rationale-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-architecture-rationale-hold",
+      "documentId": "d-architecture-rationale-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-debugging-history-dev",
+      "documentId": "d-debugging-history-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-debugging-history-hold",
+      "documentId": "d-debugging-history-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-user-directive-dev",
+      "documentId": "d-user-directive-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-user-directive-hold",
+      "documentId": "d-user-directive-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-current-constraint-dev",
+      "documentId": "d-current-constraint-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-current-constraint-hold",
+      "documentId": "d-current-constraint-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-benchmark-result-dev",
+      "documentId": "d-benchmark-result-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-benchmark-result-hold",
+      "documentId": "d-benchmark-result-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-temporal-dev",
+      "documentId": "d-temporal-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-temporal-hold",
+      "documentId": "d-temporal-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-contradictory-memory-dev",
+      "documentId": "d-contradictory-memory-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-contradictory-memory-hold",
+      "documentId": "d-contradictory-memory-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-paraphrased-decision-dev",
+      "documentId": "d-paraphrased-decision-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-paraphrased-decision-dev-p2",
+      "documentId": "d-paraphrased-decision-dev",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-paraphrased-decision-hold",
+      "documentId": "d-paraphrased-decision-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    },
+    {
+      "queryId": "q-paraphrased-decision-hold-p2",
+      "documentId": "d-paraphrased-decision-hold",
+      "grade": 2,
+      "provenance": {
+        "judge": "human",
+        "pooledFrom": [
+          "primary",
+          "manual"
+        ]
+      }
+    }
+  ]
+}

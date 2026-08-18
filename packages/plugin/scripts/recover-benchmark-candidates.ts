@@ -1,0 +1,422 @@
+#!/usr/bin/env bun
+/**
+ * Recover historical benchmark query candidates from the measurement corpus.
+ *
+ * Query-only over one stable read snapshot: joins measurement rows to
+ * `session_projects` ownership, reconstructs candidate queries from OpenCode
+ * session history with the same helpers the live paths use, and accepts a
+ * plaintext only when exactly one same-session candidate matches the stored
+ * normalized hash. Raw text and hashes stay in memory; the only outputs are a
+ * privacy-gated draft and an allowlisted status/count report, written
+ * atomically to an owner-only staging directory outside every source,
+ * publication, and VCS tree. Recovery has no import edge to promotion.
+ *
+ * Usage: bun packages/plugin/scripts/recover-benchmark-candidates.ts
+ */
+
+import {
+    chmodSync,
+    closeSync,
+    existsSync,
+    lstatSync,
+    mkdirSync,
+    openSync,
+    readdirSync,
+    realpathSync,
+    renameSync,
+    rmSync,
+    statSync,
+    unlinkSync,
+    writeSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+
+import {
+    type MeasurementOwnership,
+    listMeasurementRowsWithOwnership,
+    normalizeQueryText,
+    normalizedQueryHash,
+} from "../src/features/magic-context/storage-embedding-measurements";
+import { extractBoundedAutoSearchQuery } from "../src/hooks/magic-context/auto-search-prompt";
+import { collectUserPromptParts } from "../src/hooks/magic-context/auto-search-runner";
+import {
+    type RawMessage,
+    readRawSessionMessagesFromDb,
+} from "../src/hooks/magic-context/read-session-raw";
+import type { Database } from "../src/shared/sqlite";
+import { CTX_SEARCH_TOOL_NAME } from "../src/tools/ctx-search/constants";
+import { extractCtxSearchQueryInput } from "../src/tools/ctx-search/query-input";
+import type { CtxSearchArgs } from "../src/tools/ctx-search/types";
+import { scanForSensitiveContent } from "./retrieval-benchmark/privacy";
+
+export const DRAFT_VERSION = "benchmark-draft/v1";
+export const REPORT_VERSION = "recovery-report/v1";
+export const DRAFT_TTL_MS = 24 * 60 * 60 * 1000;
+
+export const RECOVERY_STATUSES = [
+    "recovered",
+    "owner-pi",
+    "owner-missing",
+    "owner-ambiguous",
+    "zero-match",
+    "cross-session-only",
+    "normalized-collision",
+    "multi-match",
+    "privacy-rejected",
+] as const;
+export type RecoveryStatus = (typeof RECOVERY_STATUSES)[number];
+
+export interface QueryCandidate {
+    text: string;
+    mode: "automatic" | "explicit";
+}
+
+export interface DraftRecord {
+    ordinal: number;
+    mode: "automatic" | "explicit";
+    queryText: string;
+}
+
+export interface RecoveryReport {
+    reportVersion: typeof REPORT_VERSION;
+    counts: Partial<Record<RecoveryStatus, number>>;
+    rows: Array<{ ordinal: number; status: RecoveryStatus }>;
+}
+
+export interface RecoveryDraft {
+    draftVersion: typeof DRAFT_VERSION;
+    records: DraftRecord[];
+}
+
+/** Candidate queries from one session's raw history, in message order,
+ *  through the same extraction the live automatic and explicit paths use. */
+export function collectSessionCandidates(messages: readonly RawMessage[]): QueryCandidate[] {
+    const candidates: QueryCandidate[] = [];
+    for (const message of messages) {
+        if (message.role === "user") {
+            const collected = collectUserPromptParts({
+                info: { role: message.role, id: message.id },
+                parts: message.parts,
+            });
+            const auto = extractBoundedAutoSearchQuery(collected);
+            if (auto.length > 0) candidates.push({ text: auto, mode: "automatic" });
+        }
+        for (const part of message.parts) {
+            if (part === null || typeof part !== "object") continue;
+            const p = part as Record<string, unknown>;
+            if (p.type !== "tool" || p.tool !== CTX_SEARCH_TOOL_NAME) continue;
+            const state = p.state as Record<string, unknown> | null;
+            if (!state || typeof state !== "object") continue;
+            const input = state.input;
+            if (input === null || typeof input !== "object") continue;
+            const preflight = extractCtxSearchQueryInput(input as CtxSearchArgs);
+            if (preflight.ok && preflight.query.length > 0) {
+                candidates.push({ text: preflight.query, mode: "explicit" });
+            }
+        }
+    }
+    return candidates;
+}
+
+export interface RecoveryInputRow {
+    ordinal: number;
+    sessionId: string;
+    queryTextHash: string;
+    ownership: MeasurementOwnership;
+}
+
+export interface RecoveryOutcome {
+    draft: RecoveryDraft;
+    report: RecoveryReport;
+}
+
+function normalizedCompare(a: string, b: string): boolean {
+    return normalizeQueryText(a) === normalizeQueryText(b);
+}
+
+const OWNERSHIP_STATUS = {
+    pi: "owner-pi",
+    missing: "owner-missing",
+    ambiguous: "owner-ambiguous",
+} as const;
+
+/**
+ * Pure matching core. `hashCandidate` is injectable only so tests can force
+ * the defensive hash-collision arm; production always uses
+ * `normalizedQueryHash`.
+ */
+export function recoverCandidates(args: {
+    rows: readonly RecoveryInputRow[];
+    candidatesBySession: ReadonlyMap<string, readonly QueryCandidate[]>;
+    hashCandidate?: (text: string) => string;
+}): RecoveryOutcome {
+    const hashCandidate = args.hashCandidate ?? normalizedQueryHash;
+    const hashesBySession = new Map<string, Map<string, QueryCandidate[]>>();
+    const allHashes = new Set<string>();
+    for (const [sessionId, candidates] of args.candidatesBySession) {
+        const byHash = new Map<string, QueryCandidate[]>();
+        for (const candidate of candidates) {
+            const hash = hashCandidate(candidate.text);
+            allHashes.add(hash);
+            const list = byHash.get(hash) ?? [];
+            if (!list.some((existing) => existing.text === candidate.text)) {
+                list.push(candidate);
+            }
+            byHash.set(hash, list);
+        }
+        hashesBySession.set(sessionId, byHash);
+    }
+
+    const records: DraftRecord[] = [];
+    const rows: RecoveryReport["rows"] = [];
+    const counts: RecoveryReport["counts"] = {};
+    const record = (ordinal: number, status: RecoveryStatus) => {
+        rows.push({ ordinal, status });
+        counts[status] = (counts[status] ?? 0) + 1;
+    };
+
+    for (const row of args.rows) {
+        if (row.ownership !== "opencode") {
+            record(row.ordinal, OWNERSHIP_STATUS[row.ownership]);
+            continue;
+        }
+        const matches = hashesBySession.get(row.sessionId)?.get(row.queryTextHash) ?? [];
+        if (matches.length === 0) {
+            record(
+                row.ordinal,
+                allHashes.has(row.queryTextHash) ? "cross-session-only" : "zero-match",
+            );
+            continue;
+        }
+        if (matches.length > 1) {
+            const collided = matches.every((m) => normalizedCompare(m.text, matches[0].text));
+            record(row.ordinal, collided ? "normalized-collision" : "multi-match");
+            continue;
+        }
+        const match = matches[0];
+        if (scanForSensitiveContent({ queryText: match.text }).length > 0) {
+            record(row.ordinal, "privacy-rejected");
+            continue;
+        }
+        record(row.ordinal, "recovered");
+        records.push({ ordinal: row.ordinal, mode: match.mode, queryText: match.text });
+    }
+
+    return {
+        draft: { draftVersion: DRAFT_VERSION, records },
+        report: { reportVersion: REPORT_VERSION, counts, rows },
+    };
+}
+
+export class StagingError extends Error {}
+
+function hasGitAncestor(path: string): boolean {
+    let current = resolve(path);
+    for (;;) {
+        if (existsSync(join(current, ".git"))) return true;
+        const parent = dirname(current);
+        if (parent === current) return false;
+        current = parent;
+    }
+}
+
+/**
+ * Owner-only staging root outside every forbidden tree. Rejects symlink
+ * aliases (realpath must equal the resolved path), group/other-accessible
+ * modes, and any root under a VCS worktree or a caller-named forbidden path.
+ */
+export function ensureStagingRoot(root: string, forbiddenRoots: readonly string[]): string {
+    if (!isAbsolute(root)) throw new StagingError("staging root must be absolute");
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const real = realpathSync.native(root);
+    if (real !== realpathSync.native(resolve(root))) {
+        throw new StagingError("staging root resolves through an alias");
+    }
+    const stat = lstatSync(root);
+    if (stat.isSymbolicLink() || !statSync(root).isDirectory()) {
+        throw new StagingError("staging root must be a plain directory");
+    }
+    if ((statSync(root).mode & 0o077) !== 0) {
+        throw new StagingError("staging root must be owner-only");
+    }
+    if (hasGitAncestor(real)) throw new StagingError("staging root is inside a VCS tree");
+    for (const forbidden of forbiddenRoots) {
+        let forbiddenReal: string;
+        try {
+            forbiddenReal = realpathSync.native(resolve(forbidden));
+        } catch {
+            continue;
+        }
+        if (real === forbiddenReal || real.startsWith(`${forbiddenReal}/`)) {
+            throw new StagingError("staging root overlaps a forbidden tree");
+        }
+    }
+    return real;
+}
+
+/** Exclusive temp file + rename; destination must not already exist. */
+export function writeStagedFileAtomically(root: string, name: string, content: string): string {
+    const destination = join(root, name);
+    if (existsSync(destination) || lstatSync(root).isSymbolicLink()) {
+        throw new StagingError("staging destination already exists");
+    }
+    const temp = join(root, `.${name}.tmp`);
+    let fd: number | null = null;
+    try {
+        fd = openSync(temp, "wx", 0o600);
+        writeSync(fd, content);
+        closeSync(fd);
+        fd = null;
+        chmodSync(temp, 0o600);
+        renameSync(temp, destination);
+    } catch (error) {
+        if (fd !== null) closeSync(fd);
+        try {
+            unlinkSync(temp);
+        } catch {
+            /* already gone */
+        }
+        throw error;
+    }
+    return destination;
+}
+
+/** Delete staged entries older than the TTL. */
+export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_MS): void {
+    let entries: string[];
+    try {
+        entries = readdirSync(root);
+    } catch {
+        return;
+    }
+    for (const entry of entries) {
+        const path = join(root, entry);
+        try {
+            if (nowMs - lstatSync(path).mtimeMs > ttlMs) {
+                rmSync(path, { force: true, recursive: true });
+            }
+        } catch {
+            /* raced with another purge */
+        }
+    }
+}
+
+export function defaultStagingRoot(): string {
+    return join(tmpdir(), "magic-context-benchmark-drafts");
+}
+
+const REQUIRED_TABLES: Record<string, readonly string[]> = {
+    embedding_measurement_corpus: ["id", "session_id", "query_text_hash"],
+    session_projects: ["session_id", "harness"],
+};
+
+/** Validate schema and bounded row shapes before any reconstruction. */
+export function validateMeasurementSchema(db: Database): void {
+    for (const [table, columns] of Object.entries(REQUIRED_TABLES)) {
+        const present = db
+            .prepare("SELECT 1 AS one FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .get(table);
+        if (!present) throw new StagingError("source schema is missing a required table");
+        const info = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+        const names = new Set(info.map((c) => c.name));
+        for (const column of columns) {
+            if (!names.has(column)) {
+                throw new StagingError("source schema is missing a required column");
+            }
+        }
+    }
+}
+
+export function boundedRowsOrThrow(
+    rows: ReturnType<typeof listMeasurementRowsWithOwnership>,
+): RecoveryInputRow[] {
+    return rows.map((row, ordinal) => {
+        if (!/^[0-9a-f]{64}$/.test(row.queryTextHash) || row.sessionId.length > 256) {
+            throw new StagingError("source row shape is out of bounds");
+        }
+        return {
+            ordinal,
+            sessionId: row.sessionId,
+            queryTextHash: row.queryTextHash,
+            ownership: row.ownership,
+        };
+    });
+}
+
+export async function runRecovery(args: {
+    measurementDb: Database;
+    historyDb: Database;
+    stagingRoot: string;
+    forbiddenRoots: readonly string[];
+    nowMs?: number;
+}): Promise<{ draftPath: string; reportPath: string; report: RecoveryReport }> {
+    const nowMs = args.nowMs ?? Date.now();
+    const root = ensureStagingRoot(args.stagingRoot, args.forbiddenRoots);
+    purgeStaleDrafts(root, nowMs);
+
+    validateMeasurementSchema(args.measurementDb);
+    args.measurementDb.exec("BEGIN");
+    let rows: RecoveryInputRow[];
+    try {
+        rows = boundedRowsOrThrow(listMeasurementRowsWithOwnership(args.measurementDb));
+    } finally {
+        args.measurementDb.exec("COMMIT");
+    }
+
+    const candidatesBySession = new Map<string, readonly QueryCandidate[]>();
+    for (const row of rows) {
+        if (row.ownership !== "opencode" || candidatesBySession.has(row.sessionId)) continue;
+        candidatesBySession.set(
+            row.sessionId,
+            collectSessionCandidates(readRawSessionMessagesFromDb(args.historyDb, row.sessionId)),
+        );
+    }
+
+    const { draft, report } = recoverCandidates({ rows, candidatesBySession });
+    const draftPath = writeStagedFileAtomically(
+        root,
+        "draft.json",
+        `${JSON.stringify(draft, null, 2)}\n`,
+    );
+    let reportPath: string;
+    try {
+        reportPath = writeStagedFileAtomically(
+            root,
+            "report.json",
+            `${JSON.stringify(report, null, 2)}\n`,
+        );
+    } catch (error) {
+        rmSync(draftPath, { force: true });
+        throw error;
+    }
+    return { draftPath, reportPath, report };
+}
+
+async function main(): Promise<void> {
+    const { Database: BunDatabase } = await import("bun:sqlite");
+    const measurementPath =
+        process.env.MAGIC_CONTEXT_DB ??
+        join(homedir(), ".local", "share", "cortexkit", "magic-context", "context.db");
+    const historyPath =
+        process.env.OPENCODE_DB ?? join(homedir(), ".local", "share", "opencode", "opencode.db");
+    const measurementDb = new BunDatabase(measurementPath, { readonly: true });
+    const historyDb = new BunDatabase(historyPath, { readonly: true });
+    try {
+        const { report, draftPath } = await runRecovery({
+            measurementDb: measurementDb as unknown as Database,
+            historyDb: historyDb as unknown as Database,
+            stagingRoot: defaultStagingRoot(),
+            forbiddenRoots: [dirname(measurementPath), dirname(historyPath), import.meta.dir],
+        });
+        // Allowlisted output only: status codes and counts, never text/ids.
+        process.stdout.write(`${JSON.stringify(report.counts)}\ndraft: ${draftPath}\n`);
+    } finally {
+        measurementDb.close();
+        historyDb.close();
+    }
+}
+
+if (import.meta.main) {
+    await main();
+}

@@ -46,9 +46,13 @@ export interface EmbeddingMeasurementRow {
     created_at: number;
 }
 
+/** One normalization for query hashing and hash-match comparison. */
+export function normalizeQueryText(query: string): string {
+    return query.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
 export function normalizedQueryHash(query: string): string {
-    const normalized = query.trim().replace(/\s+/g, " ").toLowerCase();
-    return createHash("sha256").update(normalized).digest("hex");
+    return createHash("sha256").update(normalizeQueryText(query)).digest("hex");
 }
 
 /** Per-session row cap for the measurement corpus. Dedup is per
@@ -132,6 +136,51 @@ export function listEmbeddingMeasurements(
     return db
         .prepare("SELECT * FROM embedding_measurement_corpus WHERE session_id = ? ORDER BY id ASC")
         .all(sessionId) as EmbeddingMeasurementRow[];
+}
+
+export type MeasurementOwnership = "opencode" | "pi" | "missing" | "ambiguous";
+
+export interface OwnedMeasurementRow {
+    id: number;
+    sessionId: string;
+    projectPath: string;
+    queryTextHash: string;
+    ownership: MeasurementOwnership;
+}
+
+function classifyOwnership(harnesses: string | null): MeasurementOwnership {
+    if (!harnesses) return "missing";
+    const distinct = harnesses.split(",").filter(Boolean);
+    if (distinct.length !== 1) return "ambiguous";
+    if (distinct[0] === "opencode") return "opencode";
+    if (distinct[0] === "pi") return "pi";
+    return "ambiguous";
+}
+
+export function listMeasurementRowsWithOwnership(db: Database): OwnedMeasurementRow[] {
+    const rows = db
+        .prepare(
+            `SELECT m.id, m.session_id, m.project_path, m.query_text_hash,
+                    (SELECT GROUP_CONCAT(DISTINCT sp.harness)
+                       FROM session_projects sp
+                      WHERE sp.session_id = m.session_id) AS harnesses
+               FROM embedding_measurement_corpus m
+              ORDER BY m.id ASC`,
+        )
+        .all() as Array<{
+        id: number;
+        session_id: string;
+        project_path: string;
+        query_text_hash: string;
+        harnesses: string | null;
+    }>;
+    return rows.map((row) => ({
+        id: row.id,
+        sessionId: row.session_id,
+        projectPath: row.project_path,
+        queryTextHash: row.query_text_hash,
+        ownership: classifyOwnership(row.harnesses),
+    }));
 }
 
 export interface SynapseBatchLedgerInput {
