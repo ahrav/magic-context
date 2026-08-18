@@ -522,12 +522,14 @@ async function getSemanticScores(args: {
                 continue;
             }
 
-            semanticScores.set(
-                memory.id,
-                normalizeCosineScore(
-                    cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-                ),
+            const score = normalizeCosineScore(
+                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
             );
+            // A nonpositive score is "no semantic signal", not a semantic
+            // match: keeping it would label an FTS hit hybrid (and downweight
+            // it) or not based on which zero entries survive the lane
+            // ceiling. Mirrors the git-commit lane's admission rule.
+            if (score > 0) semanticScores.set(memory.id, score);
         }
 
         return pruneToLaneCeiling(semanticScores);
@@ -561,12 +563,10 @@ async function getSemanticScores(args: {
         for (const memory of memberMemories) {
             const memoryEmbedding = cachedEmbeddings.get(memory.id);
             if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
-            semanticScores.set(
-                memory.id,
-                normalizeCosineScore(
-                    cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
-                ),
+            const score = normalizeCosineScore(
+                cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
             );
+            if (score > 0) semanticScores.set(memory.id, score);
         }
     }
 
