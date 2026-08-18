@@ -422,8 +422,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn generation(id: u64) -> Arc<GenerationCore> {
-        let (writer, _task) =
-            crate::wire::spawn_writer(tokio::io::duplex(1024).0, 8, CancellationToken::new());
+        let (writer, _task) = crate::wire::spawn_writer(
+            tokio::io::duplex(1024).0,
+            8,
+            CancellationToken::new(),
+            std::time::Duration::from_secs(5),
+        );
         Arc::new(GenerationCore {
             id,
             token: CancellationToken::new(),

@@ -97,6 +97,7 @@ pub async fn run_connection<H: McHostHandler>(
         write_half,
         shared.limits.writer_queue_frames,
         gen_token.clone(),
+        shared.timing.frame_deadline,
         &shared.tracker,
     );
     let mut writer_task = AbortOnDropHandle::new(writer_task);

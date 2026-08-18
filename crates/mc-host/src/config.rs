@@ -19,6 +19,13 @@ pub const MIN_RESIDENT_BYTES: u64 = (MAX_BODY_LEN as u64 * 2) + subc_protocol::H
 pub(crate) const EGRESS_RESERVED_BYTES: u64 =
     MAX_BODY_LEN as u64 + subc_protocol::HEADER_LEN as u64;
 
+/// Upper bound for every configured deadline and period. `Instant + Duration`
+/// panics on overflow, so unbounded values such as `Duration::MAX` must be
+/// rejected at validation instead of crashing the published host when a
+/// deadline is armed. One year exceeds any plausible operational deadline
+/// while staying far below overflow range.
+pub const MAX_CONFIG_DURATION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// Capacity limits for one host incarnation. All limits are independent gates:
 /// exhausting one class never consumes another (protocol §5.1, §8.3).
 #[derive(Debug, Clone)]
@@ -115,6 +122,9 @@ pub struct HostTiming {
     pub auth_deadline: Duration,
     /// Remaining header plus body once the first header byte of a frame
     /// arrives. Idle waiting between frames is unbounded (protocol §6.3).
+    /// Also bounds writing one dequeued frame to the consumer: a peer that
+    /// stops reading is retired rather than allowed to pin shared egress
+    /// budget indefinitely.
     pub frame_deadline: Duration,
     /// Bind, route-gone, initialization, and health callback budget; expiry is
     /// host-fatal (plan KTD9).
@@ -244,10 +254,20 @@ impl HostConfig {
             if value.is_zero() {
                 return Err(ConfigError::ZeroDuration { name });
             }
+            if value > MAX_CONFIG_DURATION {
+                return Err(ConfigError::DurationTooLarge { name });
+            }
         }
         if let Some(liveness) = &self.liveness {
             if liveness.ping_interval.is_zero() || liveness.pong_deadline.is_zero() {
                 return Err(ConfigError::ZeroDuration {
+                    name: "liveness period",
+                });
+            }
+            if liveness.ping_interval > MAX_CONFIG_DURATION
+                || liveness.pong_deadline > MAX_CONFIG_DURATION
+            {
+                return Err(ConfigError::DurationTooLarge {
                     name: "liveness period",
                 });
             }
@@ -267,6 +287,9 @@ pub enum ConfigError {
         maximum: usize,
     },
     ZeroDuration {
+        name: &'static str,
+    },
+    DurationTooLarge {
         name: &'static str,
     },
     EmptyDaemonVer,
@@ -297,6 +320,11 @@ impl std::fmt::Display for ConfigError {
                 "host limit {name} is {configured}; supported maximum is {maximum}"
             ),
             Self::ZeroDuration { name } => write!(f, "host duration {name} must be nonzero"),
+            Self::DurationTooLarge { name } => write!(
+                f,
+                "host duration {name} exceeds the supported maximum of {} seconds",
+                MAX_CONFIG_DURATION.as_secs()
+            ),
             Self::EmptyDaemonVer => write!(f, "daemon_ver must be nonempty"),
             Self::DaemonVerTooLarge {
                 auth_message_bytes,
@@ -434,5 +462,34 @@ mod tests {
             config.validate(),
             Err(ConfigError::ZeroDuration { .. })
         ));
+    }
+
+    #[test]
+    fn overflowing_durations_rejected() {
+        let mut config = HostConfig::default();
+        config.timing.shutdown_deadline = Duration::MAX;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::DurationTooLarge {
+                name: "shutdown_deadline"
+            })
+        ));
+
+        let config = HostConfig {
+            liveness: Some(LivenessPolicy {
+                ping_interval: Duration::from_secs(30),
+                pong_deadline: Duration::MAX,
+                invalidate_on_missed: false,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::DurationTooLarge { .. })
+        ));
+
+        let mut config = HostConfig::default();
+        config.timing.shutdown_deadline = MAX_CONFIG_DURATION;
+        config.validate().expect("exact maximum accepted");
     }
 }

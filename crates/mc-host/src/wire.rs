@@ -411,19 +411,24 @@ pub struct WriterGone;
 /// Spawns the single writer task for one connection.
 ///
 /// Every frame's bytes reach the socket completely before any byte of the
-/// next; a partial write or I/O failure retires the generation (protocol
-/// §6.3). Dropping every `WriterHandle` closes the queue, which lets already
-/// queued terminals and `Goodbye` flush before the task exits.
+/// next; a partial write, I/O failure, or `write_deadline` expiry retires the
+/// generation (protocol §6.3). The deadline is what bounds how long one
+/// consumer can hold shared egress-budget charges: a peer that stops reading
+/// would otherwise pin its queued frames' charges forever and stall every
+/// other generation's emissions. Dropping every `WriterHandle` closes the
+/// queue, which lets already queued terminals and `Goodbye` flush before the
+/// task exits.
 #[cfg(test)]
 pub fn spawn_writer<W>(
     stream: W,
     queue_frames: usize,
     generation: CancellationToken,
+    write_deadline: Duration,
 ) -> (WriterHandle, tokio::task::JoinHandle<()>)
 where
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let (handle, task) = writer_parts(stream, queue_frames, generation);
+    let (handle, task) = writer_parts(stream, queue_frames, generation, write_deadline);
     (handle, tokio::spawn(task))
 }
 
@@ -431,12 +436,13 @@ pub fn spawn_writer_tracked<W>(
     stream: W,
     queue_frames: usize,
     generation: CancellationToken,
+    write_deadline: Duration,
     tracker: &tokio_util::task::TaskTracker,
 ) -> (WriterHandle, tokio::task::JoinHandle<()>)
 where
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let (handle, task) = writer_parts(stream, queue_frames, generation);
+    let (handle, task) = writer_parts(stream, queue_frames, generation, write_deadline);
     (handle, tracker.spawn(task))
 }
 
@@ -444,6 +450,7 @@ fn writer_parts<W>(
     stream: W,
     queue_frames: usize,
     generation: CancellationToken,
+    write_deadline: Duration,
 ) -> (WriterHandle, impl std::future::Future<Output = ()> + Send)
 where
     W: AsyncWrite + Send + Unpin + 'static,
@@ -458,7 +465,8 @@ where
         let mut stream = stream;
         while let Some(frame) = rx.recv().await {
             let OutboundFrame { bytes, charge } = frame;
-            if stream.write_all(&bytes).await.is_err() {
+            let written = tokio::time::timeout(write_deadline, stream.write_all(&bytes)).await;
+            if !matches!(written, Ok(Ok(()))) {
                 retired.cancel();
                 generation.cancel();
                 break;
@@ -690,7 +698,7 @@ mod tests {
             bytes: std::sync::Arc::clone(&bytes),
         };
         let generation = CancellationToken::new();
-        let (handle, task) = spawn_writer(writer, 4, generation);
+        let (handle, task) = spawn_writer(writer, 4, generation, Duration::from_secs(5));
         let mut expected = Vec::new();
         for corr in 1..=2 {
             let encoded = encode_frame(
@@ -722,7 +730,7 @@ mod tests {
     async fn writer_serializes_frames_and_flushes_queue_on_close() {
         let (server, mut client) = duplex(1 << 16);
         let generation = CancellationToken::new();
-        let (handle, task) = spawn_writer(server, 8, generation);
+        let (handle, task) = spawn_writer(server, 8, generation, Duration::from_secs(5));
         for corr in 1..=3u64 {
             let bytes = encode_frame(
                 FrameType::Response,
@@ -755,11 +763,43 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn stalled_consumer_write_retires_generation_and_frees_charges() {
+        let budget = ByteBudget::new(crate::config::MIN_RESIDENT_BYTES);
+        let baseline = budget.available();
+        // Tiny duplex: the frame cannot fully flush while the peer reads nothing.
+        let (server, client) = duplex(16);
+        let generation = CancellationToken::new();
+        let (handle, task) = spawn_writer(server, 2, generation.clone(), Duration::from_secs(5));
+        let charge = budget.charge(1024).await;
+        let bytes = encode_frame(
+            FrameType::Response,
+            response_flags(false, true),
+            FrameId {
+                channel: 1,
+                epoch: 1,
+                corr: 1,
+            },
+            &vec![0u8; 1024],
+        )
+        .expect("frame encodes");
+        handle
+            .send(OutboundFrame { bytes, charge })
+            .await
+            .expect("queued");
+        drop(handle);
+        task.await.expect("writer task");
+        // The stalled write hit the deadline: generation retired, charge freed.
+        assert!(generation.is_cancelled());
+        assert_eq!(budget.available(), baseline);
+        drop(client);
+    }
+
     #[tokio::test]
     async fn writer_failure_retires_generation() {
         let (server, client) = duplex(16);
         let generation = CancellationToken::new();
-        let (handle, task) = spawn_writer(server, 2, generation.clone());
+        let (handle, task) = spawn_writer(server, 2, generation.clone(), Duration::from_secs(5));
         drop(client);
         let bytes = encode_frame(
             FrameType::Response,

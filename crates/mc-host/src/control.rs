@@ -31,6 +31,11 @@ const MAX_CAPABILITY_LEN: usize = 64;
 const MAX_CAPABILITIES: usize = 32;
 const MAX_ADMISSION_FACTS_BYTES: usize = 8192;
 const MAX_ADMISSION_FACTS_DEPTH: usize = 32;
+/// Whole-request nesting bound: the root object plus a maximal
+/// `admission_facts` subtree. Unknown fields count toward nesting limits
+/// (protocol §7.1), so the bound applies to the complete control object
+/// before dispatching on `op`.
+const MAX_CONTROL_DEPTH: usize = MAX_ADMISSION_FACTS_DEPTH + 1;
 
 /// Catalog-state generation. Static until catalog content can change at
 /// runtime, which the direct-linked profile has no mechanism for.
@@ -74,6 +79,16 @@ pub fn parse_control(body: &[u8], binary: bool, linked_module_id: &str) -> Contr
     let serde_json::Value::Object(fields) = root else {
         return invalid("control request must be a JSON object");
     };
+    if fields
+        .values()
+        .map(value_depth)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        > MAX_CONTROL_DEPTH
+    {
+        return invalid("control request too deeply nested");
+    }
 
     let Some(op) = fields.get("op") else {
         return invalid("missing op");
@@ -577,6 +592,31 @@ mod tests {
         request["admission_facts"] =
             serde_json::Value::String("f".repeat(MAX_ADMISSION_FACTS_BYTES - 1));
         assert_eq!(reject_code(parse(&request)), CODE_INVALID_CONTROL_REQUEST);
+    }
+
+    #[test]
+    fn ignored_field_nesting_is_bounded() {
+        fn nested(depth: usize) -> serde_json::Value {
+            let mut value = serde_json::json!(1);
+            for _ in 1..depth {
+                value = serde_json::json!([value]);
+            }
+            value
+        }
+
+        // Unknown fields count toward nesting limits (protocol §7.1): the
+        // same subtree depth admission_facts allows is accepted, one more is
+        // rejected before dispatching on `op`.
+        let mut request = minimal_route_open();
+        request["forward_compat"] = nested(MAX_ADMISSION_FACTS_DEPTH);
+        assert!(matches!(parse(&request), ControlAction::RouteOpen { .. }));
+
+        request["forward_compat"] = nested(MAX_ADMISSION_FACTS_DEPTH + 1);
+        assert_eq!(reject_code(parse(&request)), CODE_INVALID_CONTROL_REQUEST);
+
+        let mut catalog = serde_json::json!({ "op": OP_CATALOG_LIST });
+        catalog["ignored"] = nested(MAX_ADMISSION_FACTS_DEPTH + 1);
+        assert_eq!(reject_code(parse(&catalog)), CODE_INVALID_CONTROL_REQUEST);
     }
 
     #[test]
