@@ -299,6 +299,20 @@ describe("collectSessionCandidates", () => {
                 role: "user",
                 parts: [{ type: "text", text: "a real user question" }],
             },
+            {
+                ordinal: 4,
+                id: "m4",
+                // Malformed parent rows page through as role "unknown";
+                // their tool parts must not become explicit candidates.
+                role: "unknown",
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "ctx_search",
+                        state: { status: "completed", input: { query: "from malformed parent" } },
+                    },
+                ],
+            },
         ]);
         expect(candidates).toEqual([{ text: "a real user question", mode: "automatic" }]);
     });

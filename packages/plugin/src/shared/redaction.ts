@@ -243,6 +243,10 @@ const SHAREABILITY_SENSITIVE_PATTERNS: RegExp[] = [
     /\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
     /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
     /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,
+    // IPv4 link-local (APIPA) and IPv6 unique-local (fc00::/7) / link-local
+    // (fe80::/10) — environment-identifying just like the RFC1918 ranges.
+    /\b169\.254\.\d{1,3}\.\d{1,3}\b/,
+    /(?:^|[\s"'`=([])\[?(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9a-f:]*[0-9a-f\]]/i,
 ];
 
 export function hasShareabilitySensitiveText(text: string): boolean {

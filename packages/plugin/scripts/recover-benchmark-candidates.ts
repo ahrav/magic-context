@@ -137,6 +137,12 @@ export function collectSessionCandidates(
                 if (auto.length > 0) candidates.push({ text: auto, mode: "automatic" });
             }
         }
+        // Tool calls are assistant turns. The paged history reader keeps a
+        // malformed-parent row as role "unknown" (the full reader dropped
+        // it), so gating on the role keeps paging from changing candidate
+        // semantics — and a ctx_search part under any other role is not a
+        // production shape.
+        if (message.role !== "assistant") continue;
         for (const part of message.parts) {
             if (part === null || typeof part !== "object") continue;
             const p = part as Record<string, unknown>;
@@ -534,12 +540,18 @@ export async function runRecovery(args: {
 
         // One session hydrated at a time; its raw messages and unreferenced
         // candidate text are released as soon as the row-referenced subset is
-        // extracted. The hash union (hashes only, no text) spans every
-        // measurement-referenced opencode session, so cross-session-only vs
-        // zero-match is exact WITHIN that scope; a hash that exists only in
-        // sessions with no measurement rows reports zero-match, a deliberate
-        // bound — labeling it would require hydrating the entire history
-        // database for a diagnostic count that recovers nothing either way.
+        // extracted. The retained hash union is intersected with the global
+        // measurement-row hash set: the cross-session check only ever asks
+        // about ROW hashes, so the intersection is exact while staying
+        // bounded by the measurement rows rather than by session history.
+        // A hash that exists only in sessions with no measurement rows
+        // reports zero-match, a deliberate bound — labeling it would require
+        // hydrating the entire history database for a diagnostic count that
+        // recovers nothing either way.
+        const globalRowHashes = new Set<string>();
+        for (const hashes of rowHashesBySession.values()) {
+            for (const hash of hashes) globalRowHashes.add(hash);
+        }
         for (const [sessionId, rowHashes] of rowHashesBySession) {
             // Persisted decision provenance: reasons recorded BEFORE the
             // search gate (stacked, too-short) mean no automatic query ran;
@@ -559,6 +571,7 @@ export async function runRecovery(args: {
             // hashed and released one at a time; a single long-lived
             // session never materializes in full.
             const kept: QueryCandidate[] = [];
+            const keptKeys = new Set<string>();
             let afterOrdinal = 0;
             for (;;) {
                 const page = readRawSessionMessagePageFromDb(
@@ -572,8 +585,15 @@ export async function runRecovery(args: {
                     autoSearchRanMessageIds: ranIds,
                 })) {
                     const hash = normalizedQueryHash(candidate.text);
-                    allCandidateHashes.add(hash);
-                    if (rowHashes.has(hash)) kept.push(candidate);
+                    if (globalRowHashes.has(hash)) allCandidateHashes.add(hash);
+                    if (!rowHashes.has(hash)) continue;
+                    // Dedup on (text, mode) during paging, not only inside
+                    // the matcher: a prompt repeated across a long session
+                    // must not retain one copy per repetition.
+                    const key = `${candidate.mode}\u0000${candidate.text}`;
+                    if (keptKeys.has(key)) continue;
+                    keptKeys.add(key);
+                    kept.push(candidate);
                 }
                 afterOrdinal = page[page.length - 1].ordinal;
             }
