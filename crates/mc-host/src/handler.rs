@@ -123,7 +123,6 @@ pub struct OutputBuffer {
     pub(crate) body: Vec<u8>,
     pub(crate) charge: crate::wire::ByteCharge,
     pub(crate) max_len: usize,
-    pub(crate) deadline: tokio::time::Instant,
 }
 
 impl OutputBuffer {
@@ -161,8 +160,8 @@ impl OutputBuffer {
         Ok(())
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<u8>, crate::wire::ByteCharge, tokio::time::Instant) {
-        (self.body, self.charge, self.deadline)
+    pub(crate) fn into_parts(self) -> (Vec<u8>, crate::wire::ByteCharge) {
+        (self.body, self.charge)
     }
 }
 

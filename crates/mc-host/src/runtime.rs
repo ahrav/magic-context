@@ -252,10 +252,10 @@ pub async fn run<H: McHostHandler>(
     {
         let handler = Arc::clone(&handler);
         let init = config.init.clone();
-        let mut init_task =
-            tokio::spawn(
-                async move { crate::panic_boundary::redact(handler.initialize(init)).await },
-            );
+        let mut init_task = tokio::spawn(async move {
+            let callback = crate::panic_boundary::redact_sync(|| handler.initialize(init));
+            crate::panic_boundary::redact(callback).await
+        });
         match timeout(config.timing.lifecycle_callback_deadline, &mut init_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => return Err(HostError::InitFailed(err.0)),
@@ -392,7 +392,8 @@ fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
             }
             let handler = Arc::clone(&shared.handler);
             let probe = shared.spawn_tracked(async move {
-                crate::panic_boundary::redact(handler.health()).await
+                let callback = crate::panic_boundary::redact_sync(|| handler.health());
+                crate::panic_boundary::redact(callback).await
             });
             // The report itself is informational; degraded storage must not
             // make transport unready (protocol §8.1, AE9).

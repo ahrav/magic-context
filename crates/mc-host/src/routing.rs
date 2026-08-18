@@ -201,6 +201,22 @@ impl RouteRegistry {
         self.inner.lock().expect("registry lock").accepting = false;
     }
 
+    /// Advisory liveness read so dispatch can prove `unknown_channel` without
+    /// consuming capacity (protocol §8.3 ordering). `register_dispatch` is the
+    /// authoritative check; this one only orders the cheap rejection first.
+    pub fn route_live(&self, handle: RouteHandle, gen_id: u64) -> bool {
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .slots
+            .get(&handle.channel)
+            .and_then(|slot| slot.occupant.as_ref())
+            .is_some_and(|occupant| {
+                occupant.epoch == handle.epoch
+                    && occupant.gen.id == gen_id
+                    && occupant.state == OccState::Live
+            })
+    }
+
     /// Requests closure from host-owned teardown.
     pub fn begin_close(&self, handle: RouteHandle) -> CloseDecision {
         self.begin_close_for(handle, None)

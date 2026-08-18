@@ -68,12 +68,31 @@ pub enum Terminal {
     StreamEnd,
 }
 
+/// Serialized length of `s` inside a JSON string, without materializing it:
+/// `"` and `\` and the short control escapes emit two bytes, remaining
+/// control characters emit six (`\u00XX`), and everything else (including
+/// multi-byte UTF-8) passes through byte for byte.
+fn escaped_json_len(s: &str) -> usize {
+    s.bytes()
+        .map(|byte| match byte {
+            b'"' | b'\\' | 0x08 | 0x09 | 0x0A | 0x0C | 0x0D => 2,
+            0x00..=0x1F => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
 fn bounded_error_body(code: &str, message: &str) -> Vec<u8> {
-    // Input-length gate before serialization: handler-controlled code and
+    // Encoded-size gate before serialization: handler-controlled code and
     // message are otherwise materialized twice (JSON `Value`, then `Vec`)
-    // before any limit applies, so oversized inputs could allocate multiples
-    // of the frame limit outside the byte budget.
-    if code.len().saturating_add(message.len()) > crate::wire::MAX_BODY_LEN as usize {
+    // before any limit applies, and escaping can multiply control-heavy
+    // input several-fold, so the gate must measure the escaped form.
+    const ERROR_ENVELOPE_OVERHEAD: usize = r#"{"code":"","message":""}"#.len();
+    if escaped_json_len(code)
+        .saturating_add(escaped_json_len(message))
+        .saturating_add(ERROR_ENVELOPE_OVERHEAD)
+        > crate::wire::MAX_BODY_LEN as usize
+    {
         return error_body_json(CODE_INTERNAL_ERROR, "handler error exceeds frame limit");
     }
     let body = error_body_json(code, message);
@@ -141,7 +160,10 @@ pub async fn emit_frame(
 
 /// Queues a handler body whose resident-byte reservation was acquired before
 /// allocation. The charge transfers directly to the writer with no second
-/// budget acquisition.
+/// budget acquisition. Writer admission is timed from submission here — a
+/// handler may legitimately spend longer than one admission window filling
+/// its reservation, and a deadline captured at reserve time would retire a
+/// healthy generation when the completed buffer finally arrives.
 async fn emit_reserved_frame(
     gen: &GenerationCore,
     ty: FrameType,
@@ -152,17 +174,14 @@ async fn emit_reserved_frame(
     if gen.writer.is_retired() || gen.token.is_cancelled() {
         return Err(());
     }
-    let (body, charge, deadline) = body.into_parts();
+    let (body, charge) = body.into_parts();
     let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
-        .send_before(
-            OutboundFrame {
-                bytes,
-                charge,
-                written: None,
-            },
-            deadline,
-        )
+        .send(OutboundFrame {
+            bytes,
+            charge,
+            written: None,
+        })
         .await
         .map_err(|_| ())
 }
@@ -282,7 +301,6 @@ impl StreamSink {
             body: Vec::with_capacity(max_len + subc_protocol::HEADER_LEN),
             charge,
             max_len,
-            deadline,
         })
     }
 
@@ -344,56 +362,80 @@ pub async fn dispatch_request<H: McHostHandler>(
         return;
     }
 
-    let (start_tx, start_rx) = oneshot::channel::<CancellationToken>();
+    // Advisory liveness first so `unknown_channel` consumes no capacity;
+    // `register_dispatch` below is the authoritative recheck.
+    if !shared.registry.route_live(route, gen.id) {
+        drop(frame);
+        emit_error_terminal(
+            &shared.egress_budget,
+            gen,
+            FrameId::routed(route, corr),
+            CODE_UNKNOWN_CHANNEL,
+            "no live route for this channel and epoch",
+        )
+        .await;
+        return;
+    }
+
+    // Admission is synchronous with the read loop: acquiring permits inside
+    // the spawned task would let a client pipeline unbounded dispatch tasks
+    // ahead of the capacity gate.
+    let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
+        drop(frame);
+        emit_error_terminal(
+            &shared.egress_budget,
+            gen,
+            FrameId::routed(route, corr),
+            CODE_SERVER_BUSY,
+            "pending request capacity exhausted",
+        )
+        .await;
+        return;
+    };
+    let Ok(task_permit) = shared.task_permits.clone().try_acquire_owned() else {
+        drop(frame);
+        emit_error_terminal(
+            &shared.egress_budget,
+            gen,
+            FrameId::routed(route, corr),
+            CODE_SERVER_BUSY,
+            "handler task capacity exhausted",
+        )
+        .await;
+        return;
+    };
+
+    // The pending entry is visible before the read loop can process any
+    // later frame, so a pipelined Cancel arriving right behind its Request
+    // always finds the correlation. The request token is a free-standing
+    // root: route close cancels entries explicitly when it collects them.
+    let settlement = Settlement::new();
+    let cancel = CancellationToken::new();
+    let key: PendingKey = (route.channel, route.epoch, corr);
+    gen.pending.lock().expect("pending lock").insert(
+        key,
+        PendingEntry {
+            cancel: cancel.clone(),
+            settlement: Arc::clone(&settlement),
+        },
+    );
+
+    let (start_tx, start_rx) = oneshot::channel::<()>();
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
     let outer = shared.spawn_tracked(async move {
-        let Ok(route_cancel) = start_rx.await else {
-            return;
-        };
-        let cancel = route_cancel.child_token();
-
-        let Ok(pending_permit) = shared_task.pending_permits.clone().try_acquire_owned() else {
-            drop(frame);
-            emit_error_terminal(
-                &shared_task.egress_budget,
-                &gen_task,
-                FrameId::routed(route, corr),
-                CODE_SERVER_BUSY,
-                "pending request capacity exhausted",
-            )
-            .await;
-            return;
-        };
-        let Ok(task_permit) = shared_task.task_permits.clone().try_acquire_owned() else {
-            drop(frame);
-            emit_error_terminal(
-                &shared_task.egress_budget,
-                &gen_task,
-                FrameId::routed(route, corr),
-                CODE_SERVER_BUSY,
-                "handler task capacity exhausted",
-            )
-            .await;
-            return;
-        };
-
         let _pending_permit = pending_permit;
         let _task_permit = task_permit;
+        if start_rx.await.is_err() {
+            remove_pending(&gen_task, key);
+            return;
+        }
+
         let InboundFrame {
             body,
             charge: body_charge,
             ..
         } = frame;
-        let settlement = Settlement::new();
-        let key: PendingKey = (route.channel, route.epoch, corr);
-        gen_task.pending.lock().expect("pending lock").insert(
-            key,
-            PendingEntry {
-                cancel: cancel.clone(),
-                settlement: Arc::clone(&settlement),
-            },
-        );
         if cancel.is_cancelled() {
             settle(
                 &settlement,
@@ -430,7 +472,11 @@ pub async fn dispatch_request<H: McHostHandler>(
         let handler = Arc::clone(&shared_task.handler);
         let inner = shared_task.spawn_tracked(async move {
             let _body_charge = body_charge;
-            crate::panic_boundary::redact(handler.handle(ctx)).await
+            // Construct under the sync guard, poll under the async guard:
+            // a panic in the callback's synchronous prologue must reach the
+            // redacting hook too.
+            let callback = crate::panic_boundary::redact_sync(|| handler.handle(ctx));
+            crate::panic_boundary::redact(callback).await
         });
         let mut inner = AbortOnDropHandle::new(inner);
 
@@ -489,11 +535,17 @@ pub async fn dispatch_request<H: McHostHandler>(
         remove_pending(&gen_task, key);
     });
 
-    if let Some(route_cancel) = shared.registry.register_dispatch(route, gen.id, outer) {
-        let _ = start_tx.send(route_cancel);
+    if shared
+        .registry
+        .register_dispatch(route, gen.id, outer)
+        .is_some()
+    {
+        let _ = start_tx.send(());
     } else {
+        // The route left Live between the advisory check and registration.
         // No dispatch crossed the registry's live-route linearization point,
-        // so this rejection proves zero handler invocation.
+        // so this rejection proves zero handler invocation; the spawned task
+        // observes the dropped start signal and removes the pending entry.
         drop(start_tx);
         emit_error_terminal(
             &shared.egress_budget,
@@ -549,8 +601,9 @@ pub async fn open_route<H: McHostHandler>(
     // the handle, and route-gone must follow a completed or failed bind, not
     // interleave with it).
     let bind_task = shared.spawn_lifecycle(async move {
+        let callback = crate::panic_boundary::redact_sync(|| handler.bind(handle, identity));
         tokio::select! {
-            outcome = crate::panic_boundary::redact(handler.bind(handle, identity)) => Some(outcome),
+            outcome = crate::panic_boundary::redact(callback) => Some(outcome),
             () = tokio::time::sleep(bind_deadline) => {
                 bind_watchdog.fatal.trip(
                     &bind_watchdog.shutdown,
@@ -629,8 +682,11 @@ async fn run_route_gone<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: R
     let deadline = shared.timing.lifecycle_callback_deadline;
     let watchdog = Arc::clone(shared);
     let task = shared.spawn_lifecycle(async move {
-        let callback = crate::panic_boundary::redact(handler.route_gone(handle));
-        if timeout(deadline, callback).await.is_err() {
+        let callback = crate::panic_boundary::redact_sync(|| handler.route_gone(handle));
+        if timeout(deadline, crate::panic_boundary::redact(callback))
+            .await
+            .is_err()
+        {
             watchdog.fatal.trip(
                 &watchdog.shutdown,
                 "route_gone callback deadline expired".to_owned(),
@@ -720,16 +776,23 @@ pub async fn close_generation<H: McHostHandler>(
 
 /// Forced-path cleanup after the shutdown deadline: aborts every remaining
 /// route task and still runs exactly-once route-gone before handler drop
-/// (protocol §12 forced shutdown).
+/// (protocol §12 forced shutdown). Route drains run concurrently — bounded by
+/// `max_routes` — because a serial sweep would multiply each route-gone
+/// callback's deadline by the route count while `run` holds the instance lock.
 pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
+    let mut drains = tokio::task::JoinSet::new();
     for (handle, tasks) in shared.registry.force_drain() {
-        for task in tasks {
-            task.abort();
-            let _ = timeout(shared.timing.lifecycle_callback_deadline, task).await;
-        }
-        run_route_gone(shared, handle).await;
-        shared.registry.finalize_close(handle);
+        let shared = Arc::clone(shared);
+        drains.spawn(async move {
+            for task in tasks {
+                task.abort();
+                let _ = timeout(shared.timing.lifecycle_callback_deadline, task).await;
+            }
+            run_route_gone(&shared, handle).await;
+            shared.registry.finalize_close(handle);
+        });
     }
+    while drains.join_next().await.is_some() {}
 }
 
 /// Best-effort connection `Goodbye` (0/0/0), queued after drain terminals so
