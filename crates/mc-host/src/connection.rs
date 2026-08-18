@@ -241,13 +241,16 @@ async fn read_loop<H: McHostHandler>(
             ReadEvent::OversizeControl { header, deadline } => {
                 // The correlation is trustworthy from the header alone; the
                 // early terminal is authoritative even if the drain then fails
-                // (protocol §7.1). The watermark still applies first.
+                // (protocol §7.1). The watermark still applies first. Emitted
+                // off-reader (bounded) like the other no-permit rejections so
+                // contended egress cannot block this reader from a queued
+                // Pong while the declared body waits to be drained.
                 if header.corr <= watermark {
                     return ReadExit::Peer;
                 }
                 watermark = header.corr;
-                emit_error_terminal(
-                    &shared.egress_budget,
+                crate::dispatch::emit_rejection(
+                    shared,
                     gen,
                     FrameId::control(header.corr),
                     CODE_INVALID_CONTROL_REQUEST,
@@ -587,10 +590,22 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         )
         .expect("header-only Ping always encodes");
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        // The hook runs inside the writer task at write completion, so the
+        // probe is answerable the instant the Ping can reach the peer — an
+        // async notification would leave a gap where a fast (or adversarial
+        // pre-answering) Pong races the flag update.
+        let gen_probe = Arc::clone(&gen);
+        let written_hook = Box::new(move || {
+            if let Some(probe) = gen_probe.pings.lock().expect("pings lock").get_mut(&corr) {
+                probe.sent = Instant::now();
+                probe.written = true;
+            }
+            let _ = written_tx.send(());
+        });
         let send = gen.writer.send(crate::wire::OutboundFrame {
             bytes,
             charge: crate::wire::ByteCharge::none(),
-            written: Some(written_tx),
+            written: Some(written_hook),
         });
         let sent = tokio::select! {
             biased;
@@ -600,19 +615,15 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         if sent.is_err() {
             return;
         }
-        // Anchor the Pong deadline at write completion: the queue may hold
-        // large frames ahead of the Ping, and a deadline measured from
-        // enqueue would invalidate a healthy peer that never saw the Ping.
+        // Wait for write completion before arming expiry: the hook above
+        // already anchored the deadline and flipped `written` inside the
+        // writer task; this await only paces the loop.
         tokio::select! {
             () = gen.read_cancel.cancelled() => return,
             written = written_rx => {
                 if written.is_err() {
                     // Writer retired before the Ping reached the socket.
                     return;
-                }
-                if let Some(probe) = gen.pings.lock().expect("pings lock").get_mut(&corr) {
-                    probe.sent = Instant::now();
-                    probe.written = true;
                 }
             }
         }

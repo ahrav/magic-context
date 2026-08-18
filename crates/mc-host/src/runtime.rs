@@ -207,7 +207,7 @@ impl<H: McHostHandler> AbandonGuard<H> {
 
 impl<H: McHostHandler> Drop for AbandonGuard<H> {
     fn drop(&mut self) {
-        let Some((shared, guard)) = self.inner.take() else {
+        let Some((shared, mut guard)) = self.inner.take() else {
             return;
         };
         shared.shutdown.cancel();
@@ -222,12 +222,15 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
             gen.token.cancel();
         }
         shared.abort_all();
+        // The listener died with the dropped future: unpublish immediately so
+        // discovery stops advertising a dead endpoint, instead of waiting out
+        // the lifecycle cleanup chain below. Idempotent and fenced.
+        guard.remove_publication();
         // Route cleanup is async (route-gone callbacks must run before the
         // handler drops), so the guard moves into the cleanup task and drops
-        // last — the lock and publication release only after handler-visible
-        // routes got their exactly-once route-gone. Without a runtime the
-        // process is tearing down and the lock dies with it; the guard's own
-        // Drop still removes the publication.
+        // last — the lock releases only after handler-visible routes got
+        // their exactly-once route-gone. Without a runtime the process is
+        // tearing down and the lock dies with it.
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 force_close_all_routes(&shared).await;
@@ -324,7 +327,15 @@ pub async fn run<H: McHostHandler>(
         };
         match joined {
             Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(err))) => return Err(HostError::InitFailed(err.0)),
+            Ok(Ok(Err(err))) => {
+                // The handler-authored message can carry data derived from
+                // the opaque storage descriptor (credentials, endpoints);
+                // startup diagnostics get bounded structure only (V24).
+                return Err(HostError::InitFailed(format!(
+                    "handler initialization failed ({} bytes of detail redacted)",
+                    err.0.len()
+                )));
+            }
             Ok(Err(join_err)) => {
                 let kind = if join_err.is_panic() {
                     "panic"

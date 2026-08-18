@@ -390,11 +390,14 @@ pub fn pure_header_flags() -> Flags {
 pub struct OutboundFrame {
     pub bytes: Vec<u8>,
     pub charge: ByteCharge,
-    /// Fired once the frame's bytes have fully reached the socket. Senders
-    /// that anchor deadlines on delivery (Ping/Pong liveness) pass a sender;
-    /// everything else passes `None`. Dropped unfired if the writer retires
-    /// before writing the frame.
-    pub written: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Run by the writer task synchronously once the frame's bytes have
+    /// fully reached the socket — before the writer touches the next frame.
+    /// Senders that anchor state on delivery (Ping/Pong liveness) pass a
+    /// hook; everything else passes `None`. Dropped unrun if the writer
+    /// retires before writing the frame. Synchronous execution matters: an
+    /// asynchronously delivered notification would leave a gap in which a
+    /// peer's answer arrives before the sender observes the completion.
+    pub written: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Sender half of one connection's serialized writer.
@@ -543,7 +546,7 @@ where
                 break;
             }
             if let Some(written) = written {
-                let _ = written.send(());
+                written();
             }
             drop(bytes);
             drop(charge);
