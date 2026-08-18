@@ -1,12 +1,13 @@
 //! Host-owned handler contract.
 //!
-//! This boundary is what `magic-context-c50.4` adapts `McHandler` onto. It is
+//! `magic-context-c50.4` will adapt `McHandler` onto this boundary. It is
 //! deliberately independent of the private subc SDK: no `subc-*` type appears
 //! here, the handler never sees socket frames, credentials, correlations, or
-//! route allocation, and the host owns every terminal and lifecycle decision
-//! (plan KTD2).
+//! route allocation, and the host owns lifecycle transitions, terminal
+//! arbitration, and wire emission (plan KTD2).
 
 use std::future::Future;
+use std::io;
 use std::path::PathBuf;
 
 use tokio_util::sync::CancellationToken;
@@ -16,7 +17,8 @@ use crate::config::HostInit;
 /// Catalog-visible snapshot of the linked module's manifest.
 ///
 /// `provides` is carried as raw JSON so `catalog.list` can return it without
-/// lossy rewriting (protocol §7.3); the host never interprets role internals.
+/// lossy rewriting (protocol §7.3). The host reads each entry's top-level
+/// `role` for admission and preserves the remaining role data unchanged.
 #[derive(Debug, Clone)]
 pub struct ManifestSnapshot {
     pub module_id: String,
@@ -86,12 +88,24 @@ impl HealthReport {
 }
 
 /// How one routed request settles from the handler's side.
+///
+/// Output storage must be reserved through [`RequestCtx::reserve_output`]
+/// before allocation; an already allocated `Vec` cannot bypass the host's
+/// resident-byte budget:
+///
+/// ```compile_fail
+/// # use mc_host::RequestOutcome;
+/// let _ = RequestOutcome::Response {
+///     body: Vec::<u8>::new(),
+///     binary: false,
+/// };
+/// ```
 #[derive(Debug)]
 pub enum RequestOutcome {
     /// Unary success; the host emits one `Response` terminal whose wire
     /// `binary` flag mirrors `binary`, exactly like [`RequestCtx::stream`]
     /// items.
-    Response { body: Vec<u8>, binary: bool },
+    Response { body: OutputBuffer, binary: bool },
     /// Application failure; the host emits one canonical `Error` terminal.
     Error { code: String, message: String },
     /// Stream items were emitted through [`RequestCtx::stream`]; the host
@@ -99,10 +113,77 @@ pub enum RequestOutcome {
     Streamed,
 }
 
+/// Host-reserved output storage.
+///
+/// The host acquires the resident-byte charge before allocating this buffer.
+/// Its fixed maximum keeps later writes from growing beyond that reservation;
+/// the charge moves with the body into the connection writer.
+#[derive(Debug)]
+pub struct OutputBuffer {
+    pub(crate) body: Vec<u8>,
+    pub(crate) charge: crate::wire::ByteCharge,
+    pub(crate) max_len: usize,
+    pub(crate) deadline: tokio::time::Instant,
+}
+
+impl OutputBuffer {
+    pub fn len(&self) -> usize {
+        self.body.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.max_len
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Appends bytes without permitting allocation beyond the host reservation.
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), StreamClosed> {
+        if bytes.len() > self.max_len.saturating_sub(self.body.len()) {
+            return Err(StreamClosed);
+        }
+        self.body.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Resizes within the fixed reservation without permitting further growth.
+    pub fn resize(&mut self, new_len: usize, value: u8) -> Result<(), StreamClosed> {
+        if new_len > self.max_len {
+            return Err(StreamClosed);
+        }
+        self.body.resize(new_len, value);
+        Ok(())
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, crate::wire::ByteCharge, tokio::time::Instant) {
+        (self.body, self.charge, self.deadline)
+    }
+}
+
+impl io::Write for OutputBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.extend_from_slice(bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::WriteZero, "output reservation exhausted")
+        })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Context for one dispatched request. Dropping it without returning an
 /// outcome leaves settlement to the host (cancellation or teardown).
 ///
-/// `RequestCtx` does not expose transport identities or capabilities:
+/// `RequestCtx` specifically hides transport correlations, sockets, and
+/// credentials:
 ///
 /// ```compile_fail
 /// fn no_correlation(ctx: mc_host::RequestCtx) { let _ = ctx.corr; }
@@ -136,10 +217,18 @@ impl RequestCtx {
         self.cancel.is_cancelled()
     }
 
+    /// Reserves capacity and its resident-byte charge before allocating output.
+    ///
+    /// The returned buffer can hold at most `max_len` body bytes. Its charge
+    /// transfers into either a unary response or a stream item.
+    pub async fn reserve_output(&self, max_len: usize) -> Result<OutputBuffer, StreamClosed> {
+        self.stream.reserve(max_len).await
+    }
+
     /// Queues one nonterminal `StreamData` item, in order. Returns `Err` once
-    /// a terminal has been selected for this request or the connection is
+    /// the request is cancelled, a terminal is selected, or the connection is
     /// gone; the handler should stop streaming then.
-    pub async fn stream(&self, item: Vec<u8>, binary: bool) -> Result<(), StreamClosed> {
+    pub async fn stream(&self, item: OutputBuffer, binary: bool) -> Result<(), StreamClosed> {
         self.stream.send(item, binary).await
     }
 }
@@ -156,16 +245,15 @@ impl std::fmt::Debug for RequestCtx {
     }
 }
 
-/// The stream or connection can no longer accept items.
+/// Output reservation or streaming can no longer proceed because admission
+/// was rejected, cancellation or terminal selection occurred, or the
+/// connection was lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamClosed;
 
 impl std::fmt::Display for StreamClosed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "stream closed: terminal already selected or connection gone"
-        )
+        write!(f, "request output is no longer accepted")
     }
 }
 
@@ -185,12 +273,12 @@ impl std::error::Error for InitError {}
 
 /// The linked module's lifecycle surface, called only by the host.
 ///
-/// Concurrency: `handle` runs on independent tasks and may overlap itself and
-/// every other callback. `initialize` is called exactly once before the
-/// listener binds. `bind` precedes any request for its route; `route_gone`
-/// follows the settlement of all of the route's requests and runs exactly once
-/// per handle the handler observed — including rejected binds. `health` runs
-/// on a dedicated host task.
+/// Concurrency: `handle` runs on independent tasks and may overlap itself,
+/// `health`, and lifecycle callbacks for other routes. `initialize` is called
+/// exactly once before the listener binds. `bind` precedes any request for its
+/// route. `route_gone` follows completion or forced abort of that route's
+/// request tasks and runs exactly once per handle the handler observed,
+/// including rejected binds. `health` runs on a dedicated host task.
 ///
 /// Failure policy (plan KTD9): a panic or deadline overrun in `initialize`,
 /// `bind`, `route_gone`, or `health` is host-fatal. A panic in `handle` maps

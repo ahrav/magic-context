@@ -6,9 +6,11 @@ license = "MIT"
 publish = false
 
 [dependencies]
-subc-protocol = { workspace = true }
-subc-transport = { workspace = true }
-subc-control = { workspace = true }
+# The host implements the published wire authority; module crates continue to
+# use the workspace's sibling dependencies for local SDK co-development.
+subc-protocol = "=0.10.0"
+subc-transport = "=0.5.0"
+subc-control = "=0.1.1"
 
 serde = { workspace = true }
 serde_json = { workspace = true }

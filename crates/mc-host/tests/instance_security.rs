@@ -5,9 +5,62 @@
 mod support;
 
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 use support::raw_client;
 use support::{TestHandler, TestHost};
+
+const UMASK_CHILD_ENV: &str = "MC_HOST_RESTRICTIVE_UMASK_CHILD";
+
+#[test]
+fn restrictive_umask_preserves_required_owner_permissions() {
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "restrictive_umask_subprocess_child",
+            "--nocapture",
+        ])
+        .env(UMASK_CHILD_ENV, "1")
+        .output()
+        .expect("run restrictive-umask subprocess");
+    assert!(
+        output.status.success(),
+        "subprocess failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn restrictive_umask_subprocess_child() {
+    if std::env::var_os(UMASK_CHILD_ENV).is_none() {
+        return;
+    }
+    let data_root = tempfile::tempdir().expect("data root");
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o777));
+    let host = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("host publishes under restrictive umask");
+
+    let dir_mode = std::fs::symlink_metadata(host.runtime_dir())
+        .expect("stat dir")
+        .permissions()
+        .mode()
+        & 0o7777;
+    let file_mode = std::fs::symlink_metadata(host.publication_path())
+        .expect("stat publication")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(dir_mode, 0o700);
+    assert_eq!(file_mode, 0o600);
+    raw_client::discover(&host.publication_path()).expect("publication stays readable");
+
+    host.shutdown_gracefully().await;
+}
 
 #[tokio::test]
 async fn publication_is_an_owner_only_regular_file_in_an_owner_only_dir() {

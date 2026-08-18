@@ -1,8 +1,8 @@
 //! Host runtime composition: startup order, admission, health, and shutdown.
 //!
 //! Signal acquisition stays outside this crate: the caller supplies a
-//! `CancellationToken` and maps SIGINT/SIGTERM in production wiring
-//! (`magic-context-c50.4`), while tests inject deterministic shutdown.
+//! `CancellationToken`; future production wiring in `magic-context-c50.4`
+//! will map SIGINT/SIGTERM, while tests inject deterministic shutdown.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -28,7 +28,7 @@ use crate::wire::ByteBudget;
 pub enum HostError {
     Config(crate::config::ConfigError),
     Instance(InstanceError),
-    /// Handler initialization failed or overran its deadline; nothing was
+    /// Startup validation or handler initialization failed; nothing was
     /// published.
     InitFailed(String),
     /// A lifecycle callback (bind, route-gone, health) panicked or overran its
@@ -92,6 +92,7 @@ pub struct HostShared<H> {
     pub timing: HostTiming,
     pub liveness: Option<LivenessPolicy>,
     pub manifest: ManifestSnapshot,
+    pub catalog: crate::control::CatalogCache,
     pub registry: RouteRegistry,
     pub ingress_budget: ByteBudget,
     pub egress_budget: ByteBudget,
@@ -187,15 +188,15 @@ pub async fn run<H: McHostHandler>(
     config: HostConfig,
     shutdown: CancellationToken,
 ) -> Result<(), HostError> {
+    crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
     let mut guard =
         InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
-    let manifest = handler.manifest();
-    if crate::control::catalog_response_json(&manifest, None).len()
-        > crate::wire::MAX_BODY_LEN as usize
-    {
+    let manifest = crate::panic_boundary::redact_sync(|| handler.manifest());
+    let catalog = crate::control::CatalogCache::new(&manifest);
+    if catalog.max_body_len() > crate::wire::MAX_BODY_LEN as usize {
         return Err(HostError::InitFailed(
             "linked manifest exceeds the frame limit".to_owned(),
         ));
@@ -223,7 +224,10 @@ pub async fn run<H: McHostHandler>(
     {
         let handler = Arc::clone(&handler);
         let init = config.init.clone();
-        let mut init_task = tokio::spawn(async move { handler.initialize(init).await });
+        let mut init_task =
+            tokio::spawn(
+                async move { crate::panic_boundary::redact(handler.initialize(init)).await },
+            );
         match timeout(config.timing.lifecycle_callback_deadline, &mut init_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => return Err(HostError::InitFailed(err.0)),
@@ -262,6 +266,7 @@ pub async fn run<H: McHostHandler>(
         timing: config.timing.clone(),
         liveness: config.liveness.clone(),
         manifest,
+        catalog,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
             config.limits.max_resident_bytes - crate::config::EGRESS_RESERVED_BYTES,
@@ -354,7 +359,9 @@ fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
                 () = tokio::time::sleep(shared.timing.health_interval) => {}
             }
             let handler = Arc::clone(&shared.handler);
-            let probe = shared.spawn_tracked(async move { handler.health().await });
+            let probe = shared.spawn_tracked(async move {
+                crate::panic_boundary::redact(handler.health()).await
+            });
             // The report itself is informational; degraded storage must not
             // make transport unready (protocol §8.1, AE9).
             if shared.lifecycle_join("health", probe).await.is_err() {
@@ -382,13 +389,15 @@ async fn shutdown_sequence<H: McHostHandler>(
     // 2. Fenced publication removal while the lock is held.
     guard.remove_publication();
 
-    // 3-5. Drain: close every route (cancels admitted work, emits terminals
-    // while writers live, joins tasks, runs route-gone once each), then
-    // best-effort connection Goodbyes AFTER drain terminals are queued.
+    // 3-5. Drain every route while read loops remain available to reject work
+    // arriving during the frozen-admission window. Once route cleanup is
+    // complete, fence and join read-side producers; connection Goodbyes are
+    // queued only after neither producer class can enqueue another frame.
     let drain = async {
         for handle in shared.registry.all_routes() {
             close_route(shared, handle).await;
         }
+
         let generations: Vec<Arc<GenerationCore>> = shared
             .connections
             .lock()
@@ -396,11 +405,23 @@ async fn shutdown_sequence<H: McHostHandler>(
             .values()
             .cloned()
             .collect();
+
+        for gen in &generations {
+            gen.read_cancel.cancel();
+            gen.read_tasks.close();
+        }
+        for gen in &generations {
+            gen.read_tasks.wait().await;
+        }
+
         for gen in &generations {
             send_connection_goodbye(gen).await;
         }
         for gen in &generations {
             gen.token.cancel();
+        }
+        for gen in &generations {
+            gen.shutdown_complete.cancel();
         }
     };
     let drained_in_time = timeout_at(deadline, drain).await.is_ok();

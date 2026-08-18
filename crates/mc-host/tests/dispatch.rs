@@ -4,6 +4,7 @@
 mod support;
 
 use std::collections::HashSet;
+use std::process::Command;
 use std::time::Duration;
 
 use support::raw_client::{
@@ -14,6 +15,8 @@ use support::{mode_body, TestHost, LINKED_MODULE_ID};
 
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
+const PANIC_CHILD_ENV: &str = "MC_HOST_PANIC_REDACTION_CHILD";
+const REDACTED_PANIC_DIAGNOSTIC: &str = "mc-host handler callback panicked (details redacted)";
 
 #[tokio::test]
 async fn a_unary_request_dispatches_once_with_one_matching_terminal() {
@@ -597,6 +600,66 @@ async fn a_handler_panic_maps_to_one_redacted_internal_error() {
     host.shutdown_gracefully().await;
 }
 
+#[test]
+fn handler_panic_payload_is_redacted_from_process_stderr() {
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "panic_redaction_subprocess_child", "--nocapture"])
+        .env(PANIC_CHILD_ENV, "1")
+        .output()
+        .expect("run panic redaction subprocess");
+    assert!(
+        output.status.success(),
+        "subprocess failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(REDACTED_PANIC_DIAGNOSTIC),
+        "fixed redacted diagnostic missing: {stderr}"
+    );
+    assert!(
+        !stderr.contains(String::from_utf8_lossy(support::CANARY_BODY).as_ref()),
+        "handler panic payload reached stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("UNRELATED-PANIC-CANARY"),
+        "unrelated panic did not chain to the prior hook: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn panic_redaction_subprocess_child() {
+    if std::env::var_os(PANIC_CHILD_ENV).is_none() {
+        return;
+    }
+    std::panic::set_hook(Box::new(|info| eprintln!("prior panic hook: {info}")));
+
+    let host = TestHost::start().await;
+    let mut client = host.client().await;
+    let (channel, epoch) = client
+        .route_open(LINKED_MODULE_ID, ROOT, "opencode", "panic-stderr")
+        .await
+        .expect("route");
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            channel,
+            epoch,
+            corr,
+            &mode_body(serde_json::json!({"mode": "panic"})),
+        )
+        .await
+        .expect("send");
+    let frame = client.frame_within(BUDGET).await.expect("terminal");
+    assert_eq!(frame.error_code(), "internal_error");
+    host.shutdown_gracefully().await;
+
+    let _ = std::panic::catch_unwind(|| panic!("UNRELATED-PANIC-CANARY"));
+}
+
 #[tokio::test]
 async fn oversized_handler_output_cannot_corrupt_framing() {
     let host = TestHost::start().await;
@@ -645,7 +708,7 @@ async fn oversized_handler_output_cannot_corrupt_framing() {
 }
 
 #[tokio::test]
-async fn concurrent_egress_waits_for_budget_instead_of_retiring_the_generation() {
+async fn concurrent_handler_output_is_reserved_before_allocation() {
     let host = TestHost::start_with(|config| {
         config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES;
     })
@@ -667,7 +730,7 @@ async fn concurrent_egress_waits_for_budget_instead_of_retiring_the_generation()
                 epoch,
                 corr,
                 &mode_body(serde_json::json!({
-                    "mode": "response_bytes",
+                    "mode": "reserve_then_await_completion",
                     "bytes": 40 * 1024 * 1024
                 })),
             )
@@ -676,21 +739,91 @@ async fn concurrent_egress_waits_for_budget_instead_of_retiring_the_generation()
         corrs.push(corr);
     }
 
-    // The egress budget (one maximum frame) cannot hold both encoded
-    // responses at once; the second emission waits for the first to flush
-    // instead of failing its charge and retiring the generation.
-    for _ in 0..2 {
-        let frame = client
-            .frame_within(Duration::from_secs(30))
-            .await
-            .expect("large response");
-        assert_eq!(frame.ty, TY_RESPONSE);
-        let pos = corrs
-            .iter()
-            .position(|corr| *corr == frame.corr)
-            .expect("response for a sent correlation");
-        corrs.remove(pos);
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while host.handler.dispatch_count() < 2 || host.handler.output_reservation_count() < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handlers did not start"
+        );
+        tokio::task::yield_now().await;
     }
+    assert_eq!(
+        host.handler.output_reservation_count(),
+        1,
+        "the egress budget cannot reserve two 40 MiB handler buffers"
+    );
+
+    host.handler.release_completion();
+    let first = client
+        .frame_within(Duration::from_secs(30))
+        .await
+        .expect("first large response");
+    assert_eq!(first.ty, TY_RESPONSE);
+    corrs.retain(|corr| *corr != first.corr);
+
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while host.handler.output_reservation_count() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "second reservation stayed blocked after the first body flushed"
+        );
+        tokio::task::yield_now().await;
+    }
+    host.handler.release_completion();
+    let second = client
+        .frame_within(Duration::from_secs(30))
+        .await
+        .expect("second large response");
+    assert_eq!(second.ty, TY_RESPONSE);
+    corrs.retain(|corr| *corr != second.corr);
+    assert!(corrs.is_empty());
+
+    host.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn egress_budget_deadline_retires_the_generation() {
+    let host = TestHost::start_with(|config| {
+        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES;
+        config.timing.frame_deadline = Duration::from_millis(100);
+    })
+    .await;
+    let mut client = host.client().await;
+    let (channel, epoch) = client
+        .route_open(LINKED_MODULE_ID, ROOT, "opencode", "egress-deadline")
+        .await
+        .expect("route");
+
+    for _ in 0..2 {
+        let corr = client.next_corr();
+        client
+            .send_frame(
+                TY_REQUEST,
+                FLAGS_INTERACTIVE,
+                channel,
+                epoch,
+                corr,
+                &mode_body(serde_json::json!({
+                    "mode": "reserve_then_await_completion",
+                    "bytes": 40 * 1024 * 1024
+                })),
+            )
+            .await
+            .expect("send large response request");
+    }
+
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while host.handler.dispatch_count() < 2 || host.handler.output_reservation_count() < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handlers did not start"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        client.closed_within(BUDGET).await,
+        "the blocked second reservation must retire the generation"
+    );
 
     host.shutdown_gracefully().await;
 }

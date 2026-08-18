@@ -519,9 +519,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subc-control",
- "subc-protocol",
- "subc-transport",
+ "subc-control 0.1.1",
+ "subc-protocol 0.10.0",
+ "subc-transport 0.5.0",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -544,10 +544,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control",
+ "subc-control 0.1.2",
  "subc-core",
- "subc-protocol",
- "subc-transport",
+ "subc-protocol 0.12.0",
+ "subc-transport 0.5.1",
  "tempfile",
  "tokio",
 ]
@@ -863,11 +863,22 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
- "subc-control",
- "subc-protocol",
- "subc-transport",
+ "subc-control 0.1.2",
+ "subc-protocol 0.12.0",
+ "subc-transport 0.5.1",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "subc-control"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "226b6eb603c230bfdee64b9f1ce9e032523dbecde2eb9977e609163b15f8fbbf"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-protocol 0.10.0",
 ]
 
 [[package]]
@@ -876,7 +887,7 @@ version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol",
+ "subc-protocol 0.12.0",
 ]
 
 [[package]]
@@ -889,10 +900,10 @@ dependencies = [
  "rlimit",
  "serde",
  "serde_json",
- "subc-control",
+ "subc-control 0.1.2",
  "subc-jsonc",
- "subc-protocol",
- "subc-transport",
+ "subc-protocol 0.12.0",
+ "subc-transport 0.5.1",
  "terminal_size",
  "tokio",
  "tracing",
@@ -905,10 +916,36 @@ version = "0.0.0"
 
 [[package]]
 name = "subc-protocol"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d13feabcd80d43ea9e12819f0e5b28f06c2be21de475bc0d0b7fe97ec27d7c6f"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "subc-protocol"
 version = "0.12.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "subc-transport"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcc815910039de920bb680edd1a2c5743c86fe7a51e24c83c1db94da950874ab"
+dependencies = [
+ "getrandom 0.2.17",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subc-protocol 0.10.0",
+ "subtle",
+ "tokio",
 ]
 
 [[package]]
@@ -920,7 +957,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "subc-protocol",
+ "subc-protocol 0.12.0",
  "subtle",
  "tokio",
 ]

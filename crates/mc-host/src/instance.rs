@@ -25,8 +25,9 @@ pub const CONNECTION_FILE_NAME: &str = "subc-connection.json";
 /// (protocol §4.2).
 const STALE_TEMP_AFTER: Duration = Duration::from_secs(600);
 
-/// Fresh per-incarnation bearer key. Custom `Debug`/absent `Display` keep the
-/// bytes out of every diagnostic sink (protocol V24).
+/// Fresh per-incarnation bearer key. Its `Debug` implementation redacts the
+/// bytes, and the type intentionally has no `Display` implementation
+/// (protocol V24).
 pub struct ConnectionKey(pub(crate) [u8; KEY_LEN]);
 
 impl fmt::Debug for ConnectionKey {
@@ -104,9 +105,9 @@ fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -> InstanceE
     }
 }
 
-/// Resolves `${dataDir}/cortexkit/run`, where dataDir is the override, else
-/// `$XDG_DATA_HOME`, else `$HOME/.local/share` — matching the TypeScript
-/// clients' discovery path.
+/// Resolves `${dataDir}/cortexkit/run`, where dataDir is the override, a
+/// nonempty `$XDG_DATA_HOME`, or a nonempty `$HOME/.local/share`, in that
+/// order.
 pub fn runtime_dir_path(data_dir_override: Option<&Path>) -> Result<PathBuf, InstanceError> {
     let data_dir = match data_dir_override {
         Some(dir) => dir.to_path_buf(),
@@ -137,8 +138,9 @@ pub struct InstanceGuard {
     publication: Option<PublicationIdentity>,
 }
 
-/// Identity of our own published file, retained at publish time so cleanup can
-/// prove it is not deleting a successor's publication (protocol §4.2, V7).
+/// Identity retained at publish time for the best-effort check that the
+/// canonical file still names our publication before cleanup unlinks it
+/// (protocol §4.2, V7).
 struct PublicationIdentity {
     dev: u64,
     ino: u64,
@@ -232,6 +234,13 @@ impl InstanceGuard {
         .map_err(|e| io_err("create_temp", &temp_path, e))?;
 
         let result = (|| -> Result<PublicationIdentity, InstanceError> {
+            // The create mode is filtered by the process umask (a 0o777-style
+            // umask can strip owner bits and leave the file 0o000); force the
+            // exact owner-only mode so the published credentials stay
+            // readable by the owning principal and fenced cleanup can reopen
+            // the file.
+            rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))
+                .map_err(|e| io_err("chmod_temp", &temp_path, e))?;
             write_all_fd(&fd, &json).map_err(|source| InstanceError::Io {
                 op: "write_temp",
                 path: temp_path.clone(),
@@ -266,10 +275,11 @@ impl InstanceGuard {
         }
     }
 
-    /// Removes the canonical publication only if it is still provably ours:
+    /// Best-effort identity fencing before removing the canonical publication:
     /// no-follow open, secure regular file, matching retained (dev, ino), and
-    /// matching daemon ID (protocol §4.2, V7). Any mismatch leaves the file
-    /// alone — it belongs to a successor or an attacker planted it.
+    /// matching daemon ID (protocol §4.2, V7). A mismatch leaves the path
+    /// alone. Verification and pathname unlink are separate operations, so
+    /// replacement between the final check and unlink cannot be excluded.
     pub fn remove_publication(&mut self) {
         let Some(identity) = self.publication.take() else {
             return;
@@ -310,16 +320,15 @@ impl InstanceGuard {
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         // Idempotent: the graceful path already removed the publication and
-        // took the retained identity, making this a no-op. All fencing
-        // (dev/ino and daemon-ID match) applies, so a successor's file is
-        // never touched.
+        // took the retained identity, making this a no-op. The same
+        // best-effort identity checks run before unlink on the drop path.
         self.remove_publication();
     }
 }
 
-/// Creates (0700) and validates the runtime directory, returning a pinned
-/// no-follow descriptor. Ancestors are created with default modes; only the
-/// final component's security is load-bearing.
+/// Traverses and validates the runtime path without following symlinks,
+/// normalizing newly created components to 0700. Returns a pinned descriptor
+/// for the final directory after validating its ownership and mode.
 fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
     let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
     let mut current = openat(
@@ -352,12 +361,31 @@ fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
         let next = match openat(&current, name, flags, Mode::empty()) {
             Ok(fd) => fd,
             Err(rustix::io::Errno::NOENT) => {
-                match mkdirat(&current, name, Mode::from_raw_mode(0o700)) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                let created = match mkdirat(&current, name, Mode::from_raw_mode(0o700)) {
+                    Ok(()) => true,
+                    Err(rustix::io::Errno::EXIST) => false,
                     Err(e) => return Err(io_err("mkdir_component", &walked, e)),
+                };
+                // mkdir modes are filtered by umask. Restore owner access
+                // before reopening a component that a restrictive umask may
+                // have created as 0000; the subsequent no-follow open and
+                // descriptor chmod validate and pin the actual directory.
+                if created {
+                    rustix::fs::chmodat(
+                        &current,
+                        name,
+                        Mode::from_raw_mode(0o700),
+                        AtFlags::empty(),
+                    )
+                    .map_err(|e| io_err("chmod_component", &walked, e))?;
                 }
-                openat(&current, name, flags, Mode::empty())
-                    .map_err(|e| io_err("open_component", &walked, e))?
+                let fd = openat(&current, name, flags, Mode::empty())
+                    .map_err(|e| io_err("open_component", &walked, e))?;
+                if created {
+                    rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))
+                        .map_err(|e| io_err("fchmod_component", &walked, e))?;
+                }
+                fd
             }
             Err(e) => return Err(io_err("open_component", &walked, e)),
         };
@@ -379,10 +407,8 @@ fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
             path: dir_path.to_path_buf(),
         });
     }
-    if stat.st_mode & 0o077 != 0 {
-        rustix::fs::fchmod(&current, Mode::from_raw_mode(0o700))
-            .map_err(|e| io_err("chmod_dir", dir_path, e))?;
-    }
+    rustix::fs::fchmod(&current, Mode::from_raw_mode(0o700))
+        .map_err(|e| io_err("chmod_dir", dir_path, e))?;
     Ok(current)
 }
 
@@ -419,8 +445,11 @@ fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
         && stat.st_mode & 0o077 == 0
 }
 
-/// Best-effort removal of our own stale publication temp files. Age is the
-/// sole predicate; failure never delays publication (protocol §4.2).
+/// Best-effort removal of stale publication temp pathnames. Candidates and
+/// metadata come from a path-based directory iterator with metadata fetched
+/// per entry, while deletion is descriptor-relative; the metadata check and
+/// unlink are not atomic. Age is the sole predicate, failures do not prevent
+/// publication (protocol §4.2).
 fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
     let prefix = format!(".{CONNECTION_FILE_NAME}.");
     let Ok(entries) = std::fs::read_dir(dir_path) else {

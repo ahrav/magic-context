@@ -19,7 +19,9 @@ use crate::connection::{GenerationCore, PendingEntry, PendingKey};
 use crate::control::{
     error_body_json, CODE_CANCELLED, CODE_INTERNAL_ERROR, CODE_SERVER_BUSY, CODE_UNKNOWN_CHANNEL,
 };
-use crate::handler::{McHostHandler, RequestCtx, RequestOutcome, RouteHandle, StreamClosed};
+use crate::handler::{
+    McHostHandler, OutputBuffer, RequestCtx, RequestOutcome, RouteHandle, StreamClosed,
+};
 use crate::routing::{BindInstall, CloseDecision};
 use crate::runtime::HostShared;
 use crate::wire::{
@@ -61,7 +63,7 @@ impl Settlement {
 
 /// The terminal frames a request can settle with.
 pub enum Terminal {
-    Response { body: Vec<u8>, binary: bool },
+    Response { body: OutputBuffer, binary: bool },
     Error { code: String, message: String },
     StreamEnd,
 }
@@ -82,9 +84,11 @@ fn bounded_error_body(code: &str, message: &str) -> Vec<u8> {
     }
 }
 
-/// Queues one frame on a generation's writer, charging its resident bytes.
-/// The byte-budget wait is bounded by generation retirement. `Err` means the
-/// generation can no longer emit; logical state must not depend on it.
+/// Queues one frame on a generation's writer. Body-bearing frames charge their
+/// body plus wire header against the resident-byte budget; header-only frames
+/// are exempt. The byte-budget wait is bounded by generation retirement.
+/// `Err` means the generation can no longer emit; logical state must not
+/// depend on it.
 ///
 /// A cancelled generation fails closed: retirement paths (structural
 /// corruption, connection teardown) cancel the token before settling admitted
@@ -104,6 +108,7 @@ pub async fn emit_frame(
     {
         return Err(());
     }
+    let deadline = gen.writer.admission_deadline();
     let charge = if body.is_empty() {
         crate::wire::ByteCharge::none()
     } else {
@@ -111,16 +116,53 @@ pub async fn emit_frame(
         tokio::select! {
             biased;
             () = gen.token.cancelled() => return Err(()),
-            charge = budget.charge(frame_bytes) => charge,
+            charge = timeout_at(deadline, budget.charge(frame_bytes)) => match charge {
+                Ok(charge) => charge,
+                Err(_) => {
+                    gen.token.cancel();
+                    return Err(());
+                }
+            },
         }
     };
     let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
-        .send(OutboundFrame {
-            bytes,
-            charge,
-            written: None,
-        })
+        .send_before(
+            OutboundFrame {
+                bytes,
+                charge,
+                written: None,
+            },
+            deadline,
+        )
+        .await
+        .map_err(|_| ())
+}
+
+/// Queues a handler body whose resident-byte reservation was acquired before
+/// allocation. The charge transfers directly to the writer with no second
+/// budget acquisition.
+async fn emit_reserved_frame(
+    gen: &GenerationCore,
+    ty: FrameType,
+    flags: subc_protocol::Flags,
+    id: FrameId,
+    body: OutputBuffer,
+) -> Result<(), ()> {
+    if gen.writer.is_retired() || gen.token.is_cancelled() {
+        return Err(());
+    }
+    let (body, charge, deadline) = body.into_parts();
+    let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
+    gen.writer
+        .send_before(
+            OutboundFrame {
+                bytes,
+                charge,
+                written: None,
+            },
+            deadline,
+        )
         .await
         .map_err(|_| ())
 }
@@ -169,7 +211,19 @@ pub async fn settle(
     }
     let (ty, flags, body) = match terminal {
         Terminal::Response { body, binary } => {
-            (FrameType::Response, response_flags(binary, true), body)
+            if emit_reserved_frame(
+                gen,
+                FrameType::Response,
+                response_flags(binary, true),
+                FrameId::routed(route, corr),
+                body,
+            )
+            .await
+            .is_err()
+            {
+                gen.token.cancel();
+            }
+            return true;
         }
         Terminal::Error { code, message } => (
             FrameType::Error,
@@ -203,25 +257,36 @@ pub struct StreamSink {
 }
 
 impl StreamSink {
-    pub(crate) async fn send(&self, item: Vec<u8>, binary: bool) -> Result<(), StreamClosed> {
-        if item.len() > crate::wire::MAX_BODY_LEN as usize {
-            // An oversized item is a handler defect, not a closed stream:
-            // settle the request as failed so the client cannot observe a
-            // truncated stream that still ends in a successful StreamEnd.
-            settle(
-                &self.settlement,
-                &self.budget,
-                &self.gen,
-                self.route,
-                self.corr,
-                Terminal::Error {
-                    code: CODE_INTERNAL_ERROR.to_owned(),
-                    message: "stream item exceeds frame limit".to_owned(),
-                },
-            )
-            .await;
+    pub(crate) async fn reserve(&self, max_len: usize) -> Result<OutputBuffer, StreamClosed> {
+        if max_len > crate::wire::MAX_BODY_LEN as usize || self.cancel.is_cancelled() {
             return Err(StreamClosed);
         }
+        let bytes = u32::try_from(max_len + subc_protocol::HEADER_LEN).map_err(|_| StreamClosed)?;
+        let deadline = self.gen.writer.admission_deadline();
+        let charge = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Err(StreamClosed),
+            () = self.gen.token.cancelled() => return Err(StreamClosed),
+            charge = timeout_at(deadline, self.budget.charge(bytes)) => match charge {
+                Ok(charge) => charge,
+                Err(_) => {
+                    self.gen.token.cancel();
+                    return Err(StreamClosed);
+                }
+            },
+        };
+        if self.cancel.is_cancelled() || self.gen.token.is_cancelled() {
+            return Err(StreamClosed);
+        }
+        Ok(OutputBuffer {
+            body: Vec::with_capacity(max_len + subc_protocol::HEADER_LEN),
+            charge,
+            max_len,
+            deadline,
+        })
+    }
+
+    pub(crate) async fn send(&self, item: OutputBuffer, binary: bool) -> Result<(), StreamClosed> {
         if self.cancel.is_cancelled() {
             return Err(StreamClosed);
         }
@@ -232,8 +297,7 @@ impl StreamSink {
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => Err(StreamClosed),
-            result = emit_frame(
-                &self.budget,
+            result = emit_reserved_frame(
                 &self.gen,
                 FrameType::StreamData,
                 response_flags(binary, false),
@@ -280,73 +344,56 @@ pub async fn dispatch_request<H: McHostHandler>(
         return;
     }
 
-    let Some(route_cancel) = shared.registry.route_cancel(route, gen.id) else {
-        drop(frame);
-        emit_error_terminal(
-            &shared.egress_budget,
-            gen,
-            FrameId::routed(route, corr),
-            CODE_UNKNOWN_CHANNEL,
-            "no live route for this channel and epoch",
-        )
-        .await;
-        return;
-    };
-
-    let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
-        drop(frame);
-        emit_error_terminal(
-            &shared.egress_budget,
-            gen,
-            FrameId::routed(route, corr),
-            CODE_SERVER_BUSY,
-            "pending request capacity exhausted",
-        )
-        .await;
-        return;
-    };
-    let Ok(task_permit) = shared.task_permits.clone().try_acquire_owned() else {
-        drop(frame);
-        emit_error_terminal(
-            &shared.egress_budget,
-            gen,
-            FrameId::routed(route, corr),
-            CODE_SERVER_BUSY,
-            "handler task capacity exhausted",
-        )
-        .await;
-        return;
-    };
-
-    let InboundFrame {
-        body,
-        charge: body_charge,
-        ..
-    } = frame;
-    let settlement = Settlement::new();
-    let cancel = route_cancel.child_token();
-    let key: PendingKey = (route.channel, route.epoch, corr);
-    gen.pending.lock().expect("pending lock").insert(
-        key,
-        PendingEntry {
-            cancel: cancel.clone(),
-            settlement: Arc::clone(&settlement),
-        },
-    );
-
-    let (start_tx, start_rx) = oneshot::channel();
+    let (start_tx, start_rx) = oneshot::channel::<CancellationToken>();
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
-    let settlement_task = Arc::clone(&settlement);
-    let binary = header.flags.is_binary();
     let outer = shared.spawn_tracked(async move {
-        let settlement = settlement_task;
+        let Ok(route_cancel) = start_rx.await else {
+            return;
+        };
+        let cancel = route_cancel.child_token();
+
+        let Ok(pending_permit) = shared_task.pending_permits.clone().try_acquire_owned() else {
+            drop(frame);
+            emit_error_terminal(
+                &shared_task.egress_budget,
+                &gen_task,
+                FrameId::routed(route, corr),
+                CODE_SERVER_BUSY,
+                "pending request capacity exhausted",
+            )
+            .await;
+            return;
+        };
+        let Ok(task_permit) = shared_task.task_permits.clone().try_acquire_owned() else {
+            drop(frame);
+            emit_error_terminal(
+                &shared_task.egress_budget,
+                &gen_task,
+                FrameId::routed(route, corr),
+                CODE_SERVER_BUSY,
+                "handler task capacity exhausted",
+            )
+            .await;
+            return;
+        };
+
         let _pending_permit = pending_permit;
         let _task_permit = task_permit;
-        if start_rx.await.is_err() {
-            remove_pending(&gen_task, key);
-            return;
-        }
+        let InboundFrame {
+            body,
+            charge: body_charge,
+            ..
+        } = frame;
+        let settlement = Settlement::new();
+        let key: PendingKey = (route.channel, route.epoch, corr);
+        gen_task.pending.lock().expect("pending lock").insert(
+            key,
+            PendingEntry {
+                cancel: cancel.clone(),
+                settlement: Arc::clone(&settlement),
+            },
+        );
         if cancel.is_cancelled() {
             settle(
                 &settlement,
@@ -364,6 +411,7 @@ pub async fn dispatch_request<H: McHostHandler>(
             return;
         }
 
+        let binary = header.flags.is_binary();
         let sink = StreamSink {
             settlement: Arc::clone(&settlement),
             gen: Arc::clone(&gen_task),
@@ -382,7 +430,7 @@ pub async fn dispatch_request<H: McHostHandler>(
         let handler = Arc::clone(&shared_task.handler);
         let inner = shared_task.spawn_tracked(async move {
             let _body_charge = body_charge;
-            handler.handle(ctx).await
+            crate::panic_boundary::redact(handler.handle(ctx)).await
         });
         let mut inner = AbortOnDropHandle::new(inner);
 
@@ -441,27 +489,20 @@ pub async fn dispatch_request<H: McHostHandler>(
         remove_pending(&gen_task, key);
     });
 
-    if shared.registry.register_task(route, gen.id, outer) {
-        let _ = start_tx.send(());
+    if let Some(route_cancel) = shared.registry.register_dispatch(route, gen.id, outer) {
+        let _ = start_tx.send(route_cancel);
     } else {
-        // The route moved to Closing between `route_cancel` and here, so the
-        // close owner never saw this task and cannot settle it. The request
-        // was admitted; settle it as cancelled rather than leave the client
-        // with no terminal (first-terminal-wins makes a duplicate harmless).
+        // No dispatch crossed the registry's live-route linearization point,
+        // so this rejection proves zero handler invocation.
         drop(start_tx);
-        settle(
-            &settlement,
+        emit_error_terminal(
             &shared.egress_budget,
             gen,
-            route,
-            corr,
-            Terminal::Error {
-                code: CODE_CANCELLED.to_owned(),
-                message: "request cancelled".to_owned(),
-            },
+            FrameId::routed(route, corr),
+            CODE_UNKNOWN_CHANNEL,
+            "no live route for this channel and epoch",
         )
         .await;
-        remove_pending(gen, key);
     }
 }
 
@@ -509,7 +550,7 @@ pub async fn open_route<H: McHostHandler>(
     // interleave with it).
     let bind_task = shared.spawn_lifecycle(async move {
         tokio::select! {
-            outcome = handler.bind(handle, identity) => Some(outcome),
+            outcome = crate::panic_boundary::redact(handler.bind(handle, identity)) => Some(outcome),
             () = tokio::time::sleep(bind_deadline) => {
                 bind_watchdog.fatal.trip(
                     &bind_watchdog.shutdown,
@@ -588,7 +629,8 @@ async fn run_route_gone<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: R
     let deadline = shared.timing.lifecycle_callback_deadline;
     let watchdog = Arc::clone(shared);
     let task = shared.spawn_lifecycle(async move {
-        if timeout(deadline, handler.route_gone(handle)).await.is_err() {
+        let callback = crate::panic_boundary::redact(handler.route_gone(handle));
+        if timeout(deadline, callback).await.is_err() {
             watchdog.fatal.trip(
                 &watchdog.shutdown,
                 "route_gone callback deadline expired".to_owned(),
@@ -598,17 +640,18 @@ async fn run_route_gone<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: R
     let _ = shared.lifecycle_join("route_gone", task).await;
 }
 
-/// Closes one route: stop dispatch, cancel and settle admitted work within
-/// the close budget, join handler tasks, run route-gone once, free the
+/// Closes one route: stop dispatch, cancel admitted work, await its tasks until
+/// the close budget, abort overdue tasks, run route-gone once, and free the
 /// channel (protocol §9.4, §12).
 pub async fn close_route<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: RouteHandle) {
     close_route_decision(shared, handle, shared.registry.begin_close(handle)).await;
 }
 
-/// `gen_id` fences the close to its owning generation. The state transition
-/// happens synchronously in `begin_close_owned` (later frames on the route
-/// get `unknown_channel` immediately); callers run the returned drain off
-/// their own loop when cleanup latency must not stall them.
+/// Completes a supplied close decision whose registry transition already
+/// applied route ownership and generation fencing. Later frames on a route
+/// transitioned by that decision get `unknown_channel` immediately; callers
+/// run the returned drain off their own loop when cleanup latency must not
+/// stall them.
 pub(crate) async fn close_route_decision<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     handle: RouteHandle,

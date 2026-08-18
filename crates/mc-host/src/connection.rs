@@ -12,18 +12,19 @@ use std::sync::{Arc, Mutex};
 use subc_protocol::FrameType;
 use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
-use tokio::time::Instant;
+use tokio::time::{timeout_at, Instant};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::control::{parse_control, ControlAction, CODE_INVALID_CONTROL_REQUEST};
 use crate::dispatch::{
-    close_generation, dispatch_request, emit_error_terminal, emit_frame, handle_cancel, open_route,
+    close_generation, dispatch_request, emit_error_terminal, handle_cancel, open_route,
 };
 use crate::handler::McHostHandler;
 use crate::runtime::HostShared;
 use crate::wire::{
-    drain_declared_body, pure_header_flags, read_frame, FrameId, ReadClose, ReadEvent, WriterHandle,
+    drain_declared_body, encode_owned_frame, pure_header_flags, read_frame, FrameId, OutboundFrame,
+    ReadClose, ReadEvent, WriterHandle,
 };
 
 /// Key of one pending consumer request: (channel, epoch, correlation).
@@ -42,6 +43,15 @@ pub struct GenerationCore {
     /// Cancelling retires the generation: reads stop, admitted work settles as
     /// cancelled, emits fail closed.
     pub token: CancellationToken,
+    /// Stops the read side and generation-local frame producers without
+    /// retiring the writer needed to flush already-started terminals.
+    pub read_cancel: CancellationToken,
+    /// Read-loop work that can enqueue frames independently of route drains.
+    /// Shutdown closes and joins this set before queuing connection Goodbye.
+    pub read_tasks: TaskTracker,
+    /// Releases the connection owner after shutdown has queued Goodbye, so it
+    /// cannot tear down the writer while the producer fence is draining.
+    pub shutdown_complete: CancellationToken,
     pub writer: WriterHandle,
     /// channel -> epoch for routes this generation may dispatch on. Lookup
     /// only; the registry owns insertion at bind and removal at close.
@@ -91,6 +101,7 @@ pub async fn run_connection<H: McHostHandler>(
     // still emit terminals and a Goodbye on a live generation, so only
     // `shutdown_sequence` may retire these — in protocol order.
     let gen_token = CancellationToken::new();
+    let read_cancel = gen_token.child_token();
     let (read_half, write_half) = stream.into_split();
     let (writer, writer_task) = crate::wire::spawn_writer_tracked(
         write_half,
@@ -104,12 +115,21 @@ pub async fn run_connection<H: McHostHandler>(
     let gen = Arc::new(GenerationCore {
         id: shared.gen_counter.fetch_add(1, Ordering::SeqCst),
         token: gen_token,
+        read_cancel,
+        read_tasks: TaskTracker::new(),
+        shutdown_complete: CancellationToken::new(),
         writer,
         membership: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
         pings: Mutex::new(HashMap::new()),
         next_ping_corr: std::sync::atomic::AtomicU64::new(1),
     });
+    // Register the read loop before publishing the generation. Its tracker
+    // token prevents shutdown from observing an empty producer set between
+    // insertion and the first read-loop poll.
+    let read_task = gen
+        .read_tasks
+        .track_future(read_loop(&shared, &gen, read_half));
     {
         let mut connections = shared.connections.lock().expect("connections lock");
         if shared.draining.load(Ordering::SeqCst) {
@@ -120,12 +140,19 @@ pub async fn run_connection<H: McHostHandler>(
 
     if let Some(liveness) = shared.liveness.clone() {
         let gen_ping = Arc::clone(&gen);
-        shared.spawn_tracked(async move {
-            liveness_loop(gen_ping, liveness).await;
-        });
+        shared.spawn_tracked(
+            gen.read_tasks
+                .track_future(liveness_loop(gen_ping, liveness)),
+        );
     }
 
-    read_loop(&shared, &gen, read_half).await;
+    read_task.await;
+    gen.read_cancel.cancel();
+    gen.read_tasks.close();
+    gen.read_tasks.wait().await;
+    if shared.draining.load(Ordering::SeqCst) {
+        gen.shutdown_complete.cancelled().await;
+    }
 
     close_generation(&shared, &gen).await;
     drop(gen);
@@ -153,7 +180,7 @@ async fn read_loop<H: McHostHandler>(
             &mut reader,
             shared.timing.frame_deadline,
             &shared.ingress_budget,
-            &gen.token,
+            &gen.read_cancel,
         )
         .await
         {
@@ -180,7 +207,7 @@ async fn read_loop<H: McHostHandler>(
                     "control body exceeds profile cap",
                 )
                 .await;
-                if drain_declared_body(&mut reader, header.len, deadline, &gen.token)
+                if drain_declared_body(&mut reader, header.len, deadline, &gen.read_cancel)
                     .await
                     .is_err()
                 {
@@ -251,10 +278,10 @@ async fn read_loop<H: McHostHandler>(
                         };
                         let decision = shared.registry.begin_close_owned(handle, gen.id);
                         let shared_task = Arc::clone(shared);
-                        shared.spawn_tracked(async move {
+                        shared.spawn_tracked(gen.read_tasks.track_future(async move {
                             crate::dispatch::close_route_decision(&shared_task, handle, decision)
                                 .await;
-                        });
+                        }));
                     }
                     // Consumer-originated role violations close the generation
                     // rather than extend the profile (protocol §6.2). Ping is
@@ -315,20 +342,10 @@ async fn handle_control<H: McHostHandler>(
                 .await;
                 return;
             };
-            let body = crate::control::catalog_response_json(
-                &shared.manifest,
-                module_id_filter.as_deref(),
-            );
-            if emit_frame(
-                &shared.egress_budget,
-                gen,
-                FrameType::Response,
-                crate::wire::response_flags(false, true),
-                FrameId::control(corr),
-                body,
-            )
-            .await
-            .is_err()
+            let body = shared.catalog.body(module_id_filter.as_deref());
+            if emit_catalog_response(&shared.egress_budget, gen, FrameId::control(corr), body)
+                .await
+                .is_err()
             {
                 gen.token.cancel();
             }
@@ -352,12 +369,79 @@ async fn handle_control<H: McHostHandler>(
             // self-bounded.
             let shared_task = Arc::clone(shared);
             let gen_task = Arc::clone(gen);
-            shared.spawn_lifecycle(async move {
+            shared.spawn_lifecycle(gen.read_tasks.track_future(async move {
                 let _pending_permit = pending_permit;
                 open_route(shared_task, gen_task, corr, identity).await;
-            });
+            }));
         }
     }
+}
+
+/// Clones a startup-cached catalog only after its encoded size is charged,
+/// then transfers that charge unchanged to the connection writer.
+async fn emit_catalog_response(
+    budget: &crate::wire::ByteBudget,
+    gen: &GenerationCore,
+    id: FrameId,
+    body: &[u8],
+) -> Result<(), ()> {
+    if body.len() > crate::wire::MAX_BODY_LEN as usize
+        || gen.writer.is_retired()
+        || gen.token.is_cancelled()
+    {
+        return Err(());
+    }
+    let deadline = gen.writer.admission_deadline();
+    let frame = reserve_catalog_frame(budget, gen, deadline, id, body).await?;
+    gen.writer
+        .send_before(frame, deadline)
+        .await
+        .map_err(|_| ())
+}
+
+async fn reserve_catalog_frame(
+    budget: &crate::wire::ByteBudget,
+    gen: &GenerationCore,
+    deadline: Instant,
+    id: FrameId,
+    body: &[u8],
+) -> Result<OutboundFrame, ()> {
+    let frame_bytes = body
+        .len()
+        .checked_add(subc_protocol::HEADER_LEN)
+        .ok_or(())?;
+    let charged_bytes = u32::try_from(frame_bytes).map_err(|_| ())?;
+    let charge = tokio::select! {
+        biased;
+        () = gen.token.cancelled() => return Err(()),
+        charge = timeout_at(deadline, budget.charge(charged_bytes)) => match charge {
+            Ok(charge) => charge,
+            Err(_) => {
+                gen.token.cancel();
+                return Err(());
+            }
+        },
+    };
+    if gen.token.is_cancelled() {
+        return Err(());
+    }
+
+    // Capacity includes the eventual header, so encoding does not need a
+    // second allocation while the cached bytes are copied.
+    let mut owned_body = Vec::with_capacity(frame_bytes);
+    owned_body.extend_from_slice(body);
+    let bytes = encode_owned_frame(
+        FrameType::Response,
+        crate::wire::response_flags(false, true),
+        id,
+        owned_body,
+    )
+    .map_err(|_| ())?;
+    Ok(OutboundFrame {
+        bytes,
+        charge,
+        written: None,
+    })
 }
 
 /// Host-side Ping issuance. The correlation namespace is host-owned and
@@ -380,7 +464,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
                 .map_or(next_ping_at, |deadline| deadline.min(next_ping_at))
         };
         tokio::select! {
-            () = gen.token.cancelled() => return,
+            () = gen.read_cancel.cancelled() => return,
             () = tokio::time::sleep_until(wake_at) => {}
         }
         let now = Instant::now();
@@ -429,23 +513,24 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         )
         .expect("header-only Ping always encodes");
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
-        if gen
-            .writer
-            .send(crate::wire::OutboundFrame {
-                bytes,
-                charge: crate::wire::ByteCharge::none(),
-                written: Some(written_tx),
-            })
-            .await
-            .is_err()
-        {
+        let send = gen.writer.send(crate::wire::OutboundFrame {
+            bytes,
+            charge: crate::wire::ByteCharge::none(),
+            written: Some(written_tx),
+        });
+        let sent = tokio::select! {
+            biased;
+            () = gen.read_cancel.cancelled() => return,
+            sent = send => sent,
+        };
+        if sent.is_err() {
             return;
         }
         // Anchor the Pong deadline at write completion: the queue may hold
         // large frames ahead of the Ping, and a deadline measured from
         // enqueue would invalidate a healthy peer that never saw the Ping.
         tokio::select! {
-            () = gen.token.cancelled() => return,
+            () = gen.read_cancel.cancelled() => return,
             written = written_rx => {
                 if written.is_err() {
                     // Writer retired before the Ping reached the socket.
@@ -456,5 +541,168 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+
+    #[derive(Clone, Copy)]
+    enum FencedProducer {
+        Catalog,
+        CapacityRejection,
+    }
+
+    async fn read_frame_from(stream: &mut DuplexStream) -> subc_protocol::EnvelopeHeader {
+        let mut header_bytes = [0; subc_protocol::HEADER_LEN];
+        stream
+            .read_exact(&mut header_bytes)
+            .await
+            .expect("frame header");
+        let header = subc_protocol::decode_header(&header_bytes).expect("valid frame header");
+        let mut body = vec![0; header.len as usize];
+        stream.read_exact(&mut body).await.expect("frame body");
+        header
+    }
+
+    async fn assert_started_producer_precedes_goodbye(producer: FencedProducer) {
+        let generation = CancellationToken::new();
+        let read_cancel = generation.child_token();
+        let (server, mut client) = tokio::io::duplex(4096);
+        let (writer, writer_task) =
+            crate::wire::spawn_writer(server, 4, generation.clone(), Duration::from_secs(1));
+        let gen = Arc::new(GenerationCore {
+            id: 1,
+            token: generation,
+            read_cancel,
+            read_tasks: TaskTracker::new(),
+            shutdown_complete: CancellationToken::new(),
+            writer,
+            membership: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            pings: Mutex::new(HashMap::new()),
+            next_ping_corr: std::sync::atomic::AtomicU64::new(1),
+        });
+        let budget = crate::wire::ByteBudget::new(4096);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let producer_gen = Arc::clone(&gen);
+        let producer_budget = budget.clone();
+        let task = tokio::spawn(gen.read_tasks.track_future(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            match producer {
+                FencedProducer::Catalog => {
+                    emit_catalog_response(
+                        &producer_budget,
+                        &producer_gen,
+                        FrameId::control(7),
+                        br#"{"op":"catalog.list","modules":[]}"#,
+                    )
+                    .await
+                    .expect("catalog queued");
+                }
+                FencedProducer::CapacityRejection => {
+                    crate::dispatch::emit_error_terminal(
+                        &producer_budget,
+                        &producer_gen,
+                        FrameId::control(7),
+                        crate::control::CODE_SERVER_BUSY,
+                        "pending request capacity exhausted",
+                    )
+                    .await;
+                }
+            }
+        }));
+        started_rx.await.expect("producer started");
+
+        gen.read_cancel.cancel();
+        gen.read_tasks.close();
+        let tracker = gen.read_tasks.clone();
+        let (wait_started_tx, wait_started_rx) = tokio::sync::oneshot::channel();
+        let fence = tokio::spawn(async move {
+            let _ = wait_started_tx.send(());
+            tracker.wait().await;
+        });
+        wait_started_rx.await.expect("fence started");
+        tokio::task::yield_now().await;
+        assert!(
+            !fence.is_finished(),
+            "shutdown must wait for an already-started producer"
+        );
+
+        release_tx.send(()).expect("release producer");
+        fence.await.expect("producer fence");
+        task.await.expect("producer task");
+        crate::dispatch::send_connection_goodbye(&gen).await;
+
+        let terminal = read_frame_from(&mut client).await;
+        assert_eq!(terminal.corr, 7);
+        assert!(matches!(
+            terminal.ty,
+            FrameType::Response | FrameType::Error
+        ));
+        let goodbye = read_frame_from(&mut client).await;
+        assert_eq!(goodbye.ty, FrameType::Goodbye);
+        assert_eq!((goodbye.channel, goodbye.epoch, goodbye.corr), (0, 0, 0));
+
+        drop(gen);
+        drop(client);
+        writer_task.await.expect("writer task");
+    }
+
+    #[tokio::test]
+    async fn shutdown_fence_queues_started_catalog_before_goodbye() {
+        assert_started_producer_precedes_goodbye(FencedProducer::Catalog).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_fence_queues_started_capacity_rejection_before_goodbye() {
+        assert_started_producer_precedes_goodbye(FencedProducer::CapacityRejection).await;
+    }
+
+    #[tokio::test]
+    async fn cached_catalog_clone_holds_one_full_frame_charge() {
+        let body = br#"{"op":"catalog.list","modules":[]}"#;
+        let frame_bytes = subc_protocol::HEADER_LEN + body.len();
+        let budget = crate::wire::ByteBudget::new(frame_bytes as u64);
+        let generation = CancellationToken::new();
+        let (server, client) = tokio::io::duplex(64);
+        let (writer, writer_task) =
+            crate::wire::spawn_writer(server, 1, generation.clone(), Duration::from_secs(1));
+        let gen = GenerationCore {
+            id: 1,
+            token: generation,
+            read_cancel: CancellationToken::new(),
+            read_tasks: TaskTracker::new(),
+            shutdown_complete: CancellationToken::new(),
+            writer,
+            membership: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            pings: Mutex::new(HashMap::new()),
+            next_ping_corr: std::sync::atomic::AtomicU64::new(1),
+        };
+
+        let frame = reserve_catalog_frame(
+            &budget,
+            &gen,
+            Instant::now() + Duration::from_secs(1),
+            FrameId::control(7),
+            body,
+        )
+        .await
+        .expect("catalog frame reservation");
+
+        assert_eq!(budget.available(), 0);
+        assert_eq!(&frame.bytes[subc_protocol::HEADER_LEN..], body);
+        drop(frame);
+        assert_eq!(budget.available(), frame_bytes);
+
+        drop(gen);
+        drop(client);
+        writer_task.await.expect("writer task");
     }
 }

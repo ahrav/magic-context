@@ -26,9 +26,10 @@ pub const MAX_CONTROL_BODY_LEN: u32 = 65_536;
 /// Aggregate resident-byte accounting.
 ///
 /// One permit is one byte. Charges attach to the buffers they account for and
-/// travel with moves; a copy acquires a second charge. Tokio's semaphore is
-/// FIFO, so a queued maximum-size acquisition cannot be starved by later small
-/// ones; the frame deadline bounds how long an admission may wait.
+/// travel with moves; host-managed copies acquire a second charge. Tokio's
+/// semaphore is FIFO, so a queued maximum-size acquisition cannot be starved
+/// by later small ones; the frame deadline bounds how long an admission may
+/// wait.
 #[derive(Clone)]
 pub struct ByteBudget {
     semaphore: Arc<Semaphore>,
@@ -391,16 +392,39 @@ pub struct OutboundFrame {
 pub struct WriterHandle {
     tx: mpsc::Sender<OutboundFrame>,
     retired: CancellationToken,
+    generation: CancellationToken,
+    admission_timeout: Duration,
 }
 
 impl WriterHandle {
     /// Queues one encoded frame. Waits for queue capacity, bounded by writer
     /// retirement; `Err` means the generation can no longer emit frames.
     pub async fn send(&self, frame: OutboundFrame) -> Result<(), WriterGone> {
+        self.send_before(frame, self.admission_deadline()).await
+    }
+
+    pub fn admission_deadline(&self) -> Instant {
+        Instant::now() + self.admission_timeout
+    }
+
+    /// Queues a frame under an existing operation deadline. Expiry retires the
+    /// generation so no later output can overtake the failed admission.
+    pub async fn send_before(
+        &self,
+        frame: OutboundFrame,
+        deadline: Instant,
+    ) -> Result<(), WriterGone> {
         tokio::select! {
             biased;
             () = self.retired.cancelled() => Err(WriterGone),
-            sent = self.tx.send(frame) => sent.map_err(|_| WriterGone),
+            sent = timeout_at(deadline, self.tx.send(frame)) => match sent {
+                Ok(sent) => sent.map_err(|_| WriterGone),
+                Err(_) => {
+                    self.retired.cancel();
+                    self.generation.cancel();
+                    Err(WriterGone)
+                }
+            },
         }
     }
 
@@ -416,13 +440,13 @@ pub struct WriterGone;
 /// Spawns the single writer task for one connection.
 ///
 /// Every frame's bytes reach the socket completely before any byte of the
-/// next; a partial write, I/O failure, or `write_deadline` expiry retires the
-/// generation (protocol §6.3). The deadline is what bounds how long one
-/// consumer can hold shared egress-budget charges: a peer that stops reading
-/// would otherwise pin its queued frames' charges forever and stall every
-/// other generation's emissions. Dropping every `WriterHandle` closes the
-/// queue, which lets already queued terminals and `Goodbye` flush before the
-/// task exits.
+/// next. Partial writes are retried; an I/O failure or `write_deadline` expiry
+/// before the frame completes retires the generation (protocol §6.3). The
+/// deadline bounds how long one consumer can hold shared egress-budget
+/// charges: a peer that stops reading would otherwise pin its queued frames'
+/// charges forever and stall every other generation's emissions. Dropping
+/// every `WriterHandle` closes the queue, which lets already queued terminals
+/// and `Goodbye` flush before the task exits.
 #[cfg(test)]
 pub fn spawn_writer<W>(
     stream: W,
@@ -465,6 +489,8 @@ where
     let handle = WriterHandle {
         tx,
         retired: retired.clone(),
+        generation: generation.clone(),
+        admission_timeout: write_deadline,
     };
     let task = async move {
         let mut stream = stream;
@@ -811,6 +837,40 @@ mod tests {
         assert!(generation.is_cancelled());
         assert_eq!(budget.available(), baseline);
         drop(client);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_admission_uses_the_remaining_operation_deadline() {
+        let (server, client) = duplex(1);
+        let generation = CancellationToken::new();
+        let (handle, task) = spawn_writer(server, 1, generation.clone(), Duration::from_secs(10));
+        let frame = || OutboundFrame {
+            bytes: vec![0; 1024],
+            charge: ByteCharge::none(),
+            written: None,
+        };
+
+        // The writer consumes the first frame and stalls on the tiny duplex;
+        // the second frame fills the single queue slot.
+        handle.send(frame()).await.expect("first frame");
+        handle.send(frame()).await.expect("second frame");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(
+            handle.send_before(frame(), deadline).await.is_err(),
+            "a full queue must not receive a fresh deadline"
+        );
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "queue admission used only the one second remaining"
+        );
+        assert!(generation.is_cancelled());
+
+        drop(handle);
+        drop(client);
+        task.await.expect("writer task");
     }
 
     #[tokio::test]

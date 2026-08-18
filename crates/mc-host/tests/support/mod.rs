@@ -25,6 +25,53 @@ pub const MODULE_VERSION: &str = "0.1.0-test";
 pub const CANARY_SESSION: &str = "CANARY-SESSION-9d3f";
 pub const CANARY_BODY: &[u8] = b"CANARY-BODY-51ab";
 
+fn output_error() -> RequestOutcome {
+    RequestOutcome::Error {
+        code: "internal_error".to_owned(),
+        message: "test handler could not reserve output".to_owned(),
+    }
+}
+
+async fn response_from_slice(ctx: &RequestCtx, bytes: &[u8], binary: bool) -> RequestOutcome {
+    let Ok(mut body) = ctx.reserve_output(bytes.len()).await else {
+        return output_error();
+    };
+    body.extend_from_slice(bytes)
+        .expect("reservation matches response length");
+    RequestOutcome::Response { body, binary }
+}
+
+async fn zero_response(ctx: &RequestCtx, len: usize) -> RequestOutcome {
+    let Ok(mut body) = ctx.reserve_output(len).await else {
+        return output_error();
+    };
+    body.resize(len, 0)
+        .expect("reservation matches response length");
+    RequestOutcome::Response {
+        body,
+        binary: false,
+    }
+}
+
+async fn json_output(
+    ctx: &RequestCtx,
+    value: &serde_json::Value,
+) -> Result<mc_host::OutputBuffer, mc_host::StreamClosed> {
+    let mut body = ctx.reserve_output(256).await?;
+    serde_json::to_writer(&mut body, value).map_err(|_| mc_host::StreamClosed)?;
+    Ok(body)
+}
+
+async fn json_response(ctx: &RequestCtx, value: serde_json::Value) -> RequestOutcome {
+    match json_output(ctx, &value).await {
+        Ok(body) => RequestOutcome::Response {
+            body,
+            binary: false,
+        },
+        Err(_) => output_error(),
+    }
+}
+
 /// Everything the handler observed, in order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -56,6 +103,7 @@ struct Inner {
     events: Mutex<Vec<Event>>,
     identities: Mutex<Vec<(RouteHandle, RouteIdentity)>>,
     dispatches: AtomicUsize,
+    output_reservations: AtomicUsize,
     bind_policy: Mutex<BindPolicy>,
     bind_gate: tokio::sync::Semaphore,
     completion_gate: tokio::sync::Semaphore,
@@ -95,6 +143,7 @@ impl TestHandler {
                 events: Mutex::new(Vec::new()),
                 identities: Mutex::new(Vec::new()),
                 dispatches: AtomicUsize::new(0),
+                output_reservations: AtomicUsize::new(0),
                 bind_policy: Mutex::new(BindPolicy::AcceptAll),
                 bind_gate: tokio::sync::Semaphore::new(0),
                 completion_gate: tokio::sync::Semaphore::new(0),
@@ -127,6 +176,10 @@ impl TestHandler {
 
     pub fn dispatch_count(&self) -> usize {
         self.inner.dispatches.load(Ordering::SeqCst)
+    }
+
+    pub fn output_reservation_count(&self) -> usize {
+        self.inner.output_reservations.load(Ordering::SeqCst)
     }
 
     pub fn binds(&self) -> Vec<RouteHandle> {
@@ -340,33 +393,41 @@ impl McHostHandler for TestHandler {
         let mode = request["mode"].as_str().unwrap_or("echo");
 
         match mode {
-            "echo" => RequestOutcome::Response {
-                body: ctx.body.clone(),
-                binary: ctx.binary,
-            },
-            "len" => RequestOutcome::Response {
-                body: serde_json::to_vec(&serde_json::json!({"received_bytes": ctx.body.len()}))
-                    .expect("length reply serializes"),
-                binary: false,
-            },
-            "response_bytes" => RequestOutcome::Response {
-                body: vec![0; request["bytes"].as_u64().unwrap_or(1) as usize],
-                binary: false,
-            },
-            "oversize_response" => RequestOutcome::Response {
-                body: vec![0; 64 * 1024 * 1024 + 1],
-                binary: false,
-            },
-            "oversize_stream" => {
-                let rejected = ctx
-                    .stream(vec![0; 64 * 1024 * 1024 + 1], true)
+            "echo" => response_from_slice(&ctx, &ctx.body, ctx.binary).await,
+            "len" => {
+                json_response(&ctx, serde_json::json!({"received_bytes": ctx.body.len()})).await
+            }
+            "response_bytes" => {
+                zero_response(&ctx, request["bytes"].as_u64().unwrap_or(1) as usize).await
+            }
+            "reserve_then_await_completion" => {
+                let len = request["bytes"].as_u64().unwrap_or(1) as usize;
+                let Ok(mut body) = ctx.reserve_output(len).await else {
+                    return output_error();
+                };
+                self.inner
+                    .output_reservations
+                    .fetch_add(1, Ordering::SeqCst);
+                self.inner
+                    .completion_gate
+                    .acquire()
                     .await
-                    .is_err();
+                    .expect("completion gate remains open")
+                    .forget();
+                body.resize(len, 0)
+                    .expect("reservation matches response length");
                 RequestOutcome::Response {
-                    body: serde_json::to_vec(&serde_json::json!({"stream_rejected": rejected}))
-                        .expect("stream result serializes"),
+                    body,
                     binary: false,
                 }
+            }
+            "oversize_response" => {
+                let _ = ctx.reserve_output(64 * 1024 * 1024 + 1).await;
+                output_error()
+            }
+            "oversize_stream" => {
+                let _ = ctx.reserve_output(64 * 1024 * 1024 + 1).await;
+                output_error()
             }
             "error" => RequestOutcome::Error {
                 code: request["code"].as_str().unwrap_or("app_error").to_owned(),
@@ -375,8 +436,10 @@ impl McHostHandler for TestHandler {
             "stream" => {
                 let items = request["items"].as_u64().unwrap_or(3);
                 for index in 0..items {
-                    let item = serde_json::to_vec(&serde_json::json!({"item": index}))
-                        .expect("stream item serializes");
+                    let Ok(item) = json_output(&ctx, &serde_json::json!({"item": index})).await
+                    else {
+                        return RequestOutcome::Streamed;
+                    };
                     if ctx.stream(item, false).await.is_err() {
                         return RequestOutcome::Streamed;
                     }
@@ -386,19 +449,16 @@ impl McHostHandler for TestHandler {
             "stream_then_hang" => {
                 let items = request["items"].as_u64().unwrap_or(1);
                 for index in 0..items {
-                    let item = serde_json::to_vec(&serde_json::json!({"item": index}))
-                        .expect("stream item serializes");
-                    let _ = ctx.stream(item, false).await;
+                    if let Ok(item) = json_output(&ctx, &serde_json::json!({"item": index})).await {
+                        let _ = ctx.stream(item, false).await;
+                    }
                 }
                 std::future::pending::<()>().await;
                 unreachable!("pending never resolves")
             }
             "await_cancel" => {
                 ctx.cancelled().await;
-                RequestOutcome::Response {
-                    body: b"observed-cancel".to_vec(),
-                    binary: false,
-                }
+                response_from_slice(&ctx, b"observed-cancel", false).await
             }
             "await_completion" => {
                 // `forget` keeps the permit consumed: each dispatch must be
@@ -411,10 +471,7 @@ impl McHostHandler for TestHandler {
                     .await
                     .expect("completion gate remains open")
                     .forget();
-                RequestOutcome::Response {
-                    body: b"completed".to_vec(),
-                    binary: false,
-                }
+                response_from_slice(&ctx, b"completed", false).await
             }
             "hang" => {
                 std::future::pending::<()>().await;
@@ -423,10 +480,7 @@ impl McHostHandler for TestHandler {
             "slow" => {
                 let ms = request["ms"].as_u64().unwrap_or(50);
                 tokio::time::sleep(Duration::from_millis(ms)).await;
-                RequestOutcome::Response {
-                    body: b"slow-done".to_vec(),
-                    binary: false,
-                }
+                response_from_slice(&ctx, b"slow-done", false).await
             }
             "panic" => panic!("{}", String::from_utf8_lossy(CANARY_BODY)),
             other => RequestOutcome::Error {

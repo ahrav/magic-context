@@ -1,7 +1,7 @@
 //! Bounded channel-0 control handling: strict JSON validation, operation
 //! classification, `catalog.list`, and `route.open` request parsing.
 //!
-//! Every byte limit here is enforced before any handler callback, allocator
+//! Every byte limit here is enforced before handler callbacks, route
 //! reservation, or filesystem work (protocol §7.1). Metadata never grants
 //! authority; the bearer key already did.
 
@@ -304,16 +304,41 @@ fn value_depth(value: &serde_json::Value) -> usize {
     }
 }
 
-/// Tagged `catalog.list` response derived losslessly from the linked manifest
-/// (protocol §7.3). Unknown filters yield an empty list, not an error.
-pub fn catalog_response_json(
-    manifest: &ManifestSnapshot,
-    module_id_filter: Option<&str>,
-) -> Vec<u8> {
-    let include = match module_id_filter {
-        None => true,
-        Some(filter) => filter == manifest.module_id,
-    };
+/// Immutable `catalog.list` bodies serialized before the host is published.
+///
+/// The direct-linked profile has one static module, so every valid filter
+/// resolves to either the complete catalog or one canonical empty catalog.
+pub struct CatalogCache {
+    module_id: Box<str>,
+    full: Box<[u8]>,
+    empty: Box<[u8]>,
+}
+
+impl CatalogCache {
+    pub fn new(manifest: &ManifestSnapshot) -> Self {
+        Self {
+            module_id: manifest.module_id.clone().into_boxed_str(),
+            full: serialize_catalog_response(manifest, true),
+            empty: serialize_catalog_response(manifest, false),
+        }
+    }
+
+    /// Selects cached bytes without allocating. Unknown filters yield an empty
+    /// list, not an error (protocol §7.3).
+    pub fn body(&self, module_id_filter: Option<&str>) -> &[u8] {
+        match module_id_filter {
+            None => &self.full,
+            Some(filter) if filter == self.module_id.as_ref() => &self.full,
+            Some(_) => &self.empty,
+        }
+    }
+
+    pub fn max_body_len(&self) -> usize {
+        self.full.len().max(self.empty.len())
+    }
+}
+
+fn serialize_catalog_response(manifest: &ManifestSnapshot, include: bool) -> Box<[u8]> {
     let modules = if include {
         vec![serde_json::json!({
             "module_id": manifest.module_id,
@@ -331,6 +356,7 @@ pub fn catalog_response_json(
         "subc_ops": [OP_ROUTE_OPEN, OP_CATALOG_LIST],
     }))
     .expect("catalog response serialization cannot fail")
+    .into_boxed_slice()
 }
 
 /// Tagged `route.open` success response, built from the published control
@@ -354,8 +380,8 @@ pub fn error_body_json(code: &str, message: &str) -> Vec<u8> {
 
 /// Strict JSON parsing: UTF-8 only (serde_json enforces), rejects duplicate
 /// object keys outright. A conforming client never sends duplicates, and
-/// accepting them would let two spellings of a recognized field reach
-/// different validation paths (protocol §7.1).
+/// accepting repeated fields would make handling depend on decoder or field
+/// order (protocol §7.1).
 mod strict_json {
     use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
     use serde_json::Value;
@@ -697,8 +723,17 @@ mod tests {
             provides: vec![role.clone()],
             control_ops: vec!["mc.reload".to_owned()],
         };
-        let unfiltered: serde_json::Value =
-            serde_json::from_slice(&catalog_response_json(&manifest, None)).unwrap();
+        let catalog = CatalogCache::new(&manifest);
+        let unfiltered_body = catalog.body(None);
+        assert!(
+            std::ptr::eq(unfiltered_body, catalog.body(None)),
+            "repeated catalog requests must reuse startup serialization"
+        );
+        assert!(
+            std::ptr::eq(unfiltered_body, catalog.body(Some(LINKED))),
+            "an exact filter must reuse the full catalog serialization"
+        );
+        let unfiltered: serde_json::Value = serde_json::from_slice(unfiltered_body).unwrap();
         assert_eq!(unfiltered["op"], "catalog.list");
         assert_eq!(unfiltered["generation"], CATALOG_GENERATION);
         assert_eq!(unfiltered["modules"].as_array().unwrap().len(), 1);
@@ -717,11 +752,15 @@ mod tests {
         assert!(!unfiltered.to_string().contains("wake.create"));
 
         let filtered: serde_json::Value =
-            serde_json::from_slice(&catalog_response_json(&manifest, Some(LINKED))).unwrap();
+            serde_json::from_slice(catalog.body(Some(LINKED))).unwrap();
         assert_eq!(filtered["modules"].as_array().unwrap().len(), 1);
 
-        let unknown: serde_json::Value =
-            serde_json::from_slice(&catalog_response_json(&manifest, Some("nope"))).unwrap();
+        let unknown_body = catalog.body(Some("nope"));
+        assert!(
+            std::ptr::eq(unknown_body, catalog.body(Some("also-nope"))),
+            "all unknown filters must reuse one empty catalog serialization"
+        );
+        let unknown: serde_json::Value = serde_json::from_slice(unknown_body).unwrap();
         assert_eq!(unknown["modules"].as_array().unwrap().len(), 0);
     }
 }
