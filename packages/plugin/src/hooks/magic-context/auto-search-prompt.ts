@@ -55,6 +55,13 @@ function findTagClose(text: string, start: number): number {
     return -1;
 }
 
+/** Whitespace XML permits between a tag name and its attributes or closing
+ *  delimiter. Newlines matter: injected blocks are often pretty-printed with
+ *  attributes on their own line. */
+function isTagWhitespace(char: string | undefined): boolean {
+    return char === " " || char === "\t" || char === "\n" || char === "\r";
+}
+
 /** `<name ...>` / `</name>` at `index`, returning the tag end and whether it
  *  closes or self-closes, or null when `text` does not carry that tag here. */
 function matchDropTag(
@@ -76,13 +83,13 @@ function matchDropTag(
         // matcher would strip it while `dropStack` stays open, discarding all
         // following user text. The scan stops at the first non-whitespace
         // character, so it stays linear.
-        while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+        while (isTagWhitespace(text[cursor])) cursor += 1;
         if (text[cursor] !== ">") return null;
         return { end: cursor + 1, closing: true, selfClosing: false };
     }
     // Opening tags may carry attributes (`<instruction context="...">`), but a
     // name prefix (`<instructions>`) is a different tag.
-    if (text[cursor] !== " " && text[cursor] !== "\t") return null;
+    if (!isTagWhitespace(text[cursor])) return null;
     const close = findTagClose(text, cursor);
     if (close === -1) return null;
     // `<instruction .../>` is a complete, empty block: it must not open a
@@ -118,8 +125,12 @@ function matchGenericTag(text: string, index: number): number | null {
 export function collectStrippedPromptPrefix(raw: string): string {
     let out = "";
     let outBytes = 0;
-    // Stack of open content-drop tags; text is dropped while any is open.
+    // Stack of open content-drop tags; text is dropped while any is open. The
+    // per-name depth map makes orphan-closer rejection constant-time: without
+    // it, each orphan `lastIndexOf` scans the whole stack, and n openers
+    // followed by n mismatched closers turns the stripper quadratic.
     const dropStack: string[] = [];
+    const openDepth = new Map<string, number>();
     // -1: no withheld run; 0: spaces/tabs only; 1-2: newline count in the run.
     let pendingNewlines = -1;
     let i = 0;
@@ -137,11 +148,20 @@ export function collectStrippedPromptPrefix(raw: string): string {
                 if (!tag) continue;
                 if (tag.closing) {
                     // Orphan closers drop silently so a leaked closing tag from
-                    // malformed input cannot bleed into the embedded text.
-                    const openIndex = dropStack.lastIndexOf(name);
-                    if (openIndex !== -1) dropStack.length = openIndex;
+                    // malformed input cannot bleed into the embedded text. The
+                    // depth check keeps that rejection O(1); a found closer's
+                    // scan cost is amortized by the entries it pops.
+                    if ((openDepth.get(name) ?? 0) > 0) {
+                        const openIndex = dropStack.lastIndexOf(name);
+                        for (let k = openIndex; k < dropStack.length; k += 1) {
+                            const popped = dropStack[k];
+                            openDepth.set(popped, (openDepth.get(popped) ?? 1) - 1);
+                        }
+                        dropStack.length = openIndex;
+                    }
                 } else if (!tag.selfClosing) {
                     dropStack.push(name);
+                    openDepth.set(name, (openDepth.get(name) ?? 0) + 1);
                 }
                 i = tag.end;
                 matchedDrop = true;

@@ -118,6 +118,33 @@ describe("collectStrippedPromptPrefix", () => {
                 "<system-reminder>noise</system-reminder\t > question survives",
             ).trim(),
         ).toBe("question survives");
+        expect(
+            collectStrippedPromptPrefix(
+                "<instruction>noise</instruction\n> question survives",
+            ).trim(),
+        ).toBe("question survives");
+    });
+
+    it("drops blocks whose opening tag breaks to a new line before its attributes", () => {
+        const stripped = collectStrippedPromptPrefix(
+            '<instruction\nname="deferred_notes">SECRET NOISE</instruction> real question',
+        );
+        expect(stripped).not.toContain("SECRET NOISE");
+        expect(stripped.trim()).toBe("real question");
+    });
+
+    it("handles a large run of orphan closers after nested openers without stalling", () => {
+        // n openers of one drop tag followed by n closers of another: orphan
+        // rejection must be constant-time or this input is quadratic.
+        const n = 16_000;
+        const raw = `${"<instruction>".repeat(n)}${"</system-reminder>".repeat(n)}question survives`;
+        const startedAt = performance.now();
+        const stripped = collectStrippedPromptPrefix(raw);
+        const elapsedMs = performance.now() - startedAt;
+        expect(stripped).toBe("");
+        // Linear stripping finishes in single-digit milliseconds; the removed
+        // quadratic path took ~1s. The bound is generous for slow CI hosts.
+        expect(elapsedMs).toBeLessThan(500);
     });
 
     it("does not let separator whitespace between dropped blocks consume the byte budget", () => {
