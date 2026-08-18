@@ -69,6 +69,11 @@ fn bounded_error_body(code: &str, message: &str) -> Vec<u8> {
 /// Queues one frame on a generation's writer, charging its resident bytes.
 /// The byte-budget wait is bounded by generation retirement. `Err` means the
 /// generation can no longer emit; logical state must not depend on it.
+///
+/// A cancelled generation fails closed: retirement paths (structural
+/// corruption, connection teardown) cancel the token before settling admitted
+/// work, and the protocol requires those closes to stay silent rather than
+/// fabricate terminals (protocol §6.3).
 pub async fn emit_frame(
     budget: &crate::wire::ByteBudget,
     gen: &GenerationCore,
@@ -77,14 +82,21 @@ pub async fn emit_frame(
     id: FrameId,
     body: Vec<u8>,
 ) -> Result<(), ()> {
-    if body.len() > crate::wire::MAX_BODY_LEN as usize || gen.writer.is_retired() {
+    if body.len() > crate::wire::MAX_BODY_LEN as usize
+        || gen.writer.is_retired()
+        || gen.token.is_cancelled()
+    {
         return Err(());
     }
     let charge = if body.is_empty() {
         crate::wire::ByteCharge::none()
     } else {
         let frame_bytes = u32::try_from(body.len() + subc_protocol::HEADER_LEN).map_err(|_| ())?;
-        budget.try_charge(frame_bytes).ok_or(())?
+        tokio::select! {
+            biased;
+            () = gen.token.cancelled() => return Err(()),
+            charge = budget.charge(frame_bytes) => charge,
+        }
     };
     let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
@@ -281,8 +293,10 @@ pub async fn dispatch_request<H: McHostHandler>(
     let (start_tx, start_rx) = oneshot::channel();
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
+    let settlement_task = Arc::clone(&settlement);
     let binary = header.flags.is_binary();
     let outer = shared.spawn_tracked(async move {
+        let settlement = settlement_task;
         let _pending_permit = pending_permit;
         let _task_permit = task_permit;
         if start_rx.await.is_err() {
@@ -348,11 +362,11 @@ pub async fn dispatch_request<H: McHostHandler>(
             }
             joined = &mut inner => {
                 let terminal = match joined {
-                    Ok(RequestOutcome::Response(body))
+                    Ok(RequestOutcome::Response { body, binary })
                         if body.len() <= crate::wire::MAX_BODY_LEN as usize => {
-                            Terminal::Response { body, binary: false }
+                            Terminal::Response { body, binary }
                         }
-                    Ok(RequestOutcome::Response(_)) => Terminal::Error {
+                    Ok(RequestOutcome::Response { .. }) => Terminal::Error {
                         code: CODE_INTERNAL_ERROR.to_owned(),
                         message: "handler response exceeds frame limit".to_owned(),
                     },
@@ -376,7 +390,23 @@ pub async fn dispatch_request<H: McHostHandler>(
     if shared.registry.register_task(route, gen.id, outer) {
         let _ = start_tx.send(());
     } else {
+        // The route moved to Closing between `route_cancel` and here, so the
+        // close owner never saw this task and cannot settle it. The request
+        // was admitted; settle it as cancelled rather than leave the client
+        // with no terminal (first-terminal-wins makes a duplicate harmless).
         drop(start_tx);
+        settle(
+            &settlement,
+            &shared.egress_budget,
+            gen,
+            route,
+            corr,
+            Terminal::Error {
+                code: CODE_CANCELLED.to_owned(),
+                message: "request cancelled".to_owned(),
+            },
+        )
+        .await;
         remove_pending(gen, key);
     }
 }
@@ -474,12 +504,26 @@ pub async fn open_route<H: McHostHandler>(
 
 /// Runs the route-gone callback exactly once per handle, gated by the
 /// registry's `gone_started` mark. Panic or timeout is host-fatal.
+///
+/// The callback task is abort-exempt and self-bounded: the shutdown drain can
+/// drop this caller at its deadline and `abort_all` reaps ordinary tasks, but
+/// route-gone runs exactly once and must complete (or trip the fatal latch)
+/// before handler drop, so the spawned task enforces its own deadline.
 async fn run_route_gone<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: RouteHandle) {
     if !shared.registry.mark_gone_started(handle) {
         return;
     }
     let handler = Arc::clone(&shared.handler);
-    let task = shared.spawn_tracked(async move { handler.route_gone(handle).await });
+    let deadline = shared.timing.lifecycle_callback_deadline;
+    let watchdog = Arc::clone(shared);
+    let task = shared.spawn_lifecycle(async move {
+        if timeout(deadline, handler.route_gone(handle)).await.is_err() {
+            watchdog.fatal.trip(
+                &watchdog.shutdown,
+                "route_gone callback deadline expired".to_owned(),
+            );
+        }
+    });
     let _ = shared.lifecycle_join("route_gone", task).await;
 }
 

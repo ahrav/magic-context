@@ -56,13 +56,6 @@ impl ByteBudget {
         }
     }
 
-    pub fn try_charge(&self, bytes: u32) -> Option<ByteCharge> {
-        let permit = self.semaphore.clone().try_acquire_many_owned(bytes).ok()?;
-        Some(ByteCharge {
-            _permit: Some(permit),
-        })
-    }
-
     #[cfg(test)]
     pub fn available(&self) -> usize {
         self.semaphore.available_permits()
@@ -360,7 +353,10 @@ pub fn encode_owned_frame(
         corr: id.corr,
     }
     .encode();
-    body.reserve(HEADER_LEN);
+    // Exact-size growth: amortized `reserve` may double a full-capacity body
+    // (a 64 MiB response would hold 128 MiB), exceeding what the caller's
+    // byte-budget charge accounts for.
+    body.reserve_exact(HEADER_LEN);
     body.resize(body_len + HEADER_LEN, 0);
     body.copy_within(..body_len, HEADER_LEN);
     body[..HEADER_LEN].copy_from_slice(&header);

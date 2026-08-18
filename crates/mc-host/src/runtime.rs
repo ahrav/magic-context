@@ -126,6 +126,19 @@ impl<H: McHostHandler> HostShared<H> {
         handle
     }
 
+    /// Spawns a lifecycle-callback task onto the tracker WITHOUT retaining an
+    /// abort handle: the forced shutdown path's `abort_all` must never cancel
+    /// an in-progress lifecycle callback (route-gone runs exactly once and
+    /// completes before handler drop). The spawned future must bound itself
+    /// with `lifecycle_callback_deadline`.
+    pub fn spawn_lifecycle<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tracker.spawn(future)
+    }
+
     /// Joins a lifecycle callback task under the lifecycle deadline. Panic or
     /// overrun trips the fatal latch; the host must terminate rather than
     /// report graceful completion (plan KTD9).
@@ -273,6 +286,10 @@ pub async fn run<H: McHostHandler>(
     Ok(())
 }
 
+/// Delay before retrying a failed `accept()`, preventing a tight error loop
+/// when the listener stays ready under persistent resource exhaustion.
+const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Accepts sockets until shutdown. Each accept result is synchronously
 /// registered with the task tracker before the next await — the
 /// accepted-socket linearization point — so shutdown always finds and closes
@@ -285,6 +302,14 @@ async fn accept_loop<H: McHostHandler>(shared: &Arc<HostShared<H>>, listener: Tc
             accepted = listener.accept() => accepted,
         };
         let Ok((stream, _addr)) = accepted else {
+            // Resource errors (EMFILE/ENFILE) leave the listener permanently
+            // ready; retrying without delay would spin a core. Backoff keeps
+            // the loop bounded while remaining responsive to shutdown.
+            tokio::select! {
+                biased;
+                () = shared.shutdown.cancelled() => return,
+                () = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+            }
             continue;
         };
         // Bounded unauthenticated work: no permit means close without reading

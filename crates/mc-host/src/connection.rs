@@ -345,10 +345,22 @@ async fn liveness_loop(
     budget: crate::wire::ByteBudget,
     policy: crate::config::LivenessPolicy,
 ) {
+    let mut next_ping_at = Instant::now() + policy.ping_interval;
     loop {
+        // Wake at the sooner of the next Ping tick and the earliest
+        // outstanding Pong deadline, so invalidation honors `pong_deadline`
+        // rather than overshooting to the next `ping_interval` tick.
+        let wake_at = {
+            let pings = gen.pings.lock().expect("pings lock");
+            pings
+                .values()
+                .map(|(_, sent)| *sent + policy.pong_deadline)
+                .min()
+                .map_or(next_ping_at, |deadline| deadline.min(next_ping_at))
+        };
         tokio::select! {
             () = gen.token.cancelled() => return,
-            () = tokio::time::sleep(policy.ping_interval) => {}
+            () = tokio::time::sleep_until(wake_at) => {}
         }
         let now = Instant::now();
         let expired = {
@@ -366,10 +378,16 @@ async fn liveness_loop(
             if expired {
                 pings.clear();
             } else if !pings.is_empty() {
-                // Do not add a Ping while an unexpired Ping remains.
+                // An unexpired Ping is outstanding; wake again at its deadline.
                 continue;
             }
         }
+        if now < next_ping_at {
+            // Woke for a Pong deadline that was answered (or cleared) in time;
+            // the next Ping still waits for its tick.
+            continue;
+        }
+        next_ping_at = now + policy.ping_interval;
         let corr = gen.next_ping_corr.fetch_add(1, Ordering::SeqCst);
         let flags = pure_header_flags();
         gen.pings

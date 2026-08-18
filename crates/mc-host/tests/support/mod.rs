@@ -340,24 +340,33 @@ impl McHostHandler for TestHandler {
         let mode = request["mode"].as_str().unwrap_or("echo");
 
         match mode {
-            "echo" => RequestOutcome::Response(ctx.body.clone()),
-            "len" => RequestOutcome::Response(
-                serde_json::to_vec(&serde_json::json!({"received_bytes": ctx.body.len()}))
+            "echo" => RequestOutcome::Response {
+                body: ctx.body.clone(),
+                binary: ctx.binary,
+            },
+            "len" => RequestOutcome::Response {
+                body: serde_json::to_vec(&serde_json::json!({"received_bytes": ctx.body.len()}))
                     .expect("length reply serializes"),
-            ),
-            "response_bytes" => {
-                RequestOutcome::Response(vec![0; request["bytes"].as_u64().unwrap_or(1) as usize])
-            }
-            "oversize_response" => RequestOutcome::Response(vec![0; 64 * 1024 * 1024 + 1]),
+                binary: false,
+            },
+            "response_bytes" => RequestOutcome::Response {
+                body: vec![0; request["bytes"].as_u64().unwrap_or(1) as usize],
+                binary: false,
+            },
+            "oversize_response" => RequestOutcome::Response {
+                body: vec![0; 64 * 1024 * 1024 + 1],
+                binary: false,
+            },
             "oversize_stream" => {
                 let rejected = ctx
                     .stream(vec![0; 64 * 1024 * 1024 + 1], true)
                     .await
                     .is_err();
-                RequestOutcome::Response(
-                    serde_json::to_vec(&serde_json::json!({"stream_rejected": rejected}))
+                RequestOutcome::Response {
+                    body: serde_json::to_vec(&serde_json::json!({"stream_rejected": rejected}))
                         .expect("stream result serializes"),
-                )
+                    binary: false,
+                }
             }
             "error" => RequestOutcome::Error {
                 code: request["code"].as_str().unwrap_or("app_error").to_owned(),
@@ -386,7 +395,10 @@ impl McHostHandler for TestHandler {
             }
             "await_cancel" => {
                 ctx.cancelled().await;
-                RequestOutcome::Response(b"observed-cancel".to_vec())
+                RequestOutcome::Response {
+                    body: b"observed-cancel".to_vec(),
+                    binary: false,
+                }
             }
             "await_completion" => {
                 let _permit = self
@@ -395,7 +407,10 @@ impl McHostHandler for TestHandler {
                     .acquire()
                     .await
                     .expect("completion gate remains open");
-                RequestOutcome::Response(b"completed".to_vec())
+                RequestOutcome::Response {
+                    body: b"completed".to_vec(),
+                    binary: false,
+                }
             }
             "hang" => {
                 std::future::pending::<()>().await;
@@ -404,7 +419,10 @@ impl McHostHandler for TestHandler {
             "slow" => {
                 let ms = request["ms"].as_u64().unwrap_or(50);
                 tokio::time::sleep(Duration::from_millis(ms)).await;
-                RequestOutcome::Response(b"slow-done".to_vec())
+                RequestOutcome::Response {
+                    body: b"slow-done".to_vec(),
+                    binary: false,
+                }
             }
             "panic" => panic!("{}", String::from_utf8_lossy(CANARY_BODY)),
             other => RequestOutcome::Error {

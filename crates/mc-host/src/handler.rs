@@ -88,8 +88,10 @@ impl HealthReport {
 /// How one routed request settles from the handler's side.
 #[derive(Debug)]
 pub enum RequestOutcome {
-    /// Unary success; the host emits one `Response` terminal.
-    Response(Vec<u8>),
+    /// Unary success; the host emits one `Response` terminal whose wire
+    /// `binary` flag mirrors `binary`, exactly like [`RequestCtx::stream`]
+    /// items.
+    Response { body: Vec<u8>, binary: bool },
     /// Application failure; the host emits one canonical `Error` terminal.
     Error { code: String, message: String },
     /// Stream items were emitted through [`RequestCtx::stream`]; the host

@@ -643,7 +643,7 @@ async fn oversized_handler_output_cannot_corrupt_framing() {
 }
 
 #[tokio::test]
-async fn egress_exhaustion_retires_the_generation_instead_of_losing_a_terminal() {
+async fn concurrent_egress_waits_for_budget_instead_of_retiring_the_generation() {
     let host = TestHost::start_with(|config| {
         config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES;
     })
@@ -654,6 +654,7 @@ async fn egress_exhaustion_retires_the_generation_instead_of_losing_a_terminal()
         .await
         .expect("route");
 
+    let mut corrs = Vec::new();
     for _ in 0..2 {
         let corr = client.next_corr();
         client
@@ -670,13 +671,25 @@ async fn egress_exhaustion_retires_the_generation_instead_of_losing_a_terminal()
             )
             .await
             .expect("send large response request");
+        corrs.push(corr);
     }
 
-    let _ = client.drain_until_close(Duration::from_secs(15)).await;
-    assert!(
-        client.closed_within(Duration::from_secs(5)).await,
-        "failed terminal emission must retire the generation"
-    );
+    // The egress budget (one maximum frame) cannot hold both encoded
+    // responses at once; the second emission waits for the first to flush
+    // instead of failing its charge and retiring the generation.
+    for _ in 0..2 {
+        let frame = client
+            .frame_within(Duration::from_secs(30))
+            .await
+            .expect("large response");
+        assert_eq!(frame.ty, TY_RESPONSE);
+        let pos = corrs
+            .iter()
+            .position(|corr| *corr == frame.corr)
+            .expect("response for a sent correlation");
+        corrs.remove(pos);
+    }
+
     host.shutdown_gracefully().await;
 }
 
