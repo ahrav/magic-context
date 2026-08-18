@@ -350,7 +350,13 @@ MIT source for all of the above is in the four published crates, so c50.2 is a
   `XDG_CONFIG_HOME` — that is `mc-host`'s acceptance contract. The real daemon's
   spawned-module registration is satisfied by direct linking plus the synthetic
   handshake (`docs/mc-host-wire-protocol.md` Section 8.1), not by a wire HELLO
-  path. Until that binary exists the test stays unrunnable here.
+  path. The binary alone does not make the test runnable: the test still spawns
+  a module process and polls `wait_for_module_registration` before its first
+  route (`tests/real_daemon.rs`), a provider-registration path the direct
+  profile removes (`Hello` from a consumer is role-invalid). The mc-module
+  build/test task (`magic-context-c50.4`) owns updating the test to the
+  directly-linked host — dropping the module spawn and registration wait —
+  since no provider compatibility path is retained.
 
 ### `magic-context-c50.5` (TypeScript client boundary)
 

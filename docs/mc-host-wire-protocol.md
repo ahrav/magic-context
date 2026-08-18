@@ -525,7 +525,7 @@ Backoff budget counts the first attempt. Route-open retry and reconnect policy M
 
 ## 12. Reconnect, restart, and shutdown
 
-Any EOF, authentication failure, framing corruption, liveness failure, or explicit connection close retires the connection generation. Client MUST immediately invalidate its routes, pending correlations, capability/catalog caches, and late responses. Reconnect MUST reread the connection file and rerun authentication; credentials MUST NOT be cached across host incarnations.
+Any EOF, authentication failure, framing corruption, liveness failure, or explicit connection close retires the connection generation. Client MUST immediately invalidate its routes, pending correlations, capability/catalog caches, and late responses. The host has the mirror obligation for every handler-visible route on the retired generation: stop new dispatch, settle or cancel route work within a finite close budget, invoke `on_route_gone` exactly once, and release each global channel only after that callback completes — otherwise a reconnect finds handler bindings and channels still held by the dead generation. Reconnect MUST reread the connection file and rerun authentication; credentials MUST NOT be cached across host incarnations.
 
 Host restart MUST close old listener/generations, mint fresh key and daemon ID, bind and publish under lock, and reject mixed-generation authentication. Reopened routes receive new connection-fenced handles. Route-only module restart uses new channels or strictly higher epochs and preserves the same connection only if host can prove route cleanup.
 
