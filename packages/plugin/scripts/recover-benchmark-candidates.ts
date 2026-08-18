@@ -51,7 +51,7 @@ import {
 import { hasMeaningfulUserText } from "../src/hooks/magic-context/read-session-formatting";
 import {
     type RawMessage,
-    readRawSessionMessagesFromDb,
+    readRawSessionMessagePageFromDb,
 } from "../src/hooks/magic-context/read-session-raw";
 import { parseIdShapedQuery } from "../src/features/magic-context/search";
 import type { Database } from "../src/shared/sqlite";
@@ -404,9 +404,13 @@ export function purgeStaleDrafts(root: string, nowMs: number, ttlMs = DRAFT_TTL_
 }
 
 /** Canonicalized so the symlink-alias staging check holds on platforms whose
- *  temp directory itself sits behind a symlink (macOS `/var` -> `/private/var`). */
+ *  temp directory itself sits behind a symlink (macOS `/var` -> `/private/var`).
+ *  Namespaced by effective UID: on a shared /tmp, one account's 0700 root
+ *  would otherwise fail every other account's caller-ownership check (or be
+ *  pre-created to deny recovery outright). */
 export function defaultStagingRoot(): string {
-    return join(realpathSync.native(tmpdir()), "magic-context-benchmark-drafts");
+    const owner = typeof process.getuid === "function" ? String(process.getuid()) : "user";
+    return join(realpathSync.native(tmpdir()), `magic-context-benchmark-drafts-${owner}`);
 }
 
 const REQUIRED_TABLES: Record<string, readonly string[]> = {
@@ -452,6 +456,10 @@ export function boundedRowsOrThrow(
 /** Keyset page size for the measurement-corpus read. Bounds the per-query
  *  buffer; the read transaction held across pages keeps them one snapshot. */
 const MEASUREMENT_PAGE_SIZE = 5_000;
+
+/** Page size for raw session history. One long-lived session's messages and
+ *  parts are unbounded by the measurement cap, so hydration pages too. */
+const HISTORY_PAGE_SIZE = 200;
 
 export async function runRecovery(args: {
     measurementDb: Database;
@@ -547,14 +555,27 @@ export async function runRecovery(args: {
                     ranIds.add(decision.messageId);
                 }
             }
+            // Candidate extraction is per-message, so history pages can be
+            // hashed and released one at a time; a single long-lived
+            // session never materializes in full.
             const kept: QueryCandidate[] = [];
-            for (const candidate of collectSessionCandidates(
-                readRawSessionMessagesFromDb(args.historyDb, sessionId),
-                { autoSearchRanMessageIds: ranIds },
-            )) {
-                const hash = normalizedQueryHash(candidate.text);
-                allCandidateHashes.add(hash);
-                if (rowHashes.has(hash)) kept.push(candidate);
+            let afterOrdinal = 0;
+            for (;;) {
+                const page = readRawSessionMessagePageFromDb(
+                    args.historyDb,
+                    sessionId,
+                    afterOrdinal,
+                    HISTORY_PAGE_SIZE,
+                );
+                if (page.length === 0) break;
+                for (const candidate of collectSessionCandidates(page, {
+                    autoSearchRanMessageIds: ranIds,
+                })) {
+                    const hash = normalizedQueryHash(candidate.text);
+                    allCandidateHashes.add(hash);
+                    if (rowHashes.has(hash)) kept.push(candidate);
+                }
+                afterOrdinal = page[page.length - 1].ordinal;
             }
             candidatesBySession.set(sessionId, kept);
         }

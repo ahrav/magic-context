@@ -344,8 +344,15 @@ export function parseSyntheticProfiles(value: unknown): SyntheticProfilesArtifac
     // ambiguous — both despite the release otherwise loading successfully.
     const diagnostics: string[] = [];
     const seen = new Map<number, number>();
-    for (const profile of artifact.profiles) {
+    const profileIds = new Set<string>();
+    for (const [i, profile] of artifact.profiles.entries()) {
         seen.set(profile.scale, (seen.get(profile.scale) ?? 0) + 1);
+        // Synthetic document ids embed the profile id (`syn:<id>:<i>`), so
+        // two profiles sharing an id collide across their scale runs.
+        if (profileIds.has(profile.id)) {
+            diagnostics.push(`syntheticProfiles.profiles[${i}].id: duplicate`);
+        }
+        profileIds.add(profile.id);
     }
     for (const scale of SYNTHETIC_SCALES) {
         const count = seen.get(scale) ?? 0;

@@ -557,6 +557,15 @@ describe("parseSyntheticProfiles", () => {
         );
     });
 
+    it("rejects duplicate profile ids", () => {
+        const { syntheticProfiles } = makeValidRelease();
+        const duplicated = JSON.parse(JSON.stringify(syntheticProfiles));
+        duplicated.profiles[1].id = duplicated.profiles[0].id;
+        expect(diagnosticsOf(() => parseSyntheticProfiles(duplicated))).toContain(
+            "syntheticProfiles.profiles[1].id: duplicate",
+        );
+    });
+
     it("requires every synthetic scale exactly once", () => {
         const { syntheticProfiles } = makeValidRelease();
         const missing = JSON.parse(JSON.stringify(syntheticProfiles));
