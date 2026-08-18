@@ -119,7 +119,14 @@ async fn charged_error_body(
             }
         },
     };
-    let body = error_body_json_into(Vec::with_capacity(body_len), code, message);
+    let body = error_body_json_into(
+        // Header spare capacity up front: an exactly sized buffer would force
+        // `encode_owned_frame`'s reserve to reallocate, transiently retaining
+        // two near-maximum bodies against one charge.
+        Vec::with_capacity(body_len + subc_protocol::HEADER_LEN),
+        code,
+        message,
+    );
     debug_assert_eq!(body.len(), body_len, "escaped length model diverged");
     Ok(OutputBuffer {
         body,
@@ -325,7 +332,13 @@ pub struct StreamSink {
 
 impl StreamSink {
     pub(crate) async fn reserve(&self, max_len: usize) -> Result<OutputBuffer, StreamClosed> {
-        if max_len > crate::wire::MAX_BODY_LEN as usize || self.cancel.is_cancelled() {
+        // Terminal selection closes the stream (StreamClosed's contract): a
+        // context escaped into a background task must not keep reserving
+        // egress budget for buffers `send` can never emit.
+        if max_len > crate::wire::MAX_BODY_LEN as usize
+            || self.cancel.is_cancelled()
+            || self.settlement.won.load(Ordering::SeqCst)
+        {
             return Err(StreamClosed);
         }
         let bytes = u32::try_from(max_len + subc_protocol::HEADER_LEN).map_err(|_| StreamClosed)?;
@@ -342,7 +355,10 @@ impl StreamSink {
                 }
             },
         };
-        if self.cancel.is_cancelled() || self.gen.token.is_cancelled() {
+        if self.cancel.is_cancelled()
+            || self.gen.token.is_cancelled()
+            || self.settlement.won.load(Ordering::SeqCst)
+        {
             return Err(StreamClosed);
         }
         Ok(OutputBuffer {
@@ -380,6 +396,33 @@ impl StreamSink {
     }
 }
 
+/// Emits one no-dispatch rejection terminal off the connection reader while
+/// the per-generation bound allows, inline past it. The wait for contended
+/// egress can span a frame deadline; on the reader it would starve a queued
+/// Pong into a liveness false-kill, while unbounded spawning would let a
+/// client pipeline no-permit rejections into unbounded tasks.
+pub async fn emit_rejection<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    gen: &Arc<GenerationCore>,
+    id: FrameId,
+    code: &'static str,
+    message: &'static str,
+) {
+    match gen.busy_rejects.clone().try_acquire_owned() {
+        Ok(reject_permit) => {
+            let shared_task = Arc::clone(shared);
+            let gen_task = Arc::clone(gen);
+            shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                let _reject_permit = reject_permit;
+                emit_error_terminal(&shared_task.egress_budget, &gen_task, id, code, message).await;
+            }));
+        }
+        Err(_) => {
+            emit_error_terminal(&shared.egress_budget, gen, id, code, message).await;
+        }
+    }
+}
+
 /// Admits and dispatches one routed request frame (protocol §8.3, §9.1).
 ///
 /// Order matters: route lookup proves `unknown_channel` without consuming
@@ -399,8 +442,8 @@ pub async fn dispatch_request<H: McHostHandler>(
 
     if shared.draining.load(Ordering::SeqCst) {
         drop(frame);
-        emit_error_terminal(
-            &shared.egress_budget,
+        emit_rejection(
+            shared,
             gen,
             FrameId::routed(route, corr),
             CODE_SERVER_BUSY,
@@ -414,8 +457,8 @@ pub async fn dispatch_request<H: McHostHandler>(
     // `register_dispatch` below is the authoritative recheck.
     if !shared.registry.route_live(route, gen.id) {
         drop(frame);
-        emit_error_terminal(
-            &shared.egress_budget,
+        emit_rejection(
+            shared,
             gen,
             FrameId::routed(route, corr),
             CODE_UNKNOWN_CHANNEL,
@@ -430,8 +473,8 @@ pub async fn dispatch_request<H: McHostHandler>(
     // ahead of the capacity gate.
     let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
         drop(frame);
-        emit_error_terminal(
-            &shared.egress_budget,
+        emit_rejection(
+            shared,
             gen,
             FrameId::routed(route, corr),
             CODE_SERVER_BUSY,
@@ -442,8 +485,8 @@ pub async fn dispatch_request<H: McHostHandler>(
     };
     let Ok(task_permit) = shared.task_permits.clone().try_acquire_owned() else {
         drop(frame);
-        emit_error_terminal(
-            &shared.egress_budget,
+        emit_rejection(
+            shared,
             gen,
             FrameId::routed(route, corr),
             CODE_SERVER_BUSY,
@@ -595,8 +638,8 @@ pub async fn dispatch_request<H: McHostHandler>(
         // so this rejection proves zero handler invocation; the spawned task
         // observes the dropped start signal and removes the pending entry.
         drop(start_tx);
-        emit_error_terminal(
-            &shared.egress_budget,
+        emit_rejection(
+            shared,
             gen,
             FrameId::routed(route, corr),
             CODE_UNKNOWN_CHANNEL,

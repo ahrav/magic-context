@@ -18,7 +18,7 @@ use tokio_util::task::TaskTracker;
 use crate::config::{HostConfig, HostLimits, HostTiming, LivenessPolicy};
 use crate::connection::{run_connection, GenerationCore};
 use crate::dispatch::{close_route, force_close_all_routes, send_connection_goodbye};
-use crate::handler::{ManifestSnapshot, McHostHandler};
+use crate::handler::McHostHandler;
 use crate::instance::{ConnectionKey, InstanceError, InstanceGuard};
 use crate::routing::RouteRegistry;
 use crate::wire::ByteBudget;
@@ -91,7 +91,11 @@ pub struct HostShared<H> {
     pub limits: HostLimits,
     pub timing: HostTiming,
     pub liveness: Option<LivenessPolicy>,
-    pub manifest: ManifestSnapshot,
+    /// The linked module's identity, the only manifest datum the runtime
+    /// reads after startup. The full `ManifestSnapshot` is dropped once the
+    /// catalog cache is built: a large `provides` tree would otherwise stay
+    /// resident for the incarnation outside every byte budget.
+    pub module_id: Arc<str>,
     pub catalog: crate::control::CatalogCache,
     pub registry: RouteRegistry,
     pub ingress_budget: ByteBudget,
@@ -362,7 +366,7 @@ pub async fn run<H: McHostHandler>(
         limits: config.limits.clone(),
         timing: config.timing.clone(),
         liveness: config.liveness.clone(),
-        manifest,
+        module_id: Arc::from(manifest.module_id.as_str()),
         catalog,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(

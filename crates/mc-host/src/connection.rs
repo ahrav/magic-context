@@ -337,7 +337,7 @@ async fn handle_control<H: McHostHandler>(
     let action = parse_control(
         &frame.body,
         frame.header.flags.is_binary(),
-        &shared.manifest.module_id,
+        &shared.module_id,
     );
     // The body and its charge are done: validation is complete.
     drop(frame);
@@ -347,39 +347,14 @@ async fn handle_control<H: McHostHandler>(
     // no-dispatch `server_busy` terminal takes precedence over the semantic
     // error (protocol §8.3).
     let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
-        // The rejection wait can hold the reader for a frame deadline under
-        // egress contention, starving a queued Pong into a liveness
-        // false-kill — so it runs off-reader while the per-generation bound
-        // allows. Past the bound (a client flooding control frames beyond
-        // global capacity) the inline fallback lets the reader stall
-        // throttle the offender instead of growing unbounded tasks.
-        match gen.busy_rejects.clone().try_acquire_owned() {
-            Ok(reject_permit) => {
-                let shared_task = Arc::clone(shared);
-                let gen_task = Arc::clone(gen);
-                shared.spawn_tracked(gen.read_tasks.track_future(async move {
-                    let _reject_permit = reject_permit;
-                    emit_error_terminal(
-                        &shared_task.egress_budget,
-                        &gen_task,
-                        FrameId::control(corr),
-                        crate::control::CODE_SERVER_BUSY,
-                        "pending request capacity exhausted",
-                    )
-                    .await;
-                }));
-            }
-            Err(_) => {
-                emit_error_terminal(
-                    &shared.egress_budget,
-                    gen,
-                    FrameId::control(corr),
-                    crate::control::CODE_SERVER_BUSY,
-                    "pending request capacity exhausted",
-                )
-                .await;
-            }
-        }
+        crate::dispatch::emit_rejection(
+            shared,
+            gen,
+            FrameId::control(corr),
+            crate::control::CODE_SERVER_BUSY,
+            "pending request capacity exhausted",
+        )
+        .await;
         return;
     };
 
