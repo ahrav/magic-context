@@ -34,6 +34,7 @@ import {
     type UnifiedSearchResult,
     unifiedSearch,
 } from "./search";
+import { QueryBoundsError } from "./search-bounds";
 import { countingDatabase } from "./sql-counters";
 import { initializeDatabase } from "./storage-db";
 import { addNote, dismissNote, updateNote } from "./storage-notes";
@@ -1228,6 +1229,151 @@ describe("unifiedSearch", () => {
     });
 });
 
+describe("unifiedSearch hard bounds (R34, R37)", () => {
+    let db: Database;
+
+    beforeEach(() => {
+        db = createTestDb();
+    });
+
+    afterEach(() => {
+        closeQuietly(db);
+    });
+
+    function seedMessages(sessionId: string, count: number) {
+        rawMessagesBySession.set(
+            sessionId,
+            Array.from({ length: count }, (_, index) => ({
+                ordinal: index + 1,
+                id: `m${index + 1}`,
+                role: index % 2 === 0 ? "user" : "assistant",
+                parts: [{ type: "text", text: `bounded topic message number ${index + 1}` }],
+            })),
+        );
+        ensureMessagesIndexed(db, sessionId, readMessages);
+    }
+
+    it("throws QueryBoundsError before any database or provider work on an over-cap query", async () => {
+        const counting = countingDatabase(db);
+        const embedSpyCalls: string[] = [];
+        const oversized = "a".repeat(16 * 1024 + 1);
+        await expect(
+            unifiedSearch(counting.db, "session-1", "git:test", oversized, {
+                embedQuery: async (text) => {
+                    embedSpyCalls.push(text);
+                    return null;
+                },
+                isEmbeddingRuntimeEnabled: () => true,
+            }),
+        ).rejects.toBeInstanceOf(QueryBoundsError);
+        expect(counting.executions).toHaveLength(0);
+        expect(embedSpyCalls).toHaveLength(0);
+    });
+
+    it("rejects an over-cap atom count before database work", async () => {
+        const counting = countingDatabase(db);
+        const query = Array.from({ length: 65 }, (_, index) => `atom${index}`).join(" ");
+        await expect(
+            unifiedSearch(counting.db, "session-1", "git:test", query, {}),
+        ).rejects.toBeInstanceOf(QueryBoundsError);
+        expect(counting.executions).toHaveLength(0);
+    });
+
+    it("clamps limit 10_000 to at most 50 results with every SQL LIMIT binding at most 150", async () => {
+        seedMessages("session-caps", 300);
+        const counting = countingDatabase(db);
+        const results = await unifiedSearch(
+            counting.db,
+            "session-caps",
+            "git:test",
+            'bounded topic message "bounded topic" number-1 number_2 someCamelCase probe.name',
+            {
+                limit: 10_000,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                gitCommitsEnabled: true,
+                sources: ["memory", "message", "git_commit", "primer", "note"],
+                maxMessageOrdinal: 280,
+                explicitSearch: true,
+                measurementDisabled: true,
+            },
+        );
+        expect(results.length).toBeLessThanOrEqual(50);
+        const limitBindings = counting.executions
+            .filter((execution) => /\bLIMIT \?/i.test(execution.sql))
+            .map((execution) => execution.bindings[execution.bindings.length - 1]);
+        expect(limitBindings.length).toBeGreaterThan(0);
+        for (const binding of limitBindings) {
+            expect(typeof binding).toBe("number");
+            expect(binding as number).toBeLessThanOrEqual(150);
+        }
+        // Row counts catch a lane whose mutant drops the LIMIT clause and so
+        // escapes the binding filter above.
+        const messageFetches = counting.executions.filter((execution) =>
+            execution.sql.includes("message_history_fts"),
+        );
+        expect(messageFetches.length).toBeGreaterThan(0);
+        for (const execution of messageFetches) {
+            expect(execution.rowCount).toBeLessThanOrEqual(900);
+        }
+    });
+
+    it("keeps the default overfetch shape for the default limit", async () => {
+        seedMessages("session-default", 20);
+        const counting = countingDatabase(db);
+        await unifiedSearch(counting.db, "session-default", "git:test", "bounded topic", {
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            sources: ["message"],
+            maxMessageOrdinal: 15,
+            measurementDisabled: true,
+        });
+        const messageFetch = counting.executions.find((execution) =>
+            execution.sql.includes("message_history_fts"),
+        );
+        expect(messageFetch).toBeDefined();
+        expect(messageFetch?.bindings[messageFetch.bindings.length - 1]).toBe(90);
+    });
+
+    it("caps each probe branch aggregate at 900 rows across base plus five probes", async () => {
+        seedMessages("session-probes", 30);
+        const counting = countingDatabase(db);
+        await unifiedSearch(
+            counting.db,
+            "session-probes",
+            "git:test",
+            'bounded "topic one" probe-two probe_three probe.four probeFive probe-six',
+            {
+                limit: 50,
+                memoryEnabled: false,
+                embeddingEnabled: false,
+                sources: ["message"],
+                maxMessageOrdinal: 25,
+                explicitSearch: true,
+                measurementDisabled: true,
+            },
+        );
+        const batched = counting.executions.filter(
+            (execution) =>
+                execution.sql.includes("message_history_fts") &&
+                execution.sql.includes("UNION ALL") &&
+                /\bLIMIT \?/i.test(execution.sql),
+        );
+        expect(batched.length).toBeGreaterThan(0);
+        for (const execution of batched) {
+            // Binding values of 100+ are branch LIMITs; the only other numeric
+            // binding is the ordinal cutoff of 25.
+            const limits = execution.bindings.filter(
+                (binding): binding is number => typeof binding === "number" && binding >= 100,
+            );
+            // The query uses one base term and five probes, so six branches
+            // capped at 150 return at most 900 rows.
+            expect(limits).toEqual([150, 150, 150, 150, 150, 150]);
+            expect(execution.rowCount).toBeLessThanOrEqual(900);
+        }
+    });
+});
+
 describe("parseIdShapedQuery", () => {
     it("recognizes a bare numeric id", () => {
         expect(parseIdShapedQuery("7234")).toEqual([7234]);
@@ -2303,5 +2449,97 @@ describe("note candidate pruning (R36)", () => {
             { source: "note", id: `note:${seeded.ready.id}`, score: 1 },
             { source: "note", id: `note:${seeded.matching.id}`, score: 0.5 },
         ]);
+    });
+
+    it("keeps an eligible hit reachable past 150+ foreign FTS matches (AE4)", async () => {
+        const eligible = addNote(db, "session", {
+            sessionId: NOTE_SESSION,
+            content: "Eligible saturation follow-up for the drain design.",
+        });
+        for (let index = 0; index < 180; index += 1) {
+            addNote(db, "session", {
+                sessionId: "foreign-session",
+                content: `Foreign saturation chatter number ${index} for the drain design.`,
+            });
+        }
+        pinNoteTimestamps(db);
+        const counter = countingDatabase(db);
+
+        const results = await unifiedSearch(
+            counter.db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "saturation",
+            noteSearchOptions(),
+        );
+
+        expect(results.map((result) => (result.source === "note" ? result.noteId : -1))).toEqual([
+            eligible.id,
+        ]);
+        // Scope joins before the candidate statement's LIMIT.
+        const candidateSelects = counter.matching(/JOIN notes ON notes\.id = notes_fts\.rowid/);
+        expect(candidateSelects).toHaveLength(1);
+        expect(candidateSelects[0].sql).toContain("notes.session_id");
+        expect(candidateSelects[0].rowCount).toBeLessThanOrEqual(150);
+    });
+
+    it("caps the eligible pool at the deterministic best-ranked 150 rows", async () => {
+        for (let index = 0; index < 180; index += 1) {
+            addNote(db, "session", {
+                sessionId: NOTE_SESSION,
+                content: `Eligible saturation note number ${index} for the drain design.`,
+            });
+        }
+        // Repeating the term makes this note rank above the near-identical
+        // filler, so the capped pool must include it.
+        const best = addNote(db, "session", {
+            sessionId: NOTE_SESSION,
+            content: "Saturation saturation saturation deep-dive with saturation follow-ups.",
+        });
+        pinNoteTimestamps(db);
+        const counter = countingDatabase(db);
+
+        const first = await unifiedSearch(
+            counter.db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "saturation",
+            noteSearchOptions(),
+        );
+        const hydrations = counter.matching(/CROSS JOIN notes ON notes\.id = requested\.value/);
+        expect(hydrations).toHaveLength(1);
+        expect(hydrations[0].rowCount).toBeLessThanOrEqual(150);
+        expect(first.map((result) => (result.source === "note" ? result.noteId : -1))).toContain(
+            best.id,
+        );
+
+        const second = await unifiedSearch(
+            db,
+            NOTE_SESSION,
+            NOTE_PROJECT,
+            "saturation",
+            noteSearchOptions(),
+        );
+        expect(projectionOf(second)).toEqual(projectionOf(first));
+    });
+
+    it("bounds the short-needle fallback scan to 150 newest eligible rows", async () => {
+        for (let index = 0; index < 180; index += 1) {
+            addNote(db, "session", {
+                sessionId: NOTE_SESSION,
+                content: `ab short-needle note number ${index}.`,
+            });
+        }
+        pinNoteTimestamps(db);
+        const counter = countingDatabase(db);
+
+        await unifiedSearch(counter.db, NOTE_SESSION, NOTE_PROJECT, "ab", noteSearchOptions());
+
+        const fallbackScans = counter.matching(/SELECT \* FROM notes WHERE/);
+        expect(fallbackScans.length).toBeGreaterThan(0);
+        for (const scan of fallbackScans) {
+            expect(scan.sql).toContain("LIMIT");
+            expect(scan.rowCount).toBeLessThanOrEqual(150);
+        }
     });
 });

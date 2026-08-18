@@ -296,15 +296,36 @@ function notesProjectionExists(db: Database): boolean {
     return row?.present === 1;
 }
 
-/** Candidate rowids for one FTS query, or null when the projection is absent so
- *  the caller falls back to a scoped scan. */
-export function selectNoteCandidateIds(db: Database, ftsQuery: string): number[] | null {
+/** Scope and status join into the statement BEFORE the LIMIT so ineligible
+ *  rows cannot crowd an eligible hit out of the capped pool. */
+export function selectNoteCandidateIds(
+    db: Database,
+    ftsQuery: string,
+    scope: { sessionId: string; projectPath: string; limit: number },
+): number[] | null {
     if (!notesProjectionExists(db)) return null;
     if (ftsQuery.length === 0) return [];
+    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
     try {
         const rows = db
-            .prepare("SELECT rowid AS id FROM notes_fts WHERE notes_fts MATCH ?")
-            .all(ftsQuery) as Array<{ id?: number }>;
+            .prepare(
+                `SELECT notes.id AS id
+                   FROM notes_fts
+                   JOIN notes ON notes.id = notes_fts.rowid
+                  WHERE notes_fts MATCH ?
+                    AND notes.status IN (${statusPlaceholders})
+                    AND ((notes.type = 'session' AND notes.session_id = ?)
+                      OR (notes.type = 'smart' AND notes.project_path = ?))
+                  ORDER BY bm25(notes_fts), notes.id ASC
+                  LIMIT ?`,
+            )
+            .all(
+                ftsQuery,
+                ...NOTE_SEARCH_STATUSES,
+                scope.sessionId,
+                scope.projectPath,
+                scope.limit,
+            ) as Array<{ id?: number }>;
         return rows
             .map((row) => row.id)
             .filter((id): id is number => typeof id === "number" && Number.isFinite(id));
@@ -336,6 +357,32 @@ export function getSearchableNotesByIds(
                 ...NOTE_SEARCH_STATUSES,
                 options.sessionId,
                 options.projectPath,
+            ) as unknown[]
+    )
+        .filter(isNoteRow)
+        .map(toNote);
+}
+
+export function getRecentSearchableNotes(
+    db: Database,
+    options: { sessionId: string; projectPath: string; limit: number },
+): Note[] {
+    const statusPlaceholders = NOTE_SEARCH_STATUSES.map(() => "?").join(", ");
+    return (
+        db
+            .prepare(
+                `SELECT * FROM notes
+                  WHERE status IN (${statusPlaceholders})
+                    AND ((type = 'session' AND session_id = ?)
+                      OR (type = 'smart' AND project_path = ?))
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?`,
+            )
+            .all(
+                ...NOTE_SEARCH_STATUSES,
+                options.sessionId,
+                options.projectPath,
+                options.limit,
             ) as unknown[]
     )
         .filter(isNoteRow)

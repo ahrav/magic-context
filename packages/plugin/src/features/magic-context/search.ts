@@ -23,10 +23,17 @@ import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
+import {
+    DEFAULT_SEARCH_RESULT_LIMIT,
+    MAX_LANE_CANDIDATES,
+    normalizeSearchResultLimit,
+    prepareExplicitQuery,
+    QueryBoundsError,
+} from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
 import {
     countSearchableNotes,
-    getNotes,
+    getRecentSearchableNotes,
     getSearchableNotesByIds,
     type Note,
     selectNoteCandidateIds,
@@ -41,8 +48,6 @@ import {
     type WorkspaceIdentitySet,
 } from "./workspaces";
 
-const DEFAULT_UNIFIED_SEARCH_LIMIT = 10;
-const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 const SEMANTIC_WEIGHT = 0.7;
 const FTS_WEIGHT = 0.3;
 const SINGLE_SOURCE_PENALTY = 0.8;
@@ -241,12 +246,7 @@ export type UnifiedSearchResult =
     | PrimerSearchResult
     | NoteSearchResult;
 
-function normalizeLimit(limit?: number): number {
-    if (typeof limit !== "number" || !Number.isFinite(limit)) {
-        return DEFAULT_UNIFIED_SEARCH_LIMIT;
-    }
-    return Math.max(1, Math.floor(limit));
-}
+const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 
 // ID-shaped short-circuit: when the whole trimmed query is one memory id (with
 // or without a leading `#`) or a comma/space-separated list of up to
@@ -956,8 +956,13 @@ function searchMessages(args: {
     probes?: string[];
 }): MessageSearchResult[] {
     const cutoff = args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.maxOrdinal : null;
+    // Overfetch covers post-cutoff attrition, but each FTS branch's LIMIT
+    // binding stays within the shared lane ceiling regardless of the caller's
+    // (already tier-multiplied) limit.
     const fetchLimit =
-        args.maxOrdinal != null && args.maxOrdinal >= 0 ? args.limit * 3 : args.limit;
+        args.maxOrdinal != null && args.maxOrdinal >= 0
+            ? Math.min(args.limit * 3, MAX_LANE_CANDIDATES)
+            : Math.min(args.limit, MAX_LANE_CANDIDATES);
 
     const baseQuery = sanitizeFtsQuery(args.query.trim());
     const probes = args.probes ?? [];
@@ -1078,8 +1083,6 @@ function searchMessages(args: {
     }));
 }
 
-const NOTE_SEARCHABLE_STATUSES: Note["status"][] = ["active", "pending", "ready", "dismissed"];
-
 function noteSearchText(note: Note): string {
     const reason = note.readyReason?.trim();
     return reason
@@ -1162,45 +1165,42 @@ function noteFtsQueryForNeedle(needle: string): string | null {
     return atoms.map((atom) => `"${atom.replace(/"/g, '""')}"`).join(" OR ");
 }
 
-function scopedNoteScan(db: Database, sessionId: string, projectPath: string): Note[] {
-    return [
-        ...getNotes(db, {
-            sessionId,
-            type: "session",
-            status: NOTE_SEARCHABLE_STATUSES,
-        }),
-        ...getNotes(db, {
-            projectPath,
-            type: "smart",
-            status: NOTE_SEARCHABLE_STATUSES,
-        }),
-    ];
-}
-
-/** Candidate superset for every needle, falling back to the scoped scan when a
- *  needle is not representable or the projection is unavailable. */
+/** The fused pool caps at MAX_LANE_CANDIDATES so scoring work stays bounded
+ *  even when many needles each fill their branch. */
 function loadNoteSearchCorpus(args: {
     db: Database;
     sessionId: string;
     projectPath: string;
     needles: readonly string[];
 }): Note[] {
+    const scope = {
+        sessionId: args.sessionId,
+        projectPath: args.projectPath,
+        limit: MAX_LANE_CANDIDATES,
+    };
     const queries = args.needles.map(noteFtsQueryForNeedle);
     if (queries.some((query) => query === null)) {
-        return scopedNoteScan(args.db, args.sessionId, args.projectPath);
+        return getRecentSearchableNotes(args.db, scope);
     }
-    const candidateIds = new Set<number>();
+    const bestRankById = new Map<number, number>();
     for (const query of queries) {
         if (!query) continue;
-        const ids = selectNoteCandidateIds(args.db, query);
+        const ids = selectNoteCandidateIds(args.db, query, scope);
         if (ids === null) {
-            return scopedNoteScan(args.db, args.sessionId, args.projectPath);
+            return getRecentSearchableNotes(args.db, scope);
         }
-        for (const id of ids) candidateIds.add(id);
+        ids.forEach((id, rank) => {
+            const existing = bestRankById.get(id);
+            if (existing === undefined || rank < existing) bestRankById.set(id, rank);
+        });
     }
-    if (candidateIds.size === 0) return [];
+    if (bestRankById.size === 0) return [];
+    const pooled = [...bestRankById.entries()]
+        .sort((left, right) => left[1] - right[1] || left[0] - right[0])
+        .slice(0, MAX_LANE_CANDIDATES)
+        .map(([id]) => id);
     return getSearchableNotesByIds(args.db, {
-        ids: [...candidateIds],
+        ids: pooled,
         sessionId: args.sessionId,
         projectPath: args.projectPath,
     });
@@ -1627,7 +1627,11 @@ function searchPrimers(args: {
                  ORDER BY rank ASC
                  LIMIT ?`,
             )
-            .all(ftsQuery, args.projectPath, args.limit * 3) as Array<{ id: number; rank: number }>;
+            .all(
+                ftsQuery,
+                args.projectPath,
+                Math.min(args.limit * 3, MAX_LANE_CANDIDATES),
+            ) as Array<{ id: number; rank: number }>;
         rows.forEach((row, index) => {
             ftsRanks.set(row.id, linearDecayScore(index, rows.length));
         });
@@ -1761,14 +1765,21 @@ export async function unifiedSearch(
     query: string,
     options: UnifiedSearchOptions = {},
 ): Promise<UnifiedSearchResult[]> {
-    const trimmedQuery = query.trim();
+    const prepared = prepareExplicitQuery(query);
+    if (!prepared.ok) {
+        throw new QueryBoundsError(prepared);
+    }
+    const trimmedQuery = prepared.query;
     const measurementStartedAt = Date.now();
     if (trimmedQuery.length === 0) {
         return [];
     }
 
-    const limit = normalizeLimit(options.limit);
-    const tierLimit = Math.max(limit * 3, DEFAULT_UNIFIED_SEARCH_LIMIT);
+    const limit = normalizeSearchResultLimit(options.limit);
+    const tierLimit = Math.min(
+        Math.max(limit * 3, DEFAULT_SEARCH_RESULT_LIMIT),
+        MAX_LANE_CANDIDATES,
+    );
 
     const embeddingEnabled = options.embeddingEnabled ?? true;
     const embedQuery = options.embedQuery ?? embedText;

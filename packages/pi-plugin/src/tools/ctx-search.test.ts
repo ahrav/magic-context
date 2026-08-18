@@ -7,6 +7,82 @@ import { createTestDb, fakeContext } from "../test-utils.test";
 import { createCtxSearchTool } from "./ctx-search";
 
 describe("createCtxSearchTool", () => {
+	it("rejects an over-cap query with the native isError envelope before any work (AE1)", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch");
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+				resolveProjectIdentity: () => {
+					throw new Error("preflight must run before project resolution");
+				},
+			});
+
+			const byteResult = await tool.execute(
+				"call-overcap",
+				{ query: "a".repeat(16 * 1024 + 1) },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-overcap") as never,
+			);
+			expect(byteResult.isError).toBe(true);
+			expect(byteResult.content[0]?.text).toStartWith(
+				"Error: query is too large:",
+			);
+
+			const atomResult = await tool.execute(
+				"call-overcap-atoms",
+				{
+					query: Array.from({ length: 65 }, (_, index) => `a${index}`).join(
+						" ",
+					),
+				},
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-overcap") as never,
+			);
+			expect(atomResult.isError).toBe(true);
+			expect(atomResult.content[0]?.text).toStartWith(
+				"Error: query is too complex:",
+			);
+
+			expect(spy).not.toHaveBeenCalled();
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("clamps an over-cap limit to 50 instead of rejecting (Pi parity)", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockResolvedValue([]);
+		try {
+			const tool = createCtxSearchTool({
+				db,
+				memoryEnabled: false,
+				embeddingEnabled: false,
+				gitCommitsEnabled: false,
+				resolveProjectIdentity: () => "git:test",
+			});
+			await tool.execute(
+				"call-clamp",
+				{ query: "clamped", limit: 10_000 },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-clamp") as never,
+			);
+			expect(spy).toHaveBeenCalledTimes(1);
+			const options = spy.mock.calls[0]?.[4] as { limit?: number };
+			expect(options.limit).toBe(50);
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
 	it("prints ctx_expand ranges and footer for message search hits", async () => {
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(

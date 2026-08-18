@@ -24,18 +24,19 @@ import { resolveProjectIdentityForSession } from "@magic-context/core/features/m
 import {
 	parseIdShapedQuery,
 	resolveMemoriesByIdsForSearch,
-	type UnifiedSearchResult,
 	unifiedSearch,
 } from "@magic-context/core/features/magic-context/search";
+import {
+	describeQueryBoundsViolation,
+	normalizeSearchResultLimit,
+	prepareExplicitQuery,
+} from "@magic-context/core/features/magic-context/search-bounds";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
+import { formatSearchResults } from "@magic-context/core/tools/ctx-search/render";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
-
-const DEFAULT_LIMIT = 10;
-const NOTE_EXPAND_HINT =
-	"Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
 
 const ParamsSchema = Type.Object(
 	{
@@ -70,117 +71,6 @@ const ParamsSchema = Type.Object(
 );
 
 type CtxSearchParams = Static<typeof ParamsSchema>;
-
-function normalizeLimit(limit?: number): number {
-	if (typeof limit !== "number" || !Number.isFinite(limit))
-		return DEFAULT_LIMIT;
-	return Math.max(1, Math.floor(limit));
-}
-
-function formatAge(committedAtMs: number): string {
-	const ageMs = Date.now() - committedAtMs;
-	if (ageMs < 0) return "future";
-	const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
-	if (days <= 0) return "today";
-	if (days === 1) return "1d ago";
-	if (days < 30) return `${days}d ago`;
-	const months = Math.floor(days / 30);
-	if (months === 1) return "1mo ago";
-	if (months < 12) return `${months}mo ago`;
-	const years = Math.floor(days / 365);
-	return years === 1 ? "1y ago" : `${years}y ago`;
-}
-
-function formatResult(
-	result: UnifiedSearchResult,
-	index: number,
-	currentSessionId: string,
-): string {
-	if (result.source === "memory") {
-		// `source=` attributes a foreign workspace member's memory to its origin
-		// project (parity with OpenCode ctx-search/tools.ts); empty for own-project.
-		const source = result.sourceName ? ` source=${result.sourceName}` : "";
-		return [
-			`[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${result.category}${source} match=${result.matchType}`,
-			result.content,
-		].join("\n");
-	}
-
-	if (result.source === "git_commit") {
-		return [
-			`[${index}] [git_commit] score=${result.score.toFixed(2)} sha=${result.shortSha} ${formatAge(result.committedAtMs)} match=${result.matchType}`,
-			result.content,
-		].join("\n");
-	}
-
-	if (result.source === "primer") {
-		return [
-			`[${index}] [primer] score=${result.score.toFixed(2)} id=${result.primerId} support=${result.support} match=${result.matchType}`,
-			result.content,
-		].join("\n");
-	}
-
-	if (result.source === "note") {
-		const anchor =
-			result.anchorOrdinal !== null &&
-			result.sourceSessionId === currentSessionId
-				? ` @msg ${result.anchorOrdinal}`
-				: "";
-		return [
-			`[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
-			result.content,
-		].join("\n");
-	}
-
-	if (result.source === "compartment") {
-		return [
-			`[${index}] [message] score=${result.score.toFixed(2)} compartment_id=${result.compartmentId} range=${result.startOrdinal}-${result.endOrdinal} match=${result.matchType} title=${result.title}`,
-			result.snippet ? `Snippet: ${result.snippet}` : result.content,
-		].join("\n");
-	}
-
-	const expandStart = Math.max(1, result.messageOrdinal - 3);
-	const expandEnd = result.messageOrdinal + 3;
-	return [
-		`[${index}] [message] score=${result.score.toFixed(2)} ordinal=${result.messageOrdinal} range=${expandStart}-${expandEnd} role=${result.role}`,
-		result.content,
-	].join("\n");
-}
-
-function formatSearchResults(
-	query: string,
-	results: UnifiedSearchResult[],
-	currentSessionId: string,
-): string {
-	if (results.length === 0) {
-		return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
-	}
-	const bodyParts = results.map((result, index) =>
-		formatResult(result, index + 1, currentSessionId),
-	);
-	if (
-		results.some(
-			(result) =>
-				result.source === "message" || result.source === "compartment",
-		)
-	) {
-		bodyParts.push(
-			"Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.",
-		);
-	}
-	if (
-		results.some(
-			(result) =>
-				result.source === "note" &&
-				result.anchorOrdinal !== null &&
-				result.sourceSessionId === currentSessionId,
-		)
-	) {
-		bodyParts.push(NOTE_EXPAND_HINT);
-	}
-	const body = bodyParts.join("\n\n");
-	return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${body}`;
-}
 
 export interface CtxSearchToolDeps {
 	db: ContextDatabase;
@@ -222,7 +112,20 @@ export function createCtxSearchTool(
 					values: ["memory", "message", "git_commit", "primer", "note"],
 				},
 			});
-			const query = params.query?.trim();
+			const preflight = prepareExplicitQuery(params.query ?? "");
+			if (!preflight.ok) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Error: ${describeQueryBoundsViolation(preflight)}`,
+						},
+					],
+					details: undefined,
+					isError: true,
+				};
+			}
+			const query = preflight.query;
 			if (!query) {
 				return {
 					content: [{ type: "text", text: "Error: 'query' is required." }],
@@ -284,7 +187,10 @@ export function createCtxSearchTool(
 					db: deps.db,
 					projectPath: projectIdentity,
 					ids: idShape,
-					limit: Math.max(normalizeLimit(params.limit), idShape.length),
+					limit: Math.max(
+						normalizeSearchResultLimit(params.limit),
+						idShape.length,
+					),
 					visibleMemoryIds,
 				});
 				if (idResults !== null) {
@@ -306,7 +212,7 @@ export function createCtxSearchTool(
 				projectIdentity,
 				query,
 				{
-					limit: normalizeLimit(params.limit),
+					limit: normalizeSearchResultLimit(params.limit),
 					memoryEnabled,
 					embeddingEnabled,
 					embedQuery: async (text, signal) => {

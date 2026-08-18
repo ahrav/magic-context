@@ -65,6 +65,7 @@ import {
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { buildAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -151,54 +152,8 @@ function hasStackedAugmentation(rawText: string): boolean {
 	);
 }
 
-function stripNestedSystemReminders(text: string): string {
-	const OPEN = "<system-reminder>";
-	const CLOSE = "</system-reminder>";
-	let result = "";
-	let depth = 0;
-	let i = 0;
-	while (i < text.length) {
-		if (text.startsWith(OPEN, i)) {
-			depth += 1;
-			i += OPEN.length;
-		} else if (text.startsWith(CLOSE, i)) {
-			// Orphan close tag (depth already 0) is dropped silently — we
-			// don't want a leaked closing tag from a malformed/cut input
-			// to bleed into the embedded text.
-			if (depth > 0) depth -= 1;
-			i += CLOSE.length;
-		} else if (depth === 0) {
-			result += text[i];
-			i += 1;
-		} else {
-			// Inside a system-reminder — skip the character.
-			i += 1;
-		}
-	}
-	return result;
-}
-
 function extractUserPromptText(message: UserMessage): string {
-	return (
-		stripNestedSystemReminders(collectUserPromptParts(message))
-			// HTML comments — covers temporal markers, OMO/ALFONSO internal
-			// initiators, and any other commented-out extension markup.
-			.replace(/<!--[\s\S]*?-->/g, "")
-			// Plugin-owned injected blocks should be removed with their content.
-			.replace(/<ctx-search-hint>[\s\S]*?<\/ctx-search-hint>/g, "")
-			.replace(/<ctx-search-auto>[\s\S]*?<\/ctx-search-auto>/g, "")
-			.replace(/<instruction[^>]*>[\s\S]*?<\/instruction>/g, "")
-			.replace(/<sidekick-augmentation>[\s\S]*?<\/sidekick-augmentation>/g, "")
-			// Generic XML/HTML tags — opening, closing, and self-closing.
-			// Preserve text between paired tags so pasted content still embeds.
-			.replace(/<\/?[a-zA-Z][^<>]*>/g, "")
-			// Magic Context tag prefix: "§123§ " at any position.
-			.replace(/§\d+§\s*/g, "")
-			// Collapse whitespace runs that the strippings may leave behind.
-			.replace(/[ \t]+\n/g, "\n")
-			.replace(/\n{3,}/g, "\n\n")
-			.trim()
-	);
+	return extractBoundedAutoSearchQuery(collectUserPromptParts(message));
 }
 
 function findLatestMeaningfulUserMessage(

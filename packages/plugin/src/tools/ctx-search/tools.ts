@@ -7,16 +7,17 @@ import {
 import {
     parseIdShapedQuery,
     resolveMemoriesByIdsForSearch,
-    type UnifiedSearchResult,
     unifiedSearch,
 } from "../../features/magic-context/search";
+import {
+    describeQueryBoundsViolation,
+    normalizeSearchResultLimit,
+    prepareExplicitQuery,
+} from "../../features/magic-context/search-bounds";
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import {
-    CTX_SEARCH_DESCRIPTION,
-    CTX_SEARCH_TOOL_NAME,
-    DEFAULT_CTX_SEARCH_LIMIT,
-} from "./constants";
+import { CTX_SEARCH_DESCRIPTION, CTX_SEARCH_TOOL_NAME } from "./constants";
+import { formatSearchResults } from "./render";
 import type { CtxSearchArgs, CtxSearchSource, CtxSearchToolDeps } from "./types";
 
 export { CTX_SEARCH_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -28,14 +29,6 @@ const VALID_SOURCES: ReadonlySet<CtxSearchSource> = new Set([
     "primer",
     "note",
 ]);
-
-function normalizeLimit(limit?: number): number {
-    if (typeof limit !== "number" || !Number.isFinite(limit)) {
-        return DEFAULT_CTX_SEARCH_LIMIT;
-    }
-
-    return Math.max(1, Math.floor(limit));
-}
 
 /** Validate and normalize the `sources` arg. Drops unknown strings (the enum
  *  constraint catches them at the schema layer, but we still want a safe
@@ -57,107 +50,6 @@ function normalizeSources(sources?: string[]): CtxSearchSource[] | undefined {
         }
     }
     return result;
-}
-
-function formatAge(committedAtMs: number): string {
-    const ageMs = Date.now() - committedAtMs;
-    if (ageMs < 0) return "future";
-    const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
-    if (days <= 0) return "today";
-    if (days === 1) return "1d ago";
-    if (days < 30) return `${days}d ago`;
-    const months = Math.floor(days / 30);
-    if (months === 1) return "1mo ago";
-    if (months < 12) return `${months}mo ago`;
-    const years = Math.floor(days / 365);
-    return years === 1 ? "1y ago" : `${years}y ago`;
-}
-
-const NOTE_EXPAND_HINT =
-    "Use ctx_expand(start=N-10, end=N) around any note @msg anchor above to read the surrounding conversation context.";
-
-function formatResult(
-    result: UnifiedSearchResult,
-    index: number,
-    currentSessionId: string,
-): string {
-    if (result.source === "memory") {
-        const source = result.sourceName ? ` source=${result.sourceName}` : "";
-        return [
-            `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${result.category}${source} match=${result.matchType}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "git_commit") {
-        return [
-            `[${index}] [git_commit] score=${result.score.toFixed(2)} sha=${result.shortSha} ${formatAge(result.committedAtMs)} match=${result.matchType}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "primer") {
-        return [
-            `[${index}] [primer] score=${result.score.toFixed(2)} id=${result.primerId} support=${result.support} match=${result.matchType}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "note") {
-        const anchor =
-            result.anchorOrdinal !== null && result.sourceSessionId === currentSessionId
-                ? ` @msg ${result.anchorOrdinal}`
-                : "";
-        return [
-            `[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
-            result.content,
-        ].join("\n");
-    }
-
-    if (result.source === "compartment") {
-        return [
-            `[${index}] [message] score=${result.score.toFixed(2)} compartment_id=${result.compartmentId} range=${result.startOrdinal}-${result.endOrdinal} match=${result.matchType} title=${result.title}`,
-            result.snippet ? `Snippet: ${result.snippet}` : result.content,
-        ].join("\n");
-    }
-
-    const expandStart = Math.max(1, result.messageOrdinal - 3);
-    const expandEnd = result.messageOrdinal + 3;
-    return [
-        `[${index}] [message] score=${result.score.toFixed(2)} ordinal=${result.messageOrdinal} range=${expandStart}-${expandEnd} role=${result.role}`,
-        result.content,
-    ].join("\n");
-}
-
-function formatSearchResults(
-    query: string,
-    results: UnifiedSearchResult[],
-    currentSessionId: string,
-): string {
-    if (results.length === 0) {
-        return `No results found for "${query}" across notes, memories, primers, git commits, or message history.`;
-    }
-
-    const bodyParts = results.map((result, index) =>
-        formatResult(result, index + 1, currentSessionId),
-    );
-    if (results.some((result) => result.source === "message" || result.source === "compartment")) {
-        bodyParts.push(
-            "Use ctx_expand(start, end) with the range from any message result above to read the full conversation context.",
-        );
-    }
-    if (
-        results.some(
-            (result) =>
-                result.source === "note" &&
-                result.anchorOrdinal !== null &&
-                result.sourceSessionId === currentSessionId,
-        )
-    ) {
-        bodyParts.push(NOTE_EXPAND_HINT);
-    }
-    const body = bodyParts.join("\n\n");
-    return `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${query}":\n\n${body}`;
 }
 
 const ctxSearchArgsShape = {
@@ -197,7 +89,11 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     values: ["memory", "message", "git_commit", "primer", "note"],
                 },
             });
-            const query = args.query?.trim();
+            const preflight = prepareExplicitQuery(args.query ?? "");
+            if (!preflight.ok) {
+                return `Error: ${describeQueryBoundsViolation(preflight)}`;
+            }
+            const query = preflight.query;
             if (!query) {
                 return "Error: 'query' is required.";
             }
@@ -252,7 +148,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                     db: deps.db,
                     projectPath,
                     ids: idShape,
-                    limit: Math.max(normalizeLimit(args.limit), idShape.length),
+                    limit: Math.max(normalizeSearchResultLimit(args.limit), idShape.length),
                     visibleMemoryIds,
                 });
                 if (idResults !== null) {
@@ -266,7 +162,7 @@ function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
                 projectPath,
                 query,
                 {
-                    limit: normalizeLimit(args.limit),
+                    limit: normalizeSearchResultLimit(args.limit),
                     memoryEnabled,
                     embeddingEnabled,
                     embedQuery: async (text, signal) => {

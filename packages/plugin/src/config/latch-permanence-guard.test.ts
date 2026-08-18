@@ -105,7 +105,7 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
             classification: "DIAGNOSTIC",
             reason: "Repeatedly assigned on each cache-busting permission read; later reads replace an earlier denial.",
         },
-    "packages/plugin/src/hooks/magic-context/read-session-formatting.ts:tokenizerLoadAttempted": {
+    "packages/plugin/src/shared/token-estimator.ts:tokenizerLoadAttempted": {
         classification: "VERDICT",
         reason: "DEFECT: a failed tokenizer load permanently selects heuristic token counts even if the package becomes available.",
     },
@@ -133,7 +133,7 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "DIAGNOSTIC",
         reason: "Most-recent boot diagnostic: recordHookInitFailure overwrites it and clearHookInitFailure resets it.",
     },
-    "packages/plugin/src/hooks/magic-context/read-session-formatting.ts:tokenizerLoadPromise": {
+    "packages/plugin/src/shared/token-estimator.ts:tokenizerLoadPromise": {
         classification: "PUBLICATION",
         reason: "In-flight handle only: finally clears it after the load settles, so it cannot retain a failure verdict.",
     },
