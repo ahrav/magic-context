@@ -212,6 +212,26 @@ describe("validateRelease", () => {
         expect(() => validateRelease(corpus, judgments)).not.toThrow();
     });
 
+    it("rejects a corpus document absent from every pool", () => {
+        const { corpus, judgments } = makeValidRelease();
+        corpus.documents.push({
+            id: "d-unjudged-extra",
+            kind: "note",
+            semanticPayload: { kind: "note", title: "extra", body: "unreviewed content" },
+            aliases: [
+                {
+                    namespace: "note",
+                    locator: "9999",
+                    projectScope: "git:fixture-project",
+                    sessionScope: null,
+                },
+            ],
+        });
+        expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: document absent from every pool (d-unjudged-extra)",
+        );
+    });
+
     it("rejects a pooled pair without a judgment", () => {
         const { corpus, judgments } = makeValidRelease();
         judgments.pools[0].documentIds.push(corpus.documents[5].id);

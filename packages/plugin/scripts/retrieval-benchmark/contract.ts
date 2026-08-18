@@ -442,6 +442,20 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
         byDoc.set(judgment.documentId, judgment);
     }
 
+    // Every corpus document must be judged somewhere: a document absent
+    // from every pool would ship (and could be seeded and returned) with no
+    // reviewed relevance label for any scenario, silently expanding the
+    // benchmark with unreviewed content.
+    const pooledDocuments = new Set<string>();
+    for (const pool of pooled.values()) {
+        for (const documentId of pool) pooledDocuments.add(documentId);
+    }
+    for (const document of corpus.documents) {
+        if (!pooledDocuments.has(document.id)) {
+            diagnostics.push(`corpus: document absent from every pool (${document.id})`);
+        }
+    }
+
     for (const query of corpus.queries) {
         const pool = pooled.get(query.id);
         if (!pool) {
