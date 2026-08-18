@@ -180,18 +180,34 @@ impl<H: McHostHandler> HostShared<H> {
 /// Cancels host work if the `run` future is dropped instead of completing:
 /// `TaskTracker` does not abort tracked tasks on drop, so a supervisor that
 /// aborts `run` would otherwise leave the health loop and authenticated
-/// connections serving indefinitely while `InstanceGuard::drop` removes the
-/// publication and releases the lock for a successor. Running on the normal
-/// exit path is harmless — everything it touches has already stopped.
+/// connections serving indefinitely while the instance lock frees for a
+/// successor. The guard owns the `InstanceGuard`, and forced cleanup —
+/// exactly-once route-gone before handler drop, publication removal and lock
+/// release last — runs on a spawned task the abandoned future no longer has
+/// to poll. Normal completion disarms it.
 struct AbandonGuard<H: McHostHandler> {
-    shared: Arc<HostShared<H>>,
+    inner: Option<(Arc<HostShared<H>>, InstanceGuard)>,
+}
+
+impl<H: McHostHandler> AbandonGuard<H> {
+    fn guard_mut(&mut self) -> &mut InstanceGuard {
+        &mut self.inner.as_mut().expect("armed abandon guard").1
+    }
+
+    /// Normal completion: hand the instance guard back for the ordered
+    /// handler-then-lock drop.
+    fn disarm(mut self) -> InstanceGuard {
+        self.inner.take().expect("armed abandon guard").1
+    }
 }
 
 impl<H: McHostHandler> Drop for AbandonGuard<H> {
     fn drop(&mut self) {
-        self.shared.shutdown.cancel();
-        for gen in self
-            .shared
+        let Some((shared, guard)) = self.inner.take() else {
+            return;
+        };
+        shared.shutdown.cancel();
+        for gen in shared
             .connections
             .lock()
             .expect("connections lock")
@@ -201,7 +217,23 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
             gen.shutdown_complete.cancel();
             gen.token.cancel();
         }
-        self.shared.abort_all();
+        shared.abort_all();
+        // Route cleanup is async (route-gone callbacks must run before the
+        // handler drops), so the guard moves into the cleanup task and drops
+        // last — the lock and publication release only after handler-visible
+        // routes got their exactly-once route-gone. Without a runtime the
+        // process is tearing down and the lock dies with it; the guard's own
+        // Drop still removes the publication.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                force_close_all_routes(&shared).await;
+                shared.tracker.close();
+                let lifecycle_chain = shared.timing.lifecycle_callback_deadline.saturating_mul(2);
+                let _ = timeout(lifecycle_chain, shared.tracker.wait()).await;
+                drop(shared);
+                drop(guard);
+            });
+        }
     }
 }
 
@@ -248,14 +280,16 @@ pub async fn run<H: McHostHandler>(
     }
 
     // Initialization runs exactly once, before bind; failure or deadline
-    // overrun prevents publication entirely (protocol §8.1).
+    // overrun prevents publication entirely (protocol §8.1). Abort-on-drop:
+    // if this `run` future is dropped mid-initialize, the callback must not
+    // keep running after the instance lock frees for a successor.
     {
         let handler = Arc::clone(&handler);
         let init = config.init.clone();
-        let mut init_task = tokio::spawn(async move {
+        let mut init_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             let callback = crate::panic_boundary::redact_sync(|| handler.initialize(init));
             crate::panic_boundary::redact(callback).await
-        });
+        }));
         match timeout(config.timing.lifecycle_callback_deadline, &mut init_task).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => return Err(HostError::InitFailed(err.0)),
@@ -269,7 +303,7 @@ pub async fn run<H: McHostHandler>(
             }
             Err(_) => {
                 init_task.abort();
-                let _ = init_task.await;
+                let _ = (&mut init_task).await;
                 return Err(HostError::InitFailed(
                     "initialize deadline expired".to_owned(),
                 ));
@@ -316,13 +350,13 @@ pub async fn run<H: McHostHandler>(
         daemon_ver: config.daemon_ver.clone(),
     });
 
-    let abandon_guard = AbandonGuard {
-        shared: Arc::clone(&shared),
+    let mut abandon_guard = AbandonGuard {
+        inner: Some((Arc::clone(&shared), guard)),
     };
     spawn_health_task(&shared);
     accept_loop(&shared, listener).await;
-    let graceful = shutdown_sequence(&shared, &mut guard).await;
-    drop(abandon_guard);
+    let graceful = shutdown_sequence(&shared, abandon_guard.guard_mut()).await;
+    let guard = abandon_guard.disarm();
 
     // Handler drop precedes lock release: `shared` holds the last handler Arc
     // once the tracker has drained, and `guard` drops after it (protocol §12

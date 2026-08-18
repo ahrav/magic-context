@@ -217,6 +217,18 @@ impl RouteRegistry {
             })
     }
 
+    /// Begins closure of every route one generation owns, in one marking
+    /// pass. Run this before waiting for the generation's in-flight binds:
+    /// a bind that completes after the pass observes `close_requested` and
+    /// lands in `CloseWins` instead of installing a route onto a retiring
+    /// generation.
+    pub fn begin_close_generation(&self, gen_id: u64) -> Vec<(RouteHandle, CloseDecision)> {
+        self.routes_of_generation(gen_id)
+            .into_iter()
+            .map(|handle| (handle, self.begin_close_owned(handle, gen_id)))
+            .collect()
+    }
+
     /// Requests closure from host-owned teardown.
     pub fn begin_close(&self, handle: RouteHandle) -> CloseDecision {
         self.begin_close_for(handle, None)

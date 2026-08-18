@@ -148,13 +148,19 @@ pub async fn run_connection<H: McHostHandler>(
 
     read_task.await;
     gen.read_cancel.cancel();
+    // Mark generation-owned routes closing BEFORE waiting for in-flight
+    // binds: the route.open wrappers below run inside `read_tasks`, and a
+    // bind completing during that wait must observe `close_requested`
+    // (finishing through CloseWins) instead of installing a route onto a
+    // generation that is about to retire.
+    let begun_closes = shared.registry.begin_close_generation(gen.id);
     gen.read_tasks.close();
     gen.read_tasks.wait().await;
     if shared.draining.load(Ordering::SeqCst) {
         gen.shutdown_complete.cancelled().await;
     }
 
-    close_generation(&shared, &gen).await;
+    close_generation(&shared, &gen, begun_closes).await;
     drop(gen);
     if tokio::time::timeout(shared.timing.route_close_budget, &mut writer_task)
         .await
@@ -315,6 +321,22 @@ async fn handle_control<H: McHostHandler>(
     // The body and its charge are done: validation is complete.
     drop(frame);
 
+    // Every channel-0 request — including semantic rejections — is one
+    // consumer request against the global unsettled bound; at capacity the
+    // no-dispatch `server_busy` terminal takes precedence over the semantic
+    // error (protocol §8.3).
+    let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
+        emit_error_terminal(
+            &shared.egress_budget,
+            gen,
+            FrameId::control(corr),
+            crate::control::CODE_SERVER_BUSY,
+            "pending request capacity exhausted",
+        )
+        .await;
+        return;
+    };
+
     match action {
         ControlAction::Reject { code, message } => {
             emit_error_terminal(
@@ -328,20 +350,7 @@ async fn handle_control<H: McHostHandler>(
         }
         ControlAction::CatalogList { module_id_filter } => {
             // Catalog stays serviceable during drain (protocol §12 step 1
-            // freezes routes and dispatch, not control reads), but it is
-            // still one consumer request: it consumes pending admission so
-            // the global unsettled-request bound holds across all frames.
-            let Ok(_pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
-                emit_error_terminal(
-                    &shared.egress_budget,
-                    gen,
-                    FrameId::control(corr),
-                    crate::control::CODE_SERVER_BUSY,
-                    "pending request capacity exhausted",
-                )
-                .await;
-                return;
-            };
+            // freezes routes and dispatch, not control reads).
             let body = shared.catalog.body(module_id_filter.as_deref());
             if emit_catalog_response(&shared.egress_budget, gen, FrameId::control(corr), body)
                 .await
@@ -351,17 +360,6 @@ async fn handle_control<H: McHostHandler>(
             }
         }
         ControlAction::RouteOpen { identity } => {
-            let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
-                emit_error_terminal(
-                    &shared.egress_budget,
-                    gen,
-                    FrameId::control(corr),
-                    crate::control::CODE_SERVER_BUSY,
-                    "pending request capacity exhausted",
-                )
-                .await;
-                return;
-            };
             // Bind callbacks may be slow; never stall the read loop on them.
             // Abort-exempt: this wrapper owns its route's cleanup (rejected
             // or close-raced binds still get exactly-once route-gone), so the

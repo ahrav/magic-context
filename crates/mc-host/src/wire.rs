@@ -174,6 +174,16 @@ where
     {
         return Err(ReadClose::Corrupt("invalid pure-header flags"));
     }
+    // Consumer-role classification from the header alone, BEFORE any body
+    // admission: a role-invalid type with a large declared body must not
+    // hold ingress budget or an allocation through the frame deadline —
+    // the type already proves the generation closes (protocol §6.2).
+    if !matches!(
+        header.ty,
+        FrameType::Request | FrameType::Cancel | FrameType::Pong | FrameType::Goodbye
+    ) {
+        return Err(ReadClose::Corrupt("role-invalid frame type"));
+    }
 
     if header.ty == FrameType::Request && header.channel == 0 && header.len > MAX_CONTROL_BODY_LEN {
         // The header alone proves the violation; never buffer the body

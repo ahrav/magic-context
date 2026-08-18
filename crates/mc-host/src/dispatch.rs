@@ -750,20 +750,25 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
 }
 
 /// Retires a generation: cancels its token (stopping reads, settling admitted
-/// work as cancelled) and closes every route it owned (protocol §12). Routes
-/// close concurrently — bounded by `max_routes` — because serial closes would
-/// multiply a slow route-gone callback by the route count, retaining the
-/// connection permit and global channels for the whole product.
+/// work as cancelled) and closes every route it owned (protocol §12). `begun`
+/// carries decisions the caller marked before waiting for in-flight binds; a
+/// second sweep after the token cancel catches routes reserved in the window
+/// between that marking pass and here. Routes close concurrently — bounded by
+/// `max_routes` — because serial closes would multiply a slow route-gone
+/// callback by the route count, retaining the connection permit and global
+/// channels for the whole product.
 pub async fn close_generation<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
+    begun: Vec<(RouteHandle, CloseDecision)>,
 ) {
     gen.token.cancel();
     let mut closes = tokio::task::JoinSet::new();
-    for handle in shared.registry.routes_of_generation(gen.id) {
+    let sweep = shared.registry.begin_close_generation(gen.id);
+    for (handle, decision) in begun.into_iter().chain(sweep) {
         let shared = Arc::clone(shared);
         closes.spawn(async move {
-            close_route(&shared, handle).await;
+            close_route_decision(&shared, handle, decision).await;
         });
     }
     while closes.join_next().await.is_some() {}
