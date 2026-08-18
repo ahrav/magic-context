@@ -401,12 +401,16 @@ impl McHostHandler for TestHandler {
                 }
             }
             "await_completion" => {
-                let _permit = self
-                    .inner
+                // `forget` keeps the permit consumed: each dispatch must be
+                // individually released via `release_completion`, or the
+                // returned permit would let later iterations complete without
+                // racing the release.
+                self.inner
                     .completion_gate
                     .acquire()
                     .await
-                    .expect("completion gate remains open");
+                    .expect("completion gate remains open")
+                    .forget();
                 RequestOutcome::Response {
                     body: b"completed".to_vec(),
                     binary: false,

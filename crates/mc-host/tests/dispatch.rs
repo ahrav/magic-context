@@ -634,10 +634,12 @@ async fn oversized_handler_output_cannot_corrupt_framing() {
         )
         .await
         .expect("send");
-    let frame = client.frame_within(BUDGET).await.expect("bounded response");
+    // An oversized stream item fails the request outright: the handler's
+    // later unary response loses to the already-settled error terminal, so
+    // the client can never observe a truncated-but-successful stream.
+    let frame = client.frame_within(BUDGET).await.expect("bounded terminal");
     assert_eq!(frame.corr, corr);
-    assert_eq!(frame.ty, TY_RESPONSE);
-    assert_eq!(frame.json()["stream_rejected"], true);
+    assert_eq!(frame.error_code(), "internal_error");
 
     host.shutdown_gracefully().await;
 }

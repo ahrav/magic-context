@@ -288,7 +288,10 @@ impl InstanceGuard {
         if !is_secure_regular(&stat) {
             return;
         }
-        if stat.st_dev != identity.dev || stat.st_ino != identity.ino {
+        // `Stat` field types vary by platform (macOS `st_dev` is `i32`); the
+        // casts are no-ops on Linux but load-bearing elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        if stat.st_dev as u64 != identity.dev || stat.st_ino as u64 != identity.ino {
             return;
         }
         let Ok(bytes) = read_all_fd(&fd, 65_536) else {

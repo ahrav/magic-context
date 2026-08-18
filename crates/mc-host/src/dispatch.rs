@@ -35,6 +35,10 @@ use crate::wire::{
 pub struct Settlement {
     won: AtomicBool,
     order: tokio::sync::Mutex<()>,
+    /// Set once any `StreamData` item reaches the writer. A streamed sequence
+    /// may terminate only with `StreamEnd` or `Error` (protocol §8.3), so a
+    /// later unary `Response` from the handler is a contract violation.
+    streamed: AtomicBool,
 }
 
 impl Settlement {
@@ -42,11 +46,16 @@ impl Settlement {
         Arc::new(Self {
             won: AtomicBool::new(false),
             order: tokio::sync::Mutex::new(()),
+            streamed: AtomicBool::new(false),
         })
     }
 
     pub fn is_settled(&self) -> bool {
         self.won.load(Ordering::SeqCst)
+    }
+
+    fn has_streamed(&self) -> bool {
+        self.streamed.load(Ordering::SeqCst)
     }
 }
 
@@ -195,7 +204,25 @@ pub struct StreamSink {
 
 impl StreamSink {
     pub(crate) async fn send(&self, item: Vec<u8>, binary: bool) -> Result<(), StreamClosed> {
-        if item.len() > crate::wire::MAX_BODY_LEN as usize || self.cancel.is_cancelled() {
+        if item.len() > crate::wire::MAX_BODY_LEN as usize {
+            // An oversized item is a handler defect, not a closed stream:
+            // settle the request as failed so the client cannot observe a
+            // truncated stream that still ends in a successful StreamEnd.
+            settle(
+                &self.settlement,
+                &self.budget,
+                &self.gen,
+                self.route,
+                self.corr,
+                Terminal::Error {
+                    code: CODE_INTERNAL_ERROR.to_owned(),
+                    message: "stream item exceeds frame limit".to_owned(),
+                },
+            )
+            .await;
+            return Err(StreamClosed);
+        }
+        if self.cancel.is_cancelled() {
             return Err(StreamClosed);
         }
         let _order = self.settlement.order.lock().await;
@@ -212,7 +239,13 @@ impl StreamSink {
                 response_flags(binary, false),
                 FrameId::routed(self.route, self.corr),
                 item,
-            ) => result.map_err(|_| StreamClosed),
+            ) => match result {
+                Ok(()) => {
+                    self.settlement.streamed.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                Err(()) => Err(StreamClosed),
+            },
         }
     }
 }
@@ -373,6 +406,16 @@ pub async fn dispatch_request<H: McHostHandler>(
             }
             joined = &mut inner => {
                 let terminal = match joined {
+                    Ok(RequestOutcome::Response { .. }) if settlement.has_streamed() => {
+                        // Streamed sequences terminate only with StreamEnd or
+                        // Error (protocol §8.3); a unary Response after
+                        // StreamData would corrupt the client's view.
+                        Terminal::Error {
+                            code: CODE_INTERNAL_ERROR.to_owned(),
+                            message: "handler returned a unary response after streaming"
+                                .to_owned(),
+                        }
+                    }
                     Ok(RequestOutcome::Response { body, binary })
                         if body.len() <= crate::wire::MAX_BODY_LEN as usize => {
                             Terminal::Response { body, binary }
@@ -458,8 +501,25 @@ pub async fn open_route<H: McHostHandler>(
     };
 
     let handler = Arc::clone(&shared.handler);
-    let bind_task = shared.spawn_tracked(async move { handler.bind(handle, identity).await });
-    let Ok(outcome) = shared.lifecycle_join("bind", bind_task).await else {
+    let bind_deadline = shared.timing.lifecycle_callback_deadline;
+    let bind_watchdog = Arc::clone(&shared);
+    // Abort-exempt and self-bounded like route-gone: the forced shutdown
+    // path must not abort a bind callback mid-flight (the handler observed
+    // the handle, and route-gone must follow a completed or failed bind, not
+    // interleave with it).
+    let bind_task = shared.spawn_lifecycle(async move {
+        tokio::select! {
+            outcome = handler.bind(handle, identity) => Some(outcome),
+            () = tokio::time::sleep(bind_deadline) => {
+                bind_watchdog.fatal.trip(
+                    &bind_watchdog.shutdown,
+                    "bind callback deadline expired".to_owned(),
+                );
+                None
+            }
+        }
+    });
+    let Ok(Some(outcome)) = shared.lifecycle_join("bind", bind_task).await else {
         shared.registry.take_rejected_bind(handle);
         run_route_gone(&shared, handle).await;
         shared.registry.finalize_close(handle);
@@ -591,15 +651,23 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
 }
 
 /// Retires a generation: cancels its token (stopping reads, settling admitted
-/// work as cancelled) and closes every route it owned (protocol §12).
+/// work as cancelled) and closes every route it owned (protocol §12). Routes
+/// close concurrently — bounded by `max_routes` — because serial closes would
+/// multiply a slow route-gone callback by the route count, retaining the
+/// connection permit and global channels for the whole product.
 pub async fn close_generation<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
 ) {
     gen.token.cancel();
+    let mut closes = tokio::task::JoinSet::new();
     for handle in shared.registry.routes_of_generation(gen.id) {
-        close_route(shared, handle).await;
+        let shared = Arc::clone(shared);
+        closes.spawn(async move {
+            close_route(&shared, handle).await;
+        });
     }
+    while closes.join_next().await.is_some() {}
     shared
         .connections
         .lock()

@@ -346,9 +346,13 @@ async fn handle_control<H: McHostHandler>(
                 return;
             };
             // Bind callbacks may be slow; never stall the read loop on them.
+            // Abort-exempt: this wrapper owns its route's cleanup (rejected
+            // or close-raced binds still get exactly-once route-gone), so the
+            // forced shutdown path must let it finish; every await inside is
+            // self-bounded.
             let shared_task = Arc::clone(shared);
             let gen_task = Arc::clone(gen);
-            shared.spawn_tracked(async move {
+            shared.spawn_lifecycle(async move {
                 let _pending_permit = pending_permit;
                 open_route(shared_task, gen_task, corr, identity).await;
             });

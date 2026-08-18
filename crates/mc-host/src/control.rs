@@ -269,6 +269,13 @@ fn parse_route_open(
     }
 }
 
+/// Validates the linked manifest's module ID against the same constraints
+/// `route.open` applies to the client-supplied target, so startup rejects a
+/// manifest advertising a module that no conforming request could ever bind.
+pub(crate) fn validate_manifest_module_id(module_id: &str) -> Result<(), String> {
+    check_string("manifest module_id", module_id, MAX_MODULE_ID_LEN, true)
+}
+
 fn check_string(
     field: &str,
     value: &str,

@@ -211,6 +211,12 @@ pub async fn run<H: McHostHandler>(
             "linked manifest does not advertise a tool_provider role".to_owned(),
         ));
     }
+    // The module ID must satisfy the same bounds route.open enforces on the
+    // client-supplied target, or the catalog advertises a module no request
+    // can name.
+    if let Err(err) = crate::control::validate_manifest_module_id(&manifest.module_id) {
+        return Err(HostError::InitFailed(err));
+    }
 
     // Initialization runs exactly once, before bind; failure or deadline
     // overrun prevents publication entirely (protocol §8.1).
@@ -414,17 +420,14 @@ async fn shutdown_sequence<H: McHostHandler>(
     if timeout_at(deadline, shared.tracker.wait()).await.is_err() {
         shared.abort_all();
         force_close_all_routes(shared).await;
-        // Abort-exempt lifecycle callbacks self-bound at
-        // lifecycle_callback_deadline, which can exceed the shutdown
-        // deadline. Wait that long before returning: `run` releases the
-        // instance lock when it returns, and releasing it while a route-gone
-        // callback still owns the handler would let a successor start
+        // Abort-exempt lifecycle work self-bounds: a bind wrapper chains two
+        // callbacks (bind, then route-gone), each capped at
+        // lifecycle_callback_deadline. Wait out that chain before returning:
+        // `run` releases the instance lock when it returns, and releasing it
+        // while a callback still owns the handler would let a successor start
         // against the predecessor's in-flight cleanup.
-        let _ = timeout(
-            shared.timing.lifecycle_callback_deadline,
-            shared.tracker.wait(),
-        )
-        .await;
+        let lifecycle_chain = shared.timing.lifecycle_callback_deadline.saturating_mul(2);
+        let _ = timeout(lifecycle_chain, shared.tracker.wait()).await;
         return false;
     }
     drained_in_time

@@ -60,8 +60,12 @@ async fn catalog_is_truthful_and_filters_exactly() {
         serde_json::json!(["route.open", "catalog.list"])
     );
     // Wake-plane probing stays fail-open only while this stays absent.
+    const WAKE_CREATE: &[u8] = b"wake.create";
     assert!(
-        !unfiltered.body.windows(12).any(|w| w == b"wake.create"),
+        !unfiltered
+            .body
+            .windows(WAKE_CREATE.len())
+            .any(|w| w == WAKE_CREATE),
         "an unimplemented operation must not be advertised"
     );
 

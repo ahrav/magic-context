@@ -77,6 +77,7 @@ pub enum CloseDecision {
 }
 
 /// What the bind task must do after the handler callback returned.
+#[derive(Debug, PartialEq, Eq)]
 pub enum BindInstall {
     /// Route published; the success response may be queued.
     Installed,
@@ -177,9 +178,20 @@ impl RouteRegistry {
 
     /// Transfers a rejected bind's occupant into `Closing` so the bind task
     /// can run route-gone (the handler observed the handle) and finalize.
+    /// Tolerates a missing or stale occupant: a forced shutdown may have
+    /// already swept the route between the bind outcome and this call.
     pub fn take_rejected_bind(&self, handle: RouteHandle) {
         let mut inner = self.inner.lock().expect("registry lock");
-        let occupant = expect_occupant(&mut inner, handle, "take_rejected_bind");
+        let Some(occupant) = inner
+            .slots
+            .get_mut(&handle.channel)
+            .and_then(|slot| slot.occupant.as_mut())
+        else {
+            return;
+        };
+        if occupant.epoch != handle.epoch {
+            return;
+        }
         occupant.cancel.cancel();
         occupant.state = OccState::Closing;
     }
@@ -340,9 +352,12 @@ impl RouteRegistry {
         true
     }
 
-    /// Forced-shutdown sweep: takes ownership of every route whose route-gone
-    /// has not started, regardless of state, so the forced path can abort its
-    /// tasks and run the callback (protocol §12 forced shutdown).
+    /// Forced-shutdown sweep: takes ownership of every settled route whose
+    /// route-gone has not started, so the forced path can abort its tasks and
+    /// run the callback (protocol §12 forced shutdown). Mid-bind routes are
+    /// only marked close-requested: their abort-exempt bind wrapper owns the
+    /// exactly-once route-gone, and completing the bind against a finalized
+    /// slot would otherwise panic the registry.
     pub fn force_drain(&self) -> Vec<(RouteHandle, Vec<JoinHandle<()>>)> {
         let mut inner = self.inner.lock().expect("registry lock");
         let mut drained = Vec::new();
@@ -351,6 +366,13 @@ impl RouteRegistry {
                 continue;
             };
             if occupant.gone_started {
+                continue;
+            }
+            if matches!(occupant.state, OccState::Binding { .. }) {
+                occupant.cancel.cancel();
+                occupant.state = OccState::Binding {
+                    close_requested: true,
+                };
                 continue;
             }
             occupant.state = OccState::Closing;
@@ -696,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forced_drain_claims_every_uncleaned_route_and_revokes_membership() {
+    async fn forced_drain_claims_settled_routes_and_defers_mid_bind_to_its_wrapper() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
         let live = registry.reserve(&gen).expect("reserve live");
@@ -709,13 +731,18 @@ mod tests {
             .map(|(handle, _tasks)| handle)
             .collect();
 
-        assert_eq!(
-            drained.len(),
-            2,
-            "both live and mid-bind routes are owed cleanup"
-        );
-        assert!(drained.contains(&live));
-        assert!(drained.contains(&mid_bind));
+        assert_eq!(drained, vec![live], "only settled routes are swept");
         assert!(gen.membership.lock().expect("lock").is_empty());
+
+        // The mid-bind route was marked close-requested, not finalized: its
+        // bind wrapper completes against a live slot and owns route-gone.
+        assert_eq!(
+            registry.install_bound(mid_bind),
+            BindInstall::CloseWins,
+            "a bind completing after the forced sweep must observe the close"
+        );
+        // A rejected bind after the sweep is likewise a tolerated transfer.
+        registry.take_rejected_bind(mid_bind);
+        registry.finalize_close(mid_bind);
     }
 }

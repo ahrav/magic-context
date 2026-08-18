@@ -292,6 +292,10 @@ impl RawClient {
         self.next_corr
     }
 
+    pub fn into_stream(self) -> TcpStream {
+        self.stream
+    }
+
     pub async fn send_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.stream.write_all(bytes).await
     }
