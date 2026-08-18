@@ -312,13 +312,24 @@ directly from `historian_producer.rs` rather than only through the SDK:
 - `Flags::new(binary, priority, last)` with `Priority::Interactive`;
 - channel-0 control JSON: `route.open` request `{target, identity, consumer_identity,
   consumer_capabilities, admission_facts}` → response `{route_channel, route_epoch}`;
-- the module registration handshake HELLO{manifest} → HELLO_ACK{storage descriptor};
-- a channel-0 health probe answered on a lane independent of the request path;
+- the registration lifecycle of HELLO{manifest} → HELLO_ACK{storage descriptor},
+  preserved as a host-constructed synthetic `ModuleHelloAckBody` plus exactly-once
+  handler initialization; wire `Hello`/`HelloAck` stay decodable for numeric
+  compatibility but are role-invalid on consumer connections
+  (`docs/mc-host-wire-protocol.md` Sections 6.2, 8.1);
+- handler health, preserved as a host-internal `McHandler::health` callback on a
+  dedicated control task independent of the request path; consumer liveness is
+  pure-header `Ping`/`Pong`, and no client-visible channel-0 health operation exists
+  (`docs/mc-host-wire-protocol.md` Sections 7.4, 9.3);
 - the pre-envelope auth handshake and connection-file format (`SERVER_PROOF_DOMAIN`,
-  `CLIENT_AUTH_DOMAIN`, `schema`, `endpoints`, `key`, `daemon_id`, `pid`, `daemon_ver`) —
-  the TS test suite pins `SERVER_PROOF_DOMAIN` and `HEADER_LEN` directly;
-- `unknown_module` must remain a **terminal** control-plane reject, not a transport
-  failure: `tests/real_daemon.rs` relies on route-retry *not* covering it.
+  `CLIENT_AUTH_DOMAIN`, `schema`, `endpoints`, `key`, `daemon_id`, `pid`, `daemon_ver`).
+  The TS fake-peer test exercises these exports but imports the package's own proof/header
+  helpers, so independent conformance vectors must pin their literal bytes;
+- `unknown_module` remains a **terminal** Error for one `route.open` correlation,
+  not a transport failure. Published `subc-client-rs` 0.3.0 may issue a fresh
+  `route.open` with a new correlation under its bounded route-retry policy; the
+  private 0.3.1 behavior described by `tests/real_daemon.rs` is unverified drift,
+  not authority for disabling managed retries.
 
 MIT source for all of the above is in the four published crates, so c50.2 is a
 *confirm-and-trim* exercise rather than a design-from-scratch one.
@@ -335,9 +346,17 @@ MIT source for all of the above is in the four published crates, so c50.2 is a
   risk to this decision.
 - `subc-core` cannot be adopted. `tests/real_daemon.rs` needs a spawnable
   daemon binary that answers `--version`, writes `subc-connection.json` under
-  `XDG_RUNTIME_DIR`, honors `SUBC_PORT=0`, reads `cortexkit/subc.jsonc` under
-  `XDG_CONFIG_HOME`, and registers a spawned module — that is `mc-host`'s acceptance
-  contract, and until it exists that test stays unrunnable here.
+  `XDG_RUNTIME_DIR`, honors `SUBC_PORT=0`, and reads `cortexkit/subc.jsonc` under
+  `XDG_CONFIG_HOME` — that is `mc-host`'s acceptance contract. The real daemon's
+  spawned-module registration is satisfied by direct linking plus the synthetic
+  handshake (`docs/mc-host-wire-protocol.md` Section 8.1), not by a wire HELLO
+  path. The binary alone does not make the test runnable: the test still spawns
+  a module process and polls `wait_for_module_registration` before its first
+  route (`tests/real_daemon.rs`), a provider-registration path the direct
+  profile removes (`Hello` from a consumer is role-invalid). The mc-module
+  build/test task (`magic-context-c50.4`) owns updating the test to the
+  directly-linked host — dropping the module spawn and registration wait —
+  since no provider compatibility path is retained.
 
 ### `magic-context-c50.5` (TypeScript client boundary)
 
