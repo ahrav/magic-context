@@ -55,13 +55,30 @@ const SESSION_ID = /\bses[_-][A-Za-z0-9]{8,}/;
 // case-insensitive and tools emit `c:/users/...` as readily as `C:\Users\`.
 const SOURCE_PATH = /(?:\/home\/|\/Users\/|[A-Za-z]:[\\/]Users[\\/]|(?:^|[^\w.-])~\/)/i;
 // Identifying paths are not only home-rooted: `/workspace/customer-x/src`,
-// `/mnt/projects/acme`, `D:\Client Work\repo`, or a UNC share
-// `\\server\share\...` carry the same signal. Any multi-segment absolute
-// path, drive-rooted Windows path (spaces allowed inside components), or
-// UNC server+share prefix rejects; this is a rejecting gate, so
+// `/Client Work/repo`, `/用户/客户/repo`, `D:\Client Work\repo`, or UNC
+// shares in either separator form (`\\server\share\...`,
+// `//server/share/...`) carry the same signal. This is a rejecting gate, so
 // over-matching costs a review, never a leak.
-const ABSOLUTE_PATH =
-    /(?:(?:^|[\s"'`=:([])\/(?:[\w.@+-]+\/)+[\w.@+-]+|[A-Za-z]:[\\/][^\\/\r\n]+[\\/]|\\\\[\w.-]+\\[^\\\r\n]+)/;
+const WINDOWS_PATH = /(?:[A-Za-z]:[\\/][^\\/\r\n]+[\\/]|\\\\[\w.-]+\\[^\\\r\n]+)/;
+// No ":" in this delimiter class: `scheme://host/...` URLs must not read as
+// forward-slash UNC shares.
+const UNC_FORWARD = /(?:^|[\s"'`=([])\/\/[\w.-]+\/[^/\s]+/;
+// Two-or-more-component absolute POSIX paths, matched broadly and then
+// verified segment-wise so prose around standalone slashes stays clean.
+const POSIX_PATH_CANDIDATE = /(?:^|[\s"'`=:([])((?:\/[^/\r\n]+){2,})/g;
+
+function hasAbsolutePath(value: string): boolean {
+    if (WINDOWS_PATH.test(value) || UNC_FORWARD.test(value)) return true;
+    for (const match of value.matchAll(POSIX_PATH_CANDIDATE)) {
+        const segments = match[1].split("/").slice(1);
+        // Real path components carry no leading/trailing whitespace; prose
+        // like "either / this / that" does.
+        if (segments.every((segment) => segment.length > 0 && segment === segment.trim())) {
+            return true;
+        }
+    }
+    return false;
+}
 
 interface ForbiddenMatchers {
     tokens: readonly string[];
@@ -89,7 +106,7 @@ function scanString(
         violations.push({ path, category: "hash-like" });
     }
     if (SESSION_ID.test(value)) violations.push({ path, category: "session-id" });
-    if (SOURCE_PATH.test(value) || ABSOLUTE_PATH.test(value)) {
+    if (SOURCE_PATH.test(value) || hasAbsolutePath(value)) {
         violations.push({ path, category: "source-path" });
     }
     const lower = value.toLowerCase();

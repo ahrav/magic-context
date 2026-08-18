@@ -9,7 +9,6 @@
 import { z } from "zod";
 import {
     MAX_SEARCH_RESULT_LIMIT,
-    prepareAutomaticQuery,
     prepareExplicitQuery,
 } from "../../src/features/magic-context/search-bounds";
 import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
@@ -17,6 +16,7 @@ import { normalizeQueryText } from "../../src/features/magic-context/storage-emb
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
+    extractBoundedAutoSearchQuery,
 } from "../../src/hooks/magic-context/auto-search-prompt";
 import type { CtxSearchSource } from "../../src/tools/ctx-search/types";
 import { canonicalFingerprint } from "./canonical-json";
@@ -263,7 +263,11 @@ export function parseCorpus(value: unknown): CorpusArtifact {
                 diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
             }
         } else {
-            const prepared = prepareAutomaticQuery(query.queryText);
+            // The LIVE extractor, not only the bounds preflight: the
+            // automatic path strips plugin markup and collapses whitespace,
+            // so the approved text must survive that whole pipeline
+            // unchanged or production would search a different query.
+            const prepared = extractBoundedAutoSearchQuery(query.queryText);
             if (prepared.length === 0 || prepared !== query.queryText.trim()) {
                 diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
             }
@@ -570,10 +574,12 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     document.kind === "compartment" ||
                     document.kind === "primer" ||
                     document.kind === "note";
+                // Canonical decimal only: production interpolates the numeric
+                // id, so `memory:042` can never byte-match an emitted locator.
                 const producible = reachableAliases.filter(
                     (alias) =>
                         alias.namespace === producibleNamespace &&
-                        (!numericLocator || /^\d+$/.test(alias.locator)),
+                        (!numericLocator || /^(?:0|[1-9]\d*)$/.test(alias.locator)),
                 );
                 if (producible.length === 0) {
                     diagnostics.push(

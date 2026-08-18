@@ -113,6 +113,8 @@ export type ResolvedRankedResult =
  * project-only scope, so a chunk alias bound to its session does not leak
  * across sessions. Later occurrences of an already-credited canonical
  * identity come back as `duplicate` (AE5: aliases earn credit once).
+ * `rank` is ONE-based, matching IR metric conventions: reciprocal rank and
+ * nDCG discounts consume it directly without an off-by-one adjustment.
  */
 export function resolveRankedLocators(
     ranked: readonly string[],
@@ -120,7 +122,8 @@ export function resolveRankedLocators(
     index: AliasIndex,
 ): ResolvedRankedResult[] {
     const seen = new Set<string>();
-    return ranked.map((raw, rank) => {
+    return ranked.map((raw, position) => {
+        const rank = position + 1;
         // Production spellings go through the frozen production parser;
         // benchmark-only dialect spellings fall back to the dialect table.
         const parsed = parsePhysicalResultLocator(raw);

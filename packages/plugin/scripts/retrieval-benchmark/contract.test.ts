@@ -64,6 +64,17 @@ describe("parseCorpus", () => {
         expect(diagnosticsOf(() => parseCorpus(oversized))).toContain(
             "corpus.queries[0].queryText: not-executable",
         );
+        // Markup the live automatic extractor strips: the approved text and
+        // the production query would differ even inside every bound.
+        const markup = corpusJson();
+        const markupQuery = (markup.queries as Record<string, unknown>[])[0];
+        markupQuery.mode = "automatic";
+        markupQuery.sourceFilters = ["git_commit", "memory", "message"];
+        markupQuery.queryText =
+            "<system-reminder>private directive</system-reminder> find retry policy";
+        expect(diagnosticsOf(() => parseCorpus(markup))).toContain(
+            "corpus.queries[0].queryText: not-executable",
+        );
         // Over-bounds automatic query: production silently truncates, which
         // would replay a different query than the judged one.
         const truncated = corpusJson();
@@ -380,6 +391,19 @@ describe("validateRelease", () => {
         document.aliases[0].locator = "42";
         document.aliases[0].namespace = "claim";
         expect(diagnosticsOf(() => validateRelease(corpus, judgments))).toContain(
+            "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+        );
+        // Canonical decimal only: production interpolates numeric ids, so a
+        // leading-zero spelling can never byte-match an emitted locator.
+        const zeroRelease = makeValidRelease();
+        const zeroDoc = zeroRelease.corpus.documents.find(
+            (d) => d.id === "d-exact-symbol-path-dev",
+        );
+        if (!zeroDoc) throw new Error("fixture document missing");
+        zeroDoc.aliases[0].locator = "042";
+        expect(
+            diagnosticsOf(() => validateRelease(zeroRelease.corpus, zeroRelease.judgments)),
+        ).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
         // Compartments, primers, and notes carry numeric production ids too.
