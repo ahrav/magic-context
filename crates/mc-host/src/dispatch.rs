@@ -538,7 +538,6 @@ pub async fn dispatch_request<H: McHostHandler>(
     let gen_task = Arc::clone(gen);
     let outer = shared.spawn_tracked(async move {
         let _pending_permit = pending_permit;
-        let _task_permit = task_permit;
         if start_rx.await.is_err() {
             remove_pending(&gen_task, key);
             return;
@@ -577,14 +576,23 @@ pub async fn dispatch_request<H: McHostHandler>(
         };
         let ctx = RequestCtx {
             route,
-            body,
+            // The charge travels inside the body: a handler that moves it
+            // into a background task keeps the ingress accounting with it.
+            body: crate::handler::InputBuffer {
+                body,
+                _charge: body_charge,
+            },
             binary,
             cancel: cancel.clone(),
             stream: sink,
         };
         let handler = Arc::clone(&shared_task.handler);
         let inner = shared_task.spawn_tracked(async move {
-            let _body_charge = body_charge;
+            // The task permit lives in the callback task, not the settling
+            // outer task: capacity frees when the handler finishes, so a
+            // slow client blocking terminal emission cannot occupy
+            // max_handler_tasks with already-finished handlers.
+            let _task_permit = task_permit;
             // Construct under the sync guard, poll under the async guard:
             // a panic in the callback's synchronous prologue must reach the
             // redacting hook too.

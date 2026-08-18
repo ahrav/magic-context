@@ -69,7 +69,7 @@ impl std::fmt::Debug for RouteIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum BindOutcome {
     Accept,
     /// The route is never published; the client receives this as the terminal
@@ -78,6 +78,21 @@ pub enum BindOutcome {
         code: String,
         message: String,
     },
+}
+
+impl std::fmt::Debug for BindOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Rejection code and message are handler-controlled and can carry
+        // identity data; diagnostics get lengths only (protocol V24).
+        match self {
+            Self::Accept => f.write_str("Accept"),
+            Self::Reject { code, message } => f
+                .debug_struct("Reject")
+                .field("code_len", &code.len())
+                .field("message_len", &message.len())
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +164,45 @@ impl std::fmt::Debug for RequestOutcome {
                 .finish(),
             Self::Streamed => f.write_str("Streamed"),
         }
+    }
+}
+
+/// Request body with its resident-byte charge attached: moving the bytes
+/// anywhere moves the charge with them, so handler code that retains the
+/// body past the callback cannot separate it from its ingress accounting.
+pub struct InputBuffer {
+    pub(crate) body: Vec<u8>,
+    pub(crate) _charge: crate::wire::ByteCharge,
+}
+
+impl InputBuffer {
+    pub fn len(&self) -> usize {
+        self.body.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.body.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl std::ops::Deref for InputBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+impl std::fmt::Debug for InputBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Application data stays out of diagnostics (protocol V24).
+        f.debug_struct("InputBuffer")
+            .field("len", &self.body.len())
+            .finish()
     }
 }
 
@@ -247,8 +301,9 @@ impl io::Write for OutputBuffer {
 /// ```
 pub struct RequestCtx {
     pub route: RouteHandle,
-    /// Opaque request body. Binary or JSON per `binary`.
-    pub body: Vec<u8>,
+    /// Opaque request body. Binary or JSON per `binary`. Carries its
+    /// resident-byte charge, so retaining it keeps its ingress accounting.
+    pub body: InputBuffer,
     pub binary: bool,
     pub(crate) cancel: CancellationToken,
     pub(crate) stream: crate::dispatch::StreamSink,

@@ -403,10 +403,20 @@ pub struct WriterHandle {
     tx: mpsc::Sender<OutboundFrame>,
     retired: CancellationToken,
     generation: CancellationToken,
+    discard: CancellationToken,
     admission_timeout: Duration,
 }
 
 impl WriterHandle {
+    /// Retires the writer AND drops every queued frame. Peer-initiated and
+    /// error retirement must close silently (protocol §6.3): cancelling
+    /// producers stops new frames, but responses already queued would still
+    /// flush to the peer without this. Graceful host shutdown never calls
+    /// it — drain terminals and Goodbye must flush.
+    pub fn discard(&self) {
+        self.discard.cancel();
+    }
+
     /// Queues one encoded frame. Waits for queue capacity, bounded by writer
     /// retirement; `Err` means the generation can no longer emit frames.
     pub async fn send(&self, frame: OutboundFrame) -> Result<(), WriterGone> {
@@ -496,22 +506,38 @@ where
 {
     let (tx, mut rx) = mpsc::channel::<OutboundFrame>(queue_frames);
     let retired = CancellationToken::new();
+    let discard = CancellationToken::new();
     let handle = WriterHandle {
         tx,
         retired: retired.clone(),
         generation: generation.clone(),
+        discard: discard.clone(),
         admission_timeout: write_deadline,
     };
     let task = async move {
         let mut stream = stream;
-        while let Some(frame) = rx.recv().await {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                () = discard.cancelled() => break,
+                frame = rx.recv() => match frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
             let OutboundFrame {
                 bytes,
                 charge,
                 written,
             } = frame;
-            let result = tokio::time::timeout(write_deadline, stream.write_all(&bytes)).await;
-            if !matches!(result, Ok(Ok(()))) {
+            let result = tokio::select! {
+                biased;
+                () = discard.cancelled() => None,
+                result = tokio::time::timeout(write_deadline, stream.write_all(&bytes)) => {
+                    Some(result)
+                }
+            };
+            if !matches!(result, Some(Ok(Ok(())))) {
                 retired.cancel();
                 generation.cancel();
                 break;
@@ -522,6 +548,7 @@ where
             drop(bytes);
             drop(charge);
         }
+        // Dropping `rx` here frees any still-queued frames and their charges.
         retired.cancel();
         let _ = stream.shutdown().await;
     };
