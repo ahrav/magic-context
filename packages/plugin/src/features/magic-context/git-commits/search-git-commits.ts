@@ -13,6 +13,7 @@ import { log } from "../../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
 import { cosineSimilarity } from "../memory/cosine-similarity";
 import { sanitizeFtsQuery } from "../memory/storage-memory-fts";
+import { MAX_LANE_CANDIDATES } from "../search-bounds";
 import { loadProjectCommitEmbeddings } from "./storage-git-commit-embeddings";
 import type { StoredGitCommit } from "./storage-git-commits";
 
@@ -174,7 +175,10 @@ export function searchGitCommitsSync(
         ftsWeight: options.ftsWeight ?? 0.3,
         singleSourcePenalty: options.singleSourcePenalty ?? 0.8,
     };
-    const fetchLimit = Math.max(options.limit * 3, 30);
+    // R37: the requested limit is clamped to the lane ceiling so no caller can
+    // widen the selected output past the shared candidate bound.
+    const limit = Math.min(options.limit, MAX_LANE_CANDIDATES);
+    const fetchLimit = Math.min(Math.max(limit * 3, 30), MAX_LANE_CANDIDATES);
 
     // Selection and hydration read one snapshot, so a concurrent indexer cannot
     // make the hydrated rows disagree with the ranked candidates.
@@ -230,11 +234,25 @@ export function searchGitCommitsSync(
         // ---- Semantic pass ----------------------------------------------
         if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
             const embeddings = loadProjectCommitEmbeddings(db, projectPath, options.queryModelId);
+            // Brute-force scoring must visit every cached vector, but only the
+            // strongest fetchLimit similarities may join the candidate pool so
+            // fusion, scoring, and the final sort are bounded by the lane cap
+            // rather than the commit corpus. Newer commits win similarity ties,
+            // matching the final-rank tie-break below.
+            const semanticHits: Array<{ sha: string; committedAtMs: number; similarity: number }> =
+                [];
             for (const [sha, entry] of embeddings.entries()) {
                 const similarity = clamp01(cosineSimilarity(options.queryEmbedding, entry.vector));
                 if (similarity <= 0) continue;
-                const candidate = addCandidate(sha, entry.committedAtMs);
-                candidate.semanticScore = similarity;
+                semanticHits.push({ sha, committedAtMs: entry.committedAtMs, similarity });
+            }
+            semanticHits.sort(
+                (left, right) =>
+                    right.similarity - left.similarity || right.committedAtMs - left.committedAtMs,
+            );
+            for (const hit of semanticHits.slice(0, fetchLimit)) {
+                const candidate = addCandidate(hit.sha, hit.committedAtMs);
+                candidate.semanticScore = hit.similarity;
             }
         }
 
@@ -252,7 +270,7 @@ export function searchGitCommitsSync(
             }
             return left.candidate.ordinal - right.candidate.ordinal;
         });
-        const selected = scored.slice(0, options.limit);
+        const selected = scored.slice(0, limit);
         if (selected.length === 0) return [];
 
         // ---- Hydrate only the winners -----------------------------------

@@ -42,6 +42,8 @@ function looksLikeSha(token: string): boolean {
 /**
  * Pull literal probes from a query, most-specific shapes first, deduplicated
  * (case-insensitive) and capped. Returns [] for plain natural-language text.
+ * Extraction stops when the MAX_PROBES prioritized slots are full — later
+ * shapes are never scanned once the cap is reached.
  */
 export function extractLiteralProbes(query: string): string[] {
     const trimmed = query.trim();
@@ -60,20 +62,28 @@ export function extractLiteralProbes(query: string): string[] {
         ordered.push(probe);
     };
 
+    const full = (): boolean => ordered.length >= MAX_PROBES;
+
     // Order matters: quoted spans and slash commands are the most intentional
     // literal signals, so they get the earliest (highest-priority) probe slots
-    // before the cap truncates.
-    for (const m of trimmed.matchAll(QUOTED_RE)) add(m[1]);
-    for (const m of trimmed.matchAll(SLASH_COMMAND_RE)) add(m[0]);
-    for (const m of trimmed.matchAll(ERROR_CODE_RE)) add(m[0]);
-    for (const m of trimmed.matchAll(DOTTED_RE)) add(m[0]);
-    for (const m of trimmed.matchAll(KEBAB_SNAKE_RE)) add(m[0]);
-    for (const m of trimmed.matchAll(CAMEL_RE)) add(m[0]);
-    for (const m of trimmed.matchAll(SHA_RE)) {
-        if (looksLikeSha(m[0])) add(m[0]);
+    // before the cap stops extraction.
+    const shapes: Array<[RegExp, (m: RegExpMatchArray) => string | undefined]> = [
+        [QUOTED_RE, (m) => m[1]],
+        [SLASH_COMMAND_RE, (m) => m[0]],
+        [ERROR_CODE_RE, (m) => m[0]],
+        [DOTTED_RE, (m) => m[0]],
+        [KEBAB_SNAKE_RE, (m) => m[0]],
+        [CAMEL_RE, (m) => m[0]],
+        [SHA_RE, (m) => (looksLikeSha(m[0]) ? m[0] : undefined)],
+    ];
+    for (const [pattern, pick] of shapes) {
+        for (const m of trimmed.matchAll(pattern)) {
+            if (full()) return ordered;
+            add(pick(m));
+        }
     }
 
-    return ordered.slice(0, MAX_PROBES);
+    return ordered;
 }
 
 /** True when a probe appears verbatim (case-insensitive) in the text. Used to

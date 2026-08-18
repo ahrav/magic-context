@@ -14,4 +14,3 @@ Picking sources:
 - "did we discuss this earlier" → ["message"]
 - "did we decide something about this / leave a follow-up" → ["note"]
 - "what's our convention / rule for X" → ["memory"]`;
-export const DEFAULT_CTX_SEARCH_LIMIT = 10;

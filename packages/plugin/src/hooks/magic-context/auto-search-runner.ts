@@ -36,6 +36,7 @@ import {
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { buildAutoSearchHint } from "./auto-search-hint";
+import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
@@ -129,51 +130,6 @@ function hasStackedAugmentation(rawText: string): boolean {
     );
 }
 
-/**
- * Depth-aware stripper for tags that can legitimately nest. The system-reminder
- * tag is the canonical example: OpenCode and magic-context both wrap content
- * in <system-reminder>…</system-reminder>, and when the inner content itself
- * contains a system reminder (e.g. background-task notifications cited inside
- * a parent reminder), a non-greedy regex matches from the outer open to the
- * FIRST inner close, leaving the outer close tag and any text between the
- * inner close and outer close behind.
- *
- * The non-greedy regex bug is observable in production embedding logs: the
- * leaked tail "Please address this message and continue with your tasks.
- * </system-reminder>" reaches the embedding endpoint as user-typed text.
- *
- * This parser walks the string once, tracking open/close depth. Anything
- * inside ANY level of system-reminder is dropped. Orphan open/close tags
- * (malformed input) are also dropped. Only text that lies entirely outside
- * every system-reminder block is kept.
- */
-function stripNestedSystemReminders(text: string): string {
-    const OPEN = "<system-reminder>";
-    const CLOSE = "</system-reminder>";
-    let result = "";
-    let depth = 0;
-    let i = 0;
-    while (i < text.length) {
-        if (text.startsWith(OPEN, i)) {
-            depth += 1;
-            i += OPEN.length;
-        } else if (text.startsWith(CLOSE, i)) {
-            // Orphan close tag (depth already 0) is dropped silently — we
-            // don't want a leaked closing tag from a malformed/cut input
-            // to bleed into the embedded text.
-            if (depth > 0) depth -= 1;
-            i += CLOSE.length;
-        } else if (depth === 0) {
-            result += text[i];
-            i += 1;
-        } else {
-            // Inside a system-reminder — skip the character.
-            i += 1;
-        }
-    }
-    return result;
-}
-
 function extractUserPromptText(message: MessageLike): string {
     // Strip all plugin-owned injections AND any other XML/HTML markup so the
     // embedded prompt is just what the user actually typed. Without this:
@@ -187,36 +143,7 @@ function extractUserPromptText(message: MessageLike): string {
     //  - Specific allowlists missed real cases: pasted code with `<Component>`,
     //    quoted XML from another tool's output, ALFONSO/OMO markers we hadn't
     //    enumerated yet, and so on. A generic strip catches all of them.
-    //
-    // Order matters:
-    //  1. system-reminders use a depth-aware parser (above) because they
-    //     legitimately nest. Strip them first so nested reminders don't leave
-    //     orphan close tags for the generic stripper to deal with.
-    //  2. HTML comments next — they can wrap arbitrary content including angle
-    //     brackets, so they must go before generic tag stripping.
-    //  3. Generic tag strip — `<...>` for both single tags and the open/close
-    //     of pair tags. Content between paired tags is preserved as text;
-    //     that's intentional: a user pasting `<thing>important data</thing>`
-    //     still wants "important data" in their embedding.
-    //  4. Tag-prefix cleanup last — `§NNN§ ` is plain text, not markup.
-    return (
-        stripNestedSystemReminders(collectUserPromptParts(message))
-            // (2) HTML comments — covers temporal markers (<!-- +5m -->), OMO
-            // and ALFONSO internal initiators, and any other commented-out
-            // content. `[\s\S]*?` matches across newlines.
-            .replace(/<!--[\s\S]*?-->/g, "")
-            // (3) Generic XML/HTML tags — opening, closing, and self-closing.
-            // Matches `<...>` where `...` does not start with `!` (already
-            // handled comments) and contains no embedded `<` (which would
-            // mean a malformed/unmatched tag we should leave for visibility).
-            .replace(/<\/?[a-zA-Z][^<>]*>/g, "")
-            // (4) Magic Context tag prefix: "§123§ " at any position.
-            .replace(/§\d+§\s*/g, "")
-            // Collapse whitespace runs that the strippings may leave behind.
-            .replace(/[ \t]+\n/g, "\n")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim()
-    );
+    return extractBoundedAutoSearchQuery(collectUserPromptParts(message));
 }
 
 function findLatestMeaningfulUserMessage(messages: MessageLike[]): MessageLike | null {

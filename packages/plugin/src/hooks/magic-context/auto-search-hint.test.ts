@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
+import {
+    MAX_AUTO_HINT_TOKENS,
+    MAX_RENDER_FIELD_BYTES,
+} from "../../features/magic-context/search-bounds";
+import { estimateTokens } from "../../shared/token-estimator";
 import { buildAutoSearchHint } from "./auto-search-hint";
 
 function memory(content: string, score = 0.85, id = 1): UnifiedSearchResult {
@@ -78,5 +83,50 @@ describe("buildAutoSearchHint", () => {
         expect(single).toContain("1 related fragment");
         const many = buildAutoSearchHint([memory("one"), memory("two")]);
         expect(many).toContain("2 related fragments");
+    });
+
+    it("keeps a fitting prefix when the full fragment set overflows the budget", () => {
+        const noisy = (seed: number) =>
+            Array.from({ length: 900 }, (_, index) =>
+                ((seed * 7919 + index * 2654435761) % 36).toString(36),
+            ).join("");
+        const hint = buildAutoSearchHint(
+            [memory(noisy(1), 0.9, 1), memory(noisy(2), 0.9, 2), memory(noisy(3), 0.9, 3)],
+            { fragmentCharCap: 220 },
+        );
+        // The packer must return a hint when a prefix of cap-truncated
+        // fragments fits the budget, rather than dropping the hint entirely.
+        expect(hint).not.toBeNull();
+        expect(estimateTokens(hint ?? "")).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
+        expect(hint?.startsWith("<ctx-search-hint>")).toBe(true);
+        expect(hint?.endsWith("</ctx-search-hint>")).toBe(true);
+        expect(hint).toContain("If the fragments above seem relevant");
+        const bullets = (hint ?? "").split("\n").filter((line) => line.startsWith("- "));
+        expect(bullets.length).toBeGreaterThanOrEqual(1);
+        expect(bullets.length).toBeLessThan(3);
+        for (const bullet of bullets) {
+            // A kept fragment carries its full cap-truncated shape.
+            expect(bullet.length).toBeGreaterThan(180);
+        }
+    });
+
+    it("bounds oversized dynamic fields before compression", () => {
+        const oversized = "word ".repeat(10_000);
+        const hint = buildAutoSearchHint([
+            {
+                source: "compartment",
+                content: "preview",
+                score: 0.9,
+                compartmentId: 1,
+                sessionId: "s1",
+                title: oversized,
+                startOrdinal: 1,
+                endOrdinal: 2,
+                matchType: "semantic",
+            },
+        ]);
+        expect(hint).not.toBeNull();
+        const bullet = (hint ?? "").split("\n").find((line) => line.startsWith("- "));
+        expect(Buffer.byteLength(bullet ?? "", "utf8")).toBeLessThanOrEqual(MAX_RENDER_FIELD_BYTES);
     });
 });
