@@ -495,6 +495,11 @@ async function getSemanticScores(args: {
     queryEmbedding: Float32Array | null;
     queryModelId?: string | null;
     workspace?: SearchWorkspaceContext;
+    /** Memories already rendered in <session-history>. They are excluded
+     *  BEFORE scoring and the lane ceiling: merge drops them anyway, so
+     *  letting them occupy pruned lane slots would evict eligible
+     *  lower-scored matches from the bounded lane entirely. */
+    visibleMemoryIds?: Set<number> | null;
 }): Promise<Map<number, number>> {
     const semanticScores = new Map<number, number>();
 
@@ -517,6 +522,7 @@ async function getSemanticScores(args: {
         });
 
         for (const memory of args.memories) {
+            if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = embeddings.get(memory.id);
             if (!memoryEmbedding) {
                 continue;
@@ -561,6 +567,7 @@ async function getSemanticScores(args: {
         if (memberMemories.length === 0) continue;
         const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
         for (const memory of memberMemories) {
+            if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = cachedEmbeddings.get(memory.id);
             if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
             const score = normalizeCosineScore(
@@ -751,6 +758,7 @@ async function searchMemories(args: {
         queryEmbedding: args.queryEmbedding,
         queryModelId: args.queryModelId,
         workspace: args.workspace,
+        visibleMemoryIds: args.visibleMemoryIds,
     });
 
     return mergeMemoryResults({

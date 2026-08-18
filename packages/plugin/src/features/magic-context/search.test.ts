@@ -34,7 +34,7 @@ import {
     type UnifiedSearchResult,
     unifiedSearch,
 } from "./search";
-import { QueryBoundsError } from "./search-bounds";
+import { MAX_LANE_CANDIDATES, QueryBoundsError } from "./search-bounds";
 import { countingDatabase } from "./sql-counters";
 import { initializeDatabase } from "./storage-db";
 import {
@@ -1066,6 +1066,54 @@ describe("unifiedSearch", () => {
         expect(memoryResults).toHaveLength(1);
         expect(memoryResults[0]?.memoryId).toBe(memory.id);
         expect(memoryResults[0]?.matchType).toBe("semantic");
+    });
+
+    it("excludes visible memories before the semantic lane ceiling", async () => {
+        // Visible memories are dropped at merge, so letting them occupy the
+        // pruned lane slots would evict every eligible lower-id match: with
+        // the ceiling filled by visible ids, nothing could be returned.
+        const snapshot = registerEmbeddingProject(db, "/repo/lane-visible");
+        const visibleIds = new Set<number>();
+        let survivor: number | undefined;
+        for (let index = 0; index < MAX_LANE_CANDIDATES + 10; index += 1) {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/lane-visible",
+                category: "ARCHITECTURE_DECISIONS",
+                content: `semantic corpus entry ${index}`,
+            });
+            saveEmbedding(db, memory.id, new Float32Array([0, 1]), snapshot.modelId);
+            if (index < MAX_LANE_CANDIDATES) {
+                visibleIds.add(memory.id);
+            } else {
+                survivor ??= memory.id;
+            }
+        }
+        queryEmbedding = new Float32Array([0, 1]);
+
+        const results = await unifiedSearch(
+            db,
+            "ses-lane-visible",
+            "/repo/lane-visible",
+            "vector-only query",
+            {
+                limit: 5,
+                memoryEnabled: true,
+                embeddingEnabled: true,
+                readMessages,
+                embedQuery,
+                isEmbeddingRuntimeEnabled,
+                visibleMemoryIds: visibleIds,
+                sources: ["memory"],
+            },
+        );
+
+        const ids = results
+            .filter((result) => result.source === "memory")
+            .map((result) => (result as { memoryId: number }).memoryId);
+        expect(ids).toContain(survivor);
+        for (const id of ids) {
+            expect(visibleIds.has(id)).toBe(false);
+        }
     });
 
     /**

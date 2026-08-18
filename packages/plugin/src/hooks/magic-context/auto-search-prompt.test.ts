@@ -179,4 +179,11 @@ describe("extractBoundedAutoSearchQuery", () => {
         const raw = `<ctx-search-auto>x</ctx-search-auto> question ${"🎉".repeat(9000)}`;
         expect(extractBoundedAutoSearchQuery(raw)).toBe(extractBoundedAutoSearchQuery(raw));
     });
+
+    it("does not let line markers consume the byte budget or split at the cap", () => {
+        // 4000 markers exceed MAX_QUERY_BYTES on their own; they must be
+        // skipped while streaming, not left for the post-budget cleanup.
+        const raw = `${"§123§".repeat(4_000)} real searchable question`;
+        expect(extractBoundedAutoSearchQuery(raw)).toBe("real searchable question");
+    });
 });

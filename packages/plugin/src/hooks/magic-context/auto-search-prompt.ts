@@ -174,6 +174,18 @@ export function collectStrippedPromptPrefix(raw: string): string {
                 continue;
             }
         }
+        if (char === "§") {
+            // `§N§` line markers are plugin-injected and unconditionally
+            // removed by the cleanup pass; skipping them while streaming keeps
+            // them out of the byte budget (a marker-heavy prefix would
+            // otherwise exhaust it) and stops the cap from splitting a marker.
+            let cursor = i + 1;
+            while (raw[cursor] >= "0" && raw[cursor] <= "9") cursor += 1;
+            if (cursor > i + 1 && raw[cursor] === "§") {
+                i = cursor + 1;
+                continue;
+            }
+        }
         if (dropStack.length > 0) {
             i += 1;
             continue;
