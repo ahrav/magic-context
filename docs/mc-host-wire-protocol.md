@@ -318,7 +318,7 @@ The only current successful target is linked module ID `magic-context` with a ro
 
 This exclusion has one known in-repo casualty: `RealSessionResolver` (`crates/mc-module/src/session_resolver.rs`), constructed whenever `McHandler` receives a connection file, unconditionally opens a `management_surface` route to module `thalamus`, and the linked manifest consumes that service. Against a conforming direct host that `route.open` receives a terminal error (`target_unavailable` for the unsupported `management_surface` kind), so stateful facade calls that resolve sessions fail at route-open. This contract deliberately does not add a thalamus-compatible route; `magic-context-c50.4` owns replacing or disabling that resolver path (for example, a host-served session-resolve equivalent or the existing `MissingSessionResolver` fallback) before mc-module runs against this profile.
 
-The Synapse embedding lane has the same shape: when `embedding.provider` is `synapse`, `embedding-synapse.ts` opens a `management_surface` route to module `synapse` for every operation. Against this profile that route receives terminal `target_unavailable`, so the discovery probe fails over to the configured fallback embedding provider. That fail-over is the intended interim behavior, not silent breakage: `magic-context-c50.6` owns porting the synapse embedding service (`embed.batch`, `models.list`) to the Rust host, and until it lands the configured Synapse lane is unavailable against this host by design.
+The Synapse embedding lane has the same shape: when `embedding.provider` is `synapse`, `embedding-synapse.ts` opens a `management_surface` route to module `synapse` for every operation. Against this profile that route receives terminal `target_unavailable`, so the discovery probe fails over to the configured fallback embedding provider. That fail-over is the intended interim behavior, not silent breakage: `magic-context-c50.6` owns porting the synapse embedding service — all four operations the client calls: `embed.batch`, `embed.query` (single-vector requests), `embed.result` (asynchronous-job polling), and `models.list` — to the Rust host, and until it lands the configured Synapse lane is unavailable against this host by design.
 
 ### 7.3 `catalog.list`
 
@@ -430,9 +430,9 @@ Local close racing `route.open` wins. A late successful bind MUST NOT enter clie
 
 Each sender allocates correlations monotonically from 1 within a connection generation. The two directions are independent namespaces: a host `Ping` correlation MAY be numerically equal to a pending consumer correlation on the same connection, and neither affects the other. Matching is direction-scoped by frame type — `Response`, `Error`, `StreamData`, and `StreamEnd` settle only consumer-originated requests; `Pong` settles only host-originated `Ping`. The no-reuse rule applies within one sender's namespace. A correlation MUST NOT be reused, even after terminal completion. `u64::MAX` may identify one final request; before another request, sender MUST retire the generation and reconnect. Published `HistorianProducer` currently saturates at `u64::MAX`; compatibility work in `magic-context-c50.4` MUST replace saturation with checked exhaustion and generation retirement.
 
-Host pending state is keyed by full request identity. For ingress, a routed `Request` to an absent or stale route gets terminal `unknown_channel` and never reaches handler; stale or unknown `Cancel`/`Goodbye` is an idempotent no-op. For client ingress, unmatched or stale response/stream frames are dropped with redacted rate-limited diagnostics. First terminal wins; duplicate or late terminals are dropped. No frame from an old generation, wrong channel/epoch, unknown correlation, or terminal correlation may affect current work.
+Host pending state is keyed by full request identity. Sender-side no-reuse alone cannot stop a buggy client: a reused correlation on a different route keys a distinct pending entry and would dispatch a mutating handler operation twice. The host therefore enforces the monotonic allocation rule on ingress with a per-generation watermark: it MUST track the highest consumer `Request` correlation seen on the generation and treat any consumer `Request` (control or routed) whose correlation is not strictly greater than that watermark as a protocol violation that closes the generation before any dispatch. One `u64` per generation makes the check exact and bounded; it also obligates the sender to write `Request` frames in allocation order. `Cancel`, `Pong`, and `Goodbye` reference existing identities and are exempt. For ingress, a routed `Request` to an absent or stale route gets terminal `unknown_channel` and never reaches handler; stale or unknown `Cancel`/`Goodbye` is an idempotent no-op. For client ingress, unmatched or stale response/stream frames are dropped with redacted rate-limited diagnostics. First terminal wins; duplicate or late terminals are dropped. No frame from an old generation, wrong channel/epoch, unknown correlation, or terminal correlation may affect current work.
 
-Implementations MUST use finite limits for live connections, routes, pending correlations, handler tasks, queued requests, and aggregate buffered bodies. Limit exhaustion before dispatch returns terminal `target_unavailable` or `server_busy` for that correlation; it MUST NOT silently queue without a deadline.
+Implementations MUST use finite limits for live connections, routes, pending correlations, handler tasks, queued requests, and aggregate buffered bodies. Limit exhaustion before dispatch of a routed or control request returns terminal `server_busy` for that correlation; `target_unavailable` is reserved for route admission — `route.open` failures such as channel exhaustion (Section 8.2) — so each code keeps exactly one recovery rule in Section 10.2. Rejection MUST NOT silently queue without a deadline.
 
 ## 9. Requests, streams, cancellation, and close
 
@@ -545,7 +545,7 @@ stateDiagram-v2
 
 Graceful host shutdown order:
 
-1. stop accepting connections and route opens;
+1. stop accepting connections and route opens, and freeze new routed-request dispatch: a complete, valid routed `Request` arriving after this point receives terminal `server_busy` (host proves no handler dispatch) instead of new handler work, so a busy client cannot starve the drain;
 2. while holding instance lock, daemon-ID-fenced remove own connection file;
 3. drain or cancel work within finite shutdown deadline, emitting terminal `Response`, `StreamEnd`, or `Error{code:"cancelled"}` frames while generations are still live;
 4. send best-effort connection Goodbye; receiving it retires the generation client-side (Section 6.2), so it MUST follow the drain, or drain-phase terminals would arrive on a retired generation and be dropped;
@@ -651,10 +651,11 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | V41 | Unsupported control op | One `unsupported_operation` terminal; connection remains usable; no handler callback |
 | V42 | Host sends structurally valid `Request` | Client closes generation without dispatching or responding |
 | V43 | Host `Ping` correlation numerically equals a pending consumer correlation | `Pong` settles only the Ping; consumer terminals settle only the consumer request; no cross-settlement |
+| V44 | Consumer `Request` reuses a pending, terminal, or lower-than-watermark correlation, on any route | Host closes the generation before dispatch; handler dispatch count for the duplicate stays zero |
 
 ### 14.1 Downstream fixture oracle
 
-Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V43 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
+Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V44 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
 
 ## 15. Consumer traceability
 
@@ -675,7 +676,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | --- | --- | --- |
 | R1 single normative owner | 1, 17 | AE1-AE13 |
 | R2 terms, authority, verified/private distinction | 1-3, 18 | AE1, AE4, AE7 |
-| R3 byte/JSON examples and scenario tables | 4-7, 13-14 | AE1-AE13, V1-V43 |
+| R3 byte/JSON examples and scenario tables | 4-7, 13-14 | AE1-AE13, V1-V44 |
 | R4 no executable fixtures/implementation | 1, 17 | AE1-AE13 |
 | R5 discovery schema/endpoints | 4.1 | AE1, AE7, V1-V4 |
 | R6 publication/cleanup/redaction | 4.2, 12 | AE7, AE13, V5-V7, V24 |
@@ -684,7 +685,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | R9 frame/control classification/catalog | 6.2, 7 | AE9, AE10, V17, V40-V42 |
 | R10 tagged control and opaque application bodies | 7, 9.1 | AE1, V16, V38, V41 |
 | R11 route/bind/direct lifecycle | 8.1-8.2 | AE3, AE8, AE11-AE13, V20, V27, V31-V36 |
-| R12 request identity/counters | 8.3 | AE5, AE7, AE11, V18-V22, V31-V32, V43 |
+| R12 request identity/counters | 8.3 | AE5, AE7, AE11, V18-V22, V31-V32, V43-V44 |
 | R13 terminal/cancel/close/health | 9 | AE8, AE9, AE12, AE13, V19, V25-V26, V33-V35, V38 |
 | R14 deadlines/outcomes | 10-11 | AE2, AE4-AE6, V23, V29-V30, V37 |
 | R15 reconnect/rotation/stale state | 12 | AE7, AE13, V7, V22 |
