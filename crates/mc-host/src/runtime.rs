@@ -425,9 +425,25 @@ fn spawn_health_task<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
                 () = tokio::time::sleep(shared.timing.health_interval) => {}
             }
             let handler = Arc::clone(&shared.handler);
-            let probe = shared.spawn_tracked(async move {
+            let deadline = shared.timing.lifecycle_callback_deadline;
+            let watchdog = Arc::clone(&shared);
+            // Abort-exempt and self-bounded like the other lifecycle
+            // callbacks: `abort_all` on the forced path must not turn an
+            // in-flight healthy probe into a spurious LifecycleFatal, and
+            // the internal deadline keeps the probe bounded even if this
+            // joining loop is aborted.
+            let probe = shared.spawn_lifecycle(async move {
                 let callback = crate::panic_boundary::redact_sync(|| handler.health());
-                crate::panic_boundary::redact(callback).await
+                match timeout(deadline, crate::panic_boundary::redact(callback)).await {
+                    Ok(report) => Some(report),
+                    Err(_) => {
+                        watchdog.fatal.trip(
+                            &watchdog.shutdown,
+                            "health callback deadline expired".to_owned(),
+                        );
+                        None
+                    }
+                }
             });
             // The report itself is informational; degraded storage must not
             // make transport unready (protocol §8.1, AE9).

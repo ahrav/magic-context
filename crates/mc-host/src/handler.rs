@@ -118,11 +118,22 @@ pub enum RequestOutcome {
 /// The host acquires the resident-byte charge before allocating this buffer.
 /// Its fixed maximum keeps later writes from growing beyond that reservation;
 /// the charge moves with the body into the connection writer.
-#[derive(Debug)]
 pub struct OutputBuffer {
     pub(crate) body: Vec<u8>,
     pub(crate) charge: crate::wire::ByteCharge,
     pub(crate) max_len: usize,
+}
+
+impl std::fmt::Debug for OutputBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Reserved output holds application data, which stays out of
+        // diagnostics (protocol V24) — mirror RequestCtx's body_len-only
+        // policy.
+        f.debug_struct("OutputBuffer")
+            .field("len", &self.body.len())
+            .field("max_len", &self.max_len)
+            .finish()
+    }
 }
 
 impl OutputBuffer {
