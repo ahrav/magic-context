@@ -252,7 +252,7 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
 /// releases when the guard drops at the end — after the handler.
 pub async fn run<H: McHostHandler>(
     handler: H,
-    config: HostConfig,
+    mut config: HostConfig,
     shutdown: CancellationToken,
 ) -> Result<(), HostError> {
     crate::panic_boundary::install();
@@ -304,7 +304,10 @@ pub async fn run<H: McHostHandler>(
     // keep running after the instance lock frees for a successor.
     {
         let handler = Arc::clone(&handler);
-        let init = config.init.clone();
+        // Taken, not cloned: the storage descriptor can be arbitrarily large
+        // and must not stay owned by `config` for the incarnation, outside
+        // every byte budget — the handler consumes the only copy.
+        let init = std::mem::take(&mut config.init);
         let mut init_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             let callback = crate::panic_boundary::redact_sync(|| handler.initialize(init));
             crate::panic_boundary::redact(callback).await

@@ -41,16 +41,16 @@ const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 /// One outstanding host Ping. `written` flips inside the writer task when
 /// the frame is fully on the socket: a Pong clears only a written probe, or
 /// a peer predicting the correlation sequence could pre-answer Pings it
-/// never received and defeat read-liveness detection. `answered` retains a
-/// Pong that raced the write-completion hook (the kernel write makes the
-/// Ping visible a beat before the hook runs); the hook reconciles it — the
-/// probe still clears only once the Ping was genuinely written, so a
-/// stalled writer still expires the peer.
+/// never received and defeat read-liveness detection. `answered_at` retains
+/// a Pong that raced the write-completion hook (bytes can reach the wire
+/// during `write_all`, before the hook runs); the hook reconciles it against
+/// the write START instant — an answer recorded before any byte existed is
+/// a pre-answer and is ignored, so the real Ping still demands a real Pong.
 pub struct PingProbe {
     pub flags: u8,
     pub sent: Instant,
     pub written: bool,
-    pub answered: bool,
+    pub answered_at: Option<Instant>,
 }
 
 pub struct PendingEntry {
@@ -180,12 +180,16 @@ pub async fn run_connection<H: McHostHandler>(
         // generation token (liveness invalidation, emission failure) is a
         // retirement, not a drain — fall through to the silent close.
         ReadExit::HostCancelled if !gen.token.is_cancelled() => {}
-        // Oversized-control drain failure: the queued rejection task (in
-        // `read_tasks`, awaited below) must still acquire budget and queue
-        // the authoritative terminal (protocol §7.1), so the token stays
-        // live until `close_generation` retires it; the writer then flushes
-        // the queue under its own stall deadline.
-        ReadExit::PeerKeepQueue => {}
+        // Oversized-control drain failure: wait for exactly the promised
+        // authoritative terminal to reach the socket (protocol §7.1) — the
+        // emission self-bounds via its admission and write deadlines, and a
+        // failed emission drops the sender — then retire silently like every
+        // other peer exit, discarding whatever else is queued.
+        ReadExit::PeerKeepQueue(terminal_written) => {
+            let _ = terminal_written.await;
+            gen.token.cancel();
+            gen.writer.discard();
+        }
         // Peer-initiated or error retirement closes silently — even while
         // the host is draining: cancelling the generation token makes queued
         // off-reader emissions fail closed, and discarding the writer drops
@@ -229,7 +233,11 @@ pub async fn run_connection<H: McHostHandler>(
 enum ReadExit {
     HostCancelled,
     Peer,
-    PeerKeepQueue,
+    /// An oversized-control drain failure whose early terminal is
+    /// authoritative for its correlation (protocol §7.1): the receiver fires
+    /// when exactly that frame is on the socket, letting the close fence the
+    /// one promised frame and then discard everything else.
+    PeerKeepQueue(tokio::sync::oneshot::Receiver<()>),
 }
 
 /// Serves validated frames until close. Returning retires the generation.
@@ -270,14 +278,24 @@ async fn read_loop<H: McHostHandler>(
                     return ReadExit::Peer;
                 }
                 watermark = header.corr;
-                crate::dispatch::emit_rejection(
-                    shared,
-                    gen,
-                    FrameId::control(header.corr),
-                    CODE_INVALID_CONTROL_REQUEST,
-                    "control body exceeds profile cap",
-                )
-                .await;
+                // Off-reader like the other rejections (contended egress
+                // must not block this reader from a queued Pong), but with a
+                // written-signal: if the body drain below fails, the close
+                // fences exactly this authoritative frame (protocol §7.1).
+                let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+                let shared_task = Arc::clone(shared);
+                let gen_task = Arc::clone(gen);
+                shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                    crate::dispatch::emit_authoritative_rejection(
+                        &shared_task,
+                        &gen_task,
+                        FrameId::control(header.corr),
+                        CODE_INVALID_CONTROL_REQUEST,
+                        "control body exceeds profile cap",
+                        terminal_tx,
+                    )
+                    .await;
+                }));
                 if drain_declared_body(&mut reader, header.len, deadline, &gen.read_cancel)
                     .await
                     .is_err()
@@ -286,7 +304,7 @@ async fn read_loop<H: McHostHandler>(
                     // correlation even when the declared body then fails
                     // (protocol §7.1): the close stays silent otherwise, but
                     // that one frame must survive to flush.
-                    return ReadExit::PeerKeepQueue;
+                    return ReadExit::PeerKeepQueue(terminal_rx);
                 }
             }
             ReadEvent::Frame(frame) => {
@@ -336,7 +354,7 @@ async fn read_loop<H: McHostHandler>(
                                     if probe.written {
                                         pings.remove(&header.corr);
                                     } else {
-                                        probe.answered = true;
+                                        probe.answered_at = Some(now);
                                     }
                                 }
                             }
@@ -617,7 +635,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
                 flags: flags.0,
                 sent: Instant::now(),
                 written: false,
-                answered: false,
+                answered_at: None,
             },
         );
         let bytes = crate::wire::encode_owned_frame(
@@ -633,16 +651,23 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         // async notification would leave a gap where a fast (or adversarial
         // pre-answering) Pong races the flag update.
         let gen_probe = Arc::clone(&gen);
-        let written_hook = Box::new(move || {
+        let written_hook = Box::new(move |write_started: Instant| {
             let mut pings = gen_probe.pings.lock().expect("pings lock");
             if let Some(probe) = pings.get_mut(&corr) {
-                if probe.answered {
-                    // The Pong raced the hook after the kernel write: the
-                    // Ping was genuinely written, so the answer counts.
-                    pings.remove(&corr);
-                } else {
-                    probe.sent = Instant::now();
-                    probe.written = true;
+                match probe.answered_at {
+                    // The Pong arrived while the Ping's bytes were reaching
+                    // the wire: a genuine answer that raced the hook.
+                    Some(answered_at) if answered_at >= write_started => {
+                        pings.remove(&corr);
+                    }
+                    // A Pong recorded before any byte existed is a
+                    // pre-answer for a Ping the peer never saw: ignore it
+                    // and demand a real answer to the now-written Ping.
+                    _ => {
+                        probe.answered_at = None;
+                        probe.sent = Instant::now();
+                        probe.written = true;
+                    }
                 }
             }
             let _ = written_tx.send(());

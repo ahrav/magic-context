@@ -289,6 +289,39 @@ pub async fn settle(
     }
     let (ty, flags, body) = match terminal {
         Terminal::Response { body, binary } => {
+            // Authoritative streamed-state check, under the same order lock
+            // that serializes stream emission: a context escaped into a
+            // background task can queue StreamData after the caller's
+            // outside-the-lock check, and a Response following StreamData is
+            // a forbidden sequence (protocol §8.3).
+            if settlement.has_streamed() {
+                drop(body);
+                let Ok((error_body, deadline)) = charged_error_body(
+                    budget,
+                    gen,
+                    CODE_INTERNAL_ERROR,
+                    "handler returned a unary response after streaming",
+                )
+                .await
+                else {
+                    gen.token.cancel();
+                    return true;
+                };
+                if emit_reserved_frame(
+                    gen,
+                    FrameType::Error,
+                    response_flags(false, true),
+                    FrameId::routed(route, corr),
+                    error_body,
+                    deadline,
+                )
+                .await
+                .is_err()
+                {
+                    gen.token.cancel();
+                }
+                return true;
+            }
             if emit_reserved_frame(
                 gen,
                 FrameType::Response,
@@ -443,6 +476,42 @@ pub async fn emit_rejection<H: McHostHandler>(
             emit_error_terminal(&shared.egress_budget, gen, id, code, message).await;
         }
     }
+}
+
+/// Queues one §7.1-authoritative rejection terminal and reports (via
+/// `written_tx`) when its bytes fully reach the socket, so the caller can
+/// fence an otherwise-silent close around exactly this frame. The sender
+/// drops unfired if the emission fails at any stage.
+pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    gen: &Arc<GenerationCore>,
+    id: FrameId,
+    code: &'static str,
+    message: &'static str,
+    written_tx: oneshot::Sender<()>,
+) {
+    let Ok((body, deadline)) = charged_error_body(&shared.egress_budget, gen, code, message).await
+    else {
+        return;
+    };
+    let (body, charge) = body.into_parts();
+    let Ok(bytes) = encode_owned_frame(FrameType::Error, response_flags(false, true), id, body)
+    else {
+        return;
+    };
+    let _ = gen
+        .writer
+        .send_before(
+            OutboundFrame {
+                bytes,
+                charge,
+                written: Some(Box::new(move |_write_started| {
+                    let _ = written_tx.send(());
+                })),
+            },
+            deadline,
+        )
+        .await;
 }
 
 /// Admits and dispatches one routed request frame (protocol §8.3, §9.1).
