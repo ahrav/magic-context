@@ -210,6 +210,12 @@ fn next_due_at_ms<Tz: TimeZone>(
     next_occurrence(&cron, after_ms, max_search_ms, tz)
 }
 
+/// Whether a wire-submitted cron expression parses under this contract's
+/// 5-field grammar.
+pub fn is_valid_smart_note_cron(expression: &str) -> bool {
+    parse_cron(expression).is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Schedule (port of smart-notes/schedule.ts)
 // ---------------------------------------------------------------------------
@@ -749,6 +755,40 @@ pub fn get_fallback_smart_notes(
         .collect();
     selected.truncate(limit.max(1));
     selected
+}
+
+/// Evaluator polls prioritize due checks over compilation, liveness, and
+/// fallback.
+pub fn select_next_smart_note_evaluation(
+    notes: &[SmartNoteSelectionSnapshot],
+    now: i64,
+    retina_handoff: bool,
+) -> Option<(i64, String)> {
+    fn first(selected: &[&SmartNoteSelectionSnapshot], phase: &str) -> Option<(i64, String)> {
+        selected.first().map(|note| (note.id, phase.to_string()))
+    }
+    first(
+        &get_due_compiled_smart_note_checks(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
+        "due",
+    )
+    .or_else(|| {
+        first(
+            &get_smart_notes_needing_compilation(notes, now, MAX_COMPILE_PER_RUN, retina_handoff),
+            "compile",
+        )
+    })
+    .or_else(|| {
+        first(
+            &get_stale_compiled_smart_notes(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
+            "liveness",
+        )
+    })
+    .or_else(|| {
+        first(
+            &get_fallback_smart_notes(notes, MAX_FALLBACK_PER_RUN, retina_handoff),
+            "fallback",
+        )
+    })
 }
 
 #[cfg(test)]

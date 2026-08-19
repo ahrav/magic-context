@@ -14461,7 +14461,9 @@ impl McStore {
                     )));
                 }
                 tx.execute(
-                    "UPDATE mc_authority SET state = 'MODULE', generation = generation + 1
+                    "UPDATE mc_authority SET state = 'MODULE', generation = generation + 1,
+                            note_eval_protocol_epoch = CASE WHEN domain = 'notes' THEN 2
+                                ELSE note_eval_protocol_epoch END
                        WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
                     params![context_store_uuid, project, domain],
                 )?;
@@ -14522,11 +14524,20 @@ impl McStore {
                     )));
                 }
                 let next_state = if verified { "MODULE" } else { "TS" };
-                tx.execute(
+                let update_sql = if verified && domain == "notes" {
+                    "UPDATE mc_authority
+                        SET state = ?1, generation = generation + 1,
+                            checksum_expected = ?2, checksum_actual = ?3, checksum_ok = ?4,
+                            note_eval_protocol_epoch = 2
+                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7"
+                } else {
                     "UPDATE mc_authority
                         SET state = ?1, generation = generation + 1,
                             checksum_expected = ?2, checksum_actual = ?3, checksum_ok = ?4
-                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
+                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7"
+                };
+                tx.execute(
+                    update_sql,
                     params![
                         next_state,
                         checksum_expected,
@@ -17083,7 +17094,7 @@ impl McStore {
         evaluator_instance: &str,
         evaluator_slot: i64,
         now_ms: i64,
-        apply: impl FnOnce(&StoredNote) -> Result<NoteEvalReducedState, String>,
+        apply: impl FnOnce(&NoteEvalClaim, &StoredNote) -> Result<NoteEvalReducedState, String>,
     ) -> Result<NoteEvalCompleteOutcome, McStoreError> {
         if !note_eval_valid_id(completion_id) {
             return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
@@ -17169,7 +17180,7 @@ impl McStore {
             {
                 return stale(tx);
             }
-            let reduced = match apply(&note) {
+            let reduced = match apply(&row.claim, &note) {
                 Ok(reduced) => reduced,
                 Err(message) => {
                     let response = serde_json::json!({
@@ -25141,7 +25152,7 @@ mod tests {
                     "eval-a",
                     0,
                     expiry + 2,
-                    |note| Ok(eval_reduced(note, "ready", expiry + 2)),
+                    |_claim, note| Ok(eval_reduced(note, "ready", expiry + 2)),
                 )
                 .unwrap(),
             NoteEvalCompleteOutcome::Conflict { kind: "expired" }
@@ -25167,7 +25178,7 @@ mod tests {
                 "eval-a",
                 0,
                 50,
-                |note| Ok(eval_reduced(note, "pending", 50)),
+                |_claim, note| Ok(eval_reduced(note, "pending", 50)),
             )
             .unwrap()
         {
@@ -25192,7 +25203,7 @@ mod tests {
                     "eval-a",
                     0,
                     60,
-                    |_| panic!("a replayed completion must not run the reducer"),
+                    |_, _| panic!("a replayed completion must not run the reducer"),
                 )
                 .unwrap(),
             NoteEvalCompleteOutcome::Replayed {
@@ -25208,7 +25219,7 @@ mod tests {
                     "eval-a",
                     0,
                     70,
-                    |_| panic!("a conflicting completion must not run the reducer"),
+                    |_, _| panic!("a conflicting completion must not run the reducer"),
                 )
                 .unwrap(),
             NoteEvalCompleteOutcome::Conflict {
@@ -25226,7 +25237,7 @@ mod tests {
                 "eval-a",
                 0,
                 150,
-                |note| Ok(eval_reduced(note, "ready", 150)),
+                |_claim, note| Ok(eval_reduced(note, "ready", 150)),
             )
             .unwrap()
         {
@@ -25272,7 +25283,7 @@ mod tests {
                     "eval-a",
                     0,
                     30,
-                    |note| Ok(eval_reduced(note, "ready", 30)),
+                    |_claim, note| Ok(eval_reduced(note, "ready", 30)),
                 )
                 .unwrap(),
             NoteEvalCompleteOutcome::Conflict { kind: "stale" }
@@ -25301,7 +25312,7 @@ mod tests {
                     "eval-a",
                     0,
                     60,
-                    |note| Ok(eval_reduced(note, "ready", 60)),
+                    |_claim, note| Ok(eval_reduced(note, "ready", 60)),
                 )
                 .unwrap(),
             NoteEvalCompleteOutcome::Conflict { kind: "stale" }
@@ -25337,7 +25348,7 @@ mod tests {
                     "eval-a",
                     0,
                     30,
-                    |note| Ok(eval_reduced(note, "ready", 30)),
+                    |_claim, note| Ok(eval_reduced(note, "ready", 30)),
                 )
                 .unwrap(),
             NoteEvalCompleteOutcome::Conflict {
