@@ -977,7 +977,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // project identity, and discarding the second bridge would evaluate
         // its file-dependent conditions against the first checkout.
         const bridgeKeyId = moduleNoteEvaluationBridgeKey(bridgeProjectPath, bridgeProjectRoot);
-        if (getModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot)) {
+        const existingBridge = getModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot);
+        if (existingBridge) {
             // Another plugin instance already registered this exact bridge.
             // Record shared ownership (once per instance) so that instance's
             // disposal cannot tear down a bridge this one still routes
@@ -989,6 +990,13 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 );
                 if (retained) ownedBridgeProjects.add(retained);
             }
+            // The eager boot registration can run before authority preparation
+            // flips notes to MODULE and be rejected; preparation re-invokes
+            // this ensure, so retry the registration here instead of leaving
+            // conditioned writes refused until a timer drain recovers it.
+            void existingBridge.ensureRegistered?.().catch((error) => {
+                log(`[magic-context] evaluator registration retry failed: ${error}`);
+            });
             return;
         }
         // The module derives evaluator scope from the server-side route root,
@@ -1111,6 +1119,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         const bridgeKey = registerModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot, {
             sync: syncModuleNotes,
             available: () => worker.registered,
+            async ensureRegistered() {
+                if (!worker.registered) await worker.register();
+            },
             async drain(drainArgs) {
                 const wakePresent = (await wakePlaneStatus()) === "present";
                 const wakeReleased = workerPolicy.wakeOwned && !wakePresent;

@@ -134,7 +134,7 @@ describe("smart-note compiler output bounds", () => {
                 ),
             }),
         ).toThrow(/32 KiB/);
-        expect(() => normalizeCron("*".repeat(257))).toThrow(/256 characters/);
+        expect(() => normalizeCron("*".repeat(257))).toThrow(/256 bytes/);
     });
 });
 

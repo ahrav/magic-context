@@ -83,6 +83,8 @@ export interface ModuleNoteEvaluationBridge {
         maxFallbackPerRun?: number;
     }): Promise<DrainResult>;
     available(): boolean;
+    /** Retry a failed or premature evaluator registration; no-op when live. */
+    ensureRegistered?(): Promise<void>;
     dispose(): Promise<void>;
 }
 

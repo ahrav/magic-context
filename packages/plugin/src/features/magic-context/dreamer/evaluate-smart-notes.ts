@@ -112,11 +112,13 @@ export async function evaluateSmartNotes(
         // it: an expired lease would let the next scheduler tick launch an
         // overlapping billable drain.
         const leaseAbortController = new AbortController();
+        let moduleLeaseLost = false;
         const heartbeat = startLeaseHeartbeat(
             args.db,
             args.holderId,
             args.leaseKey,
             () => {
+                moduleLeaseLost = true;
                 leaseAbortController.abort(new Error("Dream lease lost during smart notes"));
                 log("[dreamer] smart notes: lease lost — aborting module drain");
                 args.onLeaseLost?.("smart notes module drain");
@@ -136,6 +138,12 @@ export async function evaluateSmartNotes(
         log(
             `[dreamer] smart notes: module drain claimed=${result.claimed} completed=${result.completed} surfaced=${result.surfaced}`,
         );
+        if (moduleLeaseLost) {
+            // The drain aborted mid-flight and a new lease holder may already
+            // be running; recording completion would advance the schedule for
+            // work this run did not finish.
+            throw new Error("Dream lease lost during module smart-note drain");
+        }
         if (!result.drained && result.claimed === 0) {
             // Registration failure or a transport error before any claim:
             // reporting success would advance the cron (nightly by default)

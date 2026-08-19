@@ -62,7 +62,8 @@ const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_MANIFEST_ENTRIES = 64;
 /** Wire limit mirrored from the module's NOTE_EVALUATOR_MAX_MANIFEST_BYTES. */
 const MAX_MANIFEST_BYTES = 32 * 1024;
-const MAX_CRON_CHARS = 256;
+/** Wire limit mirrored from the module's NOTE_EVALUATOR_MAX_CRON_BYTES. */
+const MAX_CRON_BYTES = 256;
 const MAX_COMPILER_ERROR_CHARS = 2 * 1024;
 
 export async function compileSmartNoteCheck(
@@ -359,8 +360,13 @@ function literalCalls(code: string, method: "readFile" | "httpGet"): string[] {
 }
 
 export function normalizeCron(cron: string): string {
-    if (cron.length > MAX_CRON_CHARS) throw new Error("check_cron exceeds 256 characters");
     const normalized = cron.trim() || "0 * * * *";
+    // The module enforces this limit in UTF-8 bytes on the wire artifact;
+    // measuring UTF-16 length here would accept a multibyte cron the module
+    // then rejects at completion, abandoning the claim without recording a
+    // compilation failure.
+    if (Buffer.byteLength(normalized, "utf8") > MAX_CRON_BYTES)
+        throw new Error("check_cron exceeds 256 bytes");
     const parsed = parseCron(normalized);
     if (!parsed.ok) throw new Error(`invalid check_cron: ${parsed.error}`);
     const next = nextOccurrence(parsed.cron, new Date(), undefined, SMART_NOTE_CHECK_CEILING_MS);
