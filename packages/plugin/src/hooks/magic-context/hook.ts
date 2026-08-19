@@ -18,7 +18,9 @@ import {
     ensureContextStoreUuid,
     getMirrorCursor,
     getModuleNoteEvaluationBridge,
+    moduleNoteEvaluationBridgeKey,
     registerModuleNoteEvaluationBridge,
+    retainModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
 import { confirmSmartNoteReadOnly } from "../../features/magic-context/dreamer/evaluate-smart-notes";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
@@ -960,10 +962,29 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // forever. Without a registration the live-evaluator gate fails closed
         // at write time instead.
         if (!dreamerRunnable) return;
+        // A disabled per-task schedule ("" = never due) disables evaluation the
+        // same way: the timer drain is unconditional once a bridge exists, so
+        // honoring the task disable means no registration — conditioned writes
+        // fail closed at write time, and no billable compile/fallback work runs.
+        if ((evaluatorTaskConfig?.schedule ?? "").trim() === "") return;
         // Keyed by identity AND root: two worktrees of one repository share a
         // project identity, and discarding the second bridge would evaluate
         // its file-dependent conditions against the first checkout.
-        if (getModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot)) return;
+        const bridgeKeyId = moduleNoteEvaluationBridgeKey(bridgeProjectPath, bridgeProjectRoot);
+        if (getModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot)) {
+            // Another plugin instance already registered this exact bridge.
+            // Record shared ownership (once per instance) so that instance's
+            // disposal cannot tear down a bridge this one still routes
+            // conditioned writes and drains through.
+            if (!ownedBridgeProjects.has(bridgeKeyId)) {
+                const retained = retainModuleNoteEvaluationBridge(
+                    bridgeProjectPath,
+                    bridgeProjectRoot,
+                );
+                if (retained) ownedBridgeProjects.add(retained);
+            }
+            return;
+        }
         // The module derives evaluator scope from the server-side route root,
         // and filesystem capabilities resolve against the checkout, so both
         // must use the prepared project's root — not the plugin launch

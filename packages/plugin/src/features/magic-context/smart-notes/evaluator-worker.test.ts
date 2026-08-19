@@ -161,6 +161,38 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         await w.dispose();
     });
 
+    test("a revision-fence conflict on one claim does not abort the drain", async () => {
+        let served = 0;
+        let completions = 0;
+        const { transport, calls } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                return served <= 2 ? claimResponse(served, "due") : { result: "no_work" };
+            }
+            if (method === "note.evaluation.complete") {
+                completions += 1;
+                // First claim fenced by a concurrent edit; second applies.
+                return completions === 1 ? { result: "stale" } : { result: "applied" };
+            }
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
+        expect(result).toEqual({
+            claimed: 2,
+            completed: 1,
+            abandoned: 1,
+            surfaced: 0,
+            drained: true,
+        });
+        // The fenced claim is already terminal server-side: no abandon call,
+        // and the drain moves on to the next note instead of breaking.
+        expect(calls.some((c) => c.method === "note.evaluation.abandon")).toBe(false);
+        expect(calls.filter((c) => c.method === "note.evaluation.next")).toHaveLength(3);
+        await w.dispose();
+    });
+
     test("a cancelled execution abandons the claim without a failure outcome", async () => {
         let served = 0;
         const { transport, calls } = stubTransport((method) => {

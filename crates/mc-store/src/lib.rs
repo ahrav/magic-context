@@ -4493,6 +4493,12 @@ pub const NOTE_EVAL_CLAIM_LEASE_MS: i64 = 2 * 60_000;
 pub const NOTE_EVAL_NO_WORK_RETENTION_MS: i64 = 10 * 60_000;
 /// Replay retention for a terminal claim result.
 pub const NOTE_EVAL_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60_000;
+/// How long a terminal claim keeps its `terminal_response` before redaction.
+/// The response exists only so a worker that lost the completion reply can
+/// replay it; that window is minutes, not days. Nulling it well before the
+/// row itself ages out keeps evaluator-supplied response text from being
+/// retained for the full terminal-retention window.
+pub const NOTE_EVAL_RESPONSE_REDACT_MS: i64 = 24 * 60 * 60_000;
 /// Per-project row cap for each evaluation ledger.
 pub const NOTE_EVAL_LEDGER_CAP: i64 = 10_000;
 /// Rows repaired per committed batch by the v51 compiled-artifact repair.
@@ -16828,8 +16834,10 @@ fn fence_active_note_claims_tx(
 
 /// Ledger garbage collection: expire overdue active claims, tombstone expired
 /// `no_work` decisions (`decision = ''` keeps replay identity), then null the
-/// response of terminal claims past their protection window. Tombstoned rows
-/// replay as `Expired`; they no longer count against either cap.
+/// response of terminal claims once their completion-replay window has passed
+/// (`NOTE_EVAL_RESPONSE_REDACT_MS`, well before row deletion at
+/// `NOTE_EVAL_TERMINAL_RETENTION_MS`). Tombstoned rows replay as `Expired`;
+/// they no longer count against either cap.
 fn collect_note_eval_ledgers_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
@@ -16850,7 +16858,7 @@ fn collect_note_eval_ledgers_tx(
         "UPDATE mc_note_eval_claims SET terminal_response = NULL
           WHERE project = ?1 AND terminal_kind IS NOT NULL AND terminal_response IS NOT NULL
             AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
-        params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+        params![project, now_ms - NOTE_EVAL_RESPONSE_REDACT_MS],
     )?;
     // Reclaim rows, not just columns. Blanking `decision`/`terminal_response`
     // stops a row counting toward the cap but leaves it on disk forever, so both
@@ -25207,6 +25215,80 @@ mod tests {
             count("mc_note_eval_acquisitions"),
             1,
             "only the current acquisition should remain"
+        );
+    }
+
+    #[test]
+    fn note_eval_terminal_response_is_redacted_before_row_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note");
+
+        let now = 1_000;
+        let claim = eval_claim(&store, "acq-1", 0, now);
+        store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "done-1",
+                "eval-a",
+                0,
+                now,
+                |_claim, note| Ok(eval_reduced(note, "pending", now)),
+            )
+            .unwrap();
+
+        // Trigger GC via an idle poll at `at`, then report
+        // (terminal rows, terminal rows still carrying a response).
+        let response_state = |at: i64| -> (i64, i64) {
+            store
+                .acquire_note_evaluation(
+                    EVAL_PROJECT,
+                    &format!("idle-{at}"),
+                    "eval-a",
+                    0,
+                    1,
+                    |_| None,
+                    at,
+                )
+                .unwrap();
+            store
+                .inner
+                .with_conn(|conn| {
+                    let rows = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM mc_note_eval_claims WHERE project = ?1",
+                            params![EVAL_PROJECT],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap();
+                    let with_response = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM mc_note_eval_claims
+                              WHERE project = ?1 AND terminal_response IS NOT NULL",
+                            params![EVAL_PROJECT],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap();
+                    Ok((rows, with_response))
+                })
+                .unwrap()
+        };
+
+        assert_eq!(
+            response_state(now + NOTE_EVAL_RESPONSE_REDACT_MS - 1),
+            (1, 1),
+            "inside the redact window the replay payload is retained"
+        );
+        assert_eq!(
+            response_state(now + NOTE_EVAL_RESPONSE_REDACT_MS),
+            (1, 0),
+            "past the redact window the response is nulled while the row is retained"
+        );
+        assert_eq!(
+            response_state(now + NOTE_EVAL_TERMINAL_RETENTION_MS),
+            (0, 0),
+            "past terminal retention the row itself is deleted"
         );
     }
 

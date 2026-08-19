@@ -78,7 +78,13 @@ export interface ModuleNoteEvaluationBridge {
     dispose(): Promise<void>;
 }
 
-const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridge>();
+/** One registered bridge plus the number of plugin instances relying on it. */
+interface ModuleNoteEvaluationBridgeEntry {
+    bridge: ModuleNoteEvaluationBridge;
+    owners: number;
+}
+
+const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridgeEntry>();
 
 /**
  * Composite registry key. Worktrees of one repository share a project
@@ -86,18 +92,36 @@ const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridge>(
  * over its own transport route and filesystem capabilities, so identity alone
  * cannot address a bridge. NUL cannot appear in a filesystem path.
  */
-function moduleNoteEvaluationBridgeKey(projectPath: string, projectRoot: string): string {
+export function moduleNoteEvaluationBridgeKey(projectPath: string, projectRoot: string): string {
     return `${projectPath}\u0000${projectRoot}`;
 }
 
-/** Registers the bridge and returns its registry key for later disposal. */
+/** Registers the bridge (one owner) and returns its registry key for later disposal. */
 export function registerModuleNoteEvaluationBridge(
     projectPath: string,
     projectRoot: string,
     bridge: ModuleNoteEvaluationBridge,
 ): string {
     const key = moduleNoteEvaluationBridgeKey(projectPath, projectRoot);
-    moduleNoteEvaluationBridges.set(key, bridge);
+    moduleNoteEvaluationBridges.set(key, { bridge, owners: 1 });
+    return key;
+}
+
+/**
+ * Record another owner of an already-registered exact bridge and return its
+ * registry key, or undefined when no such bridge exists. A second plugin
+ * instance serving the same (identity, root) must retain rather than skip:
+ * otherwise the first instance's disposal tears down the only registry entry
+ * while the second instance still routes conditioned writes through it.
+ */
+export function retainModuleNoteEvaluationBridge(
+    projectPath: string,
+    projectRoot: string,
+): string | undefined {
+    const key = moduleNoteEvaluationBridgeKey(projectPath, projectRoot);
+    const entry = moduleNoteEvaluationBridges.get(key);
+    if (!entry) return undefined;
+    entry.owners += 1;
     return key;
 }
 
@@ -113,30 +137,33 @@ export function getModuleNoteEvaluationBridge(
     if (projectRoot !== undefined) {
         return moduleNoteEvaluationBridges.get(
             moduleNoteEvaluationBridgeKey(projectPath, projectRoot),
-        );
+        )?.bridge;
     }
     const prefix = `${projectPath}\u0000`;
-    for (const [key, bridge] of moduleNoteEvaluationBridges) {
-        if (key.startsWith(prefix)) return bridge;
+    for (const [key, entry] of moduleNoteEvaluationBridges) {
+        if (key.startsWith(prefix)) return entry.bridge;
     }
     return undefined;
 }
 
 /**
- * Dispose only the named bridges (registry keys returned by register). The
- * registry is process-global while plugin instances are disposed
- * individually, so an instance passes the keys it registered and sibling
- * instances' bridges stay live.
+ * Release the named owners' claims (registry keys returned by register or
+ * retain). The registry is process-global while plugin instances are disposed
+ * individually, so an instance passes the keys it owns; a bridge is removed
+ * and disposed only when its last owner releases it, and sibling instances'
+ * bridges stay live.
  */
 export async function disposeModuleNoteEvaluationBridges(
     bridgeKeys: Iterable<string>,
 ): Promise<void> {
     const bridges: ModuleNoteEvaluationBridge[] = [];
     for (const key of bridgeKeys) {
-        const bridge = moduleNoteEvaluationBridges.get(key);
-        if (!bridge) continue;
+        const entry = moduleNoteEvaluationBridges.get(key);
+        if (!entry) continue;
+        entry.owners -= 1;
+        if (entry.owners > 0) continue;
         moduleNoteEvaluationBridges.delete(key);
-        bridges.push(bridge);
+        bridges.push(entry.bridge);
     }
     await Promise.allSettled(bridges.map((bridge) => bridge.dispose()));
 }

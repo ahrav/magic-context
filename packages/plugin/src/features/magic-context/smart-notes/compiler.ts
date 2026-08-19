@@ -32,8 +32,6 @@ interface CompileSmartNoteArgs {
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
-    /** See RunCompiledSmartNoteCheckOptions.sandboxLockHeld. */
-    sandboxLockHeld?: boolean;
 }
 
 export interface CompileSmartNoteSuccess {
@@ -171,7 +169,6 @@ Remember: output only the JSON object described by the system prompt.`;
             capabilityFactory: args.capabilityFactory,
             signal: args.signal,
             timeoutMs: 2_000,
-            sandboxLockHeld: args.sandboxLockHeld,
         });
         if (!dryRun.ok) {
             const error = boundedError(`dry-run failed: ${dryRun.error}`);

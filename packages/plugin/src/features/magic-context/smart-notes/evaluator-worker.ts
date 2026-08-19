@@ -31,13 +31,13 @@ export interface SmartNoteEvaluatorWorkerDeps {
     transport: EvaluatorWorkerTransport;
     /**
      * Build the phase executors for one claimed snapshot. Executors run QuickJS
-     * through `runCompiledSmartNoteCheck` without `sandboxLockHeld`, so each
-     * sandbox execution serializes itself for exactly its own window. The worker
-     * deliberately holds no process-wide sandbox reservation across a claim: a
-     * claim lease outlives a bounded QuickJS run by orders of magnitude, so
-     * waiting behind one run is cheap, whereas holding the global slot across an
-     * LLM compile or fallback confirmation would stall every other project's
-     * sweep for the length of a network round-trip.
+     * through `runCompiledSmartNoteCheck`, so each sandbox execution serializes
+     * itself for exactly its own window. The worker deliberately holds no
+     * process-wide sandbox reservation across a claim: a claim lease outlives a
+     * bounded QuickJS run by orders of magnitude, so waiting behind one run is
+     * cheap, whereas holding the global slot across an LLM compile or fallback
+     * confirmation would stall every other project's sweep for the length of a
+     * network round-trip.
      */
     executors: (
         snapshot: SmartNotePhaseSnapshot,
@@ -371,6 +371,18 @@ export class SmartNoteEvaluatorWorker {
             if (next === "retry") continue;
             if (next === "stop") break;
             result.claimed += 1;
+            if (this.disposed || args.signal?.aborted) {
+                // dispose() may have aborted and unregistered while next() was
+                // in flight; executing would strand the claim on a dead
+                // registration. Best-effort release — if the registration is
+                // already gone, the lease expires server-side.
+                this.lastAbandonReleased = await this.abandon(
+                    next.claimId,
+                    "worker disposed during poll",
+                );
+                result.abandoned += 1;
+                break;
+            }
             if (next.snapshot.phase === "compile") {
                 compileClaims += 1;
                 if (compileClaims > MAX_COMPILE_PER_RUN) {
@@ -404,6 +416,12 @@ export class SmartNoteEvaluatorWorker {
                 done = await running;
             } finally {
                 this.activeClaimSettled = null;
+            }
+            if (done === "conflict") {
+                // The store fenced this one claim; other queued phases are
+                // unaffected. Counted as abandoned: claimed but not completed.
+                result.abandoned += 1;
+                continue;
             }
             if (done === "failed") break;
             if (done === "abandoned") {
@@ -488,7 +506,7 @@ export class SmartNoteEvaluatorWorker {
     private async executeClaim(
         claim: ClaimResponse,
         args: { deadline: number; signal?: AbortSignal },
-    ): Promise<"completed" | "surfaced" | "abandoned" | "failed"> {
+    ): Promise<"completed" | "surfaced" | "abandoned" | "conflict" | "failed"> {
         const controller = new AbortController();
         this.activeClaimController = controller;
         const abortFromCaller = () => controller.abort(args.signal?.reason);
@@ -525,6 +543,14 @@ export class SmartNoteEvaluatorWorker {
                 // completion.
                 const applied = result === "replayed" ? asRecord(response.response) : response;
                 return applied.status === "ready" ? "surfaced" : "completed";
+            }
+            if (result === "stale" || result === "expired") {
+                // Per-note outcomes: a concurrent edit/dismissal fenced the
+                // claim (the revision-fence CAS working as designed) or the
+                // lease lapsed. The claim is already terminal server-side, so
+                // the drain can move on to unrelated work.
+                this.logLine(`completion for note #${claim.noteId} superseded: ${String(result)}`);
+                return "conflict";
             }
             this.logLine(`completion for note #${claim.noteId} rejected: ${String(result)}`);
             return "failed";
