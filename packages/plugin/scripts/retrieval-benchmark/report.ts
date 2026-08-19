@@ -95,13 +95,50 @@ const scenarioSchema = z.strictObject({
     paraphraseGroup: z.string().min(1),
     /** Raw physical ranking exactly as the surface returned it. */
     rankedPhysical: z.array(z.string().min(1)),
+    deliveredPhysical: z.array(z.string().min(1)),
     deliveredTokens: z.number().int().nonnegative().nullable(),
+    deliveryReason: z.enum([
+        "delivered",
+        "empty-results",
+        "packer-empty",
+        "empty",
+        "below-threshold",
+        "timeout",
+    ]),
     /** Raw per-scenario latency samples; summaries are recomputable. */
     latencySamplesMs: z.array(z.number().min(0)),
     metrics: scenarioMetricsSchema,
     timing: scenarioTimingSchema.nullable(),
 });
 export type ReportScenario = z.infer<typeof scenarioSchema>;
+export type DeliveryReason = ReportScenario["deliveryReason"];
+
+const caseEvidenceSchema = z.strictObject({
+    caseId: z.string().min(1),
+    workerCount: z.number().int().positive(),
+    warmups: z.number().int().nonnegative(),
+    samplesPerQuery: z.number().int().positive(),
+    fixture: z.strictObject({
+        manifestFingerprint: fingerprintSchema,
+        indexBuildMs: z.number().min(0),
+        snapshotBytes: z.number().int().nonnegative(),
+    }),
+    selectivityObserved: z.strictObject({
+        preFilterDenominator: z.number().int().nonnegative(),
+        eligibleCount: z.number().int().nonnegative(),
+    }),
+    cacheLayers: z.array(
+        z.strictObject({
+            layer: z.enum(["processVector", "connectionStatement", "sqlitePage", "osPage"]),
+            declared: z.enum(["cold", "warm"]),
+            mechanism: z.string().min(1),
+            resets: z.number().int().nonnegative(),
+            verifications: z.number().int().nonnegative(),
+            status: z.enum(["verified", "not-attempted", "not-applicable"]),
+        }),
+    ),
+});
+export type CaseEvidence = z.infer<typeof caseEvidenceSchema>;
 
 const attemptSchema = z.strictObject({
     attemptId: z.string().min(1),
@@ -153,6 +190,7 @@ const reportSchema = z.strictObject({
     evidence: z.strictObject({
         attempts: z.array(attemptSchema).min(1),
         scenarios: z.array(scenarioSchema),
+        cases: z.array(caseEvidenceSchema),
     }),
     candidatePool: candidatePoolSchema,
 });

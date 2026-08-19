@@ -47,13 +47,15 @@ function diagnosticsOf(fn: () => unknown): string[] {
 }
 
 describe("fixture profiles", () => {
-    it("validate strictly with a fixed case count and shared required cells", () => {
+    it("validate strictly with a fixed case count", () => {
         for (const name of PROFILE_FILES) {
             const profile = loadFixtureProfile(name);
             expect(profile.expectedCaseCount).toBe(profile.cases.length);
             expect(profile.cases.length).toBeLessThanOrEqual(MAX_PROFILE_CASES);
         }
-        const caseIds = PROFILE_FILES.map((name) =>
+        // The two reference profiles share one case set; the CI profile
+        // omits the heavy endpoint cases.
+        const caseIds = (["arm-neon.json", "x86-avx2.json"] as const).map((name) =>
             loadFixtureProfile(name)
                 .cases.map((profileCase) => profileCase.id)
                 .join(","),
@@ -62,7 +64,7 @@ describe("fixture profiles", () => {
     });
 
     it("cover every axis endpoint, the audit cell, and stay non-Cartesian", () => {
-        const profile = loadFixtureProfile("ci.json");
+        const profile = loadFixtureProfile("arm-neon.json");
         const scales = profile.cases.map((c) => c.scale);
         expect(scales).toContain(PROFILE_AXIS_ENDPOINTS.scale.min);
         expect(scales).toContain(PROFILE_AXIS_ENDPOINTS.scale.max);
@@ -112,8 +114,8 @@ describe("fixture profiles", () => {
 });
 
 describe("parseProfile required cells", () => {
-    it("rejects a profile missing the required K=100 cell", () => {
-        const profile = fixtureProfileJson("ci.json");
+    it("rejects a reference profile missing the required K=100 cell", () => {
+        const profile = fixtureProfileJson("arm-neon.json");
         for (const profileCase of profile.cases) {
             if (profileCase.candidateK.requested === 100) {
                 profileCase.candidateK = { requested: 50, effective: 50 };
@@ -124,8 +126,8 @@ describe("parseProfile required cells", () => {
         );
     });
 
-    it("rejects a profile missing a selectivity endpoint", () => {
-        const profile = fixtureProfileJson("ci.json");
+    it("rejects a reference profile missing a selectivity endpoint", () => {
+        const profile = fixtureProfileJson("arm-neon.json");
         for (const profileCase of profile.cases) {
             if (profileCase.selectivity.fraction === 0.001) {
                 profileCase.selectivity.fraction = 0.01;
@@ -144,7 +146,7 @@ describe("parseProfile required cells", () => {
     });
 
     it("rejects a missing audit cell and a missing interaction corner", () => {
-        const noAudit = fixtureProfileJson("ci.json");
+        const noAudit = fixtureProfileJson("arm-neon.json");
         noAudit.cases = noAudit.cases.filter(
             (profileCase) => profileCase.id !== "case-audit-auto-100k-384",
         );
@@ -153,13 +155,41 @@ describe("parseProfile required cells", () => {
             "profile.cases: missing 100K/384 audit cell",
         );
 
-        const noCorner = fixtureProfileJson("ci.json");
+        const noCorner = fixtureProfileJson("arm-neon.json");
         noCorner.cases = noCorner.cases.filter(
             (profileCase) => profileCase.id !== "case-corner-1m-1024-c8",
         );
         noCorner.expectedCaseCount = noCorner.cases.length;
         const diagnostics = diagnosticsOf(() => parseProfile(noCorner));
         expect(diagnostics).toContain("profile.cases: missing 1M/1024/concurrency-8 corner");
+    });
+
+    it("exempts the CI host class from heavy axis endpoints but not structural cells", () => {
+        // The checked-in CI profile has no 1M/1024/concurrency-8 cases and
+        // still parses; the SAME case set under a reference host class must
+        // reject for the missing heavy endpoints.
+        const ci = fixtureProfileJson("ci.json");
+        expect(() => parseProfile(ci)).not.toThrow();
+        const promoted = fixtureProfileJson("ci.json");
+        promoted.host = {
+            class: "x86-avx2",
+            cpuArchitecture: "x64",
+            minTotalMemoryBytes: promoted.host.minTotalMemoryBytes,
+            minAvailableDiskBytes: promoted.host.minAvailableDiskBytes,
+        };
+        const diagnostics = diagnosticsOf(() => parseProfile(promoted));
+        expect(diagnostics).toContain("profile.cases: missing scale endpoint 1000000");
+        expect(diagnostics).toContain("profile.cases: missing 1M/1024/concurrency-8 corner");
+
+        // Structural cells stay mandatory for the CI class.
+        const noAutomatic = fixtureProfileJson("ci.json");
+        noAutomatic.cases = noAutomatic.cases.filter(
+            (profileCase) => profileCase.mode !== "automatic",
+        );
+        noAutomatic.expectedCaseCount = noAutomatic.cases.length;
+        expect(diagnosticsOf(() => parseProfile(noAutomatic))).toContain(
+            "profile.cases: missing automatic mode",
+        );
     });
 
     it("rejects an expected case count that disagrees with the enumerated cases", () => {
@@ -179,7 +209,7 @@ describe("parseProfile required cells", () => {
     });
 
     it("rejects selectivity numbers outside the discrete rounding rule", () => {
-        const profile = fixtureProfileJson("ci.json");
+        const profile = fixtureProfileJson("arm-neon.json");
         const cell = profile.cases.find(
             (profileCase) => profileCase.selectivity.fraction === 0.001,
         );
@@ -192,7 +222,7 @@ describe("parseProfile required cells", () => {
     });
 
     it("rejects a cutoff predicate that disagrees with the declared eligible count", () => {
-        const profile = fixtureProfileJson("ci.json");
+        const profile = fixtureProfileJson("arm-neon.json");
         const cell = profile.cases.find(
             (profileCase) => profileCase.selectivity.fraction === 0.001,
         );
@@ -213,7 +243,7 @@ describe("parseProfile required cells", () => {
 
 describe("resource preflight", () => {
     it("prices the 1M/1024/concurrency-8 corner above 30 GiB of f32 worker payload", () => {
-        const profile = loadFixtureProfile("ci.json");
+        const profile = loadFixtureProfile("arm-neon.json");
         const corner = profile.cases.find(
             (profileCase) => profileCase.id === "case-corner-1m-1024-c8",
         );
@@ -276,7 +306,7 @@ describe("resource preflight", () => {
 
 describe("verifySelectivityObservation", () => {
     it("accepts observations within the rounding tolerance and rejects drift", () => {
-        const profile = loadFixtureProfile("ci.json");
+        const profile = loadFixtureProfile("arm-neon.json");
         const cell = profile.cases.find(
             (profileCase) => profileCase.selectivity.fraction === 0.001,
         );

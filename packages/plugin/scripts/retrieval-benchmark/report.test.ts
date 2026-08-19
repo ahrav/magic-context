@@ -27,7 +27,9 @@ function makeScenario(queryId: string): ReportScenario {
         partition: "holdout",
         paraphraseGroup: "pg-1",
         rankedPhysical: ["memory:1", "memory:2"],
+        deliveredPhysical: ["memory:1"],
         deliveredTokens: 120,
+        deliveryReason: "delivered",
         latencySamplesMs: [4.5, 6.25, 5.5],
         metrics: {
             metricPolicyVersion: METRIC_POLICY_VERSION,
@@ -89,6 +91,30 @@ function makeReport(
                 },
             ],
             scenarios: [makeScenario("q-1")],
+            cases: [
+                {
+                    caseId: "case-1",
+                    workerCount: 1,
+                    warmups: 1,
+                    samplesPerQuery: 3,
+                    fixture: {
+                        manifestFingerprint: FP,
+                        indexBuildMs: 250,
+                        snapshotBytes: 4096,
+                    },
+                    selectivityObserved: { preFilterDenominator: 100, eligibleCount: 100 },
+                    cacheLayers: [
+                        {
+                            layer: "processVector",
+                            declared: "warm",
+                            mechanism: "warmup-population",
+                            resets: 0,
+                            verifications: 3,
+                            status: "verified",
+                        },
+                    ],
+                },
+            ],
         },
         candidatePool: {
             schemaVersion: CANDIDATE_POOL_SCHEMA_VERSION,

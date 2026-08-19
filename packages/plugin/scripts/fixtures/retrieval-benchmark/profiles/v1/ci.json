@@ -1,92 +1,26 @@
 {
   "schemaVersion": "retrieval-benchmark-profile/v1",
   "id": "profile-ci",
-  "description": "Deterministic CI-sized runtime settings over the full required cell set; quality and accounting gates only, latency informational.",
-  "expectedCaseCount": 13,
+  "description": "Deterministic CI-sized check: small 1K-scale fixtures, both modes, cache-state and lane coverage; latency informational only. Heavy axis endpoints (1M scale, 1024 dims, K endpoints at scale, concurrency 8) belong to the reference-host profiles.",
+  "expectedCaseCount": 9,
   "runtime": {
     "warmups": 1,
     "samples": 5,
-    "maxWallTimeMs": 1800000
+    "maxWallTimeMs": 600000
   },
   "budgets": {
-    "maxFixtureBytes": 8589934592,
-    "maxPeakRssBytes": 34359738368
+    "maxFixtureBytes": 67108864,
+    "maxPeakRssBytes": 1073741824
   },
   "host": {
     "class": "ci",
     "cpuArchitecture": "any",
-    "minTotalMemoryBytes": 36000000000,
-    "minAvailableDiskBytes": 20000000000
+    "minTotalMemoryBytes": 2147483648,
+    "minAvailableDiskBytes": 1073741824
   },
   "cases": [
     {
-      "id": "case-audit-auto-100k-384",
-      "scale": 100000,
-      "dims": 384,
-      "candidateK": {
-        "requested": 50,
-        "effective": 50
-      },
-      "mode": "automatic",
-      "sourceLanes": [
-        "git_commit",
-        "memory",
-        "message"
-      ],
-      "concurrency": 1,
-      "cacheState": {
-        "processVector": "warm",
-        "connectionStatement": "warm",
-        "sqlitePage": "warm",
-        "osPage": "warm"
-      },
-      "selectivity": {
-        "fraction": 1,
-        "predicate": {
-          "projectScope": "git:benchmark-fixture-project",
-          "sessionScope": null,
-          "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
-        },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
-      }
-    },
-    {
-      "id": "case-explicit-100k-384",
-      "scale": 100000,
-      "dims": 384,
-      "candidateK": {
-        "requested": 50,
-        "effective": 50
-      },
-      "mode": "explicit",
-      "sourceLanes": null,
-      "concurrency": 1,
-      "cacheState": {
-        "processVector": "warm",
-        "connectionStatement": "warm",
-        "sqlitePage": "warm",
-        "osPage": "warm"
-      },
-      "selectivity": {
-        "fraction": 1,
-        "predicate": {
-          "projectScope": "git:benchmark-fixture-project",
-          "sessionScope": null,
-          "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
-        },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
-      }
-    },
-    {
-      "id": "case-scale-1k",
+      "id": "case-explicit-warm-1k-384",
       "scale": 1000,
       "dims": 384,
       "candidateK": {
@@ -108,23 +42,23 @@
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 1000,
-        "eligibleCount": 1000,
-        "expectedScannedCount": 1000
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
       }
     },
     {
-      "id": "case-scale-1m",
-      "scale": 1000000,
+      "id": "case-automatic-warm-1k-384",
+      "scale": 1000,
       "dims": 384,
       "candidateK": {
         "requested": 50,
         "effective": 50
       },
-      "mode": "explicit",
+      "mode": "automatic",
       "sourceLanes": null,
       "concurrency": 1,
       "cacheState": {
@@ -139,79 +73,17 @@
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 1000000,
-        "eligibleCount": 1000000,
-        "expectedScannedCount": 1000000
-      }
-    },
-    {
-      "id": "case-dims-128",
-      "scale": 100000,
-      "dims": 128,
-      "candidateK": {
-        "requested": 50,
-        "effective": 50
-      },
-      "mode": "explicit",
-      "sourceLanes": null,
-      "concurrency": 1,
-      "cacheState": {
-        "processVector": "warm",
-        "connectionStatement": "warm",
-        "sqlitePage": "warm",
-        "osPage": "warm"
-      },
-      "selectivity": {
-        "fraction": 1,
-        "predicate": {
-          "projectScope": "git:benchmark-fixture-project",
-          "sessionScope": null,
-          "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
-        },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
-      }
-    },
-    {
-      "id": "case-dims-1024",
-      "scale": 100000,
-      "dims": 1024,
-      "candidateK": {
-        "requested": 50,
-        "effective": 50
-      },
-      "mode": "explicit",
-      "sourceLanes": null,
-      "concurrency": 1,
-      "cacheState": {
-        "processVector": "warm",
-        "connectionStatement": "warm",
-        "sqlitePage": "warm",
-        "osPage": "warm"
-      },
-      "selectivity": {
-        "fraction": 1,
-        "predicate": {
-          "projectScope": "git:benchmark-fixture-project",
-          "sessionScope": null,
-          "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
-        },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
       }
     },
     {
       "id": "case-k-5",
-      "scale": 100000,
+      "scale": 1000,
       "dims": 384,
       "candidateK": {
         "requested": 5,
@@ -232,17 +104,17 @@
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
       }
     },
     {
       "id": "case-k-100",
-      "scale": 100000,
+      "scale": 1000,
       "dims": 384,
       "candidateK": {
         "requested": 100,
@@ -263,18 +135,18 @@
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
       }
     },
     {
-      "id": "case-selectivity-min",
-      "scale": 100000,
-      "dims": 384,
+      "id": "case-dims-128",
+      "scale": 1000,
+      "dims": 128,
       "candidateK": {
         "requested": 50,
         "effective": 50
@@ -289,22 +161,22 @@
         "osPage": "warm"
       },
       "selectivity": {
-        "fraction": 0.001,
+        "fraction": 1,
         "predicate": {
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": 100,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100,
-        "expectedScannedCount": 100
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
       }
     },
     {
       "id": "case-cache-cold",
-      "scale": 100000,
+      "scale": 1000,
       "dims": 384,
       "candidateK": {
         "requested": 50,
@@ -325,48 +197,17 @@
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
-      }
-    },
-    {
-      "id": "case-concurrency-8",
-      "scale": 100000,
-      "dims": 384,
-      "candidateK": {
-        "requested": 50,
-        "effective": 50
-      },
-      "mode": "explicit",
-      "sourceLanes": null,
-      "concurrency": 8,
-      "cacheState": {
-        "processVector": "warm",
-        "connectionStatement": "warm",
-        "sqlitePage": "warm",
-        "osPage": "warm"
-      },
-      "selectivity": {
-        "fraction": 1,
-        "predicate": {
-          "projectScope": "git:benchmark-fixture-project",
-          "sessionScope": null,
-          "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
-        },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
       }
     },
     {
       "id": "case-lane-message",
-      "scale": 100000,
+      "scale": 1000,
       "dims": 384,
       "candidateK": {
         "requested": 50,
@@ -389,25 +230,25 @@
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 100000,
-        "eligibleCount": 100000,
-        "expectedScannedCount": 100000
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
       }
     },
     {
-      "id": "case-corner-1m-1024-c8",
-      "scale": 1000000,
-      "dims": 1024,
+      "id": "case-concurrency-2",
+      "scale": 1000,
+      "dims": 384,
       "candidateK": {
-        "requested": 100,
-        "effective": 100
+        "requested": 50,
+        "effective": 50
       },
       "mode": "explicit",
       "sourceLanes": null,
-      "concurrency": 8,
+      "concurrency": 2,
       "cacheState": {
         "processVector": "warm",
         "connectionStatement": "warm",
@@ -420,12 +261,43 @@
           "projectScope": "git:benchmark-fixture-project",
           "sessionScope": null,
           "sources": null,
-          "messageOrdinalCutoff": null,
-          "visibleMemoryIds": []
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
         },
-        "preFilterDenominator": 1000000,
-        "eligibleCount": 1000000,
-        "expectedScannedCount": 1000000
+        "preFilterDenominator": 327,
+        "eligibleCount": 327,
+        "expectedScannedCount": 327
+      }
+    },
+    {
+      "id": "case-selectivity-cutoff",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 0.5,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": 164
+        },
+        "preFilterDenominator": 327,
+        "eligibleCount": 164,
+        "expectedScannedCount": 164
       }
     }
   ]

@@ -221,6 +221,15 @@ function advanceIdCursor(db: Database, table: "memories" | "notes" | "primers" |
     }
 }
 
+function pinNoteTimestamp(db: Database, noteId: number): void {
+    const pinned = SEED_EPOCH_MS + noteId;
+    db.prepare("UPDATE notes SET created_at = ?, updated_at = ? WHERE id = ?").run(
+        pinned,
+        pinned,
+        noteId,
+    );
+}
+
 function documentText(document: { title: string; body: string }): string {
     return document.title.length > 0 ? `${document.title}\n${document.body}` : document.body;
 }
@@ -396,6 +405,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
                 sessionId,
                 content: documentText(plan.document.semanticPayload),
             });
+            pinNoteTimestamp(db, note.id);
             verifyEmittedId(plan, note.id);
             record(plan, sessionId, null, 0);
         }
@@ -653,7 +663,8 @@ function seedSyntheticStream(
             });
         } else {
             batch.push(() => {
-                addNote(db, "session", { sessionId, content: documentText(document) });
+                const note = addNote(db, "session", { sessionId, content: documentText(document) });
+                pinNoteTimestamp(db, note.id);
             });
         }
         if (batch.length >= SEED_BATCH_SIZE) flush();

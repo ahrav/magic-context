@@ -2,12 +2,18 @@
  * Versioned sparse benchmark profiles (KTD14, R58).
  *
  * A profile enumerates an EXACT bounded case set — anchor sweeps plus
- * required interaction corners — never an implicit Cartesian product. Every
- * axis endpoint (corpus scale 1K-1M, dims 128-1024, candidate K 5-100,
- * filter selectivity 0.1%-100%, concurrency 1-8, both modes, cold and warm
- * cache states, all-lane and single-lane) and the 100K/384 audit cell must
- * be present, or the profile rejects at parse time. A resource preflight
- * prices each case before any allocation so an undersized host fails first.
+ * required interaction corners — never an implicit Cartesian product. For
+ * reference-host profiles (`host.class` arm-neon / x86-avx2) every axis
+ * endpoint (corpus scale 1K-1M, dims 128-1024, candidate K 5-100, filter
+ * selectivity 0.1%-100%, concurrency 1-8) plus the 100K/384 audit cell and
+ * the 1M/1024/concurrency-8 corner must be present, or the profile rejects
+ * at parse time. The CI host class runs the deterministic SMALL profile:
+ * it still must cover both modes, all-cold and all-warm cache states, and
+ * all-lane plus single-lane cases, but it is exempt from the heavy
+ * scale/dims/K/selectivity/concurrency endpoints — seeding 1M-scale
+ * fixtures inside a CI-sized deterministic check is infeasible by design,
+ * and CI latency is informational only. A resource preflight prices each
+ * case before any allocation so an undersized host fails first.
  */
 
 import { readFileSync } from "node:fs";
@@ -342,7 +348,11 @@ export function parseProfile(value: unknown): BenchmarkProfile {
         validateSelectivity(index, profileCase.selectivity, diagnostics);
     }
 
-    const endpointChecks: Array<[boolean, string]> = [
+    // Full axis-endpoint coverage is a reference-host obligation; CI host
+    // profiles require only mode, cache-state, and lane coverage.
+    const requiresFullAxisCoverage = profile.host.class !== "ci";
+    const endpointChecks: Array<[boolean, string]> = requiresFullAxisCoverage
+        ? [
         [scales.has(PROFILE_AXIS_ENDPOINTS.scale.min), "profile.cases: missing scale endpoint 1000"],
         [
             scales.has(PROFILE_AXIS_ENDPOINTS.scale.max),
@@ -368,15 +378,18 @@ export function parseProfile(value: unknown): BenchmarkProfile {
             concurrencies.has(PROFILE_AXIS_ENDPOINTS.concurrency.max),
             "profile.cases: missing concurrency endpoint 8",
         ],
+        [hasAuditCell, "profile.cases: missing 100K/384 audit cell"],
+        [hasScaleDimsConcurrencyCorner, "profile.cases: missing 1M/1024/concurrency-8 corner"],
+          ]
+        : [];
+    endpointChecks.push(
         [modes.has("explicit"), "profile.cases: missing explicit mode"],
         [modes.has("automatic"), "profile.cases: missing automatic mode"],
         [hasAllCold, "profile.cases: missing all-cold cache case"],
         [hasAllWarm, "profile.cases: missing all-warm cache case"],
         [hasAllLanes, "profile.cases: missing all-lane case"],
         [hasSingleLane, "profile.cases: missing single-lane case"],
-        [hasAuditCell, "profile.cases: missing 100K/384 audit cell"],
-        [hasScaleDimsConcurrencyCorner, "profile.cases: missing 1M/1024/concurrency-8 corner"],
-    ];
+    );
     for (const [present, diagnostic] of endpointChecks) {
         if (!present) diagnostics.push(diagnostic);
     }
