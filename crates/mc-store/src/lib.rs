@@ -4562,16 +4562,9 @@ pub enum NoteEvalRenewOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum NoteEvalCompleteOutcome {
-    Applied {
-        note: StoredNote,
-        response_json: String,
-    },
-    Replayed {
-        response_json: String,
-    },
-    Conflict {
-        kind: &'static str,
-    },
+    Applied { response_json: String },
+    Replayed { response_json: String },
+    Conflict { kind: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16959,6 +16952,7 @@ impl McStore {
                     tx,
                     project,
                     row.claim,
+                    acquisition_id,
                     registration_generation,
                     now_ms,
                 );
@@ -16999,6 +16993,7 @@ impl McStore {
                     tx,
                     project,
                     row.claim,
+                    acquisition_id,
                     registration_generation,
                     now_ms,
                 );
@@ -17351,13 +17346,15 @@ impl McStore {
             if changed == 0 {
                 return stale(tx);
             }
-            let note = load_note_tx(tx, row.claim.note_id)?;
+            // Every response field is already known locally (the CAS above
+            // asserted `state_version = row.claim.state_version`), so no
+            // re-read of the row is needed.
             let response_json = serde_json::json!({
                 "result": "applied",
-                "note_id": note.id,
-                "status": note.status,
-                "state_version": note.state_version,
-                "check_status": note.check_status,
+                "note_id": row.claim.note_id,
+                "status": reduced.status,
+                "state_version": row.claim.state_version + 1,
+                "check_status": reduced.check_status,
             })
             .to_string();
             mark_note_eval_claim_terminal_tx(
@@ -17369,10 +17366,7 @@ impl McStore {
                 &response_json,
                 now_ms,
             )?;
-            Ok(NoteEvalCompleteOutcome::Applied {
-                note,
-                response_json,
-            })
+            Ok(NoteEvalCompleteOutcome::Applied { response_json })
         })
     }
 
@@ -17421,17 +17415,30 @@ fn rebind_note_eval_claim_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
     mut claim: NoteEvalClaim,
+    acquisition_id: &str,
     registration_generation: i64,
     now_ms: i64,
 ) -> rusqlite::Result<NoteEvalAcquireOutcome> {
     let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
+    // The slot-recovery path reaches this rebind with a NEW acquisition id.
+    // Persisting it keeps the replay guarantee: a retry of that id hits the
+    // acquisition-keyed lookup and replays this rebind instead of re-entering
+    // slot recovery and extending the lease again.
     tx.execute(
-        "UPDATE mc_note_eval_claims SET registration_generation = ?1, expires_at = ?2
-          WHERE project = ?3 AND claim_id = ?4 AND terminal_kind IS NULL",
-        params![registration_generation, expires_at, project, claim.claim_id],
+        "UPDATE mc_note_eval_claims
+            SET registration_generation = ?1, expires_at = ?2, acquisition_id = ?3
+          WHERE project = ?4 AND claim_id = ?5 AND terminal_kind IS NULL",
+        params![
+            registration_generation,
+            expires_at,
+            acquisition_id,
+            project,
+            claim.claim_id
+        ],
     )?;
     claim.registration_generation = registration_generation;
     claim.expires_at = expires_at;
+    claim.acquisition_id = acquisition_id.to_string();
     let note = load_note_tx(tx, claim.note_id)
         .optional()?
         .filter(|note| note.project_path == project);
@@ -25290,9 +25297,31 @@ mod tests {
                 ..
             } => {
                 assert_eq!(recovered.claim_id, claim.claim_id);
-                assert_eq!(recovered.acquisition_id, "acq-1");
+                // The rebind adopts the new acquisition id so a retry of it
+                // replays this decision from the acquisition-keyed lookup
+                // instead of re-entering slot recovery.
+                assert_eq!(recovered.acquisition_id, "acq-2");
             }
             other => panic!("expected recovered claim, got {other:?}"),
+        }
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                0,
+                2,
+                |_| panic!("a replayed acquisition must not re-select"),
+                300,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: replayed,
+                replayed: true,
+                ..
+            } => assert_eq!(replayed.claim_id, claim.claim_id),
+            other => panic!("expected replayed rebind, got {other:?}"),
         }
     }
 
@@ -25657,7 +25686,7 @@ mod tests {
         let store = note_eval_store(dir.path());
         let note = eval_note(&store, "watch the build");
         let claim = eval_claim(&store, "acq-1", 0, 0);
-        let (applied, response) = match store
+        let response = match store
             .complete_note_evaluation(
                 EVAL_PROJECT,
                 &claim.claim_id,
@@ -25669,12 +25698,10 @@ mod tests {
             )
             .unwrap()
         {
-            NoteEvalCompleteOutcome::Applied {
-                note,
-                response_json,
-            } => (note, response_json),
+            NoteEvalCompleteOutcome::Applied { response_json } => response_json,
             other => panic!("expected applied completion, got {other:?}"),
         };
+        let applied = reload_note(&store, note.id);
         assert_eq!(applied.state_version, note.state_version + 1);
         assert_eq!(applied.status_version, note.status_version + 1);
         assert_eq!(applied.state_version, applied.status_version);
@@ -25728,7 +25755,9 @@ mod tests {
             )
             .unwrap()
         {
-            NoteEvalCompleteOutcome::Applied { note, .. } => assert_eq!(note.status, "ready"),
+            NoteEvalCompleteOutcome::Applied { .. } => {
+                assert_eq!(reload_note(&store, note.id).status, "ready");
+            }
             other => panic!("expected second completion to apply, got {other:?}"),
         }
     }

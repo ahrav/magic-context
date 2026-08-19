@@ -92,6 +92,21 @@ function claimExpectedState(db: Database, expected: SmartNoteCommitExpectation):
     );
 }
 
+/**
+ * Pending notes eligible for phase selection. A retina handoff skips notes it
+ * already compiled. Mirrors `eligible` in the Rust port
+ * (crates/mc-module/src/smart_note_evaluation.rs).
+ */
+function eligibleSmartNotes(
+    db: Database,
+    projectPath: string,
+    retinaHandoff: boolean,
+): SmartNoteCheckNote[] {
+    return getPendingSmartNotes(db, projectPath)
+        .filter((note) => !retinaHandoff || note.compileStatus !== "compiled")
+        .map(toSmartNote);
+}
+
 export function getDueCompiledSmartNoteChecks(
     db: Database,
     projectPath: string,
@@ -99,9 +114,7 @@ export function getDueCompiledSmartNoteChecks(
     limit: number,
     retinaHandoff = false,
 ): SmartNoteCheckNote[] {
-    return getPendingSmartNotes(db, projectPath)
-        .filter((note) => !retinaHandoff || note.compileStatus !== "compiled")
-        .map(toSmartNote)
+    return eligibleSmartNotes(db, projectPath, retinaHandoff)
         .filter(
             (note) =>
                 note.checkStatus === "compiled" &&
@@ -121,9 +134,7 @@ export function getSmartNotesNeedingCompilation(
     limit: number,
     retinaHandoff = false,
 ): SmartNoteCheckNote[] {
-    return getPendingSmartNotes(db, projectPath)
-        .filter((note) => !retinaHandoff || note.compileStatus !== "compiled")
-        .map(toSmartNote)
+    return eligibleSmartNotes(db, projectPath, retinaHandoff)
         .filter(
             (note) =>
                 (note.checkNextDueAt === null || note.checkNextDueAt <= now) &&
@@ -145,9 +156,7 @@ export function getStaleCompiledSmartNotes(
 ): SmartNoteCheckNote[] {
     const staleBefore = now - SMART_NOTE_CHECK_MAX_STALENESS_MS;
     const livenessBefore = now - SMART_NOTE_CHECK_LIVENESS_RECHECK_MS;
-    return getPendingSmartNotes(db, projectPath)
-        .filter((note) => !retinaHandoff || note.compileStatus !== "compiled")
-        .map(toSmartNote)
+    return eligibleSmartNotes(db, projectPath, retinaHandoff)
         .filter(
             (note) =>
                 note.checkStatus === "compiled" &&
@@ -167,9 +176,7 @@ export function getFallbackSmartNotes(
     limit: number,
     retinaHandoff = false,
 ): SmartNoteCheckNote[] {
-    return getPendingSmartNotes(db, projectPath)
-        .filter((note) => !retinaHandoff || note.compileStatus !== "compiled")
-        .map(toSmartNote)
+    return eligibleSmartNotes(db, projectPath, retinaHandoff)
         .filter((note) => note.checkStatus === "fallback")
         .slice(0, Math.max(1, limit));
 }

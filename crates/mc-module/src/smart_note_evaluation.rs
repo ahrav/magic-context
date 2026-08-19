@@ -1435,4 +1435,75 @@ mod tests {
             None
         );
     }
+
+    // The golden fixtures exercise each phase selector in isolation; this pins
+    // the composed priority chain itself so an ordering regression cannot slip
+    // past the fixture replay.
+    #[test]
+    fn phase_selection_prefers_due_then_compile_then_liveness_then_fallback() {
+        let now: i64 = 1_781_542_800_000;
+        let base = SmartNoteSelectionSnapshot {
+            id: 0,
+            status: "pending".to_string(),
+            compile_status: None,
+            created_at: 1,
+            has_compiled_check: false,
+            check_status: "uncompiled".to_string(),
+            check_quarantined_until: None,
+            check_next_due_at: None,
+            check_false_since_at: None,
+            check_last_liveness_at: None,
+            policy_version: SMART_NOTE_CHECK_POLICY_VERSION,
+        };
+        let due = SmartNoteSelectionSnapshot {
+            id: 1,
+            check_status: "compiled".to_string(),
+            has_compiled_check: true,
+            check_next_due_at: Some(now - 1),
+            ..base.clone()
+        };
+        let compile = SmartNoteSelectionSnapshot {
+            id: 2,
+            ..base.clone()
+        };
+        let liveness = SmartNoteSelectionSnapshot {
+            id: 3,
+            check_status: "compiled".to_string(),
+            has_compiled_check: true,
+            check_next_due_at: Some(now + 60_000),
+            check_false_since_at: Some(now - SMART_NOTE_CHECK_MAX_STALENESS_MS - 1),
+            ..base.clone()
+        };
+        let fallback = SmartNoteSelectionSnapshot {
+            id: 4,
+            check_status: "fallback".to_string(),
+            has_compiled_check: true,
+            ..base.clone()
+        };
+        let all = [
+            fallback.clone(),
+            liveness.clone(),
+            compile.clone(),
+            due.clone(),
+        ];
+        assert_eq!(
+            select_next_smart_note_evaluation(&all, now, false),
+            Some((1, "due".to_string()))
+        );
+        let no_due = [fallback.clone(), liveness.clone(), compile.clone()];
+        assert_eq!(
+            select_next_smart_note_evaluation(&no_due, now, false),
+            Some((2, "compile".to_string()))
+        );
+        let no_compile = [fallback.clone(), liveness];
+        assert_eq!(
+            select_next_smart_note_evaluation(&no_compile, now, false),
+            Some((3, "liveness".to_string()))
+        );
+        assert_eq!(
+            select_next_smart_note_evaluation(&[fallback], now, false),
+            Some((4, "fallback".to_string()))
+        );
+        assert_eq!(select_next_smart_note_evaluation(&[], now, false), None);
+    }
 }

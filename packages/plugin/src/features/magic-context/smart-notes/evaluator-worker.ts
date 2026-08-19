@@ -443,8 +443,20 @@ export class SmartNoteEvaluatorWorker {
                 }
             }
             if (next.snapshot.phase === "fallback") {
+                // Re-selection of an already-attempted note ends the drain (the
+                // authority's fallback selection is deterministic, so releasing
+                // and polling again would hand the same note back forever); it
+                // must not consume a fallback budget slot first.
+                if (fallbackAttempted.has(next.noteId)) {
+                    this.lastAbandonReleased = await this.abandon(
+                        next.claimId,
+                        "fallback already attempted this drain",
+                    );
+                    result.abandoned += 1;
+                    break;
+                }
                 fallbackClaims += 1;
-                if (fallbackClaims > maxFallback || fallbackAttempted.has(next.noteId)) {
+                if (fallbackClaims > maxFallback) {
                     this.lastAbandonReleased = await this.abandon(
                         next.claimId,
                         "fallback cap reached this drain",
@@ -544,8 +556,15 @@ export class SmartNoteEvaluatorWorker {
                 },
             };
         }
-        this.pendingAcquisitionId = null;
-        if (result === "no_work" || result === "expired") return "no_work";
+        if (result === "no_work" || result === "expired") {
+            // The authority recorded (or replayed) a durable decision for this
+            // acquisition; it is consumed.
+            this.pendingAcquisitionId = null;
+            return "no_work";
+        }
+        // `busy` records no durable decision, and an unrecognized result is an
+        // unknown outcome: keep the acquisition id so the next poll replays
+        // whatever decision may exist instead of leasing a second note.
         if (result === "busy") return "stop";
         this.logLine(`next returned ${String(result)}`);
         return "stop";

@@ -374,6 +374,9 @@ export async function confirmSmartNoteReadOnly(
 ): Promise<boolean | null> {
     const { noteId, content, surfaceCondition, signal: leaseSignal } = args;
     let childSessionId: string | null = null;
+    // Hoisted so the catch below can distinguish a deadline abort (the prompt
+    // never concluded — inconclusive) from a genuine failed confirmation.
+    let promptSignal: ReturnType<typeof createPromptAbortSignal> | undefined;
     const startedAt = Date.now();
     let invocationRecorded = false;
     const recordInvocation = (params: {
@@ -427,7 +430,7 @@ Note content: ${JSON.stringify(content)}
 Surface condition: ${JSON.stringify(surfaceCondition ?? "")}
 
 Output exactly JSON: {"met": false}`;
-        const promptSignal = createPromptAbortSignal(
+        promptSignal = createPromptAbortSignal(
             leaseSignal,
             Math.max(1_000, args.deadline - Date.now()),
             "smart-note confirmation deadline",
@@ -480,7 +483,10 @@ Output exactly JSON: {"met": false}`;
         recordInvocation({ status: "completed", messages: run.output });
         return run.validated;
     } catch (error) {
-        if (leaseSignal.aborted) {
+        if (leaseSignal.aborted || promptSignal?.signal.aborted) {
+            // Lease loss or the deadline timer aborted the prompt mid-flight:
+            // the confirmation never concluded, so record an abandonment
+            // instead of a genuine met=false verdict.
             recordInvocation({ status: "aborted", error });
             return null;
         }
