@@ -66,4 +66,59 @@ exists.
 
 ## Results
 
-(appended per collection)
+### Collection 1 — baseline `99a12e8e` vs candidate (opt1)
+
+Environment: dev-dsk 128×CPU, kernel 6.12.95, rustc 1.97.1, shared box
+(1-min load 39–42 at run start; treat single-digit-percent deltas as noise).
+Raw runs: `docs/perf/runs/baseline-99a12e8e/` and `docs/perf/runs/candidate-opt1/`.
+
+Candidate changes: buffered connection reads (64 KiB), uninitialized body
+read via `read_buf`+`take`, split large-frame writes (no header-prepend
+copy ≥ 16 KiB), amortized abort-handle pruning, `TCP_NODELAY` on accepted
+sockets.
+
+A1 closed-loop ceilings, 256 B echo (median of 3, rps):
+
+| conns | baseline | candidate | Δ |
+| --- | --- | --- | --- |
+| 1 | 33.7k (p50 0.72 ms) | 76.5k (p50 0.23 ms) | +127% |
+| 8 | 205.8k (p50 1.24 ms) | 204.5k (p50 1.22 ms) | ~0 (loadgen-bound) |
+| 64 | 162.6k (p50 12.7 ms) | 243.5k (p50 8.4 ms) | +50%, negative 8→64 scaling gone |
+
+A1 open-loop, 8 conns, 256 B:
+
+| rate | baseline p50/p99/max (ms) | candidate p50/p99/max (ms) |
+| --- | --- | --- |
+| 20k | 1.99 / 3.22 / 60.5 | 1.17 / 2.14 / 2.8 |
+| 100k | 2.27 / 3.31 / 51.3 | 1.39 / 2.31 / 6.3 |
+
+A2 closed-loop, 4 conns × pipeline 4 echo (rps): 64 KiB 41.3k→42.3k;
+1 MiB 4.09k→3.75k (box noise; echo-handler copy dominates);
+16 MiB 158→190 (+20%, p50 93→79 ms).
+
+Attribution (strace `-f -c`, 8 conns × pipeline 16, 256 B):
+recvfrom/request 4.0→0.29; sendto/request 1.0→1.0;
+host allocs/request ≈7.0→7.0 (unchanged; not a top cost).
+perf cycles:u — small path: `AbortHandle::is_finished` scan gone
+(3.5%→0); large path: `memset` of fresh body vectors gone (34.7%→0),
+encode `copy_within` gone; remaining memmove is the echo handler's own
+`reserve_output`+`extend_from_slice` copy plus BufReader drain.
+
+Robustness arms (behavior, not thresholds):
+
+- A3 slow reader holding 2×32 MiB echoes: victims p99 1.6 ms in both
+  builds; host retires the stalled generation (writer frame_deadline).
+- A4 greedy client (depth 512): victims p99 ≈2 ms, zero `server_busy`
+  on victims in both builds.
+- A5 ingress starvation (24×8 MiB sleeping bodies ≈ whole 192 MiB ingress
+  pool): victims' 256 B requests stall p50 898 ms (baseline) / 500 ms
+  (candidate); full immediate recovery after load stops in both.
+  KNOWN CEILING, unchanged by design: the shared FIFO ingress budget
+  head-of-line-blocks small frames behind large holders. Upgrade path if a
+  real multi-client deployment needs it: reserved small-frame sliver or
+  per-connection ingress sub-budgets.
+
+Deferred (measured but not changed): two task spawns + settlement
+machinery per request (~6% small-path cycles) — collapsing it reworks
+first-terminal-wins arbitration for single-digit gain; per-request alloc
+churn (~7 allocs/request) — below syscall/copy costs after this round.

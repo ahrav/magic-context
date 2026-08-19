@@ -107,7 +107,7 @@ pub struct HostShared<H> {
     pub handshake_permits: Arc<Semaphore>,
     pub connection_permits: Arc<Semaphore>,
     pub tracker: TaskTracker,
-    abort_handles: Mutex<Vec<AbortHandle>>,
+    abort_handles: Mutex<AbortRegistry>,
     pub shutdown: CancellationToken,
     pub draining: AtomicBool,
     pub fatal: FatalCell,
@@ -127,9 +127,8 @@ impl<H: McHostHandler> HostShared<H> {
         F::Output: Send + 'static,
     {
         let handle = self.tracker.spawn(future);
-        let mut aborts = self.abort_handles.lock().expect("abort lock");
-        aborts.retain(|h| !h.is_finished());
-        aborts.push(handle.abort_handle());
+        let mut registry = self.abort_handles.lock().expect("abort lock");
+        registry.prune_and_push(handle.abort_handle());
         handle
     }
 
@@ -188,9 +187,41 @@ impl<H: McHostHandler> HostShared<H> {
     }
 
     fn abort_all(&self) {
-        for handle in self.abort_handles.lock().expect("abort lock").iter() {
+        for handle in self
+            .abort_handles
+            .lock()
+            .expect("abort lock")
+            .handles
+            .iter()
+        {
             handle.abort();
         }
+    }
+}
+
+/// Pruning at doubling thresholds amortizes cleanup; finished handles remain
+/// until a registration reaches `prune_at`.
+struct AbortRegistry {
+    handles: Vec<AbortHandle>,
+    prune_at: usize,
+}
+
+const ABORT_PRUNE_FLOOR: usize = 64;
+
+impl AbortRegistry {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+            prune_at: ABORT_PRUNE_FLOOR,
+        }
+    }
+
+    fn prune_and_push(&mut self, handle: AbortHandle) {
+        if self.handles.len() >= self.prune_at {
+            self.handles.retain(|h| !h.is_finished());
+            self.prune_at = (self.handles.len() * 2).max(ABORT_PRUNE_FLOOR);
+        }
+        self.handles.push(handle);
     }
 }
 
@@ -470,7 +501,7 @@ pub async fn run<H: McHostHandler>(
         handshake_permits: Arc::new(Semaphore::new(config.limits.max_handshakes)),
         connection_permits: Arc::new(Semaphore::new(config.limits.max_connections)),
         tracker: TaskTracker::new(),
-        abort_handles: Mutex::new(Vec::new()),
+        abort_handles: Mutex::new(AbortRegistry::new()),
         shutdown: shutdown.clone(),
         draining: AtomicBool::new(false),
         fatal: FatalCell::new(),

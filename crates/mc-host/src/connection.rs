@@ -28,6 +28,8 @@ use crate::wire::{
     ReadClose, ReadEvent, WriterHandle,
 };
 
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+
 /// Key of one pending consumer request: (channel, epoch, correlation).
 /// Direction is implied — this map holds only consumer-originated requests;
 /// host Pings live in their own namespace (protocol §8.3, V43).
@@ -112,6 +114,7 @@ pub async fn run_connection<H: McHostHandler>(
     mut stream: TcpStream,
     handshake_permit: OwnedSemaphorePermit,
 ) {
+    let _ = stream.set_nodelay(true);
     let auth = subc_transport::authenticate_server(
         &mut stream,
         shared.auth_key.bytes(),
@@ -142,6 +145,7 @@ pub async fn run_connection<H: McHostHandler>(
     let gen_token = CancellationToken::new();
     let read_cancel = gen_token.child_token();
     let (read_half, write_half) = stream.into_split();
+    let read_half = tokio::io::BufReader::with_capacity(READ_BUFFER_BYTES, read_half);
     let (writer, writer_task) = crate::wire::spawn_writer_tracked(
         write_half,
         shared.limits.writer_queue_frames,
@@ -265,7 +269,7 @@ enum ReadExit {
 async fn read_loop<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> ReadExit {
     // Highest consumer Request correlation seen; any non-increasing Request
     // closes the generation before dispatch (protocol §8.3, V44).
@@ -611,6 +615,7 @@ async fn reserve_catalog_frame(
     .map_err(|_| ())?;
     Ok(OutboundFrame {
         bytes,
+        tail: Vec::new(),
         charge,
         written: None,
     })
@@ -723,6 +728,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         });
         let send = gen.writer.send(crate::wire::OutboundFrame {
             bytes,
+            tail: Vec::new(),
             charge: crate::wire::ByteCharge::none(),
             written: Some(written_hook),
         });

@@ -204,9 +204,9 @@ where
         }
     };
 
-    let mut body = vec![0u8; header.len as usize];
-    if !body.is_empty() {
-        read_exact_deadline(reader, &mut body, deadline, cancel).await?;
+    let mut body = Vec::with_capacity(header.len as usize);
+    if header.len > 0 {
+        read_body_deadline(reader, &mut body, header.len as usize, deadline, cancel).await?;
     }
 
     Ok(ReadEvent::Frame(InboundFrame {
@@ -274,6 +274,36 @@ where
             return Err(ReadClose::Corrupt("EOF inside frame"));
         }
         filled += read;
+    }
+    Ok(())
+}
+
+/// `read_buf` appends into `buf`'s spare capacity without zero-initializing
+/// it. `take` caps the read at the frame boundary even when the vector's
+/// allocated capacity exceeds `len`.
+async fn read_body_deadline<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    len: usize,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<(), ReadClose>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut limited = reader.take(len as u64);
+    while buf.len() < len {
+        let read = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(ReadClose::Cancelled),
+            result = timeout_at(deadline, limited.read_buf(buf)) => match result {
+                Ok(read) => read.map_err(ReadClose::Io)?,
+                Err(_) => return Err(ReadClose::Corrupt("frame deadline expired")),
+            },
+        };
+        if read == 0 {
+            return Err(ReadClose::Corrupt("EOF inside frame"));
+        }
     }
     Ok(())
 }
@@ -374,6 +404,37 @@ pub fn encode_owned_frame(
     Ok(body)
 }
 
+/// Bodies of at least this size use [`OutboundFrame::tail`] to avoid copying
+/// the body.
+const SPLIT_WRITE_MIN_BODY: usize = 16 * 1024;
+
+pub fn encode_split_frame(
+    ty: FrameType,
+    flags: Flags,
+    id: FrameId,
+    body: Vec<u8>,
+) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
+    if body.len() < SPLIT_WRITE_MIN_BODY {
+        return Ok((encode_owned_frame(ty, flags, id, body)?, Vec::new()));
+    }
+    let body_len = body.len();
+    if body_len > MAX_BODY_LEN as usize {
+        return Err(EncodeError { body_len });
+    }
+    let len = u32::try_from(body_len).map_err(|_| EncodeError { body_len })?;
+    let header = EnvelopeHeader {
+        len,
+        ver: subc_protocol::PROTOCOL_VERSION,
+        ty,
+        flags,
+        channel: id.channel,
+        epoch: id.epoch,
+        corr: id.corr,
+    }
+    .encode();
+    Ok((header.to_vec(), body))
+}
+
 /// Default flags for host-emitted body frames.
 pub fn response_flags(binary: bool, last: bool) -> Flags {
     Flags::new(binary, Priority::Interactive, last)
@@ -389,6 +450,9 @@ pub fn pure_header_flags() -> Flags {
 /// resident-byte charge until the bytes leave host memory.
 pub struct OutboundFrame {
     pub bytes: Vec<u8>,
+    /// Body bytes written after `bytes` when the encode path skipped the
+    /// header-prepend copy. Empty for fully encoded frames.
+    pub tail: Vec<u8>,
     pub charge: ByteCharge,
     /// Run by the writer task once the frame's bytes have fully reached the
     /// socket, receiving the instant `write_all` returned — captured before
@@ -549,6 +613,7 @@ where
             };
             let OutboundFrame {
                 bytes,
+                tail,
                 charge,
                 written,
             } = frame;
@@ -559,7 +624,13 @@ where
             let result = tokio::select! {
                 biased;
                 () = discard.cancelled() => None,
-                result = tokio::time::timeout(write_deadline, stream.write_all(&bytes)) => {
+                result = tokio::time::timeout(write_deadline, async {
+                    stream.write_all(&bytes).await?;
+                    if !tail.is_empty() {
+                        stream.write_all(&tail).await?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                }) => {
                     Some((result, Instant::now()))
                 }
             };
@@ -577,6 +648,7 @@ where
                 written(completed_at);
             }
             drop(bytes);
+            drop(tail);
             drop(charge);
         }
         // Dropping `rx` here frees any still-queued frames and their charges.
@@ -822,6 +894,7 @@ mod tests {
             handle
                 .send(OutboundFrame {
                     bytes: encoded,
+                    tail: Vec::new(),
                     charge: ByteCharge::none(),
                     written: None,
                 })
@@ -853,6 +926,7 @@ mod tests {
             handle
                 .send(OutboundFrame {
                     bytes,
+                    tail: Vec::new(),
                     charge: ByteCharge::none(),
                     written: None,
                 })
@@ -894,6 +968,7 @@ mod tests {
         handle
             .send(OutboundFrame {
                 bytes,
+                tail: Vec::new(),
                 charge,
                 written: None,
             })
@@ -914,6 +989,7 @@ mod tests {
         let (handle, task) = spawn_writer(server, 1, generation.clone(), Duration::from_secs(10));
         let frame = || OutboundFrame {
             bytes: vec![0; 1024],
+            tail: Vec::new(),
             charge: ByteCharge::none(),
             written: None,
         };
@@ -961,6 +1037,7 @@ mod tests {
         handle
             .send(OutboundFrame {
                 bytes,
+                tail: Vec::new(),
                 charge: ByteCharge::none(),
                 written: None,
             })
@@ -972,6 +1049,7 @@ mod tests {
         assert!(handle
             .send(OutboundFrame {
                 bytes: Vec::new(),
+                tail: Vec::new(),
                 charge: ByteCharge::none(),
                 written: None,
             })

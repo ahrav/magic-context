@@ -212,11 +212,12 @@ pub async fn emit_frame(
             },
         }
     };
-    let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
+    let (bytes, tail) = crate::wire::encode_split_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
         .send_before(
             OutboundFrame {
                 bytes,
+                tail,
                 charge,
                 written: None,
             },
@@ -245,11 +246,12 @@ async fn emit_reserved_frame(
         return Err(());
     }
     let (body, charge) = body.into_parts();
-    let bytes = encode_owned_frame(ty, flags, id, body).map_err(|_| ())?;
+    let (bytes, tail) = crate::wire::encode_split_frame(ty, flags, id, body).map_err(|_| ())?;
     gen.writer
         .send_before(
             OutboundFrame {
                 bytes,
+                tail,
                 charge,
                 written: None,
             },
@@ -529,6 +531,7 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
         .send_before(
             OutboundFrame {
                 bytes,
+                tail: Vec::new(),
                 charge,
                 written: Some(Box::new(move |_completed_at| {
                     let _ = written_tx.send(());
@@ -1151,6 +1154,7 @@ pub async fn send_connection_goodbye(gen: &GenerationCore) {
         .writer
         .send(OutboundFrame {
             bytes,
+            tail: Vec::new(),
             charge: crate::wire::ByteCharge::none(),
             written: None,
         })

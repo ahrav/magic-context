@@ -1,0 +1,44 @@
+RESULT label=A1-ceiling-c1-r1 loop=closed conns=1 payload=256 rate=0 pipeline=32 secs=15 sent=1146944 completed=1146944 measured=1032915 closed_early=0 inflight_full=35878 errors={}
+LATENCY_MS p50=0.227 p90=0.249 p99=0.430 p999=0.478 max=1.658 mean=0.230 sched_lag_p99=0.184 throughput_rps=76512
+RESULT label=A1-ceiling-c8-r1 loop=closed conns=8 payload=256 rate=0 pipeline=32 secs=15 sent=3055627 completed=3055627 measured=2724206 closed_early=0 inflight_full=1119682 errors={}
+LATENCY_MS p50=1.240 p90=1.649 p99=2.072 p999=2.503 max=5.966 mean=1.263 sched_lag_p99=0.223 throughput_rps=201793
+RESULT label=A1-ceiling-c64-r1 loop=closed conns=64 payload=256 rate=0 pipeline=32 secs=15 sent=3690138 completed=3688028 measured=3320138 closed_early=0 inflight_full=1768518 errors={"server_busy": 2110}
+LATENCY_MS p50=8.373 p90=11.242 p99=14.658 p999=18.135 max=26.517 mean=8.550 sched_lag_p99=1.807 throughput_rps=245936
+RESULT label=A1-ceiling-c1-r2 loop=closed conns=1 payload=256 rate=0 pipeline=32 secs=15 sent=1179810 completed=1179810 measured=1063979 closed_early=0 inflight_full=35533 errors={}
+LATENCY_MS p50=0.213 p90=0.243 p99=0.418 p999=0.473 max=1.358 mean=0.218 sched_lag_p99=0.169 throughput_rps=78813
+RESULT label=A1-ceiling-c8-r2 loop=closed conns=8 payload=256 rate=0 pipeline=32 secs=15 sent=3107266 completed=3107266 measured=2791964 closed_early=0 inflight_full=1125502 errors={}
+LATENCY_MS p50=1.206 p90=1.620 p99=2.043 p999=2.453 max=6.055 mean=1.231 sched_lag_p99=0.220 throughput_rps=206812
+RESULT label=A1-ceiling-c64-r2 loop=closed conns=64 payload=256 rate=0 pipeline=32 secs=15 sent=3619084 completed=3615058 measured=3255526 closed_early=0 inflight_full=1628975 errors={"server_busy": 4026}
+LATENCY_MS p50=8.494 p90=11.640 p99=15.591 p999=20.160 max=48.142 mean=8.712 sched_lag_p99=2.046 throughput_rps=241150
+RESULT label=A1-ceiling-c1-r3 loop=closed conns=1 payload=256 rate=0 pipeline=32 secs=15 sent=1143769 completed=1143769 measured=1029934 closed_early=0 inflight_full=35892 errors={}
+LATENCY_MS p50=0.228 p90=0.250 p99=0.431 p999=0.507 max=2.552 mean=0.231 sched_lag_p99=0.184 throughput_rps=76291
+RESULT label=A1-ceiling-c8-r3 loop=closed conns=8 payload=256 rate=0 pipeline=32 secs=15 sent=3088008 completed=3088008 measured=2760210 closed_early=0 inflight_full=1110066 errors={}
+LATENCY_MS p50=1.219 p90=1.632 p99=2.064 p999=2.562 max=10.457 mean=1.245 sched_lag_p99=0.223 throughput_rps=204460
+RESULT label=A1-ceiling-c64-r3 loop=closed conns=64 payload=256 rate=0 pipeline=32 secs=15 sent=3657329 completed=3653275 measured=3287519 closed_early=0 inflight_full=1680804 errors={"server_busy": 4054}
+LATENCY_MS p50=8.426 p90=11.447 p99=15.187 p999=18.966 max=26.708 mean=8.628 sched_lag_p99=1.933 throughput_rps=243520
+RESULT label=A1-open-c8-rate20000 loop=open conns=8 payload=256 rate=20000 pipeline=32 secs=20 sent=400000 completed=400000 measured=360000 closed_early=0 inflight_full=0 errors={}
+LATENCY_MS p50=1.170 p90=1.785 p99=2.137 p999=2.285 max=2.802 mean=1.178 sched_lag_p99=1.955 throughput_rps=20000
+RESULT label=A1-open-c8-rate100000 loop=open conns=8 payload=256 rate=100000 pipeline=32 secs=20 sent=2000000 completed=2000000 measured=1800000 closed_early=0 inflight_full=0 errors={}
+LATENCY_MS p50=1.389 p90=2.010 p99=2.305 p999=2.505 max=6.279 mean=1.408 sched_lag_p99=1.973 throughput_rps=100000
+RESULT label=A2-large-p65536 loop=closed conns=4 payload=65536 rate=0 pipeline=4 secs=15 sent=633775 completed=633775 measured=571579 closed_early=0 inflight_full=472238 errors={}
+LATENCY_MS p50=0.397 p90=0.557 p99=0.912 p999=1.810 max=5.670 mean=0.413 sched_lag_p99=0.308 throughput_rps=42339
+RESULT label=A2-large-p1048576 loop=closed conns=4 payload=1048576 rate=0 pipeline=4 secs=15 sent=56349 completed=56349 measured=50658 closed_early=0 inflight_full=38924 errors={}
+LATENCY_MS p50=4.366 p90=5.786 p99=7.131 p999=8.655 max=13.917 mean=4.404 sched_lag_p99=2.245 throughput_rps=3752
+RESULT label=A2-large-p16777216 loop=closed conns=4 payload=16777216 rate=0 pipeline=4 secs=15 sent=2827 completed=2827 measured=2571 closed_early=0 inflight_full=1315 errors={}
+LATENCY_MS p50=78.965 p90=99.657 p99=122.622 p999=135.678 max=149.704 mean=80.116 sched_lag_p99=20.262 throughput_rps=190
+RESULT label=A3-victims loop=open conns=8 payload=256 rate=2000 pipeline=32 secs=30 sent=60000 completed=60000 measured=54000 closed_early=0 inflight_full=0 errors={}
+LATENCY_MS p50=0.849 p90=1.428 p99=1.635 p999=1.659 max=2.052 mean=0.847 sched_lag_p99=1.582 throughput_rps=2000
+RESULT label=A5-victims loop=open conns=2 payload=256 rate=400 pipeline=32 secs=20 sent=8000 completed=8000 measured=7200 closed_early=0 inflight_full=0 errors={}
+LATENCY_MS p50=500.433 p90=1297.332 p99=1477.001 p999=1507.168 max=1517.154 mean=591.571 sched_lag_p99=1.661 throughput_rps=400
+RESULT label=A5-hogs loop=closed conns=3 payload=8388608 rate=0 pipeline=8 secs=25 sent=296 completed=296 measured=253 closed_early=0 inflight_full=237 errors={}
+LATENCY_MS p50=2025.561 p90=3522.658 p99=3970.399 p999=3986.667 max=3986.667 mean=2350.462 sched_lag_p99=1952.270 throughput_rps=11
+RESULT label=A5-recovery loop=open conns=2 payload=256 rate=400 pipeline=32 secs=10 sent=4000 completed=4000 measured=3600 closed_early=0 inflight_full=0 errors={}
+LATENCY_MS p50=1.132 p90=1.687 p99=1.871 p999=1.889 max=1.913 mean=1.133 sched_lag_p99=1.817 throughput_rps=400
+RESULT label=ATTR-strace loop=closed conns=8 payload=256 rate=0 pipeline=16 secs=10 sent=254864 completed=254864 measured=227638 closed_early=0 inflight_full=254702 errors={}
+LATENCY_MS p50=5.090 p90=6.632 p99=11.234 p999=25.731 max=52.929 mean=5.364 sched_lag_p99=0.961 throughput_rps=25293
+RESULT label=ATTR-perf-warm loop=closed conns=8 payload=256 rate=0 pipeline=32 secs=3 sent=624097 completed=624097 measured=558756 closed_early=0 inflight_full=221747 errors={}
+LATENCY_MS p50=1.204 p90=1.623 p99=2.068 p999=2.529 max=6.586 mean=1.229 sched_lag_p99=0.225 throughput_rps=206947
+RESULT label=ATTR-perf-small loop=closed conns=8 payload=256 rate=0 pipeline=32 secs=12 sent=1840056 completed=1840056 measured=1673981 closed_early=0 inflight_full=614812 errors={}
+LATENCY_MS p50=1.583 p90=2.422 p99=3.292 p999=4.096 max=6.405 mean=1.648 sched_lag_p99=0.405 throughput_rps=154998
+RESULT label=ATTR-perf-large loop=closed conns=4 payload=1048576 rate=0 pipeline=4 secs=12 sent=44209 completed=44209 measured=39787 closed_early=0 inflight_full=30079 errors={}
+LATENCY_MS p50=4.457 p90=5.949 p99=7.407 p999=9.040 max=15.806 mean=4.501 sched_lag_p99=2.442 throughput_rps=3684
