@@ -5,7 +5,11 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
-import { _resetAutoSearchCache, runAutoSearchHint } from "./auto-search-runner";
+import {
+    _resetAutoSearchCache,
+    executeAutoSearchDelivery,
+    runAutoSearchHint,
+} from "./auto-search-runner";
 import type { MessageLike } from "./transform-operations";
 
 function makeUserMsg(id: string, text: string): MessageLike {
@@ -604,6 +608,185 @@ describe("auto-search-runner", () => {
             // …and the ignored announcement is NOT.
             expect(capturedQuery ?? "").not.toContain("Magic Context");
             expect(capturedQuery ?? "").not.toContain("announcement bullet");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});
+
+describe("executeAutoSearchDelivery", () => {
+    let db: Database;
+    const deliveryArgs = (
+        overrides: Partial<Parameters<typeof executeAutoSearchDelivery>[0]> = {},
+    ) => ({
+        db,
+        sessionId: "s-delivery",
+        projectPath: "git:test",
+        prompt: "please explain how the historian decides when to run",
+        searchOptions: { limit: 3 },
+        scoreThreshold: 0.6,
+        ...overrides,
+    });
+
+    beforeEach(() => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        runMigrations(db);
+    });
+
+    afterEach(() => {
+        closeQuietly(db);
+    });
+
+    test("delivered outcome carries hint text plus the results whose fragments packed", async () => {
+        const results = [
+            {
+                source: "memory",
+                content: "install.sh uses bunx without --bun flag",
+                score: 0.9,
+                memoryId: 1,
+                category: "ARCHITECTURE_DECISIONS",
+                matchType: "hybrid",
+            },
+        ] as Awaited<ReturnType<typeof searchModule.unifiedSearch>>;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("delivered");
+            expect(delivery.hintText).toStartWith("<ctx-search-hint>");
+            expect(delivery.prePack).toEqual(results);
+            expect(delivery.delivered).toEqual(results);
+            expect(delivery.omittedCount).toBe(0);
+            expect(delivery.tokenCount).toBeGreaterThan(0);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("below-threshold is a completed empty delivery that retains the pre-pack ranking", async () => {
+        const results = [
+            {
+                source: "memory",
+                content: "weak match",
+                score: 0.2,
+                memoryId: 2,
+                category: "ARCHITECTURE_DECISIONS",
+                matchType: "fts",
+            },
+        ] as Awaited<ReturnType<typeof searchModule.unifiedSearch>>;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("below-threshold");
+            expect(delivery.hintText).toBeNull();
+            expect(delivery.prePack).toEqual(results);
+            expect(delivery.delivered).toEqual([]);
+            expect(delivery.tokenCount).toBe(0);
+            expect(delivery.omittedCount).toBe(1);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("empty results are a completed empty delivery", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("empty");
+            expect(delivery.delivered).toEqual([]);
+            expect(delivery.prePack).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("a packer that emits no hint is a completed empty delivery", async () => {
+        const results = [
+            {
+                source: "memory",
+                content: "   ",
+                score: 0.9,
+                memoryId: 3,
+                category: "ARCHITECTURE_DECISIONS",
+                matchType: "fts",
+            },
+        ] as Awaited<ReturnType<typeof searchModule.unifiedSearch>>;
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("packer-empty");
+            expect(delivery.hintText).toBeNull();
+            expect(delivery.prePack).toEqual(results);
+            expect(delivery.delivered).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("timeout is a completed empty delivery with a deadline reason (AE8)", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            () => new Promise(() => {}) as unknown as ReturnType<typeof searchModule.unifiedSearch>,
+        );
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs({ timeoutMs: 50 }));
+            expect(delivery.status).toBe("complete");
+            if (delivery.status !== "complete") return;
+            expect(delivery.reason).toBe("timeout");
+            expect(delivery.hintText).toBeNull();
+            expect(delivery.delivered).toEqual([]);
+            expect(delivery.prePack).toEqual([]);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("search failure is incomplete evidence, not an empty ranking (AE8)", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("embedding endpoint down");
+        });
+        try {
+            const delivery = await executeAutoSearchDelivery(deliveryArgs());
+            expect(delivery.status).toBe("incomplete");
+            if (delivery.status !== "incomplete") return;
+            expect(delivery.kind).toBe("search-failure");
+            expect(delivery.error).toBeInstanceOf(Error);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("runAutoSearchHint reports search failure as a retryable non-ok outcome", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("embedding endpoint down");
+        });
+        try {
+            const messages: MessageLike[] = [
+                makeUserMsg("u-fail", "a long enough prompt to pass the minPromptChars gate"),
+            ];
+            const outcome = await runAutoSearchHint({
+                sessionId: "s-fail",
+                db,
+                messages,
+                options: {
+                    enabled: true,
+                    scoreThreshold: 0.6,
+                    minPromptChars: 20,
+                    projectPath: "git:test",
+                    memoryEnabled: true,
+                    embeddingEnabled: true,
+                    gitCommitsEnabled: true,
+                },
+            });
+            expect(outcome).toEqual({ ok: false, kind: "search-failure" });
+            expect(findUserPromptText(messages[0])).not.toContain("<ctx-search-hint>");
         } finally {
             spy.mockRestore();
         }

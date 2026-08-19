@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import type { VectorLoadObserver } from "./search-trace";
 
 export const PRIMER_CANDIDATE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 export const PRIMER_CANDIDATE_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
@@ -412,7 +413,11 @@ export function countPrimerCandidatesForProject(db: Database, projectPath: strin
     return row?.count ?? 0;
 }
 
-export function getActivePrimers(db: Database, projectPath: string): Primer[] {
+export function getActivePrimers(
+    db: Database,
+    projectPath: string,
+    onVectorLoad?: VectorLoadObserver,
+): Primer[] {
     const rows = db
         .prepare(
             `SELECT * FROM primers
@@ -420,7 +425,18 @@ export function getActivePrimers(db: Database, projectPath: string): Primer[] {
              ORDER BY COALESCE(last_observed_at, created_at) DESC, id ASC`,
         )
         .all(projectPath) as PrimerRow[];
-    return rows.map(toPrimer);
+    const primers = rows.map(toPrimer);
+    if (onVectorLoad) {
+        let decodedBytes = 0;
+        let vectorCount = 0;
+        for (const primer of primers) {
+            if (!primer.questionEmbedding) continue;
+            decodedBytes += primer.questionEmbedding.byteLength;
+            vectorCount += 1;
+        }
+        onVectorLoad({ decodedBytes, cachedBytes: 0, vectorCount, cacheHit: false });
+    }
+    return primers;
 }
 
 export function getAllPrimers(db: Database, projectPath?: string): Primer[] {

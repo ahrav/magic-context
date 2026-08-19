@@ -35,7 +35,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { buildAutoSearchHint } from "./auto-search-hint";
+import { packAutoSearchHint } from "./auto-search-hint";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -92,6 +92,112 @@ export type AutoSearchOutcome =
     | { ok: false; kind: "timeout" | "search-failure" | "cas-exhaustion" };
 
 const AUTO_SEARCH_OK: AutoSearchOutcome = { ok: true };
+
+export type AutoSearchDeliveryReason =
+    | "delivered"
+    | "empty"
+    | "below-threshold"
+    | "packer-empty"
+    | "timeout";
+
+/** Below-threshold, empty, packer-empty, and timeout are completed
+ *  empty-delivery outcomes. Search failures are incomplete evidence, not
+ *  empty rankings. The delivered variant carries a non-null hint by
+ *  construction (the packer-empty branch already rejected a null pack), so
+ *  consumers need no defensive null re-check after discriminating on
+ *  `reason`. */
+export type AutoSearchDelivery =
+    | {
+          status: "complete";
+          reason: "delivered";
+          hintText: string;
+          prePack: UnifiedSearchResult[];
+          delivered: UnifiedSearchResult[];
+          tokenCount: number;
+          omittedCount: number;
+      }
+    | {
+          status: "complete";
+          reason: Exclude<AutoSearchDeliveryReason, "delivered">;
+          hintText: null;
+          prePack: UnifiedSearchResult[];
+          delivered: UnifiedSearchResult[];
+          tokenCount: number;
+          omittedCount: number;
+      }
+    | { status: "incomplete"; kind: "search-failure"; error: unknown };
+
+function emptyDelivery(
+    reason: Exclude<AutoSearchDeliveryReason, "delivered">,
+    prePack: UnifiedSearchResult[],
+): AutoSearchDelivery {
+    return {
+        status: "complete",
+        reason,
+        hintText: null,
+        prePack,
+        delivered: [],
+        tokenCount: 0,
+        omittedCount: prePack.length,
+    };
+}
+
+/**
+ * `runAutoSearchHint` delegates here, so structured callers observe the same
+ * source restrictions, timeout, and packing the transform applies.
+ * Persistence and message mutation stay with the transform caller.
+ */
+export async function executeAutoSearchDelivery(args: {
+    db: Database;
+    sessionId: string;
+    projectPath: string;
+    prompt: string;
+    searchOptions: UnifiedSearchOptions;
+    scoreThreshold: number;
+    timeoutMs?: number;
+    /** Reference clock for hint age wording (defaults to the live clock);
+     *  the benchmark injects the scenario's fixed reference time. */
+    packNowMs?: number;
+}): Promise<AutoSearchDelivery> {
+    let results: UnifiedSearchResult[] | null;
+    try {
+        results = await unifiedSearchWithTimeout(
+            args.db,
+            args.sessionId,
+            args.projectPath,
+            args.prompt,
+            args.searchOptions,
+            args.timeoutMs ?? AUTO_SEARCH_TIMEOUT_MS,
+        );
+    } catch (error) {
+        return { status: "incomplete", kind: "search-failure", error };
+    }
+    if (results === null) {
+        return emptyDelivery("timeout", []);
+    }
+    if (results.length === 0) {
+        return emptyDelivery("empty", results);
+    }
+    if (results[0].score < args.scoreThreshold) {
+        return emptyDelivery("below-threshold", results);
+    }
+    const packed = packAutoSearchHint(
+        results,
+        args.packNowMs === undefined ? {} : { nowMs: args.packNowMs },
+    );
+    if (packed.text === null) {
+        return emptyDelivery("packer-empty", results);
+    }
+    return {
+        status: "complete",
+        reason: "delivered",
+        hintText: packed.text,
+        prePack: results,
+        delivered: packed.delivered,
+        tokenCount: packed.tokenCount,
+        omittedCount: packed.omittedCount,
+    };
+}
 
 export interface AutoSearchRunnerOptions {
     enabled: boolean;
@@ -243,7 +349,7 @@ export async function runAutoSearchHint(args: {
         return writeNoHintAndReconcile("too-short");
     }
 
-    let results: UnifiedSearchResult[] | null;
+    let delivery: AutoSearchDelivery;
     try {
         if (options.directory) {
             await options.ensureProjectRegistered?.(options.directory, db);
@@ -278,25 +384,29 @@ export async function runAutoSearchHint(args: {
             // and dashboard only, never transform-time auto-search prompt hints.
             sources: [...AUTO_SEARCH_SOURCES],
         };
-        results = await unifiedSearchWithTimeout(
+        delivery = await executeAutoSearchDelivery({
             db,
             sessionId,
-            options.projectPath,
-            rawPrompt,
+            projectPath: options.projectPath,
+            prompt: rawPrompt,
             searchOptions,
-            AUTO_SEARCH_TIMEOUT_MS,
-        );
+            scoreThreshold: options.scoreThreshold,
+        });
     } catch (error) {
+        delivery = { status: "incomplete", kind: "search-failure", error };
+    }
+
+    if (delivery.status === "incomplete") {
         // Retryable failure — do NOT persist a permanent no-hint decision, or the
         // hint would be suppressed forever for this message even though the next
         // pass might succeed. Just skip this pass; a later pass re-evaluates.
         log(
-            `[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${error instanceof Error ? error.message : String(error)}`,
+            `[auto-search] unified search failed for session ${sessionId} (will retry next pass): ${delivery.error instanceof Error ? delivery.error.message : String(delivery.error)}`,
         );
         return { ok: false, kind: "search-failure" };
     }
 
-    if (results === null) {
+    if (delivery.reason === "timeout") {
         // Timeout is also retryable — skip without persisting a no-hint decision.
         sessionLog(
             sessionId,
@@ -305,10 +415,11 @@ export async function runAutoSearchHint(args: {
         return { ok: false, kind: "timeout" };
     }
 
-    if (results.length === 0) {
+    const results = delivery.prePack;
+    if (delivery.reason === "empty" || delivery.reason === "packer-empty") {
         return writeNoHintAndReconcile("empty");
     }
-    if (results[0].score < options.scoreThreshold) {
+    if (delivery.reason === "below-threshold") {
         sessionLog(
             sessionId,
             `auto-search: top score ${results[0].score.toFixed(3)} below threshold ${options.scoreThreshold}`,
@@ -316,10 +427,9 @@ export async function runAutoSearchHint(args: {
         return writeNoHintAndReconcile("below-threshold");
     }
 
-    const hintText = buildAutoSearchHint(results);
-    if (!hintText) {
-        return writeNoHintAndReconcile("empty");
-    }
+    // All non-delivered reasons returned above, so the type system proves
+    // hintText is a non-null string here.
+    const hintText = delivery.hintText;
 
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.

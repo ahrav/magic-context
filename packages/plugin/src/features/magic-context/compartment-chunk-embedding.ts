@@ -5,6 +5,7 @@ import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { recursiveCharacterSplit } from "./recursive-text-splitter";
+import type { VectorLoadObserver } from "./search-trace";
 
 export const DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
 
@@ -340,7 +341,13 @@ function invalidateDecodedSearchPools(
     const pool = decodedSearchPools.get(db);
     if (!pool) return;
     for (const [key, entry] of [...pool.entries()]) {
-        const parsed = JSON.parse(key) as [string, string, string];
+        let parsed: [string, string, string];
+        try {
+            parsed = JSON.parse(key) as [string, string, string];
+        } catch {
+            removeDecodedSearchPoolEntry(entry);
+            continue;
+        }
         if (predicate(parsed)) removeDecodedSearchPoolEntry(entry);
     }
 }
@@ -802,11 +809,25 @@ export function replaceCompartmentChunkEmbeddings(
     );
 }
 
+function searchPoolVectorBytes(rows: readonly StoredCompartmentChunkEmbedding[]): number {
+    let bytes = 0;
+    for (const row of rows) {
+        bytes += row.vector.byteLength;
+    }
+    return bytes;
+}
+
 export function loadCompartmentChunkEmbeddingsForSearch(
     db: Database,
     sessionId: string,
     projectPath: string,
     modelId: string,
+    onVectorLoad?: VectorLoadObserver,
+    /** Ordinal cutoff the caller applies before comparing vectors. Warm
+     *  touched-byte evidence counts only rows the search can actually
+     *  compare; the cold decode below still reports the whole pool, since
+     *  a cache miss genuinely decodes everything. */
+    touchedMaxOrdinal?: number | null,
 ): StoredCompartmentChunkEmbedding[] {
     if (!modelId) {
         throw new Error("loadCompartmentChunkEmbeddingsForSearch requires a current model id");
@@ -821,6 +842,18 @@ export function loadCompartmentChunkEmbeddingsForSearch(
     const cached = pool.get(key);
     if (cached && cached.rowCount === rowCount && cached.maxRowId === maxRowId) {
         touchDecodedSearchPoolEntry(cached);
+        if (onVectorLoad) {
+            const touched =
+                touchedMaxOrdinal == null
+                    ? cached.rows
+                    : cached.rows.filter((row) => row.endOrdinal <= touchedMaxOrdinal);
+            onVectorLoad({
+                decodedBytes: 0,
+                cachedBytes: searchPoolVectorBytes(touched),
+                vectorCount: touched.length,
+                cacheHit: true,
+            });
+        }
         return cached.rows;
     }
     if (cached) removeDecodedSearchPoolEntry(cached);
@@ -861,6 +894,12 @@ export function loadCompartmentChunkEmbeddingsForSearch(
             vector: toFloat32Array(row.vector),
         }));
     cacheDecodedSearchPool(pool, key, rowCount, maxRowId, decodedRows);
+    onVectorLoad?.({
+        decodedBytes: searchPoolVectorBytes(decodedRows),
+        cachedBytes: 0,
+        vectorCount: decodedRows.length,
+        cacheHit: false,
+    });
     return decodedRows;
 }
 

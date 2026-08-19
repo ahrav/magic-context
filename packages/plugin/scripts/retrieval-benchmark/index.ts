@@ -8,10 +8,14 @@
  * code is reachable from this module.
  */
 
-import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { canonicalFingerprint, canonicalJson } from "./canonical-json";
+import {
+    canonicalFingerprint,
+    canonicalJson,
+    readCanonicalJsonFile,
+} from "./canonical-json";
 import {
     type CorpusArtifact,
     ContractError,
@@ -99,28 +103,10 @@ export const RELEASE_FILES = {
 } as const;
 
 function readJson(dir: string, name: string): unknown {
-    let text: string;
-    try {
-        text = readFileSync(join(dir, name), "utf8");
-    } catch {
-        throw new ContractError([`release.${name}: unreadable`]);
-    }
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(text);
-    } catch {
-        throw new ContractError([`release.${name}: invalid-json`]);
-    }
-    // The parsed view must account for every byte on disk. JSON.parse keeps
-    // the LAST of duplicate object members, so a duplicated key could hide
-    // sensitive plaintext in the file bytes while the scan, schema, and
-    // recomputed fingerprints all see only the clean survivor. Requiring the
-    // exact promoter serialization (stringify + trailing newline) makes any
-    // dropped or reformatted byte a rejection.
-    if (`${JSON.stringify(parsed, null, 2)}\n` !== text) {
-        throw new ContractError([`release.${name}: non-canonical-bytes`]);
-    }
-    return parsed;
+    return readCanonicalJsonFile(
+        join(dir, name),
+        (code) => new ContractError([`release.${name}: ${code}`]),
+    );
 }
 
 /**

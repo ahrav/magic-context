@@ -61,4 +61,9 @@ export interface MemoryInput {
     sourceType?: MemorySourceType;
     expiresAt?: number | null;
     metadataJson?: string | null;
+    /** Injected insert clock (defaults to the live clock). Deterministic
+     *  fixture seeding pins it so identical seeds produce identical row
+     *  bytes; the v80 telemetry freeze forbids rewriting these columns
+     *  after insert. */
+    nowMs?: number;
 }

@@ -12,7 +12,9 @@ import {
     prepareExplicitQuery,
 } from "../../src/features/magic-context/search-bounds";
 import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
-import { normalizeQueryText } from "../../src/features/magic-context/storage-embedding-measurements";
+import { normalizeMemoryContent } from "../../src/features/magic-context/memory/normalize-hash";
+import { normalizeQueryText } from "../../src/features/magic-context/query-normalization";
+import { parseIdShapedQuery } from "../../src/features/magic-context/search-bounds";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -23,6 +25,24 @@ import { canonicalFingerprint } from "./canonical-json";
 import { dialectNamespace, relevanceIdentity } from "./identity";
 
 export const CORPUS_SCHEMA_VERSION = "retrieval-benchmark-corpus/v1";
+
+/** Canonical-decimal numeric locator production can actually emit: SQLite
+ *  AUTOINCREMENT ids start at 1 (so "0" is never producible — the cursor
+ *  advance would set sqlite_sequence to -1 and the emitted row would come
+ *  back as id 1), the value must be a safe integer (seeding subtracts from
+ *  and sorts it as a JS number), and production interpolates the id
+ *  through a JS number, so it must survive a Number -> String round-trip
+ *  byte-exactly (rejects "042" and ids above MAX_SAFE_INTEGER). One
+ *  predicate shared by corpus validation and seeding so both gates agree
+ *  on producibility. */
+export function isProducibleNumericLocator(locator: string): boolean {
+    const numeric = Number(locator);
+    return (
+        /^[1-9]\d*$/.test(locator) &&
+        Number.isSafeInteger(numeric) &&
+        String(numeric) === locator
+    );
+}
 export const JUDGMENTS_SCHEMA_VERSION = "retrieval-benchmark-judgments/v1";
 export const SYNTHETIC_SCHEMA_VERSION = "retrieval-benchmark-synthetic/v1";
 export const MANIFEST_SCHEMA_VERSION = "retrieval-benchmark-manifest/v1";
@@ -223,7 +243,7 @@ export class ContractError extends Error {
 
 /** Path + code only — never the offending value (privacy: diagnostics are an
  *  output channel too). */
-function formatIssues(artifact: string, error: z.ZodError): string[] {
+export function formatIssues(artifact: string, error: z.ZodError): string[] {
     return error.issues
         .map((issue) => `${artifact}.${issue.path.join(".")}: ${issue.code}`)
         .sort();
@@ -269,6 +289,13 @@ export function parseCorpus(value: unknown): CorpusArtifact {
             if (!prepared.ok || prepared.query.length === 0) {
                 diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
             }
+            // Production explicit search short-circuits ID-shaped queries
+            // (`9101`, `#9101`) to a direct lookup that never touches
+            // unified retrieval; benchmarking them through unifiedSearch
+            // would report a miss the real tool answers.
+            if (parseIdShapedQuery(query.queryText) !== null) {
+                diagnostics.push(`corpus.queries[${i}].queryText: id-shaped-bypasses-retrieval`);
+            }
         } else {
             // The LIVE extractor, not only the bounds preflight: the
             // automatic path strips plugin markup and collapses whitespace,
@@ -313,6 +340,7 @@ export function parseCorpus(value: unknown): CorpusArtifact {
     }
     const documentIds = new Set<string>();
     const documentByIdentity = new Map<string, number>();
+    const memoryByNormalizedContent = new Map<string, number>();
     for (const [i, doc] of corpus.documents.entries()) {
         if (documentIds.has(doc.id)) diagnostics.push(`corpus.documents[${i}].id: duplicate`);
         documentIds.add(doc.id);
@@ -327,6 +355,30 @@ export function parseCorpus(value: unknown): CorpusArtifact {
             diagnostics.push(`corpus.documents[${i}].semanticPayload: duplicate-identity`);
         } else {
             documentByIdentity.set(identity, i);
+        }
+        // The memories table enforces UNIQUE(project_path, category,
+        // normalized_hash), reviewed memories all seed under one category,
+        // and normalization collapses case and whitespace — so two memory
+        // documents that pass the exact-byte identity check above can still
+        // collide at insert time with a raw SQLite constraint error. Reject
+        // the collision here, where it is diagnosable.
+        if (doc.kind === "memory") {
+            const normalized = normalizeMemoryContent(
+                `${doc.semanticPayload.title} ${doc.semanticPayload.body}`,
+            );
+            for (const alias of doc.aliases) {
+                // Only production-producible memory aliases insert rows;
+                // evaluation-only namespaces never reach the table.
+                if (alias.namespace !== SOURCE_LOCATOR_KIND.memory) continue;
+                const key = `${alias.projectScope}\u0000${normalized}`;
+                if (memoryByNormalizedContent.has(key)) {
+                    diagnostics.push(
+                        `corpus.documents[${i}].semanticPayload: duplicate-normalized-memory-content`,
+                    );
+                } else {
+                    memoryByNormalizedContent.set(key, i);
+                }
+            }
         }
     }
     if (diagnostics.length > 0) throw new ContractError(diagnostics.sort());
@@ -659,17 +711,10 @@ export function validateRelease(corpus: CorpusArtifact, judgments: JudgmentsArti
                     document.kind === "compartment" ||
                     document.kind === "primer" ||
                     document.kind === "note";
-                // Canonical decimal AND exactly representable: production
-                // interpolates the numeric id through a JS number, so
-                // `memory:042` and `memory:9007199254740993` (above
-                // MAX_SAFE_INTEGER, rounds on read) can never byte-match an
-                // emitted locator. Number->String round-trip covers both.
                 const producible = reachableAliases.filter(
                     (alias) =>
                         alias.namespace === producibleNamespace &&
-                        (!numericLocator ||
-                            (/^\d+$/.test(alias.locator) &&
-                                String(Number(alias.locator)) === alias.locator)),
+                        (!numericLocator || isProducibleNumericLocator(alias.locator)),
                 );
                 if (producible.length === 0) {
                     diagnostics.push(

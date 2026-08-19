@@ -14,6 +14,7 @@ import type { Database, Statement as PreparedStatement } from "../../../shared/s
 import { cosineSimilarity } from "../memory/cosine-similarity";
 import { sanitizeFtsQuery } from "../memory/storage-memory-fts";
 import { MAX_LANE_CANDIDATES } from "../search-bounds";
+import type { HybridLaneStageMarks, VectorLoadObserver } from "../search-trace";
 import { loadProjectCommitEmbeddings } from "./storage-git-commit-embeddings";
 import type { StoredGitCommit } from "./storage-git-commits";
 
@@ -120,6 +121,10 @@ export interface SearchGitCommitsOptions {
     queryEmbedding?: Float32Array | null;
     /** ID of the model that generated queryEmbedding; commit vectors are read only from the same model space. */
     queryModelId?: string | null;
+    /** Receives the decoded commit-vector byte counts when the semantic pass loads embeddings. */
+    onVectorLoad?: VectorLoadObserver;
+    /** Trace phase boundaries for the lexical, semantic, and fusion passes. */
+    stages?: HybridLaneStageMarks;
 }
 
 function clamp01(value: number): number {
@@ -197,6 +202,7 @@ export function searchGitCommitsSync(
         };
 
         // ---- FTS pass ---------------------------------------------------
+        options.stages?.lexicalStart();
         const lexicalRows: CandidateRow[] = [];
         const sanitized = sanitizeFtsQuery(trimmed);
         if (sanitized.length > 0) {
@@ -230,10 +236,17 @@ export function searchGitCommitsSync(
             const candidate = addCandidate(row.sha, row.committed_at);
             if (candidate.ftsScore === undefined) candidate.ftsScore = 1 / (rank + 1);
         });
+        options.stages?.lexicalEnd(lexicalRows.length);
 
         // ---- Semantic pass ----------------------------------------------
         if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
-            const embeddings = loadProjectCommitEmbeddings(db, projectPath, options.queryModelId);
+            options.stages?.vectorStart();
+            const embeddings = loadProjectCommitEmbeddings(
+                db,
+                projectPath,
+                options.queryModelId,
+                options.onVectorLoad,
+            );
             // Brute-force scoring must visit every cached vector, but only the
             // strongest fetchLimit similarities may join the candidate pool so
             // fusion, scoring, and the final sort are bounded by the lane cap
@@ -254,9 +267,13 @@ export function searchGitCommitsSync(
                 const candidate = addCandidate(hit.sha, hit.committedAtMs);
                 candidate.semanticScore = hit.similarity;
             }
+            options.stages?.vectorEnd(Math.min(semanticHits.length, fetchLimit));
+        } else {
+            options.stages?.vectorSkipped();
         }
 
         // ---- Select top-K before any metadata read ----------------------
+        options.stages?.fusionStart();
         const scored: ScoredCandidate[] = [];
         for (const candidate of candidates.values()) {
             const entry = scoreCandidate(candidate, weights);
@@ -271,7 +288,10 @@ export function searchGitCommitsSync(
             return left.candidate.ordinal - right.candidate.ordinal;
         });
         const selected = scored.slice(0, limit);
-        if (selected.length === 0) return [];
+        if (selected.length === 0) {
+            options.stages?.fusionEnd(candidates.size, 0);
+            return [];
+        }
 
         // ---- Hydrate only the winners -----------------------------------
         const rows = getBySHAsStatement(db).all(
@@ -287,6 +307,7 @@ export function searchGitCommitsSync(
             if (!commit) continue;
             hits.push({ commit, score: entry.score, matchType: entry.matchType });
         }
+        options.stages?.fusionEnd(candidates.size, hits.length);
         return hits;
     })();
 }

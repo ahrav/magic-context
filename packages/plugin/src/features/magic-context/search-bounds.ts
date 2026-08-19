@@ -29,6 +29,12 @@ export const DEFAULT_SEARCH_RESULT_LIMIT = 10;
 export const MAX_SEARCH_RESULT_LIMIT = 50;
 /** R37: ceiling on each bounded lexical/probe fetch and post-score lane output. */
 export const MAX_LANE_CANDIDATES = 150;
+/** KTD7: ceiling on a caller-requested per-lane candidate depth. Must stay
+ *  at or below MAX_LANE_CANDIDATES: pruneToLaneCeiling truncates lanes at
+ *  that bound, so tightening it below this value would silently cut an
+ *  already-validated candidateDepth. The benchmark's profile K axis pins
+ *  its maximum endpoint to this constant. */
+export const MAX_CANDIDATE_DEPTH = 100;
 /** Ceiling on the estimated tokens of one explicit search response. */
 export const MAX_RENDERED_RESULT_TOKENS = 4096;
 /** Ceiling on the estimated tokens of one automatic search hint. */
@@ -119,6 +125,34 @@ export function prepareExplicitQuery(raw: string): ExplicitQueryPreparation {
         return { ok: false, violation: "tokens", limit: MAX_QUERY_TOKENS, actual: tokens };
     }
     return { ok: true, query: trimmed };
+}
+
+export class CandidateDepthError extends Error {
+    readonly requested: number;
+
+    constructor(requested: number) {
+        super(
+            `candidate depth must be an integer between 1 and ${MAX_CANDIDATE_DEPTH}, got ${requested}`,
+        );
+        this.name = "CandidateDepthError";
+        this.requested = requested;
+    }
+}
+
+/** Rejects invalid depths instead of clamping them, so callers cannot receive a value different from the requested depth. */
+export function normalizeCandidateDepth(depth?: number): number | null {
+    if (depth === undefined) {
+        return null;
+    }
+    if (
+        typeof depth !== "number" ||
+        !Number.isInteger(depth) ||
+        depth < 1 ||
+        depth > MAX_CANDIDATE_DEPTH
+    ) {
+        throw new CandidateDepthError(depth);
+    }
+    return depth;
 }
 
 /** Longest prefix of `text` whose UTF-8 encoding is at most `maxBytes`,
@@ -221,4 +255,39 @@ export function normalizeSearchResultLimit(limit?: number): number {
         return DEFAULT_SEARCH_RESULT_LIMIT;
     }
     return Math.min(MAX_SEARCH_RESULT_LIMIT, Math.max(1, Math.floor(limit)));
+}
+
+// ID-shaped short-circuit: when the whole trimmed query is one memory id (with
+// or without a leading `#`) or a comma/space-separated list of up to
+// `ID_SHAPED_QUERY_MAX_TOKENS` such tokens, we treat it as a direct id lookup.
+// Anything else — `"fix bug 1234"`, a quoted sentence containing a number — is
+// left alone so the normal lexical+semantic lanes still run. Reused by
+// ctx_search, the benchmark corpus validator, and any future consumer that
+// needs to decide whether a query should bypass the normal search pipeline.
+export const ID_SHAPED_QUERY_MAX_TOKENS = 5;
+// Matches one ID token: an optional leading `#` followed by one or more digits.
+// The `+` requires at least one digit, so a bare `#` does not match.
+const ID_SHAPED_TOKEN = /^#?\d+$/;
+
+export function parseIdShapedQuery(query: string): number[] | null {
+    const trimmed = query.trim();
+    if (trimmed.length === 0) {
+        return null;
+    }
+    const tokens = trimmed.split(/[\s,]+/).filter((token) => token.length > 0);
+    if (tokens.length === 0 || tokens.length > ID_SHAPED_QUERY_MAX_TOKENS) {
+        return null;
+    }
+    const ids: number[] = [];
+    for (const token of tokens) {
+        if (!ID_SHAPED_TOKEN.test(token)) {
+            return null;
+        }
+        const parsed = Number.parseInt(token.replace(/^#/, ""), 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            return null;
+        }
+        ids.push(parsed);
+    }
+    return ids;
 }

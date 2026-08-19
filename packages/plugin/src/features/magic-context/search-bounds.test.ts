@@ -1,13 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import { estimateTokens } from "../../shared/token-estimator";
 import {
+    CandidateDepthError,
     countQueryAtoms,
     DEFAULT_SEARCH_RESULT_LIMIT,
     describeQueryBoundsViolation,
+    MAX_CANDIDATE_DEPTH,
     MAX_QUERY_ATOMS,
     MAX_QUERY_BYTES,
     MAX_QUERY_TOKENS,
     MAX_SEARCH_RESULT_LIMIT,
+    normalizeCandidateDepth,
     normalizeSearchResultLimit,
     prepareAutomaticQuery,
     prepareExplicitQuery,
@@ -214,6 +217,38 @@ describe("truncateUtf8Bytes", () => {
         const cut = truncateUtf8Bytes("🎉🎉🎉", 6);
         expect(cut).toBe("🎉");
         expect(isValidUnicode(cut)).toBe(true);
+    });
+});
+
+describe("normalizeCandidateDepth", () => {
+    it("returns null for a missing request", () => {
+        expect(normalizeCandidateDepth(undefined)).toBeNull();
+    });
+
+    it("admits integer depths across the full range", () => {
+        expect(normalizeCandidateDepth(1)).toBe(1);
+        expect(normalizeCandidateDepth(50)).toBe(50);
+        expect(normalizeCandidateDepth(MAX_CANDIDATE_DEPTH)).toBe(MAX_CANDIDATE_DEPTH);
+    });
+
+    it("rejects out-of-range and non-integer depths instead of clamping", () => {
+        for (const depth of [
+            0,
+            -1,
+            MAX_CANDIDATE_DEPTH + 1,
+            2.5,
+            Number.NaN,
+            Number.POSITIVE_INFINITY,
+        ]) {
+            let error: unknown = null;
+            try {
+                normalizeCandidateDepth(depth);
+            } catch (caught) {
+                error = caught;
+            }
+            expect(error).toBeInstanceOf(CandidateDepthError);
+            expect((error as CandidateDepthError).requested).toBe(depth);
+        }
     });
 });
 

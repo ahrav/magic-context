@@ -8,7 +8,7 @@ import * as searchModule from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { createCtxSearchTools } from "./tools";
+import { createCtxSearchTools, executeCtxSearch } from "./tools";
 
 const toolContext = (sessionID = "ses-search") => ({ sessionID }) as never;
 const EXPAND_HINT =
@@ -452,6 +452,157 @@ describe("createCtxSearchTools", () => {
             const result = await tools.ctx_search.execute({ query: "fix bug 1234" }, toolContext());
 
             expect(result).toContain("Text search hit, not an id lookup.");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+});
+
+describe("executeCtxSearch", () => {
+    let db: Database;
+    const deps = () => ({
+        db,
+        resolveProjectPath: () => "/repo/project",
+        memoryEnabled: true,
+        embeddingEnabled: false,
+        readMessages: () => [],
+    });
+
+    beforeEach(() => {
+        db = createTestDb();
+    });
+
+    afterEach(() => {
+        closeQuietly(db);
+    });
+
+    it("returns invalid outcomes with the same error text the tool returns", async () => {
+        const tools = createCtxSearchTools(deps());
+        const execution = await executeCtxSearch(deps(), { query: "   " }, toolContext());
+        expect(execution.status).toBe("invalid");
+        expect(execution.text).toBe(
+            String(await tools.ctx_search.execute({ query: "   " }, toolContext())),
+        );
+    });
+
+    it("keeps direct-ID lookup byte-identical between the tool and the structured helper", async () => {
+        const memory = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "Direct id hit for the structured helper.",
+        });
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("unifiedSearch must not run for ID-shaped queries");
+        });
+        try {
+            const sharedDeps = deps();
+            const tools = createCtxSearchTools(sharedDeps);
+            const args = { query: `#${memory.id}` };
+            const execution = await executeCtxSearch(sharedDeps, args, toolContext());
+            expect(execution.status).toBe("complete");
+            if (execution.status !== "complete") return;
+            expect(execution.text).toBe(
+                String(await tools.ctx_search.execute(args, toolContext())),
+            );
+            expect(execution.reason).toBe("delivered");
+            expect(execution.prePack).toHaveLength(1);
+            expect(execution.delivered).toEqual(execution.prePack);
+            expect(execution.omittedCount).toBe(0);
+            expect(execution.text).toContain(`id=${memory.id}`);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("keeps the multi-probe explicit path byte-identical between tool and helper", async () => {
+        const results: UnifiedSearchResult[] = [
+            {
+                source: "memory",
+                content: "multi-probe explicit search hit",
+                score: 0.7,
+                memoryId: 5,
+                category: "USER_DIRECTIVES",
+                matchType: "fts",
+            },
+        ];
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const sharedDeps = deps();
+            const tools = createCtxSearchTools(sharedDeps);
+            const args = { query: "multi probe lookup" };
+            const execution = await executeCtxSearch(sharedDeps, args, toolContext());
+            expect(execution.status).toBe("complete");
+            if (execution.status !== "complete") return;
+            expect(execution.text).toBe(
+                String(await tools.ctx_search.execute(args, toolContext())),
+            );
+            // Both calls run through the same explicit-search options.
+            expect(spy).toHaveBeenCalledTimes(2);
+            for (const call of spy.mock.calls) {
+                const options = call[4] as { explicitSearch?: boolean };
+                expect(options.explicitSearch).toBe(true);
+            }
+            expect(execution.prePack).toEqual(results);
+            expect(execution.delivered).toEqual(results);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("keeps a packing-omitted result in prePack but out of delivered", async () => {
+        const filler = Array.from({ length: 300 }, (_, index) =>
+            ((index * 2654435761) % 36).toString(36),
+        ).join(" ");
+        const results: UnifiedSearchResult[] = Array.from({ length: 50 }, (_, index) => ({
+            source: "memory",
+            content: `${filler} tail-${index}`,
+            score: 0.9,
+            memoryId: index + 1,
+            category: "USER_DIRECTIVES",
+            matchType: "fts",
+        }));
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => results);
+        try {
+            const execution = await executeCtxSearch(deps(), { query: "big" }, toolContext());
+            expect(execution.status).toBe("complete");
+            if (execution.status !== "complete") return;
+            expect(execution.reason).toBe("delivered");
+            expect(execution.prePack).toEqual(results);
+            expect(execution.delivered.length).toBeLessThan(results.length);
+            expect(execution.delivered).toEqual(results.slice(0, execution.delivered.length));
+            expect(execution.omittedCount).toBe(results.length - execution.delivered.length);
+            const omitted = results[results.length - 1];
+            expect(execution.prePack).toContain(omitted);
+            expect(execution.delivered).not.toContain(omitted);
+            expect(execution.text).not.toContain(`tail-${results.length - 1}`);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("returns an empty-results completed delivery, not a failure, for zero results", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        try {
+            const execution = await executeCtxSearch(deps(), { query: "missing" }, toolContext());
+            expect(execution.status).toBe("complete");
+            if (execution.status !== "complete") return;
+            expect(execution.reason).toBe("empty-results");
+            expect(execution.prePack).toEqual([]);
+            expect(execution.delivered).toEqual([]);
+            expect(execution.text).toContain("No results found");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("propagates a search failure instead of returning an empty delivery", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
+            throw new Error("search lane exploded");
+        });
+        try {
+            await expect(
+                executeCtxSearch(deps(), { query: "boom" }, toolContext()),
+            ).rejects.toThrow("search lane exploded");
         } finally {
             spy.mockRestore();
         }

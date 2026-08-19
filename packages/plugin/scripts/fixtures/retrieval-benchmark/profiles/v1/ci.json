@@ -1,0 +1,304 @@
+{
+  "schemaVersion": "retrieval-benchmark-profile/v1",
+  "id": "profile-ci",
+  "description": "Deterministic CI-sized check: small 1K-scale fixtures, both modes, cache-state and lane coverage; latency informational only. Heavy axis endpoints (1M scale, 1024 dims, K endpoints at scale, concurrency 8) belong to the reference-host profiles.",
+  "expectedCaseCount": 9,
+  "runtime": {
+    "warmups": 1,
+    "samples": 5,
+    "maxWallTimeMs": 600000
+  },
+  "budgets": {
+    "maxFixtureBytes": 67108864,
+    "maxPeakRssBytes": 1073741824
+  },
+  "host": {
+    "class": "ci",
+    "cpuArchitecture": "any",
+    "minTotalMemoryBytes": 2147483648,
+    "minAvailableDiskBytes": 1073741824
+  },
+  "cases": [
+    {
+      "id": "case-explicit-warm-1k-384",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-automatic-warm-1k-384",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "automatic",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-k-5",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 5,
+        "effective": 5
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-k-100",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 100,
+        "effective": 100
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-dims-128",
+      "scale": 1000,
+      "dims": 128,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-cache-cold",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "cold",
+        "connectionStatement": "cold",
+        "sqlitePage": "cold",
+        "osPage": "cold"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-lane-message",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "explicit",
+      "sourceLanes": [
+        "message"
+      ],
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-concurrency-2",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 2,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 1,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": null
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 329,
+        "expectedScannedCount": 329
+      }
+    },
+    {
+      "id": "case-selectivity-cutoff",
+      "scale": 1000,
+      "dims": 384,
+      "candidateK": {
+        "requested": 50,
+        "effective": 50
+      },
+      "mode": "explicit",
+      "sourceLanes": null,
+      "concurrency": 1,
+      "cacheState": {
+        "processVector": "warm",
+        "connectionStatement": "warm",
+        "sqlitePage": "warm",
+        "osPage": "warm"
+      },
+      "selectivity": {
+        "fraction": 0.5,
+        "predicate": {
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null,
+          "sources": null,
+          "visibleMemoryIds": [],
+          "messageOrdinalCutoff": 165
+        },
+        "preFilterDenominator": 329,
+        "eligibleCount": 165,
+        "expectedScannedCount": 165
+      }
+    }
+  ]
+}

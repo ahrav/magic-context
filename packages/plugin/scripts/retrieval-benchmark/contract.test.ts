@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join, dirname, relative, resolve, sep } from "node:path";
 
 import {
     ContractError,
@@ -444,6 +444,23 @@ describe("validateRelease", () => {
         ).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
+        // Locators beyond MAX_SAFE_INTEGER are rejected even when they
+        // survive a Number -> String round-trip (2^53 does): seeding
+        // subtracts from and sorts the value as a JS number, and locators
+        // like "0" can never come back from AUTOINCREMENT.
+        for (const locator of [String(2 ** 53), "0"]) {
+            const unsafeRelease = makeValidRelease();
+            const unsafeDoc = unsafeRelease.corpus.documents.find(
+                (d) => d.id === "d-exact-symbol-path-dev",
+            );
+            if (!unsafeDoc) throw new Error("fixture document missing");
+            unsafeDoc.aliases[0].locator = locator;
+            expect(
+                diagnosticsOf(() => validateRelease(unsafeRelease.corpus, unsafeRelease.judgments)),
+            ).toContain(
+                "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+            );
+        }
         // Compartments, primers, and notes carry numeric production ids too.
         const noteRelease = makeValidRelease();
         const noteDoc = noteRelease.corpus.documents.find(
@@ -682,5 +699,99 @@ describe("facade boundary", () => {
                 .map((term) => `index.ts:${number} references "${term}": ${line.trim()}`),
         );
         expect(violations).toEqual([]);
+    });
+
+    // `import type` is erased at runtime and intentionally skipped.
+    function runtimeImports(filePath: string): string[] {
+        const source = readFileSync(filePath, "utf8");
+        const specifiers: string[] = [];
+        const pattern = /(?:^|\n)\s*(import|export)\s+([\s\S]*?from\s+)?"([^"]+)"/g;
+        for (const match of source.matchAll(pattern)) {
+            const clause = match[2] ?? "";
+            if (/^type\s/.test(clause.trim())) continue;
+            specifiers.push(match[3]);
+        }
+        return specifiers;
+    }
+
+    function resolveRelative(fromFile: string, specifier: string): string | null {
+        if (!specifier.startsWith(".")) return null;
+        const base = join(fromFile, "..", specifier);
+        for (const candidate of [base, `${base}.ts`, join(base, "index.ts")]) {
+            if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
+        }
+        throw new Error(`unresolvable import ${specifier} from ${fromFile}`);
+    }
+
+    function transitiveModules(entry: string): { files: Set<string>; bare: Set<string> } {
+        const files = new Set<string>();
+        const bare = new Set<string>();
+        const queue = [entry];
+        while (queue.length > 0) {
+            const file = queue.pop();
+            if (file === undefined || files.has(file)) continue;
+            files.add(file);
+            for (const specifier of runtimeImports(file)) {
+                const resolved = resolveRelative(file, specifier);
+                if (resolved === null) {
+                    bare.add(specifier);
+                } else if (!files.has(resolved)) {
+                    queue.push(resolved);
+                }
+            }
+        }
+        return { files, bare };
+    }
+
+    it("the facade has no transitive runtime dependency on storage or database modules", () => {
+        const entry = join(import.meta.dir, "index.ts");
+        const { files, bare } = transitiveModules(entry);
+        const forbiddenPath = /storage|sqlite|migration|database|promote|recover/i;
+        const violations = [...files].filter((file) =>
+            forbiddenPath.test(relative(import.meta.dir, file)),
+        );
+        expect(violations).toEqual([]);
+        for (const specifier of bare) {
+            expect(specifier).not.toBe("bun:sqlite");
+            expect(specifier).not.toBe("node:sqlite");
+            expect(specifier).not.toBe("better-sqlite3");
+        }
+    });
+
+    it("the runner-side seeder keeps the one-way import into production adapters", () => {
+        const seedImports = runtimeImports(join(import.meta.dir, "seed.ts"));
+        expect(
+            seedImports.some((specifier) => specifier.includes("src/features/magic-context")),
+        ).toBe(true);
+    });
+
+    it("production source never imports script code", () => {
+        const srcRoot = join(import.meta.dir, "..", "..", "src");
+        const scriptsRoot = resolve(srcRoot, "..", "scripts");
+        const offenders: string[] = [];
+        const stack = [srcRoot];
+        while (stack.length > 0) {
+            const dir = stack.pop();
+            if (dir === undefined) continue;
+            for (const entry of readdirSync(dir, { withFileTypes: true })) {
+                const path = join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    stack.push(path);
+                    continue;
+                }
+                if (!entry.name.endsWith(".ts")) continue;
+                for (const specifier of runtimeImports(path)) {
+                    if (!specifier.startsWith(".")) continue;
+                    // Compare against the resolved scripts root: a substring
+                    // match on "/scripts/" would fire on any checkout whose
+                    // own path contains a scripts component.
+                    const resolved = resolve(dirname(path), specifier);
+                    if (resolved === scriptsRoot || resolved.startsWith(scriptsRoot + sep)) {
+                        offenders.push(`${relative(srcRoot, path)} -> ${specifier}`);
+                    }
+                }
+            }
+        }
+        expect(offenders).toEqual([]);
     });
 });

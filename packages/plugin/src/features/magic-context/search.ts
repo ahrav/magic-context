@@ -26,11 +26,23 @@ import { getIndexedMessageCorpusSize } from "./message-index";
 import {
     DEFAULT_SEARCH_RESULT_LIMIT,
     MAX_LANE_CANDIDATES,
+    normalizeCandidateDepth,
     normalizeSearchResultLimit,
     prepareExplicitQuery,
     QueryBoundsError,
 } from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
+import {
+    accumulateVectorLoad,
+    createSearchTraceRecorder,
+    type HybridLaneStageMarks,
+    type SearchTraceOptions,
+    type SearchTraceRecorder,
+    type SearchTraceSpanHandle,
+    type VectorLoadEvent,
+    type VectorLoadObserver,
+    vectorLoadCounters,
+} from "./search-trace";
 import {
     countNoteFtsMatchesBatch,
     countSearchableNotes,
@@ -172,6 +184,13 @@ export interface UnifiedSearchOptions {
     measurementDisabled?: boolean;
     embeddingModelIdOverride?: string;
     chunkModelIdOverride?: string;
+    /** When `trace` is absent, search performs no tracing. When present,
+     *  tracing does not change results, SQL, side effects, ordering, or
+     *  errors. */
+    trace?: SearchTraceOptions;
+    /** `candidateDepth` sets the per-lane candidate count; `limit` controls
+     *  returned results. */
+    candidateDepth?: number;
 }
 
 export interface MemorySearchResult {
@@ -249,40 +268,7 @@ export type UnifiedSearchResult =
 
 const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 
-// ID-shaped short-circuit: when the whole trimmed query is one memory id (with
-// or without a leading `#`) or a comma/space-separated list of up to
-// `ID_SHAPED_QUERY_MAX_TOKENS` such tokens, we treat it as a direct id lookup.
-// Anything else — `"fix bug 1234"`, a quoted sentence containing a number — is
-// left alone so the normal lexical+semantic lanes still run. Reused by
-// ctx_search and any future consumer that needs to decide whether a query
-// should bypass the normal search pipeline.
-export const ID_SHAPED_QUERY_MAX_TOKENS = 5;
-// Matches one ID token: an optional leading `#` followed by one or more digits.
-// The `+` requires at least one digit, so a bare `#` does not match.
-const ID_SHAPED_TOKEN = /^#?\d+$/;
-
-export function parseIdShapedQuery(query: string): number[] | null {
-    const trimmed = query.trim();
-    if (trimmed.length === 0) {
-        return null;
-    }
-    const tokens = trimmed.split(/[\s,]+/).filter((token) => token.length > 0);
-    if (tokens.length === 0 || tokens.length > ID_SHAPED_QUERY_MAX_TOKENS) {
-        return null;
-    }
-    const ids: number[] = [];
-    for (const token of tokens) {
-        if (!ID_SHAPED_TOKEN.test(token)) {
-            return null;
-        }
-        const parsed = Number.parseInt(token.replace(/^#/, ""), 10);
-        if (!Number.isFinite(parsed) || parsed <= 0) {
-            return null;
-        }
-        ids.push(parsed);
-    }
-    return ids;
-}
+export { ID_SHAPED_QUERY_MAX_TOKENS, parseIdShapedQuery } from "./search-bounds";
 
 function normalizeCosineScore(score: number): number {
     if (!Number.isFinite(score)) {
@@ -483,6 +469,14 @@ function pruneToLaneCeiling(scores: Map<number, number>): Map<number, number> {
     return new Map(top);
 }
 
+/** Total vector-buffer bytes held by a loaded embedding map — what a cache
+ *  miss actually decoded, as opposed to the candidate subset compared. */
+function totalEmbeddingBytes(embeddings: ReadonlyMap<number, { embedding: Float32Array }>): number {
+    let bytes = 0;
+    for (const entry of embeddings.values()) bytes += entry.embedding.byteLength;
+    return bytes;
+}
+
 async function getSemanticScores(args: {
     db: Database;
     projectPath: string;
@@ -500,6 +494,8 @@ async function getSemanticScores(args: {
      *  letting them occupy pruned lane slots would evict eligible
      *  lower-scored matches from the bounded lane entirely. */
     visibleMemoryIds?: Set<number> | null;
+    /** Reports the exact vector-buffer bytes compared by the scan. */
+    onVectorLoad?: VectorLoadObserver;
 }): Promise<Map<number, number>> {
     const semanticScores = new Map<number, number>();
 
@@ -513,6 +509,9 @@ async function getSemanticScores(args: {
     }
 
     if (!args.workspace?.isWorkspaced) {
+        const wasCached = args.onVectorLoad
+            ? peekProjectEmbeddings(args.projectPath, args.queryModelId) !== null
+            : false;
         const cachedEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
         const embeddings = await ensureMemoryEmbeddings({
             db: args.db,
@@ -521,12 +520,16 @@ async function getSemanticScores(args: {
             existingEmbeddings: cachedEmbeddings,
         });
 
+        let touchedBytes = 0;
+        let touchedVectors = 0;
         for (const memory of args.memories) {
             if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = embeddings.get(memory.id);
             if (!memoryEmbedding) {
                 continue;
             }
+            touchedBytes += memoryEmbedding.embedding.byteLength;
+            touchedVectors += 1;
 
             const score = normalizeCosineScore(
                 cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
@@ -538,6 +541,15 @@ async function getSemanticScores(args: {
             if (score > 0) semanticScores.set(memory.id, score);
         }
 
+        args.onVectorLoad?.({
+            // A cache miss decodes the WHOLE project's embedding table, not
+            // just the candidates compared afterwards; the counters must
+            // attribute the bytes the load actually decoded.
+            decodedBytes: wasCached ? 0 : totalEmbeddingBytes(embeddings),
+            cachedBytes: wasCached ? touchedBytes : 0,
+            vectorCount: wasCached ? touchedVectors : embeddings.size,
+            cacheHit: wasCached,
+        });
         return pruneToLaneCeiling(semanticScores);
     }
 
@@ -552,7 +564,13 @@ async function getSemanticScores(args: {
     }
 
     const ownMemories = memoriesByIdentity.get(args.projectPath) ?? [];
+    // getProjectEmbeddings below primes the process cache for the own
+    // project, so its cached-before state must be captured first or the
+    // loop would report every cold own-project load as a cache hit.
+    let ownWasCachedBeforePrime: boolean | null = null;
     if (ownMemories.length > 0) {
+        ownWasCachedBeforePrime =
+            peekProjectEmbeddings(args.projectPath, args.queryModelId) !== null;
         const ownEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
         await ensureMemoryEmbeddings({
             db: args.db,
@@ -565,16 +583,49 @@ async function getSemanticScores(args: {
     for (const identity of workspace.identities) {
         const memberMemories = memoriesByIdentity.get(identity) ?? [];
         if (memberMemories.length === 0) continue;
+        const identityWasCached = args.onVectorLoad
+            ? identity === args.projectPath && ownWasCachedBeforePrime !== null
+                ? ownWasCachedBeforePrime
+                : peekProjectEmbeddings(identity, args.queryModelId) !== null
+            : false;
         const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
+        // A cold identity decodes its whole embedding table on load; warm
+        // identities are billed at touched-byte granularity. The whole-map
+        // scan only feeds the observer, so skip it on untraced searches.
+        const identityIsCold = args.onVectorLoad !== undefined && !identityWasCached;
+        let identityTouchedBytes = 0;
+        let identityTouchedVectors = 0;
         for (const memory of memberMemories) {
             if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = cachedEmbeddings.get(memory.id);
             if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
+            if (!identityIsCold) {
+                identityTouchedBytes += memoryEmbedding.embedding.byteLength;
+                identityTouchedVectors += 1;
+            }
             const score = normalizeCosineScore(
                 cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
             );
             if (score > 0) semanticScores.set(memory.id, score);
         }
+        // One all-or-nothing event per identity load (the v1 VectorLoadEvent
+        // contract): a mixed warm/cold workspace emits one event per side
+        // instead of a single event with both byte fields nonzero.
+        args.onVectorLoad?.(
+            identityIsCold
+                ? {
+                      decodedBytes: totalEmbeddingBytes(cachedEmbeddings),
+                      cachedBytes: 0,
+                      vectorCount: cachedEmbeddings.size,
+                      cacheHit: false,
+                  }
+                : {
+                      decodedBytes: 0,
+                      cachedBytes: identityTouchedBytes,
+                      vectorCount: identityTouchedVectors,
+                      cacheHit: true,
+                  },
+        );
     }
 
     return pruneToLaneCeiling(semanticScores);
@@ -709,6 +760,11 @@ async function searchMemories(args: {
     projectPath: string;
     query: string;
     limit: number;
+    /** Explicit per-lane candidate bound (from `options.candidateDepth`).
+     *  When absent the lane keeps its fixed lexical candidate ceiling, so
+     *  production behavior is unchanged; an explicit depth is executed as
+     *  the lexical fetch bound so K sweeps measure a real workload change. */
+    candidateLimit?: number | null;
     memoryEnabled: boolean;
     /** Pre-computed query embedding (or null if embedding is disabled / failed).
      *  unifiedSearch embeds once and passes the same vector here and to
@@ -717,11 +773,27 @@ async function searchMemories(args: {
     queryModelId?: string | null;
     workspace?: SearchWorkspaceContext;
     visibleMemoryIds?: Set<number> | null;
-}): Promise<MemorySearchResult[]> {
+    trace?: SearchTraceRecorder | null;
+    rootSpanId?: number | null;
+    /** The span gating the query vector this lane consumes — the generation
+     *  lookup when tracing records one, else the query-inference span — so
+     *  the vector scan's causal chain includes the generation check. */
+    semanticGateSpanId?: number | null;
+    /** The unified filter span; the lane's first span depends on it so the
+     *  causal chain includes filter and workspace-resolution cost. */
+    filterSpanId?: number | null;
+}): Promise<{ results: MemorySearchResult[]; laneSpanId: number | null }> {
     if (!args.memoryEnabled) {
-        return [];
+        return { results: [], laneSpanId: null };
     }
 
+    const trace = args.trace ?? null;
+    const rootSpanId = args.rootSpanId ?? null;
+    const hydrationSpan =
+        trace?.begin("metadata_hydration", "memory", {
+            parent: rootSpanId,
+            dependsOn: args.filterSpanId != null ? [args.filterSpanId] : [],
+        }) ?? null;
     const memories = args.workspace?.isWorkspaced
         ? getMemoriesByProjects(
               args.db,
@@ -732,17 +804,28 @@ async function searchMemories(args: {
               args.workspace.shareCategories,
           )
         : getMemoriesByProject(args.db, args.projectPath);
+    hydrationSpan?.end("ok", { rows: memories.length });
     if (memories.length === 0) {
-        return [];
+        return { results: [], laneSpanId: hydrationSpan?.id ?? null };
     }
 
+    // Hydration completes synchronously before the lexical and vector work
+    // starts, so both downstream spans depend on it; otherwise the critical
+    // path treats a costly hydration as an isolated branch.
+    const hydrationDeps = hydrationSpan ? [hydrationSpan.id] : [];
+    const lexicalSpan =
+        trace?.begin("lexical_scan", "memory", {
+            parent: rootSpanId,
+            dependsOn: hydrationDeps,
+        }) ?? null;
     const ftsMatches = getFtsMatches({
         db: args.db,
         projectPath: args.projectPath,
         query: args.query,
-        limit: FTS_SEMANTIC_CANDIDATE_LIMIT,
+        limit: args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT,
         workspace: args.workspace,
     });
+    lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
     const ftsScores = getFtsScores(ftsMatches);
     const semanticCandidates = selectSemanticCandidates({
         memories,
@@ -751,6 +834,15 @@ async function searchMemories(args: {
         queryModelId: args.queryModelId,
         workspace: args.workspace,
     });
+    let memoryLoad: VectorLoadEvent | null = null;
+    const scanSpan =
+        trace?.begin("vector_scan", "memory", {
+            parent: rootSpanId,
+            dependsOn: [
+                ...hydrationDeps,
+                ...(args.semanticGateSpanId != null ? [args.semanticGateSpanId] : []),
+            ],
+        }) ?? null;
     const semanticScores = await getSemanticScores({
         db: args.db,
         projectPath: args.projectPath,
@@ -759,9 +851,32 @@ async function searchMemories(args: {
         queryModelId: args.queryModelId,
         workspace: args.workspace,
         visibleMemoryIds: args.visibleMemoryIds,
+        onVectorLoad: scanSpan
+            ? (event) => {
+                  memoryLoad = accumulateVectorLoad(memoryLoad, event);
+              }
+            : undefined,
+    });
+    scanSpan?.end("ok", {
+        ...vectorLoadCounters(memoryLoad),
+        candidatesIn: semanticCandidates.length,
+        candidatesOut: semanticScores.size,
+        // Same plumbing-identity convention as the top_k span below, so the
+        // candidate-depth assertion covers this lane's scan instead of
+        // skipping a span with no depth evidence.
+        requestedK: args.limit,
+        effectiveK: args.candidateLimit ?? args.limit,
     });
 
-    return mergeMemoryResults({
+    const topKSpan =
+        trace?.begin("top_k", "memory", {
+            parent: rootSpanId,
+            dependsOn: [
+                ...(lexicalSpan ? [lexicalSpan.id] : []),
+                ...(scanSpan ? [scanSpan.id] : []),
+            ],
+        }) ?? null;
+    const merged = mergeMemoryResults({
         memories,
         semanticScores,
         ftsScores,
@@ -781,6 +896,18 @@ async function searchMemories(args: {
             },
         }),
     });
+    topKSpan?.end("ok", {
+        candidatesIn: new Set([...semanticScores.keys(), ...ftsScores.keys()]).size,
+        candidatesOut: merged.length,
+        requestedK: args.limit,
+        // With an explicit candidate bound the lexical fetch executed it;
+        // otherwise both counters carry the caller's limit (plumbing
+        // identity only, not an executed lane bound).
+        effectiveK: args.candidateLimit ?? args.limit,
+    });
+    // The lane's terminal span: the unified fusion span depends on it so
+    // critical-path analysis can follow the memory lane.
+    return { results: merged, laneSpanId: topKSpan?.id ?? null };
 }
 
 /** Linear decay message scoring.
@@ -1403,6 +1530,7 @@ function searchCompartmentChunks(args: {
     limit: number;
     maxOrdinal?: number;
     modelId?: string | null;
+    onVectorLoad?: VectorLoadObserver;
 }): CompartmentSearchResult[] {
     if (!args.queryEmbedding || args.limit <= 0 || !args.modelId || args.modelId === "off")
         return [];
@@ -1412,6 +1540,8 @@ function searchCompartmentChunks(args: {
         args.sessionId,
         args.projectPath,
         args.modelId,
+        args.onVectorLoad,
+        cutoff,
     );
     if (rows.length === 0) return [];
 
@@ -1665,6 +1795,8 @@ function searchGitCommits(args: {
      *  searchMemories — never embed twice for one query. */
     queryEmbedding: Float32Array | null;
     queryModelId?: string | null;
+    onVectorLoad?: VectorLoadObserver;
+    stages?: HybridLaneStageMarks;
 }): GitCommitSearchResult[] {
     if (args.limit <= 0) return [];
 
@@ -1672,6 +1804,8 @@ function searchGitCommits(args: {
         limit: args.limit,
         queryEmbedding: args.queryEmbedding,
         queryModelId: args.queryModelId,
+        onVectorLoad: args.onVectorLoad,
+        stages: args.stages,
     });
     return hits.map(toGitCommitResult);
 }
@@ -1688,9 +1822,32 @@ function searchPrimers(args: {
     limit: number;
     queryEmbedding: Float32Array | null;
     queryModelId: string | null;
+    onVectorLoad?: VectorLoadObserver;
+    stages?: HybridLaneStageMarks;
 }): PrimerSearchResult[] {
-    const primers = getActivePrimers(args.db, args.projectPath);
-    if (primers.length === 0 || args.limit <= 0) return [];
+    if (args.limit <= 0) return [];
+    // Vector phase covers the primer decode plus cosine scoring: the decoded
+    // bytes reported through onVectorLoad are exactly this phase's work.
+    args.stages?.vectorStart();
+    const primers = getActivePrimers(args.db, args.projectPath, args.onVectorLoad);
+    const semanticScores = new Map<number, number>();
+    for (const primer of primers) {
+        if (
+            !args.queryEmbedding ||
+            !primer.questionEmbedding ||
+            primer.questionEmbeddingModelId !== args.queryModelId
+        ) {
+            continue;
+        }
+        const score = normalizeCosineScore(
+            cosineSimilarity(args.queryEmbedding, primer.questionEmbedding),
+        );
+        if (score > 0) semanticScores.set(primer.id, score);
+    }
+    args.stages?.vectorEnd(semanticScores.size);
+    if (primers.length === 0) return [];
+
+    args.stages?.lexicalStart();
     const ftsQuery = sanitizeFtsQuery(args.query);
     const ftsRanks = new Map<number, number>();
     if (ftsQuery) {
@@ -1712,16 +1869,12 @@ function searchPrimers(args: {
             ftsRanks.set(row.id, linearDecayScore(index, rows.length));
         });
     }
+    args.stages?.lexicalEnd(ftsRanks.size);
+
+    args.stages?.fusionStart();
     const scored = primers
         .map((primer) => {
-            const semantic =
-                args.queryEmbedding &&
-                primer.questionEmbedding &&
-                primer.questionEmbeddingModelId === args.queryModelId
-                    ? normalizeCosineScore(
-                          cosineSimilarity(args.queryEmbedding, primer.questionEmbedding),
-                      )
-                    : 0;
+            const semantic = semanticScores.get(primer.id) ?? 0;
             const fts = ftsRanks.get(primer.id) ?? 0;
             if (semantic <= 0 && fts <= 0) return null;
             const score =
@@ -1742,6 +1895,7 @@ function searchPrimers(args: {
         .filter((result): result is PrimerSearchResult => result !== null)
         .sort((a, b) => b.score - a.score || b.support - a.support || a.primerId - b.primerId)
         .slice(0, args.limit);
+    args.stages?.fusionEnd(primers.length, scored.length);
     return scored;
 }
 
@@ -1847,16 +2001,69 @@ export async function unifiedSearch(
     }
     const trimmedQuery = prepared.query;
     const measurementStartedAt = Date.now();
+    // The trace root precedes depth validation, and both precede the
+    // empty-query short-circuit: an invalid candidateDepth must throw for
+    // every input, and a supplied sink must see one root span per call —
+    // including the call that throws.
+    const trace = options.trace ? createSearchTraceRecorder(options.trace) : null;
+    const rootSpan = trace?.begin("root", "unified") ?? null;
+    let candidateDepth: number | null;
+    try {
+        candidateDepth = normalizeCandidateDepth(options.candidateDepth);
+    } catch (error) {
+        rootSpan?.end("failed");
+        throw error;
+    }
     if (trimmedQuery.length === 0) {
+        rootSpan?.end("ok", { candidatesOut: 0 });
         return [];
     }
 
-    const limit = normalizeSearchResultLimit(options.limit);
-    const tierLimit = Math.min(
-        Math.max(limit * 3, DEFAULT_SEARCH_RESULT_LIMIT),
-        MAX_LANE_CANDIDATES,
-    );
+    try {
+        const results = await executeUnifiedSearch({
+            db,
+            sessionId,
+            projectPath,
+            trimmedQuery,
+            options,
+            measurementStartedAt,
+            candidateDepth,
+            trace,
+            rootSpan,
+        });
+        rootSpan?.end("ok", { candidatesOut: results.length });
+        return results;
+    } catch (error) {
+        rootSpan?.end("failed");
+        throw error;
+    }
+}
 
+async function executeUnifiedSearch(args: {
+    db: Database;
+    sessionId: string;
+    projectPath: string;
+    trimmedQuery: string;
+    options: UnifiedSearchOptions;
+    measurementStartedAt: number;
+    candidateDepth: number | null;
+    trace: SearchTraceRecorder | null;
+    rootSpan: SearchTraceSpanHandle | null;
+}): Promise<UnifiedSearchResult[]> {
+    const { db, sessionId, projectPath, trimmedQuery, options, trace } = args;
+    const rootId = args.rootSpan?.id ?? null;
+
+    const limit = normalizeSearchResultLimit(options.limit);
+    const tierLimit =
+        args.candidateDepth ??
+        Math.min(Math.max(limit * 3, DEFAULT_SEARCH_RESULT_LIMIT), MAX_LANE_CANDIDATES);
+    // requestedK and effectiveK are emitted from this one variable, so the
+    // candidate-depth assertion over these counters checks plumbing
+    // identity only; it cannot see a lane that internally clamped its
+    // executed bound. Surfacing per-lane executed bounds is future work.
+    const laneDepth = { requestedK: tierLimit, effectiveK: tierLimit };
+
+    const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;
     const embeddingEnabled = options.embeddingEnabled ?? true;
     const embedQuery = options.embedQuery ?? embedText;
     const isEmbeddingRuntimeEnabled = options.isEmbeddingRuntimeEnabled ?? isEmbeddingEnabled;
@@ -1870,6 +2077,12 @@ export async function unifiedSearch(
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
     const runNotes = activeSources.has("note");
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
+    filterSpan?.end("ok");
+    // Downstream chain roots depend on the filter span so criticalPathMs
+    // includes filtering cost. Workspace resolution is also filter work,
+    // but its synchronous SQLite reads must not run before the embed fetch
+    // is dispatched; it gets its own span after the dispatch below.
+    const filterDeps = filterSpan ? [filterSpan.id] : [];
 
     // Embed the query ONCE at the top — both memory and git-commit searches
     // need the same vector. Previously each search called `embedQuery`
@@ -1892,14 +2105,28 @@ export async function unifiedSearch(
         embeddingEnabled &&
         isEmbeddingRuntimeEnabled();
 
+    const embedSpan =
+        trace && needsEmbedding
+            ? trace.begin("query_inference", "query", { parent: rootId, dependsOn: filterDeps })
+            : null;
+    if (trace && !needsEmbedding) {
+        trace.notApplicable("query_inference", "query", rootId);
+    }
     const queryEmbeddingPromise: Promise<CapturedQueryEmbedding | Float32Array | null> =
         needsEmbedding
-            ? embedQuery(trimmedQuery, options.signal).catch((error) => {
-                  log(
-                      `[search] query embedding failed: ${error instanceof Error ? error.message : String(error)}`,
-                  );
-                  return null;
-              })
+            ? embedQuery(trimmedQuery, options.signal).then(
+                  (captured) => {
+                      embedSpan?.end("ok");
+                      return captured;
+                  },
+                  (error) => {
+                      embedSpan?.end(options.signal?.aborted ? "cancelled" : "failed");
+                      log(
+                          `[search] query embedding failed: ${error instanceof Error ? error.message : String(error)}`,
+                      );
+                      return null;
+                  },
+              )
             : Promise.resolve(null);
 
     // Yield to the event loop so the embed fetch's request gets a chance
@@ -1910,6 +2137,20 @@ export async function unifiedSearch(
     // doesn't actually leave the process until we await later.
     await Promise.resolve();
 
+    // Workspace resolution is filter work — the identity/alias/sharing
+    // lookups deciding what the memory lane may read — but placing its
+    // synchronous SQLite reads before the embed dispatch above would delay
+    // the outbound fetch, the exact latency regression the searchMessages
+    // placement below exists to avoid. It runs post-dispatch under its own
+    // filter span; the memory lane's causal chain gates on it.
+    const workspaceSpan =
+        trace?.begin("filter_construction", "unified", {
+            parent: rootId,
+            dependsOn: filterDeps,
+        }) ?? null;
+    const workspace = resolveSearchWorkspaceContext(db, projectPath);
+    workspaceSpan?.end("ok");
+
     // Run the synchronous message-FTS SELECT now that the embed fetch is
     // in flight. Message indexing is event-driven and never runs here;
     // unreconciled sessions simply return no message hits until the async
@@ -1917,6 +2158,10 @@ export async function unifiedSearch(
     // Multi-probe recall is opt-in for explicit searches only. NL queries
     // yield no probes, so this is a no-op for them regardless of the flag.
     const messageProbes = options.explicitSearch ? extractLiteralProbes(trimmedQuery) : [];
+    const messageSpan =
+        trace && runMessages
+            ? trace.begin("lexical_scan", "message", { parent: rootId, dependsOn: filterDeps })
+            : null;
     const messageResults: MessageSearchResult[] = runMessages
         ? searchMessages({
               db,
@@ -1927,10 +2172,16 @@ export async function unifiedSearch(
               probes: messageProbes,
           })
         : [];
+    messageSpan?.end("ok", { candidatesOut: messageResults.length, ...laneDepth });
 
     // Wait for the single embed call (if any) and then run the two
     // embedding-dependent searches in parallel using the same vector.
     const capturedQuery = await queryEmbeddingPromise;
+    const generationSpan =
+        trace?.begin("generation_lookup", "query", {
+            parent: rootId,
+            dependsOn: embedSpan ? [embedSpan.id] : [],
+        }) ?? null;
     const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
     const queryContract =
         capturedQuery instanceof Float32Array || capturedQuery === null ? null : capturedQuery;
@@ -1940,13 +2191,26 @@ export async function unifiedSearch(
     const queryEmbedding = generationIsCurrent
         ? (queryContract?.vector ?? (capturedQuery instanceof Float32Array ? capturedQuery : null))
         : null;
-    const workspace = resolveSearchWorkspaceContext(db, projectPath);
+    generationSpan?.end("ok");
+    // Every semantic lane consumes the generation-gated vector, so a vector
+    // scan's causal edge runs through generation_lookup rather than jumping
+    // straight to query inference; otherwise the critical path drops the
+    // generation check from the semantic pipeline.
+    const semanticDeps = generationSpan ? [generationSpan.id] : embedSpan ? [embedSpan.id] : [];
     const embeddingModelId =
         queryContract?.modelId ?? options.embeddingModelIdOverride ?? embeddingSnapshot?.modelId;
     const chunkModelId =
         queryContract?.chunkModelId ??
         options.chunkModelIdOverride ??
         embeddingSnapshot?.chunkModelId;
+    let compartmentLoad: VectorLoadEvent | null = null;
+    const compartmentSpan =
+        trace && runCompartmentChunks
+            ? trace.begin("vector_scan", "compartment", {
+                  parent: rootId,
+                  dependsOn: semanticDeps,
+              })
+            : null;
     const compartmentResults = runCompartmentChunks
         ? searchCompartmentChunks({
               db,
@@ -1956,78 +2220,224 @@ export async function unifiedSearch(
               limit: tierLimit,
               maxOrdinal: options.maxMessageOrdinal,
               modelId: chunkModelId && chunkModelId !== "off" ? chunkModelId : null,
+              onVectorLoad: compartmentSpan
+                  ? (event) => {
+                        compartmentLoad = accumulateVectorLoad(compartmentLoad, event);
+                    }
+                  : undefined,
           })
         : [];
+    compartmentSpan?.end("ok", {
+        ...vectorLoadCounters(compartmentLoad),
+        candidatesOut: compartmentResults.length,
+        ...laneDepth,
+    });
+    // The message fusion stage only runs when a feeding lane ran; a span
+    // with status "ok" for a disabled stage would misreport zero-cost work
+    // as executed, so absent stages emit the explicit marker instead.
+    const messageFusionRan = runMessages || runCompartmentChunks;
+    const messageFusionSpan =
+        trace && messageFusionRan
+            ? trace.begin("fusion", "message", {
+                  parent: rootId,
+                  dependsOn: [
+                      ...(messageSpan ? [messageSpan.id] : []),
+                      ...(compartmentSpan ? [compartmentSpan.id] : []),
+                  ],
+              })
+            : null;
+    if (trace && !messageFusionRan) trace.notApplicable("fusion", "message", rootId);
     const messageLikeResults = mergeMessageAndCompartmentResults({
         messages: messageResults,
         compartments: compartmentResults,
         limit: tierLimit,
     });
+    messageFusionSpan?.end("ok", {
+        candidatesIn: messageResults.length + compartmentResults.length,
+        candidatesOut: messageLikeResults.length,
+    });
 
-    const [memoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
+    const laneSpanIds: number[] = messageFusionSpan ? [messageFusionSpan.id] : [];
+
+    // Hybrid lanes (git-commit, primer) decompose into lexical_scan,
+    // vector_scan, and fusion spans through stage marks the lane functions
+    // fire at their phase boundaries, joined by an explicit fusion
+    // dependency — one undifferentiated lane span would report lexical-only
+    // execution as vector time and hide the hybrid pipeline's structure.
+    const runVectorLane = <T>(
+        lane: "git_commit" | "primer",
+        run: (
+            onVectorLoad: VectorLoadObserver | undefined,
+            stages: HybridLaneStageMarks | undefined,
+        ) => T[],
+    ): T[] => {
+        if (!trace) return run(undefined, undefined);
+        const recorder = trace;
+        let load: VectorLoadEvent | null = null;
+        const spans: {
+            lexical: SearchTraceSpanHandle | null;
+            vector: SearchTraceSpanHandle | null;
+            fusion: SearchTraceSpanHandle | null;
+        } = { lexical: null, vector: null, fusion: null };
+        const stages: HybridLaneStageMarks = {
+            lexicalStart: () => {
+                spans.lexical = recorder.begin("lexical_scan", lane, {
+                    parent: rootId,
+                    // Sequential phase chaining: the lane implementations
+                    // run their phases one after another on one thread, so
+                    // whichever phase starts second causally waited on the
+                    // first — without the edge the critical path takes
+                    // max(lexical, vector) instead of their sum.
+                    dependsOn: [...filterDeps, ...(spans.vector ? [spans.vector.id] : [])],
+                });
+            },
+            lexicalEnd: (candidatesOut) => spans.lexical?.end("ok", { candidatesOut }),
+            vectorStart: () => {
+                spans.vector = recorder.begin("vector_scan", lane, {
+                    parent: rootId,
+                    dependsOn: [...semanticDeps, ...(spans.lexical ? [spans.lexical.id] : [])],
+                });
+            },
+            vectorEnd: (candidatesOut) =>
+                spans.vector?.end("ok", {
+                    ...vectorLoadCounters(load),
+                    candidatesOut,
+                    ...laneDepth,
+                }),
+            vectorSkipped: () => recorder.notApplicable("vector_scan", lane, rootId),
+            fusionStart: () => {
+                spans.fusion = recorder.begin("fusion", lane, {
+                    parent: rootId,
+                    dependsOn: [
+                        ...(spans.lexical ? [spans.lexical.id] : []),
+                        ...(spans.vector ? [spans.vector.id] : []),
+                    ],
+                });
+            },
+            fusionEnd: (candidatesIn, candidatesOut) =>
+                spans.fusion?.end("ok", { candidatesIn, candidatesOut }),
+        };
+        const results = run((event) => {
+            load = accumulateVectorLoad(load, event);
+        }, stages);
+        const tail = spans.fusion ?? spans.vector ?? spans.lexical;
+        if (tail) laneSpanIds.push(tail.id);
+        return results;
+    };
+
+    const runGitCommitLane = (): GitCommitSearchResult[] =>
+        runVectorLane("git_commit", (onVectorLoad, stages) =>
+            searchGitCommits({
+                db,
+                projectPath,
+                query: trimmedQuery,
+                limit: tierLimit,
+                queryEmbedding,
+                queryModelId:
+                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
+                onVectorLoad,
+                stages,
+            }),
+        );
+
+    const runPrimerLane = (): PrimerSearchResult[] =>
+        runVectorLane("primer", (onVectorLoad, stages) =>
+            searchPrimers({
+                db,
+                projectPath,
+                query: trimmedQuery,
+                limit: tierLimit,
+                queryEmbedding,
+                queryModelId:
+                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
+                onVectorLoad,
+                stages,
+            }),
+        );
+
+    const runNoteLane = (): NoteSearchResult[] => {
+        const span = trace
+            ? trace.begin("lexical_scan", "note", { parent: rootId, dependsOn: filterDeps })
+            : null;
+        const lane = searchNotes({
+            db,
+            sessionId,
+            projectPath,
+            query: trimmedQuery,
+            limit: tierLimit,
+            probes: messageProbes,
+        });
+        if (span) {
+            laneSpanIds.push(span.id);
+            span.end("ok", { candidatesOut: lane.length, ...laneDepth });
+        }
+        return lane;
+    };
+
+    const [memoryLane, gitCommitResults, primerResults, noteResults] = await Promise.all([
         runMemory
             ? searchMemories({
                   db,
                   projectPath,
                   query: trimmedQuery,
                   limit: tierLimit,
+                  candidateLimit: args.candidateDepth,
                   memoryEnabled: true,
                   queryEmbedding,
                   queryModelId:
                       embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
                   workspace,
                   visibleMemoryIds: options.visibleMemoryIds,
+                  trace,
+                  rootSpanId: rootId,
+                  semanticGateSpanId: semanticDeps.length > 0 ? semanticDeps[0] : null,
+                  filterSpanId: workspaceSpan?.id ?? filterSpan?.id ?? null,
               })
-            : Promise.resolve([] as MemorySearchResult[]),
+            : Promise.resolve({
+                  results: [] as MemorySearchResult[],
+                  laneSpanId: null as number | null,
+              }),
         runGitCommits
-            ? Promise.resolve(
-                  searchGitCommits({
-                      db,
-                      projectPath,
-                      query: trimmedQuery,
-                      limit: tierLimit,
-                      queryEmbedding,
-                      queryModelId:
-                          embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                  }),
-              )
+            ? Promise.resolve(runGitCommitLane())
             : Promise.resolve([] as GitCommitSearchResult[]),
-        runPrimers
-            ? Promise.resolve(
-                  searchPrimers({
-                      db,
-                      projectPath,
-                      query: trimmedQuery,
-                      limit: tierLimit,
-                      queryEmbedding,
-                      queryModelId:
-                          embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-                  }),
-              )
-            : Promise.resolve([] as PrimerSearchResult[]),
-        runNotes
-            ? Promise.resolve(
-                  searchNotes({
-                      db,
-                      sessionId,
-                      projectPath,
-                      query: trimmedQuery,
-                      limit: tierLimit,
-                      probes: messageProbes,
-                  }),
-              )
-            : Promise.resolve([] as NoteSearchResult[]),
+        runPrimers ? Promise.resolve(runPrimerLane()) : Promise.resolve([] as PrimerSearchResult[]),
+        runNotes ? Promise.resolve(runNoteLane()) : Promise.resolve([] as NoteSearchResult[]),
     ]);
+    const memoryResults = memoryLane.results;
+    // The memory lane runs inside searchMemories, so its terminal span joins
+    // the fusion dependency set here; without it criticalPathMs understates
+    // queries whose longest path is the memory lane.
+    if (memoryLane.laneSpanId !== null) laneSpanIds.push(memoryLane.laneSpanId);
 
-    const results = [
+    const fusionSpan =
+        trace?.begin("fusion", "unified", { parent: rootId, dependsOn: laneSpanIds }) ?? null;
+    const fused = [
         ...memoryResults,
         ...primerResults,
         ...messageLikeResults,
         ...gitCommitResults,
         ...noteResults,
-    ]
-        .sort(compareUnifiedResults)
-        .slice(0, limit);
+    ].sort(compareUnifiedResults);
+    fusionSpan?.end("ok", {
+        candidatesIn:
+            memoryResults.length +
+            primerResults.length +
+            messageLikeResults.length +
+            gitCommitResults.length +
+            noteResults.length,
+        candidatesOut: fused.length,
+    });
+    const topKSpan =
+        trace?.begin("top_k", "unified", {
+            parent: rootId,
+            dependsOn: fusionSpan ? [fusionSpan.id] : [],
+        }) ?? null;
+    const results = fused.slice(0, limit);
+    topKSpan?.end("ok", { candidatesIn: fused.length, candidatesOut: results.length });
+    if (trace) {
+        trace.notApplicable("reranking", "unified", rootId);
+        trace.notApplicable("packing", "unified", rootId);
+    }
 
     if (!options.measurementDisabled) {
         void recordShadowMeasurement({
@@ -2035,10 +2445,10 @@ export async function unifiedSearch(
             sessionId,
             projectPath,
             query: trimmedQuery,
-            options,
+            options: options.trace ? { ...options, trace: undefined } : options,
             primaryResults: results,
             primaryQuery: queryContract,
-            primaryLatencyMs: Date.now() - measurementStartedAt,
+            primaryLatencyMs: Date.now() - args.measurementStartedAt,
             search: unifiedSearch,
         });
     }

@@ -5,7 +5,7 @@ import {
     MAX_RENDER_FIELD_BYTES,
 } from "../../features/magic-context/search-bounds";
 import { estimateTokens } from "../../shared/token-estimator";
-import { buildAutoSearchHint } from "./auto-search-hint";
+import { buildAutoSearchHint, packAutoSearchHint } from "./auto-search-hint";
 
 function memory(content: string, score = 0.85, id = 1): UnifiedSearchResult {
     return {
@@ -128,5 +128,67 @@ describe("buildAutoSearchHint", () => {
         expect(hint).not.toBeNull();
         const bullet = (hint ?? "").split("\n").find((line) => line.startsWith("- "));
         expect(Buffer.byteLength(bullet ?? "", "utf8")).toBeLessThanOrEqual(MAX_RENDER_FIELD_BYTES);
+    });
+});
+
+describe("packAutoSearchHint", () => {
+    it("returns text byte-identical to buildAutoSearchHint when every fragment fits", () => {
+        const results = [memory("one fragment", 0.9, 1), commit("install: force bun runtime", 5)];
+        const packed = packAutoSearchHint(results);
+        expect(packed.text).toBe(buildAutoSearchHint(results));
+        expect(packed.delivered).toEqual(results);
+        expect(packed.omittedCount).toBe(0);
+        expect(packed.tokenCount).toBe(estimateTokens(packed.text ?? ""));
+    });
+
+    it("returns text byte-identical to buildAutoSearchHint when packing drops fragments", () => {
+        const noisy = (seed: number) =>
+            Array.from({ length: 900 }, (_, index) =>
+                ((seed * 7919 + index * 2654435761) % 36).toString(36),
+            ).join("");
+        const results = [
+            memory(noisy(1), 0.9, 1),
+            memory(noisy(2), 0.9, 2),
+            memory(noisy(3), 0.9, 3),
+        ];
+        const options = { fragmentCharCap: 220 };
+        const packed = packAutoSearchHint(results, options);
+        expect(packed.text).toBe(buildAutoSearchHint(results, options));
+        expect(packed.text).not.toBeNull();
+
+        const bullets = (packed.text ?? "").split("\n").filter((line) => line.startsWith("- "));
+        // Delivered results preserve input order and correspond one-to-one
+        // with emitted hint fragments.
+        expect(packed.delivered.length).toBe(bullets.length);
+        expect(packed.delivered.length).toBeLessThan(results.length);
+        expect(packed.delivered).toEqual(results.slice(0, packed.delivered.length));
+        expect(packed.omittedCount).toBe(results.length - packed.delivered.length);
+        expect(packed.tokenCount).toBe(estimateTokens(packed.text ?? ""));
+        expect(packed.tokenCount).toBeLessThanOrEqual(MAX_AUTO_HINT_TOKENS);
+    });
+
+    it("counts results beyond maxFragments as omitted, not delivered", () => {
+        const results = [memory("one"), memory("two"), memory("three"), memory("four")];
+        const packed = packAutoSearchHint(results, { maxFragments: 2 });
+        expect(packed.text).toBe(buildAutoSearchHint(results, { maxFragments: 2 }));
+        expect(packed.delivered).toEqual(results.slice(0, 2));
+        expect(packed.omittedCount).toBe(2);
+    });
+
+    it("returns a null-text empty delivery for empty results", () => {
+        const packed = packAutoSearchHint([]);
+        expect(packed.text).toBeNull();
+        expect(packed.delivered).toEqual([]);
+        expect(packed.tokenCount).toBe(0);
+        expect(packed.omittedCount).toBe(0);
+    });
+
+    it("returns a null-text empty delivery when no fragment survives compression", () => {
+        const packed = packAutoSearchHint([memory("   ", 0.9, 1)]);
+        expect(packed.text).toBeNull();
+        expect(buildAutoSearchHint([memory("   ", 0.9, 1)])).toBeNull();
+        expect(packed.delivered).toEqual([]);
+        expect(packed.tokenCount).toBe(0);
+        expect(packed.omittedCount).toBe(1);
     });
 });
