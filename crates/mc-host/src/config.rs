@@ -164,12 +164,24 @@ pub struct LivenessPolicy {
 
 /// Host-owned synthetic initialization payload handed to the linked handler
 /// before the listener binds (protocol §8.1 step 3-4).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct HostInit {
     pub subc_capabilities: Vec<String>,
     /// Opaque resolved storage descriptor, when deployment configures managed
     /// storage. The handler deserializes it; the host never reads it.
     pub storage: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for HostInit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The storage descriptor can carry credentials or deployment
+        // secrets; diagnostics (including HostConfig's derived Debug) get
+        // presence and bounded structure only (protocol V24).
+        f.debug_struct("HostInit")
+            .field("subc_capabilities", &self.subc_capabilities)
+            .field("storage", &self.storage.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

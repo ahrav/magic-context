@@ -38,14 +38,19 @@ pub type PendingKey = (u16, u32, u64);
 /// exhausted AND egress is contended; beyond it the reader emits inline.
 const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 
-/// One outstanding host Ping. `written` flips when the writer reports the
-/// frame fully on the socket: a Pong may only clear a written probe, or a
-/// peer predicting the correlation sequence could pre-answer Pings it never
-/// received and defeat read-liveness detection.
+/// One outstanding host Ping. `written` flips inside the writer task when
+/// the frame is fully on the socket: a Pong clears only a written probe, or
+/// a peer predicting the correlation sequence could pre-answer Pings it
+/// never received and defeat read-liveness detection. `answered` retains a
+/// Pong that raced the write-completion hook (the kernel write makes the
+/// Ping visible a beat before the hook runs); the hook reconciles it — the
+/// probe still clears only once the Ping was genuinely written, so a
+/// stalled writer still expires the peer.
 pub struct PingProbe {
     pub flags: u8,
     pub sent: Instant,
     pub written: bool,
+    pub answered: bool,
 }
 
 pub struct PendingEntry {
@@ -169,16 +174,28 @@ pub async fn run_connection<H: McHostHandler>(
 
     let read_exit = read_task.await;
     gen.read_cancel.cancel();
-    if matches!(read_exit, ReadExit::Peer) {
+    match read_exit {
+        // Graceful shutdown stopped the reader directly: everything keeps
+        // draining in protocol order. A cancellation INHERITED from the
+        // generation token (liveness invalidation, emission failure) is a
+        // retirement, not a drain — fall through to the silent close.
+        ReadExit::HostCancelled if !gen.token.is_cancelled() => {}
+        // Oversized-control drain failure: the queued rejection task (in
+        // `read_tasks`, awaited below) must still acquire budget and queue
+        // the authoritative terminal (protocol §7.1), so the token stays
+        // live until `close_generation` retires it; the writer then flushes
+        // the queue under its own stall deadline.
+        ReadExit::PeerKeepQueue => {}
         // Peer-initiated or error retirement closes silently — even while
         // the host is draining: cancelling the generation token makes queued
         // off-reader emissions fail closed, and discarding the writer drops
         // frames already queued, so a client that sent a corrupt frame never
         // receives terminals or a Goodbye after the close decision
-        // (protocol §6.3). Only a host-cancelled read keeps the writer
-        // draining in protocol order.
-        gen.token.cancel();
-        gen.writer.discard();
+        // (protocol §6.3).
+        ReadExit::HostCancelled | ReadExit::Peer => {
+            gen.token.cancel();
+            gen.writer.discard();
+        }
     }
     // Mark generation-owned routes closing BEFORE waiting for in-flight
     // binds: the route.open wrappers below run inside `read_tasks`, and a
@@ -206,9 +223,13 @@ pub async fn run_connection<H: McHostHandler>(
 /// Why the read side of a connection stopped. Only a host-cancelled read may
 /// keep the writer draining: every peer-driven exit (EOF, corruption, peer
 /// Goodbye, protocol violation) retires silently, even mid-shutdown.
+/// `PeerKeepQueue` marks the one exception: an oversized-control drain
+/// failure whose early terminal is authoritative for its correlation
+/// (protocol §7.1) and must flush despite the otherwise-silent close.
 enum ReadExit {
     HostCancelled,
     Peer,
+    PeerKeepQueue,
 }
 
 /// Serves validated frames until close. Returning retires the generation.
@@ -261,7 +282,11 @@ async fn read_loop<H: McHostHandler>(
                     .await
                     .is_err()
                 {
-                    return ReadExit::Peer;
+                    // The queued early terminal is authoritative for its
+                    // correlation even when the declared body then fails
+                    // (protocol §7.1): the close stays silent otherwise, but
+                    // that one frame must survive to flush.
+                    return ReadExit::PeerKeepQueue;
                 }
             }
             ReadEvent::Frame(frame) => {
@@ -293,15 +318,27 @@ async fn read_loop<H: McHostHandler>(
                         if header.channel != 0 || header.corr == 0 {
                             return ReadExit::Peer;
                         }
+                        let now = Instant::now();
                         let mut pings = gen.pings.lock().expect("pings lock");
-                        match pings.get(&header.corr) {
+                        match pings.get_mut(&header.corr) {
                             // The echo must match what we sent exactly
-                            // (protocol V35) AND the Ping must have reached
-                            // the socket — a predictable-correlation Pong
-                            // sent before its Ping is unmatched and dropped
-                            // (protocol §6.2 table).
-                            Some(probe) if probe.flags == header.flags.0 && probe.written => {
-                                pings.remove(&header.corr);
+                            // (protocol V35). A matching Pong for a probe the
+                            // writer has not yet confirmed written is retained
+                            // for the write-completion hook to reconcile.
+                            Some(probe) if probe.flags == header.flags.0 => {
+                                // Scheduler delay must not extend the
+                                // configured deadline: a Pong arriving past
+                                // it leaves the probe for expiry.
+                                let in_deadline = shared.liveness.as_ref().is_none_or(|p| {
+                                    now.duration_since(probe.sent) < p.pong_deadline
+                                });
+                                if in_deadline {
+                                    if probe.written {
+                                        pings.remove(&header.corr);
+                                    } else {
+                                        probe.answered = true;
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -580,6 +617,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
                 flags: flags.0,
                 sent: Instant::now(),
                 written: false,
+                answered: false,
             },
         );
         let bytes = crate::wire::encode_owned_frame(
@@ -596,9 +634,16 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         // pre-answering) Pong races the flag update.
         let gen_probe = Arc::clone(&gen);
         let written_hook = Box::new(move || {
-            if let Some(probe) = gen_probe.pings.lock().expect("pings lock").get_mut(&corr) {
-                probe.sent = Instant::now();
-                probe.written = true;
+            let mut pings = gen_probe.pings.lock().expect("pings lock");
+            if let Some(probe) = pings.get_mut(&corr) {
+                if probe.answered {
+                    // The Pong raced the hook after the kernel write: the
+                    // Ping was genuinely written, so the answer counts.
+                    pings.remove(&corr);
+                } else {
+                    probe.sent = Instant::now();
+                    probe.written = true;
+                }
             }
             let _ = written_tx.send(());
         });
