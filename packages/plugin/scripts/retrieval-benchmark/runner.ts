@@ -837,14 +837,33 @@ function checkCaseDeadline(ctx: RunContext, profileCase: ProfileCase): void {
     }
 }
 
-/** Execute ONE unit of a query scenario — a single warmup or a single
- *  measured sample. The case scheduler interleaves queries at this
+/** One warmup delivery for the query; returns true when its warmups are
+ *  complete. All warmups and connection primers finish behind the phase
+ *  barrier in executeCase before any measured sample is scheduled. */
+async function executeWarmupUnit(
+    ctx: RunContext,
+    profileCase: ProfileCase,
+    conn: ConnectionLease,
+    state: QueryRunState,
+): Promise<boolean> {
+    checkCaseDeadline(ctx, profileCase);
+    const db = conn.acquire();
+    try {
+        await executeDelivery(db, state.qctx);
+    } finally {
+        conn.release(db);
+    }
+    state.warmupsDone += 1;
+    return state.warmupsDone >= ctx.profile.runtime.warmups;
+}
+
+/** One measured sample. The case scheduler interleaves queries at this
  *  granularity so every worker stays busy for the whole measurement window
  *  and samples are taken at the declared concurrency; whole-query
  *  scheduling would let the case tail run below the declared load while
  *  still pooling those samples into the concurrency cell. Returns true when
  *  the query's sampling is complete. */
-async function executeQueryUnit(
+async function executeSampleUnit(
     ctx: RunContext,
     profileCase: ProfileCase,
     controller: CaseCacheController,
@@ -853,17 +872,6 @@ async function executeQueryUnit(
 ): Promise<boolean> {
     checkCaseDeadline(ctx, profileCase);
     const { qctx, queryTouchesMemory } = state;
-
-    if (state.warmupsDone < ctx.profile.runtime.warmups) {
-        const db = conn.acquire();
-        try {
-            await executeDelivery(db, qctx);
-        } finally {
-            conn.release(db);
-        }
-        state.warmupsDone += 1;
-        return false;
-    }
 
     controller.beforeSample(queryTouchesMemory);
     const db = conn.acquire();
@@ -906,19 +914,23 @@ async function finalizeQueryScenario(
         throw new RunnerError([`query ${qctx.query.id}: no measured sample`]);
     }
 
+    // The last measured sample leaves every cache layer warm; a cold cell's
+    // declared state is re-established before EACH diagnostic pass or its
+    // evaluation ranking (selectSemanticCandidates widens from the lexical
+    // subset to every cached embedding on a warm process cache) and its
+    // stage decomposition would describe a warm execution.
+    controller.beforeSample(queryTouchesMemory);
     const evalDb = conn.acquire();
     let ranked: string[];
     try {
+        controller.warmSampleReady(evalDb, queryTouchesMemory);
         ranked = await executeEvaluation(evalDb, qctx);
     } finally {
         conn.release(evalDb);
     }
 
     // Paired trace-enabled diagnostic pass (KTD15): stage
-    // decomposition only, never a latency-policy sample. The evaluation
-    // pass above left every cache layer warm, so the declared cache state
-    // is re-established first or a cold cell's stage decomposition would
-    // describe a warm execution.
+    // decomposition only, never a latency-policy sample.
     controller.beforeSample(queryTouchesMemory);
     const tracedSpans: SearchTraceSpan[] = [];
     const traceDb = conn.acquire();
@@ -978,11 +990,12 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     // Scope is the one predicate field the executed search cannot merge: a
     // query runs under its own fixture scope, so a mismatch means the
     // preflight validated cardinalities for a workload no query executes.
+    // Session scope compares exactly: measureMessageSelectivity resolves a
+    // null scope to the concrete fallback session, never a wildcard.
     for (const query of queries) {
         const scopeMismatch =
             predicate.projectScope !== query.fixtureScope.projectScope ||
-            (predicate.sessionScope !== null &&
-                predicate.sessionScope !== query.fixtureScope.sessionScope);
+            predicate.sessionScope !== query.fixtureScope.sessionScope;
         if (scopeMismatch) {
             throw new RunnerError([
                 `case ${profileCase.id}: query ${query.id} fixture scope does not match the selectivity predicate scope`,
@@ -1020,13 +1033,14 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         }
     }
 
-    // Sample-granularity round-robin: a query re-enters the queue after
-    // each unit (one warmup or one measured sample), so all workers stay
-    // busy until the case's final units and measured samples run at the
-    // declared concurrency. Whole-query scheduling would leave the last
-    // queries running with progressively fewer active workers while their
-    // samples still pooled into the declared concurrency cell.
-    const pending: QueryRunState[] = queries.map((query) =>
+    // Sample-granularity round-robin across three barriered phases: all
+    // priming and warmups finish before any measured sample, all measured
+    // samples finish before any evaluation or traced diagnostic. A query
+    // re-enters its phase queue after each unit, so all workers stay busy
+    // and measured samples always compete with exactly the declared number
+    // of measured requests — never with warmups, primers, top-50
+    // evaluations, or traced searches.
+    const states: QueryRunState[] = queries.map((query) =>
         newQueryRunState({
             query,
             profileCase,
@@ -1043,7 +1057,6 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     );
     const scenarios = new Map<string, ReportScenario>();
     const candidateRankings = new Map<string, string[]>();
-    const readyToFinalize: QueryRunState[] = [];
 
     const makeWorkerConn = (): { conn: ConnectionLease; close: () => void } => {
         let persistent: Database | null = null;
@@ -1068,20 +1081,22 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         };
     };
 
-    // Phase 1: sampling only. Finalization (evaluation + traced passes) is
-    // deferred until every query's measured samples complete, so measured
-    // samples always compete with exactly the declared number of measured
-    // requests, never with unmeasured top-50 or traced diagnostics.
-    const samplingWorker = async (): Promise<void> => {
-        const { conn, close } = makeWorkerConn();
-        try {
-            // Query-level warmups prime the shared process and OS caches,
-            // but prepared statements and the SQLite page cache live on
-            // each worker's persistent connection — a warmup executed on
-            // another worker never touches this one. Prime this connection
-            // with one untimed delivery before it measures anything.
-            if (!controller.freshConnectionPerSample && pending.length > 0) {
-                const primer = pending[0];
+    // One connection set shared across the phases: the connections primed
+    // and warmed in phase 1 are the ones that measure in phase 2.
+    const workerConns = Array.from({ length: profileCase.concurrency }, () => makeWorkerConn());
+    const runPhase = (worker: (conn: ConnectionLease) => Promise<void>): Promise<void[]> =>
+        Promise.all(workerConns.map(({ conn }) => worker(conn)));
+
+    try {
+        // Phase 1: priming and warmups. Query-level warmups prime the
+        // shared process and OS caches; prepared statements and the SQLite
+        // page cache live on each worker's persistent connection, so each
+        // worker also primes its own connection with one untimed delivery.
+        const warming: QueryRunState[] =
+            ctx.profile.runtime.warmups > 0 ? [...states] : [];
+        await runPhase(async (conn) => {
+            if (!controller.freshConnectionPerSample && states.length > 0) {
+                const primer = states[0];
                 const db = conn.acquire();
                 try {
                     await executeDelivery(db, primer.qctx);
@@ -1092,9 +1107,21 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             for (;;) {
                 // shift/push are synchronous, so a state is owned by exactly
                 // one worker between dequeue and requeue.
-                const state = pending.shift();
+                const state = warming.shift();
                 if (!state) return;
-                const samplingComplete = await executeQueryUnit(
+                const warmupsComplete = await executeWarmupUnit(ctx, profileCase, conn, state);
+                if (!warmupsComplete) warming.push(state);
+            }
+        });
+
+        // Phase 2: measured samples only.
+        const sampling: QueryRunState[] = [...states];
+        const readyToFinalize: QueryRunState[] = [];
+        await runPhase(async (conn) => {
+            for (;;) {
+                const state = sampling.shift();
+                if (!state) return;
+                const samplingComplete = await executeSampleUnit(
                     ctx,
                     profileCase,
                     controller,
@@ -1104,19 +1131,13 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
                 if (samplingComplete) {
                     readyToFinalize.push(state);
                 } else {
-                    pending.push(state);
+                    sampling.push(state);
                 }
             }
-        } finally {
-            close();
-        }
-    };
-    await Promise.all(Array.from({ length: profileCase.concurrency }, () => samplingWorker()));
+        });
 
-    // Phase 2: evaluation and traced diagnostics, after all sampling ended.
-    const finalizeWorker = async (): Promise<void> => {
-        const { conn, close } = makeWorkerConn();
-        try {
+        // Phase 3: evaluation and traced diagnostics.
+        await runPhase(async (conn) => {
             for (;;) {
                 const state = readyToFinalize.shift();
                 if (!state) return;
@@ -1131,11 +1152,10 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
                 scenarios.set(query.id, buildScenario(ctx, profileCase, query, fixture, outcome));
                 candidateRankings.set(query.id, outcome.ranked);
             }
-        } finally {
-            close();
-        }
-    };
-    await Promise.all(Array.from({ length: profileCase.concurrency }, () => finalizeWorker()));
+        });
+    } finally {
+        for (const { close } of workerConns) close();
+    }
 
     const cacheLayers = controller.finish();
     const orderedScenarios = queries

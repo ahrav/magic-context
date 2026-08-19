@@ -351,8 +351,20 @@ export function parseProfile(value: unknown): BenchmarkProfile {
         const states = CACHE_LAYERS.map((layer) => profileCase.cacheState[layer]);
         if (states.every((state) => state === "cold")) hasAllCold = true;
         if (states.every((state) => state === "warm")) hasAllWarm = true;
-        if (profileCase.sourceLanes === null) hasAllLanes = true;
-        if (profileCase.sourceLanes !== null && profileCase.sourceLanes.length === 1) {
+        // Lane coverage counts what the case EXECUTES: the predicate's
+        // sources narrow execution exactly like the lane axis, so a case
+        // whose predicate drops lanes cannot satisfy the all-lane endpoint,
+        // and a predicate-only single-lane case does satisfy single-lane.
+        const lanes = profileCase.sourceLanes;
+        const predicateSources = profileCase.selectivity.predicate.sources;
+        const effectiveLanes =
+            predicateSources === null
+                ? lanes
+                : lanes === null
+                  ? predicateSources
+                  : lanes.filter((lane) => predicateSources.includes(lane));
+        if (effectiveLanes === null) hasAllLanes = true;
+        if (effectiveLanes !== null && effectiveLanes.length === 1) {
             hasSingleLane = true;
         }
         if (

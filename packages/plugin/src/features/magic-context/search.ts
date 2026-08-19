@@ -268,40 +268,7 @@ export type UnifiedSearchResult =
 
 const FTS_SEMANTIC_CANDIDATE_LIMIT = 50;
 
-// ID-shaped short-circuit: when the whole trimmed query is one memory id (with
-// or without a leading `#`) or a comma/space-separated list of up to
-// `ID_SHAPED_QUERY_MAX_TOKENS` such tokens, we treat it as a direct id lookup.
-// Anything else — `"fix bug 1234"`, a quoted sentence containing a number — is
-// left alone so the normal lexical+semantic lanes still run. Reused by
-// ctx_search and any future consumer that needs to decide whether a query
-// should bypass the normal search pipeline.
-export const ID_SHAPED_QUERY_MAX_TOKENS = 5;
-// Matches one ID token: an optional leading `#` followed by one or more digits.
-// The `+` requires at least one digit, so a bare `#` does not match.
-const ID_SHAPED_TOKEN = /^#?\d+$/;
-
-export function parseIdShapedQuery(query: string): number[] | null {
-    const trimmed = query.trim();
-    if (trimmed.length === 0) {
-        return null;
-    }
-    const tokens = trimmed.split(/[\s,]+/).filter((token) => token.length > 0);
-    if (tokens.length === 0 || tokens.length > ID_SHAPED_QUERY_MAX_TOKENS) {
-        return null;
-    }
-    const ids: number[] = [];
-    for (const token of tokens) {
-        if (!ID_SHAPED_TOKEN.test(token)) {
-            return null;
-        }
-        const parsed = Number.parseInt(token.replace(/^#/, ""), 10);
-        if (!Number.isFinite(parsed) || parsed <= 0) {
-            return null;
-        }
-        ids.push(parsed);
-    }
-    return ids;
-}
+export { ID_SHAPED_QUERY_MAX_TOKENS, parseIdShapedQuery } from "./search-bounds";
 
 function normalizeCosineScore(score: number): number {
     if (!Number.isFinite(score)) {

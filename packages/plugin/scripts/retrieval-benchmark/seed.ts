@@ -551,16 +551,19 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         // backing message keeps fusion's message-in-range coalescing
         // pointed at the SAME identity instead of merging an unrelated
         // filler message into the reviewed compartment.
-        const reservedCompartmentOrdinals = new Map<string, number>();
+        // Keyed by the planned alias, not the document id: a document with
+        // several producible aliases seeds one physical compartment per
+        // alias, and each needs its own reserved slot and backing message.
+        const reservedCompartmentOrdinals = new Map<PlannedAlias, number>();
         for (const plan of planned) {
             if (plan.document.kind !== "compartment") continue;
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
             const ordinal = nextOrdinal(sessionId);
-            reservedCompartmentOrdinals.set(plan.document.id, ordinal);
+            reservedCompartmentOrdinals.set(plan, ordinal);
             const messages = messagesBySession.get(sessionId) ?? [];
             messages.push({
                 ordinal,
-                id: `bench-compartment-${plan.document.id}`,
+                id: `bench-compartment-${plan.document.id}-${plan.alias.locator}`,
                 role: "user",
                 parts: [{ type: "text", text: documentText(plan.document.semanticPayload) }],
             });
@@ -586,7 +589,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         for (const plan of planned) {
             if (plan.document.kind !== "compartment") continue;
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
-            const ordinal = reservedCompartmentOrdinals.get(plan.document.id);
+            const ordinal = reservedCompartmentOrdinals.get(plan);
             if (ordinal === undefined) {
                 throw new SeedError([`seed: missing reserved ordinal (${plan.document.id})`]);
             }

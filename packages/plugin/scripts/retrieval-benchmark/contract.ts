@@ -13,6 +13,7 @@ import {
 } from "../../src/features/magic-context/search-bounds";
 import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
 import { normalizeQueryText } from "../../src/features/magic-context/query-normalization";
+import { parseIdShapedQuery } from "../../src/features/magic-context/search-bounds";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,
@@ -268,6 +269,13 @@ export function parseCorpus(value: unknown): CorpusArtifact {
             const prepared = prepareExplicitQuery(query.queryText);
             if (!prepared.ok || prepared.query.length === 0) {
                 diagnostics.push(`corpus.queries[${i}].queryText: not-executable`);
+            }
+            // Production explicit search short-circuits ID-shaped queries
+            // (`9101`, `#9101`) to a direct lookup that never touches
+            // unified retrieval; benchmarking them through unifiedSearch
+            // would report a miss the real tool answers.
+            if (parseIdShapedQuery(query.queryText) !== null) {
+                diagnostics.push(`corpus.queries[${i}].queryText: id-shaped-bypasses-retrieval`);
             }
         } else {
             // The LIVE extractor, not only the bounds preflight: the
