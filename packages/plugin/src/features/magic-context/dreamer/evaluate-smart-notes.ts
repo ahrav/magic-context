@@ -106,11 +106,43 @@ export async function evaluateSmartNotes(
         // full-budget drain — the timer's per-tick sweep drains with zero
         // compile/fallback budget, so billable prompts run only inside the
         // configured schedule window.
-        const result = await moduleBridge.drain({ deadline: args.deadline });
-        await moduleBridge.sync();
+        //
+        // The drain can run several sequential compiler/fallback prompts and
+        // outlive the two-minute Dreamer lease, so the lease heartbeat wraps
+        // it: an expired lease would let the next scheduler tick launch an
+        // overlapping billable drain.
+        const leaseAbortController = new AbortController();
+        const heartbeat = startLeaseHeartbeat(
+            args.db,
+            args.holderId,
+            args.leaseKey,
+            () => {
+                leaseAbortController.abort(new Error("Dream lease lost during smart notes"));
+                log("[dreamer] smart notes: lease lost — aborting module drain");
+                args.onLeaseLost?.("smart notes module drain");
+            },
+            args.leaseAcquisition,
+        );
+        let result: Awaited<ReturnType<typeof moduleBridge.drain>>;
+        try {
+            result = await moduleBridge.drain({
+                deadline: args.deadline,
+                signal: leaseAbortController.signal,
+            });
+            await moduleBridge.sync();
+        } finally {
+            heartbeat.stop();
+        }
         log(
             `[dreamer] smart notes: module drain claimed=${result.claimed} completed=${result.completed} surfaced=${result.surfaced}`,
         );
+        if (!result.drained && result.claimed === 0) {
+            // Registration failure or a transport error before any claim:
+            // reporting success would advance the cron (nightly by default)
+            // past a transient outage while the per-tick sweep excludes the
+            // billable work this task exists to run.
+            throw new Error("module smart-note drain stopped before reaching no_work");
+        }
         return {
             surfaced: result.surfaced,
             pending: getPendingSmartNotes(args.db, args.projectIdentity).length,

@@ -512,6 +512,10 @@ async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database)
         // cadence (cheap QuickJS runs) plus registration recovery. Billable
         // compile and fallback claims belong to the cron-scheduled
         // evaluate-smart-notes task, which drains with the full budgets.
+        // exclude_billable filters the authority's selection; the zero
+        // budgets are the client-side guard for replayed or slot-recovered
+        // claims, which bypass selection and are released instead of
+        // executed.
         const result = await bridge.drain({
             deadline: Date.now() + 60_000,
             excludeBillable: true,

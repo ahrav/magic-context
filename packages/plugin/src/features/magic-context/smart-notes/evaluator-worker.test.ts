@@ -195,6 +195,31 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         await w.dispose();
     });
 
+    test("an exclude-billable drain releases a recovered billable claim instead of executing it", async () => {
+        // Replayed and slot-recovered claims bypass the authority's selection,
+        // so the server-side exclude_billable filter never sees them; the
+        // zero client-side budgets are the guard that keeps a committed
+        // compile claim from billing inside a maintenance drain.
+        const { transport, calls } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") return claimResponse(1, "compile");
+            if (method === "note.evaluation.abandon") return { result: "abandoned" };
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({
+            deadline: Date.now() + 30_000,
+            excludeBillable: true,
+            maxCompilePerRun: 0,
+            maxFallbackPerRun: 0,
+        });
+        expect(result.abandoned).toBe(1);
+        expect(result.completed).toBe(0);
+        expect(calls.filter((c) => c.method === "note.evaluation.abandon")).toHaveLength(1);
+        expect(calls.filter((c) => c.method === "note.evaluation.complete")).toHaveLength(0);
+        await w.dispose();
+    });
+
     test("an exclude-billable drain sends the flag on every poll", async () => {
         let served = 0;
         const { transport, calls } = stubTransport((method) => {
