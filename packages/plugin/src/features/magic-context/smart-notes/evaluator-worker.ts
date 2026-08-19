@@ -579,6 +579,26 @@ export class SmartNoteEvaluatorWorker {
             this.pendingAcquisitionId = null;
             return "retry";
         }
+        if (
+            result === "applied" ||
+            result === "abandoned" ||
+            result === "stale" ||
+            result === "invalid"
+        ) {
+            // A lost claim response whose claim later reached a terminal state
+            // (completed, released, or fenced by a note edit) replays that
+            // terminal kind. The decision is consumed; retaining the id would
+            // replay it forever and wedge the worker.
+            this.pendingAcquisitionId = null;
+            return "retry";
+        }
+        if (result === "authority_changed") {
+            // Terminal replay or a live authority transition: either way the
+            // acquisition is spent and this drain should not keep polling
+            // through the handover.
+            this.pendingAcquisitionId = null;
+            return "stop";
+        }
         // `busy` records no durable decision, and an unrecognized result is an
         // unknown outcome: keep the acquisition id so the next poll replays
         // whatever decision may exist instead of leasing a second note.
@@ -649,8 +669,12 @@ export class SmartNoteEvaluatorWorker {
         }
     }
 
-    private async renew(claimId: string, controller: AbortController): Promise<void> {
-        if (!this.registration || this.disposed) return;
+    private async renew(
+        claimId: string,
+        controller: AbortController,
+        isRetry = false,
+    ): Promise<void> {
+        if (!this.registration || this.disposed || controller.signal.aborted) return;
         try {
             const response = asRecord(
                 await this.deps.transport.call({
@@ -663,6 +687,18 @@ export class SmartNoteEvaluatorWorker {
             }
         } catch (error) {
             this.logLine(`renew failed: ${error}`);
+            if (isRetry) {
+                // The renewal interval is half the lease. Two failures inside
+                // one interval mean the next scheduled attempt lands at the
+                // lease boundary; abort instead of billing work the authority
+                // may already re-hand to another drain.
+                controller.abort(new Error("claim lease renewal failing"));
+                return;
+            }
+            const retryTimer = setTimeout(() => {
+                void this.renew(claimId, controller, true);
+            }, 5_000);
+            if (typeof retryTimer.unref === "function") retryTimer.unref();
         }
     }
 

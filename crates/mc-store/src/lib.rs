@@ -13545,6 +13545,12 @@ impl McStore {
                 surface_condition.is_some() && next_condition != current_condition;
             let content_changed = next_content != current.content;
             let compiler_edit = condition_changed || content_changed;
+            if !compiler_edit {
+                // A fully unchanged update is mutation-neutral: bumping the
+                // versions would fence an active evaluation claim and re-run
+                // billable work for compiler inputs that did not change.
+                return Ok(NoteCasOutcome::Applied(current));
+            }
             let remaining_condition = if condition_changed {
                 next_condition
             } else {
@@ -14366,6 +14372,19 @@ impl McStore {
                         "DELETE FROM mc_authority_seed_rows WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
                         params![context_store_uuid, project, domain],
                     )?;
+                    if domain == "notes" {
+                        // A claim surviving from an earlier MODULE period must
+                        // not block its note under the new generation for a
+                        // full lease; completion is already generation-fenced,
+                        // so terminalize it like the drain transition does.
+                        fence_active_note_claims_tx(
+                            tx,
+                            project,
+                            None,
+                            "authority_changed",
+                            current_time_ms(),
+                        )?;
+                    }
                     tx.execute(
                         "UPDATE mc_authority SET state = 'PREPARING', generation = generation + 1,
                                 checksum_expected = NULL, checksum_actual = NULL, checksum_ok = NULL
@@ -14476,6 +14495,19 @@ impl McStore {
                         },
                     )));
                 }
+                if domain == "notes" {
+                    // Same fence as the drain transition: a stale claim from a
+                    // prior MODULE period cannot complete under the new
+                    // generation, but left active it blocks its note for a
+                    // full lease.
+                    fence_active_note_claims_tx(
+                        tx,
+                        project,
+                        None,
+                        "authority_changed",
+                        current_time_ms(),
+                    )?;
+                }
                 tx.execute(
                     "UPDATE mc_authority SET state = 'MODULE', generation = generation + 1,
                             note_eval_protocol_epoch = CASE WHEN domain = 'notes' THEN 2
@@ -14540,6 +14572,19 @@ impl McStore {
                     )));
                 }
                 let next_state = if verified { "MODULE" } else { "TS" };
+                if domain == "notes" {
+                    // Same fence as the drain transition: a stale claim from a
+                    // prior MODULE period cannot complete under the new
+                    // generation, but left active it blocks its note for a
+                    // full lease.
+                    fence_active_note_claims_tx(
+                        tx,
+                        project,
+                        None,
+                        "authority_changed",
+                        current_time_ms(),
+                    )?;
+                }
                 let update_sql = if verified && domain == "notes" {
                     "UPDATE mc_authority
                         SET state = ?1, generation = generation + 1,
@@ -15607,6 +15652,16 @@ impl McStore {
                     snapshot_json,
                 ])?;
                 module_row_ids.push(module_row_id);
+            }
+            // Seeds can import pre-v51 artifacts (compiled_check present,
+            // compiled_source_revision NULL) after the boot-time repair
+            // already recorded its completion marker; verify them here so an
+            // unvalidated compiled check never becomes selectable.
+            loop {
+                let processed = repair_note_artifacts_tx(tx, project)?;
+                if processed < NOTE_ARTIFACT_REPAIR_BATCH as usize {
+                    break;
+                }
             }
             Ok(module_row_ids)
         })
@@ -23991,6 +24046,10 @@ mod tests {
         assert_eq!(unchanged.status, ready.status);
         assert_eq!(unchanged.source_revision, ready.source_revision);
         assert_eq!(unchanged.compiled_check, ready.compiled_check);
+        // Mutation-neutral: a version bump would fence an active claim for
+        // compiler inputs that did not change.
+        assert_eq!(unchanged.status_version, ready.status_version);
+        assert_eq!(unchanged.state_version, ready.state_version);
 
         let changed = match store
             .update_note_cas(
