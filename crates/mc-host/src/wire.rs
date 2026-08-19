@@ -390,15 +390,14 @@ pub fn pure_header_flags() -> Flags {
 pub struct OutboundFrame {
     pub bytes: Vec<u8>,
     pub charge: ByteCharge,
-    /// Run by the writer task synchronously once the frame's bytes have
-    /// fully reached the socket, in the statement after `write_all` returns
-    /// and before the writer touches the next frame. Senders that anchor
-    /// state on delivery (Ping/Pong liveness) pass a hook; everything else
-    /// passes `None`. Dropped unrun if the writer retires before writing the
-    /// frame. Synchronous execution is what makes the completion transition
-    /// observable without a gap: an asynchronously delivered notification
-    /// would let a peer's answer arrive before the sender saw completion.
-    pub written: Option<Box<dyn FnOnce() + Send>>,
+    /// Run by the writer task once the frame's bytes have fully reached the
+    /// socket, receiving the instant `write_all` returned — captured before
+    /// the hook takes any lock, so receivers can compare a peer's answer
+    /// against write COMPLETION rather than against lock ordering. Senders
+    /// that anchor state on delivery (Ping/Pong liveness) pass a hook;
+    /// everything else passes `None`. Dropped unrun if the writer retires
+    /// before writing the frame.
+    pub written: Option<Box<dyn FnOnce(Instant) + Send>>,
 }
 
 /// Sender half of one connection's serialized writer.
@@ -547,7 +546,9 @@ where
                 break;
             }
             if let Some(written) = written {
-                written();
+                // Captured before the hook can block on a lock: this is the
+                // fence a receiver compares peer answers against.
+                written(Instant::now());
             }
             drop(bytes);
             drop(charge);

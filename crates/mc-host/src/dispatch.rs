@@ -513,7 +513,7 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
             OutboundFrame {
                 bytes,
                 charge,
-                written: Some(Box::new(move || {
+                written: Some(Box::new(move |_completed_at| {
                     let _ = written_tx.send(());
                 })),
             },

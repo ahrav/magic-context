@@ -38,20 +38,31 @@ pub type PendingKey = (u16, u32, u64);
 /// exhausted AND egress is contended; beyond it the reader emits inline.
 const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 
-/// One outstanding host Ping. A Pong clears the probe only once `written` is
-/// set, which the writer task does — under this same `pings` mutex — in the
-/// statement immediately after `write_all` returns, with no await between.
+/// One outstanding host Ping.
 ///
-/// That makes the rule exact rather than a trade-off: a Ping is header-only,
-/// so it is a single write, and the hook holds the lock before the writer can
-/// touch anything else. A Pong observing `written == false` was therefore
-/// sent before the Ping's bytes existed — a pre-answer for a probe the peer
-/// never received — so ignoring it is correct, and predictive pre-answering
-/// cannot defeat missed-Pong retirement.
+/// Acceptance is decided by comparing WHEN the Pong was observed against WHEN
+/// the Ping's write COMPLETED — never by which side won the `pings` mutex.
+/// The writer captures `completed_at` the instant `write_all` returns, before
+/// taking any lock, so:
+///
+/// * a Pong observed at-or-after `completed_at` is accepted even if the read
+///   loop won the mutex race or the writer task was preempted for longer than
+///   a round trip (the bytes were demonstrably on the wire); and
+/// * a Pong observed before `completed_at` is a pre-answer for a Ping whose
+///   bytes did not yet exist, so it is discarded and the probe still demands
+///   a real answer.
+///
+/// Comparing against write START (rather than completion) would admit
+/// pre-answers; requiring the mutex transition to precede the Pong would drop
+/// legitimate ones. The residual case — a peer that received the bytes but
+/// answers without reading them — is indistinguishable from a real answer to
+/// any observer, and is still caught by the writer's per-frame stall deadline
+/// once that peer stops draining its socket.
 pub struct PingProbe {
     pub flags: u8,
     pub sent: Instant,
-    pub written: bool,
+    pub written_at: Option<Instant>,
+    pub answered_at: Option<Instant>,
 }
 
 pub struct PendingEntry {
@@ -283,10 +294,21 @@ async fn read_loop<H: McHostHandler>(
                 // must not block this reader from a queued Pong), but with a
                 // written-signal: if the body drain below fails, the close
                 // fences exactly this authoritative frame (protocol §7.1).
+                // Oversized-control frames consume no pending permit, so the
+                // per-generation rejection semaphore is what bounds these
+                // emissions. Acquired BEFORE spawning: past the bound a peer
+                // streaming oversize bodies would otherwise accumulate tasks,
+                // oneshots, and captured Arcs, so exhaustion retires instead.
+                let Ok(reject_permit) = gen.busy_rejects.clone().try_acquire_owned() else {
+                    gen.token.cancel();
+                    gen.writer.discard();
+                    return ReadExit::Peer;
+                };
                 let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
                 let shared_task = Arc::clone(shared);
                 let gen_task = Arc::clone(gen);
                 shared.spawn_tracked(gen.read_tasks.track_future(async move {
+                    let _reject_permit = reject_permit;
                     crate::dispatch::emit_authoritative_rejection(
                         &shared_task,
                         &gen_task,
@@ -351,11 +373,20 @@ async fn read_loop<H: McHostHandler>(
                                 let in_deadline = shared.liveness.as_ref().is_none_or(|p| {
                                     now.duration_since(probe.sent) < p.pong_deadline
                                 });
-                                // Serialized behind the write-completion
-                                // transition by this same lock: an unwritten
-                                // probe's Pong is a pre-answer, dropped.
-                                if in_deadline && probe.written {
-                                    pings.remove(&header.corr);
+                                if in_deadline {
+                                    match probe.written_at {
+                                        // The write already completed: this
+                                        // answer followed the bytes.
+                                        Some(completed_at) if now >= completed_at => {
+                                            pings.remove(&header.corr);
+                                        }
+                                        // Completion not yet recorded: park
+                                        // the arrival instant for the hook to
+                                        // reconcile against completion.
+                                        None => probe.answered_at = Some(now),
+                                        // Recorded, but this Pong predates it.
+                                        Some(_) => {}
+                                    }
                                 }
                             }
                             _ => {}
@@ -587,6 +618,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
             let pings = gen.pings.lock().expect("pings lock");
             pings
                 .values()
+                .filter(|probe| probe.written_at.is_some())
                 .map(|probe| probe.sent + policy.pong_deadline)
                 .min()
                 .map_or(next_ping_at, |deadline| deadline.min(next_ping_at))
@@ -598,9 +630,9 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         let now = Instant::now();
         let expired = {
             let pings = gen.pings.lock().expect("pings lock");
-            pings
-                .values()
-                .any(|probe| now.duration_since(probe.sent) >= policy.pong_deadline)
+            pings.values().any(|probe| {
+                probe.written_at.is_some() && now.duration_since(probe.sent) >= policy.pong_deadline
+            })
         };
         if expired && policy.invalidate_on_missed {
             gen.token.cancel();
@@ -634,7 +666,8 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
             PingProbe {
                 flags: flags.0,
                 sent: Instant::now(),
-                written: false,
+                written_at: None,
+                answered_at: None,
             },
         );
         let bytes = crate::wire::encode_owned_frame(
@@ -650,13 +683,23 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         // async notification would leave a gap where a fast (or adversarial
         // pre-answering) Pong races the flag update.
         let gen_probe = Arc::clone(&gen);
-        let written_hook = Box::new(move || {
-            // Runs in the writer task immediately after `write_all` returns,
-            // holding the same lock the Pong path takes: this is the
-            // write-completion transition a Pong must follow.
-            if let Some(probe) = gen_probe.pings.lock().expect("pings lock").get_mut(&corr) {
-                probe.sent = Instant::now();
-                probe.written = true;
+        let written_hook = Box::new(move |completed_at: Instant| {
+            let mut pings = gen_probe.pings.lock().expect("pings lock");
+            if let Some(probe) = pings.get_mut(&corr) {
+                match probe.answered_at {
+                    // A Pong the read loop parked while completion was
+                    // unrecorded: accept it only if it followed the bytes.
+                    Some(answered_at) if answered_at >= completed_at => {
+                        pings.remove(&corr);
+                    }
+                    // No answer yet, or a pre-answer: arm the deadline from
+                    // completion so the peer owes a real Pong.
+                    _ => {
+                        probe.answered_at = None;
+                        probe.sent = completed_at;
+                        probe.written_at = Some(completed_at);
+                    }
+                }
             }
             let _ = written_tx.send(());
         });

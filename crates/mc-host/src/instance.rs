@@ -322,7 +322,12 @@ impl InstanceGuard {
         if info.daemon_id != self.daemon_id {
             return;
         }
-        let _ = unlinkat(&self.dir, CONNECTION_FILE_NAME, AtFlags::empty());
+        // A transient unlink failure must leave the identity retained so
+        // `Drop` retries; otherwise the dead endpoint and its bearer key stay
+        // published.
+        if unlinkat(&self.dir, CONNECTION_FILE_NAME, AtFlags::empty()).is_err() {
+            self.publication = Some(identity);
+        }
     }
 }
 
