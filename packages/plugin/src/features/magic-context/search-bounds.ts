@@ -29,6 +29,11 @@ export const DEFAULT_SEARCH_RESULT_LIMIT = 10;
 export const MAX_SEARCH_RESULT_LIMIT = 50;
 /** R37: ceiling on each bounded lexical/probe fetch and post-score lane output. */
 export const MAX_LANE_CANDIDATES = 150;
+/** KTD7: ceiling on a caller-requested per-lane candidate depth. Must stay
+ *  at or below MAX_LANE_CANDIDATES: pruneToLaneCeiling truncates lanes at
+ *  that bound, so tightening it below this value would silently cut an
+ *  already-validated candidateDepth. The benchmark's profile K axis pins
+ *  its maximum endpoint to this constant. */
 export const MAX_CANDIDATE_DEPTH = 100;
 /** Ceiling on the estimated tokens of one explicit search response. */
 export const MAX_RENDERED_RESULT_TOKENS = 4096;

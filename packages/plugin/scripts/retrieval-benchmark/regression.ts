@@ -435,6 +435,30 @@ export function buildQualityBaseline(input: {
     });
 }
 
+/** Core per-run host-evidence checks shared by baseline building and
+ *  candidate evaluation: the exclusive run lock, canary stability, and the
+ *  report's host matching its evidence. Reference comparisons stay with
+ *  each caller because their referents differ (the first run's evidence
+ *  for a new baseline; the stored baseline for candidates). */
+function hostEvidenceRunIssues(
+    label: string,
+    index: number,
+    evidence: HostEvidence,
+    report: BenchmarkReport,
+): string[] {
+    const issues: string[] = [];
+    if (!evidence.exclusiveRunLock) {
+        issues.push(`${label}: run ${index + 1} lacks the exclusive run lock`);
+    }
+    if (evidence.canary.pre !== "stable" || evidence.canary.post !== "stable") {
+        issues.push(`${label}: run ${index + 1} has an unstable pre/post canary`);
+    }
+    if (reportHostFingerprint(report) !== evidence.hostFingerprint) {
+        issues.push(`${label}: run ${index + 1} report host does not match its evidence`);
+    }
+    return issues;
+}
+
 export function buildLatencyBaseline(input: {
     policy: RegressionPolicy;
     reports: readonly BenchmarkReport[];
@@ -451,20 +475,11 @@ export function buildLatencyBaseline(input: {
     const qualityKey = matchingQualityKey("baseline", input.reports);
 
     for (const [i, evidence] of input.hostEvidence.entries()) {
-        if (!evidence.exclusiveRunLock) {
-            diagnostics.push(`baseline: run ${i + 1} lacks the exclusive run lock`);
-        }
-        if (evidence.canary.pre !== "stable" || evidence.canary.post !== "stable") {
-            diagnostics.push(`baseline: run ${i + 1} has an unstable pre/post canary`);
-        }
+        diagnostics.push(...hostEvidenceRunIssues("baseline", i, evidence, input.reports[i]));
         if (canonicalFingerprint(evidence) !== canonicalFingerprint(input.hostEvidence[0])) {
             diagnostics.push(
                 `baseline: run ${i + 1} host evidence differs (mixed hosts or drifted placement/power/cache state)`,
             );
-        }
-        const reportHost = reportHostFingerprint(input.reports[i]);
-        if (reportHost !== evidence.hostFingerprint) {
-            diagnostics.push(`baseline: run ${i + 1} report host does not match its evidence`);
         }
     }
     if (diagnostics.length > 0) throw new RegressionError(diagnostics);
@@ -843,25 +858,16 @@ export function evaluateRegression(input: EvaluateRegressionInput): RegressionRe
         latencyReasons.push("latency: host evidence required for each candidate run");
     } else {
         for (const [i, evidence] of hostEvidence.entries()) {
+            latencyReasons.push(
+                ...hostEvidenceRunIssues("latency", i, evidence, input.candidates[i]),
+            );
             if (evidence.hostFingerprint !== latencyBaseline.hostFingerprint) {
                 latencyReasons.push(`latency: run ${i + 1} host fingerprint mismatch`);
-            }
-            if (!evidence.exclusiveRunLock) {
-                latencyReasons.push(`latency: run ${i + 1} lacks the exclusive run lock`);
-            }
-            if (evidence.canary.pre !== "stable" || evidence.canary.post !== "stable") {
-                latencyReasons.push(`latency: run ${i + 1} failed a pre/post canary`);
             }
             for (const field of ["affinity", "numa", "power", "cache"] as const) {
                 if (evidence[field] !== latencyBaseline.hostEvidence[field]) {
                     latencyReasons.push(`latency: run ${i + 1} ${field} evidence drifted`);
                 }
-            }
-            const reportHost = reportHostFingerprint(input.candidates[i]);
-            if (reportHost !== evidence.hostFingerprint) {
-                latencyReasons.push(
-                    `latency: run ${i + 1} report host does not match its evidence`,
-                );
             }
         }
     }

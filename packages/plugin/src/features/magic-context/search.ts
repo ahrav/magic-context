@@ -626,9 +626,11 @@ async function getSemanticScores(args: {
             : false;
         if (!identityWasCached) workspaceServedFromCache = false;
         const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
-        // A cold identity decodes its whole embedding table on load; only
-        // warm identities are billed at touched-byte granularity.
-        if (!identityWasCached) {
+        // A cold identity decodes its whole embedding table on load; warm
+        // identities are billed at touched-byte granularity. The whole-map
+        // scan only feeds the observer, so skip it on untraced searches.
+        const identityIsCold = args.onVectorLoad !== undefined && !identityWasCached;
+        if (identityIsCold) {
             workspaceDecodedBytes += totalEmbeddingBytes(cachedEmbeddings);
             workspaceDecodedVectors += cachedEmbeddings.size;
         }
@@ -636,8 +638,10 @@ async function getSemanticScores(args: {
             if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = cachedEmbeddings.get(memory.id);
             if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
-            workspaceTouchedBytes += memoryEmbedding.embedding.byteLength;
-            workspaceTouchedVectors += 1;
+            if (!identityIsCold) {
+                workspaceTouchedBytes += memoryEmbedding.embedding.byteLength;
+                workspaceTouchedVectors += 1;
+            }
             const score = normalizeCosineScore(
                 cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
             );
@@ -645,10 +649,13 @@ async function getSemanticScores(args: {
         }
     }
 
+    // Mixed warm/cold workspaces report both sides: cold identities' full
+    // decoded loads AND warm identities' touched cache hits — zeroing the
+    // warm side whenever any identity is cold would drop real evidence.
     args.onVectorLoad?.({
-        decodedBytes: workspaceServedFromCache ? 0 : workspaceDecodedBytes,
-        cachedBytes: workspaceServedFromCache ? workspaceTouchedBytes : 0,
-        vectorCount: workspaceServedFromCache ? workspaceTouchedVectors : workspaceDecodedVectors,
+        decodedBytes: workspaceDecodedBytes,
+        cachedBytes: workspaceTouchedBytes,
+        vectorCount: workspaceTouchedVectors + workspaceDecodedVectors,
         cacheHit: workspaceServedFromCache,
     });
     return pruneToLaneCeiling(semanticScores);
