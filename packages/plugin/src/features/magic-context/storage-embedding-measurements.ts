@@ -1,5 +1,7 @@
-import { createHash } from "node:crypto";
 import type { Database } from "../../shared/sqlite";
+import { normalizedQueryHash } from "./query-normalization";
+
+export { normalizedQueryHash, normalizeQueryText } from "./query-normalization";
 
 export interface EmbeddingMeasurementInput {
     sessionId: string;
@@ -44,15 +46,6 @@ export interface EmbeddingMeasurementRow {
     corpus_hash: string;
     coverage_json: string;
     created_at: number;
-}
-
-/** One normalization for query hashing and hash-match comparison. */
-export function normalizeQueryText(query: string): string {
-    return query.trim().replace(/\s+/g, " ").toLowerCase();
-}
-
-export function normalizedQueryHash(query: string): string {
-    return createHash("sha256").update(normalizeQueryText(query)).digest("hex");
 }
 
 /** Per-session row cap for the measurement corpus. Dedup is per

@@ -12,7 +12,7 @@ import {
     prepareExplicitQuery,
 } from "../../src/features/magic-context/search-bounds";
 import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
-import { normalizeQueryText } from "../../src/features/magic-context/storage-embedding-measurements";
+import { normalizeQueryText } from "../../src/features/magic-context/query-normalization";
 import {
     AUTO_SEARCH_RESULT_LIMIT,
     AUTO_SEARCH_SOURCES,

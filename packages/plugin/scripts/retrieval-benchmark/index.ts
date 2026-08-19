@@ -68,6 +68,51 @@ export {
 } from "./identity";
 export { PRIVACY_POLICY_VERSION, SANITIZER_VERSION, scanForSensitiveContent } from "./privacy";
 export {
+    computeQueryMetrics,
+    computeRerankerLift,
+    contextTokensPerUsefulResult,
+    type CutoffMetrics,
+    gateAggregates,
+    isRelevantGrade,
+    type JudgedGrade,
+    judgedGradesByQuery,
+    type MacroAggregate,
+    macroAggregate,
+    METRIC_CUTOFFS,
+    METRIC_POLICY_VERSION,
+    MetricError,
+    type QueryMetrics,
+    type RerankerLift,
+    type ScoredQuery,
+    scoredQueryValues,
+} from "./metrics";
+export {
+    type BenchmarkReport,
+    buildCandidatePool,
+    CANDIDATE_POOL_CONSUMER,
+    CANDIDATE_POOL_SCHEMA_VERSION,
+    type CandidatePoolArtifact,
+    computeReportStatus,
+    evidenceDigest,
+    parseReport,
+    passEligibility,
+    REPORT_SCHEMA_VERSION,
+    type ReportAttempt,
+    type ReportScenario,
+    type ReportStatus,
+    semanticFingerprint,
+} from "./report";
+export {
+    type LatencySummary,
+    nearestRankPercentile,
+    summarizeLatency,
+    TIMING_POLICY_VERSION,
+    TimingError,
+    type TraceTimingEvidence,
+    traceTimingEvidence,
+    type WorkEvidence,
+} from "./timing";
+export {
     checkSyntheticProfile,
     iterateSyntheticDocuments,
     SYNTHETIC_GENERATOR_VERSION,
