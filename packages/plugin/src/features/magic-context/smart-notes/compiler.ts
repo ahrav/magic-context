@@ -32,6 +32,8 @@ interface CompileSmartNoteArgs {
     deadline: number;
     model?: string;
     fallbackModels?: readonly string[];
+    /** See RunCompiledSmartNoteCheckOptions.sandboxLockHeld. */
+    sandboxLockHeld?: boolean;
 }
 
 export interface CompileSmartNoteSuccess {
@@ -167,6 +169,7 @@ Remember: output only the JSON object described by the system prompt.`;
             capabilityFactory: args.capabilityFactory,
             signal: args.signal,
             timeoutMs: 2_000,
+            sandboxLockHeld: args.sandboxLockHeld,
         });
         if (!dryRun.ok) {
             const error = boundedError(`dry-run failed: ${dryRun.error}`);
@@ -206,7 +209,12 @@ export function parseCompilerOutput(output: string | null): CompilerResponse {
         throw new Error("smart-note compiler output exceeds 128 KiB");
     }
     const json = extractJsonObject(output);
-    const parsed = JSON.parse(json) as Partial<CompilerResponse>;
+    let parsed: Partial<CompilerResponse>;
+    try {
+        parsed = JSON.parse(json) as Partial<CompilerResponse>;
+    } catch {
+        throw new Error("smart-note compiler returned malformed JSON");
+    }
     if (typeof parsed.compiled_check !== "string") throw new Error("compiled_check missing");
     if (!parsed.manifest || typeof parsed.manifest !== "object")
         throw new Error("manifest missing");

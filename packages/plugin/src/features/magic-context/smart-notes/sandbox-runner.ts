@@ -73,6 +73,50 @@ function withSandboxLock<T>(fn: () => Promise<T>): Promise<T> {
     return run;
 }
 
+export interface SandboxSlotReservation {
+    /** Run `fn` while holding the slot; consumes the reservation. */
+    run<T>(fn: () => Promise<T>): Promise<T>;
+    /** Give the slot back unused. Safe to call after run(). */
+    release(): void;
+}
+
+/**
+ * Reserve the process-wide sandbox execution slot ahead of time, so callers
+ * can guarantee a later execution never waits behind another QuickJS run.
+ * Work run through the reservation must pass `sandboxLockHeld: true` to
+ * runCompiledSmartNoteCheck so it does not re-queue behind itself.
+ */
+export function reserveSandboxSlot(): Promise<SandboxSlotReservation> {
+    let grant!: (reservation: SandboxSlotReservation) => void;
+    const granted = new Promise<SandboxSlotReservation>((resolve) => {
+        grant = resolve;
+    });
+    void withSandboxLock(
+        () =>
+            new Promise<void>((releaseSlot) => {
+                let settled = false;
+                const finish = () => {
+                    if (!settled) {
+                        settled = true;
+                        releaseSlot();
+                    }
+                };
+                grant({
+                    async run<T>(fn: () => Promise<T>): Promise<T> {
+                        if (settled) throw new Error("sandbox slot reservation already consumed");
+                        try {
+                            return await fn();
+                        } finally {
+                            finish();
+                        }
+                    },
+                    release: finish,
+                });
+            }),
+    );
+    return granted;
+}
+
 export interface RunCompiledSmartNoteCheckOptions {
     compiledCheck: string;
     capabilities?: SmartNoteCapabilityApi;
@@ -81,6 +125,12 @@ export interface RunCompiledSmartNoteCheckOptions {
     timeoutMs?: number;
     heapLimitBytes?: number;
     stackLimitBytes?: number;
+    /**
+     * The caller already holds the process-wide sandbox slot through a
+     * SandboxSlotReservation, so this run must execute directly instead of
+     * queueing behind itself.
+     */
+    sandboxLockHeld?: boolean;
 }
 
 export interface RunCompiledSmartNoteCheckSuccess {
@@ -147,6 +197,9 @@ export async function runCompiledSmartNoteCheck(
     // asyncify-suspended eval may exist at a time on the shared module. The
     // per-check timeout and host-capability controller start INSIDE the lock so
     // a check queued behind another doesn't burn its own budget waiting.
+    if (options.sandboxLockHeld) {
+        return runCompiledSmartNoteCheckLocked(options);
+    }
     return withSandboxLock(() => runCompiledSmartNoteCheckLocked(options));
 }
 
