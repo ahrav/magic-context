@@ -274,14 +274,16 @@ describe("seed-time positive-target validation (AE2)", () => {
     });
 
     it("applies the same inclusive cutoff to compartment end ordinals", () => {
-        // Compartments take ordinals above the four message ordinals;
-        // d-architecture-rationale-dev is the first compartment: ordinal 5.
-        const atCutoff = releaseWithCutoff("q-architecture-rationale-dev", 5);
+        // Reviewed compartments draw from a dedicated low counter so scale
+        // filler cannot push them past explicit cutoffs:
+        // d-architecture-rationale-dev is the first compartment (ordinal 1),
+        // d-architecture-rationale-hold the second (ordinal 2).
+        const atCutoff = releaseWithCutoff("q-architecture-rationale-dev", 1);
         expect(() =>
             seedFixture(toSeedInput(atCutoff), { fixtureDir: tempFixtureDir(), dims: 8 }),
         ).not.toThrow();
 
-        const beyond = releaseWithCutoff("q-architecture-rationale-dev", 4);
+        const beyond = releaseWithCutoff("q-architecture-rationale-hold", 1);
         expect(() =>
             seedFixture(toSeedInput(beyond), { fixtureDir: tempFixtureDir(), dims: 8 }),
         ).toThrow(SeedError);

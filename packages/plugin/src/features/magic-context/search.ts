@@ -33,6 +33,7 @@ import {
 } from "./search-bounds";
 import { recordShadowMeasurement } from "./search-measurement";
 import {
+    accumulateVectorLoad,
     createSearchTraceRecorder,
     type SearchTraceOptions,
     type SearchTraceRecorder,
@@ -585,11 +586,6 @@ async function getSemanticScores(args: {
     }
 
     const workspace = args.workspace;
-    let workspaceTouchedBytes = 0;
-    let workspaceTouchedVectors = 0;
-    let workspaceDecodedBytes = 0;
-    let workspaceDecodedVectors = 0;
-    let workspaceServedFromCache = true;
     const memoriesByIdentity = new Map<string, Memory[]>();
     for (const memory of args.memories) {
         const identity = memoryWorkspaceIdentity(memory, workspace);
@@ -624,40 +620,46 @@ async function getSemanticScores(args: {
                 ? ownWasCachedBeforePrime
                 : peekProjectEmbeddings(identity, args.queryModelId) !== null
             : false;
-        if (!identityWasCached) workspaceServedFromCache = false;
         const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
         // A cold identity decodes its whole embedding table on load; warm
         // identities are billed at touched-byte granularity. The whole-map
         // scan only feeds the observer, so skip it on untraced searches.
         const identityIsCold = args.onVectorLoad !== undefined && !identityWasCached;
-        if (identityIsCold) {
-            workspaceDecodedBytes += totalEmbeddingBytes(cachedEmbeddings);
-            workspaceDecodedVectors += cachedEmbeddings.size;
-        }
+        let identityTouchedBytes = 0;
+        let identityTouchedVectors = 0;
         for (const memory of memberMemories) {
             if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = cachedEmbeddings.get(memory.id);
             if (!memoryEmbedding || memoryEmbedding.modelId !== args.queryModelId) continue;
             if (!identityIsCold) {
-                workspaceTouchedBytes += memoryEmbedding.embedding.byteLength;
-                workspaceTouchedVectors += 1;
+                identityTouchedBytes += memoryEmbedding.embedding.byteLength;
+                identityTouchedVectors += 1;
             }
             const score = normalizeCosineScore(
                 cosineSimilarity(args.queryEmbedding, memoryEmbedding.embedding),
             );
             if (score > 0) semanticScores.set(memory.id, score);
         }
+        // One all-or-nothing event per identity load (the v1 VectorLoadEvent
+        // contract): a mixed warm/cold workspace emits one event per side
+        // instead of a single event with both byte fields nonzero.
+        args.onVectorLoad?.(
+            identityIsCold
+                ? {
+                      decodedBytes: totalEmbeddingBytes(cachedEmbeddings),
+                      cachedBytes: 0,
+                      vectorCount: cachedEmbeddings.size,
+                      cacheHit: false,
+                  }
+                : {
+                      decodedBytes: 0,
+                      cachedBytes: identityTouchedBytes,
+                      vectorCount: identityTouchedVectors,
+                      cacheHit: true,
+                  },
+        );
     }
 
-    // Mixed warm/cold workspaces report both sides: cold identities' full
-    // decoded loads AND warm identities' touched cache hits — zeroing the
-    // warm side whenever any identity is cold would drop real evidence.
-    args.onVectorLoad?.({
-        decodedBytes: workspaceDecodedBytes,
-        cachedBytes: workspaceTouchedBytes,
-        vectorCount: workspaceTouchedVectors + workspaceDecodedVectors,
-        cacheHit: workspaceServedFromCache,
-    });
     return pruneToLaneCeiling(semanticScores);
 }
 
@@ -806,6 +808,9 @@ async function searchMemories(args: {
     trace?: SearchTraceRecorder | null;
     rootSpanId?: number | null;
     embedSpanId?: number | null;
+    /** The unified filter span; the lane's first span depends on it so the
+     *  causal chain includes filter and workspace-resolution cost. */
+    filterSpanId?: number | null;
 }): Promise<{ results: MemorySearchResult[]; laneSpanId: number | null }> {
     if (!args.memoryEnabled) {
         return { results: [], laneSpanId: null };
@@ -814,7 +819,10 @@ async function searchMemories(args: {
     const trace = args.trace ?? null;
     const rootSpanId = args.rootSpanId ?? null;
     const hydrationSpan =
-        trace?.begin("metadata_hydration", "memory", { parent: rootSpanId }) ?? null;
+        trace?.begin("metadata_hydration", "memory", {
+            parent: rootSpanId,
+            dependsOn: args.filterSpanId != null ? [args.filterSpanId] : [],
+        }) ?? null;
     const memories = args.workspace?.isWorkspaced
         ? getMemoriesByProjects(
               args.db,
@@ -871,7 +879,7 @@ async function searchMemories(args: {
         visibleMemoryIds: args.visibleMemoryIds,
         onVectorLoad: scanSpan
             ? (event) => {
-                  memoryLoad = event;
+                  memoryLoad = accumulateVectorLoad(memoryLoad, event);
               }
             : undefined,
     });
@@ -1554,6 +1562,7 @@ function searchCompartmentChunks(args: {
         args.projectPath,
         args.modelId,
         args.onVectorLoad,
+        cutoff,
     );
     if (rows.length === 0) return [];
 
@@ -2061,7 +2070,15 @@ async function executeUnifiedSearch(args: {
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
     const runNotes = activeSources.has("note");
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
+    // Workspace resolution is part of filter construction: it performs the
+    // identity/alias/sharing-policy lookups that decide what each lane may
+    // read, so it must fall inside this span and precede its end or the
+    // filtering stage undercounts and drops out of the causal chain.
+    const workspace = resolveSearchWorkspaceContext(db, projectPath);
     filterSpan?.end("ok");
+    // Downstream chain roots depend on the filter span so criticalPathMs
+    // includes filter and workspace-resolution cost.
+    const filterDeps = filterSpan ? [filterSpan.id] : [];
 
     // Embed the query ONCE at the top — both memory and git-commit searches
     // need the same vector. Previously each search called `embedQuery`
@@ -2086,7 +2103,7 @@ async function executeUnifiedSearch(args: {
 
     const embedSpan =
         trace && needsEmbedding
-            ? trace.begin("query_inference", "query", { parent: rootId })
+            ? trace.begin("query_inference", "query", { parent: rootId, dependsOn: filterDeps })
             : null;
     if (trace && !needsEmbedding) {
         trace.notApplicable("query_inference", "query", rootId);
@@ -2124,7 +2141,9 @@ async function executeUnifiedSearch(args: {
     // yield no probes, so this is a no-op for them regardless of the flag.
     const messageProbes = options.explicitSearch ? extractLiteralProbes(trimmedQuery) : [];
     const messageSpan =
-        trace && runMessages ? trace.begin("lexical_scan", "message", { parent: rootId }) : null;
+        trace && runMessages
+            ? trace.begin("lexical_scan", "message", { parent: rootId, dependsOn: filterDeps })
+            : null;
     const messageResults: MessageSearchResult[] = runMessages
         ? searchMessages({
               db,
@@ -2155,7 +2174,6 @@ async function executeUnifiedSearch(args: {
         ? (queryContract?.vector ?? (capturedQuery instanceof Float32Array ? capturedQuery : null))
         : null;
     generationSpan?.end("ok");
-    const workspace = resolveSearchWorkspaceContext(db, projectPath);
     const embeddingModelId =
         queryContract?.modelId ?? options.embeddingModelIdOverride ?? embeddingSnapshot?.modelId;
     const chunkModelId =
@@ -2181,7 +2199,7 @@ async function executeUnifiedSearch(args: {
               modelId: chunkModelId && chunkModelId !== "off" ? chunkModelId : null,
               onVectorLoad: compartmentSpan
                   ? (event) => {
-                        compartmentLoad = event;
+                        compartmentLoad = accumulateVectorLoad(compartmentLoad, event);
                     }
                   : undefined,
           })
@@ -2230,7 +2248,7 @@ async function executeUnifiedSearch(args: {
         const results = run(
             span
                 ? (event) => {
-                      load = event;
+                      load = accumulateVectorLoad(load, event);
                   }
                 : undefined,
         );
@@ -2274,7 +2292,9 @@ async function executeUnifiedSearch(args: {
         );
 
     const runNoteLane = (): NoteSearchResult[] => {
-        const span = trace ? trace.begin("lexical_scan", "note", { parent: rootId }) : null;
+        const span = trace
+            ? trace.begin("lexical_scan", "note", { parent: rootId, dependsOn: filterDeps })
+            : null;
         const lane = searchNotes({
             db,
             sessionId,
@@ -2307,6 +2327,7 @@ async function executeUnifiedSearch(args: {
                   trace,
                   rootSpanId: rootId,
                   embedSpanId: embedSpan?.id ?? null,
+                  filterSpanId: filterSpan?.id ?? null,
               })
             : Promise.resolve({
                   results: [] as MemorySearchResult[],

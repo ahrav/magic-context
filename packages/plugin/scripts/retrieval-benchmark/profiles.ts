@@ -363,6 +363,20 @@ export function parseProfile(value: unknown): BenchmarkProfile {
             hasScaleDimsConcurrencyCorner = true;
         }
         validateSelectivity(index, profileCase.selectivity, diagnostics);
+        // Connection-statement, SQLite-page, and OS-page warmth comes only
+        // from executed searches; with zero warmups the first measured
+        // sample runs cold while the case evidence still claims warm. The
+        // process-vector layer is exempt: the cache controller primes it
+        // explicitly at case start.
+        const warmthNeedsExecution =
+            profileCase.cacheState.connectionStatement === "warm" ||
+            profileCase.cacheState.sqlitePage === "warm" ||
+            profileCase.cacheState.osPage === "warm";
+        if (warmthNeedsExecution && profile.runtime.warmups === 0) {
+            diagnostics.push(
+                `profile.cases[${index}].cacheState: warm execution layers require runtime.warmups >= 1`,
+            );
+        }
     }
 
     // Full axis-endpoint coverage is a reference-host obligation; CI host

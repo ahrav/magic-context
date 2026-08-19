@@ -823,6 +823,11 @@ export function loadCompartmentChunkEmbeddingsForSearch(
     projectPath: string,
     modelId: string,
     onVectorLoad?: VectorLoadObserver,
+    /** Ordinal cutoff the caller applies before comparing vectors. Warm
+     *  touched-byte evidence counts only rows the search can actually
+     *  compare; the cold decode below still reports the whole pool, since
+     *  a cache miss genuinely decodes everything. */
+    touchedMaxOrdinal?: number | null,
 ): StoredCompartmentChunkEmbedding[] {
     if (!modelId) {
         throw new Error("loadCompartmentChunkEmbeddingsForSearch requires a current model id");
@@ -837,12 +842,18 @@ export function loadCompartmentChunkEmbeddingsForSearch(
     const cached = pool.get(key);
     if (cached && cached.rowCount === rowCount && cached.maxRowId === maxRowId) {
         touchDecodedSearchPoolEntry(cached);
-        onVectorLoad?.({
-            decodedBytes: 0,
-            cachedBytes: searchPoolVectorBytes(cached.rows),
-            vectorCount: cached.rows.length,
-            cacheHit: true,
-        });
+        if (onVectorLoad) {
+            const touched =
+                touchedMaxOrdinal == null
+                    ? cached.rows
+                    : cached.rows.filter((row) => row.endOrdinal <= touchedMaxOrdinal);
+            onVectorLoad({
+                decodedBytes: 0,
+                cachedBytes: searchPoolVectorBytes(touched),
+                vectorCount: touched.length,
+                cacheHit: true,
+            });
+        }
         return cached.rows;
     }
     if (cached) removeDecodedSearchPoolEntry(cached);

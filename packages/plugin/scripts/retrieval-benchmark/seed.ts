@@ -482,10 +482,24 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             syntheticCompartments = stream.pendingCompartments;
         }
 
+        // Reviewed compartments reference the session's EARLIEST message
+        // ordinals (a dedicated low counter) instead of consuming fresh
+        // ordinals from the shared stream counter. Fresh ordinals land after
+        // the synthetic scale filler — beyond every explicit-query ordinal
+        // cutoff on large fixtures, which fails validatePositiveTargets —
+        // and a compartment summarizing already-seeded messages is the
+        // production shape anyway. Message ordinals stay contiguous 1..N
+        // per session, which the production message indexer requires.
+        const compartmentOrdinals = new Map<string, number>();
+        const nextCompartmentOrdinal = (sessionId: string): number => {
+            const next = (compartmentOrdinals.get(sessionId) ?? 0) + 1;
+            compartmentOrdinals.set(sessionId, next);
+            return next;
+        };
         for (const plan of planned) {
             if (plan.document.kind !== "compartment") continue;
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
-            const ordinal = nextOrdinal(sessionId);
+            const ordinal = nextCompartmentOrdinal(sessionId);
             const vector = deterministicVector(`doc:${plan.document.id}`, options.dims);
             const seeded = seedCompartmentRow(db, {
                 sessionId,

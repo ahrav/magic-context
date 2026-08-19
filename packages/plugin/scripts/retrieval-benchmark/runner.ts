@@ -530,9 +530,19 @@ interface QueryExecutionContext {
 function effectiveSources(ctx: QueryExecutionContext): SearchSource[] | undefined {
     const base: readonly SearchSource[] | null =
         ctx.query.mode === "automatic" ? AUTO_SEARCH_SOURCES : ctx.query.sourceFilters;
-    const lanes = ctx.profileCase.sourceLanes;
-    if (lanes === null) return base ? [...base] : undefined;
-    return lanes.filter((lane) => !base || base.includes(lane));
+    // The case's lane axis and its selectivity predicate both narrow the
+    // executed source set: the preflight validates cardinalities for the
+    // declared predicate, so the measured search must run under it (R58).
+    let sources: readonly SearchSource[] | null = base;
+    for (const narrower of [
+        ctx.profileCase.sourceLanes,
+        ctx.profileCase.selectivity.predicate.sources,
+    ]) {
+        if (narrower === null) continue;
+        const admitted = sources;
+        sources = admitted === null ? narrower : narrower.filter((lane) => admitted.includes(lane));
+    }
+    return sources === null ? undefined : [...sources];
 }
 
 function effectiveMessageCutoff(ctx: QueryExecutionContext): number | undefined {
@@ -575,7 +585,13 @@ function buildSearchOptions(
         // semantic scoring lane. Model ids come from the overrides above.
         embedQuery: async (text) => deterministicVector(`query:${text}`, dims),
         isEmbeddingRuntimeEnabled: () => true,
-        visibleMemoryIds: new Set(ctx.query.visibleState.visibleMemoryIds),
+        // The predicate's visibility exclusions execute alongside the
+        // query's own: both narrow the eligible memory set the preflight
+        // validated cardinalities against.
+        visibleMemoryIds: new Set([
+            ...ctx.query.visibleState.visibleMemoryIds,
+            ...ctx.profileCase.selectivity.predicate.visibleMemoryIds,
+        ]),
         candidateDepth: ctx.profileCase.candidateK.effective,
         ...overrides,
     };
@@ -889,6 +905,20 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     }
 
     const queries = ctx.release.corpus.queries.filter((query) => query.mode === profileCase.mode);
+    // Scope is the one predicate field the executed search cannot merge: a
+    // query runs under its own fixture scope, so a mismatch means the
+    // preflight validated cardinalities for a workload no query executes.
+    for (const query of queries) {
+        const scopeMismatch =
+            predicate.projectScope !== query.fixtureScope.projectScope ||
+            (predicate.sessionScope !== null &&
+                predicate.sessionScope !== query.fixtureScope.sessionScope);
+        if (scopeMismatch) {
+            throw new RunnerError([
+                `case ${profileCase.id}: query ${query.id} fixture scope does not match the selectivity predicate scope`,
+            ]);
+        }
+    }
     const lanes = profileCase.sourceLanes;
     const memoryLaneActive =
         (lanes === null || lanes.includes("memory")) &&
