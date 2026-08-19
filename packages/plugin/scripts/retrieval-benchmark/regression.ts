@@ -199,6 +199,17 @@ export function parseRegressionPolicy(value: unknown): RegressionPolicy {
 export function parseQualityBaseline(value: unknown): QualityBaselineArtifact {
     const parsed = qualityBaselineSchema.safeParse(value);
     if (!parsed.success) throw new RegressionError(formatArtifactIssues("baseline", parsed.error));
+    // Cross-run mode consistency is a loader obligation, not just a builder
+    // one: evaluateRegression derives its mode set from the first run and
+    // asks every run for it, so a hand-edited but schema-valid artifact
+    // with diverging per-run mode sets must fail here with a clean
+    // diagnostic instead of crashing the evaluation.
+    const modeSet = (run: { modes: readonly { mode: string }[] }) =>
+        [...run.modes.map((entry) => entry.mode)].sort().join(",");
+    const first = parsed.data.runs[0];
+    if (first && parsed.data.runs.some((run) => modeSet(run) !== modeSet(first))) {
+        throw new RegressionError(["baseline: holdout mode coverage differs across runs"]);
+    }
     return parsed.data;
 }
 
@@ -955,15 +966,32 @@ export function aaMechanicalCheck(input: {
         allowIdenticalRuns: true,
     });
 
+    // Cross-check two INDEPENDENT computations of the same policy: the
+    // p95 recomputed here from raw samples against the p95 the runner
+    // recorded in case evidence at run time. Recomputing the same pure
+    // function twice over one array would be tautological and could never
+    // surface a defect in either pipeline.
+    const recordedP95ByCase = new Map<string, number>();
+    for (const caseEvidence of input.report.evidence.cases) {
+        if (caseEvidence.latencySummary) {
+            recordedP95ByCase.set(caseEvidence.caseId, caseEvidence.latencySummary.p95Ms);
+        }
+    }
     const cells = reportCellSamples(input.report);
     let latencyCellsChecked = 0;
     let latencyExact = true;
-    for (const samplesMs of cells.values()) {
+    for (const [caseId, samplesMs] of cells) {
         if (samplesMs.length === 0) continue;
         latencyCellsChecked += 1;
-        const baselineP95 = runLevelP95({ kind: "raw-request-samples", samplesMs });
-        const candidateP95 = runLevelP95({ kind: "raw-request-samples", samplesMs });
-        if (candidateP95 !== baselineP95) latencyExact = false;
+        const recordedP95 = recordedP95ByCase.get(caseId);
+        // The runner records a summary for every case with samples, so a
+        // missing or diverging recorded p95 is a mechanical defect.
+        if (recordedP95 === undefined) {
+            latencyExact = false;
+            continue;
+        }
+        const recomputedP95 = runLevelP95({ kind: "raw-request-samples", samplesMs });
+        if (recomputedP95 !== recordedP95) latencyExact = false;
     }
 
     const maxAbsAverageLossPoints = Math.max(

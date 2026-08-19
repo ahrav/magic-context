@@ -22,7 +22,7 @@ import {
     tsAudit,
 } from "./regression";
 import { type BenchmarkReport, parseReport, REPORT_SCHEMA_VERSION } from "./report";
-import { TIMING_POLICY_VERSION } from "./timing";
+import { summarizeLatency, TIMING_POLICY_VERSION } from "./timing";
 
 const FP = "a".repeat(64);
 const HOST_A = "1".repeat(64);
@@ -164,7 +164,21 @@ function makeRun(spec: RunSpec): BenchmarkReport {
                 selectivityObserved: { preFilterDenominator: 1, eligibleCount: 1 },
                 cacheLayers: [],
                 laneRestricted: false,
-                latencySummary: null,
+                // Mirrors the runner: a case with samples records their
+                // summary; the A/A mechanical check cross-verifies this
+                // recorded p95 against its own recomputation.
+                latencySummary:
+                    (cells[caseId] ?? []).length > 0
+                        ? (() => {
+                              const summary = summarizeLatency(cells[caseId] ?? []);
+                              return {
+                                  timingPolicyVersion: summary.timingPolicyVersion,
+                                  sampleCount: summary.sampleCount,
+                                  p50Ms: summary.p50Ms,
+                                  p95Ms: summary.p95Ms,
+                              };
+                          })()
+                        : null,
             })),
         },
         candidatePool: {

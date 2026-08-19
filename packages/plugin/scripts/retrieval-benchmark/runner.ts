@@ -338,9 +338,20 @@ class CaseCacheController {
             ]);
         }
         // With concurrency > 1, another worker can repopulate the shared processVector cache between invalidation and measurement, so cold samples require one worker (KTD9). commentlint: allow(JUDGE)
-        if (state.processVector === "cold" && profileCase.concurrency > 1) {
+        // The guard applies only when the memory lane can touch that cache;
+        // a case whose lanes exclude memory never reads it, so the race it
+        // prevents cannot occur.
+        if (state.processVector === "cold" && profileCase.concurrency > 1 && ctx.memoryLaneActive) {
             throw new RunnerError([
                 `case ${profileCase.id}: cold processVector requires concurrency 1 (a concurrent worker can re-warm the shared process cache between invalidate and sample)`,
+            ]);
+        }
+        // Same shared-resource race for the OS page cache: every worker
+        // reads the same snapshot file, so one worker's eviction is undone
+        // by any concurrent worker's read before the measured query runs.
+        if (state.osPage === "cold" && profileCase.concurrency > 1) {
+            throw new RunnerError([
+                `case ${profileCase.id}: cold osPage requires concurrency 1 (a concurrent worker re-warms the shared page cache between eviction and sample)`,
             ]);
         }
         this.freshConnectionPerSample = state.connectionStatement === "cold";
@@ -415,7 +426,10 @@ class CaseCacheController {
         }
     }
 
-    connectionOpened(): void {
+    /** Called once per measured sample, right after its connection opens.
+     *  Warmups, the evaluation pass, and the traced diagnostic pass open
+     *  connections too, but only measured samples are reset evidence. */
+    measuredConnectionOpened(): void {
         if (this.freshConnectionPerSample) {
             this.layers[1].resets += 1;
             this.layers[2].resets += 1;
@@ -771,6 +785,7 @@ async function executeQueryScenario(
         controller.beforeSample(queryTouchesMemory);
         const db = conn.acquire();
         try {
+            controller.measuredConnectionOpened();
             controller.warmSampleReady(db, queryTouchesMemory);
             const startedAt = ctx.now();
             delivery = await executeDelivery(db, qctx);
@@ -890,7 +905,6 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         const conn: ConnectionLease = {
             acquire: () => {
                 if (controller.freshConnectionPerSample) {
-                    controller.connectionOpened();
                     return openFixtureSnapshot(fixture.snapshotPath);
                 }
                 if (!persistent) {

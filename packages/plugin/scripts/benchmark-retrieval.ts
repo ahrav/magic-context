@@ -13,7 +13,7 @@
  *   3  structurally invalid evidence / A/A mechanical failure
  */
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -214,10 +214,19 @@ function readHostEvidenceFile(path: string): HostEvidence {
     return parseHostEvidence(parsed);
 }
 
+/** Atomic artifact write: a process killed mid-serialization must not leave
+ *  a truncated JSON file at the path automation treats as the validated
+ *  artifact. Same temp-then-rename discipline as the runner's checkpoints. */
+async function writeArtifact(path: string, text: string): Promise<void> {
+    const tmp = `${path}.tmp`;
+    await Bun.write(tmp, text);
+    renameSync(tmp, path);
+}
+
 async function emitResult(value: unknown, outPath: string | null): Promise<void> {
     const text = JSON.stringify(value, null, 2);
     if (outPath) {
-        await Bun.write(outPath, `${text}\n`);
+        await writeArtifact(outPath, `${text}\n`);
         console.error(`[benchmark-retrieval] result=${outPath}`);
     } else {
         console.log(text);
@@ -254,6 +263,22 @@ async function runBaselineCreate(rest: string[]): Promise<void> {
             throw new RunnerError([`usage: unknown claim eligibility ${claimEligibility}`]);
         }
         const artifact = buildQualityBaseline({ policy, reports, claimEligibility });
+        // A mode whose metrics are zero across every run publishes a vacuous
+        // gate: loss is bounded below by zero, so no regression in that mode
+        // can ever fail. Refuse to publish it; fix the lane first.
+        for (const mode of artifact.runs[0]?.modes ?? []) {
+            const allZero = artifact.runs.every((run) =>
+                run.modes.some(
+                    (entry) =>
+                        entry.mode === mode.mode && entry.ndcgAt10 === 0 && entry.recallAt50 === 0,
+                ),
+            );
+            if (allZero) {
+                throw new RunnerError([
+                    `usage: refusing to publish a zero-valued ${mode.mode} baseline (the gate would be vacuous)`,
+                ]);
+            }
+        }
         const { path } = publishBaseline(artifact, outPath);
         console.error(`[benchmark-retrieval] published quality baseline ${path}`);
         await emitResult(
@@ -479,14 +504,14 @@ async function runCheckOrMatrix(command: "check" | "matrix", rest: string[]): Pr
 
         const reportJson = `${JSON.stringify(result.report, null, 2)}\n`;
         if (args.candidatePoolPath) {
-            await Bun.write(
+            await writeArtifact(
                 args.candidatePoolPath,
                 `${JSON.stringify(result.candidatePool, null, 2)}\n`,
             );
             console.error(`[benchmark-retrieval] candidatePool=${args.candidatePoolPath}`);
         }
         if (args.outPath) {
-            await Bun.write(args.outPath, reportJson);
+            await writeArtifact(args.outPath, reportJson);
             console.log(
                 JSON.stringify(
                     {

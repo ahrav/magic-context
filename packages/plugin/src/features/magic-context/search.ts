@@ -500,6 +500,14 @@ function pruneToLaneCeiling(scores: Map<number, number>): Map<number, number> {
     return new Map(top);
 }
 
+/** Total vector-buffer bytes held by a loaded embedding map — what a cache
+ *  miss actually decoded, as opposed to the candidate subset compared. */
+function totalEmbeddingBytes(embeddings: ReadonlyMap<number, { embedding: Float32Array }>): number {
+    let bytes = 0;
+    for (const entry of embeddings.values()) bytes += entry.embedding.byteLength;
+    return bytes;
+}
+
 async function getSemanticScores(args: {
     db: Database;
     projectPath: string;
@@ -565,9 +573,12 @@ async function getSemanticScores(args: {
         }
 
         args.onVectorLoad?.({
-            decodedBytes: wasCached ? 0 : touchedBytes,
+            // A cache miss decodes the WHOLE project's embedding table, not
+            // just the candidates compared afterwards; the counters must
+            // attribute the bytes the load actually decoded.
+            decodedBytes: wasCached ? 0 : totalEmbeddingBytes(embeddings),
             cachedBytes: wasCached ? touchedBytes : 0,
-            vectorCount: touchedVectors,
+            vectorCount: wasCached ? touchedVectors : embeddings.size,
             cacheHit: wasCached,
         });
         return pruneToLaneCeiling(semanticScores);
@@ -576,6 +587,8 @@ async function getSemanticScores(args: {
     const workspace = args.workspace;
     let workspaceTouchedBytes = 0;
     let workspaceTouchedVectors = 0;
+    let workspaceDecodedBytes = 0;
+    let workspaceDecodedVectors = 0;
     let workspaceServedFromCache = true;
     const memoriesByIdentity = new Map<string, Memory[]>();
     for (const memory of args.memories) {
@@ -613,6 +626,12 @@ async function getSemanticScores(args: {
             : false;
         if (!identityWasCached) workspaceServedFromCache = false;
         const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
+        // A cold identity decodes its whole embedding table on load; only
+        // warm identities are billed at touched-byte granularity.
+        if (!identityWasCached) {
+            workspaceDecodedBytes += totalEmbeddingBytes(cachedEmbeddings);
+            workspaceDecodedVectors += cachedEmbeddings.size;
+        }
         for (const memory of memberMemories) {
             if (args.visibleMemoryIds?.has(memory.id)) continue;
             const memoryEmbedding = cachedEmbeddings.get(memory.id);
@@ -627,9 +646,9 @@ async function getSemanticScores(args: {
     }
 
     args.onVectorLoad?.({
-        decodedBytes: workspaceServedFromCache ? 0 : workspaceTouchedBytes,
+        decodedBytes: workspaceServedFromCache ? 0 : workspaceDecodedBytes,
         cachedBytes: workspaceServedFromCache ? workspaceTouchedBytes : 0,
-        vectorCount: workspaceTouchedVectors,
+        vectorCount: workspaceServedFromCache ? workspaceTouchedVectors : workspaceDecodedVectors,
         cacheHit: workspaceServedFromCache,
     });
     return pruneToLaneCeiling(semanticScores);
@@ -764,6 +783,11 @@ async function searchMemories(args: {
     projectPath: string;
     query: string;
     limit: number;
+    /** Explicit per-lane candidate bound (from `options.candidateDepth`).
+     *  When absent the lane keeps its fixed lexical candidate ceiling, so
+     *  production behavior is unchanged; an explicit depth is executed as
+     *  the lexical fetch bound so K sweeps measure a real workload change. */
+    candidateLimit?: number | null;
     memoryEnabled: boolean;
     /** Pre-computed query embedding (or null if embedding is disabled / failed).
      *  unifiedSearch embeds once and passes the same vector here and to
@@ -812,7 +836,7 @@ async function searchMemories(args: {
         db: args.db,
         projectPath: args.projectPath,
         query: args.query,
-        limit: FTS_SEMANTIC_CANDIDATE_LIMIT,
+        limit: args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT,
         workspace: args.workspace,
     });
     lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
@@ -881,10 +905,11 @@ async function searchMemories(args: {
     topKSpan?.end("ok", {
         candidatesIn: new Set([...semanticScores.keys(), ...ftsScores.keys()]).size,
         candidatesOut: merged.length,
-        // One variable feeds both counters: plumbing-identity evidence
-        // only, not the lane's actually executed bound.
         requestedK: args.limit,
-        effectiveK: args.limit,
+        // With an explicit candidate bound the lexical fetch executed it;
+        // otherwise both counters carry the caller's limit (plumbing
+        // identity only, not an executed lane bound).
+        effectiveK: args.candidateLimit ?? args.limit,
     });
     // The lane's terminal span: the unified fusion span depends on it so
     // critical-path analysis can follow the memory lane.
@@ -1960,13 +1985,17 @@ export async function unifiedSearch(
     }
     const trimmedQuery = prepared.query;
     const measurementStartedAt = Date.now();
-    if (trimmedQuery.length === 0) {
-        return [];
-    }
-
+    // Depth validation and the trace root both precede the empty-query
+    // short-circuit: an invalid candidateDepth must throw for every input,
+    // and a supplied sink must see one root span per call.
     const candidateDepth = normalizeCandidateDepth(options.candidateDepth);
     const trace = options.trace ? createSearchTraceRecorder(options.trace) : null;
     const rootSpan = trace?.begin("root", "unified") ?? null;
+    if (trimmedQuery.length === 0) {
+        rootSpan?.end("ok", { candidatesOut: 0 });
+        return [];
+    }
+
     try {
         const results = await executeUnifiedSearch({
             db,
@@ -2155,14 +2184,21 @@ async function executeUnifiedSearch(args: {
         candidatesOut: compartmentResults.length,
         ...laneDepth,
     });
+    // The message fusion stage only runs when a feeding lane ran; a span
+    // with status "ok" for a disabled stage would misreport zero-cost work
+    // as executed, so absent stages emit the explicit marker instead.
+    const messageFusionRan = runMessages || runCompartmentChunks;
     const messageFusionSpan =
-        trace?.begin("fusion", "message", {
-            parent: rootId,
-            dependsOn: [
-                ...(messageSpan ? [messageSpan.id] : []),
-                ...(compartmentSpan ? [compartmentSpan.id] : []),
-            ],
-        }) ?? null;
+        trace && messageFusionRan
+            ? trace.begin("fusion", "message", {
+                  parent: rootId,
+                  dependsOn: [
+                      ...(messageSpan ? [messageSpan.id] : []),
+                      ...(compartmentSpan ? [compartmentSpan.id] : []),
+                  ],
+              })
+            : null;
+    if (trace && !messageFusionRan) trace.notApplicable("fusion", "message", rootId);
     const messageLikeResults = mergeMessageAndCompartmentResults({
         messages: messageResults,
         compartments: compartmentResults,
@@ -2254,6 +2290,7 @@ async function executeUnifiedSearch(args: {
                   projectPath,
                   query: trimmedQuery,
                   limit: tierLimit,
+                  candidateLimit: args.candidateDepth,
                   memoryEnabled: true,
                   queryEmbedding,
                   queryModelId:
