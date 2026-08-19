@@ -47,7 +47,6 @@ import {
     sweepStaleEmbeddingIdentitiesForProject,
 } from "../features/magic-context/project-embedding-registry";
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
-import { wakePlaneStatus } from "../features/magic-context/smart-notes/wake-plane";
 import {
     openDatabase,
     retryPendingSessionCleanups,
@@ -500,8 +499,11 @@ async function sweepProject(
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
     const bridge = getModuleNoteEvaluationBridge(reg.projectIdentity);
     if (bridge) {
-        if (!bridge.available()) return;
-        if ((await wakePlaneStatus()) === "present") return;
+        // Deliberately NOT gated on bridge.available(): drain is the path that
+        // re-registers a dropped evaluator, so gating it on availability would
+        // make a failed boot registration or a module restart permanently
+        // unrecoverable for this process. The bridge itself suppresses local
+        // claims and publishes wake ownership when the wake plane is present.
         const result = await bridge.drain({ deadline: Date.now() + 60_000 });
         if (result.claimed > 0) {
             log(

@@ -349,14 +349,37 @@ pub fn evaluation_backoff_ms(failure_count: i64) -> i64 {
 }
 
 /// Host-derived ready reason for a due-phase met result: the manifest's first
-/// signal, else its summary, else a fixed default; truncated to 240 chars.
+/// signal, else its summary, else a fixed default; truncated to 240 units.
+///
+/// The bound is 240 UTF-16 code units, not 240 Unicode scalars, because the
+/// TypeScript reducer this mirrors truncates with `String.prototype.slice`. For a
+/// reason containing non-BMP characters the two counts differ, and this field is
+/// persisted, so counting scalars here would let the two authorities store
+/// different `ready_reason` values for the same note.
 pub fn due_ready_reason(note_id: i64, manifest_json: Option<&str>) -> String {
     let signal = manifest_signal_or_summary(manifest_json)
         .unwrap_or_else(|| "compiled check returned met=true".to_string());
-    format!("Smart note #{note_id}: {signal}")
-        .chars()
-        .take(240)
-        .collect()
+    truncate_utf16_units(&format!("Smart note #{note_id}: {signal}"), 240)
+}
+
+/// Truncate to at most `max_units` UTF-16 code units, matching JS `slice`.
+/// A trailing lone surrogate (a split surrogate pair) is dropped rather than
+/// emitted, since Rust `String` cannot hold an unpaired surrogate.
+fn truncate_utf16_units(value: &str, max_units: usize) -> String {
+    if value.chars().map(char::len_utf16).sum::<usize>() <= max_units {
+        return value.to_string();
+    }
+    let mut used = 0usize;
+    let mut out = String::new();
+    for ch in value.chars() {
+        let width = ch.len_utf16();
+        if used + width > max_units {
+            break;
+        }
+        used += width;
+        out.push(ch);
+    }
+    out
 }
 
 /// Mirror of parseSmartNoteManifest for the fields the ready reason reads:
@@ -653,7 +676,9 @@ pub struct SmartNoteSelectionSnapshot {
     /// already compiled.
     pub compile_status: Option<String>,
     pub created_at: i64,
-    pub compiled_check: Option<String>,
+    /// Only artifact PRESENCE affects selection, so the snapshot avoids copying
+    /// the artifact body for every pending note on every acquisition poll.
+    pub has_compiled_check: bool,
     pub check_status: String,
     pub check_quarantined_until: Option<i64>,
     pub check_next_due_at: Option<i64>,
@@ -680,7 +705,7 @@ pub fn get_due_compiled_smart_note_checks(
         .filter(|note| {
             eligible(note, retina_handoff)
                 && note.check_status == "compiled"
-                && note.compiled_check.is_some()
+                && note.has_compiled_check
                 && note.policy_version == SMART_NOTE_CHECK_POLICY_VERSION
                 && note.check_quarantined_until.is_none_or(|q| q <= now)
                 && note.check_next_due_at.is_none_or(|d| d <= now)
@@ -706,7 +731,7 @@ pub fn get_smart_notes_needing_compilation(
                 && note.check_next_due_at.is_none_or(|d| d <= now)
                 && (note.check_status == "uncompiled"
                     || note.check_status == "failing"
-                    || note.compiled_check.is_none()
+                    || !note.has_compiled_check
                     || note.policy_version != SMART_NOTE_CHECK_POLICY_VERSION)
         })
         .collect();
@@ -730,7 +755,7 @@ pub fn get_stale_compiled_smart_notes(
         .filter(|note| {
             eligible(note, retina_handoff)
                 && note.check_status == "compiled"
-                && note.compiled_check.is_some()
+                && note.has_compiled_check
                 && note.policy_version == SMART_NOTE_CHECK_POLICY_VERSION
                 && note.check_false_since_at.is_some_and(|f| f <= stale_before)
                 && note
@@ -890,7 +915,9 @@ mod tests {
             status: note.status.clone().unwrap_or_else(|| "pending".to_string()),
             compile_status: note.compile_status.clone(),
             created_at: note.created_at.unwrap_or(now - 1_000_000),
-            compiled_check: note.compiled_check.clone(),
+            // The fixture records the artifact itself; selection only observes
+            // presence, so map it here rather than changing the frozen fixture.
+            has_compiled_check: note.compiled_check.is_some(),
             check_status: note
                 .check_status
                 .clone()
@@ -1343,5 +1370,39 @@ mod tests {
                 case.id
             );
         }
+    }
+
+    /// The TypeScript reducer truncates `ready_reason` with `String.slice`, which
+    /// counts UTF-16 code units. Counting Unicode scalars here would persist a
+    /// different value for the same note whenever the reason runs past the bound
+    /// with non-BMP characters in it.
+    #[test]
+    fn due_ready_reason_truncates_on_utf16_units_like_the_ts_reducer() {
+        // Each emoji is one scalar but TWO UTF-16 units.
+        let signal = "\u{1F600}".repeat(200);
+        let manifest = format!("{{\"signals\":[\"{signal}\"]}}");
+        let reason = due_ready_reason(1, Some(manifest.as_str()));
+
+        let units: usize = reason.chars().map(char::len_utf16).sum();
+        assert!(
+            units <= 240,
+            "expected at most 240 UTF-16 units, got {units}"
+        );
+        // A scalar-based bound would have kept 240 emoji (480 units).
+        assert!(
+            reason.chars().count() < 240,
+            "scalar-counted truncation would exceed the JS bound"
+        );
+        // Never emit a broken pair.
+        assert!(reason.is_char_boundary(reason.len()));
+    }
+
+    #[test]
+    fn due_ready_reason_leaves_short_reasons_untouched() {
+        let manifest = r#"{"signals":["build is green"]}"#;
+        assert_eq!(
+            due_ready_reason(7, Some(manifest)),
+            "Smart note #7: build is green"
+        );
     }
 }

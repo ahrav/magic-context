@@ -75,12 +75,12 @@ use mc_store::{
     ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
     ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
     NoteCasOutcome, NoteConditionCompile, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome,
-    NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState, NoteEvalRenewOutcome, NoteInput,
-    NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow,
-    PendingCompactionMarkerState, RecordWrapupCommandOutcome, StateImportError,
-    StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
-    StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate,
-    WrapupCommandRecord, LATEST_MIGRATION_VERSION,
+    NoteEvalCandidate, NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState,
+    NoteEvalRenewOutcome, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
+    PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -3064,6 +3064,9 @@ const NOTE_EVALUATOR_HEARTBEAT_MS: i64 = 60_000;
 const NOTE_EVALUATOR_PROTOCOL_VERSION: &str = "2.0";
 const NOTE_EVALUATOR_ID_MAX_BYTES: usize = 128;
 const NOTE_EVALUATOR_MAX_CAPACITY: i64 = 16;
+/// Live registrations retained per project. `evaluator_instance` is caller-chosen,
+/// so this bounds both memory and the O(n) expiry purge.
+const NOTE_EVALUATOR_MAX_REGISTRATIONS: usize = 32;
 const NOTE_EVALUATOR_MAX_COMPILED_CHECK_BYTES: usize = 64 * 1024;
 const NOTE_EVALUATOR_MAX_MANIFEST_BYTES: usize = 32 * 1024;
 const NOTE_EVALUATOR_MAX_CRON_BYTES: usize = 256;
@@ -10981,6 +10984,14 @@ impl McHandler {
             entries.retain(|entry| {
                 !(entry.evaluator_instance == evaluator_instance && entry.channel == channel)
             });
+            // `evaluator_instance` is caller-chosen, so without a cap a single
+            // bound channel could retain unbounded live entries for a full lease
+            // and make the O(n) expiry purge superlinear in injected entries.
+            if entries.len() >= NOTE_EVALUATOR_MAX_REGISTRATIONS {
+                return note_evaluation_bad_request(format!(
+                    "project already has {NOTE_EVALUATOR_MAX_REGISTRATIONS} live evaluator registrations"
+                ));
+            }
             entries.push(NoteEvaluatorRegistration {
                 token: token.clone(),
                 registration_generation,
@@ -11721,9 +11732,16 @@ impl McHandler {
                         "Error: Note #{note_id} not found in your session/project or has no compatible fields to update."
                     ));
                 };
-                let remains_conditioned =
-                    condition.is_some() || current.surface_condition.is_some();
-                if remains_conditioned && !self.has_live_note_evaluator(project, now) {
+                // Only an update that introduces or CHANGES the condition needs a
+                // live evaluator, because that new condition must be compiled
+                // before it can ever surface. A content-only edit on an
+                // already-conditioned note resets the compiled artifact, which the
+                // evaluator recompiles once it is available again; refusing it here
+                // would make every conditioned note uneditable for as long as the
+                // evaluator is down.
+                let condition_changed = condition
+                    .is_some_and(|value| current.surface_condition.as_deref() != Some(value));
+                if condition_changed && !self.has_live_note_evaluator(project, now) {
                     return tool_error_result(
                         "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not updated.",
                     );
@@ -13618,13 +13636,13 @@ fn note_evaluation_opt_bool_field(
     }
 }
 
-fn smart_note_selection_snapshot(note: &StoredNote) -> SmartNoteSelectionSnapshot {
+fn smart_note_selection_snapshot(note: &NoteEvalCandidate) -> SmartNoteSelectionSnapshot {
     SmartNoteSelectionSnapshot {
         id: note.id,
         status: note.status.clone(),
         compile_status: note.compile_status.clone(),
         created_at: note.created_at_ms,
-        compiled_check: note.compiled_check.clone(),
+        has_compiled_check: note.has_compiled_check,
         check_status: note
             .check_status
             .clone()
@@ -13819,20 +13837,19 @@ fn parse_note_evaluation_wire_artifact(
 }
 
 /// Canonical artifact digest matching hashCheck in smart-notes/compiler.ts:
-/// condition, code, manifest JSON, and cron separated by NUL bytes.
+/// condition, code, manifest JSON, and cron separated by NUL bytes. Delegates to
+/// the single definition in `mc-store` so the admission gate here and the v51
+/// artifact repair there can never disagree about what the digest is.
 fn smart_note_check_digest(
     surface_condition: Option<&str>,
     artifact: &CompiledCheckArtifact,
 ) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(surface_condition.unwrap_or("").as_bytes());
-    hasher.update(b"\0");
-    hasher.update(artifact.compiled_check.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(artifact.manifest_json.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(artifact.check_cron.as_bytes());
-    format!("{:x}", hasher.finalize())
+    mc_store::note_check_digest(
+        surface_condition,
+        &artifact.compiled_check,
+        Some(artifact.manifest_json.as_str()),
+        Some(artifact.check_cron.as_str()),
+    )
 }
 
 /// The reducer step run inside the store's completion transaction. The digest

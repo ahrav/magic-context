@@ -4495,6 +4495,8 @@ pub const NOTE_EVAL_NO_WORK_RETENTION_MS: i64 = 10 * 60_000;
 pub const NOTE_EVAL_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60_000;
 /// Per-project row cap for each evaluation ledger.
 pub const NOTE_EVAL_LEDGER_CAP: i64 = 10_000;
+/// Rows repaired per committed batch by the v51 compiled-artifact repair.
+const NOTE_ARTIFACT_REPAIR_BATCH: i64 = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteEvalClaim {
@@ -6849,7 +6851,17 @@ impl McStore {
             Ok(rows)
         })?;
         for project in projects {
-            self.with_note_conn_fenced(&project, |tx| repair_note_artifacts_tx(tx, &project))?;
+            // Commit in bounded batches so a kill mid-repair keeps the work
+            // already done instead of rolling back a whole project and redoing it
+            // on every subsequent boot. The query re-selects unrepaired rows each
+            // pass, so this is naturally resumable.
+            loop {
+                let processed = self
+                    .with_note_conn_fenced(&project, |tx| repair_note_artifacts_tx(tx, &project))?;
+                if processed < NOTE_ARTIFACT_REPAIR_BATCH as usize {
+                    break;
+                }
+            }
         }
         self.inner.with_conn(|conn| {
             conn.execute(
@@ -16636,6 +16648,47 @@ const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id,
     state_version, policy_version, protocol_epoch, authority_generation, expires_at, \
     completion_id, terminal_kind, terminal_response";
 
+/// Columns the work selector actually reads. Acquisition polls the pending set on
+/// every call, so this deliberately excludes `content`, `manifest_json`, and the
+/// compiled artifact body (bounded at `MAX_COMPILED_CHECK_BYTES`); the selector
+/// only needs to know WHETHER an artifact exists. The full row is loaded once, for
+/// the single note that wins selection.
+const NOTE_EVAL_CANDIDATE_COLUMNS: &str = "id, status, compile_status, created_at_ms, \
+    compiled_check IS NOT NULL, check_status, check_quarantined_until, check_next_due_at, \
+    check_false_since_at, check_last_liveness_at, policy_version";
+
+/// One pending smart note as seen by the work selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEvalCandidate {
+    pub id: i64,
+    pub status: String,
+    pub compile_status: Option<String>,
+    pub created_at_ms: i64,
+    pub has_compiled_check: bool,
+    pub check_status: Option<String>,
+    pub check_quarantined_until: Option<i64>,
+    pub check_next_due_at: Option<i64>,
+    pub check_false_since_at: Option<i64>,
+    pub check_last_liveness_at: Option<i64>,
+    pub policy_version: Option<i64>,
+}
+
+fn note_eval_candidate_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteEvalCandidate> {
+    Ok(NoteEvalCandidate {
+        id: r.get(0)?,
+        status: r.get(1)?,
+        compile_status: r.get(2)?,
+        created_at_ms: r.get(3)?,
+        has_compiled_check: r.get(4)?,
+        check_status: r.get(5)?,
+        check_quarantined_until: r.get(6)?,
+        check_next_due_at: r.get(7)?,
+        check_false_since_at: r.get(8)?,
+        check_last_liveness_at: r.get(9)?,
+        policy_version: r.get(10)?,
+    })
+}
+
 const NOTE_EVAL_ID_MAX_LEN: usize = 200;
 const NOTE_EVAL_RESPONSE_MAX_LEN: usize = 2048;
 
@@ -16799,6 +16852,22 @@ fn collect_note_eval_ledgers_tx(
             AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
         params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
     )?;
+    // Reclaim rows, not just columns. Blanking `decision`/`terminal_response`
+    // stops a row counting toward the cap but leaves it on disk forever, so both
+    // ledgers would grow without bound - one acquisition row per poll, including
+    // every idle no-work poll - and the per-poll GC and cap counts would degrade
+    // into ever-longer scans.
+    tx.execute(
+        "DELETE FROM mc_note_eval_acquisitions
+          WHERE project = ?1 AND decision = '' AND expires_at <= ?2",
+        params![project, now_ms - NOTE_EVAL_NO_WORK_RETENTION_MS],
+    )?;
+    tx.execute(
+        "DELETE FROM mc_note_eval_claims
+          WHERE project = ?1 AND terminal_kind IS NOT NULL
+            AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
+        params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+    )?;
     Ok(())
 }
 
@@ -16815,7 +16884,7 @@ impl McStore {
         evaluator_instance: &str,
         evaluator_slot: i64,
         registration_generation: i64,
-        select: impl FnOnce(&[StoredNote]) -> Option<(i64, String)>,
+        select: impl FnOnce(&[NoteEvalCandidate]) -> Option<(i64, String)>,
         now_ms: i64,
     ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
         self.acquire_note_evaluation_with_cap(
@@ -16838,7 +16907,7 @@ impl McStore {
         evaluator_instance: &str,
         evaluator_slot: i64,
         registration_generation: i64,
-        select: impl FnOnce(&[StoredNote]) -> Option<(i64, String)>,
+        select: impl FnOnce(&[NoteEvalCandidate]) -> Option<(i64, String)>,
         now_ms: i64,
         ledger_cap: i64,
     ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
@@ -16911,14 +16980,14 @@ impl McStore {
             }
             let candidates = {
                 let mut stmt = tx.prepare(&format!(
-                    "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+                    "SELECT {NOTE_EVAL_CANDIDATE_COLUMNS} FROM mc_notes
                       WHERE project_path = ?1 AND type = 'smart' AND status = 'pending'
                         AND id NOT IN (SELECT note_id FROM mc_note_eval_claims
                                         WHERE project = ?1 AND terminal_kind IS NULL)
                       ORDER BY id"
                 ))?;
                 let rows = stmt
-                    .query_map(params![project], stored_note_from_row)?
+                    .query_map(params![project], note_eval_candidate_from_row)?
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
@@ -16948,16 +17017,27 @@ impl McStore {
             if !matches!(phase.as_str(), "compile" | "due" | "liveness" | "fallback") {
                 return Ok(NoteEvalAcquireOutcome::Invalid);
             }
-            let Some(note) = candidates.into_iter().find(|note| note.id == note_id) else {
+            let Some(candidate) = candidates.into_iter().find(|note| note.id == note_id) else {
                 return Ok(NoteEvalAcquireOutcome::Invalid);
             };
-            let protected: i64 = tx.query_row(
+            // Selection ran on the narrow projection; load the full row once for
+            // the note that actually won so the claim snapshot has content,
+            // condition, and the compiled artifact.
+            let note = load_note_tx(tx, candidate.id)?;
+            // Bound IN-FLIGHT claims only. Counting terminal rows still inside the
+            // replay-retention window would turn this cap into a rolling
+            // throughput ceiling: once a project completed `ledger_cap`
+            // evaluations within the retention window every further acquisition
+            // would return Busy and all evaluation would stall until rows aged
+            // out. Terminal-row volume is bounded by deletion in
+            // `collect_note_eval_ledgers_tx` instead.
+            let live: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM mc_note_eval_claims
-                  WHERE project = ?1 AND (terminal_kind IS NULL OR terminal_at_ms > ?2)",
-                params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+                  WHERE project = ?1 AND terminal_kind IS NULL",
+                params![project],
                 |row| row.get(0),
             )?;
-            if protected >= ledger_cap {
+            if live >= ledger_cap {
                 return Ok(NoteEvalAcquireOutcome::Busy);
             }
             let claim = NoteEvalClaim {
@@ -17322,9 +17402,17 @@ fn rebind_note_eval_claim_tx(
     })
 }
 
-/// Mirrors hashCheck in packages/plugin smart-notes/compiler.ts; manifest_json is hashed
-/// exactly as stored so both sides produce the same hex digest.
-fn note_check_digest(
+/// Canonical digest binding a compiled smart-note artifact to the condition it was
+/// compiled from. Mirrors hashCheck in packages/plugin smart-notes/compiler.ts;
+/// `manifest_json` is hashed exactly as stored so both sides produce the same hex
+/// digest.
+///
+/// This is the ONE definition of that digest: `mc-module` recomputes it from the
+/// authoritative condition to admit a compile completion, and the v51 repair uses it
+/// to decide whether a legacy artifact is trustworthy. A second copy would let those
+/// two decisions drift, which either rejects every valid completion or discards every
+/// legacy artifact.
+pub fn note_check_digest(
     surface_condition: Option<&str>,
     compiled_check: &str,
     manifest_json: Option<&str>,
@@ -17344,7 +17432,7 @@ fn note_check_digest(
 fn repair_note_artifacts_tx(
     tx: &rusqlite::Transaction<'_>,
     project_path: &str,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<usize> {
     struct Candidate {
         id: i64,
         surface_condition: Option<String>,
@@ -17361,10 +17449,11 @@ fn repair_note_artifacts_tx(
                FROM mc_notes
               WHERE project_path = ?1 AND compiled_check IS NOT NULL
                 AND compiled_source_revision IS NULL
-              ORDER BY id",
+              ORDER BY id
+              LIMIT ?2",
         )?;
         let rows = statement
-            .query_map(params![project_path], |row| {
+            .query_map(params![project_path, NOTE_ARTIFACT_REPAIR_BATCH], |row| {
                 Ok(Candidate {
                     id: row.get(0)?,
                     surface_condition: row.get(1)?,
@@ -17378,15 +17467,24 @@ fn repair_note_artifacts_tx(
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
+    let processed = candidates.len();
     for candidate in candidates {
-        let verified = candidate.check_hash.as_deref().is_some_and(|hash| {
-            note_check_digest(
-                candidate.surface_condition.as_deref(),
-                &candidate.compiled_check,
-                candidate.manifest_json.as_deref(),
-                candidate.check_cron.as_deref(),
-            ) == hash
-        });
+        // A row with no recorded digest cannot be verified either way. Treat it as
+        // trusted-as-is rather than discarding a real compiled artifact: wiping it
+        // forces a fresh LLM compile per note and is unrecoverable, whereas
+        // adopting it only carries forward a pre-v51 artifact the previous binary
+        // was already serving.
+        let verified = match candidate.check_hash.as_deref() {
+            None => true,
+            Some(hash) => {
+                note_check_digest(
+                    candidate.surface_condition.as_deref(),
+                    &candidate.compiled_check,
+                    candidate.manifest_json.as_deref(),
+                    candidate.check_cron.as_deref(),
+                ) == hash
+            }
+        };
         if verified {
             tx.execute(
                 "UPDATE mc_notes
@@ -17406,7 +17504,7 @@ fn repair_note_artifacts_tx(
             )?;
         }
     }
-    Ok(())
+    Ok(processed)
 }
 
 fn promote_facts_tx(
@@ -24859,7 +24957,7 @@ mod tests {
             .unwrap()
     }
 
-    fn pick_first(notes: &[StoredNote]) -> Option<(i64, String)> {
+    fn pick_first(notes: &[NoteEvalCandidate]) -> Option<(i64, String)> {
         notes.first().map(|note| (note.id, "due".to_string()))
     }
 
@@ -25016,6 +25114,162 @@ mod tests {
             }
             other => panic!("expected recovered claim, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn note_eval_ledger_rows_are_reclaimed_after_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note");
+
+        // One no-work acquisition, then one terminal claim.
+        let idle_at = 1_000;
+        store
+            .acquire_note_evaluation(EVAL_PROJECT, "idle-1", "eval-a", 0, 1, |_| None, idle_at)
+            .unwrap();
+        let claim = eval_claim(&store, "acq-1", 0, idle_at);
+        store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "done-1",
+                "eval-a",
+                0,
+                idle_at,
+                |_claim, note| Ok(eval_reduced(note, "pending", idle_at)),
+            )
+            .unwrap();
+
+        let count = |table: &str| -> i64 {
+            store
+                .inner
+                .with_conn(|conn| {
+                    Ok(conn
+                        .query_row(
+                            &format!("SELECT COUNT(*) FROM {table} WHERE project = ?1"),
+                            params![EVAL_PROJECT],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap())
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            count("mc_note_eval_acquisitions"),
+            1,
+            "the idle poll records a replayable no_work decision"
+        );
+        assert_eq!(count("mc_note_eval_claims"), 1);
+
+        // Past both retention windows the GC must RECLAIM rows, not merely blank
+        // their columns; otherwise the ledgers grow for the life of the store.
+        let after_retention =
+            idle_at + NOTE_EVAL_TERMINAL_RETENTION_MS + NOTE_EVAL_NO_WORK_RETENTION_MS + 1;
+        store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "idle-2",
+                "eval-a",
+                0,
+                1,
+                |_| None,
+                after_retention,
+            )
+            .unwrap();
+        assert_eq!(
+            count("mc_note_eval_claims"),
+            0,
+            "terminal claims past retention must be deleted"
+        );
+        assert_eq!(
+            count("mc_note_eval_acquisitions"),
+            1,
+            "only the current acquisition should remain"
+        );
+    }
+
+    #[test]
+    fn note_eval_cap_counts_live_claims_not_retained_terminal_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note");
+        let now = 1_000;
+
+        // Retire one claim, leaving a terminal row inside the retention window.
+        let claim = eval_claim(&store, "acq-1", 0, now);
+        store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "done-1",
+                "eval-a",
+                0,
+                now,
+                |_claim, note| Ok(eval_reduced(note, "pending", now)),
+            )
+            .unwrap();
+
+        // With the cap squeezed to 1, a retained terminal row must NOT deny new
+        // work: counting it would turn the cap into a rolling throughput ceiling
+        // that stalls the project until rows aged out.
+        match store
+            .acquire_note_evaluation_with_cap(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                0,
+                1,
+                pick_first,
+                now + 1,
+                1,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { .. } => {}
+            other => panic!("terminal rows must not consume the live cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v51_repair_keeps_a_legacy_artifact_that_has_no_recorded_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "note");
+
+        // Legacy shape: a compiled artifact with NO check_hash, so verification is
+        // impossible either way. Discarding it would force a fresh LLM compile.
+        // The repair is one-shot per store and already ran during open(), so clear
+        // its completion flag to exercise it against this row.
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_notes SET compiled_check = 'legacy body', manifest_json = '{}',
+                        check_hash = NULL, check_status = 'compiled',
+                        compiled_source_revision = NULL
+                      WHERE id = ?1",
+                    params![note.id],
+                )?;
+                conn.execute(
+                    "DELETE FROM mc_cache_state WHERE session_id = ?1",
+                    params!["note_artifact_repair_v51_done"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        store.repair_note_artifacts_v51().unwrap();
+
+        let repaired = reload_note(&store, note.id);
+        assert_eq!(
+            repaired.compiled_check.as_deref(),
+            Some("legacy body"),
+            "an unverifiable legacy artifact must be adopted, not destroyed"
+        );
+        assert!(
+            repaired.compiled_source_revision.is_some(),
+            "adoption must stamp the provenance so the repair does not run forever"
+        );
     }
 
     #[test]

@@ -93,9 +93,21 @@ export function getModuleNoteEvaluationBridge(
     return moduleNoteEvaluationBridges.get(projectPath);
 }
 
-export async function disposeModuleNoteEvaluationBridges(): Promise<void> {
-    const bridges = [...moduleNoteEvaluationBridges.values()];
-    moduleNoteEvaluationBridges.clear();
+/**
+ * Dispose only the named bridges. The registry is process-global while plugin
+ * instances are disposed individually, so an instance passes the keys it
+ * registered and sibling instances' bridges stay live.
+ */
+export async function disposeModuleNoteEvaluationBridges(
+    projectPaths: Iterable<string>,
+): Promise<void> {
+    const bridges: ModuleNoteEvaluationBridge[] = [];
+    for (const projectPath of projectPaths) {
+        const bridge = moduleNoteEvaluationBridges.get(projectPath);
+        if (!bridge) continue;
+        moduleNoteEvaluationBridges.delete(projectPath);
+        bridges.push(bridge);
+    }
     await Promise.allSettled(bridges.map((bridge) => bridge.dispose()));
 }
 

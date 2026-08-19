@@ -119,6 +119,26 @@ describe("smart-note revision matrix: compiler-input edits", () => {
         }
     });
 
+    test("project move clears a Retina compilation so the note is recompiled", () => {
+        const db = freshDb();
+        try {
+            const note = smartNote(db);
+            setCompiled(db, note.id);
+            db.prepare(
+                `UPDATE notes SET compile_status = 'compiled', compiled_provider = 'local-fs',
+                    compiled_config = '{"path":"src/main.rs"}', compiled_at = 8 WHERE id = ?`,
+            ).run(note.id);
+            const updated = updateNote(db, note.id, { projectPath: "/other/project" }, SCOPE);
+            expect(updated?.compileStatus).toBeNull();
+            expect(updated?.compiledProvider).toBeNull();
+            expect(updated?.compiledConfig).toBeNull();
+            expect(updated?.compiledAt).toBeNull();
+            expect(updated?.checkStatus).toBe("uncompiled");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("same-value writes do not advance source_revision", () => {
         const db = freshDb();
         try {
@@ -235,9 +255,7 @@ describe("smart-note revision matrix: normative fixture replay", () => {
                     matrixCase.expected.state_version - (pre.state_version ?? 0),
                 );
                 if (matrixCase.expected.artifact_cleared !== undefined) {
-                    expect(after.compiledCheck === null).toBe(
-                        matrixCase.expected.artifact_cleared,
-                    );
+                    expect(after.compiledCheck === null).toBe(matrixCase.expected.artifact_cleared);
                 }
             } finally {
                 closeQuietly(db);

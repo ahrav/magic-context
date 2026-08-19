@@ -276,9 +276,11 @@ export interface RustModeTransformOptions {
     /**
      * Invoked with each project that reaches rust-mode authority preparation, so the
      * host can lazily register per-project services (the smart-note evaluator bridge)
-     * for projects other than the plugin's launch directory.
+     * for projects other than the plugin's launch directory. `projectRoot` is the
+     * route root the authority was prepared with; per-project services must bind
+     * their transports and filesystem scope to it.
      */
-    onProjectPrepared?: (projectPath: string) => void;
+    onProjectPrepared?: (projectPath: string, projectRoot: string) => void;
     /** Test-only escape hatch for transform-wire tests without an authority transport. */
     allowAuthorityProtocolBypassForTests?: boolean;
     /** Override only for deterministic capture scheduling in tests. */
@@ -956,7 +958,7 @@ async function prepareRustMemoryAuthority(args: {
     state: RustSessionState;
     allowProtocolBypassForTests?: boolean;
     /** Fires after authority is ready so hosts can register per-project services. */
-    onProjectPrepared?: (projectPath: string) => void;
+    onProjectPrepared?: (projectPath: string, projectRoot: string) => void;
 }): Promise<void> {
     const { db, module, projectPath, projectRoot, state } = args;
     if (
@@ -1103,7 +1105,7 @@ async function prepareRustMemoryAuthority(args: {
 
     await reconcileAuthorityProject({ db, projectPath, module: authorityModule });
     state.memoryAuthorityReady = true;
-    args.onProjectPrepared?.(projectPath);
+    args.onProjectPrepared?.(projectPath, projectRoot);
 }
 
 const TODO_HEAD_ANCHOR_ID = "__magic_context_todo_head__";

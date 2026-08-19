@@ -7,7 +7,6 @@ import {
     type SmartNotePhaseExecutors,
     type SmartNotePhaseSnapshot,
 } from "./evaluator";
-import { reserveSandboxSlot, type SandboxSlotReservation } from "./sandbox-runner";
 
 export type EvaluatorMethod =
     | "note.evaluation.register"
@@ -29,11 +28,18 @@ export interface EvaluatorWorkerPolicy {
 
 export interface SmartNoteEvaluatorWorkerDeps {
     transport: EvaluatorWorkerTransport;
-    /** Build the phase executors for one claimed snapshot. Executors that run
-     *  QuickJS must pass sandboxLockHeld and run inside `slot.run`. */
+    /**
+     * Build the phase executors for one claimed snapshot. Executors run QuickJS
+     * through `runCompiledSmartNoteCheck` without `sandboxLockHeld`, so each
+     * sandbox execution serializes itself for exactly its own window. The worker
+     * deliberately holds no process-wide sandbox reservation across a claim: a
+     * claim lease outlives a bounded QuickJS run by orders of magnitude, so
+     * waiting behind one run is cheap, whereas holding the global slot across an
+     * LLM compile or fallback confirmation would stall every other project's
+     * sweep for the length of a network round-trip.
+     */
     executors: (
         snapshot: SmartNotePhaseSnapshot,
-        slot: SandboxSlotReservation,
         signal: AbortSignal,
         deadline: number,
     ) => SmartNotePhaseExecutors;
@@ -54,18 +60,21 @@ export interface DrainResult {
 interface Registration {
     token: string;
     generation: number;
+    /** Renewal cadence published by the authority at registration. */
+    heartbeatMs: number;
 }
 
 interface ClaimResponse {
     claimId: string;
     noteId: number;
-    phase: SmartNotePhaseSnapshot["phase"];
     snapshot: SmartNotePhaseSnapshot;
 }
 
 const EVALUATOR_PROTOCOL_VERSION = "2.0";
 const DEFAULT_HEARTBEAT_MS = 60_000;
 const MAX_CLAIMS_PER_DRAIN = 25;
+/** Single-capacity worker: `capacity: 1` at registration means slot 0 is the only slot. */
+const EVALUATOR_SLOT = 0;
 
 function asRecord(value: unknown): Record<string, unknown> {
     return value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
@@ -103,6 +112,12 @@ export class SmartNoteEvaluatorWorker {
     private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     private pendingAcquisitionId: string | null = null;
     private disposed = false;
+    /** Whether the most recent abandon actually released the claim. */
+    private lastAbandonReleased = true;
+    /** Abort handle for the claim currently executing, if any. */
+    private activeClaimController: AbortController | null = null;
+    /** Settlement of the claim currently executing; never rejects. */
+    private activeClaimSettled: Promise<void> | null = null;
 
     constructor(deps: SmartNoteEvaluatorWorkerDeps) {
         this.deps = deps;
@@ -112,10 +127,25 @@ export class SmartNoteEvaluatorWorker {
         return this.registration !== null;
     }
 
+    /**
+     * Claim-renewal cadence. An explicit dependency override wins for tests;
+     * otherwise follow the cadence the authority published at registration so a
+     * lease change on the Rust side cannot silently outrun the client.
+     */
+    private claimRenewIntervalMs(): number {
+        return this.deps.heartbeatMs ?? this.registration?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+    }
+
     private logLine(message: string): void {
         (this.deps.log ?? defaultLog)(`[smart-note-worker] ${message}`);
     }
 
+    /**
+     * Registration-identity fence accepted by every fenced method. The module
+     * validates each method against a closed field set, so this carries only the
+     * fields common to all of them; claim-scoped calls add `evaluator_slot`
+     * through {@link claimBody}.
+     */
     private fencedBody(extra: Record<string, unknown>): Record<string, unknown> {
         if (!this.registration) throw new Error("evaluator worker is not registered");
         return {
@@ -123,9 +153,13 @@ export class SmartNoteEvaluatorWorker {
             token: this.registration.token,
             registration_generation: this.registration.generation,
             evaluator_instance: this.instanceId,
-            evaluator_slot: 0,
             ...extra,
         };
+    }
+
+    /** Fence for the claim-scoped methods (next/renew/complete/abandon). */
+    private claimBody(extra: Record<string, unknown>): Record<string, unknown> {
+        return this.fencedBody({ evaluator_slot: EVALUATOR_SLOT, ...extra });
     }
 
     async register(signal?: AbortSignal): Promise<boolean> {
@@ -152,14 +186,25 @@ export class SmartNoteEvaluatorWorker {
             this.logLine(`registration rejected: ${JSON.stringify(response).slice(0, 200)}`);
             return false;
         }
-        this.registration = { token, generation };
+        // Follow the authority's published renewal cadence; fall back only when
+        // the field is absent so the lease and the client cannot drift apart.
+        const publishedHeartbeat = response.heartbeat_ms;
+        this.registration = {
+            token,
+            generation,
+            heartbeatMs:
+                typeof publishedHeartbeat === "number" && publishedHeartbeat > 0
+                    ? publishedHeartbeat
+                    : DEFAULT_HEARTBEAT_MS,
+        };
+        this.lastAbandonReleased = true;
         this.startHeartbeat();
         return true;
     }
 
     private startHeartbeat(): void {
         this.stopHeartbeat();
-        const interval = this.deps.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+        const interval = this.claimRenewIntervalMs();
         this.heartbeatTimer = setInterval(() => {
             void this.heartbeat();
         }, interval);
@@ -186,12 +231,22 @@ export class SmartNoteEvaluatorWorker {
             );
             if (response.ok !== true) {
                 this.logLine("heartbeat rejected; dropping registration");
-                this.registration = null;
-                this.stopHeartbeat();
+                this.dropRegistration();
             }
         } catch (error) {
-            this.logLine(`heartbeat failed: ${error}`);
+            // A throw is the module's error-frame path (bad_request,
+            // registration_unknown after a module restart), which means the lease
+            // is not renewed. Retaining the registration here would make
+            // `registered` report a liveness the module has already dropped and
+            // would stop `drainOnce` from ever re-registering.
+            this.logLine(`heartbeat failed; dropping registration: ${error}`);
+            this.dropRegistration();
         }
+    }
+
+    private dropRegistration(): void {
+        this.registration = null;
+        this.stopHeartbeat();
     }
 
     async unregister(): Promise<void> {
@@ -207,7 +262,6 @@ export class SmartNoteEvaluatorWorker {
                     token: registration.token,
                     registration_generation: registration.generation,
                     evaluator_instance: this.instanceId,
-                    evaluator_slot: 0,
                 },
             });
         } catch (error) {
@@ -217,6 +271,11 @@ export class SmartNoteEvaluatorWorker {
 
     async dispose(): Promise<void> {
         this.disposed = true;
+        // Abort in-flight claim work and wait for its terminal release while
+        // the registration is still live: unregistering first would strand the
+        // claim active until lease expiry with its executor still running.
+        this.activeClaimController?.abort(new Error("evaluator worker disposed"));
+        await this.activeClaimSettled;
         await this.unregister();
     }
 
@@ -235,32 +294,54 @@ export class SmartNoteEvaluatorWorker {
         if (!this.registration) {
             if (!(await this.register(args.signal))) return result;
         }
+        // A false fallback confirmation leaves the note pending with
+        // check_status='fallback', and fallback selection has no next-due gate,
+        // so the authority re-selects the same note on the very next poll. One
+        // confirmation prompt per note per drain bounds the billable loop.
+        const fallbackAttempted = new Set<number>();
         for (let i = 0; i < MAX_CLAIMS_PER_DRAIN; i++) {
             if (this.disposed || args.signal?.aborted || Date.now() >= args.deadline) break;
-            // The slot is reserved before requesting work so a granted claim
-            // never waits behind another QuickJS execution.
-            const slot = await reserveSandboxSlot();
-            let claim: ClaimResponse | null = null;
-            try {
-                const next = await this.next(args.signal);
-                if (next === "no_work") {
-                    result.drained = true;
+            const next = await this.next(args.signal);
+            if (next === "no_work") {
+                result.drained = true;
+                break;
+            }
+            if (next === "retry") continue;
+            if (next === "stop") break;
+            result.claimed += 1;
+            if (next.snapshot.phase === "fallback") {
+                if (fallbackAttempted.has(next.noteId)) {
+                    this.lastAbandonReleased = await this.abandon(
+                        next.claimId,
+                        "fallback already attempted this drain",
+                    );
+                    result.abandoned += 1;
                     break;
                 }
-                if (next === "retry") continue;
-                if (next === "stop") break;
-                claim = next;
+                fallbackAttempted.add(next.noteId);
+            }
+            const running = this.executeClaim(next, args);
+            this.activeClaimSettled = running.then(
+                () => undefined,
+                () => undefined,
+            );
+            let done: Awaited<typeof running>;
+            try {
+                done = await running;
             } finally {
-                if (!claim) slot.release();
+                this.activeClaimSettled = null;
             }
-            result.claimed += 1;
-            const done = await this.executeClaim(claim, slot, args);
-            if (done === "abandoned") result.abandoned += 1;
-            else if (done === "failed") break;
-            else {
-                result.completed += 1;
-                if (done === "surfaced") result.surfaced += 1;
+            if (done === "failed") break;
+            if (done === "abandoned") {
+                result.abandoned += 1;
+                // A claim we could not terminally release is still active, so the
+                // authority would hand the same phase back on the next poll.
+                // Stop instead of re-running it until the lease expires.
+                if (!this.lastAbandonReleased) break;
+                continue;
             }
+            result.completed += 1;
+            if (done === "surfaced") result.surfaced += 1;
         }
         return result;
     }
@@ -275,7 +356,7 @@ export class SmartNoteEvaluatorWorker {
             response = asRecord(
                 await this.deps.transport.call({
                     method: "note.evaluation.next",
-                    body: this.fencedBody({ acquisition_id: acquisitionId, wait_ms: 0 }),
+                    body: this.claimBody({ acquisition_id: acquisitionId, wait_ms: 0 }),
                     signal,
                 }),
             );
@@ -303,7 +384,6 @@ export class SmartNoteEvaluatorWorker {
             return {
                 claimId: response.claim_id,
                 noteId: response.note_id,
-                phase,
                 snapshot: {
                     phase,
                     noteId: response.note_id,
@@ -328,31 +408,30 @@ export class SmartNoteEvaluatorWorker {
 
     private async executeClaim(
         claim: ClaimResponse,
-        slot: SandboxSlotReservation,
         args: { deadline: number; signal?: AbortSignal },
     ): Promise<"completed" | "surfaced" | "abandoned" | "failed"> {
         const controller = new AbortController();
+        this.activeClaimController = controller;
         const abortFromCaller = () => controller.abort(args.signal?.reason);
         if (args.signal?.aborted) abortFromCaller();
         else args.signal?.addEventListener("abort", abortFromCaller, { once: true });
         const renewTimer = setInterval(() => {
             void this.renew(claim.claimId, controller);
-        }, this.deps.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
+        }, this.claimRenewIntervalMs());
         if (typeof renewTimer.unref === "function") renewTimer.unref();
         try {
             const evaluated = await evaluateSmartNotePhase(
                 claim.snapshot,
-                this.deps.executors(claim.snapshot, slot, controller.signal, args.deadline),
+                this.deps.executors(claim.snapshot, controller.signal, args.deadline),
             );
-            slot.release();
             if (!evaluated.ok) {
-                await this.abandon(claim.claimId, evaluated.reason);
+                this.lastAbandonReleased = await this.abandon(claim.claimId, evaluated.reason);
                 return "abandoned";
             }
             const response = asRecord(
                 await this.deps.transport.call({
                     method: "note.evaluation.complete",
-                    body: this.fencedBody({
+                    body: this.claimBody({
                         claim_id: claim.claimId,
                         completion_id: randomUUID(),
                         outcome: outcomeWire(evaluated.outcome),
@@ -361,18 +440,23 @@ export class SmartNoteEvaluatorWorker {
             );
             const result = response.result;
             if (result === "applied" || result === "replayed") {
-                return response.status === "ready" ? "surfaced" : "completed";
+                // `applied` returns the note payload flat; `replayed` nests the
+                // recovered payload under `response`, so unwrap before reading
+                // the status or a replayed surface is miscounted as a plain
+                // completion.
+                const applied = result === "replayed" ? asRecord(response.response) : response;
+                return applied.status === "ready" ? "surfaced" : "completed";
             }
             this.logLine(`completion for note #${claim.noteId} rejected: ${String(result)}`);
             return "failed";
         } catch (error) {
-            slot.release();
             this.logLine(`claim ${claim.claimId} failed: ${error}`);
-            await this.abandon(claim.claimId, String(error));
+            this.lastAbandonReleased = await this.abandon(claim.claimId, String(error));
             return "abandoned";
         } finally {
             clearInterval(renewTimer);
             args.signal?.removeEventListener("abort", abortFromCaller);
+            this.activeClaimController = null;
         }
     }
 
@@ -382,7 +466,7 @@ export class SmartNoteEvaluatorWorker {
             const response = asRecord(
                 await this.deps.transport.call({
                     method: "note.evaluation.renew",
-                    body: this.fencedBody({ claim_id: claimId }),
+                    body: this.claimBody({ claim_id: claimId }),
                 }),
             );
             if (response.result !== "renewed") {
@@ -393,14 +477,28 @@ export class SmartNoteEvaluatorWorker {
         }
     }
 
-    private async abandon(claimId: string, reason: string): Promise<void> {
+    /**
+     * Terminally release a claim. `reason` is local telemetry only: the module's
+     * abandon schema is closed and carries no reason field, so sending it would
+     * reject the release and leave the claim to be re-handed out until its lease
+     * expires.
+     */
+    private async abandon(claimId: string, reason: string): Promise<boolean> {
+        this.logLine(`abandoning claim ${claimId}: ${reason.slice(0, 200)}`);
         try {
-            await this.deps.transport.call({
-                method: "note.evaluation.abandon",
-                body: this.fencedBody({ claim_id: claimId, reason: reason.slice(0, 200) }),
-            });
+            const response = asRecord(
+                await this.deps.transport.call({
+                    method: "note.evaluation.abandon",
+                    body: this.claimBody({ claim_id: claimId }),
+                }),
+            );
+            const result = response.result;
+            if (result === "abandoned" || result === "replayed") return true;
+            this.logLine(`abandon for claim ${claimId} rejected: ${String(result)}`);
+            return false;
         } catch (error) {
             this.logLine(`abandon failed (claim will expire): ${error}`);
+            return false;
         }
     }
 }

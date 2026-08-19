@@ -14,6 +14,7 @@ import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
     applyMirrorPage,
+    disposeModuleNoteEvaluationBridges,
     ensureContextStoreUuid,
     getMirrorCursor,
     getModuleNoteEvaluationBridge,
@@ -936,11 +937,23 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // Registration is therefore an idempotent ensure invoked for every project
     // that reaches rust-mode preparation, not a one-shot at construction.
     const evaluatorTransport = rustModeModuleClient ? new SubcModuleTransport() : undefined;
-    const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
+    // Bridge keys this hook instance registered. Instance disposal must tear
+    // down only these: the registry is process-global and Desktop hosts several
+    // plugin instances in one process.
+    const ownedBridgeProjects = new Set<string>();
+    const ensureModuleNoteEvaluationBridge = (
+        bridgeProjectPath: string,
+        bridgeProjectRoot: string,
+    ): void => {
         if (!rustModeModuleClient?.mirrorPull || !evaluatorTransport) return;
         if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
+        // The module derives evaluator scope from the server-side route root,
+        // and filesystem capabilities resolve against the checkout, so both
+        // must use the prepared project's root — not the plugin launch
+        // directory — or the bridge registers against and drains the wrong
+        // project's notes.
         const capabilityFactory = (signal: AbortSignal) =>
-            createSmartNoteCapabilities({ projectRoot: deps.directory, signal });
+            createSmartNoteCapabilities({ projectRoot: bridgeProjectRoot, signal });
         const workerPolicy = {
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
             wakeOwned: false,
@@ -950,48 +963,46 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                 call: ({ method, body, signal }) =>
                     evaluatorTransport.call({
                         sessionId: `note-evaluator:${bridgeProjectPath}`,
-                        projectRoot: deps.directory,
+                        projectRoot: bridgeProjectRoot,
                         method,
                         body: { method, ...(body as Record<string, unknown>) },
                         signal,
                     }),
             },
-            executors: (snapshot, slot, signal, deadline) => ({
+            // No pre-reserved sandbox slot: each QuickJS execution serializes
+            // itself for exactly its own window. Wrapping these in a held
+            // reservation would keep the process-wide slot across the compile and
+            // fallback LLM round-trips, stalling every other project's sweep.
+            executors: (snapshot, signal, deadline) => ({
                 compile: () =>
-                    slot.run(() =>
-                        compileSmartNoteCheck({
-                            client: deps.client,
-                            db,
-                            parentSessionId: undefined,
-                            sessionDirectory: deps.directory,
-                            projectIdentity: bridgeProjectPath,
-                            note: {
-                                id: snapshot.noteId,
-                                content: snapshot.content,
-                                surfaceCondition: snapshot.surfaceCondition,
-                            },
-                            capabilityFactory,
-                            signal,
-                            deadline,
-                            sandboxLockHeld: true,
-                        }),
-                    ),
+                    compileSmartNoteCheck({
+                        client: deps.client,
+                        db,
+                        parentSessionId: undefined,
+                        sessionDirectory: bridgeProjectRoot,
+                        projectIdentity: bridgeProjectPath,
+                        note: {
+                            id: snapshot.noteId,
+                            content: snapshot.content,
+                            surfaceCondition: snapshot.surfaceCondition,
+                        },
+                        capabilityFactory,
+                        signal,
+                        deadline,
+                    }),
                 runCompiled: (compiledCheck) =>
-                    slot.run(() =>
-                        runCompiledSmartNoteCheck({
-                            compiledCheck,
-                            capabilityFactory,
-                            signal,
-                            timeoutMs: 2_000,
-                            sandboxLockHeld: true,
-                        }),
-                    ),
+                    runCompiledSmartNoteCheck({
+                        compiledCheck,
+                        capabilityFactory,
+                        signal,
+                        timeoutMs: 2_000,
+                    }),
                 confirmFallback: () =>
                     confirmSmartNoteReadOnly({
                         client: deps.client,
                         db,
                         parentSessionId: undefined,
-                        sessionDirectory: deps.directory,
+                        sessionDirectory: bridgeProjectRoot,
                         projectIdentity: bridgeProjectPath,
                         deadline,
                         noteId: snapshot.noteId,
@@ -1007,19 +1018,29 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             available: () => worker.registered,
             async drain(drainArgs) {
                 workerPolicy.wakeOwned = (await wakePlaneStatus()) === "present";
+                if (workerPolicy.wakeOwned) {
+                    // The wake plane owns standalone evaluations: claim no work
+                    // locally, but keep the registration and its policy live so
+                    // the module can apply the wake-owner veto and a failed
+                    // boot registration still recovers on the timer.
+                    if (worker.registered) await worker.heartbeat();
+                    else await worker.register(drainArgs.signal);
+                    return { claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true };
+                }
                 const result = await worker.drainOnce(drainArgs);
                 await syncModuleNotes();
                 return result;
             },
             dispose: () => worker.dispose(),
         });
+        ownedBridgeProjects.add(bridgeProjectPath);
         // Register eagerly so conditioned ctx_note writes pass the
         // live-evaluator gate before the first drain.
         void worker.register().catch((error) => {
             log(`[magic-context] evaluator registration failed: ${error}`);
         });
     };
-    ensureModuleNoteEvaluationBridge(projectPath);
+    ensureModuleNoteEvaluationBridge(projectPath, deps.directory);
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {
@@ -1451,6 +1472,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         "experimental.chat.messages.transform": transform,
         "experimental.chat.system.transform": systemPromptHashHandler,
         "experimental.text.complete": createTextCompleteHandler(),
+        // Instance disposal tears down only the evaluator bridges this hook
+        // registered; the registry is process-global across plugin instances.
+        disposeNoteEvaluationBridges: () => disposeModuleNoteEvaluationBridges(ownedBridgeProjects),
         "chat.message": createChatMessageHook({
             db,
             liveModelBySession,

@@ -606,6 +606,24 @@ export function updateNote(
                     updates.compiledAt ?? null,
                     updates.compileStatus ?? null,
                 );
+            } else if (
+                updates.projectPath !== undefined &&
+                updates.projectPath !== existing.projectPath &&
+                existing.compileStatus === "compiled"
+            ) {
+                // A project move keeps the condition text but invalidates a
+                // Retina compilation: local-fs compiled configs resolve
+                // relative paths and default repositories against the project
+                // root, and a preserved compile_status='compiled' keeps the
+                // note Retina-owned watching the old checkout instead of being
+                // recompiled for the new one. 'plain'/'refused' verdicts carry
+                // no project-relative artifact and stay.
+                sets.push(
+                    "compiled_provider = NULL",
+                    "compiled_config = NULL",
+                    "compiled_at = NULL",
+                    "compile_status = NULL",
+                );
             }
             if (noteCheckColumnsExist(db)) {
                 sets.push(
