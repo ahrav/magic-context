@@ -12,13 +12,13 @@
     },
     "metricPolicyVersion": "retrieval-metric-policy/v1",
     "timingPolicyVersion": "retrieval-timing-policy/v1",
-    "profileFingerprint": "39d6bfa1e43d05c514953d6dbfbf9ebf0d1f4bb8101f48cce53b1a2c9c25d719",
-    "behaviorFingerprint": "e41efde7c0d0bc211c0c8411865a0cd820edd692bdf34b67aa51c8e65ef1733d"
+    "profileFingerprint": "67778282cc28d905020b905e6cdeb8f033447039b2ee7be8765ac68ca7282486",
+    "behaviorFingerprint": "cc57b06fda2776ed86b58259c9def0cce3474929ca0f6929103628d3ec35c518"
   },
   "runs": [
     {
-      "evidenceDigest": "c923c7626d612feb4ae484d8b0c4dc9305b2f3b6a363189305873b4f89dc404c",
-      "semanticFingerprint": "afb12d9c9969a0a40a2b8c6727c58458426af196eb0e9e590723eb367bb10aaa",
+      "evidenceDigest": "dbc5aa0a0591210c6a7f40e98e7c1d80312a9696d6a176110163a32de0d1eab7",
+      "semanticFingerprint": "7e069f1e168e324d07fe9a42388a53371c8b2f405d6d0aae2c631e7b7ec98998",
       "hostFingerprint": "58a0868e2af682cf37c1f8d8198ba64e7eed73b01afdaa70a5769f255d13c5c6",
       "modes": [
         {
@@ -28,14 +28,14 @@
         },
         {
           "mode": "explicit",
-          "ndcgAt10": 1,
-          "recallAt50": 1
+          "ndcgAt10": 0.6607142857142857,
+          "recallAt50": 0.9642857142857143
         }
       ]
     },
     {
-      "evidenceDigest": "1923a4c7248db592648b1a4cf7c145389ccd898bc3ec29af4e1008b2c56551e2",
-      "semanticFingerprint": "afb12d9c9969a0a40a2b8c6727c58458426af196eb0e9e590723eb367bb10aaa",
+      "evidenceDigest": "069921b1333e8b5874523ea1155f736795edf04fa4c3314cad878ab5ef849759",
+      "semanticFingerprint": "7e069f1e168e324d07fe9a42388a53371c8b2f405d6d0aae2c631e7b7ec98998",
       "hostFingerprint": "58a0868e2af682cf37c1f8d8198ba64e7eed73b01afdaa70a5769f255d13c5c6",
       "modes": [
         {
@@ -45,14 +45,14 @@
         },
         {
           "mode": "explicit",
-          "ndcgAt10": 1,
-          "recallAt50": 1
+          "ndcgAt10": 0.6607142857142857,
+          "recallAt50": 0.9642857142857143
         }
       ]
     },
     {
-      "evidenceDigest": "a11d384c6987fa92ba80cd132957a35737e989b7a16f938c9e92ec9afafecc7d",
-      "semanticFingerprint": "afb12d9c9969a0a40a2b8c6727c58458426af196eb0e9e590723eb367bb10aaa",
+      "evidenceDigest": "9c86ccba78a98f2a5a3d10c62388619addf1741194a881b3cde1541ea2d23b13",
+      "semanticFingerprint": "7e069f1e168e324d07fe9a42388a53371c8b2f405d6d0aae2c631e7b7ec98998",
       "hostFingerprint": "58a0868e2af682cf37c1f8d8198ba64e7eed73b01afdaa70a5769f255d13c5c6",
       "modes": [
         {
@@ -62,8 +62,8 @@
         },
         {
           "mode": "explicit",
-          "ndcgAt10": 1,
-          "recallAt50": 1
+          "ndcgAt10": 0.6607142857142857,
+          "recallAt50": 0.9642857142857143
         }
       ]
     }

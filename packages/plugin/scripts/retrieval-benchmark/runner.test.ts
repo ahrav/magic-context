@@ -45,7 +45,7 @@ afterAll(() => {
 });
 
 /** Observed message-lane cardinality of the seeded scale-1000 fixture. */
-const DENOMINATOR_1K = 327;
+const DENOMINATOR_1K = 329;
 
 const WARM_STATE = {
     processVector: "warm",

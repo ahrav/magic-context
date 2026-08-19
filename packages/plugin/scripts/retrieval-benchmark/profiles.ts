@@ -370,6 +370,17 @@ export function parseProfile(value: unknown): BenchmarkProfile {
             hasScaleDimsConcurrencyCorner = true;
         }
         validateSelectivity(index, profileCase.selectivity, diagnostics);
+        // Prepared statements and the SQLite page cache both live on the
+        // connection in this runtime, so their declared states must agree.
+        // Enforced at parse time: runBenchmark seeds every fixture before
+        // constructing the cache controller, and a reference-scale profile
+        // must not spend hours seeding 1M-row snapshots before reporting a
+        // configuration error knowable at load time.
+        if (profileCase.cacheState.connectionStatement !== profileCase.cacheState.sqlitePage) {
+            diagnostics.push(
+                `profile.cases[${index}].cacheState: connectionStatement and sqlitePage states must agree in-process`,
+            );
+        }
         // Connection-statement, SQLite-page, and OS-page warmth comes only
         // from executed searches; with zero warmups the first measured
         // sample runs cold while the case evidence still claims warm. The

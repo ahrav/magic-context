@@ -107,14 +107,17 @@ export function deterministicVector(key: string, dims: number): Float32Array {
 }
 
 /** Deterministic text embedding: the normalized sum of per-token hash
- *  vectors, each weighted by token length as a crude IDF proxy (long tokens
- *  are rarer and more discriminative). Cosine similarity then reflects
- *  content-token overlap between texts, so lexically related pairs score
- *  above token noise. Benchmark queries embed through this; reviewed
- *  documents blend it with their graded queries (see seedFixture), and
- *  synthetic filler keeps per-id random vectors — noise distractors are
- *  its job. */
-export function deterministicTextVector(text: string, dims: number): Float32Array {
+ *  vectors weighted by corpus IDF (rare tokens dominate, ubiquitous tokens
+ *  vanish), so cosine similarity reflects discriminative-content overlap
+ *  between texts. Weights derive from document CONTENT only — never from
+ *  relevance judgments — so the quality gate measures retrieval against
+ *  labels the embeddings have never seen. Synthetic filler keeps per-id
+ *  random vectors: noise distractors are its job. */
+export function deterministicTextVector(
+    text: string,
+    dims: number,
+    tokenWeights?: ReadonlyMap<string, number>,
+): Float32Array {
     const tokens = new Set(
         text
             .toLowerCase()
@@ -122,13 +125,43 @@ export function deterministicTextVector(text: string, dims: number): Float32Arra
             .filter((token) => token.length > 0),
     );
     if (tokens.size === 0) return deterministicVector(`text:${text}`, dims);
+    // Unseen tokens are maximally rare by definition; weight 1 matches the
+    // upper end of the IDF scale buildCorpusTokenWeights produces.
+    const weightFor = (token: string): number => tokenWeights?.get(token) ?? 1;
     const vector = new Float32Array(dims);
     for (const token of tokens) {
         const tokenVector = deterministicVector(`token:${token}`, dims);
-        for (let i = 0; i < dims; i += 1) vector[i] += token.length * tokenVector[i];
+        const weight = weightFor(token);
+        for (let i = 0; i < dims; i += 1) vector[i] += weight * tokenVector[i];
     }
     normalizeVectorInPlace(vector);
     return vector;
+}
+
+/** Per-token IDF weights over the reviewed corpus documents, normalized to
+ *  (0, 1]. Content-only: judgments and queries never contribute. */
+export function buildCorpusTokenWeights(
+    documents: readonly { semanticPayload: { title: string; body: string } }[],
+): Map<string, number> {
+    const documentFrequency = new Map<string, number>();
+    for (const document of documents) {
+        const tokens = new Set(
+            documentText(document.semanticPayload)
+                .toLowerCase()
+                .split(/[^a-z0-9]+/)
+                .filter((token) => token.length > 0),
+        );
+        for (const token of tokens) {
+            documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
+        }
+    }
+    const total = Math.max(1, documents.length);
+    const maxIdf = Math.log(1 + total);
+    const weights = new Map<string, number>();
+    for (const [token, df] of documentFrequency) {
+        weights.set(token, Math.log(1 + total / (1 + df)) / maxIdf);
+    }
+    return weights;
 }
 
 export interface SeedManifestEntry {
@@ -393,39 +426,18 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         const numericAscending = (a: PlannedAlias, b: PlannedAlias) =>
             Number(a.alias.locator) - Number(b.alias.locator);
 
-        // Reviewed-document embedding: the document's text vector blended
-        // with the text vectors of its positively graded queries, weighted
-        // by grade. A real embedding model places a relevant document near
-        // its query even without token overlap (paraphrase scenarios); this
-        // corpus's semantic ground truth IS the judgment set, so the
-        // judgments define that relatedness deterministically. Grade 2
-        // pulls harder than grade 1, preserving the ranking the metrics
-        // expect, while unrelated query-document pairs stay at hash noise.
-        const queryTextById = new Map(
-            release.corpus.queries.map((query) => [query.id, query.queryText]),
-        );
-        const gradedQueriesByDocument = new Map<string, Array<{ text: string; grade: number }>>();
-        for (const judgment of release.judgments.judgments) {
-            if (judgment.grade === 0) continue;
-            const text = queryTextById.get(judgment.queryId);
-            if (text === undefined) continue;
-            const list = gradedQueriesByDocument.get(judgment.documentId) ?? [];
-            list.push({ text, grade: judgment.grade });
-            gradedQueriesByDocument.set(judgment.documentId, list);
-        }
-        const documentVector = (document: CorpusDocument): Float32Array => {
-            const vector = new Float32Array(options.dims);
-            const own = deterministicTextVector(documentText(document.semanticPayload), options.dims);
-            for (let i = 0; i < options.dims; i += 1) vector[i] += own[i];
-            for (const graded of gradedQueriesByDocument.get(document.id) ?? []) {
-                const queryVector = deterministicTextVector(graded.text, options.dims);
-                for (let i = 0; i < options.dims; i += 1) {
-                    vector[i] += graded.grade * queryVector[i];
-                }
-            }
-            normalizeVectorInPlace(vector);
-            return vector;
-        };
+        // Reviewed-document embeddings derive from document CONTENT only,
+        // IDF-weighted over the corpus. Judgments never contribute: an
+        // embedding built from the labels it is scored against would make
+        // the quality gate self-fulfilling and blind to retrieval
+        // regressions.
+        const tokenWeights = buildCorpusTokenWeights(release.corpus.documents);
+        const documentVector = (document: CorpusDocument): Float32Array =>
+            deterministicTextVector(
+                documentText(document.semanticPayload),
+                options.dims,
+                tokenWeights,
+            );
 
         const record = (
             plan: PlannedAlias,
@@ -529,14 +541,31 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             record(plan, sessionId, ordinal, 0);
         }
 
-        // Per-session ordinal watermark after reviewed messages, before the
-        // synthetic filler advances the shared counter. Reviewed compartments
-        // anchor their ranges just past this mark: below any explicit-query
-        // cutoff (filler cannot shift them), but never overlapping a reviewed
-        // message ordinal — production fusion coalesces a message inside a
-        // compartment's range into the compartment identity, which would
-        // erase judged messages from the ranking whenever both retrieve.
-        const reviewedMessageWatermark = new Map(ordinals);
+        // Reviewed compartments reserve their ordinal slots from the shared
+        // counter BEFORE the synthetic filler runs, so they sit just past
+        // the reviewed messages — below any explicit-query cutoff — and the
+        // filler cannot shift them. Each reserved slot is backed by a
+        // message carrying the compartment's own content: production
+        // compartments summarize real messages, message ordinals must stay
+        // contiguous 1..N per session for the production indexer, and a
+        // backing message keeps fusion's message-in-range coalescing
+        // pointed at the SAME identity instead of merging an unrelated
+        // filler message into the reviewed compartment.
+        const reservedCompartmentOrdinals = new Map<string, number>();
+        for (const plan of planned) {
+            if (plan.document.kind !== "compartment") continue;
+            const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
+            const ordinal = nextOrdinal(sessionId);
+            reservedCompartmentOrdinals.set(plan.document.id, ordinal);
+            const messages = messagesBySession.get(sessionId) ?? [];
+            messages.push({
+                ordinal,
+                id: `bench-compartment-${plan.document.id}`,
+                role: "user",
+                parts: [{ type: "text", text: documentText(plan.document.semanticPayload) }],
+            });
+            messagesBySession.set(sessionId, messages);
+        }
 
         let synthetic: SeedManifest["synthetic"] = null;
         let syntheticCompartments: SyntheticCompartment[] = [];
@@ -554,24 +583,13 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             syntheticCompartments = stream.pendingCompartments;
         }
 
-        // Reviewed compartments reference deterministic low message ordinals
-        // (watermark + dedicated counter) instead of consuming fresh ordinals
-        // from the shared stream counter. Fresh ordinals land after the
-        // synthetic scale filler — beyond every explicit-query ordinal cutoff
-        // on large fixtures, which fails validatePositiveTargets. Message
-        // ordinals stay contiguous 1..N per session, which the production
-        // message indexer requires.
-        const compartmentOrdinals = new Map<string, number>();
-        const nextCompartmentOrdinal = (sessionId: string): number => {
-            const next = (compartmentOrdinals.get(sessionId) ?? 0) + 1;
-            compartmentOrdinals.set(sessionId, next);
-            return next;
-        };
         for (const plan of planned) {
             if (plan.document.kind !== "compartment") continue;
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
-            const ordinal =
-                (reviewedMessageWatermark.get(sessionId) ?? 0) + nextCompartmentOrdinal(sessionId);
+            const ordinal = reservedCompartmentOrdinals.get(plan.document.id);
+            if (ordinal === undefined) {
+                throw new SeedError([`seed: missing reserved ordinal (${plan.document.id})`]);
+            }
             const vector = documentVector(plan.document);
             const seeded = seedCompartmentRow(db, {
                 sessionId,

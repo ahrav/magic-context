@@ -208,8 +208,13 @@ describe("seedFixture on the reviewed v1 release", () => {
             const messages = db
                 .prepare("SELECT COUNT(*) AS count FROM message_history_fts")
                 .get() as { count: number };
+            // Each reviewed compartment reserves an ordinal backed by one
+            // message carrying its content, so the indexed count covers
+            // message documents plus one backing message per compartment.
             expect(messages.count).toBe(
-                result.manifest.documents.filter((entry) => entry.kind === "message").length,
+                result.manifest.documents.filter(
+                    (entry) => entry.kind === "message" || entry.kind === "compartment",
+                ).length,
             );
             expect(() =>
                 db

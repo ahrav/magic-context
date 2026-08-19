@@ -94,6 +94,7 @@ import {
 } from "./report";
 import {
     BENCHMARK_EMBEDDING_MODEL_ID,
+    buildCorpusTokenWeights,
     deterministicTextVector,
     fixtureSessionId,
     measureMessageSelectivity,
@@ -161,7 +162,14 @@ function buildFingerprint(): string {
  *  the old depth — a manufactured quality regression. */
 export const EVALUATION_DEPTH = MAX_SEARCH_RESULT_LIMIT;
 
-const DEFAULT_AUTO_SCORE_THRESHOLD = 0.6;
+/** Automatic-delivery score threshold calibrated to the deterministic
+ *  IDF-weighted hash embedder, whose similarity scale differs from the
+ *  production model's (production defaults to 0.6). The gating MECHANISM is
+ *  identical — `executeAutoSearchDelivery` compares the top fused score —
+ *  and this value separates the fixture's relevant-target scores (0.17+)
+ *  from its synthetic-noise ceiling (~0.12). Recorded in the fingerprinted
+ *  semantic config, so runs under different thresholds never compare. */
+const DEFAULT_AUTO_SCORE_THRESHOLD = 0.15;
 const DEFAULT_AUTO_TIMEOUT_MS = 3_000;
 const CONSERVATION_TOLERANCE_MS = 1e-6;
 
@@ -525,6 +533,9 @@ interface QueryExecutionContext {
     dims: number;
     autoScoreThreshold: number;
     autoTimeoutMs: number;
+    /** Corpus-content IDF weights shared with the seeded document vectors;
+     *  queries and documents must embed in one token-weight space. */
+    tokenWeights: ReadonlyMap<string, number>;
 }
 
 function effectiveSources(ctx: QueryExecutionContext): SearchSource[] | undefined {
@@ -583,7 +594,7 @@ function buildSearchOptions(
         // a CapturedQueryEmbedding (generation-bearing) would always compare
         // against a null snapshot and be discarded as stale, silencing every
         // semantic scoring lane. Model ids come from the overrides above.
-        embedQuery: async (text) => deterministicTextVector(text, dims),
+        embedQuery: async (text) => deterministicTextVector(text, dims, ctx.tokenWeights),
         isEmbeddingRuntimeEnabled: () => true,
         // The predicate's visibility exclusions execute alongside the
         // query's own: both narrow the eligible memory set the preflight
@@ -680,6 +691,7 @@ interface RunContext {
     requireOsPageEvictionProof: boolean;
     fixtures: Map<string, FixtureHandle>;
     judged: Map<string, ReadonlyMap<string, JudgedGrade>>;
+    tokenWeights: ReadonlyMap<string, number>;
 }
 
 function fixtureKey(scale: number, dims: number): string {
@@ -977,9 +989,17 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             ]);
         }
     }
+    // The lane axis and the predicate's sources both narrow execution;
+    // cache setup and evidence must describe the final effective set, or a
+    // warm case would prime (and a cold case would serialize on) a memory
+    // cache no executed search can touch.
     const lanes = profileCase.sourceLanes;
+    const caseSources = profileCase.selectivity.predicate.sources;
+    const laneExecutes = (lane: SearchSource): boolean =>
+        (lanes === null || lanes.includes(lane)) &&
+        (caseSources === null || caseSources.includes(lane));
     const memoryLaneActive =
-        (lanes === null || lanes.includes("memory")) &&
+        laneExecutes("memory") &&
         (profileCase.mode === "automatic"
             ? AUTO_SEARCH_SOURCES.includes("memory")
             : queries.some((query) => query.sourceFilters === null || query.sourceFilters.includes("memory")));
@@ -1018,6 +1038,7 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             dims: profileCase.dims,
             autoScoreThreshold: ctx.autoScoreThreshold,
             autoTimeoutMs: ctx.autoTimeoutMs,
+            tokenWeights: ctx.tokenWeights,
         }),
     );
     const scenarios = new Map<string, ReportScenario>();
@@ -1398,6 +1419,7 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         requireOsPageEvictionProof,
         fixtures,
         judged: judgedGradesByQuery(options.release.judgments),
+        tokenWeights: buildCorpusTokenWeights(options.release.corpus.documents),
     };
 
     const diagnostics: string[] = [`host:${identity.host}`];
