@@ -352,6 +352,17 @@ fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
         Mode::empty(),
     )
     .map_err(|e| io_err("open_anchor", dir_path, e))?;
+    // The anchor is part of the resolved path: for a relative root it is the
+    // process working directory, which another principal may control and
+    // could use to replace an otherwise secure first component.
+    let anchor_stat =
+        rustix::fs::fstat(&current).map_err(|e| io_err("fstat_anchor", dir_path, e))?;
+    if !is_safe_ancestor(&anchor_stat) {
+        return Err(InstanceError::Insecure {
+            what: "runtime directory ancestor",
+            path: dir_path.to_path_buf(),
+        });
+    }
     let mut walked = if dir_path.is_absolute() {
         PathBuf::from("/")
     } else {

@@ -974,10 +974,16 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
                     .await
                     .is_err()
                 {
+                    // Request code may still be executing, so route-gone must
+                    // NOT run: handler cleanup and channel finalization would
+                    // race it. The latch makes the incarnation fatal instead,
+                    // and this route stays claimed — inert, because the host
+                    // is terminating.
                     shared.fatal.trip(
                         &shared.shutdown,
                         "dispatch task did not stop before route-gone".to_owned(),
                     );
+                    return;
                 }
             }
             // Aborted tasks never removed their own pending entries.
@@ -1046,12 +1052,13 @@ pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>
                 .await
                 .is_err()
             {
-                // Same limit as the graceful path: an unyielding future cannot
-                // be stopped, and the forced path cannot wait forever.
+                // Same rule as the graceful path: never run route-gone beside
+                // still-executing request code. Fatal, and no finalize.
                 shared.fatal.trip(
                     &shared.shutdown,
                     "dispatch task did not stop before route-gone".to_owned(),
                 );
+                return;
             }
             run_route_gone(&shared, handle).await;
             shared.registry.finalize_close(handle);

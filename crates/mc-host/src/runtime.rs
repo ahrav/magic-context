@@ -165,8 +165,13 @@ impl<H: McHostHandler> HostShared<H> {
                 Err(())
             }
             Err(_) => {
+                // Abort is only observed when the callback's current poll
+                // returns, so joining here could block forever on a
+                // non-yielding future — the very case the deadline exists to
+                // escape. Request the abort, trip the latch, and return; the
+                // detached task is reaped by the tracker wait, which is
+                // itself bounded.
                 task.abort();
-                let _ = task.await;
                 self.fatal
                     .trip(&self.shutdown, format!("{what} callback deadline expired"));
                 Err(())
@@ -322,8 +327,9 @@ pub async fn run<H: McHostHandler>(
             }
         };
         let Some(joined) = joined else {
+            // Not joined: a non-yielding initialize would block this await
+            // forever. AbortOnDropHandle detaches it as this scope unwinds.
             init_task.abort();
-            let _ = (&mut init_task).await;
             return Err(HostError::InitFailed(
                 "shutdown requested during initialization".to_owned(),
             ));
@@ -349,7 +355,6 @@ pub async fn run<H: McHostHandler>(
             }
             Err(_) => {
                 init_task.abort();
-                let _ = (&mut init_task).await;
                 return Err(HostError::InitFailed(
                     "initialize deadline expired".to_owned(),
                 ));

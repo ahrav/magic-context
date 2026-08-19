@@ -35,7 +35,9 @@ pub type PendingKey = (u16, u32, u64);
 
 /// Concurrent off-reader `server_busy` rejection emissions per generation.
 /// Small: rejections only queue this deep when global pending capacity is
-/// exhausted AND egress is contended; beyond it the reader emits inline.
+/// exhausted AND egress is contended. Past the bound the generation is
+/// retired (token cancelled, writer discarded) rather than stalling the sole
+/// reader on contended egress, which is what this bound exists to prevent.
 const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 
 /// One outstanding host Ping.
