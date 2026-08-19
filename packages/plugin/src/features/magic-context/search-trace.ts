@@ -72,6 +72,22 @@ export interface VectorLoadEvent {
 
 export type VectorLoadObserver = (event: VectorLoadEvent) => void;
 
+/** Phase boundaries a hybrid (lexical + vector) lane reports so its trace
+ *  decomposes into lexical_scan, vector_scan, and fusion spans instead of one
+ *  undifferentiated span. Marks fire synchronously on one thread; phase order
+ *  may vary by lane, and a lane whose semantic pass cannot run calls
+ *  vectorSkipped instead of the vector pair. Callers that do not trace pass
+ *  no marks and pay nothing. */
+export interface HybridLaneStageMarks {
+    lexicalStart(): void;
+    lexicalEnd(candidatesOut: number): void;
+    vectorStart(): void;
+    vectorEnd(candidatesOut: number): void;
+    vectorSkipped(): void;
+    fusionStart(): void;
+    fusionEnd(candidatesIn: number, candidatesOut: number): void;
+}
+
 export interface SearchTraceCounters {
     /** Exact decoded BLOB/vector-buffer bytes returned by this stage (R57). */
     decodedVectorBytes?: number;

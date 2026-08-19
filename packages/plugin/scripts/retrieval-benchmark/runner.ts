@@ -94,7 +94,7 @@ import {
 } from "./report";
 import {
     BENCHMARK_EMBEDDING_MODEL_ID,
-    deterministicVector,
+    deterministicTextVector,
     fixtureSessionId,
     measureMessageSelectivity,
     openFixtureSnapshot,
@@ -583,7 +583,7 @@ function buildSearchOptions(
         // a CapturedQueryEmbedding (generation-bearing) would always compare
         // against a null snapshot and be discarded as stale, silencing every
         // semantic scoring lane. Model ids come from the overrides above.
-        embedQuery: async (text) => deterministicVector(`query:${text}`, dims),
+        embedQuery: async (text) => deterministicTextVector(text, dims),
         isEmbeddingRuntimeEnabled: () => true,
         // The predicate's visibility exclusions execute alongside the
         // query's own: both narrow the eligible memory set the preflight
@@ -782,62 +782,104 @@ interface QueryScenarioOutcome {
     tracedSpans: SearchTraceSpan[];
 }
 
-async function executeQueryScenario(
+/** Per-query progress owned by exactly one worker at a time: the case
+ *  scheduler passes a state between workers one unit (warmup or sample) at a
+ *  time, so no lock guards these fields. */
+interface QueryRunState {
+    qctx: QueryExecutionContext;
+    queryTouchesMemory: boolean;
+    warmupsDone: number;
+    latencySamplesMs: number[];
+    firstDelivery: DeliveryOutcome | null;
+    lastDelivery: DeliveryOutcome | null;
+}
+
+function newQueryRunState(qctx: QueryExecutionContext): QueryRunState {
+    const sources = effectiveSources(qctx);
+    return {
+        qctx,
+        queryTouchesMemory: sources === undefined || sources.includes("memory"),
+        warmupsDone: 0,
+        latencySamplesMs: [],
+        firstDelivery: null,
+        lastDelivery: null,
+    };
+}
+
+function checkCaseDeadline(ctx: RunContext, profileCase: ProfileCase): void {
+    if (ctx.now() > ctx.deadlineAtMs) {
+        throw new RunnerInterrupt(
+            `wall-time budget exhausted during case ${profileCase.id} (maxWallTimeMs=${ctx.profile.runtime.maxWallTimeMs})`,
+        );
+    }
+}
+
+/** Execute ONE unit of a query scenario — a single warmup or a single
+ *  measured sample. The case scheduler interleaves queries at this
+ *  granularity so every worker stays busy for the whole measurement window
+ *  and samples are taken at the declared concurrency; whole-query
+ *  scheduling would let the case tail run below the declared load while
+ *  still pooling those samples into the concurrency cell. Returns true when
+ *  the query's sampling is complete. */
+async function executeQueryUnit(
     ctx: RunContext,
     profileCase: ProfileCase,
     controller: CaseCacheController,
     conn: ConnectionLease,
-    qctx: QueryExecutionContext,
-): Promise<QueryScenarioOutcome> {
-    const sources = effectiveSources(qctx);
-    const queryTouchesMemory = sources === undefined || sources.includes("memory");
-    const checkDeadline = () => {
-        if (ctx.now() > ctx.deadlineAtMs) {
-            throw new RunnerInterrupt(
-                `wall-time budget exhausted during case ${profileCase.id} (maxWallTimeMs=${ctx.profile.runtime.maxWallTimeMs})`,
-            );
-        }
-    };
+    state: QueryRunState,
+): Promise<boolean> {
+    checkCaseDeadline(ctx, profileCase);
+    const { qctx, queryTouchesMemory } = state;
 
-    for (let i = 0; i < ctx.profile.runtime.warmups; i += 1) {
-        checkDeadline();
+    if (state.warmupsDone < ctx.profile.runtime.warmups) {
         const db = conn.acquire();
         try {
             await executeDelivery(db, qctx);
         } finally {
             conn.release(db);
         }
+        state.warmupsDone += 1;
+        return false;
     }
 
-    const latencySamplesMs: number[] = [];
-    let delivery: DeliveryOutcome | null = null;
-    let firstDelivery: DeliveryOutcome | null = null;
-    for (let i = 0; i < ctx.profile.runtime.samples; i += 1) {
-        checkDeadline();
-        controller.beforeSample(queryTouchesMemory);
-        const db = conn.acquire();
-        try {
-            controller.measuredConnectionOpened();
-            controller.warmSampleReady(db, queryTouchesMemory);
-            const startedAt = ctx.now();
-            delivery = await executeDelivery(db, qctx);
-            latencySamplesMs.push(ctx.now() - startedAt);
-        } finally {
-            conn.release(db);
-        }
-        controller.afterSample(queryTouchesMemory);
-        // Measured samples must agree on the user-visible outcome: keeping
-        // only the last sample's outcome would let a case with intermittent
-        // timeouts report a normal delivery.
-        if (firstDelivery === null) {
-            firstDelivery = delivery;
-        } else if (delivery.reason !== firstDelivery.reason) {
-            throw new RunnerError([
-                `query ${qctx.query.id}: measured delivery outcomes disagree (sample 1: ${firstDelivery.reason}, sample ${i + 1}: ${delivery.reason})`,
-            ]);
-        }
+    controller.beforeSample(queryTouchesMemory);
+    const db = conn.acquire();
+    let delivery: DeliveryOutcome;
+    try {
+        controller.measuredConnectionOpened();
+        controller.warmSampleReady(db, queryTouchesMemory);
+        const startedAt = ctx.now();
+        delivery = await executeDelivery(db, qctx);
+        state.latencySamplesMs.push(ctx.now() - startedAt);
+    } finally {
+        conn.release(db);
     }
-    if (!delivery) {
+    controller.afterSample(queryTouchesMemory);
+    state.lastDelivery = delivery;
+    // Measured samples must agree on the user-visible outcome: keeping
+    // only the last sample's outcome would let a case with intermittent
+    // timeouts report a normal delivery.
+    if (state.firstDelivery === null) {
+        state.firstDelivery = delivery;
+    } else if (delivery.reason !== state.firstDelivery.reason) {
+        throw new RunnerError([
+            `query ${qctx.query.id}: measured delivery outcomes disagree (sample 1: ${state.firstDelivery.reason}, sample ${state.latencySamplesMs.length}: ${delivery.reason})`,
+        ]);
+    }
+    return state.latencySamplesMs.length >= ctx.profile.runtime.samples;
+}
+
+/** Evaluation and traced-diagnostic passes after a query's last measured
+ *  sample; neither is a latency-policy sample. */
+async function finalizeQueryScenario(
+    ctx: RunContext,
+    profileCase: ProfileCase,
+    controller: CaseCacheController,
+    conn: ConnectionLease,
+    state: QueryRunState,
+): Promise<QueryScenarioOutcome> {
+    const { qctx, queryTouchesMemory } = state;
+    if (!state.lastDelivery) {
         throw new RunnerError([`query ${qctx.query.id}: no measured sample`]);
     }
 
@@ -870,7 +912,12 @@ async function executeQueryScenario(
     }
     if (tracedDelivery.reason === "timeout") tracedSpans.length = 0;
 
-    return { ranked, delivery, latencySamplesMs, tracedSpans };
+    return {
+        ranked,
+        delivery: state.lastDelivery,
+        latencySamplesMs: state.latencySamplesMs,
+        tracedSpans,
+    };
 }
 
 async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<CaseResultRecord> {
@@ -942,7 +989,26 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         }
     }
 
-    const queue = [...queries];
+    // Sample-granularity round-robin: a query re-enters the queue after
+    // each unit (one warmup or one measured sample), so all workers stay
+    // busy until the case's final units and measured samples run at the
+    // declared concurrency. Whole-query scheduling would leave the last
+    // queries running with progressively fewer active workers while their
+    // samples still pooled into the declared concurrency cell.
+    const pending: QueryRunState[] = queries.map((query) =>
+        newQueryRunState({
+            query,
+            profileCase,
+            sessionId: fixtureSessionId(
+                query.fixtureScope.projectScope,
+                query.fixtureScope.sessionScope,
+            ),
+            projectScope: query.fixtureScope.projectScope,
+            dims: profileCase.dims,
+            autoScoreThreshold: ctx.autoScoreThreshold,
+            autoTimeoutMs: ctx.autoTimeoutMs,
+        }),
+    );
     const scenarios = new Map<string, ReportScenario>();
     const candidateRankings = new Map<string, string[]>();
 
@@ -964,27 +1030,29 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         };
         try {
             for (;;) {
-                const query = queue.shift();
-                if (!query) return;
-                const qctx: QueryExecutionContext = {
-                    query,
-                    profileCase,
-                    sessionId: fixtureSessionId(
-                        query.fixtureScope.projectScope,
-                        query.fixtureScope.sessionScope,
-                    ),
-                    projectScope: query.fixtureScope.projectScope,
-                    dims: profileCase.dims,
-                    autoScoreThreshold: ctx.autoScoreThreshold,
-                    autoTimeoutMs: ctx.autoTimeoutMs,
-                };
-                const outcome = await executeQueryScenario(
+                // shift/push are synchronous, so a state is owned by exactly
+                // one worker between dequeue and requeue.
+                const state = pending.shift();
+                if (!state) return;
+                const samplingComplete = await executeQueryUnit(
                     ctx,
                     profileCase,
                     controller,
                     conn,
-                    qctx,
+                    state,
                 );
+                if (!samplingComplete) {
+                    pending.push(state);
+                    continue;
+                }
+                const outcome = await finalizeQueryScenario(
+                    ctx,
+                    profileCase,
+                    controller,
+                    conn,
+                    state,
+                );
+                const query = state.qctx.query;
                 scenarios.set(query.id, buildScenario(ctx, profileCase, query, fixture, outcome));
                 candidateRankings.set(query.id, outcome.ranked);
             }
@@ -1348,7 +1416,7 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     const caseEvidences: CaseEvidence[] = [];
     const candidateByQuery = new Map<
         string,
-        { queryId: string; ranked: string[]; laneRestricted: boolean }
+        { queryId: string; rankings: string[][]; laneRestricted: boolean }
     >();
     for (const profileCase of options.profile.cases) {
         const caseQueries = options.release.corpus.queries.filter(
@@ -1362,22 +1430,62 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         scenarios.push(...record.scenarios);
         caseEvidences.push(record.caseEvidence);
         for (const entry of record.candidateRankings) {
-            // First executing full-lane case in profile order supplies the
-            // pool ranking for a query; later cases re-rank the same corpus.
-            // A lane-restricted case (R52) only stands in when no full-lane
-            // case ranked the query, so the judged pool reflects the full
-            // source set whenever one exists.
-            const existing = candidateByQuery.get(entry.queryId);
+            // Candidate pooling unions every eligible case's ranking: later
+            // full-lane cases run different scales, dims, cache states, and
+            // candidate depths, so their top-K can surface identities no
+            // earlier case ranked. A lane-restricted case (R52) only stands
+            // in when no full-lane case ranked the query, so the judged pool
+            // reflects the full source set whenever one exists.
             const laneRestricted = record.caseEvidence.laneRestricted;
+            const existing = candidateByQuery.get(entry.queryId);
             if (!existing || (existing.laneRestricted && !laneRestricted)) {
-                candidateByQuery.set(entry.queryId, { ...entry, laneRestricted });
+                candidateByQuery.set(entry.queryId, {
+                    queryId: entry.queryId,
+                    rankings: [entry.ranked],
+                    laneRestricted,
+                });
+            } else if (existing.laneRestricted === laneRestricted) {
+                existing.rankings.push(entry.ranked);
             }
         }
     }
 
+    // Aggregation rule for the merged pool ranking: each eligible case
+    // contributes at most its top-EVALUATION_DEPTH; a locator's pooled rank
+    // is its best rank across cases, tie-broken by earlier case in profile
+    // order, then locator text, so the merge is deterministic and keeps
+    // case provenance meaningful.
+    const pooledByQuery = [...candidateByQuery.values()].map((entry) => {
+        const best = new Map<string, { rank: number; caseIndex: number }>();
+        entry.rankings.forEach((ranked, caseIndex) => {
+            for (const [rank, locator] of ranked.slice(0, EVALUATION_DEPTH).entries()) {
+                const current = best.get(locator);
+                if (
+                    !current ||
+                    rank < current.rank ||
+                    (rank === current.rank && caseIndex < current.caseIndex)
+                ) {
+                    best.set(locator, { rank, caseIndex });
+                }
+            }
+        });
+        const ranked = [...best.entries()]
+            .sort(
+                (left, right) =>
+                    left[1].rank - right[1].rank ||
+                    left[1].caseIndex - right[1].caseIndex ||
+                    (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0),
+            )
+            .map(([locator]) => locator);
+        return { queryId: entry.queryId, ranked };
+    });
+
     const candidatePool = buildCandidatePool({
-        topK: EVALUATION_DEPTH,
-        queries: [...candidateByQuery.values()].map((entry) => {
+        // The merged rankings are already bounded to per-case top-K unions;
+        // the pool depth must cover the longest union or candidates unique
+        // to later cases would fall back out of the artifact.
+        topK: Math.max(EVALUATION_DEPTH, ...pooledByQuery.map((entry) => entry.ranked.length)),
+        queries: pooledByQuery.map((entry) => {
             const query = options.release.corpus.queries.find(
                 (candidate) => candidate.id === entry.queryId,
             );

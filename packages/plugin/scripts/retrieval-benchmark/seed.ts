@@ -102,6 +102,37 @@ export function deterministicVector(key: string, dims: number): Float32Array {
     return vector;
 }
 
+/** Deterministic text embedding: the normalized sum of per-token hash
+ *  vectors, so cosine similarity reflects token overlap between texts.
+ *  Reviewed documents and benchmark queries embed through this so semantic
+ *  lanes carry retrievable signal — a per-id random vector makes every
+ *  query-document similarity noise, which zeroes semantic ranking quality
+ *  by construction. Synthetic filler keeps per-id random vectors: noise
+ *  distractors are its job. */
+export function deterministicTextVector(text: string, dims: number): Float32Array {
+    const tokens = new Set(
+        text
+            .toLowerCase()
+            .split(/[^a-z0-9]+/)
+            .filter((token) => token.length > 0),
+    );
+    if (tokens.size === 0) return deterministicVector(`text:${text}`, dims);
+    const vector = new Float32Array(dims);
+    for (const token of tokens) {
+        const tokenVector = deterministicVector(`token:${token}`, dims);
+        for (let i = 0; i < dims; i += 1) vector[i] += tokenVector[i];
+    }
+    let norm = 0;
+    for (const value of vector) norm += value * value;
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+        for (let i = 0; i < dims; i += 1) vector[i] /= norm;
+    } else {
+        vector[0] = 1;
+    }
+    return vector;
+}
+
 export interface SeedManifestEntry {
     documentId: string;
     kind: DocumentKind;
@@ -401,7 +432,10 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
                 nowMs: SEED_EPOCH_MS + Number(plan.alias.locator),
             });
             verifyEmittedId(plan, memory.id);
-            const vector = deterministicVector(`doc:${plan.document.id}`, options.dims);
+            const vector = deterministicTextVector(
+                documentText(plan.document.semanticPayload),
+                options.dims,
+            );
             saveEmbedding(db, memory.id, vector, BENCHMARK_EMBEDDING_MODEL_ID);
             record(plan, null, null, vector.byteLength);
         }
@@ -420,7 +454,10 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
 
         for (const plan of byKind("primer").sort(numericAscending)) {
             advanceIdCursor(db, "primers", Number(plan.alias.locator) - 1);
-            const vector = deterministicVector(`doc:${plan.document.id}`, options.dims);
+            const vector = deterministicTextVector(
+                documentText(plan.document.semanticPayload),
+                options.dims,
+            );
             const primerId = createPrimer(db, {
                 projectPath: plan.alias.projectScope,
                 question: plan.document.semanticPayload.title,
@@ -437,7 +474,10 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         }
 
         for (const [index, plan] of byKind("git_commit").entries()) {
-            const vector = deterministicVector(`doc:${plan.document.id}`, options.dims);
+            const vector = deterministicTextVector(
+                documentText(plan.document.semanticPayload),
+                options.dims,
+            );
             upsertCommits(db, plan.alias.projectScope, [
                 {
                     sha: plan.alias.locator,
@@ -466,6 +506,15 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             record(plan, sessionId, ordinal, 0);
         }
 
+        // Per-session ordinal watermark after reviewed messages, before the
+        // synthetic filler advances the shared counter. Reviewed compartments
+        // anchor their ranges just past this mark: below any explicit-query
+        // cutoff (filler cannot shift them), but never overlapping a reviewed
+        // message ordinal — production fusion coalesces a message inside a
+        // compartment's range into the compartment identity, which would
+        // erase judged messages from the ranking whenever both retrieve.
+        const reviewedMessageWatermark = new Map(ordinals);
+
         let synthetic: SeedManifest["synthetic"] = null;
         let syntheticCompartments: SyntheticCompartment[] = [];
         if (options.synthetic) {
@@ -482,14 +531,13 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             syntheticCompartments = stream.pendingCompartments;
         }
 
-        // Reviewed compartments reference the session's EARLIEST message
-        // ordinals (a dedicated low counter) instead of consuming fresh
-        // ordinals from the shared stream counter. Fresh ordinals land after
-        // the synthetic scale filler — beyond every explicit-query ordinal
-        // cutoff on large fixtures, which fails validatePositiveTargets —
-        // and a compartment summarizing already-seeded messages is the
-        // production shape anyway. Message ordinals stay contiguous 1..N
-        // per session, which the production message indexer requires.
+        // Reviewed compartments reference deterministic low message ordinals
+        // (watermark + dedicated counter) instead of consuming fresh ordinals
+        // from the shared stream counter. Fresh ordinals land after the
+        // synthetic scale filler — beyond every explicit-query ordinal cutoff
+        // on large fixtures, which fails validatePositiveTargets. Message
+        // ordinals stay contiguous 1..N per session, which the production
+        // message indexer requires.
         const compartmentOrdinals = new Map<string, number>();
         const nextCompartmentOrdinal = (sessionId: string): number => {
             const next = (compartmentOrdinals.get(sessionId) ?? 0) + 1;
@@ -499,8 +547,12 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         for (const plan of planned) {
             if (plan.document.kind !== "compartment") continue;
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
-            const ordinal = nextCompartmentOrdinal(sessionId);
-            const vector = deterministicVector(`doc:${plan.document.id}`, options.dims);
+            const ordinal =
+                (reviewedMessageWatermark.get(sessionId) ?? 0) + nextCompartmentOrdinal(sessionId);
+            const vector = deterministicTextVector(
+                documentText(plan.document.semanticPayload),
+                options.dims,
+            );
             const seeded = seedCompartmentRow(db, {
                 sessionId,
                 projectPath: plan.alias.projectScope,

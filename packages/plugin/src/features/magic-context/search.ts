@@ -35,6 +35,7 @@ import { recordShadowMeasurement } from "./search-measurement";
 import {
     accumulateVectorLoad,
     createSearchTraceRecorder,
+    type HybridLaneStageMarks,
     type SearchTraceOptions,
     type SearchTraceRecorder,
     type SearchTraceSpanHandle,
@@ -807,7 +808,10 @@ async function searchMemories(args: {
     visibleMemoryIds?: Set<number> | null;
     trace?: SearchTraceRecorder | null;
     rootSpanId?: number | null;
-    embedSpanId?: number | null;
+    /** The span gating the query vector this lane consumes — the generation
+     *  lookup when tracing records one, else the query-inference span — so
+     *  the vector scan's causal chain includes the generation check. */
+    semanticGateSpanId?: number | null;
     /** The unified filter span; the lane's first span depends on it so the
      *  causal chain includes filter and workspace-resolution cost. */
     filterSpanId?: number | null;
@@ -867,7 +871,10 @@ async function searchMemories(args: {
     const scanSpan =
         trace?.begin("vector_scan", "memory", {
             parent: rootSpanId,
-            dependsOn: [...hydrationDeps, ...(args.embedSpanId != null ? [args.embedSpanId] : [])],
+            dependsOn: [
+                ...hydrationDeps,
+                ...(args.semanticGateSpanId != null ? [args.semanticGateSpanId] : []),
+            ],
         }) ?? null;
     const semanticScores = await getSemanticScores({
         db: args.db,
@@ -1817,6 +1824,7 @@ function searchGitCommits(args: {
     queryEmbedding: Float32Array | null;
     queryModelId?: string | null;
     onVectorLoad?: VectorLoadObserver;
+    stages?: HybridLaneStageMarks;
 }): GitCommitSearchResult[] {
     if (args.limit <= 0) return [];
 
@@ -1825,6 +1833,7 @@ function searchGitCommits(args: {
         queryEmbedding: args.queryEmbedding,
         queryModelId: args.queryModelId,
         onVectorLoad: args.onVectorLoad,
+        stages: args.stages,
     });
     return hits.map(toGitCommitResult);
 }
@@ -1842,9 +1851,31 @@ function searchPrimers(args: {
     queryEmbedding: Float32Array | null;
     queryModelId: string | null;
     onVectorLoad?: VectorLoadObserver;
+    stages?: HybridLaneStageMarks;
 }): PrimerSearchResult[] {
+    if (args.limit <= 0) return [];
+    // Vector phase covers the primer decode plus cosine scoring: the decoded
+    // bytes reported through onVectorLoad are exactly this phase's work.
+    args.stages?.vectorStart();
     const primers = getActivePrimers(args.db, args.projectPath, args.onVectorLoad);
-    if (primers.length === 0 || args.limit <= 0) return [];
+    const semanticScores = new Map<number, number>();
+    for (const primer of primers) {
+        if (
+            !args.queryEmbedding ||
+            !primer.questionEmbedding ||
+            primer.questionEmbeddingModelId !== args.queryModelId
+        ) {
+            continue;
+        }
+        const score = normalizeCosineScore(
+            cosineSimilarity(args.queryEmbedding, primer.questionEmbedding),
+        );
+        if (score > 0) semanticScores.set(primer.id, score);
+    }
+    args.stages?.vectorEnd(semanticScores.size);
+    if (primers.length === 0) return [];
+
+    args.stages?.lexicalStart();
     const ftsQuery = sanitizeFtsQuery(args.query);
     const ftsRanks = new Map<number, number>();
     if (ftsQuery) {
@@ -1866,16 +1897,12 @@ function searchPrimers(args: {
             ftsRanks.set(row.id, linearDecayScore(index, rows.length));
         });
     }
+    args.stages?.lexicalEnd(ftsRanks.size);
+
+    args.stages?.fusionStart();
     const scored = primers
         .map((primer) => {
-            const semantic =
-                args.queryEmbedding &&
-                primer.questionEmbedding &&
-                primer.questionEmbeddingModelId === args.queryModelId
-                    ? normalizeCosineScore(
-                          cosineSimilarity(args.queryEmbedding, primer.questionEmbedding),
-                      )
-                    : 0;
+            const semantic = semanticScores.get(primer.id) ?? 0;
             const fts = ftsRanks.get(primer.id) ?? 0;
             if (semantic <= 0 && fts <= 0) return null;
             const score =
@@ -1896,6 +1923,7 @@ function searchPrimers(args: {
         .filter((result): result is PrimerSearchResult => result !== null)
         .sort((a, b) => b.score - a.score || b.support - a.support || a.primerId - b.primerId)
         .slice(0, args.limit);
+    args.stages?.fusionEnd(primers.length, scored.length);
     return scored;
 }
 
@@ -2174,6 +2202,11 @@ async function executeUnifiedSearch(args: {
         ? (queryContract?.vector ?? (capturedQuery instanceof Float32Array ? capturedQuery : null))
         : null;
     generationSpan?.end("ok");
+    // Every semantic lane consumes the generation-gated vector, so a vector
+    // scan's causal edge runs through generation_lookup rather than jumping
+    // straight to query inference; otherwise the critical path drops the
+    // generation check from the semantic pipeline.
+    const semanticDeps = generationSpan ? [generationSpan.id] : embedSpan ? [embedSpan.id] : [];
     const embeddingModelId =
         queryContract?.modelId ?? options.embeddingModelIdOverride ?? embeddingSnapshot?.modelId;
     const chunkModelId =
@@ -2185,7 +2218,7 @@ async function executeUnifiedSearch(args: {
         trace && runCompartmentChunks
             ? trace.begin("vector_scan", "compartment", {
                   parent: rootId,
-                  dependsOn: embedSpan ? [embedSpan.id] : [],
+                  dependsOn: semanticDeps,
               })
             : null;
     const compartmentResults = runCompartmentChunks
@@ -2234,37 +2267,71 @@ async function executeUnifiedSearch(args: {
         candidatesOut: messageLikeResults.length,
     });
 
-    const embedDeps = embedSpan ? [embedSpan.id] : [];
     const laneSpanIds: number[] = messageFusionSpan ? [messageFusionSpan.id] : [];
 
+    // Hybrid lanes (git-commit, primer) decompose into lexical_scan,
+    // vector_scan, and fusion spans through stage marks the lane functions
+    // fire at their phase boundaries, joined by an explicit fusion
+    // dependency — one undifferentiated lane span would report lexical-only
+    // execution as vector time and hide the hybrid pipeline's structure.
     const runVectorLane = <T>(
         lane: "git_commit" | "primer",
-        run: (onVectorLoad: VectorLoadObserver | undefined) => T[],
+        run: (
+            onVectorLoad: VectorLoadObserver | undefined,
+            stages: HybridLaneStageMarks | undefined,
+        ) => T[],
     ): T[] => {
-        const span = trace
-            ? trace.begin("vector_scan", lane, { parent: rootId, dependsOn: embedDeps })
-            : null;
+        if (!trace) return run(undefined, undefined);
+        const recorder = trace;
         let load: VectorLoadEvent | null = null;
-        const results = run(
-            span
-                ? (event) => {
-                      load = accumulateVectorLoad(load, event);
-                  }
-                : undefined,
-        );
-        if (span) {
-            laneSpanIds.push(span.id);
-            span.end("ok", {
-                ...vectorLoadCounters(load),
-                candidatesOut: results.length,
-                ...laneDepth,
-            });
-        }
+        const spans: {
+            lexical: SearchTraceSpanHandle | null;
+            vector: SearchTraceSpanHandle | null;
+            fusion: SearchTraceSpanHandle | null;
+        } = { lexical: null, vector: null, fusion: null };
+        const stages: HybridLaneStageMarks = {
+            lexicalStart: () => {
+                spans.lexical = recorder.begin("lexical_scan", lane, {
+                    parent: rootId,
+                    dependsOn: filterDeps,
+                });
+            },
+            lexicalEnd: (candidatesOut) => spans.lexical?.end("ok", { candidatesOut }),
+            vectorStart: () => {
+                spans.vector = recorder.begin("vector_scan", lane, {
+                    parent: rootId,
+                    dependsOn: semanticDeps,
+                });
+            },
+            vectorEnd: (candidatesOut) =>
+                spans.vector?.end("ok", {
+                    ...vectorLoadCounters(load),
+                    candidatesOut,
+                    ...laneDepth,
+                }),
+            vectorSkipped: () => recorder.notApplicable("vector_scan", lane, rootId),
+            fusionStart: () => {
+                spans.fusion = recorder.begin("fusion", lane, {
+                    parent: rootId,
+                    dependsOn: [
+                        ...(spans.lexical ? [spans.lexical.id] : []),
+                        ...(spans.vector ? [spans.vector.id] : []),
+                    ],
+                });
+            },
+            fusionEnd: (candidatesIn, candidatesOut) =>
+                spans.fusion?.end("ok", { candidatesIn, candidatesOut }),
+        };
+        const results = run((event) => {
+            load = accumulateVectorLoad(load, event);
+        }, stages);
+        const tail = spans.fusion ?? spans.vector ?? spans.lexical;
+        if (tail) laneSpanIds.push(tail.id);
         return results;
     };
 
     const runGitCommitLane = (): GitCommitSearchResult[] =>
-        runVectorLane("git_commit", (onVectorLoad) =>
+        runVectorLane("git_commit", (onVectorLoad, stages) =>
             searchGitCommits({
                 db,
                 projectPath,
@@ -2274,11 +2341,12 @@ async function executeUnifiedSearch(args: {
                 queryModelId:
                     embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
                 onVectorLoad,
+                stages,
             }),
         );
 
     const runPrimerLane = (): PrimerSearchResult[] =>
-        runVectorLane("primer", (onVectorLoad) =>
+        runVectorLane("primer", (onVectorLoad, stages) =>
             searchPrimers({
                 db,
                 projectPath,
@@ -2288,6 +2356,7 @@ async function executeUnifiedSearch(args: {
                 queryModelId:
                     embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
                 onVectorLoad,
+                stages,
             }),
         );
 
@@ -2326,7 +2395,7 @@ async function executeUnifiedSearch(args: {
                   visibleMemoryIds: options.visibleMemoryIds,
                   trace,
                   rootSpanId: rootId,
-                  embedSpanId: embedSpan?.id ?? null,
+                  semanticGateSpanId: semanticDeps.length > 0 ? semanticDeps[0] : null,
                   filterSpanId: filterSpan?.id ?? null,
               })
             : Promise.resolve({

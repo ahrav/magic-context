@@ -10,7 +10,7 @@ import { canonicalFingerprint } from "./canonical-json";
 import { loadReviewedRelease } from "./index";
 import {
     BENCHMARK_EMBEDDING_MODEL_ID,
-    deterministicVector,
+    deterministicTextVector,
     fixtureSessionId,
     measureMessageSelectivity,
     openFixtureSnapshot,
@@ -90,7 +90,7 @@ async function searchSnapshot(
                 embeddingModelIdOverride: BENCHMARK_EMBEDDING_MODEL_ID,
                 chunkModelIdOverride: BENCHMARK_EMBEDDING_MODEL_ID,
                 embedQuery: async (text) => ({
-                    vector: deterministicVector(`query:${text}`, 32),
+                    vector: deterministicTextVector(text, 32),
                     modelId: BENCHMARK_EMBEDDING_MODEL_ID,
                     chunkModelId: BENCHMARK_EMBEDDING_MODEL_ID,
                     generation: 0,
@@ -274,16 +274,16 @@ describe("seed-time positive-target validation (AE2)", () => {
     });
 
     it("applies the same inclusive cutoff to compartment end ordinals", () => {
-        // Reviewed compartments draw from a dedicated low counter so scale
-        // filler cannot push them past explicit cutoffs:
-        // d-architecture-rationale-dev is the first compartment (ordinal 1),
-        // d-architecture-rationale-hold the second (ordinal 2).
-        const atCutoff = releaseWithCutoff("q-architecture-rationale-dev", 1);
+        // Reviewed compartments anchor just past the reviewed-message
+        // watermark (four message ordinals), so scale filler cannot shift
+        // them and they never overlap a judged message ordinal:
+        // d-architecture-rationale-dev is the first compartment: ordinal 5.
+        const atCutoff = releaseWithCutoff("q-architecture-rationale-dev", 5);
         expect(() =>
             seedFixture(toSeedInput(atCutoff), { fixtureDir: tempFixtureDir(), dims: 8 }),
         ).not.toThrow();
 
-        const beyond = releaseWithCutoff("q-architecture-rationale-hold", 1);
+        const beyond = releaseWithCutoff("q-architecture-rationale-dev", 4);
         expect(() =>
             seedFixture(toSeedInput(beyond), { fixtureDir: tempFixtureDir(), dims: 8 }),
         ).toThrow(SeedError);
