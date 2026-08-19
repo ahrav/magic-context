@@ -2569,6 +2569,49 @@ const MIGRATIONS: &[Migration] = &[
         END;
     "#,
     },
+    Migration {
+        version: 52,
+        statements: "
+        ALTER TABLE mc_authority ADD COLUMN note_eval_protocol_epoch INTEGER NOT NULL DEFAULT 1;
+        UPDATE mc_authority SET note_eval_protocol_epoch = 2, generation = generation + 1
+         WHERE domain = 'notes';
+        CREATE TABLE IF NOT EXISTS mc_note_eval_claims (
+            claim_id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            note_id INTEGER NOT NULL,
+            phase TEXT NOT NULL CHECK (phase IN ('compile', 'due', 'liveness', 'fallback')),
+            acquisition_id TEXT NOT NULL,
+            evaluator_instance TEXT NOT NULL,
+            evaluator_slot INTEGER NOT NULL,
+            registration_generation INTEGER NOT NULL,
+            source_revision INTEGER NOT NULL,
+            state_version INTEGER NOT NULL,
+            policy_version INTEGER NOT NULL,
+            protocol_epoch INTEGER NOT NULL,
+            authority_generation INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            completion_id TEXT,
+            terminal_kind TEXT,
+            terminal_response TEXT,
+            terminal_at_ms INTEGER,
+            UNIQUE (project, acquisition_id)
+        );
+        CREATE UNIQUE INDEX idx_mc_note_eval_claims_active_note
+            ON mc_note_eval_claims(project, note_id) WHERE terminal_kind IS NULL;
+        CREATE UNIQUE INDEX idx_mc_note_eval_claims_active_slot
+            ON mc_note_eval_claims(project, evaluator_instance, evaluator_slot)
+            WHERE terminal_kind IS NULL;
+        CREATE TABLE IF NOT EXISTS mc_note_eval_acquisitions (
+            project TEXT NOT NULL,
+            acquisition_id TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (project, acquisition_id)
+        );
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4444,6 +4487,118 @@ pub struct NoteEvaluationInput<'a> {
     pub now_ms: i64,
 }
 
+/// Lease length for one durable smart-note evaluation claim.
+pub const NOTE_EVAL_CLAIM_LEASE_MS: i64 = 2 * 60_000;
+/// Replay retention for a `no_work` acquisition decision.
+pub const NOTE_EVAL_NO_WORK_RETENTION_MS: i64 = 10 * 60_000;
+/// Replay retention for a terminal claim result.
+pub const NOTE_EVAL_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60_000;
+/// Per-project row cap for each evaluation ledger.
+pub const NOTE_EVAL_LEDGER_CAP: i64 = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEvalClaim {
+    pub claim_id: String,
+    pub note_id: i64,
+    pub phase: String,
+    pub acquisition_id: String,
+    pub evaluator_instance: String,
+    pub evaluator_slot: i64,
+    pub registration_generation: i64,
+    pub source_revision: i64,
+    pub state_version: i64,
+    pub policy_version: i64,
+    pub protocol_epoch: i64,
+    pub authority_generation: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum NoteEvalAcquireOutcome {
+    Claim {
+        claim: NoteEvalClaim,
+        note: StoredNote,
+        replayed: bool,
+    },
+    NoWork {
+        replayed: bool,
+    },
+    /// The acquisition identity replays an expired decision.
+    Expired,
+    /// The acquisition identity replays a terminal claim result.
+    Terminal {
+        kind: String,
+        response: Option<String>,
+    },
+    Busy,
+    AuthorityChanged,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteEvalRenewOutcome {
+    Renewed {
+        expires_at: i64,
+    },
+    Expired,
+    AuthorityChanged,
+    UnknownClaim,
+    Invalid,
+    TerminalReplay {
+        kind: String,
+        response: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum NoteEvalCompleteOutcome {
+    Applied {
+        note: StoredNote,
+        response_json: String,
+    },
+    Replayed {
+        response_json: String,
+    },
+    Conflict {
+        kind: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteEvalAbandonOutcome {
+    Abandoned,
+    Replayed { kind: String },
+    UnknownClaim,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEvalReducedState {
+    pub status: String,
+    pub ready_at: Option<i64>,
+    pub ready_reason: Option<String>,
+    pub last_checked_at: Option<i64>,
+    pub updated_at_ms: i64,
+    pub compiled_check: Option<String>,
+    pub manifest_json: Option<String>,
+    pub check_hash: Option<String>,
+    pub check_cron: Option<String>,
+    pub check_version: Option<i64>,
+    pub check_status: Option<String>,
+    pub check_failure_count: i64,
+    pub check_network_failure_count: i64,
+    pub check_quarantined_until: Option<i64>,
+    pub check_next_due_at: Option<i64>,
+    pub check_compiled_at: Option<i64>,
+    pub check_false_since_at: Option<i64>,
+    pub check_last_liveness_at: Option<i64>,
+    pub policy_version: Option<i64>,
+    pub compiled_source_revision: Option<i64>,
+    pub compiled_project_path: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredNoteSearchRow {
     pub id: i64,
@@ -6074,6 +6229,10 @@ impl<'a> FacadeMutationTxn<'a> {
                     .map_err(|error| error.to_string())?,
             });
         }
+        if compiler_edit {
+            fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
+                .map_err(|error| error.to_string())?;
+        }
         Ok(NoteCasOutcome::Applied(
             load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
         ))
@@ -6130,6 +6289,8 @@ impl<'a> FacadeMutationTxn<'a> {
         if changed == 0 {
             return Ok(None);
         }
+        fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
+            .map_err(|error| error.to_string())?;
         Ok(Some(
             load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
         ))
@@ -13403,6 +13564,9 @@ impl McStore {
                     current: load_note_tx(tx, note_id).optional()?,
                 });
             }
+            if compiler_edit {
+                fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
+            }
             Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
         })?;
         Ok(result)
@@ -13459,6 +13623,7 @@ impl McStore {
             if changed == 0 {
                 return Ok(None);
             }
+            fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
             Ok(Some(load_note_tx(tx, note_id)?))
         })
     }
@@ -14476,6 +14641,9 @@ impl McStore {
                     params![domain],
                     |row| row.get(0),
                 )?;
+                if domain == "notes" {
+                    fence_active_note_claims_tx(tx, project, None, "authority_changed", now_ms)?;
+                }
                 let next_generation = current.generation + 1;
                 let token = mint_coordinator_token(lease, lease_expires_at, next_generation);
                 tx.execute(
@@ -16450,6 +16618,718 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
         params![id],
         stored_note_from_row,
     )
+}
+
+const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id, \
+    evaluator_instance, evaluator_slot, registration_generation, source_revision, \
+    state_version, policy_version, protocol_epoch, authority_generation, expires_at, \
+    completion_id, terminal_kind, terminal_response";
+
+const NOTE_EVAL_ID_MAX_LEN: usize = 200;
+const NOTE_EVAL_RESPONSE_MAX_LEN: usize = 2048;
+
+struct NoteEvalClaimRow {
+    claim: NoteEvalClaim,
+    completion_id: Option<String>,
+    terminal_kind: Option<String>,
+    terminal_response: Option<String>,
+}
+
+fn note_eval_claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteEvalClaimRow> {
+    Ok(NoteEvalClaimRow {
+        claim: NoteEvalClaim {
+            claim_id: row.get(0)?,
+            note_id: row.get(1)?,
+            phase: row.get(2)?,
+            acquisition_id: row.get(3)?,
+            evaluator_instance: row.get(4)?,
+            evaluator_slot: row.get(5)?,
+            registration_generation: row.get(6)?,
+            source_revision: row.get(7)?,
+            state_version: row.get(8)?,
+            policy_version: row.get(9)?,
+            protocol_epoch: row.get(10)?,
+            authority_generation: row.get(11)?,
+            expires_at: row.get(12)?,
+        },
+        completion_id: row.get(13)?,
+        terminal_kind: row.get(14)?,
+        terminal_response: row.get(15)?,
+    })
+}
+
+fn note_eval_valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= NOTE_EVAL_ID_MAX_LEN
+}
+
+fn note_eval_bound_response(response: &str) -> String {
+    if response.len() <= NOTE_EVAL_RESPONSE_MAX_LEN {
+        return response.to_string();
+    }
+    let mut end = NOTE_EVAL_RESPONSE_MAX_LEN;
+    while !response.is_char_boundary(end) {
+        end -= 1;
+    }
+    response[..end].to_string()
+}
+
+fn note_eval_kind_response(kind: &str) -> String {
+    serde_json::json!({ "result": kind }).to_string()
+}
+
+/// Resolve the notes-authority row this project's evaluation protocol is fenced on.
+/// A MODULE row wins over stale twins under other context store UUIDs, matching
+/// `module_authority_for_project`; otherwise the lowest UUID reports current state.
+fn note_eval_authority_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+) -> rusqlite::Result<Option<(i64, i64, String)>> {
+    tx.query_row(
+        "SELECT generation, note_eval_protocol_epoch, state
+           FROM mc_authority
+          WHERE project = ?1 AND domain = 'notes'
+          ORDER BY CASE WHEN state = 'MODULE' THEN 0 ELSE 1 END, context_store_uuid
+          LIMIT 1",
+        params![project],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+fn note_eval_module_authority_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    Ok(note_eval_authority_tx(tx, project)?
+        .filter(|(_, _, state)| state == "MODULE")
+        .map(|(generation, epoch, _)| (generation, epoch)))
+}
+
+fn load_note_eval_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    claim_id: &str,
+) -> rusqlite::Result<Option<NoteEvalClaimRow>> {
+    tx.query_row(
+        &format!(
+            "SELECT {NOTE_EVAL_CLAIM_COLUMNS} FROM mc_note_eval_claims
+              WHERE project = ?1 AND claim_id = ?2"
+        ),
+        params![project, claim_id],
+        note_eval_claim_from_row,
+    )
+    .optional()
+}
+
+fn mark_note_eval_claim_terminal_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    claim_id: &str,
+    kind: &str,
+    completion_id: Option<&str>,
+    response: &str,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "UPDATE mc_note_eval_claims
+            SET terminal_kind = ?1, completion_id = COALESCE(?2, completion_id),
+                terminal_response = ?3, terminal_at_ms = ?4
+          WHERE project = ?5 AND claim_id = ?6 AND terminal_kind IS NULL",
+        params![kind, completion_id, response, now_ms, project, claim_id],
+    )
+}
+
+/// Terminally fence active claims so in-flight evaluations lose their completion
+/// instead of surfacing stale work. `note_id = None` fences the whole project.
+fn fence_active_note_claims_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    note_id: Option<i64>,
+    kind: &str,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "UPDATE mc_note_eval_claims
+            SET terminal_kind = ?1, terminal_response = ?2, terminal_at_ms = ?3
+          WHERE project = ?4 AND terminal_kind IS NULL AND (?5 IS NULL OR note_id = ?5)",
+        params![
+            kind,
+            note_eval_kind_response(kind),
+            now_ms,
+            project,
+            note_id
+        ],
+    )
+}
+
+/// Ledger garbage collection: expire overdue active claims, tombstone expired
+/// `no_work` decisions (`decision = ''` keeps replay identity), then null the
+/// response of terminal claims past their protection window. Tombstoned rows
+/// replay as `Expired`; they no longer count against either cap.
+fn collect_note_eval_ledgers_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE mc_note_eval_claims
+            SET terminal_kind = 'expired', terminal_response = ?1, terminal_at_ms = ?2
+          WHERE project = ?3 AND terminal_kind IS NULL AND expires_at <= ?2",
+        params![note_eval_kind_response("expired"), now_ms, project],
+    )?;
+    tx.execute(
+        "UPDATE mc_note_eval_acquisitions SET decision = ''
+          WHERE project = ?1 AND decision <> '' AND expires_at <= ?2",
+        params![project, now_ms],
+    )?;
+    tx.execute(
+        "UPDATE mc_note_eval_claims SET terminal_response = NULL
+          WHERE project = ?1 AND terminal_kind IS NOT NULL AND terminal_response IS NOT NULL
+            AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
+        params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+    )?;
+    Ok(())
+}
+
+impl McStore {
+    /// Report (authority generation, evaluation-protocol epoch, state) for this
+    /// project's notes domain.
+    pub fn note_eval_authority(
+        &self,
+        project: &str,
+    ) -> Result<Option<(i64, i64, String)>, McStoreError> {
+        self.with_note_conn_fenced(project, |tx| note_eval_authority_tx(tx, project))
+    }
+
+    /// Run ledger garbage collection for one project. Acquisition folds this in;
+    /// the standalone entry point exists for opportunistic maintenance callers.
+    pub fn collect_note_eval_ledgers(
+        &self,
+        project: &str,
+        now_ms: i64,
+    ) -> Result<(), McStoreError> {
+        self.with_note_conn_fenced(project, |tx| {
+            collect_note_eval_ledgers_tx(tx, project, now_ms)
+        })
+    }
+
+    /// Acquire one durable evaluation claim or a replayable `no_work` decision.
+    /// `select` receives the pending, unclaimed smart notes and picks (note, phase);
+    /// the decision commits atomically under (project, acquisition_id) uniqueness so
+    /// the same acquisition ID always returns the same decision after response loss.
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire_note_evaluation(
+        &self,
+        project: &str,
+        acquisition_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        registration_generation: i64,
+        select: impl FnOnce(&[StoredNote]) -> Option<(i64, String)>,
+        now_ms: i64,
+    ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
+        self.acquire_note_evaluation_with_cap(
+            project,
+            acquisition_id,
+            evaluator_instance,
+            evaluator_slot,
+            registration_generation,
+            select,
+            now_ms,
+            NOTE_EVAL_LEDGER_CAP,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_note_evaluation_with_cap(
+        &self,
+        project: &str,
+        acquisition_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        registration_generation: i64,
+        select: impl FnOnce(&[StoredNote]) -> Option<(i64, String)>,
+        now_ms: i64,
+        ledger_cap: i64,
+    ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
+        if project.is_empty()
+            || !note_eval_valid_id(acquisition_id)
+            || !note_eval_valid_id(evaluator_instance)
+            || evaluator_slot < 0
+        {
+            return Ok(NoteEvalAcquireOutcome::Invalid);
+        }
+        self.with_note_conn_fenced(project, |tx| {
+            collect_note_eval_ledgers_tx(tx, project, now_ms)?;
+            let replayed_claim = tx
+                .query_row(
+                    &format!(
+                        "SELECT {NOTE_EVAL_CLAIM_COLUMNS} FROM mc_note_eval_claims
+                          WHERE project = ?1 AND acquisition_id = ?2"
+                    ),
+                    params![project, acquisition_id],
+                    note_eval_claim_from_row,
+                )
+                .optional()?;
+            if let Some(row) = replayed_claim {
+                if let Some(kind) = row.terminal_kind {
+                    return Ok(NoteEvalAcquireOutcome::Terminal {
+                        kind,
+                        response: row.terminal_response,
+                    });
+                }
+                if row.claim.evaluator_instance != evaluator_instance
+                    || row.claim.evaluator_slot != evaluator_slot
+                {
+                    return Ok(NoteEvalAcquireOutcome::Invalid);
+                }
+                return rebind_note_eval_claim_tx(tx, project, row.claim, registration_generation);
+            }
+            let replayed_decision = tx
+                .query_row(
+                    "SELECT decision FROM mc_note_eval_acquisitions
+                      WHERE project = ?1 AND acquisition_id = ?2",
+                    params![project, acquisition_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(decision) = replayed_decision {
+                return Ok(if decision.is_empty() {
+                    NoteEvalAcquireOutcome::Expired
+                } else {
+                    NoteEvalAcquireOutcome::NoWork { replayed: true }
+                });
+            }
+            let Some((authority_generation, protocol_epoch)) =
+                note_eval_module_authority_tx(tx, project)?
+            else {
+                return Ok(NoteEvalAcquireOutcome::AuthorityChanged);
+            };
+            let slot_claim = tx
+                .query_row(
+                    &format!(
+                        "SELECT {NOTE_EVAL_CLAIM_COLUMNS} FROM mc_note_eval_claims
+                          WHERE project = ?1 AND evaluator_instance = ?2
+                            AND evaluator_slot = ?3 AND terminal_kind IS NULL"
+                    ),
+                    params![project, evaluator_instance, evaluator_slot],
+                    note_eval_claim_from_row,
+                )
+                .optional()?;
+            if let Some(row) = slot_claim {
+                return rebind_note_eval_claim_tx(tx, project, row.claim, registration_generation);
+            }
+            let candidates = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
+                      WHERE project_path = ?1 AND type = 'smart' AND status = 'pending'
+                        AND id NOT IN (SELECT note_id FROM mc_note_eval_claims
+                                        WHERE project = ?1 AND terminal_kind IS NULL)
+                      ORDER BY id"
+                ))?;
+                let rows = stmt
+                    .query_map(params![project], stored_note_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let Some((note_id, phase)) = select(&candidates) else {
+                let live: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM mc_note_eval_acquisitions
+                      WHERE project = ?1 AND decision <> ''",
+                    params![project],
+                    |row| row.get(0),
+                )?;
+                if live >= ledger_cap {
+                    return Ok(NoteEvalAcquireOutcome::Busy);
+                }
+                tx.execute(
+                    "INSERT INTO mc_note_eval_acquisitions(
+                         project, acquisition_id, decision, created_at_ms, expires_at)
+                     VALUES (?1, ?2, 'no_work', ?3, ?4)",
+                    params![
+                        project,
+                        acquisition_id,
+                        now_ms,
+                        now_ms + NOTE_EVAL_NO_WORK_RETENTION_MS
+                    ],
+                )?;
+                return Ok(NoteEvalAcquireOutcome::NoWork { replayed: false });
+            };
+            if !matches!(phase.as_str(), "compile" | "due" | "liveness" | "fallback") {
+                return Ok(NoteEvalAcquireOutcome::Invalid);
+            }
+            let Some(note) = candidates.into_iter().find(|note| note.id == note_id) else {
+                return Ok(NoteEvalAcquireOutcome::Invalid);
+            };
+            let protected: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM mc_note_eval_claims
+                  WHERE project = ?1 AND (terminal_kind IS NULL OR terminal_at_ms > ?2)",
+                params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+                |row| row.get(0),
+            )?;
+            if protected >= ledger_cap {
+                return Ok(NoteEvalAcquireOutcome::Busy);
+            }
+            let claim = NoteEvalClaim {
+                claim_id: format!("nec:{project}:{acquisition_id}"),
+                note_id: note.id,
+                phase,
+                acquisition_id: acquisition_id.to_string(),
+                evaluator_instance: evaluator_instance.to_string(),
+                evaluator_slot,
+                registration_generation,
+                source_revision: note.source_revision,
+                state_version: note.state_version,
+                policy_version: note.policy_version.unwrap_or(1),
+                protocol_epoch,
+                authority_generation,
+                expires_at: now_ms + NOTE_EVAL_CLAIM_LEASE_MS,
+            };
+            tx.execute(
+                "INSERT INTO mc_note_eval_claims(
+                     claim_id, project, note_id, phase, acquisition_id, evaluator_instance,
+                     evaluator_slot, registration_generation, source_revision, state_version,
+                     policy_version, protocol_epoch, authority_generation, expires_at,
+                     created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    claim.claim_id,
+                    project,
+                    claim.note_id,
+                    claim.phase,
+                    claim.acquisition_id,
+                    claim.evaluator_instance,
+                    claim.evaluator_slot,
+                    claim.registration_generation,
+                    claim.source_revision,
+                    claim.state_version,
+                    claim.policy_version,
+                    claim.protocol_epoch,
+                    claim.authority_generation,
+                    claim.expires_at,
+                    now_ms,
+                ],
+            )?;
+            Ok(NoteEvalAcquireOutcome::Claim {
+                claim,
+                note,
+                replayed: false,
+            })
+        })
+    }
+
+    /// Extend an active claim's lease by one lease interval.
+    pub fn renew_note_evaluation_claim(
+        &self,
+        project: &str,
+        claim_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        registration_generation: i64,
+        now_ms: i64,
+    ) -> Result<NoteEvalRenewOutcome, McStoreError> {
+        self.with_note_conn_fenced(project, |tx| {
+            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                return Ok(NoteEvalRenewOutcome::UnknownClaim);
+            };
+            if let Some(kind) = row.terminal_kind {
+                return Ok(NoteEvalRenewOutcome::TerminalReplay {
+                    kind,
+                    response: row.terminal_response,
+                });
+            }
+            if row.claim.evaluator_instance != evaluator_instance
+                || row.claim.evaluator_slot != evaluator_slot
+            {
+                return Ok(NoteEvalRenewOutcome::Invalid);
+            }
+            if row.claim.expires_at <= now_ms {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "expired",
+                    None,
+                    &note_eval_kind_response("expired"),
+                    now_ms,
+                )?;
+                return Ok(NoteEvalRenewOutcome::Expired);
+            }
+            match note_eval_module_authority_tx(tx, project)? {
+                Some((generation, _)) if generation == row.claim.authority_generation => {}
+                _ => return Ok(NoteEvalRenewOutcome::AuthorityChanged),
+            }
+            let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
+            tx.execute(
+                "UPDATE mc_note_eval_claims
+                    SET expires_at = ?1, registration_generation = ?2
+                  WHERE project = ?3 AND claim_id = ?4 AND terminal_kind IS NULL",
+                params![expires_at, registration_generation, project, claim_id],
+            )?;
+            Ok(NoteEvalRenewOutcome::Renewed { expires_at })
+        })
+    }
+
+    /// Commit one evaluation outcome. `apply` receives the fenced note snapshot and
+    /// returns the reduced lifecycle columns; every fence (identity, lease, authority
+    /// generation, source revision, state version, pending status) is revalidated in
+    /// the same transaction that writes the note and the replayable terminal result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_note_evaluation(
+        &self,
+        project: &str,
+        claim_id: &str,
+        completion_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        now_ms: i64,
+        apply: impl FnOnce(&StoredNote) -> Result<NoteEvalReducedState, String>,
+    ) -> Result<NoteEvalCompleteOutcome, McStoreError> {
+        if !note_eval_valid_id(completion_id) {
+            return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+        }
+        self.with_note_conn_fenced(project, |tx| {
+            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                return Ok(NoteEvalCompleteOutcome::Conflict {
+                    kind: "unknown_claim",
+                });
+            };
+            if let Some(kind) = row.terminal_kind {
+                return Ok(match row.completion_id {
+                    Some(stored) if stored == completion_id => match row.terminal_response {
+                        Some(response_json) => NoteEvalCompleteOutcome::Replayed { response_json },
+                        None => NoteEvalCompleteOutcome::Conflict { kind: "expired" },
+                    },
+                    Some(_) => NoteEvalCompleteOutcome::Conflict {
+                        kind: "completion_conflict",
+                    },
+                    None => NoteEvalCompleteOutcome::Conflict {
+                        kind: match kind.as_str() {
+                            "stale" => "stale",
+                            "expired" => "expired",
+                            "authority_changed" => "authority_changed",
+                            _ => "invalid",
+                        },
+                    },
+                });
+            }
+            if row.claim.evaluator_instance != evaluator_instance
+                || row.claim.evaluator_slot != evaluator_slot
+            {
+                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+            }
+            if row.claim.expires_at <= now_ms {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "expired",
+                    None,
+                    &note_eval_kind_response("expired"),
+                    now_ms,
+                )?;
+                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "expired" });
+            }
+            match note_eval_module_authority_tx(tx, project)? {
+                Some((generation, _)) if generation == row.claim.authority_generation => {}
+                _ => {
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "authority_changed",
+                        None,
+                        &note_eval_kind_response("authority_changed"),
+                        now_ms,
+                    )?;
+                    return Ok(NoteEvalCompleteOutcome::Conflict {
+                        kind: "authority_changed",
+                    });
+                }
+            }
+            let stale = |tx: &rusqlite::Transaction<'_>| -> rusqlite::Result<_> {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "stale",
+                    None,
+                    &note_eval_kind_response("stale"),
+                    now_ms,
+                )?;
+                Ok(NoteEvalCompleteOutcome::Conflict { kind: "stale" })
+            };
+            let note = load_note_tx(tx, row.claim.note_id).optional()?;
+            let Some(note) = note.filter(|note| note.project_path == project) else {
+                return stale(tx);
+            };
+            if note.source_revision != row.claim.source_revision
+                || note.state_version != row.claim.state_version
+                || note.status != "pending"
+            {
+                return stale(tx);
+            }
+            let reduced = match apply(&note) {
+                Ok(reduced) => reduced,
+                Err(message) => {
+                    let response = serde_json::json!({
+                        "result": "invalid",
+                        "error": note_eval_bound_response(&message),
+                    })
+                    .to_string();
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "invalid",
+                        None,
+                        &note_eval_bound_response(&response),
+                        now_ms,
+                    )?;
+                    return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+                }
+            };
+            if !matches!(reduced.status.as_str(), "pending" | "ready") {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "invalid",
+                    None,
+                    &note_eval_kind_response("invalid"),
+                    now_ms,
+                )?;
+                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+            }
+            let changed = tx.execute(
+                "UPDATE mc_notes SET status = ?1, ready_at = ?2, ready_reason = ?3,
+                    last_checked_at = ?4, updated_at_ms = ?5, compiled_check = ?6,
+                    manifest_json = ?7, check_hash = ?8, check_cron = ?9, check_version = ?10,
+                    check_status = ?11, check_failure_count = ?12,
+                    check_network_failure_count = ?13, check_quarantined_until = ?14,
+                    check_next_due_at = ?15, check_compiled_at = ?16,
+                    check_false_since_at = ?17, check_last_liveness_at = ?18,
+                    policy_version = ?19, compiled_source_revision = ?20,
+                    compiled_project_path = ?21,
+                    status_version = status_version + 1, state_version = state_version + 1
+                  WHERE id = ?22 AND project_path = ?23 AND status = 'pending'
+                    AND state_version = ?24",
+                params![
+                    reduced.status,
+                    reduced.ready_at,
+                    reduced.ready_reason,
+                    reduced.last_checked_at,
+                    reduced.updated_at_ms,
+                    reduced.compiled_check,
+                    reduced.manifest_json,
+                    reduced.check_hash,
+                    reduced.check_cron,
+                    reduced.check_version.unwrap_or(0),
+                    reduced.check_status,
+                    reduced.check_failure_count,
+                    reduced.check_network_failure_count,
+                    reduced.check_quarantined_until,
+                    reduced.check_next_due_at,
+                    reduced.check_compiled_at,
+                    reduced.check_false_since_at,
+                    reduced.check_last_liveness_at,
+                    reduced.policy_version.unwrap_or(1),
+                    reduced.compiled_source_revision,
+                    reduced.compiled_project_path,
+                    row.claim.note_id,
+                    project,
+                    row.claim.state_version,
+                ],
+            )?;
+            if changed == 0 {
+                return stale(tx);
+            }
+            let note = load_note_tx(tx, row.claim.note_id)?;
+            let response_json = serde_json::json!({
+                "result": "applied",
+                "note_id": note.id,
+                "status": note.status,
+                "state_version": note.state_version,
+                "check_status": note.check_status,
+            })
+            .to_string();
+            mark_note_eval_claim_terminal_tx(
+                tx,
+                project,
+                claim_id,
+                "applied",
+                Some(completion_id),
+                &response_json,
+                now_ms,
+            )?;
+            Ok(NoteEvalCompleteOutcome::Applied {
+                note,
+                response_json,
+            })
+        })
+    }
+
+    /// Terminally release a claim for controlled cancellation. Never touches
+    /// `mc_notes`; abandoning an already-terminal claim replays its terminal kind.
+    pub fn abandon_note_evaluation_claim(
+        &self,
+        project: &str,
+        claim_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        now_ms: i64,
+    ) -> Result<NoteEvalAbandonOutcome, McStoreError> {
+        self.with_note_conn_fenced(project, |tx| {
+            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                return Ok(NoteEvalAbandonOutcome::UnknownClaim);
+            };
+            if let Some(kind) = row.terminal_kind {
+                return Ok(NoteEvalAbandonOutcome::Replayed { kind });
+            }
+            if row.claim.evaluator_instance != evaluator_instance
+                || row.claim.evaluator_slot != evaluator_slot
+            {
+                return Ok(NoteEvalAbandonOutcome::Invalid);
+            }
+            mark_note_eval_claim_terminal_tx(
+                tx,
+                project,
+                claim_id,
+                "abandoned",
+                None,
+                &note_eval_kind_response("abandoned"),
+                now_ms,
+            )?;
+            Ok(NoteEvalAbandonOutcome::Abandoned)
+        })
+    }
+}
+
+/// Rebind an active claim to the caller's registration and replay it with the
+/// current note snapshot.
+fn rebind_note_eval_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    mut claim: NoteEvalClaim,
+    registration_generation: i64,
+) -> rusqlite::Result<NoteEvalAcquireOutcome> {
+    tx.execute(
+        "UPDATE mc_note_eval_claims SET registration_generation = ?1
+          WHERE project = ?2 AND claim_id = ?3 AND terminal_kind IS NULL",
+        params![registration_generation, project, claim.claim_id],
+    )?;
+    claim.registration_generation = registration_generation;
+    let note = load_note_tx(tx, claim.note_id)
+        .optional()?
+        .filter(|note| note.project_path == project);
+    let Some(note) = note else {
+        return Ok(NoteEvalAcquireOutcome::Invalid);
+    };
+    Ok(NoteEvalAcquireOutcome::Claim {
+        claim,
+        note,
+        replayed: true,
+    })
 }
 
 /// Mirrors hashCheck in packages/plugin smart-notes/compiler.ts; manifest_json is hashed
@@ -23947,6 +24827,670 @@ mod tests {
             store.load("ses").unwrap().meta.historian.state,
             HistorianPhase::Publishing
         );
+    }
+
+    const EVAL_PROJECT: &str = "git:proj";
+
+    fn note_eval_store(dir: &std::path::Path) -> McStore {
+        let store = McStore::open(&descriptor(dir)).unwrap();
+        let preparing = store
+            .authority_begin_prepare("ctx", EVAL_PROJECT, "notes")
+            .unwrap();
+        store
+            .authority_finish_prepare(
+                "ctx",
+                EVAL_PROJECT,
+                "notes",
+                preparing.generation,
+                "hash",
+                "hash",
+                true,
+            )
+            .unwrap();
+        store
+    }
+
+    fn eval_note(store: &McStore, content: &str) -> StoredNote {
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: EVAL_PROJECT,
+                route_project_root: None,
+                session_id: Some("writer"),
+                content,
+                surface_condition: Some("condition"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 1,
+            })
+            .unwrap()
+    }
+
+    fn pick_first(notes: &[StoredNote]) -> Option<(i64, String)> {
+        notes.first().map(|note| (note.id, "due".to_string()))
+    }
+
+    fn eval_reduced(note: &StoredNote, status: &str, now_ms: i64) -> NoteEvalReducedState {
+        let ready = status == "ready";
+        NoteEvalReducedState {
+            status: status.to_string(),
+            ready_at: ready.then_some(now_ms),
+            ready_reason: ready.then(|| "condition_true".to_string()),
+            last_checked_at: Some(now_ms),
+            updated_at_ms: now_ms,
+            compiled_check: Some("compiled body".to_string()),
+            manifest_json: Some("{}".to_string()),
+            check_hash: Some("hash".to_string()),
+            check_cron: note.check_cron.clone(),
+            check_version: Some(1),
+            check_status: Some("compiled".to_string()),
+            check_failure_count: note.check_failure_count,
+            check_network_failure_count: note.check_network_failure_count,
+            check_quarantined_until: None,
+            check_next_due_at: Some(now_ms + 60_000),
+            check_compiled_at: Some(now_ms),
+            check_false_since_at: None,
+            check_last_liveness_at: None,
+            policy_version: note.policy_version,
+            compiled_source_revision: Some(note.source_revision),
+            compiled_project_path: Some(EVAL_PROJECT.to_string()),
+        }
+    }
+
+    fn eval_claim(store: &McStore, acquisition_id: &str, slot: i64, now_ms: i64) -> NoteEvalClaim {
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                acquisition_id,
+                "eval-a",
+                slot,
+                1,
+                pick_first,
+                now_ms,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim,
+                replayed: false,
+                ..
+            } => claim,
+            other => panic!("expected fresh claim, got {other:?}"),
+        }
+    }
+
+    fn reload_note(store: &McStore, id: i64) -> StoredNote {
+        store
+            .get_note_by_id(EVAL_PROJECT, "writer", id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn note_eval_acquire_replays_lost_claim_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 100);
+        assert_eq!(claim.note_id, note.id);
+        match store
+            .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 2, pick_first, 200)
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: replayed,
+                replayed: true,
+                ..
+            } => {
+                assert_eq!(replayed.claim_id, claim.claim_id);
+                assert_eq!(replayed.registration_generation, 2);
+                assert_eq!(replayed.expires_at, claim.expires_at);
+            }
+            other => panic!("expected replayed claim, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 1, 2, pick_first, 200)
+                .unwrap(),
+            NoteEvalAcquireOutcome::Invalid,
+            "a different slot must not steal a replayed acquisition identity"
+        );
+    }
+
+    #[test]
+    fn note_eval_no_work_decision_replays_after_work_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let outcome = store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-1",
+                "eval-a",
+                0,
+                1,
+                |notes| {
+                    assert!(notes.is_empty());
+                    None
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(outcome, NoteEvalAcquireOutcome::NoWork { replayed: false });
+        eval_note(&store, "new work");
+        assert_eq!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 1, pick_first, 200)
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: true },
+            "the durable decision wins over newly available work"
+        );
+        assert!(matches!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-2", "eval-a", 0, 1, pick_first, 300)
+                .unwrap(),
+            NoteEvalAcquireOutcome::Claim {
+                replayed: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn note_eval_slot_with_active_claim_recovers_it_for_a_new_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 100);
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                0,
+                2,
+                |_| panic!("selection must not run when the slot already owns a claim"),
+                200,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: recovered,
+                replayed: true,
+                ..
+            } => {
+                assert_eq!(recovered.claim_id, claim.claim_id);
+                assert_eq!(recovered.acquisition_id, "acq-1");
+            }
+            other => panic!("expected recovered claim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn note_eval_active_claims_are_unique_per_note_and_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let first = eval_note(&store, "note one");
+        let second = eval_note(&store, "note two");
+        let claim = eval_claim(&store, "acq-1", 0, 100);
+        assert_eq!(claim.note_id, first.id);
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                1,
+                1,
+                |notes| {
+                    assert_eq!(
+                        notes.iter().map(|note| note.id).collect::<Vec<_>>(),
+                        vec![second.id],
+                        "a claimed note must not be offered again"
+                    );
+                    pick_first(notes)
+                },
+                200,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { claim, .. } => assert_eq!(claim.note_id, second.id),
+            other => panic!("expected claim on the second note, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .acquire_note_evaluation(
+                    EVAL_PROJECT,
+                    "acq-3",
+                    "eval-b",
+                    0,
+                    1,
+                    |notes| {
+                        assert!(notes.is_empty());
+                        None
+                    },
+                    300,
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: false }
+        );
+    }
+
+    #[test]
+    fn note_eval_renewal_extends_and_expiry_frees_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        assert_eq!(claim.expires_at, NOTE_EVAL_CLAIM_LEASE_MS);
+        assert_eq!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 60_000)
+                .unwrap(),
+            NoteEvalRenewOutcome::Renewed {
+                expires_at: 60_000 + NOTE_EVAL_CLAIM_LEASE_MS
+            }
+        );
+        let expiry = 60_000 + NOTE_EVAL_CLAIM_LEASE_MS;
+        assert_eq!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, expiry)
+                .unwrap(),
+            NoteEvalRenewOutcome::Expired
+        );
+        assert!(matches!(
+            store
+                .renew_note_evaluation_claim(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "eval-a",
+                    0,
+                    1,
+                    expiry + 1
+                )
+                .unwrap(),
+            NoteEvalRenewOutcome::TerminalReplay { ref kind, .. } if kind == "expired"
+        ));
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-b",
+                0,
+                1,
+                pick_first,
+                expiry + 1,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: second,
+                replayed: false,
+                ..
+            } => assert_eq!(second.note_id, note.id),
+            other => panic!("expected the note to be claimable again, got {other:?}"),
+        }
+        let before = reload_note(&store, note.id);
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    expiry + 2,
+                    |note| Ok(eval_reduced(note, "ready", expiry + 2)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "expired" }
+        );
+        let after = reload_note(&store, note.id);
+        assert_eq!(
+            after, before,
+            "an expired completion must not mutate the note"
+        );
+    }
+
+    #[test]
+    fn note_eval_completion_applies_replays_and_detects_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        let (applied, response) = match store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "comp-1",
+                "eval-a",
+                0,
+                50,
+                |note| Ok(eval_reduced(note, "pending", 50)),
+            )
+            .unwrap()
+        {
+            NoteEvalCompleteOutcome::Applied {
+                note,
+                response_json,
+            } => (note, response_json),
+            other => panic!("expected applied completion, got {other:?}"),
+        };
+        assert_eq!(applied.state_version, note.state_version + 1);
+        assert_eq!(applied.status_version, note.status_version + 1);
+        assert_eq!(applied.state_version, applied.status_version);
+        assert_eq!(applied.source_revision, note.source_revision);
+        assert_eq!(applied.status, "pending");
+        assert!(!response.contains("watch the build"));
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    60,
+                    |_| panic!("a replayed completion must not run the reducer"),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Replayed {
+                response_json: response.clone()
+            }
+        );
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-2",
+                    "eval-a",
+                    0,
+                    70,
+                    |_| panic!("a conflicting completion must not run the reducer"),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict {
+                kind: "completion_conflict"
+            }
+        );
+        let second = eval_claim(&store, "acq-2", 0, 100);
+        assert_eq!(second.note_id, note.id);
+        assert_eq!(second.state_version, applied.state_version);
+        match store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &second.claim_id,
+                "comp-3",
+                "eval-a",
+                0,
+                150,
+                |note| Ok(eval_reduced(note, "ready", 150)),
+            )
+            .unwrap()
+        {
+            NoteEvalCompleteOutcome::Applied { note, .. } => assert_eq!(note.status, "ready"),
+            other => panic!("expected second completion to apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn note_eval_edit_and_dismissal_fence_active_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        let edited = match store
+            .update_note_cas(
+                EVAL_PROJECT,
+                note.id,
+                "pending",
+                note.status_version,
+                Some("watch the release"),
+                None,
+                None,
+                10,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("expected the edit to apply, got {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 20)
+                .unwrap(),
+            NoteEvalRenewOutcome::TerminalReplay { ref kind, .. } if kind == "stale"
+        ));
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    30,
+                    |note| Ok(eval_reduced(note, "ready", 30)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "stale" }
+        );
+        assert_eq!(reload_note(&store, note.id), edited);
+
+        let second = eval_note(&store, "another note");
+        let second_claim = eval_claim(&store, "acq-2", 0, 40);
+        assert_eq!(second_claim.note_id, edited.id.min(second.id));
+        store
+            .dismiss_note(
+                EVAL_PROJECT,
+                "writer",
+                second_claim.note_id,
+                Some("done"),
+                50,
+            )
+            .unwrap()
+            .expect("dismissal applies");
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &second_claim.claim_id,
+                    "comp-2",
+                    "eval-a",
+                    0,
+                    60,
+                    |note| Ok(eval_reduced(note, "ready", 60)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "stale" }
+        );
+        assert_eq!(
+            reload_note(&store, second_claim.note_id).status,
+            "dismissed"
+        );
+    }
+
+    #[test]
+    fn note_eval_drain_fences_claims_with_authority_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        let before = reload_note(&store, note.id);
+        store
+            .authority_begin_drain("ctx", EVAL_PROJECT, "notes", "lease", 1_000_000, 10)
+            .unwrap();
+        assert!(matches!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 20)
+                .unwrap(),
+            NoteEvalRenewOutcome::TerminalReplay { ref kind, .. } if kind == "authority_changed"
+        ));
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    30,
+                    |note| Ok(eval_reduced(note, "ready", 30)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict {
+                kind: "authority_changed"
+            }
+        );
+        assert_eq!(reload_note(&store, note.id), before);
+        assert_eq!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-2", "eval-a", 0, 1, pick_first, 40)
+                .unwrap(),
+            NoteEvalAcquireOutcome::AuthorityChanged
+        );
+    }
+
+    #[test]
+    fn note_eval_ledger_caps_return_busy_and_tombstones_replay_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note one");
+        eval_note(&store, "note two");
+        assert!(matches!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-1",
+                    "eval-a",
+                    0,
+                    1,
+                    pick_first,
+                    0,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Claim { .. }
+        ));
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-2",
+                    "eval-a",
+                    1,
+                    1,
+                    pick_first,
+                    10,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Busy,
+            "a saturated protected claim ledger must refuse new claims"
+        );
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-3",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    20,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: false }
+        );
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-4",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    30,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Busy,
+            "a saturated no-work ledger must refuse new decisions"
+        );
+        let after_retention = 20 + NOTE_EVAL_NO_WORK_RETENTION_MS + 1;
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-4",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    after_retention,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: false },
+            "tombstoning the expired decision frees ledger capacity"
+        );
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-3",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    after_retention + 1,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Expired,
+            "a tombstoned decision replays as expired"
+        );
+    }
+
+    #[test]
+    fn note_eval_abandon_is_replayable_and_never_touches_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let before = reload_note(&store, note.id);
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        assert_eq!(
+            store
+                .abandon_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 10)
+                .unwrap(),
+            NoteEvalAbandonOutcome::Abandoned
+        );
+        assert_eq!(
+            reload_note(&store, note.id),
+            before,
+            "abandon must not change note state or failure counters"
+        );
+        assert_eq!(
+            store
+                .abandon_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 20)
+                .unwrap(),
+            NoteEvalAbandonOutcome::Replayed {
+                kind: "abandoned".to_string()
+            }
+        );
+        match store
+            .acquire_note_evaluation(EVAL_PROJECT, "acq-2", "eval-a", 0, 1, pick_first, 30)
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { claim: second, .. } => {
+                assert_eq!(second.note_id, note.id)
+            }
+            other => panic!("expected the note to be claimable after abandon, got {other:?}"),
+        }
     }
 }
 
