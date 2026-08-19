@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::connection::GenerationCore;
 use crate::handler::RouteHandle;
@@ -40,9 +40,13 @@ struct Occupant {
     epoch: u32,
     gen: Arc<GenerationCore>,
     state: OccState,
-    /// Handler tasks dispatched on this route; joined by the close owner
-    /// before route-gone runs.
-    tasks: Vec<JoinHandle<()>>,
+    /// Abort handles for dispatch tasks on this route.
+    aborts: Vec<tokio::task::AbortHandle>,
+    /// Completion tracker for those same tasks. Registry-owned, so a close
+    /// owner whose future is DROPPED (shutdown deadline) does not destroy the
+    /// ability to wait: the forced path waits on this same tracker before
+    /// route-gone, preserving "tasks stopped before route-gone runs".
+    tracker: TaskTracker,
     cancel: CancellationToken,
     /// Set under the registry lock immediately before the route-gone callback
     /// task is spawned; guarantees exactly-once even when a graceful closer
@@ -63,11 +67,13 @@ enum OccState {
 
 /// What `begin_close` grants the caller.
 pub enum CloseDecision {
-    /// Caller became the close owner: settle/cancel work, join `tasks`, run
-    /// route-gone, and call [`RouteRegistry::finalize_close`].
+    /// Caller became the close owner: settle/cancel work, stop dispatch
+    /// tasks (`aborts` then `tracker`), run route-gone, and call
+    /// [`RouteRegistry::finalize_close`].
     Owner {
         gen: Arc<GenerationCore>,
-        tasks: Vec<JoinHandle<()>>,
+        aborts: Vec<tokio::task::AbortHandle>,
+        tracker: TaskTracker,
     },
     /// A bind is in flight; its task will observe `close_requested` and owns
     /// cleanup.
@@ -127,7 +133,8 @@ impl RouteRegistry {
                         state: OccState::Binding {
                             close_requested: false,
                         },
-                        tasks: Vec::new(),
+                        aborts: Vec::new(),
+                        tracker: TaskTracker::new(),
                         cancel: CancellationToken::new(),
                         gone_started: false,
                     });
@@ -201,22 +208,6 @@ impl RouteRegistry {
         self.inner.lock().expect("registry lock").accepting = false;
     }
 
-    /// Advisory liveness read so dispatch can prove `unknown_channel` without
-    /// consuming capacity (protocol §8.3 ordering). `register_dispatch` is the
-    /// authoritative check; this one only orders the cheap rejection first.
-    pub fn route_live(&self, handle: RouteHandle, gen_id: u64) -> bool {
-        let inner = self.inner.lock().expect("registry lock");
-        inner
-            .slots
-            .get(&handle.channel)
-            .and_then(|slot| slot.occupant.as_ref())
-            .is_some_and(|occupant| {
-                occupant.epoch == handle.epoch
-                    && occupant.gen.id == gen_id
-                    && occupant.state == OccState::Live
-            })
-    }
-
     /// Begins closure of every route one generation owns, in one marking
     /// pass. Run this before waiting for the generation's in-flight binds:
     /// a bind that completes after the pass observes `close_requested` and
@@ -270,7 +261,8 @@ impl RouteRegistry {
                     .remove(&handle.channel);
                 CloseDecision::Owner {
                     gen: Arc::clone(&occupant.gen),
-                    tasks: std::mem::take(&mut occupant.tasks),
+                    aborts: std::mem::take(&mut occupant.aborts),
+                    tracker: occupant.tracker.clone(),
                 }
             }
             OccState::Closing => CloseDecision::AlreadyGone,
@@ -301,7 +293,7 @@ impl RouteRegistry {
         &self,
         handle: RouteHandle,
         gen_id: u64,
-        task: JoinHandle<()>,
+        abort: tokio::task::AbortHandle,
     ) -> Option<CancellationToken> {
         let mut inner = self.inner.lock().expect("registry lock");
         let slot = inner.slots.get_mut(&handle.channel)?;
@@ -312,10 +304,26 @@ impl RouteRegistry {
         {
             return None;
         }
-        // Prune completed handles on the dispatch path that grows the list.
-        occupant.tasks.retain(|task| !task.is_finished());
-        occupant.tasks.push(task);
+        // Prune finished handles on the dispatch path that grows the list.
+        occupant.aborts.retain(|abort| !abort.is_finished());
+        occupant.aborts.push(abort);
         Some(occupant.cancel.clone())
+    }
+
+    /// Tracker for a live route's dispatch tasks, used to wrap a dispatch
+    /// future before it is spawned. `None` proves the route is not live, so
+    /// this doubles as the cheap `unknown_channel` precheck; the authoritative
+    /// admission check remains [`RouteRegistry::register_dispatch`].
+    pub fn route_tracker(&self, handle: RouteHandle, gen_id: u64) -> Option<TaskTracker> {
+        let inner = self.inner.lock().expect("registry lock");
+        let occupant = inner
+            .slots
+            .get(&handle.channel)
+            .and_then(|slot| slot.occupant.as_ref())?;
+        (occupant.epoch == handle.epoch
+            && occupant.gen.id == gen_id
+            && occupant.state == OccState::Live)
+            .then(|| occupant.tracker.clone())
     }
 
     /// Routes currently owned by one generation (binding, live, or closing),
@@ -374,7 +382,7 @@ impl RouteRegistry {
     /// only marked close-requested: their abort-exempt bind wrapper owns the
     /// exactly-once route-gone, and completing the bind against a finalized
     /// slot would otherwise panic the registry.
-    pub fn force_drain(&self) -> Vec<(RouteHandle, Vec<JoinHandle<()>>)> {
+    pub fn force_drain(&self) -> Vec<(RouteHandle, Vec<tokio::task::AbortHandle>, TaskTracker)> {
         let mut inner = self.inner.lock().expect("registry lock");
         let mut drained = Vec::new();
         for (channel, slot) in inner.slots.iter_mut() {
@@ -404,7 +412,8 @@ impl RouteRegistry {
                     channel: *channel,
                     epoch: occupant.epoch,
                 },
-                std::mem::take(&mut occupant.tasks),
+                std::mem::take(&mut occupant.aborts),
+                occupant.tracker.clone(),
             ));
         }
         drained
@@ -481,9 +490,9 @@ mod tests {
         })
     }
 
-    fn owner_tasks(decision: CloseDecision) -> Vec<JoinHandle<()>> {
+    fn owner_aborts(decision: CloseDecision) -> Vec<tokio::task::AbortHandle> {
         match decision {
-            CloseDecision::Owner { tasks, .. } => tasks,
+            CloseDecision::Owner { aborts, .. } => aborts,
             CloseDecision::DeferredToBind => panic!("expected close ownership, got bind deferral"),
             CloseDecision::AlreadyGone => panic!("expected close ownership, got already-gone"),
         }
@@ -538,7 +547,7 @@ mod tests {
             Some(&handle.epoch)
         );
 
-        owner_tasks(registry.begin_close(handle));
+        owner_aborts(registry.begin_close(handle));
         assert!(gen.membership.lock().expect("lock").is_empty());
     }
 
@@ -552,7 +561,7 @@ mod tests {
         // A single-route budget cannot admit another route while this one lives.
         assert!(registry.reserve(&gen).is_none());
 
-        owner_tasks(registry.begin_close(first));
+        owner_aborts(registry.begin_close(first));
         // Still owned until cleanup finalizes.
         assert!(registry.reserve(&gen).is_none());
 
@@ -656,7 +665,7 @@ mod tests {
         let handle = registry.reserve(&gen).expect("reserve");
         registry.install_bound(handle);
 
-        owner_tasks(registry.begin_close(handle));
+        owner_aborts(registry.begin_close(handle));
         assert!(matches!(
             registry.begin_close(handle),
             CloseDecision::AlreadyGone
@@ -695,12 +704,12 @@ mod tests {
         // Mid-bind: not yet dispatchable, so no task may attach or receive
         // the route's cancellation root.
         assert!(registry
-            .register_dispatch(handle, gen.id, tokio::spawn(async {}))
+            .register_dispatch(handle, gen.id, tokio::spawn(async {}).abort_handle())
             .is_none());
 
         registry.install_bound(handle);
         let cancel = registry
-            .register_dispatch(handle, gen.id, tokio::spawn(async {}))
+            .register_dispatch(handle, gen.id, tokio::spawn(async {}).abort_handle())
             .expect("live route atomically registers dispatch");
         assert!(!cancel.is_cancelled());
         // A stale epoch must not attach work to the current occupant.
@@ -711,22 +720,22 @@ mod tests {
                     epoch: handle.epoch + 1,
                 },
                 gen.id,
-                tokio::spawn(async {})
+                tokio::spawn(async {}).abort_handle()
             )
             .is_none());
 
-        let tasks = owner_tasks(registry.begin_close(handle));
+        let aborts = owner_aborts(registry.begin_close(handle));
         assert!(
             cancel.is_cancelled(),
             "the same lock transition that claims dispatch tasks cancels them"
         );
         assert_eq!(
-            tasks.len(),
+            aborts.len(),
             1,
             "the close owner must receive the route's work"
         );
         assert!(registry
-            .register_dispatch(handle, gen.id, tokio::spawn(async {}))
+            .register_dispatch(handle, gen.id, tokio::spawn(async {}).abort_handle())
             .is_none());
     }
 
@@ -762,7 +771,7 @@ mod tests {
         let drained: Vec<RouteHandle> = registry
             .force_drain()
             .into_iter()
-            .map(|(handle, _tasks)| handle)
+            .map(|(handle, _aborts, _tracker)| handle)
             .collect();
 
         assert_eq!(drained, vec![live], "only settled routes are swept");

@@ -38,19 +38,20 @@ pub type PendingKey = (u16, u32, u64);
 /// exhausted AND egress is contended; beyond it the reader emits inline.
 const MAX_INFLIGHT_BUSY_REJECTS: usize = 32;
 
-/// One outstanding host Ping. `written` flips inside the writer task when
-/// the frame is fully on the socket: a Pong clears only a written probe, or
-/// a peer predicting the correlation sequence could pre-answer Pings it
-/// never received and defeat read-liveness detection. `answered_at` retains
-/// a Pong that raced the write-completion hook (bytes can reach the wire
-/// during `write_all`, before the hook runs); the hook reconciles it against
-/// the write START instant — an answer recorded before any byte existed is
-/// a pre-answer and is ignored, so the real Ping still demands a real Pong.
+/// One outstanding host Ping. A Pong clears the probe only once `written` is
+/// set, which the writer task does — under this same `pings` mutex — in the
+/// statement immediately after `write_all` returns, with no await between.
+///
+/// That makes the rule exact rather than a trade-off: a Ping is header-only,
+/// so it is a single write, and the hook holds the lock before the writer can
+/// touch anything else. A Pong observing `written == false` was therefore
+/// sent before the Ping's bytes existed — a pre-answer for a probe the peer
+/// never received — so ignoring it is correct, and predictive pre-answering
+/// cannot defeat missed-Pong retirement.
 pub struct PingProbe {
     pub flags: u8,
     pub sent: Instant,
     pub written: bool,
-    pub answered_at: Option<Instant>,
 }
 
 pub struct PendingEntry {
@@ -350,12 +351,11 @@ async fn read_loop<H: McHostHandler>(
                                 let in_deadline = shared.liveness.as_ref().is_none_or(|p| {
                                     now.duration_since(probe.sent) < p.pong_deadline
                                 });
-                                if in_deadline {
-                                    if probe.written {
-                                        pings.remove(&header.corr);
-                                    } else {
-                                        probe.answered_at = Some(now);
-                                    }
+                                // Serialized behind the write-completion
+                                // transition by this same lock: an unwritten
+                                // probe's Pong is a pre-answer, dropped.
+                                if in_deadline && probe.written {
+                                    pings.remove(&header.corr);
                                 }
                             }
                             _ => {}
@@ -635,7 +635,6 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
                 flags: flags.0,
                 sent: Instant::now(),
                 written: false,
-                answered_at: None,
             },
         );
         let bytes = crate::wire::encode_owned_frame(
@@ -651,24 +650,13 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         // async notification would leave a gap where a fast (or adversarial
         // pre-answering) Pong races the flag update.
         let gen_probe = Arc::clone(&gen);
-        let written_hook = Box::new(move |write_started: Instant| {
-            let mut pings = gen_probe.pings.lock().expect("pings lock");
-            if let Some(probe) = pings.get_mut(&corr) {
-                match probe.answered_at {
-                    // The Pong arrived while the Ping's bytes were reaching
-                    // the wire: a genuine answer that raced the hook.
-                    Some(answered_at) if answered_at >= write_started => {
-                        pings.remove(&corr);
-                    }
-                    // A Pong recorded before any byte existed is a
-                    // pre-answer for a Ping the peer never saw: ignore it
-                    // and demand a real answer to the now-written Ping.
-                    _ => {
-                        probe.answered_at = None;
-                        probe.sent = Instant::now();
-                        probe.written = true;
-                    }
-                }
+        let written_hook = Box::new(move || {
+            // Runs in the writer task immediately after `write_all` returns,
+            // holding the same lock the Pong path takes: this is the
+            // write-completion transition a Pong must follow.
+            if let Some(probe) = gen_probe.pings.lock().expect("pings lock").get_mut(&corr) {
+                probe.sent = Instant::now();
+                probe.written = true;
             }
             let _ = written_tx.send(());
         });

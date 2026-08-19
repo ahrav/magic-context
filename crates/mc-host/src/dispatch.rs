@@ -473,7 +473,15 @@ pub async fn emit_rejection<H: McHostHandler>(
             }));
         }
         Err(_) => {
-            emit_error_terminal(&shared.egress_budget, gen, id, code, message).await;
+            // Past the bound, awaiting inline would stall the generation's
+            // sole reader for a frame deadline and starve a queued Pong into
+            // a liveness false-kill. A peer with 32 no-dispatch rejections
+            // already stuck on contended egress is past its capacity grant:
+            // retire the generation instead (O(1), no reader stall). The
+            // unemitted terminals become outcome_unknown, which is the
+            // documented result of retirement (protocol §6.3).
+            gen.token.cancel();
+            gen.writer.discard();
         }
     }
 }
@@ -505,7 +513,7 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
             OutboundFrame {
                 bytes,
                 charge,
-                written: Some(Box::new(move |_write_started| {
+                written: Some(Box::new(move || {
                     let _ = written_tx.send(());
                 })),
             },
@@ -545,8 +553,10 @@ pub async fn dispatch_request<H: McHostHandler>(
     }
 
     // Advisory liveness first so `unknown_channel` consumes no capacity;
-    // `register_dispatch` below is the authoritative recheck.
-    if !shared.registry.route_live(route, gen.id) {
+    // `register_dispatch` below is the authoritative recheck. The tracker
+    // wraps the dispatch future so route close can wait for it to STOP even
+    // if the waiting future is later dropped.
+    let Some(route_tracker) = shared.registry.route_tracker(route, gen.id) else {
         drop(frame);
         emit_rejection(
             shared,
@@ -557,7 +567,7 @@ pub async fn dispatch_request<H: McHostHandler>(
         )
         .await;
         return;
-    }
+    };
 
     // Admission is synchronous with the read loop: acquiring permits inside
     // the spawned task would let a client pipeline unbounded dispatch tasks
@@ -605,7 +615,7 @@ pub async fn dispatch_request<H: McHostHandler>(
     let (start_tx, start_rx) = oneshot::channel::<()>();
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
-    let outer = shared.spawn_tracked(async move {
+    let outer = shared.spawn_tracked(route_tracker.track_future(async move {
         let _pending_permit = pending_permit;
         if start_rx.await.is_err() {
             remove_pending(&gen_task, key);
@@ -723,11 +733,11 @@ pub async fn dispatch_request<H: McHostHandler>(
             }
         }
         remove_pending(&gen_task, key);
-    });
+    }));
 
     if shared
         .registry
-        .register_dispatch(route, gen.id, outer)
+        .register_dispatch(route, gen.id, outer.abort_handle())
         .is_some()
     {
         let _ = start_tx.send(());
@@ -905,7 +915,11 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
 ) {
     match decision {
         CloseDecision::AlreadyGone | CloseDecision::DeferredToBind => {}
-        CloseDecision::Owner { gen, tasks } => {
+        CloseDecision::Owner {
+            gen,
+            aborts,
+            tracker,
+        } => {
             let keys: Vec<PendingKey> = gen
                 .pending
                 .lock()
@@ -918,12 +932,17 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
                 })
                 .collect();
 
+            // Grace, then abort, then WAIT on the registry-owned tracker:
+            // route-gone must follow dispatch tasks actually stopping. The
+            // tracker (not this future) owns that ability, so a dropped
+            // drain leaves the forced path able to wait on the same signal.
             let deadline = Instant::now() + shared.timing.route_close_budget;
-            for mut task in tasks {
-                if timeout_at(deadline, &mut task).await.is_err() {
-                    task.abort();
-                    let _ = task.await;
+            tracker.close();
+            if timeout_at(deadline, tracker.wait()).await.is_err() {
+                for abort in &aborts {
+                    abort.abort();
                 }
+                let _ = timeout(shared.timing.route_close_budget, tracker.wait()).await;
             }
             // Aborted tasks never removed their own pending entries.
             {
@@ -976,13 +995,18 @@ pub async fn close_generation<H: McHostHandler>(
 /// callback's deadline by the route count while `run` holds the instance lock.
 pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>>) {
     let mut drains = tokio::task::JoinSet::new();
-    for (handle, tasks) in shared.registry.force_drain() {
+    for (handle, aborts, tracker) in shared.registry.force_drain() {
         let shared = Arc::clone(shared);
         drains.spawn(async move {
-            for task in tasks {
-                task.abort();
-                let _ = timeout(shared.timing.lifecycle_callback_deadline, task).await;
+            for abort in &aborts {
+                abort.abort();
             }
+            // Wait for the route's dispatch tasks to STOP before route-gone,
+            // even when a graceful close owner already claimed (and lost)
+            // their handles: the tracker lives in the registry, so abort_all
+            // plus this wait still proves no request code is running.
+            tracker.close();
+            let _ = timeout(shared.timing.lifecycle_callback_deadline, tracker.wait()).await;
             run_route_gone(&shared, handle).await;
             shared.registry.finalize_close(handle);
         });

@@ -391,17 +391,14 @@ pub struct OutboundFrame {
     pub bytes: Vec<u8>,
     pub charge: ByteCharge,
     /// Run by the writer task synchronously once the frame's bytes have
-    /// fully reached the socket — before the writer touches the next frame —
-    /// receiving the instant the write STARTED. Senders that anchor state on
-    /// delivery (Ping/Pong liveness) pass a hook; everything else passes
-    /// `None`. Dropped unrun if the writer retires before writing the frame.
-    /// Synchronous execution matters: an asynchronously delivered
-    /// notification would leave a gap in which a peer's answer arrives
-    /// before the sender observes the completion. The start instant lets a
-    /// receiver separate an answer that raced the completion hook (possibly
-    /// legitimate — bytes were on the wire) from one sent before any byte
-    /// existed (never legitimate).
-    pub written: Option<Box<dyn FnOnce(Instant) + Send>>,
+    /// fully reached the socket, in the statement after `write_all` returns
+    /// and before the writer touches the next frame. Senders that anchor
+    /// state on delivery (Ping/Pong liveness) pass a hook; everything else
+    /// passes `None`. Dropped unrun if the writer retires before writing the
+    /// frame. Synchronous execution is what makes the completion transition
+    /// observable without a gap: an asynchronously delivered notification
+    /// would let a peer's answer arrive before the sender saw completion.
+    pub written: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Sender half of one connection's serialized writer.
@@ -537,7 +534,6 @@ where
                 charge,
                 written,
             } = frame;
-            let write_started = Instant::now();
             let result = tokio::select! {
                 biased;
                 () = discard.cancelled() => None,
@@ -551,7 +547,7 @@ where
                 break;
             }
             if let Some(written) = written {
-                written(write_started);
+                written();
             }
             drop(bytes);
             drop(charge);

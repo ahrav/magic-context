@@ -284,15 +284,22 @@ impl InstanceGuard {
         let Some(identity) = self.publication.take() else {
             return;
         };
+        // Transient failures (EMFILE while connection descriptors are live)
+        // must not consume the identity: `Drop` retries after those
+        // descriptors close, or the file would keep advertising a dead
+        // endpoint and its bearer key. Only success or a definitive identity
+        // mismatch clears it.
         let Ok(fd) = openat(
             &self.dir,
             CONNECTION_FILE_NAME,
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ) else {
+            self.publication = Some(identity);
             return;
         };
         let Ok(stat) = rustix::fs::fstat(&fd) else {
+            self.publication = Some(identity);
             return;
         };
         if !is_secure_regular(&stat) {
@@ -305,6 +312,8 @@ impl InstanceGuard {
             return;
         }
         let Ok(bytes) = read_all_fd(&fd, 65_536) else {
+            // Transient read failure: keep the identity for the Drop retry.
+            self.publication = Some(identity);
             return;
         };
         let Ok(info) = serde_json::from_slice::<ConnectionInfo>(&bytes) else {
