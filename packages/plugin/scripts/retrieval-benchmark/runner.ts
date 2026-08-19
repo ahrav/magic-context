@@ -313,6 +313,9 @@ class CaseCacheController {
     readonly freshConnectionPerSample: boolean;
     private readonly layers: LayerEvidence[];
     private readonly processVector: LayerEvidence;
+    /** Set by beforeSample for warm-declared cases; consumed by
+     *  warmSampleReady once a connection exists to re-prime against. */
+    private warmVerifyDue = false;
 
     constructor(
         private readonly profileCase: ProfileCase,
@@ -430,9 +433,23 @@ class CaseCacheController {
             this.processVector.resets += 1;
             return;
         }
-        // Verify warm hits only when the query's effective sources can
-        // read the memory vector cache.
-        if (queryTouchesMemory) this.verifyWarmProcessVector("before-sample");
+        if (queryTouchesMemory) this.warmVerifyDue = true;
+    }
+
+    /** Runs once a connection is available, before the timed section. The
+     *  production embedding cache expires entries by TTL without extending
+     *  on hits, so a case outliving the TTL must re-prime to keep its
+     *  declared warm state instead of failing mid-case. */
+    warmSampleReady(db: Database, queryTouchesMemory: boolean): void {
+        if (!this.warmVerifyDue) return;
+        this.warmVerifyDue = false;
+        if (!queryTouchesMemory) return;
+        if (!this.cache.peekProcessVector(this.ctx.projectScope, this.ctx.modelId)) {
+            this.cache.primeProcessVector(db, this.ctx.projectScope, this.ctx.modelId);
+            this.processVector.resets += 1;
+            this.processVector.mechanism = "primed-project-embedding-cache:ttl-reprimed";
+        }
+        this.verifyWarmProcessVector("before-sample");
     }
 
     afterSample(queryTouchesMemory: boolean): void {
@@ -521,12 +538,12 @@ function buildSearchOptions(
         measurementDisabled: true,
         embeddingModelIdOverride: BENCHMARK_EMBEDDING_MODEL_ID,
         chunkModelIdOverride: BENCHMARK_EMBEDDING_MODEL_ID,
-        embedQuery: async (text) => ({
-            vector: deterministicVector(`query:${text}`, dims),
-            modelId: BENCHMARK_EMBEDDING_MODEL_ID,
-            chunkModelId: BENCHMARK_EMBEDDING_MODEL_ID,
-            generation: 0,
-        }),
+        // A raw Float32Array bypasses the generation contract: the benchmark
+        // project is never registered in the project embedding registry, so
+        // a CapturedQueryEmbedding (generation-bearing) would always compare
+        // against a null snapshot and be discarded as stale, silencing every
+        // semantic scoring lane. Model ids come from the overrides above.
+        embedQuery: async (text) => deterministicVector(`query:${text}`, dims),
         isEmbeddingRuntimeEnabled: () => true,
         visibleMemoryIds: new Set(ctx.query.visibleState.visibleMemoryIds),
         candidateDepth: ctx.profileCase.candidateK.effective,
@@ -754,6 +771,7 @@ async function executeQueryScenario(
         controller.beforeSample(queryTouchesMemory);
         const db = conn.acquire();
         try {
+            controller.warmSampleReady(db, queryTouchesMemory);
             const startedAt = ctx.now();
             delivery = await executeDelivery(db, qctx);
             latencySamplesMs.push(ctx.now() - startedAt);
@@ -794,6 +812,7 @@ async function executeQueryScenario(
     const traceDb = conn.acquire();
     let tracedDelivery: DeliveryOutcome;
     try {
+        controller.warmSampleReady(traceDb, queryTouchesMemory);
         tracedDelivery = await executeDelivery(traceDb, qctx, {
             sink: { onSpan: (span) => tracedSpans.push(span) },
             now: ctx.now,
