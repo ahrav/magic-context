@@ -62,6 +62,8 @@ interface CompilerResponse {
 const MAX_COMPILER_OUTPUT_CHARS = 128 * 1024;
 const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_MANIFEST_ENTRIES = 64;
+/** Wire limit mirrored from the module's NOTE_EVALUATOR_MAX_MANIFEST_BYTES. */
+const MAX_MANIFEST_BYTES = 32 * 1024;
 const MAX_CRON_CHARS = 256;
 const MAX_COMPILER_ERROR_CHARS = 2 * 1024;
 
@@ -257,7 +259,7 @@ export function normalizeManifest(manifest: SmartNoteCheckManifest): SmartNoteCh
                   ),
           )
         : [];
-    return {
+    const normalized: SmartNoteCheckManifest = {
         capabilities,
         readFiles: uniqueStrings(manifest.readFiles),
         hosts: uniqueStrings(manifest.hosts, (host) => host.toLowerCase()),
@@ -265,6 +267,15 @@ export function normalizeManifest(manifest: SmartNoteCheckManifest): SmartNoteCh
         signals: uniqueStrings(manifest.signals),
         summary: typeof manifest.summary === "string" ? manifest.summary.slice(0, 160) : undefined,
     };
+    // Entry counts are bounded above but individual strings are not, and the
+    // module rejects a serialized manifest over its wire limit at completion —
+    // after the billable prompt already ran. Failing here records a compile
+    // failure (with backoff) instead of an abandoned claim that stays eligible
+    // and recompiles on every drain.
+    if (Buffer.byteLength(JSON.stringify(normalized), "utf8") > MAX_MANIFEST_BYTES) {
+        throw new Error("manifest exceeds 32 KiB");
+    }
+    return normalized;
 }
 
 /**

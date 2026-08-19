@@ -122,6 +122,17 @@ describe("smart-note compiler output bounds", () => {
                 signals: Array.from({ length: 100 }, (_, index) => `signal-${index}`),
             }).signals,
         ).toHaveLength(64);
+        // Few entries but oversized strings: the module rejects a serialized
+        // manifest over 32 KiB at completion, so the compiler must fail first.
+        expect(() =>
+            normalizeManifest({
+                capabilities: [],
+                signals: Array.from(
+                    { length: 4 },
+                    (_, index) => `${index}-${"s".repeat(10 * 1024)}`,
+                ),
+            }),
+        ).toThrow(/32 KiB/);
         expect(() => normalizeCron("*".repeat(257))).toThrow(/256 characters/);
     });
 });
