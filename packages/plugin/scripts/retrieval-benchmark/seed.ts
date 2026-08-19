@@ -791,7 +791,7 @@ export function measureMessageSelectivity(
     }
     const eligibleRow = db
         .prepare(
-            "SELECT COUNT(*) AS count FROM message_history_fts WHERE session_id = ? AND message_ordinal <= ?",
+            "SELECT COUNT(*) AS count FROM message_history_fts WHERE session_id = ? AND CAST(message_ordinal AS INTEGER) <= ?",
         )
         .get(sessionId, predicate.messageOrdinalCutoff) as { count: number };
     return {

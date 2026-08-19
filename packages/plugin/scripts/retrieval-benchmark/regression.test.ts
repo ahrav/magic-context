@@ -163,6 +163,8 @@ function makeRun(spec: RunSpec): BenchmarkReport {
                 fixture: { manifestFingerprint: FP, indexBuildMs: 1, snapshotBytes: 1 },
                 selectivityObserved: { preFilterDenominator: 1, eligibleCount: 1 },
                 cacheLayers: [],
+                laneRestricted: false,
+                latencySummary: null,
             })),
         },
         candidatePool: {
@@ -559,6 +561,15 @@ describe("TS-only audit (scenario 8)", () => {
         const missing = tsAudit({ reports: threeRuns("none"), auditCaseIds: [] });
         expect(missing.latency_target).toBe("not_evaluated");
         expect(missing.latency.medianRunP95Ms).toBeNull();
+    });
+
+    it("rejects more than one audit case rather than pooling samples across cells", () => {
+        expect(() =>
+            tsAudit({
+                reports: threeRuns("multi", { cells: { "case-a": [10], "case-b": [20] } }),
+                auditCaseIds: ["case-a", "case-b"],
+            }),
+        ).toThrow(/supply at most one audit case id/);
     });
 
     it("never feeds the regression verdict", () => {

@@ -223,7 +223,7 @@ export class ContractError extends Error {
 
 /** Path + code only — never the offending value (privacy: diagnostics are an
  *  output channel too). */
-function formatIssues(artifact: string, error: z.ZodError): string[] {
+export function formatIssues(artifact: string, error: z.ZodError): string[] {
     return error.issues
         .map((issue) => `${artifact}.${issue.path.join(".")}: ${issue.code}`)
         .sort();

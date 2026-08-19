@@ -16,11 +16,9 @@
  * case before any allocation so an undersized host fails first.
  */
 
-import { readFileSync } from "node:fs";
-
 import { z } from "zod";
-import { canonicalFingerprint } from "./canonical-json";
-import { ContractError, SOURCE_FILTERS, SYNTHETIC_SCALES } from "./contract";
+import { canonicalFingerprint, readCanonicalJsonFile } from "./canonical-json";
+import { ContractError, formatIssues, SOURCE_FILTERS, SYNTHETIC_SCALES } from "./contract";
 
 export const PROFILE_SCHEMA_VERSION = "retrieval-benchmark-profile/v1";
 
@@ -139,11 +137,6 @@ const profileSchema = z.strictObject({
 });
 export type BenchmarkProfile = z.infer<typeof profileSchema>;
 
-function formatIssues(error: z.ZodError): string[] {
-    return error.issues.map((issue) => `profile.${issue.path.join(".")}: ${issue.code}`).sort();
-}
-
-const GIB = 2 ** 30;
 const F32_BYTES = 4;
 /** Row/index/FTS overhead multiplier over the raw vector payload. */
 const FIXTURE_DISK_OVERHEAD = 2;
@@ -285,7 +278,7 @@ function validateSelectivity(index: number, cell: SelectivityCell, diagnostics: 
 
 export function parseProfile(value: unknown): BenchmarkProfile {
     const parsed = profileSchema.safeParse(value);
-    if (!parsed.success) throw new ContractError(formatIssues(parsed.error));
+    if (!parsed.success) throw new ContractError(formatIssues("profile", parsed.error));
     const profile = parsed.data;
     const diagnostics: string[] = [];
 
@@ -423,26 +416,11 @@ export function parseProfile(value: unknown): BenchmarkProfile {
 
 /** Same promoter-serialization byte rule the release loader enforces. */
 export function loadProfileFile(path: string): BenchmarkProfile {
-    let text: string;
-    try {
-        text = readFileSync(path, "utf8");
-    } catch {
-        throw new ContractError(["profile: unreadable"]);
-    }
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(text);
-    } catch {
-        throw new ContractError(["profile: invalid-json"]);
-    }
-    if (`${JSON.stringify(parsed, null, 2)}\n` !== text) {
-        throw new ContractError(["profile: non-canonical-bytes"]);
-    }
-    return parseProfile(parsed);
+    return parseProfile(
+        readCanonicalJsonFile(path, (code) => new ContractError([`profile: ${code}`])),
+    );
 }
 
 export function profileFingerprint(profile: BenchmarkProfile): string {
     return canonicalFingerprint(profile);
 }
-
-export const THIRTY_GIB = 30 * GIB;

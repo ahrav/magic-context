@@ -6,9 +6,8 @@ import { join } from "node:path";
 import { loadReviewedRelease, type ReviewedRelease } from "./index";
 import { nearestRankPercentile } from "./timing";
 import { type BenchmarkProfile, parseProfile, type ProfileCase } from "./profiles";
-import { parseReport, passEligibility } from "./report";
+import { aggregateReportQuality, parseReport, passEligibility } from "./report";
 import {
-    aggregateReportQuality,
     type RunBenchmarkResult,
     runBenchmark,
     RunnerError,
@@ -99,7 +98,12 @@ function tinyProfile(overrides: {
 }): BenchmarkProfile {
     const cases = overrides.cases ?? [
         tinyCase("case-warm-explicit"),
-        tinyCase("case-auto-lane", { mode: "automatic", sourceLanes: ["message"] }),
+        tinyCase("case-auto", { mode: "automatic" }),
+        tinyCase("case-auto-lane", {
+            mode: "automatic",
+            sourceLanes: ["message"],
+            candidateK: { requested: 10, effective: 10 },
+        }),
         tinyCase("case-cold", {
             candidateK: { requested: 5, effective: 5 },
             cacheState: { ...COLD_STATE },
@@ -213,9 +217,19 @@ describe("mode separation (scenario 2)", () => {
             expect(cells).toContain("holdout:explicit");
             expect(cells).toContain("holdout:automatic");
 
+            const laneRestricted = new Set(
+                result.report.evidence.cases
+                    .filter((caseEvidence) => caseEvidence.laneRestricted)
+                    .map((caseEvidence) => caseEvidence.caseId),
+            );
+            expect([...laneRestricted]).toEqual(["case-auto-lane"]);
+
             const scenarioCount = (mode: string, partition: string) =>
                 result.report.evidence.scenarios.filter(
-                    (s) => s.mode === mode && s.partition === partition,
+                    (s) =>
+                        s.mode === mode &&
+                        s.partition === partition &&
+                        !laneRestricted.has(s.queryId.split(":", 1)[0]),
                 ).length;
             for (const aggregate of aggregates) {
                 expect(aggregate.queryCount).toBe(
@@ -350,6 +364,31 @@ describe("cache-layer lifecycle (scenario 4)", () => {
         },
         60_000,
     );
+
+    it(
+        "rejects a cold process-vector case declared at concurrency above 1",
+        async () => {
+            const profile = tinyProfile({
+                cases: [
+                    tinyCase("case-warm-explicit"),
+                    tinyCase("case-auto-lane", { mode: "automatic", sourceLanes: ["message"] }),
+                    tinyCase("case-cold-concurrent", {
+                        candidateK: { requested: 5, effective: 5 },
+                        cacheState: { ...COLD_STATE },
+                        concurrency: 2,
+                    }),
+                ],
+            });
+            const result = await run(profile, { hooks: counterHooks() });
+            expect(result.report.status).toBe("incomplete");
+            const attempt = result.report.evidence.attempts.at(-1);
+            expect(attempt?.status).toBe("failed");
+            expect(attempt?.diagnostics.join(";")).toContain(
+                "cold processVector requires concurrency 1",
+            );
+        },
+        60_000,
+    );
 });
 
 describe("policy timing separation (scenario 5)", () => {
@@ -377,6 +416,18 @@ describe("policy timing separation (scenario 5)", () => {
                         6,
                     );
                 }
+            }
+
+            for (const caseEvidence of result.report.evidence.cases) {
+                const caseScenarios = result.report.evidence.scenarios.filter((s) =>
+                    s.queryId.startsWith(`${caseEvidence.caseId}:`),
+                );
+                expect(caseEvidence.latencySummary).not.toBeNull();
+                expect(caseEvidence.latencySummary?.p50Ms).toBe(1);
+                expect(caseEvidence.latencySummary?.p95Ms).toBe(1);
+                expect(caseEvidence.latencySummary?.sampleCount).toBe(
+                    caseScenarios.reduce((sum, s) => sum + s.latencySamplesMs.length, 0),
+                );
             }
         },
         60_000,
@@ -495,6 +546,7 @@ describe("workflow and package-script contract (U7 scenario 5)", () => {
     interface WorkflowStep {
         run?: string;
         uses?: string;
+        "continue-on-error"?: boolean;
     }
     interface WorkflowJob {
         "runs-on"?: unknown;
@@ -581,6 +633,14 @@ describe("workflow and package-script contract (U7 scenario 5)", () => {
             expect(run).toContain("packages/plugin/scripts/benchmark-retrieval.ts regression");
             expect(run).toContain(`"$arch" != "${expected.arch}"`);
             expect(profileHostClass(expected.profile)).toBe(expected.profile);
+
+            // Until per-host baselines are published from the reference
+            // hosts, the regression verdict is informational: the step must
+            // not fail the job, and its artifact is archived regardless.
+            const regressionStep = (job.steps ?? []).find((step) =>
+                step.run?.includes("benchmark-retrieval.ts regression"),
+            );
+            expect(regressionStep?.["continue-on-error"]).toBe(true);
         }
         expect(allCommands(parsed)).not.toContain("baseline-create");
         expect(raw).toContain("workflow_dispatch");

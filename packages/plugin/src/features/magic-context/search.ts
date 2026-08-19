@@ -865,6 +865,8 @@ async function searchMemories(args: {
     topKSpan?.end("ok", {
         candidatesIn: new Set([...semanticScores.keys(), ...ftsScores.keys()]).size,
         candidatesOut: merged.length,
+        // One variable feeds both counters: plumbing-identity evidence
+        // only, not the lane's actually executed bound.
         requestedK: args.limit,
         effectiveK: args.limit,
     });
@@ -1985,6 +1987,10 @@ async function executeUnifiedSearch(args: {
     const tierLimit =
         args.candidateDepth ??
         Math.min(Math.max(limit * 3, DEFAULT_SEARCH_RESULT_LIMIT), MAX_LANE_CANDIDATES);
+    // requestedK and effectiveK are emitted from this one variable, so the
+    // candidate-depth assertion over these counters checks plumbing
+    // identity only; it cannot see a lane that internally clamped its
+    // executed bound. Surfacing per-lane executed bounds is future work.
     const laneDepth = { requestedK: tierLimit, effectiveK: tierLimit };
 
     const filterSpan = trace?.begin("filter_construction", "unified", { parent: rootId }) ?? null;
@@ -2152,63 +2158,59 @@ async function executeUnifiedSearch(args: {
     const embedDeps = embedSpan ? [embedSpan.id] : [];
     const laneSpanIds: number[] = messageFusionSpan ? [messageFusionSpan.id] : [];
 
-    const runGitCommitLane = (): GitCommitSearchResult[] => {
+    const runVectorLane = <T>(
+        lane: "git_commit" | "primer",
+        run: (onVectorLoad: VectorLoadObserver | undefined) => T[],
+    ): T[] => {
         const span = trace
-            ? trace.begin("vector_scan", "git_commit", { parent: rootId, dependsOn: embedDeps })
+            ? trace.begin("vector_scan", lane, { parent: rootId, dependsOn: embedDeps })
             : null;
         let load: VectorLoadEvent | null = null;
-        const lane = searchGitCommits({
-            db,
-            projectPath,
-            query: trimmedQuery,
-            limit: tierLimit,
-            queryEmbedding,
-            queryModelId: embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-            onVectorLoad: span
+        const results = run(
+            span
                 ? (event) => {
                       load = event;
                   }
                 : undefined,
-        });
+        );
         if (span) {
             laneSpanIds.push(span.id);
             span.end("ok", {
                 ...vectorLoadCounters(load),
-                candidatesOut: lane.length,
+                candidatesOut: results.length,
                 ...laneDepth,
             });
         }
-        return lane;
+        return results;
     };
 
-    const runPrimerLane = (): PrimerSearchResult[] => {
-        const span = trace
-            ? trace.begin("vector_scan", "primer", { parent: rootId, dependsOn: embedDeps })
-            : null;
-        let load: VectorLoadEvent | null = null;
-        const lane = searchPrimers({
-            db,
-            projectPath,
-            query: trimmedQuery,
-            limit: tierLimit,
-            queryEmbedding,
-            queryModelId: embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
-            onVectorLoad: span
-                ? (event) => {
-                      load = event;
-                  }
-                : undefined,
-        });
-        if (span) {
-            laneSpanIds.push(span.id);
-            span.end("ok", {
-                ...vectorLoadCounters(load),
-                candidatesOut: lane.length,
-                ...laneDepth,
-            });
-        }
-        return lane;
-    };
+    const runGitCommitLane = (): GitCommitSearchResult[] =>
+        runVectorLane("git_commit", (onVectorLoad) =>
+            searchGitCommits({
+                db,
+                projectPath,
+                query: trimmedQuery,
+                limit: tierLimit,
+                queryEmbedding,
+                queryModelId:
+                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
+                onVectorLoad,
+            }),
+        );
+
+    const runPrimerLane = (): PrimerSearchResult[] =>
+        runVectorLane("primer", (onVectorLoad) =>
+            searchPrimers({
+                db,
+                projectPath,
+                query: trimmedQuery,
+                limit: tierLimit,
+                queryEmbedding,
+                queryModelId:
+                    embeddingModelId && embeddingModelId !== "off" ? embeddingModelId : null,
+                onVectorLoad,
+            }),
+        );
 
     const runNoteLane = (): NoteSearchResult[] => {
         const span = trace ? trace.begin("lexical_scan", "note", { parent: rootId }) : null;

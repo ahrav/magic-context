@@ -57,7 +57,7 @@ import type { Database } from "../../src/shared/sqlite";
 import { closeQuietly } from "../../src/shared/sqlite-helpers";
 
 import { canonicalFingerprint, canonicalJson } from "./canonical-json";
-import type { QueryScenario } from "./contract";
+import { SOURCE_FILTERS, type QueryScenario } from "./contract";
 import type { ReviewedRelease } from "./index";
 import { resolveRankedLocators, type ScenarioScope } from "./identity";
 import {
@@ -99,7 +99,7 @@ import {
     type SeedResult,
     seedFixture,
 } from "./seed";
-import { TIMING_POLICY_VERSION, traceTimingEvidence } from "./timing";
+import { TIMING_POLICY_VERSION, summarizeLatency, traceTimingEvidence } from "./timing";
 
 export const RUNNER_VERSION = "retrieval-benchmark-runner/v1";
 export const CHECKPOINT_SCHEMA_VERSION = "retrieval-benchmark-checkpoint/v1";
@@ -263,7 +263,6 @@ class CaseCacheController {
     readonly freshConnectionPerSample: boolean;
     private readonly layers: LayerEvidence[];
     private readonly processVector: LayerEvidence;
-    private readonly diagnostics: string[] = [];
 
     constructor(
         private readonly profileCase: ProfileCase,
@@ -274,7 +273,6 @@ class CaseCacheController {
             snapshotPath: string;
             memoryLaneActive: boolean;
             requireOsPageEvictionProof: boolean;
-            warmups: number;
         },
     ) {
         const state = profileCase.cacheState;
@@ -284,6 +282,12 @@ class CaseCacheController {
         if (state.connectionStatement !== state.sqlitePage) {
             throw new RunnerError([
                 `case ${profileCase.id}: connectionStatement and sqlitePage states must agree in-process`,
+            ]);
+        }
+        // With concurrency > 1, another worker can repopulate the shared processVector cache between invalidation and measurement, so cold samples require one worker (KTD9). commentlint: allow(JUDGE)
+        if (state.processVector === "cold" && profileCase.concurrency > 1) {
+            throw new RunnerError([
+                `case ${profileCase.id}: cold processVector requires concurrency 1 (a concurrent worker can re-warm the shared process cache between invalidate and sample)`,
             ]);
         }
         this.freshConnectionPerSample = state.connectionStatement === "cold";
@@ -395,7 +399,6 @@ class CaseCacheController {
     }
 
     finish(): CaseEvidence["cacheLayers"] {
-        if (this.diagnostics.length > 0) throw new RunnerError([...this.diagnostics]);
         return this.layers.map((layer) => ({ ...layer }));
     }
 }
@@ -635,6 +638,82 @@ function buildScenario(
     };
 }
 
+interface ConnectionLease {
+    acquire: () => Database;
+    release: (db: Database) => void;
+}
+
+interface QueryScenarioOutcome {
+    ranked: string[];
+    delivery: DeliveryOutcome;
+    latencySamplesMs: number[];
+    tracedSpans: SearchTraceSpan[];
+}
+
+async function executeQueryScenario(
+    ctx: RunContext,
+    profileCase: ProfileCase,
+    controller: CaseCacheController,
+    conn: ConnectionLease,
+    qctx: QueryExecutionContext,
+): Promise<QueryScenarioOutcome> {
+    const sources = effectiveSources(qctx);
+    const queryTouchesMemory = sources === undefined || sources.includes("memory");
+
+    for (let i = 0; i < ctx.profile.runtime.warmups; i += 1) {
+        const db = conn.acquire();
+        try {
+            await executeDelivery(db, qctx);
+        } finally {
+            conn.release(db);
+        }
+    }
+
+    const latencySamplesMs: number[] = [];
+    let delivery: DeliveryOutcome | null = null;
+    for (let i = 0; i < ctx.profile.runtime.samples; i += 1) {
+        controller.beforeSample(queryTouchesMemory);
+        const db = conn.acquire();
+        try {
+            const startedAt = ctx.now();
+            delivery = await executeDelivery(db, qctx);
+            latencySamplesMs.push(ctx.now() - startedAt);
+        } finally {
+            conn.release(db);
+        }
+        controller.afterSample(queryTouchesMemory);
+    }
+    if (!delivery) {
+        throw new RunnerError([`query ${qctx.query.id}: no measured sample`]);
+    }
+
+    const evalDb = conn.acquire();
+    let ranked: string[];
+    try {
+        ranked = await executeEvaluation(evalDb, qctx);
+    } finally {
+        conn.release(evalDb);
+    }
+
+    // Paired trace-enabled diagnostic pass (KTD15): stage
+    // decomposition only, never a latency-policy sample.
+    const tracedSpans: SearchTraceSpan[] = [];
+    const traceDb = conn.acquire();
+    let tracedDelivery: DeliveryOutcome;
+    try {
+        tracedDelivery = await executeDelivery(traceDb, qctx, {
+            sink: { onSpan: (span) => tracedSpans.push(span) },
+            now: ctx.now,
+            clockDomain: `${profileCase.id}:${qctx.query.id}`,
+        });
+    } finally {
+        conn.release(traceDb);
+    }
+    if (tracedDelivery.reason === "timeout") tracedSpans.length = 0;
+
+    return { ranked, delivery, latencySamplesMs, tracedSpans };
+}
+
 async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<CaseResultRecord> {
     const fixture = ctx.fixtures.get(fixtureKey(profileCase.scale, profileCase.dims));
     if (!fixture) {
@@ -680,7 +759,6 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         snapshotPath: fixture.snapshotPath,
         memoryLaneActive,
         requireOsPageEvictionProof: ctx.requireOsPageEvictionProof,
-        warmups: ctx.profile.runtime.warmups,
     });
     {
         const db = openFixtureSnapshot(fixture.snapshotPath);
@@ -697,18 +775,20 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
 
     const worker = async (): Promise<void> => {
         let persistent: Database | null = null;
-        const acquire = (): Database => {
-            if (controller.freshConnectionPerSample) {
-                controller.connectionOpened();
-                return openFixtureSnapshot(fixture.snapshotPath);
-            }
-            if (!persistent) {
-                persistent = openFixtureSnapshot(fixture.snapshotPath);
-            }
-            return persistent;
-        };
-        const release = (db: Database): void => {
-            if (controller.freshConnectionPerSample) closeQuietly(db);
+        const conn: ConnectionLease = {
+            acquire: () => {
+                if (controller.freshConnectionPerSample) {
+                    controller.connectionOpened();
+                    return openFixtureSnapshot(fixture.snapshotPath);
+                }
+                if (!persistent) {
+                    persistent = openFixtureSnapshot(fixture.snapshotPath);
+                }
+                return persistent;
+            },
+            release: (db) => {
+                if (controller.freshConnectionPerSample) closeQuietly(db);
+            },
         };
         try {
             for (;;) {
@@ -726,71 +806,15 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
                     autoScoreThreshold: ctx.autoScoreThreshold,
                     autoTimeoutMs: ctx.autoTimeoutMs,
                 };
-
-                const sources = effectiveSources(qctx);
-                const queryTouchesMemory = sources === undefined || sources.includes("memory");
-
-                for (let i = 0; i < ctx.profile.runtime.warmups; i += 1) {
-                    const db = acquire();
-                    try {
-                        await executeDelivery(db, qctx);
-                    } finally {
-                        release(db);
-                    }
-                }
-
-                const latencySamplesMs: number[] = [];
-                let delivery: DeliveryOutcome | null = null;
-                for (let i = 0; i < ctx.profile.runtime.samples; i += 1) {
-                    controller.beforeSample(queryTouchesMemory);
-                    const db = acquire();
-                    try {
-                        const startedAt = ctx.now();
-                        delivery = await executeDelivery(db, qctx);
-                        latencySamplesMs.push(ctx.now() - startedAt);
-                    } finally {
-                        release(db);
-                    }
-                    controller.afterSample(queryTouchesMemory);
-                }
-                if (!delivery) {
-                    throw new RunnerError([`query ${query.id}: no measured sample`]);
-                }
-
-                const evalDb = acquire();
-                let ranked: string[];
-                try {
-                    ranked = await executeEvaluation(evalDb, qctx);
-                } finally {
-                    release(evalDb);
-                }
-
-                // Paired trace-enabled diagnostic pass (KTD15): stage
-                // decomposition only, never a latency-policy sample.
-                const tracedSpans: SearchTraceSpan[] = [];
-                const traceDb = acquire();
-                let tracedDelivery: DeliveryOutcome;
-                try {
-                    tracedDelivery = await executeDelivery(traceDb, qctx, {
-                        sink: { onSpan: (span) => tracedSpans.push(span) },
-                        now: ctx.now,
-                        clockDomain: `${profileCase.id}:${query.id}`,
-                    });
-                } finally {
-                    release(traceDb);
-                }
-                if (tracedDelivery.reason === "timeout") tracedSpans.length = 0;
-
-                scenarios.set(
-                    query.id,
-                    buildScenario(ctx, profileCase, query, fixture, {
-                        ranked,
-                        delivery,
-                        latencySamplesMs,
-                        tracedSpans,
-                    }),
+                const outcome = await executeQueryScenario(
+                    ctx,
+                    profileCase,
+                    controller,
+                    conn,
+                    qctx,
                 );
-                candidateRankings.set(query.id, ranked);
+                scenarios.set(query.id, buildScenario(ctx, profileCase, query, fixture, outcome));
+                candidateRankings.set(query.id, outcome.ranked);
             }
         } finally {
             if (persistent) closeQuietly(persistent);
@@ -805,6 +829,25 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     const orderedScenarios = queries
         .map((query) => scenarios.get(query.id))
         .filter((scenario): scenario is ReportScenario => scenario !== undefined);
+    // R27 diagnostic summary over this case's trace-disabled samples; the
+    // regression policy recomputes its percentiles from the raw samples.
+    const caseSamplesMs = orderedScenarios.flatMap((scenario) => scenario.latencySamplesMs);
+    let latencySummary: CaseEvidence["latencySummary"] = null;
+    if (caseSamplesMs.length > 0) {
+        const summary = summarizeLatency(caseSamplesMs);
+        latencySummary = {
+            timingPolicyVersion: summary.timingPolicyVersion,
+            sampleCount: summary.sampleCount,
+            p50Ms: summary.p50Ms,
+            p95Ms: summary.p95Ms,
+        };
+    }
+    // R52: lanes narrower than the mode's full source set stay diagnostic;
+    // report aggregation keeps them out of gate macro-averages.
+    const fullLanes: readonly SearchSource[] =
+        profileCase.mode === "automatic" ? AUTO_SEARCH_SOURCES : SOURCE_FILTERS;
+    const laneRestricted =
+        lanes !== null && !fullLanes.every((lane) => lanes.includes(lane));
     return {
         caseId: profileCase.id,
         scenarios: orderedScenarios,
@@ -820,6 +863,8 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             },
             selectivityObserved,
             cacheLayers,
+            laneRestricted,
+            latencySummary,
         },
         candidateRankings: queries
             .map((query) => ({
@@ -1166,8 +1211,3 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         diagnostics,
     };
 }
-
-/** Per-(partition, mode) macro aggregates recomputed from report evidence.
- *  Explicit and automatic stay separate cells (R52); U6's regression policy
- *  consumes the holdout cells through `gateAggregates`. */
-export { aggregateReportQuality } from "./report";

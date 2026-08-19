@@ -28,7 +28,6 @@ import {
     existsSync,
     mkdirSync,
     mkdtempSync,
-    readFileSync,
     renameSync,
     rmSync,
     writeFileSync,
@@ -37,7 +36,8 @@ import { basename, dirname, join } from "node:path";
 
 import { z } from "zod";
 
-import { canonicalFingerprint } from "./canonical-json";
+import { canonicalFingerprint, readCanonicalJsonFile } from "./canonical-json";
+import { formatIssues } from "./contract";
 import { gateAggregates, METRIC_POLICY_VERSION, type QueryMode } from "./metrics";
 import {
     aggregateReportQuality,
@@ -186,63 +186,53 @@ const latencyBaselineSchema = z.strictObject({
 });
 export type LatencyBaselineArtifact = z.infer<typeof latencyBaselineSchema>;
 
-function formatIssues(prefix: string, error: z.ZodError): string[] {
-    return error.issues.map((issue) => `${prefix}.${issue.path.join(".")}: ${issue.code}`).sort();
+function formatArtifactIssues(prefix: string, error: z.ZodError): string[] {
+    return formatIssues(prefix, error);
 }
 
 export function parseRegressionPolicy(value: unknown): RegressionPolicy {
     const parsed = policySchema.safeParse(value);
-    if (!parsed.success) throw new RegressionError(formatIssues("policy", parsed.error));
+    if (!parsed.success) throw new RegressionError(formatArtifactIssues("policy", parsed.error));
     return parsed.data;
 }
 
 export function parseQualityBaseline(value: unknown): QualityBaselineArtifact {
     const parsed = qualityBaselineSchema.safeParse(value);
-    if (!parsed.success) throw new RegressionError(formatIssues("baseline", parsed.error));
+    if (!parsed.success) throw new RegressionError(formatArtifactIssues("baseline", parsed.error));
     return parsed.data;
 }
 
 export function parseLatencyBaseline(value: unknown): LatencyBaselineArtifact {
     const parsed = latencyBaselineSchema.safeParse(value);
-    if (!parsed.success) throw new RegressionError(formatIssues("baseline", parsed.error));
+    if (!parsed.success) throw new RegressionError(formatArtifactIssues("baseline", parsed.error));
     return parsed.data;
 }
 
 export function parseHostEvidence(value: unknown): HostEvidence {
     const parsed = hostEvidenceSchema.safeParse(value);
-    if (!parsed.success) throw new RegressionError(formatIssues("hostEvidence", parsed.error));
+    if (!parsed.success) {
+        throw new RegressionError(formatArtifactIssues("hostEvidence", parsed.error));
+    }
     return parsed.data;
 }
 
 /** Same promoter-serialization byte rule the release and profile loaders
  *  enforce: any byte the parsed view does not account for rejects. */
-function readCanonicalJsonFile(label: string, path: string): unknown {
-    let text: string;
-    try {
-        text = readFileSync(path, "utf8");
-    } catch {
-        throw new RegressionError([`${label}: unreadable (${path})`]);
-    }
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(text);
-    } catch {
-        throw new RegressionError([`${label}: invalid-json (${path})`]);
-    }
-    if (`${JSON.stringify(parsed, null, 2)}\n` !== text) {
-        throw new RegressionError([`${label}: non-canonical-bytes (${path})`]);
-    }
-    return parsed;
+function readCanonicalArtifact(label: string, path: string): unknown {
+    return readCanonicalJsonFile(
+        path,
+        (code) => new RegressionError([`${label}: ${code} (${path})`]),
+    );
 }
 
 export function loadRegressionPolicyFile(path: string): RegressionPolicy {
-    return parseRegressionPolicy(readCanonicalJsonFile("policy", path));
+    return parseRegressionPolicy(readCanonicalArtifact("policy", path));
 }
 
 export type BaselineArtifact = QualityBaselineArtifact | LatencyBaselineArtifact;
 
 export function loadBaselineFile(path: string): BaselineArtifact {
-    const parsed = readCanonicalJsonFile("baseline", path);
+    const parsed = readCanonicalArtifact("baseline", path);
     const schemaVersion = (parsed as { schemaVersion?: unknown } | null)?.schemaVersion;
     if (schemaVersion === QUALITY_BASELINE_SCHEMA_VERSION) return parseQualityBaseline(parsed);
     if (schemaVersion === LATENCY_BASELINE_SCHEMA_VERSION) return parseLatencyBaseline(parsed);
@@ -565,6 +555,13 @@ export function tsAudit(input: {
      *  them from the profile. Empty means the cell did not run here. */
     auditCaseIds: readonly string[];
 }): TsAudit {
+    // Pooling raw samples from several cases would fold distinct matrix
+    // cells into one run-level p95 (R61), so more than one case rejects.
+    if (input.auditCaseIds.length > 1) {
+        throw new RegressionError([
+            `audit: ${input.auditCaseIds.length} audit cases would pool raw samples across matrix cells into one run-level p95; supply at most one audit case id`,
+        ]);
+    }
     const quality = input.reports.map((report) => ({
         runId: evidenceDigest(report),
         holdout: gateAggregates(aggregateReportQuality(report)).map((aggregate) => ({

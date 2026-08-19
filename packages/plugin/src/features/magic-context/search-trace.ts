@@ -42,20 +42,6 @@ export type SearchTraceStage =
     | "reranking"
     | "packing";
 
-export const SEARCH_TRACE_STAGES: readonly SearchTraceStage[] = [
-    "root",
-    "query_inference",
-    "generation_lookup",
-    "filter_construction",
-    "lexical_scan",
-    "vector_scan",
-    "top_k",
-    "metadata_hydration",
-    "fusion",
-    "reranking",
-    "packing",
-];
-
 export type SearchTraceLane =
     | "unified"
     | "query"
@@ -70,7 +56,10 @@ export type SearchTraceStatus = "ok" | "failed" | "cancelled" | "not_applicable"
 
 /** One vector load reported by a decoder (R57). Byte fields are exact buffer
  *  byte lengths, never estimates. Exactly one of decodedBytes/cachedBytes is
- *  nonzero for a given load. */
+ *  nonzero for a given load: attribution is all-or-nothing per load, so on a
+ *  partially warm cache every touched byte lands on the side the decoder
+ *  reports via cacheHit. Byte counts stay exact; the decoded/cached split is
+ *  approximate on mixed cache states. */
 export interface VectorLoadEvent {
     /** BLOB payload bytes decoded fresh from storage by this load. */
     decodedBytes: number;

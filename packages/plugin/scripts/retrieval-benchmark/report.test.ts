@@ -4,10 +4,12 @@ import { ContractError } from "./contract";
 import type { ResolvedRankedResult } from "./identity";
 import { type JudgedGrade, METRIC_POLICY_VERSION } from "./metrics";
 import {
+    aggregateReportQuality,
     type BenchmarkReport,
     buildCandidatePool,
     CANDIDATE_POOL_CONSUMER,
     CANDIDATE_POOL_SCHEMA_VERSION,
+    type CaseEvidence,
     computeReportStatus,
     evidenceDigest,
     parseReport,
@@ -20,12 +22,18 @@ import { TIMING_POLICY_VERSION } from "./timing";
 
 const FP = "a".repeat(64);
 
-function makeScenario(queryId: string): ReportScenario {
+function makeScenario(
+    queryId: string,
+    overrides: Partial<Pick<ReportScenario, "paraphraseGroup">> & {
+        metricValue?: number;
+    } = {},
+): ReportScenario {
+    const metricValue = overrides.metricValue ?? 1;
     return {
         queryId,
         mode: "explicit",
         partition: "holdout",
-        paraphraseGroup: "pg-1",
+        paraphraseGroup: overrides.paraphraseGroup ?? "pg-1",
         rankedPhysical: ["memory:1", "memory:2"],
         deliveredPhysical: ["memory:1"],
         deliveredTokens: 120,
@@ -33,10 +41,10 @@ function makeScenario(queryId: string): ReportScenario {
         latencySamplesMs: [4.5, 6.25, 5.5],
         metrics: {
             metricPolicyVersion: METRIC_POLICY_VERSION,
-            recallAt10: 1,
-            recallAt50: 1,
-            reciprocalRank: 1,
-            ndcgAt10: 1,
+            recallAt10: metricValue,
+            recallAt50: metricValue,
+            reciprocalRank: metricValue,
+            ndcgAt10: metricValue,
             duplicateRateAt50: 0,
             contextTokensPerUsefulResult: 120,
             rerankerLift: { status: "not_applicable" },
@@ -57,12 +65,52 @@ function makeScenario(queryId: string): ReportScenario {
     };
 }
 
+function makeCaseEvidence(
+    caseId: string,
+    overrides: Partial<Pick<CaseEvidence, "laneRestricted" | "latencySummary">> = {},
+): CaseEvidence {
+    return {
+        caseId,
+        workerCount: 1,
+        warmups: 1,
+        samplesPerQuery: 3,
+        fixture: {
+            manifestFingerprint: FP,
+            indexBuildMs: 250,
+            snapshotBytes: 4096,
+        },
+        selectivityObserved: { preFilterDenominator: 100, eligibleCount: 100 },
+        cacheLayers: [
+            {
+                layer: "processVector",
+                declared: "warm",
+                mechanism: "warmup-population",
+                resets: 0,
+                verifications: 3,
+                status: "verified",
+            },
+        ],
+        laneRestricted: overrides.laneRestricted ?? false,
+        latencySummary:
+            overrides.latencySummary !== undefined
+                ? overrides.latencySummary
+                : {
+                      timingPolicyVersion: TIMING_POLICY_VERSION,
+                      sampleCount: 3,
+                      p50Ms: 5.5,
+                      p95Ms: 6.25,
+                  },
+    };
+}
+
 function makeReport(
     overrides: {
         config?: Record<string, unknown>;
         workingDirectory?: string;
         startedAtEpochMs?: number;
         status?: BenchmarkReport["status"];
+        scenarios?: ReportScenario[];
+        cases?: CaseEvidence[];
     } = {},
 ): BenchmarkReport {
     return parseReport({
@@ -90,31 +138,8 @@ function makeReport(
                     diagnostics: [],
                 },
             ],
-            scenarios: [makeScenario("q-1")],
-            cases: [
-                {
-                    caseId: "case-1",
-                    workerCount: 1,
-                    warmups: 1,
-                    samplesPerQuery: 3,
-                    fixture: {
-                        manifestFingerprint: FP,
-                        indexBuildMs: 250,
-                        snapshotBytes: 4096,
-                    },
-                    selectivityObserved: { preFilterDenominator: 100, eligibleCount: 100 },
-                    cacheLayers: [
-                        {
-                            layer: "processVector",
-                            declared: "warm",
-                            mechanism: "warmup-population",
-                            resets: 0,
-                            verifications: 3,
-                            status: "verified",
-                        },
-                    ],
-                },
-            ],
+            scenarios: overrides.scenarios ?? [makeScenario("q-1")],
+            cases: overrides.cases ?? [makeCaseEvidence("case-1")],
         },
         candidatePool: {
             schemaVersion: CANDIDATE_POOL_SCHEMA_VERSION,
@@ -244,6 +269,35 @@ describe("computeReportStatus and passEligibility", () => {
         expect(passEligibility({ status: "incomplete" }, { compatible: false }).eligible).toBe(
             false,
         );
+    });
+});
+
+describe("aggregateReportQuality lane restriction", () => {
+    it("keeps lane-restricted scenarios out of gate aggregates without dropping them from the report", () => {
+        const gated = makeReport({
+            scenarios: [
+                makeScenario("case-full:q-1", { metricValue: 1 }),
+                makeScenario("case-lane:q-1", { paraphraseGroup: "pg-lane", metricValue: 0 }),
+            ],
+            cases: [
+                makeCaseEvidence("case-full"),
+                makeCaseEvidence("case-lane", { laneRestricted: true }),
+            ],
+        });
+        const withoutLaneCase = makeReport({
+            scenarios: [makeScenario("case-full:q-1", { metricValue: 1 })],
+            cases: [makeCaseEvidence("case-full")],
+        });
+
+        expect(gated.evidence.scenarios).toHaveLength(2);
+        expect(aggregateReportQuality(gated)).toEqual(
+            aggregateReportQuality(withoutLaneCase),
+        );
+        const holdout = aggregateReportQuality(gated).find(
+            (aggregate) => aggregate.partition === "holdout" && aggregate.mode === "explicit",
+        );
+        expect(holdout?.queryCount).toBe(1);
+        expect(holdout?.ndcgAt10).toBe(1);
     });
 });
 

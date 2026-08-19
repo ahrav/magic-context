@@ -27,6 +27,7 @@ import {
     type ClaimEligibility,
     evaluateRegression,
     type HostEvidence,
+    type LatencyBaselineArtifact,
     loadBaselineFile,
     loadRegressionPolicyFile,
     parseHostEvidence,
@@ -325,7 +326,10 @@ async function runRegression(rest: string[]): Promise<void> {
         readReportFile,
     );
 
-    let latency: { baseline: never; candidateHostEvidence: HostEvidence[] } | null = null;
+    let latency: {
+        baseline: LatencyBaselineArtifact;
+        candidateHostEvidence: HostEvidence[];
+    } | null = null;
     const latencyBaselinePath = flags.single.get("--latency-baseline");
     if (latencyBaselinePath) {
         const latencyBaseline = loadBaselineFile(latencyBaselinePath);
@@ -337,7 +341,7 @@ async function runRegression(rest: string[]): Promise<void> {
             flags.repeated.get("--host-evidence"),
         ).map(readHostEvidenceFile);
         latency = {
-            baseline: latencyBaseline as never,
+            baseline: latencyBaseline,
             candidateHostEvidence,
         };
     }

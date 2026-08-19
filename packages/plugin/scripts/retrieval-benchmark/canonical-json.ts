@@ -15,8 +15,38 @@
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 export class CanonicalJsonError extends Error {}
+
+export type CanonicalJsonFileFailure = "unreadable" | "invalid-json" | "non-canonical-bytes";
+
+/**
+ * `JSON.parse` retains only the last duplicate member; the byte comparison
+ * rejects input containing duplicate members. commentlint: allow(JUDGE)
+ * Use `onFailure` to preserve caller-specific errors.
+ */
+export function readCanonicalJsonFile(
+    path: string,
+    onFailure: (code: CanonicalJsonFileFailure) => Error,
+): unknown {
+    let text: string;
+    try {
+        text = readFileSync(path, "utf8");
+    } catch {
+        throw onFailure("unreadable");
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        throw onFailure("invalid-json");
+    }
+    if (`${JSON.stringify(parsed, null, 2)}\n` !== text) {
+        throw onFailure("non-canonical-bytes");
+    }
+    return parsed;
+}
 
 function canonicalize(value: unknown, path: string): string {
     if (value === null) return "null";

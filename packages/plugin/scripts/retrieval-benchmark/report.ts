@@ -142,6 +142,20 @@ const caseEvidenceSchema = z.strictObject({
             status: z.enum(["verified", "not-attempted", "not-applicable"]),
         }),
     ),
+    /** True when the case's sourceLanes are narrower than the mode's full
+     *  source set; such cases stay diagnostic and their scenarios are
+     *  excluded from gate macro-averages (R52). */
+    laneRestricted: z.boolean(),
+    /** Diagnostic p50/p95 over the case's trace-disabled samples (R27);
+     *  the regression policy recomputes percentiles from raw samples. */
+    latencySummary: z
+        .strictObject({
+            timingPolicyVersion: z.literal(TIMING_POLICY_VERSION),
+            sampleCount: z.number().int().positive(),
+            p50Ms: z.number().min(0),
+            p95Ms: z.number().min(0),
+        })
+        .nullable(),
 });
 export type CaseEvidence = z.infer<typeof caseEvidenceSchema>;
 
@@ -267,20 +281,31 @@ export function passEligibility(
     return { eligible: reasons.length === 0, reasons };
 }
 
+/** Per-(partition, mode) macro aggregates recomputed from report evidence.
+ *  Scenarios from lane-restricted cases are excluded, so per-source-lane
+ *  cells never move a gate macro-average (R52); their raw scenario metrics
+ *  stay in the report evidence as diagnostics. */
 export function aggregateReportQuality(report: BenchmarkReport): MacroAggregate[] {
+    const laneRestrictedCases = new Set(
+        report.evidence.cases
+            .filter((caseEvidence) => caseEvidence.laneRestricted)
+            .map((caseEvidence) => caseEvidence.caseId),
+    );
     return macroAggregate(
-        report.evidence.scenarios.map((scenario) => ({
-            queryId: scenario.queryId,
-            paraphraseGroup: scenario.paraphraseGroup,
-            partition: scenario.partition,
-            mode: scenario.mode,
-            values: {
-                recallAt10: scenario.metrics.recallAt10,
-                recallAt50: scenario.metrics.recallAt50,
-                reciprocalRank: scenario.metrics.reciprocalRank,
-                ndcgAt10: scenario.metrics.ndcgAt10,
-            },
-        })),
+        report.evidence.scenarios
+            .filter((scenario) => !laneRestrictedCases.has(scenario.queryId.split(":", 1)[0]))
+            .map((scenario) => ({
+                queryId: scenario.queryId,
+                paraphraseGroup: scenario.paraphraseGroup,
+                partition: scenario.partition,
+                mode: scenario.mode,
+                values: {
+                    recallAt10: scenario.metrics.recallAt10,
+                    recallAt50: scenario.metrics.recallAt50,
+                    reciprocalRank: scenario.metrics.reciprocalRank,
+                    ndcgAt10: scenario.metrics.ndcgAt10,
+                },
+            })),
     );
 }
 

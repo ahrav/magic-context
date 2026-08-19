@@ -14,9 +14,10 @@ import {
     parseProfile,
     PROFILE_AXIS_ENDPOINTS,
     profileFingerprint,
-    THIRTY_GIB,
     verifySelectivityObservation,
 } from "./profiles";
+
+const THIRTY_GIB = 30 * 2 ** 30;
 
 const PROFILE_DIR = join(
     import.meta.dir,
