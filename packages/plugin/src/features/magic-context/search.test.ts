@@ -18,9 +18,9 @@ import {
 import { appendCompartments, getCompartments, replaceSessionFacts } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
 import { getMemoryById, insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
+import { initializeEmbedding } from "./memory/embedding";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
-import { initializeEmbedding } from "./memory/embedding";
 import {
     _resetProjectEmbeddingRegistryForTests,
     registerProjectEmbedding,
@@ -1437,10 +1437,12 @@ describe("query-purpose provider boundary (U30)", () => {
     beforeEach(() => {
         db = createTestDb();
         fetchSpy = spyOn(globalThis, "fetch");
-        fetchSpy.mockImplementation((async () =>
-            new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
-                headers: { "content-type": "application/json" },
-            })) as unknown as typeof fetch);
+        fetchSpy.mockImplementation(
+            (async () =>
+                new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+                    headers: { "content-type": "application/json" },
+                })) as unknown as typeof fetch,
+        );
         initializeEmbedding({
             provider: "openai-compatible",
             model: "nvidia/nv-embed",

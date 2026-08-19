@@ -118,10 +118,12 @@ describe("embedding module", () => {
 
         beforeEach(() => {
             fetchSpy = spyOn(globalThis, "fetch");
-            fetchSpy.mockImplementation((async () =>
-                new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
-                    headers: { "content-type": "application/json" },
-                })) as unknown as typeof fetch);
+            fetchSpy.mockImplementation(
+                (async () =>
+                    new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+                        headers: { "content-type": "application/json" },
+                    })) as unknown as typeof fetch,
+            );
             initializeEmbedding({
                 provider: "openai-compatible",
                 model: "nvidia/nv-embed",
