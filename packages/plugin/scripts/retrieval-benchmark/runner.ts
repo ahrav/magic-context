@@ -709,16 +709,27 @@ function buildScenario(
     const scope: ScenarioScope = query.fixtureScope;
     const judgedGrades = ctx.judged.get(query.id) ?? new Map<string, JudgedGrade>();
     const resolved = resolveRankedLocators(outcome.ranked, scope, ctx.release.aliasIndex);
-    const queryMetrics = computeQueryMetrics({ queryId: query.id, resolved, judgedGrades });
-    const values = scoredQueryValues(queryMetrics);
-    const at50 = queryMetrics.cutoffs.find((cutoff) => cutoff.cutoff === 50);
-    if (!at50) throw new RunnerError([`query ${query.id}: missing depth-50 metrics window`]);
     const deliveredLocators = outcome.delivery.delivered.map(encodePhysicalResultLocator);
     const deliveredResolved = resolveRankedLocators(
         deliveredLocators,
         scope,
         ctx.release.aliasIndex,
     );
+    // Automatic quality is the thresholded delivery outcome: production
+    // users only ever see what executeAutoSearchDelivery delivers, so a
+    // change that preserves ordering while pushing every score below the
+    // auto threshold must register as a quality regression instead of
+    // passing through the unthresholded evaluation ranking. Explicit mode
+    // keeps evaluation-depth metrics — its users page through results.
+    const metricResolved = query.mode === "automatic" ? deliveredResolved : resolved;
+    const queryMetrics = computeQueryMetrics({
+        queryId: query.id,
+        resolved: metricResolved,
+        judgedGrades,
+    });
+    const values = scoredQueryValues(queryMetrics);
+    const at50 = queryMetrics.cutoffs.find((cutoff) => cutoff.cutoff === 50);
+    if (!at50) throw new RunnerError([`query ${query.id}: missing depth-50 metrics window`]);
 
     let timing: ReportScenario["timing"] = null;
     if (outcome.tracedSpans.length > 0) {
@@ -1011,24 +1022,52 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     );
     const scenarios = new Map<string, ReportScenario>();
     const candidateRankings = new Map<string, string[]>();
+    const readyToFinalize: QueryRunState[] = [];
 
-    const worker = async (): Promise<void> => {
+    const makeWorkerConn = (): { conn: ConnectionLease; close: () => void } => {
         let persistent: Database | null = null;
-        const conn: ConnectionLease = {
-            acquire: () => {
-                if (controller.freshConnectionPerSample) {
-                    return openFixtureSnapshot(fixture.snapshotPath);
-                }
-                if (!persistent) {
-                    persistent = openFixtureSnapshot(fixture.snapshotPath);
-                }
-                return persistent;
+        return {
+            conn: {
+                acquire: () => {
+                    if (controller.freshConnectionPerSample) {
+                        return openFixtureSnapshot(fixture.snapshotPath);
+                    }
+                    if (!persistent) {
+                        persistent = openFixtureSnapshot(fixture.snapshotPath);
+                    }
+                    return persistent;
+                },
+                release: (db) => {
+                    if (controller.freshConnectionPerSample) closeQuietly(db);
+                },
             },
-            release: (db) => {
-                if (controller.freshConnectionPerSample) closeQuietly(db);
+            close: () => {
+                if (persistent) closeQuietly(persistent);
             },
         };
+    };
+
+    // Phase 1: sampling only. Finalization (evaluation + traced passes) is
+    // deferred until every query's measured samples complete, so measured
+    // samples always compete with exactly the declared number of measured
+    // requests, never with unmeasured top-50 or traced diagnostics.
+    const samplingWorker = async (): Promise<void> => {
+        const { conn, close } = makeWorkerConn();
         try {
+            // Query-level warmups prime the shared process and OS caches,
+            // but prepared statements and the SQLite page cache live on
+            // each worker's persistent connection — a warmup executed on
+            // another worker never touches this one. Prime this connection
+            // with one untimed delivery before it measures anything.
+            if (!controller.freshConnectionPerSample && pending.length > 0) {
+                const primer = pending[0];
+                const db = conn.acquire();
+                try {
+                    await executeDelivery(db, primer.qctx);
+                } finally {
+                    conn.release(db);
+                }
+            }
             for (;;) {
                 // shift/push are synchronous, so a state is owned by exactly
                 // one worker between dequeue and requeue.
@@ -1041,10 +1080,25 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
                     conn,
                     state,
                 );
-                if (!samplingComplete) {
+                if (samplingComplete) {
+                    readyToFinalize.push(state);
+                } else {
                     pending.push(state);
-                    continue;
                 }
+            }
+        } finally {
+            close();
+        }
+    };
+    await Promise.all(Array.from({ length: profileCase.concurrency }, () => samplingWorker()));
+
+    // Phase 2: evaluation and traced diagnostics, after all sampling ended.
+    const finalizeWorker = async (): Promise<void> => {
+        const { conn, close } = makeWorkerConn();
+        try {
+            for (;;) {
+                const state = readyToFinalize.shift();
+                if (!state) return;
                 const outcome = await finalizeQueryScenario(
                     ctx,
                     profileCase,
@@ -1057,13 +1111,10 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
                 candidateRankings.set(query.id, outcome.ranked);
             }
         } finally {
-            if (persistent) closeQuietly(persistent);
+            close();
         }
     };
-
-    await Promise.all(
-        Array.from({ length: profileCase.concurrency }, () => worker()),
-    );
+    await Promise.all(Array.from({ length: profileCase.concurrency }, () => finalizeWorker()));
 
     const cacheLayers = controller.finish();
     const orderedScenarios = queries
@@ -1083,11 +1134,21 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
         };
     }
     // R52: lanes narrower than the mode's full source set stay diagnostic;
-    // report aggregation keeps them out of gate macro-averages.
+    // report aggregation keeps them out of gate macro-averages. Restriction
+    // is computed from the FINAL effective source set — the predicate's
+    // sources narrow execution exactly like the lane axis, so a case whose
+    // predicate drops lanes must not enter gate aggregates as full-surface.
     const fullLanes: readonly SearchSource[] =
         profileCase.mode === "automatic" ? AUTO_SEARCH_SOURCES : SOURCE_FILTERS;
+    const predicateSources = profileCase.selectivity.predicate.sources;
+    const effectiveLanes: readonly SearchSource[] | null =
+        predicateSources === null
+            ? lanes
+            : lanes === null
+              ? predicateSources
+              : lanes.filter((lane) => predicateSources.includes(lane));
     const laneRestricted =
-        lanes !== null && !fullLanes.every((lane) => lanes.includes(lane));
+        effectiveLanes !== null && !fullLanes.every((lane) => effectiveLanes.includes(lane));
     return {
         caseId: profileCase.id,
         scenarios: orderedScenarios,

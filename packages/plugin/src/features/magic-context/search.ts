@@ -2293,14 +2293,19 @@ async function executeUnifiedSearch(args: {
             lexicalStart: () => {
                 spans.lexical = recorder.begin("lexical_scan", lane, {
                     parent: rootId,
-                    dependsOn: filterDeps,
+                    // Sequential phase chaining: the lane implementations
+                    // run their phases one after another on one thread, so
+                    // whichever phase starts second causally waited on the
+                    // first — without the edge the critical path takes
+                    // max(lexical, vector) instead of their sum.
+                    dependsOn: [...filterDeps, ...(spans.vector ? [spans.vector.id] : [])],
                 });
             },
             lexicalEnd: (candidatesOut) => spans.lexical?.end("ok", { candidatesOut }),
             vectorStart: () => {
                 spans.vector = recorder.begin("vector_scan", lane, {
                     parent: rootId,
-                    dependsOn: semanticDeps,
+                    dependsOn: [...semanticDeps, ...(spans.lexical ? [spans.lexical.id] : [])],
                 });
             },
             vectorEnd: (candidatesOut) =>

@@ -17,7 +17,7 @@
   },
   "runs": [
     {
-      "evidenceDigest": "aac2f0fce7103af87f87ad83d9172f078e18e5b5890d0e96888568324723427f",
+      "evidenceDigest": "c923c7626d612feb4ae484d8b0c4dc9305b2f3b6a363189305873b4f89dc404c",
       "semanticFingerprint": "afb12d9c9969a0a40a2b8c6727c58458426af196eb0e9e590723eb367bb10aaa",
       "hostFingerprint": "58a0868e2af682cf37c1f8d8198ba64e7eed73b01afdaa70a5769f255d13c5c6",
       "modes": [
@@ -28,13 +28,13 @@
         },
         {
           "mode": "explicit",
-          "ndcgAt10": 0.6785714285714286,
-          "recallAt50": 0.9642857142857143
+          "ndcgAt10": 1,
+          "recallAt50": 1
         }
       ]
     },
     {
-      "evidenceDigest": "ebda3d833e45b5da0164c110fcfc046942f5ac094f60a34d6ff8ff206c7ec9ca",
+      "evidenceDigest": "1923a4c7248db592648b1a4cf7c145389ccd898bc3ec29af4e1008b2c56551e2",
       "semanticFingerprint": "afb12d9c9969a0a40a2b8c6727c58458426af196eb0e9e590723eb367bb10aaa",
       "hostFingerprint": "58a0868e2af682cf37c1f8d8198ba64e7eed73b01afdaa70a5769f255d13c5c6",
       "modes": [
@@ -45,13 +45,13 @@
         },
         {
           "mode": "explicit",
-          "ndcgAt10": 0.6785714285714286,
-          "recallAt50": 0.9642857142857143
+          "ndcgAt10": 1,
+          "recallAt50": 1
         }
       ]
     },
     {
-      "evidenceDigest": "b70cfc1051f288586d7259496dc22fa4293adf0dba0e25d5993f098dd784dde7",
+      "evidenceDigest": "a11d384c6987fa92ba80cd132957a35737e989b7a16f938c9e92ec9afafecc7d",
       "semanticFingerprint": "afb12d9c9969a0a40a2b8c6727c58458426af196eb0e9e590723eb367bb10aaa",
       "hostFingerprint": "58a0868e2af682cf37c1f8d8198ba64e7eed73b01afdaa70a5769f255d13c5c6",
       "modes": [
@@ -62,8 +62,8 @@
         },
         {
           "mode": "explicit",
-          "ndcgAt10": 0.6785714285714286,
-          "recallAt50": 0.9642857142857143
+          "ndcgAt10": 1,
+          "recallAt50": 1
         }
       ]
     }

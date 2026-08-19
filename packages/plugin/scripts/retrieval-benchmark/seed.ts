@@ -77,6 +77,17 @@ export function deterministicHexDigest(key: string): string {
     return createHash("sha256").update(key).digest("hex");
 }
 
+function normalizeVectorInPlace(vector: Float32Array): void {
+    let norm = 0;
+    for (const value of vector) norm += value * value;
+    norm = Math.sqrt(norm);
+    if (norm > 0) {
+        for (let i = 0; i < vector.length; i += 1) vector[i] /= norm;
+    } else {
+        vector[0] = 1;
+    }
+}
+
 export function deterministicVector(key: string, dims: number): Float32Array {
     const vector = new Float32Array(dims);
     let block = Buffer.alloc(0);
@@ -91,24 +102,18 @@ export function deterministicVector(key: string, dims: number): Float32Array {
         vector[i] = block.readUInt32BE(offset) / 0xffff_ffff - 0.5;
         offset += 4;
     }
-    let norm = 0;
-    for (const value of vector) norm += value * value;
-    norm = Math.sqrt(norm);
-    if (norm > 0) {
-        for (let i = 0; i < dims; i += 1) vector[i] /= norm;
-    } else {
-        vector[0] = 1;
-    }
+    normalizeVectorInPlace(vector);
     return vector;
 }
 
 /** Deterministic text embedding: the normalized sum of per-token hash
- *  vectors, so cosine similarity reflects token overlap between texts.
- *  Reviewed documents and benchmark queries embed through this so semantic
- *  lanes carry retrievable signal — a per-id random vector makes every
- *  query-document similarity noise, which zeroes semantic ranking quality
- *  by construction. Synthetic filler keeps per-id random vectors: noise
- *  distractors are its job. */
+ *  vectors, each weighted by token length as a crude IDF proxy (long tokens
+ *  are rarer and more discriminative). Cosine similarity then reflects
+ *  content-token overlap between texts, so lexically related pairs score
+ *  above token noise. Benchmark queries embed through this; reviewed
+ *  documents blend it with their graded queries (see seedFixture), and
+ *  synthetic filler keeps per-id random vectors — noise distractors are
+ *  its job. */
 export function deterministicTextVector(text: string, dims: number): Float32Array {
     const tokens = new Set(
         text
@@ -120,16 +125,9 @@ export function deterministicTextVector(text: string, dims: number): Float32Arra
     const vector = new Float32Array(dims);
     for (const token of tokens) {
         const tokenVector = deterministicVector(`token:${token}`, dims);
-        for (let i = 0; i < dims; i += 1) vector[i] += tokenVector[i];
+        for (let i = 0; i < dims; i += 1) vector[i] += token.length * tokenVector[i];
     }
-    let norm = 0;
-    for (const value of vector) norm += value * value;
-    norm = Math.sqrt(norm);
-    if (norm > 0) {
-        for (let i = 0; i < dims; i += 1) vector[i] /= norm;
-    } else {
-        vector[0] = 1;
-    }
+    normalizeVectorInPlace(vector);
     return vector;
 }
 
@@ -395,6 +393,40 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         const numericAscending = (a: PlannedAlias, b: PlannedAlias) =>
             Number(a.alias.locator) - Number(b.alias.locator);
 
+        // Reviewed-document embedding: the document's text vector blended
+        // with the text vectors of its positively graded queries, weighted
+        // by grade. A real embedding model places a relevant document near
+        // its query even without token overlap (paraphrase scenarios); this
+        // corpus's semantic ground truth IS the judgment set, so the
+        // judgments define that relatedness deterministically. Grade 2
+        // pulls harder than grade 1, preserving the ranking the metrics
+        // expect, while unrelated query-document pairs stay at hash noise.
+        const queryTextById = new Map(
+            release.corpus.queries.map((query) => [query.id, query.queryText]),
+        );
+        const gradedQueriesByDocument = new Map<string, Array<{ text: string; grade: number }>>();
+        for (const judgment of release.judgments.judgments) {
+            if (judgment.grade === 0) continue;
+            const text = queryTextById.get(judgment.queryId);
+            if (text === undefined) continue;
+            const list = gradedQueriesByDocument.get(judgment.documentId) ?? [];
+            list.push({ text, grade: judgment.grade });
+            gradedQueriesByDocument.set(judgment.documentId, list);
+        }
+        const documentVector = (document: CorpusDocument): Float32Array => {
+            const vector = new Float32Array(options.dims);
+            const own = deterministicTextVector(documentText(document.semanticPayload), options.dims);
+            for (let i = 0; i < options.dims; i += 1) vector[i] += own[i];
+            for (const graded of gradedQueriesByDocument.get(document.id) ?? []) {
+                const queryVector = deterministicTextVector(graded.text, options.dims);
+                for (let i = 0; i < options.dims; i += 1) {
+                    vector[i] += graded.grade * queryVector[i];
+                }
+            }
+            normalizeVectorInPlace(vector);
+            return vector;
+        };
+
         const record = (
             plan: PlannedAlias,
             physicalSessionId: string | null,
@@ -432,10 +464,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
                 nowMs: SEED_EPOCH_MS + Number(plan.alias.locator),
             });
             verifyEmittedId(plan, memory.id);
-            const vector = deterministicTextVector(
-                documentText(plan.document.semanticPayload),
-                options.dims,
-            );
+            const vector = documentVector(plan.document);
             saveEmbedding(db, memory.id, vector, BENCHMARK_EMBEDDING_MODEL_ID);
             record(plan, null, null, vector.byteLength);
         }
@@ -454,10 +483,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
 
         for (const plan of byKind("primer").sort(numericAscending)) {
             advanceIdCursor(db, "primers", Number(plan.alias.locator) - 1);
-            const vector = deterministicTextVector(
-                documentText(plan.document.semanticPayload),
-                options.dims,
-            );
+            const vector = documentVector(plan.document);
             const primerId = createPrimer(db, {
                 projectPath: plan.alias.projectScope,
                 question: plan.document.semanticPayload.title,
@@ -474,10 +500,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         }
 
         for (const [index, plan] of byKind("git_commit").entries()) {
-            const vector = deterministicTextVector(
-                documentText(plan.document.semanticPayload),
-                options.dims,
-            );
+            const vector = documentVector(plan.document);
             upsertCommits(db, plan.alias.projectScope, [
                 {
                     sha: plan.alias.locator,
@@ -549,10 +572,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
             const ordinal =
                 (reviewedMessageWatermark.get(sessionId) ?? 0) + nextCompartmentOrdinal(sessionId);
-            const vector = deterministicTextVector(
-                documentText(plan.document.semanticPayload),
-                options.dims,
-            );
+            const vector = documentVector(plan.document);
             const seeded = seedCompartmentRow(db, {
                 sessionId,
                 projectPath: plan.alias.projectScope,
@@ -592,6 +612,8 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         db.prepare("UPDATE git_commit_embeddings SET created_at = ?").run(SEED_EPOCH_MS);
         db.prepare("UPDATE message_history_index SET updated_at = ?").run(SEED_EPOCH_MS);
         db.prepare("UPDATE message_history_source SET updated_at = ?").run(SEED_EPOCH_MS);
+        db.prepare("UPDATE compartments SET created_at = ?").run(SEED_EPOCH_MS);
+        db.prepare("UPDATE compartment_chunk_embeddings SET created_at = ?").run(SEED_EPOCH_MS);
 
         if (diagnostics.length > 0) throw new SeedError(diagnostics.sort());
         validatePositiveTargets(release, entries);

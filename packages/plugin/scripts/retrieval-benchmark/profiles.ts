@@ -272,6 +272,13 @@ export function verifySelectivityObservation(
     if (Math.abs(observed.eligibleCount - cell.eligibleCount) > SELECTIVITY_ROUNDING_TOLERANCE) {
         diagnostics.push("selectivity: observed eligible count outside rounding tolerance");
     }
+    // The production message index pushes the ordinal predicate into the
+    // scan, so the executed scan visits exactly the observed eligible set —
+    // the only scan cardinality this harness can verify. Any other declared
+    // value would label the case with a workload no evidence supports.
+    if (Math.abs(cell.expectedScannedCount - observed.eligibleCount) > SELECTIVITY_ROUNDING_TOLERANCE) {
+        diagnostics.push("selectivity: declared scanned count does not match the verifiable scan");
+    }
     return { ok: diagnostics.length === 0, diagnostics };
 }
 
