@@ -43,6 +43,7 @@ import {
     type JudgmentsArtifact,
     type StructuredAlias,
     type SyntheticProfile,
+    isProducibleNumericLocator,
 } from "./contract";
 import { iterateSyntheticDocuments } from "./synthetic";
 
@@ -248,16 +249,15 @@ const NUMERIC_LOCATOR_KINDS: ReadonlySet<DocumentKind> = new Set([
 ]);
 
 /** Aliases the CURRENT production search path can emit: production namespace
- *  spelling, and a canonical-decimal numeric locator for row-id stores. */
+ *  spelling, and a canonical-decimal numeric locator for row-id stores
+ *  (one shared predicate with corpus validation, so the authoring gate and
+ *  this seeding gate always agree on producibility). */
 export function producibleAliases(document: CorpusDocument): StructuredAlias[] {
     const namespace = SOURCE_LOCATOR_KIND[document.kind];
     return document.aliases.filter((alias) => {
         if (alias.namespace !== namespace) return false;
         if (!NUMERIC_LOCATOR_KINDS.has(document.kind)) return true;
-        // SQLite AUTOINCREMENT ids start at 1, so "0" is not producible: the
-        // cursor advance would set sqlite_sequence to -1 and the emitted row
-        // would come back as id 1, failing locator verification.
-        return /^[1-9]\d*$/.test(alias.locator) && String(Number(alias.locator)) === alias.locator;
+        return isProducibleNumericLocator(alias.locator);
     });
 }
 

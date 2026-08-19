@@ -909,6 +909,9 @@ async function finalizeQueryScenario(
     conn: ConnectionLease,
     state: QueryRunState,
 ): Promise<QueryScenarioOutcome> {
+    // The wall-time budget bounds the whole attempt; diagnostics are not
+    // exempt or a slow evaluation phase could run arbitrarily far past it.
+    checkCaseDeadline(ctx, profileCase);
     const { qctx, queryTouchesMemory } = state;
     if (!state.lastDelivery) {
         throw new RunnerError([`query ${qctx.query.id}: no measured sample`]);
@@ -1084,8 +1087,17 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
     // One connection set shared across the phases: the connections primed
     // and warmed in phase 1 are the ones that measure in phase 2.
     const workerConns = Array.from({ length: profileCase.concurrency }, () => makeWorkerConn());
-    const runPhase = (worker: (conn: ConnectionLease) => Promise<void>): Promise<void[]> =>
-        Promise.all(workerConns.map(({ conn }) => worker(conn)));
+    // allSettled, never all: a worker failing (RunnerInterrupt at the
+    // deadline) must not let the finally below close connections that
+    // sibling workers are still using mid-await. Every worker settles
+    // first; the first failure then propagates.
+    const runPhase = async (worker: (conn: ConnectionLease) => Promise<void>): Promise<void> => {
+        const results = await Promise.allSettled(workerConns.map(({ conn }) => worker(conn)));
+        const failure = results.find(
+            (result): result is PromiseRejectedResult => result.status === "rejected",
+        );
+        if (failure) throw failure.reason;
+    };
 
     try {
         // Phase 1: priming and warmups. Query-level warmups prime the

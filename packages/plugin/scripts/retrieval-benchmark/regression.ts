@@ -130,7 +130,15 @@ const qualityRunSchema = z.strictObject({
     evidenceDigest: fingerprintSchema,
     semanticFingerprint: fingerprintSchema,
     hostFingerprint: fingerprintSchema.nullable(),
-    modes: z.array(modeValuesSchema).min(1),
+    modes: z
+        .array(modeValuesSchema)
+        .min(1)
+        // Downstream lookups resolve a mode by find(); a duplicate entry in
+        // a hand-edited baseline would silently drop every entry after the
+        // first instead of failing loudly here.
+        .refine((modes) => new Set(modes.map((entry) => entry.mode)).size === modes.length, {
+            message: "duplicate mode entries in one run",
+        }),
 });
 
 const qualityBaselineSchema = z.strictObject({

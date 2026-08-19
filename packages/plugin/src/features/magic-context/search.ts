@@ -861,6 +861,11 @@ async function searchMemories(args: {
         ...vectorLoadCounters(memoryLoad),
         candidatesIn: semanticCandidates.length,
         candidatesOut: semanticScores.size,
+        // Same plumbing-identity convention as the top_k span below, so the
+        // candidate-depth assertion covers this lane's scan instead of
+        // skipping a span with no depth evidence.
+        requestedK: args.limit,
+        effectiveK: args.candidateLimit ?? args.limit,
     });
 
     const topKSpan =
@@ -1996,12 +2001,19 @@ export async function unifiedSearch(
     }
     const trimmedQuery = prepared.query;
     const measurementStartedAt = Date.now();
-    // Depth validation and the trace root both precede the empty-query
-    // short-circuit: an invalid candidateDepth must throw for every input,
-    // and a supplied sink must see one root span per call.
-    const candidateDepth = normalizeCandidateDepth(options.candidateDepth);
+    // The trace root precedes depth validation, and both precede the
+    // empty-query short-circuit: an invalid candidateDepth must throw for
+    // every input, and a supplied sink must see one root span per call —
+    // including the call that throws.
     const trace = options.trace ? createSearchTraceRecorder(options.trace) : null;
     const rootSpan = trace?.begin("root", "unified") ?? null;
+    let candidateDepth: number | null;
+    try {
+        candidateDepth = normalizeCandidateDepth(options.candidateDepth);
+    } catch (error) {
+        rootSpan?.end("failed");
+        throw error;
+    }
     if (trimmedQuery.length === 0) {
         rootSpan?.end("ok", { candidatesOut: 0 });
         return [];
