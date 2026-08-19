@@ -2065,14 +2065,11 @@ async function executeUnifiedSearch(args: {
     const runPrimers = activeSources.has("primer") && memoryFeatureEnabled;
     const runNotes = activeSources.has("note");
     const runCompartmentChunks = runMessages && memoryFeatureEnabled && embeddingEnabled;
-    // Workspace resolution is part of filter construction: it performs the
-    // identity/alias/sharing-policy lookups that decide what each lane may
-    // read, so it must fall inside this span and precede its end or the
-    // filtering stage undercounts and drops out of the causal chain.
-    const workspace = resolveSearchWorkspaceContext(db, projectPath);
     filterSpan?.end("ok");
     // Downstream chain roots depend on the filter span so criticalPathMs
-    // includes filter and workspace-resolution cost.
+    // includes filtering cost. Workspace resolution is also filter work,
+    // but its synchronous SQLite reads must not run before the embed fetch
+    // is dispatched; it gets its own span after the dispatch below.
     const filterDeps = filterSpan ? [filterSpan.id] : [];
 
     // Embed the query ONCE at the top — both memory and git-commit searches
@@ -2127,6 +2124,20 @@ async function executeUnifiedSearch(args: {
     // before the embed fetch is processed, and the embedding HTTP request
     // doesn't actually leave the process until we await later.
     await Promise.resolve();
+
+    // Workspace resolution is filter work — the identity/alias/sharing
+    // lookups deciding what the memory lane may read — but placing its
+    // synchronous SQLite reads before the embed dispatch above would delay
+    // the outbound fetch, the exact latency regression the searchMessages
+    // placement below exists to avoid. It runs post-dispatch under its own
+    // filter span; the memory lane's causal chain gates on it.
+    const workspaceSpan =
+        trace?.begin("filter_construction", "unified", {
+            parent: rootId,
+            dependsOn: filterDeps,
+        }) ?? null;
+    const workspace = resolveSearchWorkspaceContext(db, projectPath);
+    workspaceSpan?.end("ok");
 
     // Run the synchronous message-FTS SELECT now that the embed fetch is
     // in flight. Message indexing is event-driven and never runs here;
@@ -2368,7 +2379,7 @@ async function executeUnifiedSearch(args: {
                   trace,
                   rootSpanId: rootId,
                   semanticGateSpanId: semanticDeps.length > 0 ? semanticDeps[0] : null,
-                  filterSpanId: filterSpan?.id ?? null,
+                  filterSpanId: workspaceSpan?.id ?? filterSpan?.id ?? null,
               })
             : Promise.resolve({
                   results: [] as MemorySearchResult[],

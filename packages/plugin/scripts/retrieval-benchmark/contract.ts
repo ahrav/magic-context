@@ -12,6 +12,7 @@ import {
     prepareExplicitQuery,
 } from "../../src/features/magic-context/search-bounds";
 import { SOURCE_LOCATOR_KIND } from "../../src/features/magic-context/search-result-locator";
+import { normalizeMemoryContent } from "../../src/features/magic-context/memory/normalize-hash";
 import { normalizeQueryText } from "../../src/features/magic-context/query-normalization";
 import { parseIdShapedQuery } from "../../src/features/magic-context/search-bounds";
 import {
@@ -321,6 +322,7 @@ export function parseCorpus(value: unknown): CorpusArtifact {
     }
     const documentIds = new Set<string>();
     const documentByIdentity = new Map<string, number>();
+    const memoryByNormalizedContent = new Map<string, number>();
     for (const [i, doc] of corpus.documents.entries()) {
         if (documentIds.has(doc.id)) diagnostics.push(`corpus.documents[${i}].id: duplicate`);
         documentIds.add(doc.id);
@@ -335,6 +337,30 @@ export function parseCorpus(value: unknown): CorpusArtifact {
             diagnostics.push(`corpus.documents[${i}].semanticPayload: duplicate-identity`);
         } else {
             documentByIdentity.set(identity, i);
+        }
+        // The memories table enforces UNIQUE(project_path, category,
+        // normalized_hash), reviewed memories all seed under one category,
+        // and normalization collapses case and whitespace — so two memory
+        // documents that pass the exact-byte identity check above can still
+        // collide at insert time with a raw SQLite constraint error. Reject
+        // the collision here, where it is diagnosable.
+        if (doc.kind === "memory") {
+            const normalized = normalizeMemoryContent(
+                `${doc.semanticPayload.title} ${doc.semanticPayload.body}`,
+            );
+            for (const alias of doc.aliases) {
+                // Only production-producible memory aliases insert rows;
+                // evaluation-only namespaces never reach the table.
+                if (alias.namespace !== SOURCE_LOCATOR_KIND.memory) continue;
+                const key = `${alias.projectScope}\u0000${normalized}`;
+                if (memoryByNormalizedContent.has(key)) {
+                    diagnostics.push(
+                        `corpus.documents[${i}].semanticPayload: duplicate-normalized-memory-content`,
+                    );
+                } else {
+                    memoryByNormalizedContent.set(key, i);
+                }
+            }
         }
     }
     if (diagnostics.length > 0) throw new ContractError(diagnostics.sort());

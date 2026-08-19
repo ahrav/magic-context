@@ -554,9 +554,12 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
         // Keyed by the planned alias, not the document id: a document with
         // several producible aliases seeds one physical compartment per
         // alias, and each needs its own reserved slot and backing message.
+        // Ascending locator order because advanceIdCursor only ever raises
+        // the id cursor — out-of-order writes would emit the wrong
+        // autoincrement ids, exactly as in the other kind loops.
+        const compartmentPlans = byKind("compartment").sort(numericAscending);
         const reservedCompartmentOrdinals = new Map<PlannedAlias, number>();
-        for (const plan of planned) {
-            if (plan.document.kind !== "compartment") continue;
+        for (const plan of compartmentPlans) {
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
             const ordinal = nextOrdinal(sessionId);
             reservedCompartmentOrdinals.set(plan, ordinal);
@@ -586,8 +589,7 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             syntheticCompartments = stream.pendingCompartments;
         }
 
-        for (const plan of planned) {
-            if (plan.document.kind !== "compartment") continue;
+        for (const plan of compartmentPlans) {
             const sessionId = trackSession(plan.alias.projectScope, plan.alias.sessionScope);
             const ordinal = reservedCompartmentOrdinals.get(plan);
             if (ordinal === undefined) {
