@@ -42,6 +42,7 @@ mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
+pub mod smart_note_evaluation;
 mod tail_hygiene;
 pub mod transform;
 
