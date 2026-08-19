@@ -110,6 +110,16 @@ export async function evaluateSmartNotes(
         log("[dreamer] smart notes: no pending notes");
         return { surfaced: 0, pending: 0, ran: false };
     }
+    if (moduleBridge) {
+        // The timer's per-tick sweep (runCompiledSmartNoteSweep) already
+        // drains this bridge before the scheduler dispatches this task.
+        // Draining again in the same pass would issue a second billable
+        // confirmation prompt for any note whose fallback just returned
+        // false, since fallback selection has no next-due gate and the
+        // worker's per-drain suppression does not span drains.
+        log("[dreamer] smart notes: module bridge owns drains; synced only");
+        return { surfaced: 0, pending: pendingAtStart, ran: false };
+    }
 
     let leaseLost = false;
     const leaseAbortController = new AbortController();
@@ -137,20 +147,6 @@ export async function evaluateSmartNotes(
     let surfaced = 0;
     let didWork = false;
     try {
-        if (moduleBridge) {
-            assertLeaseHeld("module drain start");
-            const drained = await moduleBridge.drain({
-                deadline: args.deadline,
-                signal: leaseAbortController.signal,
-            });
-            surfaced += drained.surfaced;
-            didWork = drained.claimed > 0;
-            const pending = pendingNotes().length;
-            log(
-                `[dreamer] smart notes: module drain claimed=${drained.claimed} completed=${drained.completed} surfaced=${drained.surfaced} remaining=${pending}`,
-            );
-            return { surfaced, pending, ran: didWork };
-        }
         const dueRun = await runDueCompiledSmartNoteChecks({
             db: args.db,
             projectIdentity: args.projectIdentity,

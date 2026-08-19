@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { log as defaultLog } from "../../../shared/logger";
 import type { SmartNoteEvaluationOutcome } from "./evaluation-state";
+import { MAX_COMPILE_PER_RUN, MAX_FALLBACK_PER_RUN } from "./evaluation-state";
 import {
     evaluateSmartNotePhase,
     type SmartNotePhaseExecutors,
@@ -118,6 +119,8 @@ export class SmartNoteEvaluatorWorker {
     private activeClaimController: AbortController | null = null;
     /** Settlement of the claim currently executing; never rejects. */
     private activeClaimSettled: Promise<void> | null = null;
+    /** Tail of the drain queue; drains run strictly one at a time. */
+    private drainChain: Promise<void> = Promise.resolve();
 
     constructor(deps: SmartNoteEvaluatorWorkerDeps) {
         this.deps = deps;
@@ -293,6 +296,26 @@ export class SmartNoteEvaluatorWorker {
      * no_work, the deadline passes, or the signal aborts.
      */
     async drainOnce(args: { deadline: number; signal?: AbortSignal }): Promise<DrainResult> {
+        // Serialize drains: the timer sweep, the scheduled dreamer task, and a
+        // manual /ctx-dream can all reach this worker concurrently, and the
+        // acquisition id, evaluator slot 0, and active-claim fields are shared
+        // per-instance state. Interleaved drains would replay one durable
+        // claim into two executors.
+        const run = this.drainChain.then(
+            () => this.drainOnceExclusive(args),
+            () => this.drainOnceExclusive(args),
+        );
+        this.drainChain = run.then(
+            () => undefined,
+            () => undefined,
+        );
+        return run;
+    }
+
+    private async drainOnceExclusive(args: {
+        deadline: number;
+        signal?: AbortSignal;
+    }): Promise<DrainResult> {
         const result: DrainResult = {
             claimed: 0,
             completed: 0,
@@ -308,6 +331,13 @@ export class SmartNoteEvaluatorWorker {
         // so the authority re-selects the same note on the very next poll. One
         // confirmation prompt per note per drain bounds the billable loop.
         const fallbackAttempted = new Set<number>();
+        // The authority's per-poll selection caps only truncate one candidate
+        // list; each subsequent poll admits the next note. Enforce the same
+        // caps across the whole drain so one pass launches at most
+        // MAX_COMPILE_PER_RUN compiler prompts and MAX_FALLBACK_PER_RUN
+        // confirmation prompts, matching the legacy sweep's per-run bounds.
+        let compileClaims = 0;
+        let fallbackClaims = 0;
         for (let i = 0; i < MAX_CLAIMS_PER_DRAIN; i++) {
             if (this.disposed || args.signal?.aborted || Date.now() >= args.deadline) break;
             const next = await this.next(args.signal);
@@ -318,11 +348,23 @@ export class SmartNoteEvaluatorWorker {
             if (next === "retry") continue;
             if (next === "stop") break;
             result.claimed += 1;
-            if (next.snapshot.phase === "fallback") {
-                if (fallbackAttempted.has(next.noteId)) {
+            if (next.snapshot.phase === "compile") {
+                compileClaims += 1;
+                if (compileClaims > MAX_COMPILE_PER_RUN) {
                     this.lastAbandonReleased = await this.abandon(
                         next.claimId,
-                        "fallback already attempted this drain",
+                        "compile cap reached this drain",
+                    );
+                    result.abandoned += 1;
+                    break;
+                }
+            }
+            if (next.snapshot.phase === "fallback") {
+                fallbackClaims += 1;
+                if (fallbackClaims > MAX_FALLBACK_PER_RUN || fallbackAttempted.has(next.noteId)) {
+                    this.lastAbandonReleased = await this.abandon(
+                        next.claimId,
+                        "fallback cap reached this drain",
                     );
                     result.abandoned += 1;
                     break;

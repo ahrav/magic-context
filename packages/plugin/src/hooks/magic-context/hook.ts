@@ -941,11 +941,24 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // down only these: the registry is process-global and Desktop hosts several
     // plugin instances in one process.
     const ownedBridgeProjects = new Set<string>();
+    // The bridge runs the same task as the scheduled evaluate-smart-notes
+    // sweep, so its LLM helpers follow the same model ladder (task override →
+    // dreamer model, with the configured fallback chain).
+    const evaluatorTaskConfig = dreamerConfig
+        ? buildDreamTaskRuntimeConfigs(dreamerConfig).find(
+              (config) => config.task === "evaluate-smart-notes",
+          )
+        : undefined;
     const ensureModuleNoteEvaluationBridge = (
         bridgeProjectPath: string,
         bridgeProjectRoot: string,
     ): void => {
         if (!rustModeModuleClient?.mirrorPull || !evaluatorTransport) return;
+        // A disabled dreamer schedules no drains: an advertised evaluator with
+        // no drain path would accept conditioned notes that then sit pending
+        // forever. Without a registration the live-evaluator gate fails closed
+        // at write time instead.
+        if (!dreamerRunnable) return;
         if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
         // The module derives evaluator scope from the server-side route root,
         // and filesystem capabilities resolve against the checkout, so both
@@ -981,6 +994,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                         parentSessionId: undefined,
                         sessionDirectory: bridgeProjectRoot,
                         projectIdentity: bridgeProjectPath,
+                        model: evaluatorTaskConfig?.model,
+                        fallbackModels: evaluatorTaskConfig?.fallbackModels,
                         note: {
                             id: snapshot.noteId,
                             content: snapshot.content,
@@ -1004,6 +1019,8 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                         parentSessionId: undefined,
                         sessionDirectory: bridgeProjectRoot,
                         projectIdentity: bridgeProjectPath,
+                        model: evaluatorTaskConfig?.model,
+                        fallbackModels: evaluatorTaskConfig?.fallbackModels,
                         deadline,
                         noteId: snapshot.noteId,
                         content: snapshot.content,

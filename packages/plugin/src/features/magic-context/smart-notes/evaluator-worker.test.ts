@@ -335,6 +335,81 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         expect(artifact.check_hash).toBe("h".repeat(64));
         await w.dispose();
     });
+
+    test("a drain stops issuing compiler prompts at the per-run cap", async () => {
+        // The authority's MAX_COMPILE_PER_RUN truncates one selection poll;
+        // each subsequent poll admits the next candidate, so the worker owns
+        // the whole-drain bound.
+        let served = 0;
+        const { transport, calls } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                return claimResponse(served, "compile");
+            }
+            if (method === "note.evaluation.complete") return { result: "applied" };
+            if (method === "note.evaluation.abandon") return { result: "abandoned" };
+            return { ok: true };
+        });
+        let compiles = 0;
+        const w = worker(
+            transport,
+            passthroughExecutors({
+                compile: () => {
+                    compiles += 1;
+                    return Promise.resolve({
+                        ok: true,
+                        compiledCheck: "function check() { return { met: false }; }",
+                        manifest: { capabilities: [] },
+                        checkCron: "0 * * * *",
+                        checkHash: "h".repeat(64),
+                        dryRun: { met: false },
+                    });
+                },
+            }),
+        );
+        const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
+        expect(compiles).toBe(5);
+        expect(result.completed).toBe(5);
+        expect(result.abandoned).toBe(1);
+        expect(calls.filter((c) => c.method === "note.evaluation.abandon")).toHaveLength(1);
+        await w.dispose();
+    });
+
+    test("concurrent drain calls run one at a time", async () => {
+        let served = 0;
+        let releaseClaim: (() => void) | undefined;
+        const { transport, calls } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                return served === 1 ? claimResponse(1, "due") : { result: "no_work" };
+            }
+            if (method === "note.evaluation.complete") return { result: "applied" };
+            return { ok: true };
+        });
+        const w = worker(
+            transport,
+            passthroughExecutors({
+                runCompiled: () =>
+                    new Promise((resolve) => {
+                        releaseClaim = () => resolve({ ok: true, result: { met: true } });
+                    }),
+            }),
+        );
+        const first = w.drainOnce({ deadline: Date.now() + 30_000 });
+        const second = w.drainOnce({ deadline: Date.now() + 30_000 });
+        // Let the first drain claim and block inside its executor; the second
+        // drain must not poll while the first still owns the slot.
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const nextsWhileBlocked = calls.filter((c) => c.method === "note.evaluation.next").length;
+        expect(nextsWhileBlocked).toBe(1);
+        releaseClaim?.();
+        const [a, b] = await Promise.all([first, second]);
+        expect(a.completed).toBe(1);
+        expect(b.drained).toBe(true);
+        await w.dispose();
+    });
 });
 
 /**
