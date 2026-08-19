@@ -1371,7 +1371,8 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
              check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
              check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
              check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
-             policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
+             policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ?,
+             source_revision = ?, state_version = ? WHERE id = ?`,
         ),
         upsertNoteRevision: db.prepare(
             "INSERT OR REPLACE INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?)",
@@ -2008,6 +2009,11 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
         typeof effectiveRow.anchor_ordinal === "number" ? effectiveRow.anchor_ordinal : null,
         rowNumber(effectiveRow, "created_at_ms"),
         rowNumber(effectiveRow, "updated_at_ms"),
+        // The evaluator fences claims and compile artifacts on these counters;
+        // dropping them from the mirror would rewind revisions on a drain back
+        // to TypeScript or a reseed into the module.
+        rowNumber(effectiveRow, "source_revision"),
+        rowNumber(effectiveRow, "state_version"),
         contextId,
     );
     statements.upsertNoteRevision.run(

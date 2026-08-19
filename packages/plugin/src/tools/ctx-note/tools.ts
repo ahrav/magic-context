@@ -323,18 +323,24 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 if (!rustNote || !projectIdentity) {
                     return "Error: Rust notes authority is active, but this module transport does not support ctx_note.";
                 }
+                const commandId = toolCallIdFromContext(toolContext);
                 let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
                 if ((action === "write" || action === "update") && surfaceCondition) {
                     if (
-                        deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) !== true
+                        deps.rustToolBackends?.noteEvaluationAvailable?.(projectIdentity) === true
                     ) {
+                        compilation = await compileSurfaceCondition(surfaceCondition, {
+                            projectPath: toolContext.directory,
+                        });
+                    } else if (!commandId) {
                         return "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.";
                     }
-                    compilation = await compileSurfaceCondition(surfaceCondition, {
-                        projectPath: toolContext.directory,
-                    });
+                    // An identified request goes through without compilation:
+                    // the module replays a committed command's recorded
+                    // response from its ledger and refuses a first-time
+                    // mutation with this same message. Failing here would make
+                    // a lost-response retry report the note as unwritten.
                 }
-                const commandId = toolCallIdFromContext(toolContext);
                 const request: RustNoteToolRequest = {
                     ...(commandId ? { commandId } : {}),
                     sessionId,

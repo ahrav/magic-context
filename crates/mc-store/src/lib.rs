@@ -13536,21 +13536,26 @@ impl McStore {
                     current: Some(current),
                 });
             }
-            let condition_changed = surface_condition.is_some();
             let next_condition = surface_condition
                 .flatten()
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
+            let current_condition = current
+                .surface_condition
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            // Presence alone is not an edit: an update that re-supplies the
+            // existing condition unchanged must not invalidate the compiled
+            // artifact, reset a ready note to pending, or fence active claims.
+            let condition_changed =
+                surface_condition.is_some() && next_condition != current_condition;
             let content_changed = next_content != current.content;
             let compiler_edit = condition_changed || content_changed;
             let remaining_condition = if condition_changed {
                 next_condition
             } else {
-                current
-                    .surface_condition
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
+                current_condition
             };
             let next_status = if compiler_edit && remaining_condition.is_some() {
                 "pending"
@@ -23918,6 +23923,87 @@ mod tests {
             .search_notes_like("git:other", "ses", "pagination")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn note_update_with_unchanged_condition_is_not_a_compiler_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("writer-session"),
+                content: "wait for the release",
+                surface_condition: Some("release exists"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 10,
+            })
+            .unwrap();
+        let claimed = store.claim_due_note("git:proj", 20).unwrap().unwrap();
+        let ready = match store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: claimed.status_version,
+                verdict: true,
+                compiled_check: Some("release exists"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: None,
+                now_ms: 30,
+            })
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected evaluation outcome: {other:?}"),
+        };
+        assert!(ready.compiled_check.is_some());
+
+        let unchanged = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                &ready.status,
+                ready.status_version,
+                None,
+                Some(Some("  release exists  ")),
+                None,
+                40,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected unchanged-condition outcome: {other:?}"),
+        };
+        assert_eq!(unchanged.status, ready.status);
+        assert_eq!(unchanged.source_revision, ready.source_revision);
+        assert_eq!(unchanged.compiled_check, ready.compiled_check);
+
+        let changed = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                &unchanged.status,
+                unchanged.status_version,
+                None,
+                Some(Some("release tagged")),
+                None,
+                50,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected changed-condition outcome: {other:?}"),
+        };
+        assert_eq!(changed.status, "pending");
+        assert_eq!(changed.source_revision, unchanged.source_revision + 1);
+        assert!(changed.compiled_check.is_none());
     }
 
     #[test]

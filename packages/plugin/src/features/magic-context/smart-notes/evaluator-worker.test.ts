@@ -126,6 +126,40 @@ describe("SmartNoteEvaluatorWorker registration", () => {
         const unregister = calls.find((c) => c.method === "note.evaluation.unregister");
         expect(unregister?.body.token).toBe("tok-1");
     });
+
+    test("republishes a policy that changed while registration was in flight", async () => {
+        const policy = { retinaHandoff: false, wakeOwned: false };
+        let releaseRegister: ((value: unknown) => void) | undefined;
+        const calls: RecordedCall[] = [];
+        const transport: EvaluatorWorkerTransport = {
+            call({ method, body }) {
+                calls.push({ method, body: body as Record<string, unknown> });
+                if (method === "note.evaluation.register") {
+                    return new Promise((resolve) => {
+                        releaseRegister = resolve;
+                    });
+                }
+                return Promise.resolve({ ok: true });
+            },
+        };
+        const w = new SmartNoteEvaluatorWorker({
+            transport,
+            executors: passthroughExecutors(),
+            policy: () => ({ ...policy }),
+            log: () => {},
+        });
+        const registering = w.register();
+        // A drain observes the wake plane while the eager registration is
+        // still in flight; joiners share the attempt and its stale snapshot.
+        policy.wakeOwned = true;
+        releaseRegister?.(REGISTER_OK);
+        expect(await registering).toBe(true);
+        const register = calls.find((c) => c.method === "note.evaluation.register");
+        expect(register?.body.wake_owned).toBe(false);
+        const heartbeat = calls.find((c) => c.method === "note.evaluation.heartbeat");
+        expect(heartbeat?.body.wake_owned).toBe(true);
+        await w.dispose();
+    });
 });
 
 describe("SmartNoteEvaluatorWorker drain", () => {

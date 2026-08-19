@@ -248,6 +248,17 @@ export class SmartNoteEvaluatorWorker {
         };
         this.lastAbandonReleased = true;
         this.startHeartbeat();
+        // Callers that joined this attempt (register() shares one in-flight
+        // promise) may have changed the policy after the registration request
+        // captured its snapshot. Republish so the module does not hold a stale
+        // wake/retina policy until the periodic heartbeat.
+        const current = this.deps.policy();
+        if (
+            current.wakeOwned !== policy.wakeOwned ||
+            current.retinaHandoff !== policy.retinaHandoff
+        ) {
+            await this.heartbeat();
+        }
         return true;
     }
 
