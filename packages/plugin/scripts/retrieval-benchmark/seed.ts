@@ -519,6 +519,14 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
             ensureMessagesIndexed(db, sessionId, () => messages);
         }
 
+        // Production helpers stamp wall-clock bookkeeping columns that the
+        // seed manifest does not represent; pin them so identical seeds
+        // produce identical snapshot bytes under one manifest fingerprint.
+        db.prepare("UPDATE git_commits SET indexed_at = ?").run(SEED_EPOCH_MS);
+        db.prepare("UPDATE git_commit_embeddings SET created_at = ?").run(SEED_EPOCH_MS);
+        db.prepare("UPDATE message_history_index SET updated_at = ?").run(SEED_EPOCH_MS);
+        db.prepare("UPDATE message_history_source SET updated_at = ?").run(SEED_EPOCH_MS);
+
         if (diagnostics.length > 0) throw new SeedError(diagnostics.sort());
         validatePositiveTargets(release, entries);
 

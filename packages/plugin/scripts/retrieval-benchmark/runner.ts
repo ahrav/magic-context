@@ -28,7 +28,7 @@
 
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { cpus, totalmem } from "node:os";
+import { cpus, hostname, totalmem } from "node:os";
 import { join } from "node:path";
 
 import { executeAutoSearchDelivery } from "../../src/hooks/magic-context/auto-search-runner";
@@ -117,6 +117,10 @@ const BUILD_SOURCE_DIRS = [
     "src/shared",
 ] as const;
 const BUILD_SOURCE_FILES = ["scripts/benchmark-retrieval.ts"] as const;
+/** Dependency identity, relative to the workspace root: a lockfile change
+ *  (tokenizer, sqlite driver) alters measured behavior without touching
+ *  any hashed TypeScript path, so it must invalidate checkpoints too. */
+const BUILD_DEPENDENCY_FILES = ["bun.lock", "packages/plugin/package.json"] as const;
 
 let cachedBuildFingerprint: string | null = null;
 
@@ -129,19 +133,21 @@ let cachedBuildFingerprint: string | null = null;
 function buildFingerprint(): string {
     if (cachedBuildFingerprint !== null) return cachedBuildFingerprint;
     const packageRoot = new URL("../../", import.meta.url).pathname;
+    const workspaceRoot = new URL("../../../../", import.meta.url).pathname;
     const fileHashes: Record<string, string> = {};
-    const hashFile = (relPath: string): void => {
-        const bytes = readFileSync(join(packageRoot, relPath));
+    const hashFile = (root: string, relPath: string): void => {
+        const bytes = readFileSync(join(root, relPath));
         fileHashes[relPath] = createHash("sha256").update(bytes).digest("hex");
     };
-    for (const relPath of BUILD_SOURCE_FILES) hashFile(relPath);
+    for (const relPath of BUILD_SOURCE_FILES) hashFile(packageRoot, relPath);
+    for (const relPath of BUILD_DEPENDENCY_FILES) hashFile(workspaceRoot, relPath);
     for (const dir of BUILD_SOURCE_DIRS) {
         for (const entry of readdirSync(join(packageRoot, dir), { recursive: true })) {
             const normalized = String(entry).replaceAll("\\", "/");
             if (!normalized.endsWith(".ts")) continue;
             if (normalized.endsWith(".test.ts")) continue;
             if (normalized.includes("__fixtures__")) continue;
-            hashFile(`${dir}/${normalized}`);
+            hashFile(packageRoot, `${dir}/${normalized}`);
         }
     }
     cachedBuildFingerprint = canonicalFingerprint(fileHashes);
@@ -287,6 +293,10 @@ function hostFingerprint(): string {
         // Runs under different runtimes are not latency-comparable, so the
         // runtime version participates in host identity.
         runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.version}`,
+        // Hardware-class attributes alone collide across same-spec machines
+        // in a runner group; the hostname pins the actual machine so
+        // exact-host latency checks cannot mix physical hosts.
+        hostname: hostname(),
     });
 }
 
@@ -405,6 +415,12 @@ class CaseCacheController {
             this.processVector.status !== "not-applicable" &&
             this.processVector.declared === "warm"
         ) {
+            // The process vector cache keys on (projectScope, modelId),
+            // which every fixture shares: without this invalidation a warm
+            // case can inherit the PREVIOUS fixture's vectors (wrong dims)
+            // through the cache TTL and score every cosine at zero. Cold
+            // cases invalidate before every measured sample instead.
+            this.cache.invalidateProcessVector(this.ctx.projectScope);
             this.cache.primeProcessVector(db, this.ctx.projectScope, this.ctx.modelId);
             this.verifyWarmProcessVector("case-start");
         }

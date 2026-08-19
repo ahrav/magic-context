@@ -303,7 +303,19 @@ describe("cache-layer lifecycle (scenario 4)", () => {
             const coldLayers = new Map(cold?.cacheLayers.map((l) => [l.layer, l]));
             const coldResets = coldLayers.get("processVector")?.resets ?? 0;
             expect(coldResets).toBeGreaterThan(0);
-            expect(invalidated.length).toBe(coldResets);
+            // Cold cases invalidate once per measured sample; warm cases
+            // with an active memory lane invalidate once at case start (the
+            // stale-fixture guard before priming), which the layer records
+            // as a verification path, not a reset.
+            const warmStartInvalidations = result.report.evidence.cases.filter((c) =>
+                c.cacheLayers.some(
+                    (l) =>
+                        l.layer === "processVector" &&
+                        l.declared === "warm" &&
+                        l.status === "verified",
+                ),
+            ).length;
+            expect(invalidated.length).toBe(coldResets + warmStartInvalidations);
             expect(coldLayers.get("connectionStatement")?.mechanism).toBe(
                 "fresh-read-only-connection-per-sample",
             );
