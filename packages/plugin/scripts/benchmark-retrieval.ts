@@ -13,9 +13,9 @@
  *   3  structurally invalid evidence / A/A mechanical failure
  */
 
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { ContractError, loadReviewedRelease } from "./retrieval-benchmark";
 import { AUDIT_CELL, type BenchmarkProfile, loadProfileFile } from "./retrieval-benchmark/profiles";
@@ -60,8 +60,17 @@ check / matrix options:
   --profile <name|path>     Profile name under scripts/fixtures/retrieval-benchmark/profiles/v1
                             or a path to a profile JSON file (check default: ci).
   --release <dir>           Reviewed release directory (default: scripts/fixtures/retrieval-benchmark/v1).
-  --work-dir <dir>          Scratch directory for fixture databases (default: a fresh temp dir).
+  --release-fingerprint <sha256>
+                            Trusted manifest fingerprint for a custom --release directory
+                            (required with --release: a release directory cannot
+                            authenticate its own approval records).
+  --work-dir <dir>          Scratch directory for fixture databases (default: a fresh temp
+                            dir, removed after the run; explicit directories are kept).
   --checkpoint-dir <dir>    Persistent checkpoint directory; enables compatible resume (matrix).
+  --evict-os-page-cache <executable>
+                            Privileged OS page-cache eviction hook for osPage=cold cases on
+                            reference hosts; invoked as "<executable> <snapshot-path>" and its
+                            stdout is recorded as the eviction proof.
   --out <file>              Write the validated report to this path instead of stdout.
   --candidate-pool <file>   Also write the versioned unjudged candidate-pool artifact.
 
@@ -94,8 +103,10 @@ interface CliArgs {
     command: "check" | "matrix";
     profile: string;
     releaseDir: string;
+    releaseFingerprint: string | null;
     workDir: string | null;
     checkpointDir: string | null;
+    evictOsPageCacheCommand: string | null;
     outPath: string | null;
     candidatePoolPath: string | null;
 }
@@ -143,8 +154,10 @@ function parseArgs(command: "check" | "matrix", rest: string[]): CliArgs {
         single: [
             "--profile",
             "--release",
+            "--release-fingerprint",
             "--work-dir",
             "--checkpoint-dir",
+            "--evict-os-page-cache",
             "--out",
             "--candidate-pool",
         ],
@@ -153,13 +166,24 @@ function parseArgs(command: "check" | "matrix", rest: string[]): CliArgs {
         command,
         profile: flags.single.get("--profile") ?? (command === "check" ? "ci" : ""),
         releaseDir: flags.single.get("--release") ?? DEFAULT_RELEASE_DIR,
+        releaseFingerprint: flags.single.get("--release-fingerprint") ?? null,
         workDir: flags.single.get("--work-dir") ?? null,
         checkpointDir: flags.single.get("--checkpoint-dir") ?? null,
+        evictOsPageCacheCommand: flags.single.get("--evict-os-page-cache") ?? null,
         outPath: flags.single.get("--out") ?? null,
         candidatePoolPath: flags.single.get("--candidate-pool") ?? null,
     };
     if (args.profile.length === 0) {
         throw new RunnerError(["usage: matrix requires --profile"]);
+    }
+    // The default release directory ships in reviewed source; any other
+    // directory needs a trust anchor from outside itself because approval
+    // records inside it cannot authenticate themselves.
+    if (
+        args.releaseFingerprint === null &&
+        resolve(args.releaseDir) !== resolve(DEFAULT_RELEASE_DIR)
+    ) {
+        throw new RunnerError(["usage: a custom --release requires --release-fingerprint"]);
     }
     return args;
 }
@@ -251,6 +275,17 @@ async function runBaselineCreate(rest: string[]): Promise<void> {
             "usage: baseline-create --kind latency requires --host-class arm-neon|x86-avx2",
         ]);
     }
+    // The reports carry their profile's host class; a mismatched --host-class
+    // would publish a mislabeled latency baseline that host-fingerprint
+    // checks alone cannot catch.
+    for (const [index, report] of reports.entries()) {
+        const reportHostClass = (report.semantic.config as Record<string, unknown>).hostClass;
+        if (reportHostClass !== hostClass) {
+            throw new RunnerError([
+                `usage: --host-class ${hostClass} does not match run ${index + 1} hostClass ${JSON.stringify(reportHostClass ?? null)}`,
+            ]);
+        }
+    }
     const hostEvidence = requireThree(
         "--host-evidence",
         flags.repeated.get("--host-evidence"),
@@ -331,6 +366,11 @@ async function runRegression(rest: string[]): Promise<void> {
         candidateHostEvidence: HostEvidence[];
     } | null = null;
     const latencyBaselinePath = flags.single.get("--latency-baseline");
+    if (!latencyBaselinePath && flags.repeated.has("--host-evidence")) {
+        // Silently dropping the evidence would yield a quality-only verdict
+        // indistinguishable from an intended one.
+        throw new RunnerError(["usage: --host-evidence requires --latency-baseline"]);
+    }
     if (latencyBaselinePath) {
         const latencyBaseline = loadBaselineFile(latencyBaselinePath);
         if (latencyBaseline.kind !== "latency") {
@@ -368,13 +408,39 @@ async function runRegression(rest: string[]): Promise<void> {
     process.exitCode = regressionExitCode(result.verdict, result.gate.unblocked);
 }
 
+function evictOsPageCacheHook(command: string): (snapshotPath: string) => {
+    attempted: boolean;
+    proof: string | null;
+} {
+    return (snapshotPath) => {
+        const result = Bun.spawnSync([command, snapshotPath], {
+            stdout: "pipe",
+            stderr: "pipe",
+        });
+        if (result.exitCode !== 0) {
+            const stderr = result.stderr.toString().trim();
+            throw new RunnerError([
+                `os-page eviction command failed (exit ${result.exitCode})${stderr ? `: ${stderr}` : ""}`,
+            ]);
+        }
+        const proof = result.stdout.toString().trim();
+        return { attempted: true, proof: proof.length > 0 ? proof : "eviction-command-ok" };
+    };
+}
+
 async function runCheckOrMatrix(command: "check" | "matrix", rest: string[]): Promise<void> {
     const args = parseArgs(command, rest);
     const profile = loadProfileFile(resolveProfilePath(args.profile));
     if (args.command === "check" && profile.host.class !== "ci") {
         throw new RunnerError(["usage: check runs CI-class profiles only; use matrix"]);
     }
-    const release = loadReviewedRelease(args.releaseDir);
+    const release = loadReviewedRelease(
+        args.releaseDir,
+        args.releaseFingerprint === null
+            ? {}
+            : { expectedManifestFingerprint: args.releaseFingerprint },
+    );
+    const createdTempWorkDir = args.workDir === null;
     const workDir = args.workDir ?? mkdtempSync(join(tmpdir(), "retrieval-benchmark-"));
 
     console.error(`[benchmark-retrieval] ${args.command} profile=${profile.id}`);
@@ -384,49 +450,66 @@ async function runCheckOrMatrix(command: "check" | "matrix", rest: string[]): Pr
         console.error(`[benchmark-retrieval] checkpointDir=${args.checkpointDir}`);
     }
 
-    const result = await runBenchmark({
-        release,
-        profile,
-        workDir,
-        ...(args.checkpointDir ? { checkpointDir: args.checkpointDir } : {}),
-    });
-    for (const line of result.diagnostics) {
-        console.error(`[benchmark-retrieval] ${line}`);
-    }
-    console.error(
-        `[benchmark-retrieval] status=${result.report.status} scenarios=${result.report.evidence.scenarios.length} cases=${result.report.evidence.cases.length}`,
-    );
-    console.error(`[benchmark-retrieval] semanticFingerprint=${result.semanticFingerprint}`);
-    console.error(`[benchmark-retrieval] evidenceDigest=${result.evidenceDigest}`);
-
-    const reportJson = `${JSON.stringify(result.report, null, 2)}\n`;
-    if (args.candidatePoolPath) {
-        await Bun.write(
-            args.candidatePoolPath,
-            `${JSON.stringify(result.candidatePool, null, 2)}\n`,
+    try {
+        const result = await runBenchmark({
+            release,
+            profile,
+            workDir,
+            ...(args.checkpointDir ? { checkpointDir: args.checkpointDir } : {}),
+            ...(args.evictOsPageCacheCommand
+                ? {
+                      hooks: {
+                          cache: {
+                              evictOsPageCache: evictOsPageCacheHook(
+                                  args.evictOsPageCacheCommand,
+                              ),
+                          },
+                      },
+                  }
+                : {}),
+        });
+        for (const line of result.diagnostics) {
+            console.error(`[benchmark-retrieval] ${line}`);
+        }
+        console.error(
+            `[benchmark-retrieval] status=${result.report.status} scenarios=${result.report.evidence.scenarios.length} cases=${result.report.evidence.cases.length}`,
         );
-        console.error(`[benchmark-retrieval] candidatePool=${args.candidatePoolPath}`);
-    }
-    if (args.outPath) {
-        await Bun.write(args.outPath, reportJson);
-        console.log(
-            JSON.stringify(
-                {
-                    reportPath: args.outPath,
-                    status: result.report.status,
-                    semanticFingerprint: result.semanticFingerprint,
-                    evidenceDigest: result.evidenceDigest,
-                },
-                null,
-                2,
-            ),
-        );
-    } else {
-        console.log(reportJson.trimEnd());
-    }
+        console.error(`[benchmark-retrieval] semanticFingerprint=${result.semanticFingerprint}`);
+        console.error(`[benchmark-retrieval] evidenceDigest=${result.evidenceDigest}`);
 
-    if (result.report.status === "incomplete") process.exitCode = 2;
-    else if (result.report.status === "invalid") process.exitCode = 3;
+        const reportJson = `${JSON.stringify(result.report, null, 2)}\n`;
+        if (args.candidatePoolPath) {
+            await Bun.write(
+                args.candidatePoolPath,
+                `${JSON.stringify(result.candidatePool, null, 2)}\n`,
+            );
+            console.error(`[benchmark-retrieval] candidatePool=${args.candidatePoolPath}`);
+        }
+        if (args.outPath) {
+            await Bun.write(args.outPath, reportJson);
+            console.log(
+                JSON.stringify(
+                    {
+                        reportPath: args.outPath,
+                        status: result.report.status,
+                        semanticFingerprint: result.semanticFingerprint,
+                        evidenceDigest: result.evidenceDigest,
+                    },
+                    null,
+                    2,
+                ),
+            );
+        } else {
+            console.log(reportJson.trimEnd());
+        }
+
+        if (result.report.status === "incomplete") process.exitCode = 2;
+        else if (result.report.status === "invalid") process.exitCode = 3;
+    } finally {
+        // A caller-supplied --work-dir is the caller's to keep; the
+        // harness only removes the temp directory it created itself.
+        if (createdTempWorkDir) rmSync(workDir, { recursive: true, force: true });
+    }
 }
 
 async function main(): Promise<void> {

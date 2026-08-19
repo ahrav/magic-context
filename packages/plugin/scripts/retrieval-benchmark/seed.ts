@@ -195,7 +195,10 @@ export function producibleAliases(document: CorpusDocument): StructuredAlias[] {
     return document.aliases.filter((alias) => {
         if (alias.namespace !== namespace) return false;
         if (!NUMERIC_LOCATOR_KINDS.has(document.kind)) return true;
-        return /^\d+$/.test(alias.locator) && String(Number(alias.locator)) === alias.locator;
+        // SQLite AUTOINCREMENT ids start at 1, so "0" is not producible: the
+        // cursor advance would set sqlite_sequence to -1 and the emitted row
+        // would come back as id 1, failing locator verification.
+        return /^[1-9]\d*$/.test(alias.locator) && String(Number(alias.locator)) === alias.locator;
     });
 }
 

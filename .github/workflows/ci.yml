@@ -156,8 +156,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [check-plugin]
     timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -174,12 +178,15 @@ jobs:
             --out benchmark-artifacts/retrieval-check-report.json \
             --candidate-pool benchmark-artifacts/retrieval-candidate-pool.json
 
+      # The CLI writes the report before it sets a failing exit code, so a
+      # failed check still produces the artifact that explains the failure.
       - name: Archive report and candidate pool
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: retrieval-benchmark-ci
           path: benchmark-artifacts/
-          if-no-files-found: error
+          if-no-files-found: warn
 
   e2e-opencode:
     name: E2E (OpenCode, Docker)

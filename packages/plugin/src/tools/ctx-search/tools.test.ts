@@ -600,9 +600,9 @@ describe("executeCtxSearch", () => {
             throw new Error("search lane exploded");
         });
         try {
-            expect(executeCtxSearch(deps(), { query: "boom" }, toolContext())).rejects.toThrow(
-                "search lane exploded",
-            );
+            await expect(
+                executeCtxSearch(deps(), { query: "boom" }, toolContext()),
+            ).rejects.toThrow("search lane exploded");
         } finally {
             spy.mockRestore();
         }

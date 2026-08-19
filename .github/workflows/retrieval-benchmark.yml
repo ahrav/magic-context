@@ -14,13 +14,21 @@ on:
   schedule:
     - cron: "17 3 * * 1"
 
+# These jobs run repository code on self-hosted runners, so they get no
+# token scopes beyond reading the checkout.
+permissions:
+  contents: read
+
 jobs:
   reference-arm-neon:
     name: Reference host (ARM64/NEON, arm-neon profile)
+    # Manual dispatch is restricted to the default branch: a self-hosted
+    # runner executing an arbitrary pushed ref is arbitrary code execution
+    # as the runner account.
     if: >-
       github.event_name == 'schedule' ||
-      inputs.profile == 'arm-neon' ||
-      inputs.profile == 'both'
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+       (inputs.profile == 'arm-neon' || inputs.profile == 'both'))
     runs-on: [self-hosted, ARM64]
     concurrency:
       group: retrieval-benchmark-arm-neon
@@ -28,6 +36,8 @@ jobs:
     timeout-minutes: 900
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -44,10 +54,13 @@ jobs:
             exit 1
           fi
 
-      - name: Record host evidence
+      # Diagnostic notes only. The strict --host-evidence artifact is an
+      # operator attestation (run lock, canary, affinity/NUMA/power/cache
+      # state) produced out of band; nothing here masquerades as it.
+      - name: Record host notes
         run: |
           mkdir -p benchmark-artifacts
-          uname -a > benchmark-artifacts/host-evidence.txt
+          uname -a > benchmark-artifacts/host-notes.txt
           bun -e '
             const os = require("node:os");
             console.log(JSON.stringify({
@@ -55,14 +68,16 @@ jobs:
               platform: process.platform,
               cpus: os.cpus().map((c) => c.model),
               totalMemoryBytes: os.totalmem(),
+              bunVersion: Bun.version,
             }, null, 2));
-          ' >> benchmark-artifacts/host-evidence.txt
+          ' >> benchmark-artifacts/host-notes.txt
 
       - name: Run matrix (three complete runs)
         run: |
           for run in 1 2 3; do
             bun packages/plugin/scripts/benchmark-retrieval.ts matrix \
               --profile arm-neon \
+              --evict-os-page-cache packages/plugin/scripts/retrieval-benchmark/evict-os-page-cache.sh \
               --out "benchmark-artifacts/run-$run-report.json" \
               --candidate-pool "benchmark-artifacts/run-$run-pool.json"
           done
@@ -82,20 +97,20 @@ jobs:
             --candidate benchmark-artifacts/run-3-report.json \
             --out benchmark-artifacts/regression.json
 
-      - name: Archive reports and host evidence
+      - name: Archive reports and host notes
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: retrieval-benchmark-arm-neon
           path: benchmark-artifacts/
-          if-no-files-found: error
+          if-no-files-found: warn
 
   reference-x86-avx2:
     name: Reference host (X64/AVX2, x86-avx2 profile)
     if: >-
       github.event_name == 'schedule' ||
-      inputs.profile == 'x86-avx2' ||
-      inputs.profile == 'both'
+      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+       (inputs.profile == 'x86-avx2' || inputs.profile == 'both'))
     runs-on: [self-hosted, X64]
     concurrency:
       group: retrieval-benchmark-x86-avx2
@@ -103,6 +118,8 @@ jobs:
     timeout-minutes: 900
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -111,6 +128,8 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # process.arch alone admits an x64 host without AVX2, which would
+      # publish mislabeled x86-avx2 reference measurements.
       - name: Verify host matches x86-avx2 profile
         run: |
           arch="$(bun -e 'console.log(process.arch)')"
@@ -118,11 +137,18 @@ jobs:
             echo "host arch $arch does not match the x86-avx2 profile" >&2
             exit 1
           fi
+          if ! grep -qw avx2 /proc/cpuinfo; then
+            echo "host CPU lacks AVX2; refusing to label results x86-avx2" >&2
+            exit 1
+          fi
 
-      - name: Record host evidence
+      # Diagnostic notes only. The strict --host-evidence artifact is an
+      # operator attestation (run lock, canary, affinity/NUMA/power/cache
+      # state) produced out of band; nothing here masquerades as it.
+      - name: Record host notes
         run: |
           mkdir -p benchmark-artifacts
-          uname -a > benchmark-artifacts/host-evidence.txt
+          uname -a > benchmark-artifacts/host-notes.txt
           bun -e '
             const os = require("node:os");
             console.log(JSON.stringify({
@@ -130,14 +156,16 @@ jobs:
               platform: process.platform,
               cpus: os.cpus().map((c) => c.model),
               totalMemoryBytes: os.totalmem(),
+              bunVersion: Bun.version,
             }, null, 2));
-          ' >> benchmark-artifacts/host-evidence.txt
+          ' >> benchmark-artifacts/host-notes.txt
 
       - name: Run matrix (three complete runs)
         run: |
           for run in 1 2 3; do
             bun packages/plugin/scripts/benchmark-retrieval.ts matrix \
               --profile x86-avx2 \
+              --evict-os-page-cache packages/plugin/scripts/retrieval-benchmark/evict-os-page-cache.sh \
               --out "benchmark-artifacts/run-$run-report.json" \
               --candidate-pool "benchmark-artifacts/run-$run-pool.json"
           done
@@ -157,10 +185,10 @@ jobs:
             --candidate benchmark-artifacts/run-3-report.json \
             --out benchmark-artifacts/regression.json
 
-      - name: Archive reports and host evidence
+      - name: Archive reports and host notes
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: retrieval-benchmark-x86-avx2
           path: benchmark-artifacts/
-          if-no-files-found: error
+          if-no-files-found: warn

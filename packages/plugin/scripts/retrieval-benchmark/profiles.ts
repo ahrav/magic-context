@@ -178,15 +178,30 @@ export interface ProfileResourceEstimate {
     maxPeakRssBytes: number;
     maxRequiredDiskBytes: number;
     maxFixtureDiskBytes: number;
+    /** Every unique (scale, dims) fixture is seeded eagerly and retained for
+     *  the whole run, so the profile-level disk requirement is the SUM of the
+     *  unique fixtures' requirements, not the largest single case. */
+    totalRequiredDiskBytes: number;
 }
 
 export function estimateProfileResources(profile: BenchmarkProfile): ProfileResourceEstimate {
     const cases = profile.cases.map(estimateCaseResources);
+    const requiredByFixture = new Map<string, number>();
+    for (const [index, profileCase] of profile.cases.entries()) {
+        const key = `${profileCase.scale}x${profileCase.dims}`;
+        const estimate = cases[index];
+        if (!requiredByFixture.has(key) && estimate !== undefined) {
+            requiredByFixture.set(key, estimate.requiredDiskBytes);
+        }
+    }
+    let totalRequiredDiskBytes = 0;
+    for (const bytes of requiredByFixture.values()) totalRequiredDiskBytes += bytes;
     return {
         cases,
         maxPeakRssBytes: Math.max(...cases.map((estimate) => estimate.peakRssBytes)),
         maxRequiredDiskBytes: Math.max(...cases.map((estimate) => estimate.requiredDiskBytes)),
         maxFixtureDiskBytes: Math.max(...cases.map((estimate) => estimate.fixtureDiskBytes)),
+        totalRequiredDiskBytes,
     };
 }
 
@@ -225,13 +240,17 @@ export function checkHostResources(
     if (host.availableDiskBytes < profile.host.minAvailableDiskBytes) {
         diagnostics.push("preflight: host below declared disk requirement");
     }
-    for (const estimate of estimateProfileResources(profile).cases) {
-        if (estimate.peakRssBytes > host.totalMemoryBytes) {
-            diagnostics.push(`preflight: insufficient memory for case (${estimate.caseId})`);
+    const estimate = estimateProfileResources(profile);
+    for (const caseEstimate of estimate.cases) {
+        if (caseEstimate.peakRssBytes > host.totalMemoryBytes) {
+            diagnostics.push(`preflight: insufficient memory for case (${caseEstimate.caseId})`);
         }
-        if (estimate.requiredDiskBytes > host.availableDiskBytes) {
-            diagnostics.push(`preflight: insufficient disk for case (${estimate.caseId})`);
+        if (caseEstimate.requiredDiskBytes > host.availableDiskBytes) {
+            diagnostics.push(`preflight: insufficient disk for case (${caseEstimate.caseId})`);
         }
+    }
+    if (estimate.totalRequiredDiskBytes > host.availableDiskBytes) {
+        diagnostics.push("preflight: insufficient disk for retained fixtures");
     }
     diagnostics.sort();
     return { ok: diagnostics.length === 0, diagnostics };
@@ -406,7 +425,7 @@ export function parseProfile(value: unknown): BenchmarkProfile {
     if (estimate.maxPeakRssBytes > profile.host.minTotalMemoryBytes) {
         diagnostics.push("profile.host.minTotalMemoryBytes: below-estimated-rss");
     }
-    if (estimate.maxRequiredDiskBytes > profile.host.minAvailableDiskBytes) {
+    if (estimate.totalRequiredDiskBytes > profile.host.minAvailableDiskBytes) {
         diagnostics.push("profile.host.minAvailableDiskBytes: below-estimated-disk");
     }
 

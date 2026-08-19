@@ -26,7 +26,7 @@
  * production execution adapters; the pure contract modules stay on DTOs.
  */
 
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { cpus, totalmem } from "node:os";
 import { join } from "node:path";
 
@@ -237,6 +237,9 @@ function hostFingerprint(): string {
         cpuModel: cpus()[0]?.model ?? "unknown",
         cpuCount: cpus().length,
         totalMemoryBytes: totalmem(),
+        // Runs under different runtimes are not latency-comparable, so the
+        // runtime version participates in host identity.
+        runtime: typeof Bun !== "undefined" ? `bun/${Bun.version}` : `node/${process.version}`,
     });
 }
 
@@ -896,6 +899,11 @@ function seedAllFixtures(
             throw new RunnerError([`fixture ${key}: no synthetic profile for scale`]);
         }
         const fixtureDir = join(workDir, "fixtures", key);
+        // Fixtures are deterministic derivations of the release, so a
+        // leftover directory (interrupted run resumed with the same
+        // --work-dir) is safely discarded and re-seeded; seedFixture
+        // refuses to write into a non-empty directory.
+        rmSync(fixtureDir, { recursive: true, force: true });
         const result: SeedResult = seedFixture(
             {
                 corpus: release.corpus,
@@ -1090,10 +1098,21 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     const diagnostics: string[] = [`host:${identity.host}`];
     let attemptStatus: ReportAttempt["status"] = "completed";
     const startedAtEpochMs = epochNow();
+    const runStartMs = now();
 
     try {
         for (const profileCase of options.profile.cases) {
             if (completed.has(profileCase.id)) continue;
+            // The declared wall-time budget bounds the whole attempt; cases
+            // checkpointed so far stay valid and a compatible resume
+            // continues from here.
+            if (now() - runStartMs > options.profile.runtime.maxWallTimeMs) {
+                attemptStatus = "interrupted";
+                diagnostics.push(
+                    `run: wall-time budget exhausted (maxWallTimeMs=${options.profile.runtime.maxWallTimeMs})`,
+                );
+                break;
+            }
             const record = await executeCase(ctx, profileCase);
             completed.set(profileCase.id, record);
             if (options.checkpointDir) {
@@ -1150,7 +1169,10 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     const expectedQueryIds: string[] = [];
     const scenarios: ReportScenario[] = [];
     const caseEvidences: CaseEvidence[] = [];
-    const candidateByQuery = new Map<string, { queryId: string; ranked: string[] }>();
+    const candidateByQuery = new Map<
+        string,
+        { queryId: string; ranked: string[]; laneRestricted: boolean }
+    >();
     for (const profileCase of options.profile.cases) {
         const caseQueries = options.release.corpus.queries.filter(
             (query) => query.mode === profileCase.mode,
@@ -1163,9 +1185,16 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         scenarios.push(...record.scenarios);
         caseEvidences.push(record.caseEvidence);
         for (const entry of record.candidateRankings) {
-            // First executing case in profile order supplies the pool
-            // ranking for a query; later cases re-rank the same corpus.
-            if (!candidateByQuery.has(entry.queryId)) candidateByQuery.set(entry.queryId, entry);
+            // First executing full-lane case in profile order supplies the
+            // pool ranking for a query; later cases re-rank the same corpus.
+            // A lane-restricted case (R52) only stands in when no full-lane
+            // case ranked the query, so the judged pool reflects the full
+            // source set whenever one exists.
+            const existing = candidateByQuery.get(entry.queryId);
+            const laneRestricted = record.caseEvidence.laneRestricted;
+            if (!existing || (existing.laneRestricted && !laneRestricted)) {
+                candidateByQuery.set(entry.queryId, { ...entry, laneRestricted });
+            }
         }
     }
 

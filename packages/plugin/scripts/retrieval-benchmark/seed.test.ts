@@ -187,6 +187,9 @@ describe("seedFixture on the reviewed v1 release", () => {
             "where is normalizeSearchResultLimit defined",
             { sources: ["message"], maxMessageOrdinal: 1 },
         );
+        // msg-fixture-0001 has ordinal 1 and matches the query, so an empty
+        // result would make the containment loop below vacuously pass.
+        expect(narrow.length).toBeGreaterThan(0);
         const narrowOrdinals = new Set(
             messageEntries
                 .filter((entry) => entry.ordinal !== null && entry.ordinal <= 1)

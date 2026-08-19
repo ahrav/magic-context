@@ -26,9 +26,9 @@
 
 import {
     existsSync,
+    linkSync,
     mkdirSync,
     mkdtempSync,
-    renameSync,
     rmSync,
     writeFileSync,
 } from "node:fs";
@@ -497,8 +497,10 @@ export function buildLatencyBaseline(input: {
 /**
  * Atomic immutable publication (KTD11): refuse overwrite, stage the complete
  * artifact beside the destination, re-load the exact staged bytes through
- * the strict schema, and rename into place. Any failure removes the staging
- * directory and leaves the destination directory byte-identical.
+ * the strict schema, and hard-link into place. link(2) fails with EEXIST
+ * when the destination exists, so a concurrent publisher cannot replace an
+ * already published baseline (rename(2) would). Any failure removes the
+ * staging directory and leaves the destination directory byte-identical.
  */
 export function publishBaseline(artifact: BaselineArtifact, outPath: string): { path: string } {
     if (existsSync(outPath)) {
@@ -511,10 +513,14 @@ export function publishBaseline(artifact: BaselineArtifact, outPath: string): { 
         const stagedPath = join(staging, basename(outPath));
         writeFileSync(stagedPath, `${JSON.stringify(artifact, null, 2)}\n`, { flag: "wx" });
         loadBaselineFile(stagedPath);
-        if (existsSync(outPath)) {
-            throw new RegressionError([`baseline: refuse-overwrite (${outPath})`]);
+        try {
+            linkSync(stagedPath, outPath);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+                throw new RegressionError([`baseline: refuse-overwrite (${outPath})`]);
+            }
+            throw error;
         }
-        renameSync(stagedPath, outPath);
     } finally {
         rmSync(staging, { recursive: true, force: true });
     }

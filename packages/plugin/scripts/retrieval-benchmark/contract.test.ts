@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, dirname, relative, resolve, sep } from "node:path";
 
 import {
     ContractError,
@@ -750,6 +750,7 @@ describe("facade boundary", () => {
 
     it("production source never imports script code", () => {
         const srcRoot = join(import.meta.dir, "..", "..", "src");
+        const scriptsRoot = resolve(srcRoot, "..", "scripts");
         const offenders: string[] = [];
         const stack = [srcRoot];
         while (stack.length > 0) {
@@ -763,10 +764,12 @@ describe("facade boundary", () => {
                 }
                 if (!entry.name.endsWith(".ts")) continue;
                 for (const specifier of runtimeImports(path)) {
-                    if (
-                        specifier.startsWith(".") &&
-                        /\/scripts\//.test(join(path, "..", specifier))
-                    ) {
+                    if (!specifier.startsWith(".")) continue;
+                    // Compare against the resolved scripts root: a substring
+                    // match on "/scripts/" would fire on any checkout whose
+                    // own path contains a scripts component.
+                    const resolved = resolve(dirname(path), specifier);
+                    if (resolved === scriptsRoot || resolved.startsWith(scriptsRoot + sep)) {
                         offenders.push(`${relative(srcRoot, path)} -> ${specifier}`);
                     }
                 }

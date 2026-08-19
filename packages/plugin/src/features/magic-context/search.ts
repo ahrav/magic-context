@@ -587,7 +587,13 @@ async function getSemanticScores(args: {
     }
 
     const ownMemories = memoriesByIdentity.get(args.projectPath) ?? [];
+    // getProjectEmbeddings below primes the process cache for the own
+    // project, so its cached-before state must be captured first or the
+    // loop would report every cold own-project load as a cache hit.
+    let ownWasCachedBeforePrime: boolean | null = null;
     if (ownMemories.length > 0) {
+        ownWasCachedBeforePrime =
+            peekProjectEmbeddings(args.projectPath, args.queryModelId) !== null;
         const ownEmbeddings = getProjectEmbeddings(args.db, args.projectPath, args.queryModelId);
         await ensureMemoryEmbeddings({
             db: args.db,
@@ -601,7 +607,9 @@ async function getSemanticScores(args: {
         const memberMemories = memoriesByIdentity.get(identity) ?? [];
         if (memberMemories.length === 0) continue;
         const identityWasCached = args.onVectorLoad
-            ? peekProjectEmbeddings(identity, args.queryModelId) !== null
+            ? identity === args.projectPath && ownWasCachedBeforePrime !== null
+                ? ownWasCachedBeforePrime
+                : peekProjectEmbeddings(identity, args.queryModelId) !== null
             : false;
         if (!identityWasCached) workspaceServedFromCache = false;
         const cachedEmbeddings = getProjectEmbeddings(args.db, identity, args.queryModelId);
@@ -767,9 +775,9 @@ async function searchMemories(args: {
     trace?: SearchTraceRecorder | null;
     rootSpanId?: number | null;
     embedSpanId?: number | null;
-}): Promise<MemorySearchResult[]> {
+}): Promise<{ results: MemorySearchResult[]; laneSpanId: number | null }> {
     if (!args.memoryEnabled) {
-        return [];
+        return { results: [], laneSpanId: null };
     }
 
     const trace = args.trace ?? null;
@@ -788,7 +796,7 @@ async function searchMemories(args: {
         : getMemoriesByProject(args.db, args.projectPath);
     hydrationSpan?.end("ok", { rows: memories.length });
     if (memories.length === 0) {
-        return [];
+        return { results: [], laneSpanId: hydrationSpan?.id ?? null };
     }
 
     const lexicalSpan = trace?.begin("lexical_scan", "memory", { parent: rootSpanId }) ?? null;
@@ -870,7 +878,9 @@ async function searchMemories(args: {
         requestedK: args.limit,
         effectiveK: args.limit,
     });
-    return merged;
+    // The lane's terminal span: the unified fusion span depends on it so
+    // critical-path analysis can follow the memory lane.
+    return { results: merged, laneSpanId: topKSpan?.id ?? null };
 }
 
 /** Linear decay message scoring.
@@ -2229,7 +2239,7 @@ async function executeUnifiedSearch(args: {
         return lane;
     };
 
-    const [memoryResults, gitCommitResults, primerResults, noteResults] = await Promise.all([
+    const [memoryLane, gitCommitResults, primerResults, noteResults] = await Promise.all([
         runMemory
             ? searchMemories({
                   db,
@@ -2246,13 +2256,21 @@ async function executeUnifiedSearch(args: {
                   rootSpanId: rootId,
                   embedSpanId: embedSpan?.id ?? null,
               })
-            : Promise.resolve([] as MemorySearchResult[]),
+            : Promise.resolve({
+                  results: [] as MemorySearchResult[],
+                  laneSpanId: null as number | null,
+              }),
         runGitCommits
             ? Promise.resolve(runGitCommitLane())
             : Promise.resolve([] as GitCommitSearchResult[]),
         runPrimers ? Promise.resolve(runPrimerLane()) : Promise.resolve([] as PrimerSearchResult[]),
         runNotes ? Promise.resolve(runNoteLane()) : Promise.resolve([] as NoteSearchResult[]),
     ]);
+    const memoryResults = memoryLane.results;
+    // The memory lane runs inside searchMemories, so its terminal span joins
+    // the fusion dependency set here; without it criticalPathMs understates
+    // queries whose longest path is the memory lane.
+    if (memoryLane.laneSpanId !== null) laneSpanIds.push(memoryLane.laneSpanId);
 
     const fusionSpan =
         trace?.begin("fusion", "unified", { parent: rootId, dependsOn: laneSpanIds }) ?? null;

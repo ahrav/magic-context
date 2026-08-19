@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ContractError } from "./contract";
@@ -108,6 +109,20 @@ describe("fixture profiles", () => {
     });
 
     it("reject non-canonical profile bytes", () => {
+        const dir = mkdtempSync(join(tmpdir(), "profile-bytes-"));
+        try {
+            const canonical = readFileSync(join(PROFILE_DIR, "ci.json"), "utf8");
+            const path = join(dir, "profile.json");
+            // Same JSON value, one extra trailing newline: the loader's
+            // byte-for-byte canonical rule must reject it.
+            writeFileSync(path, `${canonical}\n`);
+            expect(() => loadProfileFile(path)).toThrow(ContractError);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("reject an unreadable profile file", () => {
         expect(() => loadProfileFile(join(PROFILE_DIR, "..", "missing.json"))).toThrow(
             ContractError,
         );
@@ -296,6 +311,11 @@ describe("resource preflight", () => {
                 profile.host.minTotalMemoryBytes,
             );
             expect(estimate.maxRequiredDiskBytes).toBeLessThanOrEqual(
+                profile.host.minAvailableDiskBytes,
+            );
+            // All unique fixtures stay on disk for the whole run, so the
+            // host declaration must cover their sum, not just the max.
+            expect(estimate.totalRequiredDiskBytes).toBeLessThanOrEqual(
                 profile.host.minAvailableDiskBytes,
             );
             expect(estimate.maxFixtureDiskBytes).toBeLessThanOrEqual(

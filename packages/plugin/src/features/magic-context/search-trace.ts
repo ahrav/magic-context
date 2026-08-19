@@ -180,7 +180,25 @@ export function createSearchTraceRecorder(options: SearchTraceOptions): SearchTr
         clockDomain,
         begin,
         notApplicable(stage, lane, parent) {
-            begin(stage, lane, { parent }).end("not_applicable");
+            // One timestamp for both edges: begin(...).end(...) would take
+            // two clock readings and record spurious elapsed time for a
+            // stage that never executed.
+            const id = nextId;
+            nextId += 1;
+            const at = now();
+            options.sink.onSpan({
+                schemaVersion: SEARCH_TRACE_SCHEMA_VERSION,
+                id,
+                parentId: parent ?? null,
+                dependsOn: [],
+                stage,
+                lane,
+                startMs: at,
+                endMs: at,
+                status: "not_applicable",
+                counters: {},
+                clockDomain,
+            });
         },
         hasOpenSpans: () => openSpans > 0,
     };
