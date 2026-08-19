@@ -10,6 +10,7 @@ import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
+import { disposeModuleNoteEvaluationBridges } from "./features/magic-context/context-authority";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -593,6 +594,7 @@ const server: Plugin = async (ctx) => {
                 } catch {
                     // best-effort
                 }
+                void disposeModuleNoteEvaluationBridges().catch(() => {});
                 try {
                     rpcServer?.stop();
                 } catch {

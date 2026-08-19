@@ -13,13 +13,18 @@ import {
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
-    applyMirroredNoteCompileFields,
     applyMirrorPage,
     ensureContextStoreUuid,
     getMirrorCursor,
     getModuleNoteEvaluationBridge,
     registerModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
+import { confirmSmartNoteReadOnly } from "../../features/magic-context/dreamer/evaluate-smart-notes";
+import { createSmartNoteCapabilities } from "../../features/magic-context/smart-notes/capabilities";
+import { compileSmartNoteCheck } from "../../features/magic-context/smart-notes/compiler";
+import { SmartNoteEvaluatorWorker } from "../../features/magic-context/smart-notes/evaluator-worker";
+import { runCompiledSmartNoteCheck } from "../../features/magic-context/smart-notes/sandbox-runner";
+import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
 import {
@@ -221,38 +226,6 @@ function notifyMagicContextDisabled(client: PluginContext["client"], reason: str
         .catch((error) => {
             log("[magic-context] failed to show disabled toast:", error);
         });
-}
-
-function moduleNoteRowId(response: unknown, depth = 0): number | null {
-    if (depth > 4 || response === null || response === undefined) return null;
-    if (typeof response === "string") {
-        const match = response.match(/\b(?:smart\s+)?note\s+#(\d+)/i);
-        return match ? Number(match[1]) : null;
-    }
-    if (Array.isArray(response)) {
-        for (const item of response) {
-            const id = moduleNoteRowId(item, depth + 1);
-            if (id !== null) return id;
-        }
-        return null;
-    }
-    if (typeof response !== "object") return null;
-    const record = response as Record<string, unknown>;
-    return (
-        moduleNoteRowId(record.result, depth + 1) ??
-        moduleNoteRowId(record.content, depth + 1) ??
-        moduleNoteRowId(record.text, depth + 1)
-    );
-}
-
-function moduleNoteResponseIsError(response: unknown, depth = 0): boolean {
-    if (depth > 4 || response === null || typeof response !== "object") return false;
-    if (Array.isArray(response)) {
-        return response.some((item) => moduleNoteResponseIsError(item, depth + 1));
-    }
-    const record = response as Record<string, unknown>;
-    if (record.isError === true || record.ok === false || record.error !== undefined) return true;
-    return moduleNoteResponseIsError(record.result, depth + 1);
 }
 
 export function createMagicContextHook(deps: MagicContextDeps) {
@@ -898,6 +871,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   content,
                                   memory_project: memoryProject,
                                   surface_condition: surfaceCondition,
+                                  ...(compileStatus
+                                      ? {
+                                            compiled_provider: compiledProvider,
+                                            compiled_config: compiledConfig,
+                                            compiled_at: compiledAt,
+                                            compile_status: compileStatus,
+                                        }
+                                      : {}),
                                   filter,
                                   limit,
                                   offset,
@@ -908,28 +889,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       // The module is authoritative, but context.db remains the local
                       // read model for note nudges and dashboard/RPC consumers.
                       await syncModuleNotes();
-                      if (compileStatus && !moduleNoteResponseIsError(response)) {
-                          const moduleRowId =
-                              action === "write" ? moduleNoteRowId(response) : (noteId ?? null);
-                          if (
-                              moduleRowId === null ||
-                              !applyMirroredNoteCompileFields({
-                                  db,
-                                  moduleProject: memoryProject,
-                                  moduleRowId,
-                                  fields: {
-                                      compiledProvider: compiledProvider ?? null,
-                                      compiledConfig: compiledConfig ?? null,
-                                      compiledAt: compiledAt ?? null,
-                                      compileStatus,
-                                  },
-                              })
-                          ) {
-                              throw new Error(
-                                  "Rust note was written but its host compilation metadata could not be mirrored",
-                              );
-                          }
-                      }
                       return response;
                   },
                   memory: async ({
@@ -966,7 +925,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       return response;
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
-                      getModuleNoteEvaluationBridge(evaluationProjectPath) !== undefined,
+                      getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,
                   memorySync: (sessionId: string) => {
                       rustMemorySyncRequestedSessions.add(sessionId);
                   },
@@ -976,43 +935,88 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // than the plugin's launch directory (a /cd switch, multi-project hosts).
     // Registration is therefore an idempotent ensure invoked for every project
     // that reaches rust-mode preparation, not a one-shot at construction.
+    const evaluatorTransport = rustModeModuleClient ? new SubcModuleTransport() : undefined;
     const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
-        if (!rustModeModuleClient?.mirrorPull) return;
+        if (!rustModeModuleClient?.mirrorPull || !evaluatorTransport) return;
         if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
+        const capabilityFactory = (signal: AbortSignal) =>
+            createSmartNoteCapabilities({ projectRoot: deps.directory, signal });
+        const workerPolicy = {
+            retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+            wakeOwned: false,
+        };
+        const worker = new SmartNoteEvaluatorWorker({
+            transport: {
+                call: ({ method, body, signal }) =>
+                    evaluatorTransport.call({
+                        sessionId: `note-evaluator:${bridgeProjectPath}`,
+                        projectRoot: deps.directory,
+                        method,
+                        body: { method, ...(body as Record<string, unknown>) },
+                        signal,
+                    }),
+            },
+            executors: (snapshot, slot, signal, deadline) => ({
+                compile: () =>
+                    slot.run(() =>
+                        compileSmartNoteCheck({
+                            client: deps.client,
+                            db,
+                            parentSessionId: undefined,
+                            sessionDirectory: deps.directory,
+                            projectIdentity: bridgeProjectPath,
+                            note: {
+                                id: snapshot.noteId,
+                                content: snapshot.content,
+                                surfaceCondition: snapshot.surfaceCondition,
+                            },
+                            capabilityFactory,
+                            signal,
+                            deadline,
+                            sandboxLockHeld: true,
+                        }),
+                    ),
+                runCompiled: (compiledCheck) =>
+                    slot.run(() =>
+                        runCompiledSmartNoteCheck({
+                            compiledCheck,
+                            capabilityFactory,
+                            signal,
+                            timeoutMs: 2_000,
+                            sandboxLockHeld: true,
+                        }),
+                    ),
+                confirmFallback: () =>
+                    confirmSmartNoteReadOnly({
+                        client: deps.client,
+                        db,
+                        parentSessionId: undefined,
+                        sessionDirectory: deps.directory,
+                        projectIdentity: bridgeProjectPath,
+                        deadline,
+                        noteId: snapshot.noteId,
+                        content: snapshot.content,
+                        surfaceCondition: snapshot.surfaceCondition,
+                        signal,
+                    }),
+            }),
+            policy: () => ({ ...workerPolicy }),
+        });
         registerModuleNoteEvaluationBridge(bridgeProjectPath, {
             sync: syncModuleNotes,
-            async evaluate({ contextNoteId, sessionId, verdict }): Promise<void> {
-                const identity = db
-                    .prepare(
-                        `SELECT identity.module_row_id, revision.status_version
-                           FROM mirror_identity identity
-                           JOIN mirror_note_revisions revision
-                             ON revision.module_project = identity.module_project
-                            AND revision.module_row_id = identity.module_row_id
-                          WHERE identity.domain = 'notes' AND identity.module_project = ?
-                            AND identity.context_row_id = ?`,
-                    )
-                    .get(bridgeProjectPath, contextNoteId) as
-                    | { module_row_id: number; status_version: number }
-                    | undefined;
-                if (!identity) {
-                    throw new Error(`module identity is missing for smart note ${contextNoteId}`);
-                }
-                await rustModeModuleClient.call({
-                    sessionId,
-                    projectRoot: deps.directory,
-                    method: "note.evaluate",
-                    body: {
-                        method: "note.evaluate",
-                        v: 1,
-                        session_id: sessionId,
-                        note_id: identity.module_row_id,
-                        source_revision: identity.status_version,
-                        verdict,
-                    },
-                });
+            available: () => worker.registered,
+            async drain(drainArgs) {
+                workerPolicy.wakeOwned = (await wakePlaneStatus()) === "present";
+                const result = await worker.drainOnce(drainArgs);
                 await syncModuleNotes();
+                return result;
             },
+            dispose: () => worker.dispose(),
+        });
+        // Register eagerly so conditioned ctx_note writes pass the
+        // live-evaluator gate before the first drain.
+        void worker.register().catch((error) => {
+            log(`[magic-context] evaluator registration failed: ${error}`);
         });
     };
     ensureModuleNoteEvaluationBridge(projectPath);

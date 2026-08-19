@@ -35,6 +35,7 @@ export interface SmartNoteEvaluatorWorkerDeps {
         snapshot: SmartNotePhaseSnapshot,
         slot: SandboxSlotReservation,
         signal: AbortSignal,
+        deadline: number,
     ) => SmartNotePhaseExecutors;
     policy: () => EvaluatorWorkerPolicy;
     heartbeatMs?: number;
@@ -45,6 +46,7 @@ export interface DrainResult {
     claimed: number;
     completed: number;
     abandoned: number;
+    surfaced: number;
     /** True when polling stopped because the authority reported no more work. */
     drained: boolean;
 }
@@ -227,7 +229,13 @@ export class SmartNoteEvaluatorWorker {
      * no_work, the deadline passes, or the signal aborts.
      */
     async drainOnce(args: { deadline: number; signal?: AbortSignal }): Promise<DrainResult> {
-        const result: DrainResult = { claimed: 0, completed: 0, abandoned: 0, drained: false };
+        const result: DrainResult = {
+            claimed: 0,
+            completed: 0,
+            abandoned: 0,
+            surfaced: 0,
+            drained: false,
+        };
         if (!this.registration) {
             if (!(await this.register(args.signal))) return result;
         }
@@ -251,9 +259,12 @@ export class SmartNoteEvaluatorWorker {
             }
             result.claimed += 1;
             const done = await this.executeClaim(claim, slot, args);
-            if (done === "completed") result.completed += 1;
-            else if (done === "abandoned") result.abandoned += 1;
-            else break;
+            if (done === "abandoned") result.abandoned += 1;
+            else if (done === "failed") break;
+            else {
+                result.completed += 1;
+                if (done === "surfaced") result.surfaced += 1;
+            }
         }
         return result;
     }
@@ -316,7 +327,7 @@ export class SmartNoteEvaluatorWorker {
         claim: ClaimResponse,
         slot: SandboxSlotReservation,
         args: { deadline: number; signal?: AbortSignal },
-    ): Promise<"completed" | "abandoned" | "failed"> {
+    ): Promise<"completed" | "surfaced" | "abandoned" | "failed"> {
         const controller = new AbortController();
         const abortFromCaller = () => controller.abort(args.signal?.reason);
         if (args.signal?.aborted) abortFromCaller();
@@ -328,7 +339,7 @@ export class SmartNoteEvaluatorWorker {
         try {
             const evaluated = await evaluateSmartNotePhase(
                 claim.snapshot,
-                this.deps.executors(claim.snapshot, slot, controller.signal),
+                this.deps.executors(claim.snapshot, slot, controller.signal, args.deadline),
             );
             slot.release();
             if (!evaluated.ok) {
@@ -346,7 +357,9 @@ export class SmartNoteEvaluatorWorker {
                 }),
             );
             const result = response.result;
-            if (result === "applied" || result === "replayed") return "completed";
+            if (result === "applied" || result === "replayed") {
+                return response.status === "ready" ? "surfaced" : "completed";
+            }
             this.logLine(`completion for note #${claim.noteId} rejected: ${String(result)}`);
             return "failed";
         } catch (error) {

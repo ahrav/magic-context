@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
+import { getModuleNoteEvaluationBridge } from "../features/magic-context/context-authority";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
@@ -41,6 +42,7 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
+import { wakePlaneStatus } from "../features/magic-context/smart-notes/wake-plane";
 import {
     drainCommitBacklogForProject,
     sweepStaleEmbeddingIdentitiesForProject,
@@ -496,6 +498,18 @@ async function sweepProject(
 }
 
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
+    const bridge = getModuleNoteEvaluationBridge(reg.projectIdentity);
+    if (bridge) {
+        if (!bridge.available()) return;
+        if ((await wakePlaneStatus()) === "present") return;
+        const result = await bridge.drain({ deadline: Date.now() + 60_000 });
+        if (result.claimed > 0) {
+            log(
+                `[dreamer] module smart-note drain ${reg.projectIdentity}: claimed=${result.claimed} completed=${result.completed} surfaced=${result.surfaced}`,
+            );
+        }
+        return;
+    }
     const leaseKey = leaseKeyFor("evaluate-smart-notes", reg.projectIdentity);
     const holderId = crypto.randomUUID();
     if (!acquireLease(db, holderId, leaseKey)) return;

@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import type { AuthorityModuleClient, AuthorityStatus, ChangefeedPage } from "./context-authority";
 import {
-    applyMirroredNoteCompileFields,
     applyMirrorPage,
     bumpDomainMutationEpoch,
     drainAuthority,
@@ -389,7 +388,7 @@ describe("memory authority protocol", () => {
         ).toEqual({ context_row_id: 42 });
     });
 
-    test("attaches host compilation metadata to a mirrored module note", () => {
+    test("mirrors module compilation metadata onto the context note row", () => {
         const database = db();
         applyMirrorPage({
             db: database,
@@ -410,6 +409,10 @@ describe("memory authority protocol", () => {
                             content: "guard secret",
                             surface_condition: "when path /tmp/project-binding-key exists",
                             status: "pending",
+                            compiled_provider: null,
+                            compiled_config: null,
+                            compiled_at: null,
+                            compile_status: "refused",
                             created_at_ms: 10,
                             updated_at_ms: 10,
                         },
@@ -419,19 +422,6 @@ describe("memory authority protocol", () => {
             },
         });
 
-        expect(
-            applyMirroredNoteCompileFields({
-                db: database,
-                moduleProject: "/repo",
-                moduleRowId: 12,
-                fields: {
-                    compiledProvider: null,
-                    compiledConfig: null,
-                    compiledAt: null,
-                    compileStatus: "refused",
-                },
-            }),
-        ).toBe(true);
         expect(
             database
                 .prepare("SELECT compile_status FROM notes WHERE content = 'guard secret'")
@@ -2586,18 +2576,17 @@ describe("memory authority protocol", () => {
             sync: async () => {
                 calls.push("sync-a");
             },
-            evaluate: async () => {
-                calls.push("eval-a");
+            drain: async () => {
+                calls.push("drain-a");
+                return { claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true };
             },
+            available: () => true,
+            dispose: async () => {},
         });
         expect(getModuleNoteEvaluationBridge("/project-a")).toBeDefined();
         expect(getModuleNoteEvaluationBridge("/project-b")).toBeUndefined();
-        await getModuleNoteEvaluationBridge("/project-a")?.evaluate({
-            contextNoteId: 1,
-            sessionId: "s",
-            verdict: true,
-        });
-        expect(calls).toEqual(["eval-a"]);
+        await getModuleNoteEvaluationBridge("/project-a")?.drain({ deadline: Date.now() + 1000 });
+        expect(calls).toEqual(["drain-a"]);
     });
 
     test("module-managed memory search skips retrieval_count writes", async () => {

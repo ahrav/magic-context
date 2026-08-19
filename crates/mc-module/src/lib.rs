@@ -74,8 +74,8 @@ use mc_store::{
     FacadeMutationOutcome, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError,
     ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
     ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
-    NoteCasOutcome, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome, NoteEvalClaim,
-    NoteEvalCompleteOutcome, NoteEvalReducedState, NoteEvalRenewOutcome, NoteInput,
+    NoteCasOutcome, NoteConditionCompile, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome,
+    NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState, NoteEvalRenewOutcome, NoteInput,
     NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow,
     PendingCompactionMarkerState, RecordWrapupCommandOutcome, StateImportError,
     StateImportPreflight, StateImportValidationError, StoredChunkTranscript, StoredCompartment,
@@ -11463,6 +11463,9 @@ impl McHandler {
         let args = &args;
         if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
             .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
+            .and_then(|_| validate_string_cap(args, "compiled_provider", 128))
+            .and_then(|_| validate_string_cap(args, "compiled_config", MAX_SHORT_FIELD_BYTES))
+            .and_then(|_| validate_string_cap(args, "compile_status", 32))
         {
             return tool_error_result(format!("Error: {error}."));
         }
@@ -11525,6 +11528,10 @@ impl McHandler {
                         "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.",
                     );
                 }
+                let condition_compile = match note_condition_compile_args(args) {
+                    Ok(compile) => compile,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 if let Some(condition) = condition {
                     facade_command_outcome(
                         store.with_facade_command(
@@ -11547,10 +11554,18 @@ impl McHandler {
                                         surface_condition: Some(condition),
                                         anchor_block_id: anchor.as_deref(),
                                         anchor_ordinal: None,
-                                        compiled_provider: None,
-                                        compiled_config: None,
-                                        compiled_at: None,
-                                        compile_status: None,
+                                        compiled_provider: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compiled_provider),
+                                        compiled_config: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compiled_config),
+                                        compiled_at: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compiled_at),
+                                        compile_status: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compile_status),
                                         now_ms: now,
                                     })
                                     .map_err(|error| error.to_string())?;
@@ -11688,6 +11703,10 @@ impl McHandler {
                             .to_string(),
                     );
                 }
+                let condition_compile = match note_condition_compile_args(args) {
+                    Ok(compile) => compile,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 let current = match store.get_note_by_id(project, session, note_id) {
                     Ok(note) => note.filter(|note| {
                         matches!(
@@ -11702,6 +11721,13 @@ impl McHandler {
                         "Error: Note #{note_id} not found in your session/project or has no compatible fields to update."
                     ));
                 };
+                let remains_conditioned =
+                    condition.is_some() || current.surface_condition.is_some();
+                if remains_conditioned && !self.has_live_note_evaluator(project, now) {
+                    return tool_error_result(
+                        "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not updated.",
+                    );
+                }
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -11720,7 +11746,7 @@ impl McHandler {
                                     current.status_version,
                                     content,
                                     condition.map(Some),
-                                    None,
+                                    condition_compile.clone(),
                                     now,
                                 )
                                 .map_err(|error| error.to_string())?
@@ -14046,6 +14072,32 @@ fn non_empty_string_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&
 
 fn i64_arg(args: &Map<String, Value>, key: &str) -> Option<i64> {
     args.get(key).and_then(Value::as_i64)
+}
+
+fn note_condition_compile_args<'a>(
+    args: &'a Map<String, Value>,
+) -> Result<Option<NoteConditionCompile<'a>>, String> {
+    let provider = string_arg(args, "compiled_provider");
+    let config = string_arg(args, "compiled_config");
+    let compiled_at = i64_arg(args, "compiled_at");
+    let status = string_arg(args, "compile_status");
+    if provider.is_none() && config.is_none() && compiled_at.is_none() && status.is_none() {
+        return Ok(None);
+    }
+    match status {
+        Some("compiled") | Some("plain") | Some("refused") | None => {}
+        Some(other) => {
+            return Err(format!(
+                "compile_status must be compiled, plain, or refused (got {other})"
+            ));
+        }
+    }
+    Ok(Some(NoteConditionCompile {
+        compiled_provider: provider,
+        compiled_config: config,
+        compiled_at,
+        compile_status: status,
+    }))
 }
 
 fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {

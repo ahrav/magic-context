@@ -138,34 +138,17 @@ export async function evaluateSmartNotes(
     let didWork = false;
     try {
         if (moduleBridge) {
-            const candidates = pendingNotes().slice(0, MAX_COMPILE_PER_RUN);
-            for (const note of candidates) {
-                if (Date.now() >= args.deadline) break;
-                assertLeaseHeld("module evaluation start");
-                const sessionId = note.sessionId ?? args.parentSessionId;
-                if (!sessionId) {
-                    throw new Error(
-                        `Smart-note evaluation unavailable: note #${note.id} has no module session binding`,
-                    );
-                }
-                didWork = true;
-                const met = await confirmReadOnly(
-                    args,
-                    note.id,
-                    note.content,
-                    note.surfaceCondition,
-                    leaseAbortController.signal,
-                );
-                assertLeaseHeld("module evaluation commit");
-                await moduleBridge.evaluate({
-                    contextNoteId: note.id,
-                    sessionId,
-                    verdict: met === true,
-                });
-                if (met === true) surfaced += 1;
-            }
-            await moduleBridge.sync();
+            assertLeaseHeld("module drain start");
+            const drained = await moduleBridge.drain({
+                deadline: args.deadline,
+                signal: leaseAbortController.signal,
+            });
+            surfaced += drained.surfaced;
+            didWork = drained.claimed > 0;
             const pending = pendingNotes().length;
+            log(
+                `[dreamer] smart notes: module drain claimed=${drained.claimed} completed=${drained.completed} surfaced=${drained.surfaced} remaining=${pending}`,
+            );
             return { surfaced, pending, ran: didWork };
         }
         const dueRun = await runDueCompiledSmartNoteChecks({
@@ -351,6 +334,41 @@ async function confirmReadOnly(
     surfaceCondition: string | null,
     leaseSignal: AbortSignal,
 ): Promise<boolean | null> {
+    return confirmSmartNoteReadOnly({
+        client: args.client,
+        db: args.db,
+        parentSessionId: args.parentSessionId,
+        sessionDirectory: args.sessionDirectory,
+        projectIdentity: args.projectIdentity,
+        deadline: args.deadline,
+        model: args.model,
+        fallbackModels: args.fallbackModels,
+        noteId,
+        content,
+        surfaceCondition,
+        signal: leaseSignal,
+    });
+}
+
+export interface ConfirmSmartNoteReadOnlyArgs {
+    client: PluginContext["client"];
+    db: Database;
+    parentSessionId: string | undefined;
+    sessionDirectory: string | undefined;
+    projectIdentity: string;
+    deadline: number;
+    model?: string;
+    fallbackModels?: readonly string[];
+    noteId: number;
+    content: string;
+    surfaceCondition: string | null;
+    signal: AbortSignal;
+}
+
+export async function confirmSmartNoteReadOnly(
+    args: ConfirmSmartNoteReadOnlyArgs,
+): Promise<boolean | null> {
+    const { noteId, content, surfaceCondition, signal: leaseSignal } = args;
     let childSessionId: string | null = null;
     const startedAt = Date.now();
     let invocationRecorded = false;

@@ -69,9 +69,22 @@ export interface AuthorityModuleClient {
     }): Promise<{ page: ChangefeedPage }>;
 }
 
+export interface ModuleNoteEvaluationDrainResult {
+    claimed: number;
+    completed: number;
+    abandoned: number;
+    surfaced: number;
+    drained: boolean;
+}
+
 export interface ModuleNoteEvaluationBridge {
     sync(): Promise<void>;
-    evaluate(args: { contextNoteId: number; sessionId: string; verdict: boolean }): Promise<void>;
+    drain(args: {
+        deadline: number;
+        signal?: AbortSignal;
+    }): Promise<ModuleNoteEvaluationDrainResult>;
+    available(): boolean;
+    dispose(): Promise<void>;
 }
 
 const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridge>();
@@ -87,6 +100,12 @@ export function getModuleNoteEvaluationBridge(
     projectPath: string,
 ): ModuleNoteEvaluationBridge | undefined {
     return moduleNoteEvaluationBridges.get(projectPath);
+}
+
+export async function disposeModuleNoteEvaluationBridges(): Promise<void> {
+    const bridges = [...moduleNoteEvaluationBridges.values()];
+    moduleNoteEvaluationBridges.clear();
+    await Promise.allSettled(bridges.map((bridge) => bridge.dispose()));
 }
 
 export interface ChangefeedRow {
@@ -1392,42 +1411,6 @@ function mirrorIdentity(
             )
         ).get(domain, moduleProject, moduleRowId) as { context_row_id: number } | undefined) ?? null
     );
-}
-
-export interface MirroredNoteCompileFields {
-    compiledProvider: string | null;
-    compiledConfig: string | null;
-    compiledAt: number | null;
-    compileStatus: "compiled" | "plain" | "refused";
-}
-
-export function applyMirroredNoteCompileFields(args: {
-    db: Database;
-    moduleProject: string;
-    moduleRowId: number;
-    fields: MirroredNoteCompileFields;
-}): boolean {
-    return withPrivilegedWriter(args.db, () => {
-        const result = args.db
-            .prepare(
-                `UPDATE notes
-                    SET compiled_provider = ?, compiled_config = ?, compiled_at = ?, compile_status = ?
-                  WHERE id = (
-                        SELECT context_row_id
-                          FROM mirror_identity
-                         WHERE domain = 'notes' AND module_project = ? AND module_row_id = ?
-                  )`,
-            )
-            .run(
-                args.fields.compiledProvider,
-                args.fields.compiledConfig,
-                args.fields.compiledAt,
-                args.fields.compileStatus,
-                args.moduleProject,
-                args.moduleRowId,
-            );
-        return result.changes === 1;
-    });
 }
 
 function rememberIdentity(
