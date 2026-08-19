@@ -72,14 +72,20 @@ jobs:
             }, null, 2));
           ' >> benchmark-artifacts/host-notes.txt
 
+      # The work dir lives under RUNNER_TEMP so the runner service reclaims
+      # it even when the job is killed mid-run (the CLI's own cleanup only
+      # covers process-level exits), and each run's ~25 GB of fixtures is
+      # removed before the next run starts so the three runs never stack.
       - name: Run matrix (three complete runs)
         run: |
           for run in 1 2 3; do
             bun packages/plugin/scripts/benchmark-retrieval.ts matrix \
               --profile arm-neon \
               --evict-os-page-cache packages/plugin/scripts/retrieval-benchmark/evict-os-page-cache.sh \
+              --work-dir "$RUNNER_TEMP/retrieval-benchmark/run-$run" \
               --out "benchmark-artifacts/run-$run-report.json" \
               --candidate-pool "benchmark-artifacts/run-$run-pool.json"
+            rm -rf "$RUNNER_TEMP/retrieval-benchmark/run-$run"
           done
 
       # Baselines bind one profile fingerprint. commentlint: allow(JUDGE)
@@ -160,14 +166,20 @@ jobs:
             }, null, 2));
           ' >> benchmark-artifacts/host-notes.txt
 
+      # The work dir lives under RUNNER_TEMP so the runner service reclaims
+      # it even when the job is killed mid-run (the CLI's own cleanup only
+      # covers process-level exits), and each run's ~25 GB of fixtures is
+      # removed before the next run starts so the three runs never stack.
       - name: Run matrix (three complete runs)
         run: |
           for run in 1 2 3; do
             bun packages/plugin/scripts/benchmark-retrieval.ts matrix \
               --profile x86-avx2 \
               --evict-os-page-cache packages/plugin/scripts/retrieval-benchmark/evict-os-page-cache.sh \
+              --work-dir "$RUNNER_TEMP/retrieval-benchmark/run-$run" \
               --out "benchmark-artifacts/run-$run-report.json" \
               --candidate-pool "benchmark-artifacts/run-$run-pool.json"
+            rm -rf "$RUNNER_TEMP/retrieval-benchmark/run-$run"
           done
 
       # Baselines bind one profile fingerprint. commentlint: allow(JUDGE)

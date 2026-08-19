@@ -17,6 +17,7 @@
  */
 
 import { z } from "zod";
+import { MAX_CANDIDATE_DEPTH } from "../../src/features/magic-context/search-bounds";
 import { canonicalFingerprint, readCanonicalJsonFile } from "./canonical-json";
 import { ContractError, formatIssues, SOURCE_FILTERS, SYNTHETIC_SCALES } from "./contract";
 
@@ -25,7 +26,11 @@ export const PROFILE_SCHEMA_VERSION = "retrieval-benchmark-profile/v1";
 export const PROFILE_AXIS_ENDPOINTS = {
     scale: { min: 1_000, max: 1_000_000 },
     dims: { min: 128, max: 1_024 },
-    candidateK: { min: 5, max: 100 },
+    // The K ceiling is the production bound itself, not a copy: the runner
+    // feeds candidateK.effective straight into unifiedSearch, which throws
+    // CandidateDepthError above MAX_CANDIDATE_DEPTH, and reference profiles
+    // are required to cover this max endpoint.
+    candidateK: { min: 5, max: MAX_CANDIDATE_DEPTH },
     selectivityFraction: { min: 0.001, max: 1 },
     concurrency: { min: 1, max: 8 },
 } as const;
@@ -373,7 +378,10 @@ export function parseProfile(value: unknown): BenchmarkProfile {
         [dims.has(PROFILE_AXIS_ENDPOINTS.dims.min), "profile.cases: missing dims endpoint 128"],
         [dims.has(PROFILE_AXIS_ENDPOINTS.dims.max), "profile.cases: missing dims endpoint 1024"],
         [ks.has(PROFILE_AXIS_ENDPOINTS.candidateK.min), "profile.cases: missing candidate K 5"],
-        [ks.has(PROFILE_AXIS_ENDPOINTS.candidateK.max), "profile.cases: missing candidate K 100"],
+        [
+            ks.has(PROFILE_AXIS_ENDPOINTS.candidateK.max),
+            `profile.cases: missing candidate K ${PROFILE_AXIS_ENDPOINTS.candidateK.max}`,
+        ],
         [
             fractions.has(PROFILE_AXIS_ENDPOINTS.selectivityFraction.min),
             "profile.cases: missing selectivity endpoint 0.001",
