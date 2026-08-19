@@ -292,8 +292,12 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
             runtime.spawn(async move {
                 force_close_all_routes(&shared).await;
                 shared.tracker.close();
-                let lifecycle_chain = shared.timing.lifecycle_callback_deadline.saturating_mul(2);
-                let _ = timeout(lifecycle_chain, shared.tracker.wait()).await;
+                // Unbounded, for the same reason the shutdown path is: an
+                // abort-exempt callback still executing owns the handler, and
+                // releasing the lock beside it would let a successor
+                // initialize this data directory concurrently. The lock lives
+                // on a descriptor that dies with the process.
+                shared.tracker.wait().await;
                 drop(shared);
                 drop(guard);
             });

@@ -375,13 +375,33 @@ fn serialize_catalog_response(
     include: bool,
     limit: usize,
 ) -> Result<Box<[u8]>, ()> {
+    // Borrowed throughout: building a `serde_json::Value` here would clone the
+    // manifest's whole `provides` tree before the capped writer saw a byte, so
+    // an over-limit manifest could exhaust memory during the very check meant
+    // to refuse it. Field order matches the published shape.
+    #[derive(serde::Serialize)]
+    struct CatalogModule<'a> {
+        module_id: &'a str,
+        module_version: &'a str,
+        roles: &'a [serde_json::Value],
+        control_ops: &'a [String],
+    }
+
+    #[derive(serde::Serialize)]
+    struct CatalogResponse<'a> {
+        op: &'static str,
+        generation: u64,
+        modules: &'a [CatalogModule<'a>],
+        subc_ops: [&'static str; 2],
+    }
+
     let modules = if include {
-        vec![serde_json::json!({
-            "module_id": manifest.module_id,
-            "module_version": manifest.module_version,
-            "roles": manifest.provides,
-            "control_ops": manifest.control_ops,
-        })]
+        vec![CatalogModule {
+            module_id: &manifest.module_id,
+            module_version: &manifest.module_version,
+            roles: &manifest.provides,
+            control_ops: &manifest.control_ops,
+        }]
     } else {
         Vec::new()
     };
@@ -391,12 +411,12 @@ fn serialize_catalog_response(
     };
     serde_json::to_writer(
         &mut writer,
-        &serde_json::json!({
-            "op": OP_CATALOG_LIST,
-            "generation": CATALOG_GENERATION,
-            "modules": modules,
-            "subc_ops": [OP_ROUTE_OPEN, OP_CATALOG_LIST],
-        }),
+        &CatalogResponse {
+            op: OP_CATALOG_LIST,
+            generation: CATALOG_GENERATION,
+            modules: &modules,
+            subc_ops: [OP_ROUTE_OPEN, OP_CATALOG_LIST],
+        },
     )
     .map_err(|_| ())?;
     Ok(writer.buf.into_boxed_slice())
