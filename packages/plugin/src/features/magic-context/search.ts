@@ -799,7 +799,15 @@ async function searchMemories(args: {
         return { results: [], laneSpanId: hydrationSpan?.id ?? null };
     }
 
-    const lexicalSpan = trace?.begin("lexical_scan", "memory", { parent: rootSpanId }) ?? null;
+    // Hydration completes synchronously before the lexical and vector work
+    // starts, so both downstream spans depend on it; otherwise the critical
+    // path treats a costly hydration as an isolated branch.
+    const hydrationDeps = hydrationSpan ? [hydrationSpan.id] : [];
+    const lexicalSpan =
+        trace?.begin("lexical_scan", "memory", {
+            parent: rootSpanId,
+            dependsOn: hydrationDeps,
+        }) ?? null;
     const ftsMatches = getFtsMatches({
         db: args.db,
         projectPath: args.projectPath,
@@ -820,7 +828,7 @@ async function searchMemories(args: {
     const scanSpan =
         trace?.begin("vector_scan", "memory", {
             parent: rootSpanId,
-            dependsOn: args.embedSpanId != null ? [args.embedSpanId] : [],
+            dependsOn: [...hydrationDeps, ...(args.embedSpanId != null ? [args.embedSpanId] : [])],
         }) ?? null;
     const semanticScores = await getSemanticScores({
         db: args.db,

@@ -20,10 +20,7 @@ import {
     chunkCanonicalText,
     replaceCompartmentChunkEmbeddings,
 } from "../../src/features/magic-context/compartment-chunk-embedding";
-import {
-    appendCompartments,
-    getCompartments,
-} from "../../src/features/magic-context/compartment-storage";
+import { appendCompartments } from "../../src/features/magic-context/compartment-storage";
 import {
     saveCommitEmbedding,
     upsertCommits,
@@ -266,9 +263,13 @@ function seedCompartmentRow(
             p1: args.body,
         },
     ]);
-    const compartment = getCompartments(db, args.sessionId).find(
-        (candidate) => candidate.sequence === args.sequence,
-    );
+    // Indexed point lookup via UNIQUE(session_id, sequence). All synthetic
+    // compartments share one session, so re-reading the whole session per
+    // insert (getCompartments + find) is O(C^2) over the seed and pushes
+    // 1M-scale fixtures past any workflow timeout.
+    const compartment = db
+        .prepare("SELECT id FROM compartments WHERE session_id = ? AND sequence = ?")
+        .get(args.sessionId, args.sequence) as { id: number } | undefined;
     if (!compartment) throw new SeedError([`seed: compartment row missing (${args.vectorKey})`]);
     const windows = chunkCanonicalText(
         `[${args.ordinal}] U: ${documentText({ title: args.title, body: args.body })}`,
@@ -390,10 +391,14 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
 
         for (const plan of byKind("memory").sort(numericAscending)) {
             advanceIdCursor(db, "memories", Number(plan.alias.locator) - 1);
+            // insertMemory otherwise stamps wall-clock timestamps, and the
+            // v80 telemetry freeze forbids rewriting them after insert —
+            // identical seeds must produce identical row bytes.
             const memory = insertMemory(db, {
                 projectPath: plan.alias.projectScope,
                 category: "ARCHITECTURE_DECISIONS",
                 content: documentText(plan.document.semanticPayload),
+                nowMs: SEED_EPOCH_MS + Number(plan.alias.locator),
             });
             verifyEmittedId(plan, memory.id);
             const vector = deterministicVector(`doc:${plan.document.id}`, options.dims);
@@ -615,6 +620,7 @@ function seedSyntheticStream(
                     projectPath: args.projectScope,
                     category: "ARCHITECTURE_DECISIONS",
                     content: documentText(document),
+                    nowMs: SEED_EPOCH_MS,
                 });
                 saveEmbedding(
                     db,

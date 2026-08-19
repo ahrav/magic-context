@@ -102,12 +102,24 @@ export type AutoSearchDeliveryReason =
 
 /** Below-threshold, empty, packer-empty, and timeout are completed
  *  empty-delivery outcomes. Search failures are incomplete evidence, not
- *  empty rankings. */
+ *  empty rankings. The delivered variant carries a non-null hint by
+ *  construction (the packer-empty branch already rejected a null pack), so
+ *  consumers need no defensive null re-check after discriminating on
+ *  `reason`. */
 export type AutoSearchDelivery =
     | {
           status: "complete";
-          reason: AutoSearchDeliveryReason;
-          hintText: string | null;
+          reason: "delivered";
+          hintText: string;
+          prePack: UnifiedSearchResult[];
+          delivered: UnifiedSearchResult[];
+          tokenCount: number;
+          omittedCount: number;
+      }
+    | {
+          status: "complete";
+          reason: Exclude<AutoSearchDeliveryReason, "delivered">;
+          hintText: null;
           prePack: UnifiedSearchResult[];
           delivered: UnifiedSearchResult[];
           tokenCount: number;
@@ -116,7 +128,7 @@ export type AutoSearchDelivery =
     | { status: "incomplete"; kind: "search-failure"; error: unknown };
 
 function emptyDelivery(
-    reason: AutoSearchDeliveryReason,
+    reason: Exclude<AutoSearchDeliveryReason, "delivered">,
     prePack: UnifiedSearchResult[],
 ): AutoSearchDelivery {
     return {
@@ -143,6 +155,9 @@ export async function executeAutoSearchDelivery(args: {
     searchOptions: UnifiedSearchOptions;
     scoreThreshold: number;
     timeoutMs?: number;
+    /** Reference clock for hint age wording (defaults to the live clock);
+     *  the benchmark injects the scenario's fixed reference time. */
+    packNowMs?: number;
 }): Promise<AutoSearchDelivery> {
     let results: UnifiedSearchResult[] | null;
     try {
@@ -166,7 +181,10 @@ export async function executeAutoSearchDelivery(args: {
     if (results[0].score < args.scoreThreshold) {
         return emptyDelivery("below-threshold", results);
     }
-    const packed = packAutoSearchHint(results);
+    const packed = packAutoSearchHint(
+        results,
+        args.packNowMs === undefined ? {} : { nowMs: args.packNowMs },
+    );
     if (packed.text === null) {
         return emptyDelivery("packer-empty", results);
     }
@@ -409,10 +427,9 @@ export async function runAutoSearchHint(args: {
         return writeNoHintAndReconcile("below-threshold");
     }
 
+    // All non-delivered reasons returned above, so the type system proves
+    // hintText is a non-null string here.
     const hintText = delivery.hintText;
-    if (!hintText) {
-        return writeNoHintAndReconcile("empty");
-    }
 
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.

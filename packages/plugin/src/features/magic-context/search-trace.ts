@@ -145,6 +145,17 @@ export function createSearchTraceRecorder(options: SearchTraceOptions): SearchTr
     let nextId = 1;
     let openSpans = 0;
 
+    // Tracing is behavior- and error-neutral for the traced search: a
+    // throwing sink must not abort an otherwise successful search or mask
+    // an in-flight error, so observer failures are swallowed here.
+    const emit = (span: SearchTraceSpan): void => {
+        try {
+            options.sink.onSpan(span);
+        } catch {
+            // Dropped span: the observer failed, the search did not.
+        }
+    };
+
     const begin: SearchTraceRecorder["begin"] = (stage, lane, beginOptions) => {
         const id = nextId;
         nextId += 1;
@@ -159,7 +170,7 @@ export function createSearchTraceRecorder(options: SearchTraceOptions): SearchTr
                 if (ended) return;
                 ended = true;
                 openSpans -= 1;
-                options.sink.onSpan({
+                emit({
                     schemaVersion: SEARCH_TRACE_SCHEMA_VERSION,
                     id,
                     parentId,
@@ -186,7 +197,7 @@ export function createSearchTraceRecorder(options: SearchTraceOptions): SearchTr
             const id = nextId;
             nextId += 1;
             const at = now();
-            options.sink.onSpan({
+            emit({
                 schemaVersion: SEARCH_TRACE_SCHEMA_VERSION,
                 id,
                 parentId: parent ?? null,

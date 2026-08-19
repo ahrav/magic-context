@@ -27,6 +27,7 @@ function formatResult(
     result: UnifiedSearchResult,
     index: number,
     currentSessionId: string,
+    nowMs: number,
 ): string {
     if (result.source === "memory") {
         const source = result.sourceName ? ` source=${boundDynamicField(result.sourceName)}` : "";
@@ -38,7 +39,7 @@ function formatResult(
 
     if (result.source === "git_commit") {
         return [
-            `[${index}] [git_commit] score=${result.score.toFixed(2)} sha=${boundDynamicField(result.shortSha)} ${formatAge(result.committedAtMs)} match=${result.matchType}`,
+            `[${index}] [git_commit] score=${result.score.toFixed(2)} sha=${boundDynamicField(result.shortSha)} ${formatAge(result.committedAtMs, nowMs)} match=${result.matchType}`,
             boundDynamicField(result.content),
         ].join("\n");
     }
@@ -56,7 +57,7 @@ function formatResult(
                 ? ` @msg ${result.anchorOrdinal}`
                 : "";
         return [
-            `[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt)}${anchor}`,
+            `[${index}] [note] score=${result.score.toFixed(2)} id=#${result.noteId} status=${result.status} ${formatAge(result.createdAt, nowMs)}${anchor}`,
             boundDynamicField(result.content),
         ].join("\n");
     }
@@ -127,6 +128,9 @@ export function packSearchResults(
     query: string,
     results: UnifiedSearchResult[],
     currentSessionId: string,
+    /** Reference clock for age wording; injectable so a fingerprinted
+     *  benchmark scenario renders identical bytes on any day. */
+    nowMs: number = Date.now(),
 ): PackedSearchResults {
     const boundedQuery = boundDynamicField(query);
     if (results.length === 0) {
@@ -142,7 +146,7 @@ export function packSearchResults(
 
     const header = `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${boundedQuery}":`;
     const blocks = results.map((result, index) =>
-        formatResult(result, index + 1, currentSessionId),
+        formatResult(result, index + 1, currentSessionId, nowMs),
     );
 
     const full = assemble(header, bodyPartsFor(blocks, results, currentSessionId));
@@ -198,6 +202,7 @@ export function formatSearchResults(
     query: string,
     results: UnifiedSearchResult[],
     currentSessionId: string,
+    nowMs: number = Date.now(),
 ): string {
-    return packSearchResults(query, results, currentSessionId).text;
+    return packSearchResults(query, results, currentSessionId, nowMs).text;
 }

@@ -26,6 +26,7 @@
  * production execution adapters; the pure contract modules stay on DTOs.
  */
 
+import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { cpus, totalmem } from "node:os";
 import { join } from "node:path";
@@ -46,6 +47,7 @@ import type {
     UnifiedSearchResult,
 } from "../../src/features/magic-context/search";
 import { unifiedSearch } from "../../src/features/magic-context/search";
+import { MAX_SEARCH_RESULT_LIMIT } from "../../src/features/magic-context/search-bounds";
 import {
     assertCandidateDepthSatisfied,
     SEARCH_TRACE_SCHEMA_VERSION,
@@ -104,9 +106,54 @@ import { TIMING_POLICY_VERSION, summarizeLatency, traceTimingEvidence } from "./
 export const RUNNER_VERSION = "retrieval-benchmark-runner/v1";
 export const CHECKPOINT_SCHEMA_VERSION = "retrieval-benchmark-checkpoint/v1";
 
-/** Fused-ranking evaluation depth (R53). Equals the production result-limit
- *  ceiling, so depth 50 executes through the public surface unchanged. */
-export const EVALUATION_DEPTH = 50;
+/** Source directories whose contents determine measured behavior: the
+ *  harness itself plus every production module the measured path executes.
+ *  Over-approximating (whole directories) errs toward fail-closed resume. */
+const BUILD_SOURCE_DIRS = [
+    "scripts/retrieval-benchmark",
+    "src/features/magic-context",
+    "src/hooks/magic-context",
+    "src/tools/ctx-search",
+    "src/shared",
+] as const;
+const BUILD_SOURCE_FILES = ["scripts/benchmark-retrieval.ts"] as const;
+
+let cachedBuildFingerprint: string | null = null;
+
+/** Content identity of the code that produces case evidence (KTD11).
+ *  `RUNNER_VERSION` alone is hand-maintained: editing ranking code or the
+ *  harness without bumping it would let a resume silently mix stale
+ *  checkpointed evidence into one report. Hashing the source surfaces makes
+ *  any code change invalidate checkpoints without human discipline. Test
+ *  and fixture files are excluded — they cannot change measured behavior. */
+function buildFingerprint(): string {
+    if (cachedBuildFingerprint !== null) return cachedBuildFingerprint;
+    const packageRoot = new URL("../../", import.meta.url).pathname;
+    const fileHashes: Record<string, string> = {};
+    const hashFile = (relPath: string): void => {
+        const bytes = readFileSync(join(packageRoot, relPath));
+        fileHashes[relPath] = createHash("sha256").update(bytes).digest("hex");
+    };
+    for (const relPath of BUILD_SOURCE_FILES) hashFile(relPath);
+    for (const dir of BUILD_SOURCE_DIRS) {
+        for (const entry of readdirSync(join(packageRoot, dir), { recursive: true })) {
+            const normalized = String(entry).replaceAll("\\", "/");
+            if (!normalized.endsWith(".ts")) continue;
+            if (normalized.endsWith(".test.ts")) continue;
+            if (normalized.includes("__fixtures__")) continue;
+            hashFile(`${dir}/${normalized}`);
+        }
+    }
+    cachedBuildFingerprint = canonicalFingerprint(fileHashes);
+    return cachedBuildFingerprint;
+}
+
+/** Fused-ranking evaluation depth (R53). Derived from the production
+ *  result-limit ceiling: `normalizeSearchResultLimit` silently clamps
+ *  larger limits, so an unlinked literal here would let a production
+ *  ceiling change shorten ranked lists while metrics kept evaluating at
+ *  the old depth — a manufactured quality regression. */
+export const EVALUATION_DEPTH = MAX_SEARCH_RESULT_LIMIT;
 
 const DEFAULT_AUTO_SCORE_THRESHOLD = 0.6;
 const DEFAULT_AUTO_TIMEOUT_MS = 3_000;
@@ -339,26 +386,29 @@ class CaseCacheController {
     }
 
     start(db: Database): void {
-        const osLayer = this.layers[3];
-        if (this.profileCase.cacheState.osPage === "cold") {
-            const outcome = this.cache.evictOsPageCache(this.ctx.snapshotPath);
-            if (outcome.attempted && outcome.proof !== null) {
-                osLayer.resets += 1;
-                osLayer.mechanism = `eviction-hook:${outcome.proof}`;
-            } else if (this.ctx.requireOsPageEvictionProof) {
-                throw new RunnerError([
-                    `case ${this.profileCase.id}: OS-page eviction requires recorded proof`,
-                ]);
-            } else {
-                osLayer.status = "not-attempted";
-            }
-        }
+        this.evictOsPageIfCold();
         if (
             this.processVector.status !== "not-applicable" &&
             this.processVector.declared === "warm"
         ) {
             this.cache.primeProcessVector(db, this.ctx.projectScope, this.ctx.modelId);
             this.verifyWarmProcessVector("case-start");
+        }
+    }
+
+    private evictOsPageIfCold(): void {
+        if (this.profileCase.cacheState.osPage !== "cold") return;
+        const osLayer = this.layers[3];
+        const outcome = this.cache.evictOsPageCache(this.ctx.snapshotPath);
+        if (outcome.attempted && outcome.proof !== null) {
+            osLayer.resets += 1;
+            osLayer.mechanism = `eviction-hook:${outcome.proof}`;
+        } else if (this.ctx.requireOsPageEvictionProof) {
+            throw new RunnerError([
+                `case ${this.profileCase.id}: OS-page eviction requires recorded proof`,
+            ]);
+        } else {
+            osLayer.status = "not-attempted";
         }
     }
 
@@ -370,6 +420,10 @@ class CaseCacheController {
     }
 
     beforeSample(queryTouchesMemory: boolean): void {
+        // Warmups and earlier samples repopulate the page cache, so a cold
+        // OS-page declaration requires eviction before EVERY measured
+        // sample, not just at case start.
+        this.evictOsPageIfCold();
         if (this.processVector.status === "not-applicable") return;
         if (this.processVector.declared === "cold") {
             this.cache.invalidateProcessVector(this.ctx.projectScope);
@@ -501,6 +555,10 @@ async function executeDelivery(
             searchOptions: buildSearchOptions(ctx, trace ? { trace } : {}),
             scoreThreshold: ctx.autoScoreThreshold,
             timeoutMs: ctx.autoTimeoutMs,
+            // Pinned pack clock: live Date.now() would render different age
+            // strings (and token counts) for the same fingerprinted scenario
+            // on different days.
+            packNowMs: ctx.query.referenceTimeMs,
         });
         if (delivery.status === "incomplete") {
             throw new RunnerError([
@@ -520,7 +578,12 @@ async function executeDelivery(
         ctx.query.queryText,
         buildSearchOptions(ctx, trace ? { trace } : {}),
     );
-    const packed = packSearchResults(ctx.query.queryText, results, ctx.sessionId);
+    const packed = packSearchResults(
+        ctx.query.queryText,
+        results,
+        ctx.sessionId,
+        ctx.query.referenceTimeMs,
+    );
     return { reason: packed.reason, delivered: packed.delivered, tokenCount: packed.tokenCount };
 }
 
@@ -545,6 +608,9 @@ interface RunContext {
     release: ReviewedRelease;
     profile: BenchmarkProfile;
     now: () => number;
+    /** Absolute now()-domain instant when the attempt's wall-time budget
+     *  (seeding included) expires; sample loops check it between samples. */
+    deadlineAtMs: number;
     cache: CacheHooks;
     autoScoreThreshold: number;
     autoTimeoutMs: number;
@@ -662,8 +728,16 @@ async function executeQueryScenario(
 ): Promise<QueryScenarioOutcome> {
     const sources = effectiveSources(qctx);
     const queryTouchesMemory = sources === undefined || sources.includes("memory");
+    const checkDeadline = () => {
+        if (ctx.now() > ctx.deadlineAtMs) {
+            throw new RunnerInterrupt(
+                `wall-time budget exhausted during case ${profileCase.id} (maxWallTimeMs=${ctx.profile.runtime.maxWallTimeMs})`,
+            );
+        }
+    };
 
     for (let i = 0; i < ctx.profile.runtime.warmups; i += 1) {
+        checkDeadline();
         const db = conn.acquire();
         try {
             await executeDelivery(db, qctx);
@@ -674,7 +748,9 @@ async function executeQueryScenario(
 
     const latencySamplesMs: number[] = [];
     let delivery: DeliveryOutcome | null = null;
+    let firstDelivery: DeliveryOutcome | null = null;
     for (let i = 0; i < ctx.profile.runtime.samples; i += 1) {
+        checkDeadline();
         controller.beforeSample(queryTouchesMemory);
         const db = conn.acquire();
         try {
@@ -685,6 +761,16 @@ async function executeQueryScenario(
             conn.release(db);
         }
         controller.afterSample(queryTouchesMemory);
+        // Measured samples must agree on the user-visible outcome: keeping
+        // only the last sample's outcome would let a case with intermittent
+        // timeouts report a normal delivery.
+        if (firstDelivery === null) {
+            firstDelivery = delivery;
+        } else if (delivery.reason !== firstDelivery.reason) {
+            throw new RunnerError([
+                `query ${qctx.query.id}: measured delivery outcomes disagree (sample 1: ${firstDelivery.reason}, sample ${i + 1}: ${delivery.reason})`,
+            ]);
+        }
     }
     if (!delivery) {
         throw new RunnerError([`query ${qctx.query.id}: no measured sample`]);
@@ -699,7 +785,11 @@ async function executeQueryScenario(
     }
 
     // Paired trace-enabled diagnostic pass (KTD15): stage
-    // decomposition only, never a latency-policy sample.
+    // decomposition only, never a latency-policy sample. The evaluation
+    // pass above left every cache layer warm, so the declared cache state
+    // is re-established first or a cold cell's stage decomposition would
+    // describe a warm execution.
+    controller.beforeSample(queryTouchesMemory);
     const tracedSpans: SearchTraceSpan[] = [];
     const traceDb = conn.acquire();
     let tracedDelivery: DeliveryOutcome;
@@ -1048,6 +1138,12 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     const preflight = checkHostResources(options.profile, host);
     if (!preflight.ok) throw new RunnerError([...preflight.diagnostics]);
 
+    // The wall-time budget covers the whole attempt, eager fixture seeding
+    // included — setup on a slow host consumes budget the cases no longer
+    // have.
+    const runStartMs = now();
+    const deadlineAtMs = runStartMs + options.profile.runtime.maxWallTimeMs;
+
     // Fixtures are seeded eagerly for the whole case set so the semantic
     // config carries every deterministic fixture fingerprint regardless of
     // where a resume picks up.
@@ -1060,7 +1156,7 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         schemaVersion: CHECKPOINT_SCHEMA_VERSION,
         release: options.release.fingerprints,
         config: semanticConfig,
-        build: RUNNER_VERSION,
+        build: `${RUNNER_VERSION}@${buildFingerprint()}`,
         host: hostFingerprint(),
     };
     const identityFingerprint = canonicalFingerprint(identity);
@@ -1087,6 +1183,7 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
         release: options.release,
         profile: options.profile,
         now,
+        deadlineAtMs,
         cache,
         autoScoreThreshold,
         autoTimeoutMs,
@@ -1098,7 +1195,6 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     const diagnostics: string[] = [`host:${identity.host}`];
     let attemptStatus: ReportAttempt["status"] = "completed";
     const startedAtEpochMs = epochNow();
-    const runStartMs = now();
 
     try {
         for (const profileCase of options.profile.cases) {
@@ -1106,7 +1202,7 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
             // The declared wall-time budget bounds the whole attempt; cases
             // checkpointed so far stay valid and a compatible resume
             // continues from here.
-            if (now() - runStartMs > options.profile.runtime.maxWallTimeMs) {
+            if (now() > deadlineAtMs) {
                 attemptStatus = "interrupted";
                 diagnostics.push(
                     `run: wall-time budget exhausted (maxWallTimeMs=${options.profile.runtime.maxWallTimeMs})`,
@@ -1133,7 +1229,9 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
     } catch (error) {
         if (error instanceof RunnerInterrupt) {
             attemptStatus = "interrupted";
-            diagnostics.push("run: interrupted between cases");
+            diagnostics.push(
+                error.message.length > 0 ? `run: ${error.message}` : "run: interrupted between cases",
+            );
         } else {
             attemptStatus = "failed";
             diagnostics.push(

@@ -801,7 +801,7 @@ function assertTsMemoryIdWriteAllowed(db: Database, id: number): Memory | null {
 
 export function insertMemory(db: Database, input: MemoryInput): Memory {
     assertTsMemoryWriteAllowed(db, input.projectPath);
-    const now = Date.now();
+    const now = input.nowMs ?? Date.now();
     const normalizedHash = computeNormalizedHash(input.content);
     const insertValues = buildInsertMemoryValues(
         input,

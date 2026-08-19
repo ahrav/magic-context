@@ -6,8 +6,8 @@
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-export function formatAge(timestampMs: number): string {
-    const ageMs = Date.now() - timestampMs;
+export function formatAge(timestampMs: number, nowMs: number = Date.now()): string {
+    const ageMs = nowMs - timestampMs;
     if (ageMs < 0) return "future";
     const days = Math.floor(ageMs / MS_PER_DAY);
     if (days <= 0) return "today";

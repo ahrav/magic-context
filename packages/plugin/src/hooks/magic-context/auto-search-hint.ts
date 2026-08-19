@@ -37,6 +37,9 @@ const FRAGMENT_CHAR_CAP = 80; // ~20 tokens at 3.5 chars/token
 export interface AutoSearchHintOptions {
     maxFragments?: number;
     fragmentCharCap?: number;
+    /** Reference clock for age wording; injectable so a fingerprinted
+     *  benchmark scenario renders identical bytes on any day. */
+    nowMs?: number;
 }
 
 function truncate(text: string, limit: number): string {
@@ -45,7 +48,7 @@ function truncate(text: string, limit: number): string {
     return `${normalized.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
 }
 
-function renderFragment(result: UnifiedSearchResult, charCap: number): string {
+function renderFragment(result: UnifiedSearchResult, charCap: number, nowMs: number): string {
     switch (result.source) {
         case "memory": {
             const compressed = cavemanCompress(boundDynamicField(result.content), "ultra");
@@ -58,7 +61,7 @@ function renderFragment(result: UnifiedSearchResult, charCap: number): string {
             const bounded = boundDynamicField(result.content);
             const subject = bounded.split(/\r?\n/)[0] ?? bounded;
             const body = truncate(subject, Math.max(10, charCap - 20));
-            return `commit ${boundDynamicField(result.shortSha)} ${formatAge(result.committedAtMs)}: ${body}`;
+            return `commit ${boundDynamicField(result.shortSha)} ${formatAge(result.committedAtMs, nowMs)}: ${body}`;
         }
         case "message": {
             const compressed = cavemanCompress(boundDynamicField(result.content), "ultra");
@@ -115,12 +118,13 @@ export function packAutoSearchHint(
 ): PackedAutoSearchHint {
     const maxFragments = Math.max(1, options.maxFragments ?? MAX_FRAGMENTS);
     const fragmentCharCap = Math.max(20, options.fragmentCharCap ?? FRAGMENT_CHAR_CAP);
+    const nowMs = options.nowMs ?? Date.now();
 
     const picks = results.slice(0, maxFragments);
     const kept: Array<{ result: UnifiedSearchResult; line: string }> = [];
 
     for (const result of picks) {
-        const fragment = renderFragment(result, fragmentCharCap);
+        const fragment = renderFragment(result, fragmentCharCap, nowMs);
         if (fragment.length === 0) continue;
         kept.push({ result, line: `- ${fragment}` });
     }
