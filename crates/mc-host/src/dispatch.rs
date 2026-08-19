@@ -632,6 +632,11 @@ pub async fn dispatch_request<H: McHostHandler>(
     let (start_tx, start_rx) = oneshot::channel::<()>();
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
+    // The route's completion fence must cover the handler callback itself, not
+    // just this outer task: aborting the outer drops its AbortOnDropHandle,
+    // which only REQUESTS the callback's abort, so a route close could
+    // otherwise see the tracker empty while request code still runs.
+    let handler_fence = route_tracker.clone();
     let outer = shared.spawn_tracked(route_tracker.track_future(async move {
         let _pending_permit = pending_permit;
         if start_rx.await.is_err() {
@@ -683,7 +688,7 @@ pub async fn dispatch_request<H: McHostHandler>(
             stream: sink,
         };
         let handler = Arc::clone(&shared_task.handler);
-        let inner = shared_task.spawn_tracked(async move {
+        let inner = shared_task.spawn_tracked(handler_fence.track_future(async move {
             // The task permit lives in the callback task, not the settling
             // outer task: capacity frees when the handler finishes, so a
             // slow client blocking terminal emission cannot occupy
@@ -694,7 +699,7 @@ pub async fn dispatch_request<H: McHostHandler>(
             // redacting hook too.
             let callback = crate::panic_boundary::redact_sync(|| handler.handle(ctx));
             crate::panic_boundary::redact(callback).await
-        });
+        }));
         let mut inner = AbortOnDropHandle::new(inner);
 
         tokio::select! {
