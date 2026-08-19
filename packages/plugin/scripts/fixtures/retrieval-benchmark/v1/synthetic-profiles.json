@@ -1,0 +1,73 @@
+{
+  "schemaVersion": "retrieval-benchmark-synthetic/v1",
+  "profiles": [
+    {
+      "id": "syn-scale-1000",
+      "generatorVersion": "synthetic-generator/v1",
+      "prng": "splitmix32",
+      "seed": 20260818,
+      "scale": 1000,
+      "sourceDistribution": {
+        "memory": 4,
+        "message": 6,
+        "compartment": 5,
+        "note": 2
+      },
+      "textSize": {
+        "minWords": 12,
+        "maxWords": 96
+      }
+    },
+    {
+      "id": "syn-scale-10000",
+      "generatorVersion": "synthetic-generator/v1",
+      "prng": "splitmix32",
+      "seed": 20260818,
+      "scale": 10000,
+      "sourceDistribution": {
+        "memory": 4,
+        "message": 6,
+        "compartment": 5,
+        "note": 2
+      },
+      "textSize": {
+        "minWords": 12,
+        "maxWords": 96
+      }
+    },
+    {
+      "id": "syn-scale-100000",
+      "generatorVersion": "synthetic-generator/v1",
+      "prng": "splitmix32",
+      "seed": 20260818,
+      "scale": 100000,
+      "sourceDistribution": {
+        "memory": 4,
+        "message": 6,
+        "compartment": 5,
+        "note": 2
+      },
+      "textSize": {
+        "minWords": 12,
+        "maxWords": 96
+      }
+    },
+    {
+      "id": "syn-scale-1000000",
+      "generatorVersion": "synthetic-generator/v1",
+      "prng": "splitmix32",
+      "seed": 20260818,
+      "scale": 1000000,
+      "sourceDistribution": {
+        "memory": 4,
+        "message": 6,
+        "compartment": 5,
+        "note": 2
+      },
+      "textSize": {
+        "minWords": 12,
+        "maxWords": 96
+      }
+    }
+  ]
+}

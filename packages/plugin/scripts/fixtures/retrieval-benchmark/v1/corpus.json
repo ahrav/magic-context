@@ -1,0 +1,902 @@
+{
+  "schemaVersion": "retrieval-benchmark-corpus/v1",
+  "queries": [
+    {
+      "id": "q-exact-symbol-path-dev",
+      "category": "exact-symbol-path",
+      "mode": "explicit",
+      "queryText": "where is normalizeSearchResultLimit defined",
+      "sourceFilters": [
+        "message"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-exact-symbol-path-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-exact-symbol-path-hold",
+      "category": "exact-symbol-path",
+      "mode": "explicit",
+      "queryText": "which file builds the alias index for benchmark identities",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-exact-symbol-path-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-error-message-dev",
+      "category": "error-message",
+      "mode": "automatic",
+      "queryText": "SQLITE_BUSY thrown during shadow measurement write",
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": null
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-error-message-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-error-message-hold",
+      "category": "error-message",
+      "mode": "explicit",
+      "queryText": "unknown alias namespace failure when resolving ranked results",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-error-message-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-architecture-rationale-dev",
+      "category": "architecture-rationale",
+      "mode": "explicit",
+      "queryText": "why keep relevance identity separate from storage row ids",
+      "sourceFilters": [
+        "memory"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-architecture-rationale-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-architecture-rationale-hold",
+      "category": "architecture-rationale",
+      "mode": "explicit",
+      "queryText": "reason recovery drafts live outside the repository worktree",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-architecture-rationale-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-debugging-history-dev",
+      "category": "debugging-history",
+      "mode": "explicit",
+      "queryText": "how we fixed duplicate metric credit for alias spellings",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-debugging-history-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-debugging-history-hold",
+      "category": "debugging-history",
+      "mode": "explicit",
+      "queryText": "what caused the false recall drop in the migration rehearsal",
+      "sourceFilters": [
+        "git_commit",
+        "message"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-debugging-history-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-user-directive-dev",
+      "category": "user-directive",
+      "mode": "automatic",
+      "queryText": "directive to use graded judgments instead of binary labels",
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": null
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-user-directive-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-user-directive-hold",
+      "category": "user-directive",
+      "mode": "explicit",
+      "queryText": "rule about never persisting plaintext query telemetry",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-user-directive-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-current-constraint-dev",
+      "category": "current-constraint",
+      "mode": "explicit",
+      "queryText": "maximum bytes allowed for an explicit search query",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-current-constraint-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-current-constraint-hold",
+      "category": "current-constraint",
+      "mode": "automatic",
+      "queryText": "per session row cap on the measurement corpus",
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": null
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-current-constraint-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-benchmark-result-dev",
+      "category": "benchmark-result",
+      "mode": "explicit",
+      "queryText": "latest recall at ten for the shadow embedding cohort",
+      "sourceFilters": [
+        "note"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-benchmark-result-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-benchmark-result-hold",
+      "category": "benchmark-result",
+      "mode": "explicit",
+      "queryText": "p95 latency measured for the vector scan stage",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-benchmark-result-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-temporal-dev",
+      "category": "temporal",
+      "mode": "automatic",
+      "queryText": "what changed in the search pipeline last sprint",
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": null
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-temporal-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-temporal-hold",
+      "category": "temporal",
+      "mode": "explicit",
+      "queryText": "when the judgments schema version was frozen",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-temporal-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-contradictory-memory-dev",
+      "category": "contradictory-memory",
+      "mode": "explicit",
+      "queryText": "are duplicate aliases credited once or per spelling",
+      "sourceFilters": [
+        "memory"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-contradictory-memory-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-contradictory-memory-hold",
+      "category": "contradictory-memory",
+      "mode": "automatic",
+      "queryText": "is an unjudged pair scored as nonrelevant",
+      "sourceFilters": [
+        "memory",
+        "message",
+        "git_commit"
+      ],
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": null
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-contradictory-memory-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-paraphrased-decision-dev",
+      "category": "paraphrased-decision",
+      "mode": "explicit",
+      "queryText": "decision to grade every pooled query document pair",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-paraphrased-decision-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-paraphrased-decision-dev-p2",
+      "category": "paraphrased-decision",
+      "mode": "explicit",
+      "queryText": "we agreed each pooled pair gets a grade",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "development",
+      "paraphraseGroup": "pg-paraphrased-decision-dev",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-paraphrased-decision-hold",
+      "category": "paraphrased-decision",
+      "mode": "explicit",
+      "queryText": "why the holdout partition is frozen before ranking work",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-paraphrased-decision-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    },
+    {
+      "id": "q-paraphrased-decision-hold-p2",
+      "category": "paraphrased-decision",
+      "mode": "explicit",
+      "queryText": "rationale for locking holdout intents ahead of tuning",
+      "sourceFilters": null,
+      "fixtureScope": {
+        "projectScope": "git:benchmark-fixture-project",
+        "sessionScope": null
+      },
+      "visibleState": {
+        "visibleMemoryIds": [],
+        "messageOrdinalCutoff": 100000
+      },
+      "referenceTimeMs": 1755400000000,
+      "partition": "holdout",
+      "paraphraseGroup": "pg-paraphrased-decision-hold",
+      "resultLimit": 10,
+      "provenance": {
+        "origin": "curated"
+      }
+    }
+  ],
+  "documents": [
+    {
+      "id": "d-exact-symbol-path-dev",
+      "kind": "message",
+      "semanticPayload": {
+        "kind": "message",
+        "title": "search bounds module walkthrough",
+        "body": "normalizeSearchResultLimit lives in the search-bounds module next to the explicit query preflight; it clamps the requested limit into the supported result window."
+      },
+      "aliases": [
+        {
+          "namespace": "message",
+          "locator": "msg-fixture-0001",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-exact-symbol-path-dev-distractor",
+      "kind": "message",
+      "semanticPayload": {
+        "kind": "message",
+        "title": "unrelated limit discussion",
+        "body": "The rate limiter for embedding batches uses a token bucket, unrelated to result limits."
+      },
+      "aliases": [
+        {
+          "namespace": "message",
+          "locator": "msg-fixture-0002",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-exact-symbol-path-hold",
+      "kind": "memory",
+      "semanticPayload": {
+        "kind": "memory",
+        "title": "benchmark identity module map",
+        "body": "The alias index builder sits in the benchmark identity module; it maps scoped physical locators onto content-addressed relevance identities."
+      },
+      "aliases": [
+        {
+          "namespace": "memory",
+          "locator": "9101",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-error-message-dev",
+      "kind": "message",
+      "semanticPayload": {
+        "kind": "message",
+        "title": "shadow write failure triage",
+        "body": "SQLITE_BUSY during the shadow measurement insert is contained by the telemetry guard; the search results path never rejects because of it."
+      },
+      "aliases": [
+        {
+          "namespace": "message",
+          "locator": "msg-fixture-0003",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-error-message-hold",
+      "kind": "note",
+      "semanticPayload": {
+        "kind": "note",
+        "title": "alias namespace failure note",
+        "body": "Resolving a ranked result with an unrecognized locator namespace reports an unresolved status instead of guessing a target document."
+      },
+      "aliases": [
+        {
+          "namespace": "note",
+          "locator": "7301",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-error-message-hold-distractor",
+      "kind": "note",
+      "semanticPayload": {
+        "kind": "note",
+        "title": "unrelated namespace note",
+        "body": "TypeScript namespace imports are banned by the lint config; prefer module imports."
+      },
+      "aliases": [
+        {
+          "namespace": "note",
+          "locator": "7302",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-architecture-rationale-dev",
+      "kind": "memory",
+      "semanticPayload": {
+        "kind": "memory",
+        "title": "identity separation rationale",
+        "body": "Relevance truth follows the immutable semantic payload rather than a storage row id, so a correct storage migration cannot register as a false recall loss."
+      },
+      "aliases": [
+        {
+          "namespace": "memory",
+          "locator": "9102",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        },
+        {
+          "namespace": "retrieval-document",
+          "locator": "rdoc-9102",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-architecture-rationale-hold",
+      "kind": "primer",
+      "semanticPayload": {
+        "kind": "primer",
+        "title": "draft staging boundary primer",
+        "body": "Recovered drafts stage in an owner-only directory outside source, publication, and version-control trees so raw candidate text can never reach a tracked file."
+      },
+      "aliases": [
+        {
+          "namespace": "primer",
+          "locator": "501",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-debugging-history-dev",
+      "kind": "git_commit",
+      "semanticPayload": {
+        "kind": "git_commit",
+        "title": "dedupe ranked alias credit",
+        "body": "fix(benchmark): credit only the first ranked occurrence of a canonical identity; later alias spellings of the same payload count as duplicates."
+      },
+      "aliases": [
+        {
+          "namespace": "commit",
+          "locator": "a1b2c3d4e5f6071829",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-debugging-history-hold",
+      "kind": "git_commit",
+      "semanticPayload": {
+        "kind": "git_commit",
+        "title": "migration rehearsal recall fix",
+        "body": "fix(migration): rehearsal recall drop traced to physical result ids changing shape; scoring now resolves canonical identities before recall is computed."
+      },
+      "aliases": [
+        {
+          "namespace": "commit",
+          "locator": "b2c3d4e5f60718293a",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-user-directive-dev",
+      "kind": "memory",
+      "semanticPayload": {
+        "kind": "memory",
+        "title": "graded judgment directive",
+        "body": "Directive: relevance labels use grades zero, one, and two; binary labels are not acceptable for the judged corpus."
+      },
+      "aliases": [
+        {
+          "namespace": "memory",
+          "locator": "9103",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-user-directive-hold",
+      "kind": "memory",
+      "semanticPayload": {
+        "kind": "memory",
+        "title": "plaintext telemetry rule",
+        "body": "Standing rule: production telemetry stores normalized query hashes only; no new plaintext query capture sink may be added."
+      },
+      "aliases": [
+        {
+          "namespace": "memory",
+          "locator": "9104",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-current-constraint-dev",
+      "kind": "compartment",
+      "semanticPayload": {
+        "kind": "compartment",
+        "title": "query bounds compartment",
+        "body": "Explicit queries reject past sixteen kilobytes of UTF-8; automatic queries truncate to the same byte budget before token and atom caps apply."
+      },
+      "aliases": [
+        {
+          "namespace": "chunk",
+          "locator": "3401",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-current-constraint-hold",
+      "kind": "compartment",
+      "semanticPayload": {
+        "kind": "compartment",
+        "title": "measurement retention compartment",
+        "body": "The measurement corpus keeps at most two thousand rows per session; the oldest overflow rows are pruned when an insert lands."
+      },
+      "aliases": [
+        {
+          "namespace": "chunk",
+          "locator": "3402",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-benchmark-result-dev",
+      "kind": "note",
+      "semanticPayload": {
+        "kind": "note",
+        "title": "shadow cohort recall snapshot",
+        "body": "Benchmark snapshot: the shadow cohort reached recall at ten of zero point eight one on the development partition, up four points over primary."
+      },
+      "aliases": [
+        {
+          "namespace": "note",
+          "locator": "7303",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-benchmark-result-hold",
+      "kind": "note",
+      "semanticPayload": {
+        "kind": "note",
+        "title": "vector scan latency note",
+        "body": "Stage timing: vector scan p95 sits at nineteen milliseconds at the hundred-thousand document scale point with the current layout."
+      },
+      "aliases": [
+        {
+          "namespace": "note",
+          "locator": "7304",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-temporal-dev",
+      "kind": "git_commit",
+      "semanticPayload": {
+        "kind": "git_commit",
+        "title": "sprint search pipeline change",
+        "body": "refactor(search): last sprint moved locator encoding behind the production codec and froze the measurement string vocabulary."
+      },
+      "aliases": [
+        {
+          "namespace": "commit",
+          "locator": "c3d4e5f60718293a4b",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-temporal-hold",
+      "kind": "primer",
+      "semanticPayload": {
+        "kind": "primer",
+        "title": "judgments schema freeze primer",
+        "body": "The judgments schema froze at version one together with the graded pooled rubric; changes require a new schema version and fresh approvals."
+      },
+      "aliases": [
+        {
+          "namespace": "primer",
+          "locator": "502",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-contradictory-memory-dev",
+      "kind": "memory",
+      "semanticPayload": {
+        "kind": "memory",
+        "title": "alias credit resolution",
+        "body": "Resolved contradiction: duplicate aliases are credited once per canonical identity; an earlier note that credited each spelling separately is superseded."
+      },
+      "aliases": [
+        {
+          "namespace": "memory",
+          "locator": "9105",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-contradictory-memory-hold",
+      "kind": "memory",
+      "semanticPayload": {
+        "kind": "memory",
+        "title": "unjudged semantics resolution",
+        "body": "Resolved contradiction: unjudged pairs stay explicitly unjudged and are excluded from grading; treating them as grade zero was rejected."
+      },
+      "aliases": [
+        {
+          "namespace": "memory",
+          "locator": "9106",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-paraphrased-decision-dev",
+      "kind": "note",
+      "semanticPayload": {
+        "kind": "note",
+        "title": "pooled grading decision",
+        "body": "Decision: every pooled query-document pair receives a human grade; absent nonpooled pairs remain unjudged rather than defaulting to nonrelevant."
+      },
+      "aliases": [
+        {
+          "namespace": "note",
+          "locator": "7305",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    },
+    {
+      "id": "d-paraphrased-decision-hold",
+      "kind": "primer",
+      "semanticPayload": {
+        "kind": "primer",
+        "title": "holdout freeze decision",
+        "body": "Decision: development and holdout partitions are assigned by base intent before any ranking work so the holdout can gate changes without being tuned against."
+      },
+      "aliases": [
+        {
+          "namespace": "primer",
+          "locator": "503",
+          "projectScope": "git:benchmark-fixture-project",
+          "sessionScope": null
+        }
+      ]
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +15,7 @@ import {
 import type { UnifiedSearchOptions, UnifiedSearchResult } from "./search";
 import { recordShadowMeasurement } from "./search-measurement";
 import { closeDatabase, openDatabase } from "./storage";
+import { listEmbeddingMeasurements } from "./storage-embedding-measurements";
 
 class FakeShadowProvider implements EmbeddingProvider {
     readonly modelId = "synapse:v1:fake";
@@ -61,7 +63,9 @@ describe("recordShadowMeasurement", () => {
         const dir = mkdtempSync(join(tmpdir(), "search-measurement-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        if (!db) throw new Error("openDatabase returned null in test setup");
+        return db;
     }
 
     afterEach(() => {
@@ -129,5 +133,40 @@ describe("recordShadowMeasurement", () => {
         } finally {
             process.off("unhandledRejection", onUnhandledRejection);
         }
+    });
+
+    it("records rank lists and corpus hash byte-identical to the legacy inline encoding", async () => {
+        const db = useTempDb();
+        _setTestProviderFactoryForProject(() => new FakeShadowProvider());
+        registerProjectShadowEmbedding(db, "git:shadow-measure", synapseConfig, "/tmp/shadow");
+
+        const primaryResults = [
+            { source: "memory", memoryId: 42 },
+            { source: "compartment", compartmentId: 7 },
+            { source: "git_commit", sha: "abc123" },
+        ] as unknown as UnifiedSearchResult[];
+        const shadowResults = [
+            { source: "message", messageId: "msg_1" },
+            { source: "primer", primerId: 3 },
+            { source: "note", noteId: 11 },
+        ] as unknown as UnifiedSearchResult[];
+
+        await recordShadowMeasurement({
+            ...makeMeasurementArgs(db),
+            primaryResults,
+            search: async () => shadowResults,
+        });
+
+        const rows = listEmbeddingMeasurements(db, "ses-shadow");
+        expect(rows).toHaveLength(1);
+        const primaryIds = ["memory:42", "chunk:7", "commit:abc123"];
+        const shadowIds = ["message:msg_1", "primer:3", "note:11"];
+        expect(rows[0].primary_result_ids_json).toBe(JSON.stringify(primaryIds));
+        expect(rows[0].shadow_result_ids_json).toBe(JSON.stringify(shadowIds));
+        expect(rows[0].corpus_hash).toBe(
+            createHash("sha256")
+                .update(JSON.stringify({ query: "queue backpressure", primaryIds, shadowIds }))
+                .digest("hex"),
+        );
     });
 });
