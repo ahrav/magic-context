@@ -40,12 +40,18 @@ jobs:
             plugins
           persist-credentials: false
 
+      - name: Name pinned plugin marketplace
+        run: |
+          manifest=".claude-code-marketplace/.claude-plugin/marketplace.json"
+          jq '.name = "pinned-claude-code-plugins"' "$manifest" > "$manifest.tmp"
+          mv -f "$manifest.tmp" "$manifest"
+
       - name: Run Claude Code review
         uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: "./.claude-code-marketplace"
-          plugins: "code-review@claude-code-plugins"
+          plugins: "code-review@pinned-claude-code-plugins"
           prompt: >-
             /code-review:code-review
             ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
