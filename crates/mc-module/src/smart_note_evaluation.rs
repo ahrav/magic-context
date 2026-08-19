@@ -823,6 +823,30 @@ pub fn select_next_smart_note_evaluation(
     })
 }
 
+/// Selection for polls that exclude billable work (`exclude_billable`): only
+/// the due and liveness phases, which execute the already-compiled check in
+/// the sandbox. Compile and fallback claims launch LLM prompts and belong to
+/// the scheduled full-budget drain.
+pub fn select_nonbillable_smart_note_evaluation(
+    notes: &[SmartNoteSelectionSnapshot],
+    now: i64,
+    retina_handoff: bool,
+) -> Option<(i64, String)> {
+    fn first(selected: &[&SmartNoteSelectionSnapshot], phase: &str) -> Option<(i64, String)> {
+        selected.first().map(|note| (note.id, phase.to_string()))
+    }
+    first(
+        &get_due_compiled_smart_note_checks(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
+        "due",
+    )
+    .or_else(|| {
+        first(
+            &get_stale_compiled_smart_notes(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
+            "liveness",
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,9 +1525,24 @@ mod tests {
             Some((3, "liveness".to_string()))
         );
         assert_eq!(
-            select_next_smart_note_evaluation(&[fallback], now, false),
+            select_next_smart_note_evaluation(&[fallback.clone()], now, false),
             Some((4, "fallback".to_string()))
         );
         assert_eq!(select_next_smart_note_evaluation(&[], now, false), None);
+
+        // The nonbillable selection never hands out compile or fallback work
+        // and still reaches liveness past a compile candidate.
+        assert_eq!(
+            select_nonbillable_smart_note_evaluation(&all, now, false),
+            Some((1, "due".to_string()))
+        );
+        assert_eq!(
+            select_nonbillable_smart_note_evaluation(&no_due, now, false),
+            Some((3, "liveness".to_string()))
+        );
+        assert_eq!(
+            select_nonbillable_smart_note_evaluation(&[fallback, compile], now, false),
+            None
+        );
     }
 }

@@ -352,14 +352,16 @@ export class SmartNoteEvaluatorWorker {
      * Zero-wait drain: poll for Rust-selected work until the authority reports
      * no_work, the deadline passes, or the signal aborts.
      *
-     * `maxCompilePerRun`/`maxFallbackPerRun` bound the billable claims this
-     * drain executes (default: the legacy per-run caps). A budget of 0 keeps
-     * the drain to cheap phases — due checks, liveness, registration recovery,
-     * wake publication — abandoning any billable claim the authority hands out.
+     * `excludeBillable` asks the authority for sandbox-only phases (due,
+     * liveness); compile and fallback claims launch LLM prompts and belong to
+     * the scheduled full-budget drain. `maxCompilePerRun`/`maxFallbackPerRun`
+     * bound the billable claims this drain executes client-side (default: the
+     * legacy per-run caps).
      */
     async drainOnce(args: {
         deadline: number;
         signal?: AbortSignal;
+        excludeBillable?: boolean;
         maxCompilePerRun?: number;
         maxFallbackPerRun?: number;
     }): Promise<DrainResult> {
@@ -382,6 +384,7 @@ export class SmartNoteEvaluatorWorker {
     private async drainOnceExclusive(args: {
         deadline: number;
         signal?: AbortSignal;
+        excludeBillable?: boolean;
         maxCompilePerRun?: number;
         maxFallbackPerRun?: number;
     }): Promise<DrainResult> {
@@ -411,7 +414,7 @@ export class SmartNoteEvaluatorWorker {
         const maxFallback = args.maxFallbackPerRun ?? MAX_FALLBACK_PER_RUN;
         for (let i = 0; i < MAX_CLAIMS_PER_DRAIN; i++) {
             if (this.disposed || args.signal?.aborted || Date.now() >= args.deadline) break;
-            const next = await this.next(args.signal);
+            const next = await this.next(args.signal, args.excludeBillable === true);
             if (next === "no_work") {
                 result.drained = true;
                 break;
@@ -419,14 +422,16 @@ export class SmartNoteEvaluatorWorker {
             if (next === "retry") continue;
             if (next === "stop") break;
             result.claimed += 1;
-            if (this.disposed || args.signal?.aborted) {
-                // dispose() may have aborted and unregistered while next() was
-                // in flight; executing would strand the claim on a dead
-                // registration. Best-effort release — if the registration is
-                // already gone, the lease expires server-side.
+            if (this.disposed || args.signal?.aborted || !this.registration) {
+                // dispose() may have aborted and unregistered — or a failed
+                // heartbeat dropped the registration — while next() was in
+                // flight; executing would start a potentially billable claim
+                // with no credentials left to complete or abandon it.
+                // Best-effort release — if the registration is already gone,
+                // the lease expires server-side.
                 this.lastAbandonReleased = await this.abandon(
                     next.claimId,
-                    "worker disposed during poll",
+                    "registration lost during poll",
                 );
                 result.abandoned += 1;
                 break;
@@ -499,7 +504,8 @@ export class SmartNoteEvaluatorWorker {
     }
 
     private async next(
-        signal?: AbortSignal,
+        signal: AbortSignal | undefined,
+        excludeBillable: boolean,
     ): Promise<ClaimResponse | "no_work" | "retry" | "stop"> {
         const acquisitionId = this.pendingAcquisitionId ?? randomUUID();
         this.pendingAcquisitionId = acquisitionId;
@@ -508,7 +514,11 @@ export class SmartNoteEvaluatorWorker {
             response = asRecord(
                 await this.deps.transport.call({
                     method: "note.evaluation.next",
-                    body: this.claimBody({ acquisition_id: acquisitionId, wait_ms: 0 }),
+                    body: this.claimBody({
+                        acquisition_id: acquisitionId,
+                        wait_ms: 0,
+                        ...(excludeBillable ? { exclude_billable: true } : {}),
+                    }),
                     signal,
                 }),
             );
@@ -556,11 +566,18 @@ export class SmartNoteEvaluatorWorker {
                 },
             };
         }
-        if (result === "no_work" || result === "expired") {
+        if (result === "no_work") {
             // The authority recorded (or replayed) a durable decision for this
             // acquisition; it is consumed.
             this.pendingAcquisitionId = null;
             return "no_work";
+        }
+        if (result === "expired") {
+            // The replayed decision aged out of the authority's retention
+            // window: it says nothing about whether work exists NOW. Consume
+            // the stale id and poll again with a fresh acquisition.
+            this.pendingAcquisitionId = null;
+            return "retry";
         }
         // `busy` records no durable decision, and an unrecognized result is an
         // unknown outcome: keep the acquisition id so the next poll replays

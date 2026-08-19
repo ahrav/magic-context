@@ -76,7 +76,9 @@ export interface ModuleNoteEvaluationBridge {
     drain(args: {
         deadline: number;
         signal?: AbortSignal;
-        /** 0 keeps the drain to non-billable phases; absent = legacy per-run cap. */
+        /** Ask the authority for sandbox-only phases (due, liveness). */
+        excludeBillable?: boolean;
+        /** Client-side bound on billable claims; absent = legacy per-run cap. */
         maxCompilePerRun?: number;
         maxFallbackPerRun?: number;
     }): Promise<DrainResult>;
@@ -150,6 +152,27 @@ export function getModuleNoteEvaluationBridge(
         if (key.startsWith(prefix)) return entry.bridge;
     }
     return undefined;
+}
+
+/**
+ * Bridge lookup for drain paths: exact (identity, root) first — worktrees of
+ * one repository share an identity, and each bridge's filesystem capabilities
+ * bind to one checkout — then any bridge for the identity, because an
+ * undrained module queue is the worse failure: pending notes would sit
+ * forever in a process whose exact-root bridge never registered. Claims carry
+ * no originating root, so the cross-root exposure already exists in claim
+ * selection itself; root-fenced selection is tracked as magic-context-c0c and
+ * must land here, once, for every drain caller.
+ */
+export function findModuleNoteEvaluationBridgeForDrain(
+    projectPath: string,
+    projectRoot: string | undefined,
+): ModuleNoteEvaluationBridge | undefined {
+    return (
+        (projectRoot !== undefined
+            ? getModuleNoteEvaluationBridge(projectPath, projectRoot)
+            : undefined) ?? getModuleNoteEvaluationBridge(projectPath)
+    );
 }
 
 /**

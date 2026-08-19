@@ -2,8 +2,8 @@ import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
 import {
+    findModuleNoteEvaluationBridgeForDrain,
     getAuthorityManagedMarker,
-    getModuleNoteEvaluationBridge,
 } from "../features/magic-context/context-authority";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
@@ -500,13 +500,7 @@ async function sweepProject(
 }
 
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
-    // Exact (identity, root) first: worktrees of one repository share an
-    // identity, and this registration must drain the bridge bound to its own
-    // checkout. Fall back to any bridge for the identity so a root mismatch
-    // still drains the shared module queue rather than nothing.
-    const bridge =
-        getModuleNoteEvaluationBridge(reg.projectIdentity, reg.directory) ??
-        getModuleNoteEvaluationBridge(reg.projectIdentity);
+    const bridge = findModuleNoteEvaluationBridgeForDrain(reg.projectIdentity, reg.directory);
     if (bridge) {
         // Deliberately NOT gated on bridge.available(): drain is the path that
         // re-registers a dropped evaluator, so gating it on availability would
@@ -514,12 +508,13 @@ async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database)
         // unrecoverable for this process. The bridge itself suppresses local
         // claims and publishes wake ownership when the wake plane is present.
         //
-        // Zero compile/fallback budget: this per-tick sweep mirrors the legacy
-        // due-check cadence (cheap QuickJS runs) plus registration recovery.
-        // Billable compile and fallback claims belong to the cron-scheduled
+        // Sandbox-only: this per-tick sweep mirrors the legacy due-check
+        // cadence (cheap QuickJS runs) plus registration recovery. Billable
+        // compile and fallback claims belong to the cron-scheduled
         // evaluate-smart-notes task, which drains with the full budgets.
         const result = await bridge.drain({
             deadline: Date.now() + 60_000,
+            excludeBillable: true,
             maxCompilePerRun: 0,
             maxFallbackPerRun: 0,
         });

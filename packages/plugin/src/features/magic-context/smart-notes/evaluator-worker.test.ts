@@ -195,6 +195,51 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         await w.dispose();
     });
 
+    test("an exclude-billable drain sends the flag on every poll", async () => {
+        let served = 0;
+        const { transport, calls } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                return served <= 1 ? claimResponse(served, "due") : { result: "no_work" };
+            }
+            if (method === "note.evaluation.complete") return { result: "applied" };
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({
+            deadline: Date.now() + 30_000,
+            excludeBillable: true,
+        });
+        expect(result.completed).toBe(1);
+        const nexts = calls.filter((c) => c.method === "note.evaluation.next");
+        expect(nexts.length).toBeGreaterThan(0);
+        for (const next of nexts) expect(next.body.exclude_billable).toBe(true);
+        await w.dispose();
+    });
+
+    test("an expired acquisition decision retries with a fresh id", async () => {
+        let served = 0;
+        const nextIds: string[] = [];
+        const { transport } = stubTransport((method, body) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                nextIds.push(body.acquisition_id as string);
+                // A stale replayed decision says nothing about current work;
+                // the fresh poll finds the queue empty.
+                return served === 1 ? { result: "expired" } : { result: "no_work" };
+            }
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
+        expect(result.drained).toBe(true);
+        expect(nextIds).toHaveLength(2);
+        expect(nextIds[0]).not.toBe(nextIds[1]);
+        await w.dispose();
+    });
+
     test("a revision-fence conflict on one claim does not abort the drain", async () => {
         let served = 0;
         let completions = 0;

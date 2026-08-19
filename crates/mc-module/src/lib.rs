@@ -60,8 +60,9 @@ use tokio::sync::Notify;
 
 use crate::smart_note_evaluation::{
     is_valid_smart_note_cron, reduce_smart_note_evaluation, select_next_smart_note_evaluation,
-    CheckOutcome, CompileOutcome, CompiledCheckArtifact, FallbackOutcome,
-    SmartNoteEvaluationOutcome, SmartNoteLifecycleState, SmartNoteSelectionSnapshot,
+    select_nonbillable_smart_note_evaluation, CheckOutcome, CompileOutcome, CompiledCheckArtifact,
+    FallbackOutcome, SmartNoteEvaluationOutcome, SmartNoteLifecycleState,
+    SmartNoteSelectionSnapshot,
 };
 use chrono::{Local, TimeZone};
 use cortexkit_lease::LeaseError;
@@ -11132,6 +11133,7 @@ impl McHandler {
                 "evaluator_slot",
                 "acquisition_id",
                 "wait_ms",
+                "exclude_billable",
             ],
         ) {
             Ok(body) => body,
@@ -11155,6 +11157,10 @@ impl McHandler {
                 Some(wait_ms) => wait_ms,
                 None => return note_evaluation_bad_request("'wait_ms' must be an integer"),
             },
+        };
+        let exclude_billable = match note_evaluation_opt_bool_field(body, "exclude_billable") {
+            Ok(value) => value.unwrap_or(false),
+            Err(outcome) => return outcome,
         };
         if wait_ms != 0 {
             return HandlerOutcome::Error {
@@ -11201,7 +11207,15 @@ impl McHandler {
                     .iter()
                     .map(smart_note_selection_snapshot)
                     .collect();
-                select_next_smart_note_evaluation(&snapshots, now, retina_handoff)
+                if exclude_billable {
+                    // The per-tick maintenance drain runs only sandbox
+                    // phases; handing it a compile or fallback claim would
+                    // force a claim-and-abandon round per tick and block
+                    // liveness behind the strict phase priority.
+                    select_nonbillable_smart_note_evaluation(&snapshots, now, retina_handoff)
+                } else {
+                    select_next_smart_note_evaluation(&snapshots, now, retina_handoff)
+                }
             },
             now,
         ) {
@@ -11228,8 +11242,9 @@ impl McHandler {
             Ok(body) => body,
             Err(outcome) => return outcome,
         };
+        let now = now_ms();
         let (identity, evaluator_slot, claim_id, project) =
-            match self.note_evaluation_claim_scope(channel, body) {
+            match self.note_evaluation_claim_scope(channel, body, now) {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
             };
@@ -11242,7 +11257,7 @@ impl McHandler {
             identity.evaluator_instance,
             evaluator_slot,
             identity.registration_generation,
-            now_ms(),
+            now,
         ) {
             Ok(NoteEvalRenewOutcome::Renewed { expires_at }) => {
                 respond(json!({ "result": "renewed", "expires_at": expires_at }))
@@ -11292,15 +11307,15 @@ impl McHandler {
             Ok(parsed) => parsed,
             Err(handler_outcome) => return handler_outcome,
         };
+        let now = now_ms();
         let (identity, evaluator_slot, claim_id, project) =
-            match self.note_evaluation_claim_scope(channel, body) {
+            match self.note_evaluation_claim_scope(channel, body, now) {
                 Ok(scope) => scope,
                 Err(handler_outcome) => return handler_outcome,
             };
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
-        let now = now_ms();
         let project_for_apply = project.clone();
         match store.complete_note_evaluation(
             &project,
@@ -11350,8 +11365,9 @@ impl McHandler {
             Ok(body) => body,
             Err(outcome) => return outcome,
         };
+        let now = now_ms();
         let (identity, evaluator_slot, claim_id, project) =
-            match self.note_evaluation_claim_scope(channel, body) {
+            match self.note_evaluation_claim_scope(channel, body, now) {
                 Ok(scope) => scope,
                 Err(outcome) => return outcome,
             };
@@ -11363,7 +11379,7 @@ impl McHandler {
             claim_id,
             identity.evaluator_instance,
             evaluator_slot,
-            now_ms(),
+            now,
         ) {
             Ok(NoteEvalAbandonOutcome::Abandoned) => respond(json!({ "result": "abandoned" })),
             Ok(NoteEvalAbandonOutcome::Replayed { kind }) => respond(json!({ "result": kind })),
@@ -11382,6 +11398,7 @@ impl McHandler {
         &self,
         channel: u16,
         body: &'a Map<String, Value>,
+        now: i64,
     ) -> Result<(NoteEvaluationIdentity<'a>, i64, &'a str, String), HandlerOutcome> {
         let identity = note_evaluation_identity_fields(body)?;
         let evaluator_slot = note_evaluation_i64_field(body, "evaluator_slot")?;
@@ -11393,7 +11410,7 @@ impl McHandler {
             identity.token,
             identity.registration_generation,
             identity.evaluator_instance,
-            now_ms(),
+            now,
         )?;
         if evaluator_slot < 0 || evaluator_slot >= registration.capacity {
             return Err(note_evaluation_bad_request(
@@ -22935,6 +22952,39 @@ mod tests {
         .await;
         assert_eq!(claim["result"], "claim");
         assert_eq!(claim["replayed"], json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_exclude_billable_skips_compile_work() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        // Uncompiled conditioned note: selectable only through the billable
+        // compile phase.
+        insert_conditioned_note(&store, &identity, &route_root, "when evaluated", None);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let mut nonbillable = note_evaluation_next_body(&token, generation, "eval-a", "acq-nb");
+        nonbillable["exclude_billable"] = json!(true);
+        let skipped = call_dispatch_request(&handler, nonbillable).await;
+        assert_eq!(
+            skipped["result"], "no_work",
+            "an exclude-billable poll must not hand out compile work"
+        );
+
+        let claimed = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-full"),
+        )
+        .await;
+        assert_eq!(claimed["result"], "claim");
+        assert_eq!(claimed["phase"], "compile");
     }
 
     #[tokio::test(flavor = "current_thread")]

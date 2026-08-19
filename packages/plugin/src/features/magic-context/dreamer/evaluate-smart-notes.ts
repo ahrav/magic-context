@@ -6,7 +6,7 @@ import { extractLatestAssistantText } from "../../../shared/assistant-message-ex
 import { log } from "../../../shared/logger";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import { getModuleNoteEvaluationBridge } from "../context-authority";
+import { findModuleNoteEvaluationBridgeForDrain } from "../context-authority";
 import { createSmartNoteCapabilities } from "../smart-notes/capabilities";
 import { compileSmartNoteCheck } from "../smart-notes/compiler";
 import {
@@ -99,9 +99,7 @@ export async function evaluateSmartNotes(
     }
 
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
-    const moduleBridge =
-        getModuleNoteEvaluationBridge(args.projectIdentity, projectRoot) ??
-        getModuleNoteEvaluationBridge(args.projectIdentity);
+    const moduleBridge = findModuleNoteEvaluationBridgeForDrain(args.projectIdentity, projectRoot);
     if (moduleBridge) {
         // The module authority owns selection; the local mirror count is not
         // the work gate. This cron-scheduled (or manual) task is the single
