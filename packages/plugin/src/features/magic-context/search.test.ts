@@ -1112,6 +1112,7 @@ describe("unifiedSearch", () => {
         const ids = results
             .filter((result) => result.source === "memory")
             .map((result) => (result as { memoryId: number }).memoryId);
+        if (survivor === undefined) throw new Error("no survivor memory seeded");
         expect(ids).toContain(survivor);
         for (const id of ids) {
             expect(visibleIds.has(id)).toBe(false);

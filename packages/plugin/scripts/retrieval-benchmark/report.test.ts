@@ -24,7 +24,7 @@ const FP = "a".repeat(64);
 
 function makeScenario(
     queryId: string,
-    overrides: Partial<Pick<ReportScenario, "paraphraseGroup" | "queryEmbedPurpose">> & {
+    overrides: Partial<Pick<ReportScenario, "paraphraseGroup">> & {
         metricValue?: number;
     } = {},
 ): ReportScenario {
@@ -39,7 +39,7 @@ function makeScenario(
         deliveredTokens: 120,
         deliveryReason: "delivered",
         latencySamplesMs: [4.5, 6.25, 5.5],
-        queryEmbedPurpose: overrides.queryEmbedPurpose ?? null,
+        queryEmbedPurpose: null,
         metrics: {
             metricPolicyVersion: METRIC_POLICY_VERSION,
             recallAt10: metricValue,
