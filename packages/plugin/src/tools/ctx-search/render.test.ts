@@ -11,7 +11,7 @@ import {
     MAX_RENDERED_RESULT_TOKENS,
 } from "../../features/magic-context/search-bounds";
 import { estimateTokens } from "../../shared/token-estimator";
-import { formatSearchResults } from "./render";
+import { formatSearchResults, packSearchResults } from "./render";
 
 const SESSION = "session-1";
 
@@ -172,5 +172,54 @@ describe("formatSearchResults", () => {
         expect(text).not.toContain("[message]");
         expect(text).not.toContain("Use ctx_expand(start, end)");
         expect(estimateTokens(text)).toBeLessThanOrEqual(MAX_RENDERED_RESULT_TOKENS);
+    });
+});
+
+describe("packSearchResults", () => {
+    it("returns text byte-identical to formatSearchResults for under-budget results", () => {
+        const results: UnifiedSearchResult[] = [
+            memoryResult(7, "always use bd for tracking"),
+            messageResult(42, "we discussed queue saturation"),
+        ];
+        const packed = packSearchResults("queue", results, SESSION);
+        expect(packed.text).toBe(formatSearchResults("queue", results, SESSION));
+        expect(packed.delivered).toEqual(results);
+        expect(packed.omittedCount).toBe(0);
+        expect(packed.reason).toBe("delivered");
+        expect(packed.tokenCount).toBe(estimateTokens(packed.text));
+    });
+
+    it("returns text byte-identical to formatSearchResults for empty results", () => {
+        const packed = packSearchResults("nothing", [], SESSION);
+        expect(packed.text).toBe(formatSearchResults("nothing", [], SESSION));
+        expect(packed.delivered).toEqual([]);
+        expect(packed.omittedCount).toBe(0);
+        expect(packed.reason).toBe("empty-results");
+    });
+
+    it("delivers exactly the results whose complete blocks were rendered when over budget", () => {
+        const filler = Array.from({ length: 300 }, (_, index) =>
+            ((index * 2654435761) % 36).toString(36),
+        ).join(" ");
+        const results = Array.from({ length: 50 }, (_, index) =>
+            memoryResult(index + 1, `${filler} tail-${index}`),
+        );
+        const packed = packSearchResults("big", results, SESSION);
+        expect(packed.text).toBe(formatSearchResults("big", results, SESSION));
+        expect(packed.reason).toBe("delivered");
+        expect(packed.tokenCount).toBe(estimateTokens(packed.text));
+        expect(packed.tokenCount).toBeLessThanOrEqual(MAX_RENDERED_RESULT_TOKENS);
+
+        const shownBlocks = (packed.text.match(/\[\d+\] \[memory\]/g) ?? []).length;
+        expect(packed.delivered.length).toBe(shownBlocks);
+        expect(packed.delivered).toEqual(results.slice(0, shownBlocks));
+        expect(packed.omittedCount).toBe(50 - shownBlocks);
+        // Delivered blocks are fully rendered; omitted blocks are fully absent.
+        for (const delivered of results.slice(0, shownBlocks)) {
+            expect(packed.text).toContain(`id=${delivered.memoryId}`);
+        }
+        for (const omitted of results.slice(shownBlocks)) {
+            expect(packed.text).not.toContain(`tail-${omitted.memoryId - 1}`);
+        }
     });
 });

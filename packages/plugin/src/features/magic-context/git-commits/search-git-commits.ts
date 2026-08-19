@@ -14,6 +14,7 @@ import type { Database, Statement as PreparedStatement } from "../../../shared/s
 import { cosineSimilarity } from "../memory/cosine-similarity";
 import { sanitizeFtsQuery } from "../memory/storage-memory-fts";
 import { MAX_LANE_CANDIDATES } from "../search-bounds";
+import type { VectorLoadObserver } from "../search-trace";
 import { loadProjectCommitEmbeddings } from "./storage-git-commit-embeddings";
 import type { StoredGitCommit } from "./storage-git-commits";
 
@@ -120,6 +121,8 @@ export interface SearchGitCommitsOptions {
     queryEmbedding?: Float32Array | null;
     /** ID of the model that generated queryEmbedding; commit vectors are read only from the same model space. */
     queryModelId?: string | null;
+    /** Receives the decoded commit-vector byte counts when the semantic pass loads embeddings. */
+    onVectorLoad?: VectorLoadObserver;
 }
 
 function clamp01(value: number): number {
@@ -233,7 +236,12 @@ export function searchGitCommitsSync(
 
         // ---- Semantic pass ----------------------------------------------
         if (options.queryEmbedding && options.queryModelId && options.queryModelId !== "off") {
-            const embeddings = loadProjectCommitEmbeddings(db, projectPath, options.queryModelId);
+            const embeddings = loadProjectCommitEmbeddings(
+                db,
+                projectPath,
+                options.queryModelId,
+                options.onVectorLoad,
+            );
             // Brute-force scoring must visit every cached vector, but only the
             // strongest fetchLimit similarities may join the candidate pool so
             // fusion, scoring, and the final sort are bounded by the lane cap

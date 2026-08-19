@@ -91,38 +91,66 @@ function assembleHint(lines: readonly string[]): string {
     return `<ctx-search-hint>\n${body}\n</ctx-search-hint>`;
 }
 
+/** `delivered` contains exactly the results whose fragments appear in
+ *  `text`, in fragment order. `text` is null when nothing packs. */
+export interface PackedAutoSearchHint {
+    text: string | null;
+    delivered: UnifiedSearchResult[];
+    tokenCount: number;
+    omittedCount: number;
+}
+
 /**
- * Build the hint text. Returns null when `results` is empty, when no fragment
- * has meaningful content after compression, or when limits zero out the budget.
+ * Packs the hint under MAX_AUTO_HINT_TOKENS and reports which results
+ * survived. An over-budget fragment is dropped whole from the tail; a lone
+ * over-budget fragment yields a null text with an empty delivered list
+ * rather than a partially emitted hint.
  *
  * This function does NOT enforce score thresholds or message-length rules —
  * callers (the transform-time auto-search wiring) apply those gates first.
  */
-export function buildAutoSearchHint(
+export function packAutoSearchHint(
     results: UnifiedSearchResult[],
     options: AutoSearchHintOptions = {},
-): string | null {
+): PackedAutoSearchHint {
     const maxFragments = Math.max(1, options.maxFragments ?? MAX_FRAGMENTS);
     const fragmentCharCap = Math.max(20, options.fragmentCharCap ?? FRAGMENT_CHAR_CAP);
 
     const picks = results.slice(0, maxFragments);
-    const lines: string[] = [];
+    const kept: Array<{ result: UnifiedSearchResult; line: string }> = [];
 
     for (const result of picks) {
         const fragment = renderFragment(result, fragmentCharCap);
         if (fragment.length === 0) continue;
-        lines.push(`- ${fragment}`);
+        kept.push({ result, line: `- ${fragment}` });
     }
 
     // Token-pack whole fragments: drop from the tail until the assembled hint
     // (wrapper and footer included) fits the budget. A lone over-budget
     // fragment yields no hint rather than a partially emitted one.
-    while (lines.length > 0) {
-        const wrapped = assembleHint(lines);
-        if (estimateTokens(wrapped) <= MAX_AUTO_HINT_TOKENS) {
-            return wrapped;
+    while (kept.length > 0) {
+        const wrapped = assembleHint(kept.map((entry) => entry.line));
+        const tokenCount = estimateTokens(wrapped);
+        if (tokenCount <= MAX_AUTO_HINT_TOKENS) {
+            return {
+                text: wrapped,
+                delivered: kept.map((entry) => entry.result),
+                tokenCount,
+                omittedCount: results.length - kept.length,
+            };
         }
-        lines.pop();
+        kept.pop();
     }
-    return null;
+    return { text: null, delivered: [], tokenCount: 0, omittedCount: results.length };
+}
+
+/**
+ * Build the hint text. Returns null when `results` is empty, when no fragment
+ * has meaningful content after compression, or when limits zero out the budget.
+ */
+export function buildAutoSearchHint(
+    results: UnifiedSearchResult[],
+    options: AutoSearchHintOptions = {},
+): string | null {
+    return packAutoSearchHint(results, options).text;
 }

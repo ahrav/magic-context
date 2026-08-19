@@ -105,20 +105,39 @@ function assemble(header: string, parts: readonly string[]): string {
     return `${header}\n\n${parts.join("\n\n")}`;
 }
 
+export type ExplicitDeliveryReason = "delivered" | "empty-results" | "packer-empty";
+
+/** `delivered` contains exactly the results whose complete blocks appear in
+ *  `text`, in rendered order. */
+export interface PackedSearchResults {
+    text: string;
+    delivered: UnifiedSearchResult[];
+    tokenCount: number;
+    omittedCount: number;
+    reason: ExplicitDeliveryReason;
+}
+
 /**
- * Render a full search response within the token budget. Under-budget output
- * is byte-identical to the historical per-harness formatting; over-budget
- * output keeps a ranked prefix of complete blocks and appends an omission
- * notice — no block is partially emitted.
+ * Packs the response under MAX_RENDERED_RESULT_TOKENS. Over-budget output
+ * keeps a prefix of complete blocks and appends an omission notice — no
+ * block is partially emitted. Empty results and a packer that cannot fit
+ * even one block are completed empty-delivery outcomes, not failures.
  */
-export function formatSearchResults(
+export function packSearchResults(
     query: string,
     results: UnifiedSearchResult[],
     currentSessionId: string,
-): string {
+): PackedSearchResults {
     const boundedQuery = boundDynamicField(query);
     if (results.length === 0) {
-        return `No results found for "${boundedQuery}" across notes, memories, primers, git commits, or message history.`;
+        const text = `No results found for "${boundedQuery}" across notes, memories, primers, git commits, or message history.`;
+        return {
+            text,
+            delivered: [],
+            tokenCount: estimateTokens(text),
+            omittedCount: 0,
+            reason: "empty-results",
+        };
     }
 
     const header = `Found ${results.length} result${results.length === 1 ? "" : "s"} for "${boundedQuery}":`;
@@ -127,8 +146,15 @@ export function formatSearchResults(
     );
 
     const full = assemble(header, bodyPartsFor(blocks, results, currentSessionId));
-    if (estimateTokens(full) <= MAX_RENDERED_RESULT_TOKENS) {
-        return full;
+    const fullTokens = estimateTokens(full);
+    if (fullTokens <= MAX_RENDERED_RESULT_TOKENS) {
+        return {
+            text: full,
+            delivered: [...results],
+            tokenCount: fullTokens,
+            omittedCount: 0,
+            reason: "delivered",
+        };
     }
 
     const noticeFor = (omitted: number) =>
@@ -147,8 +173,31 @@ export function formatSearchResults(
         (index) => estimateTokens(candidateFor(index + 1)) <= MAX_RENDERED_RESULT_TOKENS,
     );
     if (bestIndex >= 0) {
-        return candidateFor(bestIndex + 1);
+        const kept = bestIndex + 1;
+        const text = candidateFor(kept);
+        return {
+            text,
+            delivered: results.slice(0, kept),
+            tokenCount: estimateTokens(text),
+            omittedCount: results.length - kept,
+            reason: "delivered",
+        };
     }
 
-    return assemble(header, [noticeFor(results.length)]);
+    const text = assemble(header, [noticeFor(results.length)]);
+    return {
+        text,
+        delivered: [],
+        tokenCount: estimateTokens(text),
+        omittedCount: results.length,
+        reason: "packer-empty",
+    };
+}
+
+export function formatSearchResults(
+    query: string,
+    results: UnifiedSearchResult[],
+    currentSessionId: string,
+): string {
+    return packSearchResults(query, results, currentSessionId).text;
 }

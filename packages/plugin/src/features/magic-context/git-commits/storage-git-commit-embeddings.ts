@@ -8,6 +8,7 @@
  */
 
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
+import type { VectorLoadObserver } from "../search-trace";
 
 interface CommitEmbeddingRow {
     sha: string;
@@ -107,19 +108,23 @@ export function loadProjectCommitEmbeddings(
     db: Database,
     projectPath: string,
     modelId: string,
+    onVectorLoad?: VectorLoadObserver,
 ): Map<string, CommitEmbeddingCandidate> {
     const rows = getLoadProjectStatement(db).all(projectPath, modelId) as CommitEmbeddingRow[];
     const map = new Map<string, CommitEmbeddingCandidate>();
+    let decodedBytes = 0;
     for (const row of rows) {
         const buffer = row.embedding.buffer.slice(
             row.embedding.byteOffset,
             row.embedding.byteOffset + row.embedding.byteLength,
         );
+        decodedBytes += row.embedding.byteLength;
         map.set(row.sha, {
             vector: new Float32Array(buffer),
             committedAtMs: row.committed_at,
         });
     }
+    onVectorLoad?.({ decodedBytes, cachedBytes: 0, vectorCount: map.size, cacheHit: false });
     return map;
 }
 

@@ -35,6 +35,7 @@ import {
     unifiedSearch,
 } from "./search";
 import { MAX_LANE_CANDIDATES, QueryBoundsError } from "./search-bounds";
+import type { SearchTraceSpan } from "./search-trace";
 import { countingDatabase } from "./sql-counters";
 import { initializeDatabase } from "./storage-db";
 import {
@@ -1696,6 +1697,32 @@ describe("search ranking projection (KTD1 characterization)", () => {
             searchOptions(false),
         );
         expect(projectionOf(second)).toEqual(projectionOf(first));
+    });
+
+    it("keeps the frozen mixed-source projection byte-identical with tracing enabled", async () => {
+        seedProjectionCorpus(db);
+
+        const baseline = await unifiedSearch(
+            db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain backpressure",
+            searchOptions(false),
+        );
+        const spans: SearchTraceSpan[] = [];
+        const traced = await unifiedSearch(
+            db,
+            FIXTURE_SESSION,
+            FIXTURE_PROJECT,
+            "queue drain backpressure",
+            {
+                ...searchOptions(false),
+                trace: { sink: { onSpan: (span) => spans.push(span) } },
+            },
+        );
+
+        expect(projectionOf(traced)).toEqual(projectionOf(baseline));
+        expect(spans.filter((span) => span.stage === "root")).toHaveLength(1);
     });
 
     it("counts only the selected SQL without changing statement behavior", async () => {

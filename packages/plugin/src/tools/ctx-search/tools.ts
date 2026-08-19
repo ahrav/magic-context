@@ -7,6 +7,7 @@ import {
 import {
     parseIdShapedQuery,
     resolveMemoriesByIdsForSearch,
+    type UnifiedSearchResult,
     unifiedSearch,
 } from "../../features/magic-context/search";
 import {
@@ -16,7 +17,7 @@ import {
 import { getVisibleMemoryIds } from "../../hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION, CTX_SEARCH_TOOL_NAME } from "./constants";
 import { normalizeCtxSearchArgs, prepareQueryFromNormalizedArgs } from "./query-input";
-import { formatSearchResults } from "./render";
+import { type ExplicitDeliveryReason, packSearchResults } from "./render";
 import type { CtxSearchArgs, CtxSearchSource, CtxSearchToolDeps } from "./types";
 
 export { CTX_SEARCH_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -71,116 +72,155 @@ const ctxSearchArgsShape = {
 // passthrough so execute() can receive those fields without advertising them.
 const ctxSearchArgsSchema = tool.schema.object(ctxSearchArgsShape).passthrough();
 
+export interface CtxSearchCallContext {
+    sessionID: string;
+    directory: string;
+}
+
+/** Structured explicit-delivery outcome. `invalid` carries the same error
+ *  text the tool returns; `complete` carries the rendered text plus the
+ *  pre-pack ranking and the results whose blocks survived packing. A search
+ *  failure propagates as a thrown error — incomplete evidence, never an
+ *  empty ranking. */
+export type CtxSearchExecution =
+    | { status: "invalid"; text: string }
+    | {
+          status: "complete";
+          text: string;
+          prePack: UnifiedSearchResult[];
+          delivered: UnifiedSearchResult[];
+          tokenCount: number;
+          omittedCount: number;
+          reason: ExplicitDeliveryReason;
+      };
+
+/**
+ * Execute one explicit ctx_search call. The tool's `execute` delegates here,
+ * so direct-ID lookup, multi-probe recall, source filters, visible-memory
+ * filtering, ordinal cutoffs, and token packing stay on one shared path
+ * whether the caller wants text or the structured outcome.
+ */
+export async function executeCtxSearch(
+    deps: CtxSearchToolDeps,
+    rawArgs: CtxSearchArgs,
+    toolContext: CtxSearchCallContext,
+): Promise<CtxSearchExecution> {
+    const parsedArgs = ctxSearchArgsSchema.safeParse(rawArgs);
+    let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxSearchArgs;
+    args = normalizeCtxSearchArgs(args);
+    // Exactly one normalization pass (shared with recovery), then
+    // the type-safe preflight: a model-supplied non-string query
+    // reads as missing instead of throwing out of tool execution.
+    const preflight = prepareQueryFromNormalizedArgs(args);
+    if (!preflight.ok) {
+        return { status: "invalid", text: `Error: ${describeQueryBoundsViolation(preflight)}` };
+    }
+    const query = preflight.query;
+    if (!query) {
+        return { status: "invalid", text: "Error: 'query' is required." };
+    }
+
+    // Only search message history up to the last compartment boundary —
+    // anything after that (the live tail, including the current turn) is
+    // still in context and already visible to the agent. When NO compartment
+    // exists yet, the historian hasn't scrolled anything out of context, so
+    // the boundary is 0: every indexed message (ordinals are 1-based) is in
+    // the live tail and must be excluded. A negative sentinel here would mean
+    // "search everything" and leak the current prompt back to the agent — the
+    // exact opposite of the intent (issue #131).
+    const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, toolContext.sessionID);
+    const messageOrdinalCutoff = lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
+
+    // Hard-filter memories already rendered in <session-history>.
+    // They're visible in message[0], so returning them wastes output
+    // tokens and crowds out high-signal raw-history hits.
+    const visibleMemoryIds = getVisibleMemoryIds(deps.db, toolContext.sessionID);
+
+    // Resolve the session's actual project from `toolContext.directory`
+    // each call. OpenCode's top-level `ctx.directory` (the launch dir)
+    // can differ from the session's working directory when the user
+    // runs `opencode -s <id>` from outside the project.
+    const projectPath = deps.resolveProjectPath(toolContext.directory);
+    if (!projectPath) {
+        return { status: "invalid", text: "Error: Could not resolve project identity for search." };
+    }
+    await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
+    const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
+    const memoryEnabled = embeddingSnapshot?.features.memoryEnabled ?? deps.memoryEnabled;
+    const embeddingEnabled = embeddingSnapshot
+        ? embeddingSnapshot.enabled || embeddingSnapshot.gitCommitEnabled
+        : deps.embeddingEnabled;
+    const gitCommitsEnabled =
+        embeddingSnapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
+
+    const completeFrom = (results: UnifiedSearchResult[]): CtxSearchExecution => {
+        const packed = packSearchResults(query, results, toolContext.sessionID);
+        return {
+            status: "complete",
+            text: packed.text,
+            prePack: results,
+            delivered: packed.delivered,
+            tokenCount: packed.tokenCount,
+            omittedCount: packed.omittedCount,
+            reason: packed.reason,
+        };
+    };
+
+    // ID-shaped short-circuit: when the whole query is one or more
+    // memory ids, bypass the lexical+semantic lanes and look the ids
+    // up directly. The agent is given memory ids everywhere
+    // (<project-memory> shows `#id:` lines, dashboard, guidance) and
+    // ctx_search was the only tool that could surface content for
+    // an id but it did so through text matching. Whole-query id list
+    // only — `parseIdShapedQuery` returns null for "fix bug 1234" so
+    // numeric phrases still search text. If no ids resolve (foreign
+    // hidden, missing, hard-deleted) the call falls through to the
+    // normal lanes so a query like "7234" with no such memory still
+    // returns the corpus text matches.
+    const idShape = parseIdShapedQuery(query);
+    if (idShape && memoryEnabled) {
+        const idResults = resolveMemoriesByIdsForSearch({
+            db: deps.db,
+            projectPath,
+            ids: idShape,
+            limit: Math.max(normalizeSearchResultLimit(args.limit), idShape.length),
+            visibleMemoryIds,
+        });
+        if (idResults !== null) {
+            return completeFrom(idResults);
+        }
+    }
+
+    const results = await unifiedSearch(deps.db, toolContext.sessionID, projectPath, query, {
+        limit: normalizeSearchResultLimit(args.limit),
+        memoryEnabled,
+        embeddingEnabled,
+        embedQuery: async (text, signal) => {
+            const result = await embedTextForProject(projectPath, text, signal, "query");
+            return result;
+        },
+        isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
+        readMessages: deps.readMessages,
+        maxMessageOrdinal: messageOrdinalCutoff,
+        gitCommitsEnabled,
+        sources: normalizeSources(args.sources),
+        visibleMemoryIds,
+        // Explicit agent search → enable literal-probe multi-query
+        // recall for symbol/command/path lookups. Auto-search hints
+        // (the hot path) leave this off to protect their latency.
+        explicitSearch: true,
+    });
+
+    return completeFrom(results);
+}
+
 function createCtxSearchTool(deps: CtxSearchToolDeps): ToolDefinition {
     return tool({
         description: CTX_SEARCH_DESCRIPTION,
         args: ctxSearchArgsShape,
         async execute(rawArgs: CtxSearchArgs, toolContext) {
-            const parsedArgs = ctxSearchArgsSchema.safeParse(rawArgs);
-            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxSearchArgs;
-            args = normalizeCtxSearchArgs(args);
-            // Exactly one normalization pass (shared with recovery), then
-            // the type-safe preflight: a model-supplied non-string query
-            // reads as missing instead of throwing out of tool execution.
-            const preflight = prepareQueryFromNormalizedArgs(args);
-            if (!preflight.ok) {
-                return `Error: ${describeQueryBoundsViolation(preflight)}`;
-            }
-            const query = preflight.query;
-            if (!query) {
-                return "Error: 'query' is required.";
-            }
-
-            // Only search message history up to the last compartment boundary —
-            // anything after that (the live tail, including the current turn) is
-            // still in context and already visible to the agent. When NO compartment
-            // exists yet, the historian hasn't scrolled anything out of context, so
-            // the boundary is 0: every indexed message (ordinals are 1-based) is in
-            // the live tail and must be excluded. A negative sentinel here would mean
-            // "search everything" and leak the current prompt back to the agent — the
-            // exact opposite of the intent (issue #131).
-            const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, toolContext.sessionID);
-            const messageOrdinalCutoff = lastCompartmentEnd >= 0 ? lastCompartmentEnd : 0;
-
-            // Hard-filter memories already rendered in <session-history>.
-            // They're visible in message[0], so returning them wastes output
-            // tokens and crowds out high-signal raw-history hits.
-            const visibleMemoryIds = getVisibleMemoryIds(deps.db, toolContext.sessionID);
-
-            // Resolve the session's actual project from `toolContext.directory`
-            // each call. OpenCode's top-level `ctx.directory` (the launch dir)
-            // can differ from the session's working directory when the user
-            // runs `opencode -s <id>` from outside the project.
-            const projectPath = deps.resolveProjectPath(toolContext.directory);
-            if (!projectPath) {
-                return "Error: Could not resolve project identity for search.";
-            }
-            await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
-            const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
-            const memoryEnabled = embeddingSnapshot?.features.memoryEnabled ?? deps.memoryEnabled;
-            const embeddingEnabled = embeddingSnapshot
-                ? embeddingSnapshot.enabled || embeddingSnapshot.gitCommitEnabled
-                : deps.embeddingEnabled;
-            const gitCommitsEnabled =
-                embeddingSnapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
-
-            // ID-shaped short-circuit: when the whole query is one or more
-            // memory ids, bypass the lexical+semantic lanes and look the ids
-            // up directly. The agent is given memory ids everywhere
-            // (<project-memory> shows `#id:` lines, dashboard, guidance) and
-            // ctx_search was the only tool that could surface content for
-            // an id but it did so through text matching. Whole-query id list
-            // only — `parseIdShapedQuery` returns null for "fix bug 1234" so
-            // numeric phrases still search text. If no ids resolve (foreign
-            // hidden, missing, hard-deleted) the call falls through to the
-            // normal lanes so a query like "7234" with no such memory still
-            // returns the corpus text matches.
-            const idShape = parseIdShapedQuery(query);
-            if (idShape && memoryEnabled) {
-                const idResults = resolveMemoriesByIdsForSearch({
-                    db: deps.db,
-                    projectPath,
-                    ids: idShape,
-                    limit: Math.max(normalizeSearchResultLimit(args.limit), idShape.length),
-                    visibleMemoryIds,
-                });
-                if (idResults !== null) {
-                    return formatSearchResults(query, idResults, toolContext.sessionID);
-                }
-            }
-
-            const results = await unifiedSearch(
-                deps.db,
-                toolContext.sessionID,
-                projectPath,
-                query,
-                {
-                    limit: normalizeSearchResultLimit(args.limit),
-                    memoryEnabled,
-                    embeddingEnabled,
-                    embedQuery: async (text, signal) => {
-                        const result = await embedTextForProject(
-                            projectPath,
-                            text,
-                            signal,
-                            "query",
-                        );
-                        return result;
-                    },
-                    isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
-                    readMessages: deps.readMessages,
-                    maxMessageOrdinal: messageOrdinalCutoff,
-                    gitCommitsEnabled,
-                    sources: normalizeSources(args.sources),
-                    visibleMemoryIds,
-                    // Explicit agent search → enable literal-probe multi-query
-                    // recall for symbol/command/path lookups. Auto-search hints
-                    // (the hot path) leave this off to protect their latency.
-                    explicitSearch: true,
-                },
-            );
-
-            return formatSearchResults(query, results, toolContext.sessionID);
+            const execution = await executeCtxSearch(deps, rawArgs, toolContext);
+            return execution.text;
         },
     });
 }

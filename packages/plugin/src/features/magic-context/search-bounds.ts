@@ -29,6 +29,7 @@ export const DEFAULT_SEARCH_RESULT_LIMIT = 10;
 export const MAX_SEARCH_RESULT_LIMIT = 50;
 /** R37: ceiling on each bounded lexical/probe fetch and post-score lane output. */
 export const MAX_LANE_CANDIDATES = 150;
+export const MAX_CANDIDATE_DEPTH = 100;
 /** Ceiling on the estimated tokens of one explicit search response. */
 export const MAX_RENDERED_RESULT_TOKENS = 4096;
 /** Ceiling on the estimated tokens of one automatic search hint. */
@@ -119,6 +120,34 @@ export function prepareExplicitQuery(raw: string): ExplicitQueryPreparation {
         return { ok: false, violation: "tokens", limit: MAX_QUERY_TOKENS, actual: tokens };
     }
     return { ok: true, query: trimmed };
+}
+
+export class CandidateDepthError extends Error {
+    readonly requested: number;
+
+    constructor(requested: number) {
+        super(
+            `candidate depth must be an integer between 1 and ${MAX_CANDIDATE_DEPTH}, got ${requested}`,
+        );
+        this.name = "CandidateDepthError";
+        this.requested = requested;
+    }
+}
+
+/** Rejects invalid depths instead of clamping them, so callers cannot receive a value different from the requested depth. */
+export function normalizeCandidateDepth(depth?: number): number | null {
+    if (depth === undefined) {
+        return null;
+    }
+    if (
+        typeof depth !== "number" ||
+        !Number.isInteger(depth) ||
+        depth < 1 ||
+        depth > MAX_CANDIDATE_DEPTH
+    ) {
+        throw new CandidateDepthError(depth);
+    }
+    return depth;
 }
 
 /** Longest prefix of `text` whose UTF-8 encoding is at most `maxBytes`,
