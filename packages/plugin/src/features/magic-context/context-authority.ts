@@ -73,7 +73,13 @@ import type { DrainResult } from "./smart-notes/evaluator-worker";
 
 export interface ModuleNoteEvaluationBridge {
     sync(): Promise<void>;
-    drain(args: { deadline: number; signal?: AbortSignal }): Promise<DrainResult>;
+    drain(args: {
+        deadline: number;
+        signal?: AbortSignal;
+        /** 0 keeps the drain to non-billable phases; absent = legacy per-run cap. */
+        maxCompilePerRun?: number;
+        maxFallbackPerRun?: number;
+    }): Promise<DrainResult>;
     available(): boolean;
     dispose(): Promise<void>;
 }

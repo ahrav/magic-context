@@ -99,8 +99,26 @@ export async function evaluateSmartNotes(
     }
 
     const projectRoot = args.sessionDirectory ?? args.projectIdentity;
-    const moduleBridge = getModuleNoteEvaluationBridge(args.projectIdentity);
-    await moduleBridge?.sync();
+    const moduleBridge =
+        getModuleNoteEvaluationBridge(args.projectIdentity, projectRoot) ??
+        getModuleNoteEvaluationBridge(args.projectIdentity);
+    if (moduleBridge) {
+        // The module authority owns selection; the local mirror count is not
+        // the work gate. This cron-scheduled (or manual) task is the single
+        // full-budget drain — the timer's per-tick sweep drains with zero
+        // compile/fallback budget, so billable prompts run only inside the
+        // configured schedule window.
+        const result = await moduleBridge.drain({ deadline: args.deadline });
+        await moduleBridge.sync();
+        log(
+            `[dreamer] smart notes: module drain claimed=${result.claimed} completed=${result.completed} surfaced=${result.surfaced}`,
+        );
+        return {
+            surfaced: result.surfaced,
+            pending: getPendingSmartNotes(args.db, args.projectIdentity).length,
+            ran: result.claimed > 0,
+        };
+    }
     const pendingNotes = () =>
         getPendingSmartNotes(args.db, args.projectIdentity).filter(
             (note) => !args.retinaHandoff || note.compileStatus !== "compiled",
@@ -109,16 +127,6 @@ export async function evaluateSmartNotes(
     if (pendingAtStart === 0) {
         log("[dreamer] smart notes: no pending notes");
         return { surfaced: 0, pending: 0, ran: false };
-    }
-    if (moduleBridge) {
-        // The timer's per-tick sweep (runCompiledSmartNoteSweep) already
-        // drains this bridge before the scheduler dispatches this task.
-        // Draining again in the same pass would issue a second billable
-        // confirmation prompt for any note whose fallback just returned
-        // false, since fallback selection has no next-due gate and the
-        // worker's per-drain suppression does not span drains.
-        log("[dreamer] smart notes: module bridge owns drains; synced only");
-        return { surfaced: 0, pending: pendingAtStart, ran: false };
     }
 
     let leaseLost = false;

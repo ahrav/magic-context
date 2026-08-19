@@ -1,7 +1,10 @@
 import { statSync } from "node:fs";
 
 import type { DreamerConfig } from "../config/schema/magic-context";
-import { getModuleNoteEvaluationBridge } from "../features/magic-context/context-authority";
+import {
+    getAuthorityManagedMarker,
+    getModuleNoteEvaluationBridge,
+} from "../features/magic-context/context-authority";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
@@ -510,7 +513,16 @@ async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database)
         // make a failed boot registration or a module restart permanently
         // unrecoverable for this process. The bridge itself suppresses local
         // claims and publishes wake ownership when the wake plane is present.
-        const result = await bridge.drain({ deadline: Date.now() + 60_000 });
+        //
+        // Zero compile/fallback budget: this per-tick sweep mirrors the legacy
+        // due-check cadence (cheap QuickJS runs) plus registration recovery.
+        // Billable compile and fallback claims belong to the cron-scheduled
+        // evaluate-smart-notes task, which drains with the full budgets.
+        const result = await bridge.drain({
+            deadline: Date.now() + 60_000,
+            maxCompilePerRun: 0,
+            maxFallbackPerRun: 0,
+        });
         if (result.claimed > 0) {
             log(
                 `[dreamer] module smart-note drain ${reg.projectIdentity}: claimed=${result.claimed} completed=${result.completed} surfaced=${result.surfaced}`,
@@ -518,6 +530,11 @@ async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database)
         }
         return;
     }
+    // No bridge with module-managed notes (dreamer or the task schedule is
+    // disabled): the legacy sweep below writes context.db, which the
+    // authority guard triggers reject, and the thrown abort would skip every
+    // other due Dreamer task for this project.
+    if (getAuthorityManagedMarker(db, reg.projectIdentity)) return;
     const leaseKey = leaseKeyFor("evaluate-smart-notes", reg.projectIdentity);
     const holderId = crypto.randomUUID();
     if (!acquireLease(db, holderId, leaseKey)) return;

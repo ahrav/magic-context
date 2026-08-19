@@ -1461,27 +1461,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   projectPath,
                   // Manual /ctx-dream → Dreamer v2 per-task scheduler. Runs in this
                   // hook's own checkout (not a stale sibling worktree from the
-                  // shared git:<sha> identity map).
-                  runManual: async (task) => {
-                      // The timer composes each tick as bridge drain + scheduler
-                      // dispatch; evaluateSmartNotes never drains itself (a second
-                      // drain in one pass re-prompts fallback confirmations).
-                      // Mirror that composition so a manual evaluate-smart-notes
-                      // run on a module-authority project does evaluation work
-                      // instead of returning after a mirror sync.
-                      if (task === undefined || task === "evaluate-smart-notes") {
-                          const bridge =
-                              getModuleNoteEvaluationBridge(projectPath, deps.directory) ??
-                              getModuleNoteEvaluationBridge(projectPath);
-                          if (bridge) {
-                              try {
-                                  await bridge.drain({ deadline: Date.now() + 60_000 });
-                              } catch (error) {
-                                  log(`[magic-context] manual smart-note drain failed: ${error}`);
-                              }
-                          }
-                      }
-                      return runManualDream({
+                  // shared git:<sha> identity map). The evaluate-smart-notes task
+                  // itself drains the module bridge, so the manual path needs no
+                  // separate drain.
+                  runManual: (task) =>
+                      runManualDream({
                           db,
                           projectIdentity: projectPath,
                           tasks: buildDreamTaskRuntimeConfigs(dreamerConfig, deps.config.language),
@@ -1518,8 +1502,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               },
                           }),
                           task,
-                      });
-                  },
+                      }),
               }
             : undefined,
     });

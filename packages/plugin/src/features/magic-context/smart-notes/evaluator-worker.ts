@@ -277,7 +277,8 @@ export class SmartNoteEvaluatorWorker {
     }
 
     async heartbeat(): Promise<void> {
-        if (!this.registration || this.disposed) return;
+        const registration = this.registration;
+        if (!registration || this.disposed) return;
         const policy = this.deps.policy();
         try {
             const response = asRecord(
@@ -291,7 +292,7 @@ export class SmartNoteEvaluatorWorker {
             );
             if (response.ok !== true) {
                 this.logLine("heartbeat rejected; dropping registration");
-                this.dropRegistration();
+                this.dropRegistration(registration);
             }
         } catch (error) {
             // A throw is the module's error-frame path (bad_request,
@@ -300,11 +301,15 @@ export class SmartNoteEvaluatorWorker {
             // `registered` report a liveness the module has already dropped and
             // would stop `drainOnce` from ever re-registering.
             this.logLine(`heartbeat failed; dropping registration: ${error}`);
-            this.dropRegistration();
+            this.dropRegistration(registration);
         }
     }
 
-    private dropRegistration(): void {
+    private dropRegistration(checked: Registration): void {
+        // Overlapping heartbeats can settle out of order: a slow failure for a
+        // registration that re-registration already replaced must not tear
+        // down the replacement or abort its claim.
+        if (this.registration !== checked) return;
         this.registration = null;
         this.stopHeartbeat();
         // Without credentials the running claim can neither complete nor
@@ -346,8 +351,18 @@ export class SmartNoteEvaluatorWorker {
     /**
      * Zero-wait drain: poll for Rust-selected work until the authority reports
      * no_work, the deadline passes, or the signal aborts.
+     *
+     * `maxCompilePerRun`/`maxFallbackPerRun` bound the billable claims this
+     * drain executes (default: the legacy per-run caps). A budget of 0 keeps
+     * the drain to cheap phases — due checks, liveness, registration recovery,
+     * wake publication — abandoning any billable claim the authority hands out.
      */
-    async drainOnce(args: { deadline: number; signal?: AbortSignal }): Promise<DrainResult> {
+    async drainOnce(args: {
+        deadline: number;
+        signal?: AbortSignal;
+        maxCompilePerRun?: number;
+        maxFallbackPerRun?: number;
+    }): Promise<DrainResult> {
         // Serialize drains: the timer sweep, the scheduled dreamer task, and a
         // manual /ctx-dream can all reach this worker concurrently, and the
         // acquisition id, evaluator slot 0, and active-claim fields are shared
@@ -367,6 +382,8 @@ export class SmartNoteEvaluatorWorker {
     private async drainOnceExclusive(args: {
         deadline: number;
         signal?: AbortSignal;
+        maxCompilePerRun?: number;
+        maxFallbackPerRun?: number;
     }): Promise<DrainResult> {
         const result: DrainResult = {
             claimed: 0,
@@ -390,6 +407,8 @@ export class SmartNoteEvaluatorWorker {
         // confirmation prompts, matching the legacy sweep's per-run bounds.
         let compileClaims = 0;
         let fallbackClaims = 0;
+        const maxCompile = args.maxCompilePerRun ?? MAX_COMPILE_PER_RUN;
+        const maxFallback = args.maxFallbackPerRun ?? MAX_FALLBACK_PER_RUN;
         for (let i = 0; i < MAX_CLAIMS_PER_DRAIN; i++) {
             if (this.disposed || args.signal?.aborted || Date.now() >= args.deadline) break;
             const next = await this.next(args.signal);
@@ -414,7 +433,7 @@ export class SmartNoteEvaluatorWorker {
             }
             if (next.snapshot.phase === "compile") {
                 compileClaims += 1;
-                if (compileClaims > MAX_COMPILE_PER_RUN) {
+                if (compileClaims > maxCompile) {
                     this.lastAbandonReleased = await this.abandon(
                         next.claimId,
                         "compile cap reached this drain",
@@ -425,7 +444,7 @@ export class SmartNoteEvaluatorWorker {
             }
             if (next.snapshot.phase === "fallback") {
                 fallbackClaims += 1;
-                if (fallbackClaims > MAX_FALLBACK_PER_RUN || fallbackAttempted.has(next.noteId)) {
+                if (fallbackClaims > maxFallback || fallbackAttempted.has(next.noteId)) {
                     this.lastAbandonReleased = await this.abandon(
                         next.claimId,
                         "fallback cap reached this drain",
