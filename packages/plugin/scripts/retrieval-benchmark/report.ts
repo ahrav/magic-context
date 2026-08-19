@@ -24,7 +24,12 @@ import { z } from "zod";
 import { canonicalFingerprint } from "./canonical-json";
 import { ContractError } from "./contract";
 import type { ResolvedRankedResult } from "./identity";
-import { type JudgedGrade, METRIC_POLICY_VERSION } from "./metrics";
+import {
+    type JudgedGrade,
+    type MacroAggregate,
+    METRIC_POLICY_VERSION,
+    macroAggregate,
+} from "./metrics";
 import { TIMING_POLICY_VERSION } from "./timing";
 
 export const REPORT_SCHEMA_VERSION = "retrieval-benchmark-report/v1";
@@ -260,6 +265,23 @@ export function passEligibility(
     if (report.status !== "complete") reasons.push(`evidence:${report.status}`);
     if (!options.compatible) reasons.push("evidence:incompatible");
     return { eligible: reasons.length === 0, reasons };
+}
+
+export function aggregateReportQuality(report: BenchmarkReport): MacroAggregate[] {
+    return macroAggregate(
+        report.evidence.scenarios.map((scenario) => ({
+            queryId: scenario.queryId,
+            paraphraseGroup: scenario.paraphraseGroup,
+            partition: scenario.partition,
+            mode: scenario.mode,
+            values: {
+                recallAt10: scenario.metrics.recallAt10,
+                recallAt50: scenario.metrics.recallAt50,
+                reciprocalRank: scenario.metrics.reciprocalRank,
+                ndcgAt10: scenario.metrics.ndcgAt10,
+            },
+        })),
+    );
 }
 
 /**

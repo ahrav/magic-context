@@ -65,9 +65,7 @@ import {
     computeQueryMetrics,
     type JudgedGrade,
     judgedGradesByQuery,
-    type MacroAggregate,
     METRIC_POLICY_VERSION,
-    macroAggregate,
     scoredQueryValues,
 } from "./metrics";
 import {
@@ -1172,19 +1170,4 @@ export async function runBenchmark(options: RunBenchmarkOptions): Promise<RunBen
 /** Per-(partition, mode) macro aggregates recomputed from report evidence.
  *  Explicit and automatic stay separate cells (R52); U6's regression policy
  *  consumes the holdout cells through `gateAggregates`. */
-export function aggregateReportQuality(report: BenchmarkReport): MacroAggregate[] {
-    return macroAggregate(
-        report.evidence.scenarios.map((scenario) => ({
-            queryId: scenario.queryId,
-            paraphraseGroup: scenario.paraphraseGroup,
-            partition: scenario.partition,
-            mode: scenario.mode,
-            values: {
-                recallAt10: scenario.metrics.recallAt10,
-                recallAt50: scenario.metrics.recallAt50,
-                reciprocalRank: scenario.metrics.reciprocalRank,
-                ndcgAt10: scenario.metrics.ndcgAt10,
-            },
-        })),
-    );
-}
+export { aggregateReportQuality } from "./report";

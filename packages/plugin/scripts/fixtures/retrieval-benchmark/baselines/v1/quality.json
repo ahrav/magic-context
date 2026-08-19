@@ -1,0 +1,71 @@
+{
+  "schemaVersion": "retrieval-benchmark-quality-baseline/v1",
+  "kind": "quality",
+  "policyFingerprint": "4241bd583739e3096f03eb5a6a166bec37c00aa356d658990dd0e23b98b43271",
+  "claimEligibility": "judged-support-only",
+  "qualityKey": {
+    "releaseFingerprints": {
+      "corpus": "9f388d7ac837d6f277c60da7e4fae011765982b6f2e5880ca1f92f516f874b35",
+      "judgments": "f6d8ec1de0f224c6b9ab32b771a6c0695fb1b95a9b0b6bb33712994503338639",
+      "syntheticProfiles": "69e9f35251115c3ba25dc337b8416f380098f00b8642128da2d6ca4fa414cec2",
+      "manifest": "c1eb223e7a4c34f317b3d19c6c8358466cee195e678ee6ce30f128ac3a32ffbe"
+    },
+    "metricPolicyVersion": "retrieval-metric-policy/v1",
+    "timingPolicyVersion": "retrieval-timing-policy/v1",
+    "profileFingerprint": "39d6bfa1e43d05c514953d6dbfbf9ebf0d1f4bb8101f48cce53b1a2c9c25d719",
+    "behaviorFingerprint": "af96cd4f49903daacaf1242f3bb3ce0e86a4f1a6626bce172a30bb7127acd5d5"
+  },
+  "runs": [
+    {
+      "evidenceDigest": "3fbfd78a137ad23efb4b6a693eb53cfddb2d1462f3c463f8df2cc03e883278d8",
+      "semanticFingerprint": "1366bd05701963c412910fb8d05c92bffcf0052f348759d6495a813422132888",
+      "hostFingerprint": "16abaccdcb8da2e63f2eb57d7db3b4d48cf054fc4cb085f13b70f0a42149edae",
+      "modes": [
+        {
+          "mode": "automatic",
+          "ndcgAt10": 0,
+          "recallAt50": 0
+        },
+        {
+          "mode": "explicit",
+          "ndcgAt10": 0.21875,
+          "recallAt50": 0.21875
+        }
+      ]
+    },
+    {
+      "evidenceDigest": "081e54759a7b60c0fe247050a0677c56cb4e2875d44912eeb474731a70dba619",
+      "semanticFingerprint": "1366bd05701963c412910fb8d05c92bffcf0052f348759d6495a813422132888",
+      "hostFingerprint": "16abaccdcb8da2e63f2eb57d7db3b4d48cf054fc4cb085f13b70f0a42149edae",
+      "modes": [
+        {
+          "mode": "automatic",
+          "ndcgAt10": 0,
+          "recallAt50": 0
+        },
+        {
+          "mode": "explicit",
+          "ndcgAt10": 0.21875,
+          "recallAt50": 0.21875
+        }
+      ]
+    },
+    {
+      "evidenceDigest": "93c0b6e30767ef51d809a19f17418c21ae3526483ada8a514c73f9c217ca8d5b",
+      "semanticFingerprint": "1366bd05701963c412910fb8d05c92bffcf0052f348759d6495a813422132888",
+      "hostFingerprint": "16abaccdcb8da2e63f2eb57d7db3b4d48cf054fc4cb085f13b70f0a42149edae",
+      "modes": [
+        {
+          "mode": "automatic",
+          "ndcgAt10": 0,
+          "recallAt50": 0
+        },
+        {
+          "mode": "explicit",
+          "ndcgAt10": 0.21875,
+          "recallAt50": 0.21875
+        }
+      ]
+    }
+  ]
+}

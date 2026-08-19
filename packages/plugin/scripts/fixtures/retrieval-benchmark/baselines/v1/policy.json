@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "retrieval-benchmark-regression-policy/v1",
+  "id": "policy-ktd17",
+  "description": "KTD17 repository regression policy. Quality (per mode, holdout macro-aggregates): average nDCG@10 and Recall@50 loss at most 2 percentage points, and no single run below baseline by more than 5 points. Latency (per matrix cell): candidate median-of-three run-level p95 at most 110% of the baseline median; each run-level p95 comes from raw request samples via the versioned nearest-rank rule, never pooled samples or averaged worker/query percentiles. Values are repository policy, not statistical confidence.",
+  "runsRequired": 3,
+  "quality": {
+    "partition": "holdout",
+    "appliedPerMode": true,
+    "metrics": [
+      "ndcgAt10",
+      "recallAt50"
+    ],
+    "maxAverageLossPoints": 2,
+    "maxSingleRunLossPoints": 5
+  },
+  "latency": {
+    "percentileRule": "retrieval-timing-policy/v1",
+    "runLevelP95Input": "raw-request-samples",
+    "runAggregation": "median-of-run-p95",
+    "maxMedianP95Percent": 110
+  }
+}
