@@ -41,7 +41,12 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned, not latest: hostFingerprint() embeds the exact
+          # Bun.version, and latency regression requires candidate host
+          # fingerprints to equal the stored baseline's — a runtime update
+          # would silently make an unchanged reference host non-comparable.
+          # Bump this together with republishing the latency baselines.
+          bun-version: 1.3.14
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -129,7 +134,12 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned, not latest: hostFingerprint() embeds the exact
+          # Bun.version, and latency regression requires candidate host
+          # fingerprints to equal the stored baseline's — a runtime update
+          # would silently make an unchanged reference host non-comparable.
+          # Bump this together with republishing the latency baselines.
+          bun-version: 1.3.14
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
