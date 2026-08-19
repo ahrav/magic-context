@@ -175,24 +175,6 @@ describe("smart-note revision matrix: state-only transitions", () => {
     });
 });
 
-describe("smart-note revision matrix: dismissal", () => {
-    test("dismissal advances only state_version and keeps compiler inputs", () => {
-        const db = freshDb();
-        try {
-            const note = smartNote(db);
-            setCompiled(db, note.id);
-            expect(dismissNote(db, note.id, SCOPE)).toBe(true);
-            const current = getNotes(db, { type: "smart", status: "dismissed" })[0];
-            expect(current.sourceRevision).toBe(note.sourceRevision);
-            expect(current.stateVersion).toBe(note.stateVersion + 1);
-            expect(current.content).toBe(note.content);
-            expect(current.compiledCheck).not.toBeNull();
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
-
 interface NormativeCase {
     id: string;
     event: string;

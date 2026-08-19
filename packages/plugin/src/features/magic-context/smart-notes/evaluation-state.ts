@@ -21,14 +21,10 @@ import {
     type SmartNoteCheckStatus,
 } from "./types";
 
-/** Protocol version for the module evaluator wire contract (KTD10). */
-export const SMART_NOTE_EVALUATION_PROTOCOL_VERSION = 2;
-
 export const MAX_COMPILE_PER_RUN = 5;
 export const MAX_FALLBACK_PER_RUN = 3;
 export const MAX_COMPILATION_FAILURES = 3;
 export const MAX_FAILURES_BEFORE_REAUTHOR = 3;
-export const DEFAULT_MAX_DUE_CHECKS = 10;
 
 export type EvaluationPhase = "compile" | "due" | "liveness" | "fallback";
 

@@ -69,20 +69,11 @@ export interface AuthorityModuleClient {
     }): Promise<{ page: ChangefeedPage }>;
 }
 
-export interface ModuleNoteEvaluationDrainResult {
-    claimed: number;
-    completed: number;
-    abandoned: number;
-    surfaced: number;
-    drained: boolean;
-}
+import type { DrainResult } from "./smart-notes/evaluator-worker";
 
 export interface ModuleNoteEvaluationBridge {
     sync(): Promise<void>;
-    drain(args: {
-        deadline: number;
-        signal?: AbortSignal;
-    }): Promise<ModuleNoteEvaluationDrainResult>;
+    drain(args: { deadline: number; signal?: AbortSignal }): Promise<DrainResult>;
     available(): boolean;
     dispose(): Promise<void>;
 }

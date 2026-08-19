@@ -108,10 +108,6 @@ export class SmartNoteEvaluatorWorker {
         this.deps = deps;
     }
 
-    get evaluatorInstance(): string {
-        return this.instanceId;
-    }
-
     get registered(): boolean {
         return this.registration !== null;
     }

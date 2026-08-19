@@ -16803,27 +16803,6 @@ fn collect_note_eval_ledgers_tx(
 }
 
 impl McStore {
-    /// Report (authority generation, evaluation-protocol epoch, state) for this
-    /// project's notes domain.
-    pub fn note_eval_authority(
-        &self,
-        project: &str,
-    ) -> Result<Option<(i64, i64, String)>, McStoreError> {
-        self.with_note_conn_fenced(project, |tx| note_eval_authority_tx(tx, project))
-    }
-
-    /// Run ledger garbage collection for one project. Acquisition folds this in;
-    /// the standalone entry point exists for opportunistic maintenance callers.
-    pub fn collect_note_eval_ledgers(
-        &self,
-        project: &str,
-        now_ms: i64,
-    ) -> Result<(), McStoreError> {
-        self.with_note_conn_fenced(project, |tx| {
-            collect_note_eval_ledgers_tx(tx, project, now_ms)
-        })
-    }
-
     /// Acquire one durable evaluation claim or a replayable `no_work` decision.
     /// `select` receives the pending, unclaimed smart notes and picks (note, phase);
     /// the decision commits atomically under (project, acquisition_id) uniqueness so
