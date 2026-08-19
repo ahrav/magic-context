@@ -2116,7 +2116,7 @@ async function executeUnifiedSearch(args: {
     }
     const queryEmbeddingPromise: Promise<CapturedQueryEmbedding | Float32Array | null> =
         needsEmbedding
-            ? embedQuery(trimmedQuery, options.signal).then(
+            ? embedQuery(trimmedQuery, options.signal, "query").then(
                   (captured) => {
                       embedSpan?.end("ok");
                       return captured;

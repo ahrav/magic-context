@@ -250,8 +250,8 @@ describe("embed-purpose scenario evidence", () => {
             const purposes = new Set(
                 result.report.evidence.scenarios.map((s) => s.queryEmbedPurpose),
             );
-            expect(purposes.has("passage")).toBe(true);
-            expect(purposes.has("query")).toBe(false);
+            expect(purposes.has("query")).toBe(true);
+            expect(purposes.has("passage")).toBe(false);
         },
         60_000,
     );

@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { Database } from "../../shared/sqlite";
 
 let queryEmbedding: Float32Array | null = null;
@@ -20,6 +20,7 @@ import { upsertCommits } from "./git-commits";
 import { getMemoryById, insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
+import { initializeEmbedding } from "./memory/embedding";
 import {
     _resetProjectEmbeddingRegistryForTests,
     registerProjectEmbedding,
@@ -1426,6 +1427,119 @@ describe("unifiedSearch hard bounds (R34, R37)", () => {
             expect(limits).toEqual([150, 150, 150, 150, 150, 150]);
             expect(execution.rowCount).toBeLessThanOrEqual(900);
         }
+    });
+});
+
+describe("query-purpose provider boundary (U30)", () => {
+    let db: Database;
+    let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>;
+
+    beforeEach(() => {
+        db = createTestDb();
+        fetchSpy = spyOn(globalThis, "fetch");
+        fetchSpy.mockImplementation((async () =>
+            new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+                headers: { "content-type": "application/json" },
+            })) as unknown as typeof fetch);
+        initializeEmbedding({
+            provider: "openai-compatible",
+            model: "nvidia/nv-embed",
+            endpoint: "http://127.0.0.1:65535",
+            input_type: "passage",
+            query_input_type: "query",
+        });
+    });
+
+    afterEach(() => {
+        initializeEmbedding({ provider: "off" });
+        fetchSpy.mockRestore();
+        closeQuietly(db);
+    });
+
+    function sentInputTypes(): unknown[] {
+        return fetchSpy.mock.calls.map((call) => {
+            const init = call[1] as RequestInit;
+            return (JSON.parse(init.body as string) as Record<string, unknown>).input_type;
+        });
+    }
+
+    it("sends the query input type when no embedQuery override is supplied (AE1)", async () => {
+        await unifiedSearch(db, "ses-purpose", "/repo/project", "queue saturation design", {
+            limit: 5,
+            memoryEnabled: true,
+            embeddingEnabled: true,
+        });
+
+        expect(sentInputTypes()).toEqual(["query"]);
+    });
+
+    it("runs a supplied override once across semantic lanes and never the default provider (AE2)", async () => {
+        const overrideQueries: string[] = [];
+        await unifiedSearch(db, "ses-purpose", "/repo/project", "queue saturation design", {
+            limit: 5,
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            gitCommitsEnabled: true,
+            embedQuery: async (text) => {
+                overrideQueries.push(text);
+                return new Float32Array([1, 0]);
+            },
+        });
+
+        expect(overrideQueries).toEqual(["queue saturation design"]);
+        expect(fetchSpy.mock.calls).toHaveLength(0);
+    });
+
+    it("never calls the provider when embedding is off, the runtime is off, or only non-semantic lanes run (AE3)", async () => {
+        await unifiedSearch(db, "ses-purpose", "/repo/project", "anything", {
+            memoryEnabled: true,
+            embeddingEnabled: false,
+        });
+        await unifiedSearch(db, "ses-purpose", "/repo/project", "anything", {
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            isEmbeddingRuntimeEnabled: () => false,
+        });
+        await unifiedSearch(db, "ses-purpose", "/repo/project", "anything", {
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            sources: ["note"],
+        });
+        await unifiedSearch(db, "ses-purpose", "/repo/project", "   ", {
+            memoryEnabled: true,
+            embeddingEnabled: true,
+        });
+
+        expect(fetchSpy.mock.calls).toHaveLength(0);
+    });
+
+    it("degrades semantic lanes without surfacing an exception when the provider fails", async () => {
+        fetchSpy.mockImplementation((async () => {
+            throw new Error("embedding endpoint down");
+        }) as unknown as typeof fetch);
+        const memory = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "queue saturation design notes",
+        });
+
+        const results = await unifiedSearch(
+            db,
+            "ses-purpose",
+            "/repo/project",
+            "queue saturation design",
+            {
+                limit: 5,
+                memoryEnabled: true,
+                embeddingEnabled: true,
+            },
+        );
+
+        const memoryHits = results.filter(
+            (result): result is Extract<UnifiedSearchResult, { source: "memory" }> =>
+                result.source === "memory",
+        );
+        expect(memoryHits.map((hit) => hit.memoryId)).toEqual([memory.id]);
     });
 });
 
