@@ -194,6 +194,23 @@ impl<H: McHostHandler> HostShared<H> {
     }
 }
 
+/// Keeps the instance lock held until every tracked task — including
+/// abort-exempt lifecycle callbacks that still own the handler — has finished,
+/// without blocking `run`'s return. The wait is deliberately unbounded: while
+/// such a callback runs, a successor acquiring the same data directory would
+/// initialize concurrently with live predecessor code, and the lock dies with
+/// the process anyway, so holding it is the truthful answer.
+fn retain_lock_until_drained<H: McHostHandler>(shared: Arc<HostShared<H>>, guard: InstanceGuard) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            // The tracker is already closed by the shutdown sequence.
+            shared.tracker.wait().await;
+            drop(shared);
+            drop(guard);
+        });
+    }
+}
+
 /// Keeps the instance lock held until an aborted initialization task actually
 /// stops, without blocking `run`'s return. The lock is the single-instance
 /// fence: releasing it while the old callback still owns the handler and its
@@ -302,12 +319,15 @@ pub async fn run<H: McHostHandler>(
 
     let handler = Arc::new(handler);
     let manifest = crate::panic_boundary::redact_sync(|| handler.manifest());
-    let catalog = crate::control::CatalogCache::new(&manifest);
-    if catalog.max_body_len() > crate::wire::MAX_BODY_LEN as usize {
+    // Bounded during serialization, not after: an over-limit manifest must be
+    // refused without ever materializing a full copy of its catalog.
+    let Ok(catalog) =
+        crate::control::CatalogCache::new_bounded(&manifest, crate::wire::MAX_BODY_LEN as usize)
+    else {
         return Err(HostError::InitFailed(
             "linked manifest exceeds the frame limit".to_owned(),
         ));
-    }
+    };
     // The cached catalog stays resident for the whole incarnation outside
     // the byte-budget semaphores; the ingress budget shrinks by it below so
     // total resident bytes still honor max_resident_bytes. That subtraction
@@ -469,8 +489,16 @@ pub async fn run<H: McHostHandler>(
     // once the tracker has drained, and `guard` drops after it (protocol §12
     // steps 6-8).
     let fatal = shared.fatal.take();
-    drop(shared);
-    drop(guard);
+    if graceful {
+        drop(shared);
+        drop(guard);
+    } else {
+        // The tracker did not drain, so abort-exempt lifecycle callbacks may
+        // still be running and still own the handler. Releasing the lock here
+        // would let a successor initialize the same data directory beside
+        // them; hand both to a reaper instead and return immediately.
+        retain_lock_until_drained(shared, guard);
+    }
 
     if let Some(message) = fatal {
         return Err(HostError::LifecycleFatal(message));

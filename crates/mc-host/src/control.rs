@@ -315,12 +315,17 @@ pub struct CatalogCache {
 }
 
 impl CatalogCache {
-    pub fn new(manifest: &ManifestSnapshot) -> Self {
-        Self {
+    /// Serializes both cached bodies through a capped writer, so a manifest
+    /// whose catalog exceeds `limit` is rejected while it is being written
+    /// rather than after a full copy exists. Materializing first and checking
+    /// afterwards could OOM the host on the very input startup means to
+    /// refuse.
+    pub fn new_bounded(manifest: &ManifestSnapshot, limit: usize) -> Result<Self, ()> {
+        Ok(Self {
             module_id: manifest.module_id.clone().into_boxed_str(),
-            full: serialize_catalog_response(manifest, true),
-            empty: serialize_catalog_response(manifest, false),
-        }
+            full: serialize_catalog_response(manifest, true, limit)?,
+            empty: serialize_catalog_response(manifest, false, limit)?,
+        })
     }
 
     /// Selects cached bytes without allocating. Unknown filters yield an empty
@@ -333,10 +338,6 @@ impl CatalogCache {
         }
     }
 
-    pub fn max_body_len(&self) -> usize {
-        self.full.len().max(self.empty.len())
-    }
-
     /// Bytes this cache permanently keeps resident for the incarnation; the
     /// runtime subtracts them from the byte budgets so the configured
     /// `max_resident_bytes` bound stays truthful.
@@ -345,7 +346,35 @@ impl CatalogCache {
     }
 }
 
-fn serialize_catalog_response(manifest: &ManifestSnapshot, include: bool) -> Box<[u8]> {
+/// Discards nothing but refuses to grow past `limit`, so serialization of an
+/// over-limit value fails instead of allocating it.
+struct CappedWriter {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + bytes.len() > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "catalog exceeds limit",
+            ));
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_catalog_response(
+    manifest: &ManifestSnapshot,
+    include: bool,
+    limit: usize,
+) -> Result<Box<[u8]>, ()> {
     let modules = if include {
         vec![serde_json::json!({
             "module_id": manifest.module_id,
@@ -356,14 +385,21 @@ fn serialize_catalog_response(manifest: &ManifestSnapshot, include: bool) -> Box
     } else {
         Vec::new()
     };
-    serde_json::to_vec(&serde_json::json!({
-        "op": OP_CATALOG_LIST,
-        "generation": CATALOG_GENERATION,
-        "modules": modules,
-        "subc_ops": [OP_ROUTE_OPEN, OP_CATALOG_LIST],
-    }))
-    .expect("catalog response serialization cannot fail")
-    .into_boxed_slice()
+    let mut writer = CappedWriter {
+        buf: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &serde_json::json!({
+            "op": OP_CATALOG_LIST,
+            "generation": CATALOG_GENERATION,
+            "modules": modules,
+            "subc_ops": [OP_ROUTE_OPEN, OP_CATALOG_LIST],
+        }),
+    )
+    .map_err(|_| ())?;
+    Ok(writer.buf.into_boxed_slice())
 }
 
 /// Tagged `route.open` success response, built from the published control
@@ -721,7 +757,8 @@ mod tests {
             provides: vec![role.clone()],
             control_ops: vec!["mc.reload".to_owned()],
         };
-        let catalog = CatalogCache::new(&manifest);
+        let catalog = CatalogCache::new_bounded(&manifest, crate::wire::MAX_BODY_LEN as usize)
+            .expect("test manifest fits the frame limit");
         let unfiltered_body = catalog.body(None);
         assert!(
             std::ptr::eq(unfiltered_body, catalog.body(None)),

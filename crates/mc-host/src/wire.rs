@@ -552,22 +552,29 @@ where
                 charge,
                 written,
             } = frame;
+            // The completion instant is taken inside the arm, the moment
+            // `write_all` returns — not after the result check — so a
+            // preemption between them cannot push `completed_at` past a peer
+            // answer that the bytes themselves caused.
             let result = tokio::select! {
                 biased;
                 () = discard.cancelled() => None,
                 result = tokio::time::timeout(write_deadline, stream.write_all(&bytes)) => {
-                    Some(result)
+                    Some((result, Instant::now()))
                 }
             };
-            if !matches!(result, Some(Ok(Ok(())))) {
+            let Some((result, completed_at)) = result else {
+                retired.cancel();
+                generation.cancel();
+                break;
+            };
+            if !matches!(result, Ok(Ok(()))) {
                 retired.cancel();
                 generation.cancel();
                 break;
             }
             if let Some(written) = written {
-                // Captured before the hook can block on a lock: this is the
-                // fence a receiver compares peer answers against.
-                written(Instant::now());
+                written(completed_at);
             }
             drop(bytes);
             drop(charge);
