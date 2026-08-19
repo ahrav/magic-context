@@ -2401,6 +2401,174 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE mc_chunk_transcripts ADD COLUMN raw_messages_deflate BLOB NULL;
         ",
     },
+    Migration {
+        version: 51,
+        // Backfilling both new revision counters from status_version keeps them equal on
+        // pre-v51 rows, so CAS predicates that still compare status_version stay valid.
+        // The fence triggers guard against binaries older than this migration: they never
+        // register mc_note_writer_v2, so their mc_notes writes abort instead of advancing
+        // status_version while leaving the new counters behind.
+        // commentlint: allow(JUDGE)
+        statements: r#"
+        DROP TRIGGER IF EXISTS mc_notes_feed_insert;
+        DROP TRIGGER IF EXISTS mc_notes_feed_update;
+        DROP TRIGGER IF EXISTS mc_notes_feed_delete;
+        ALTER TABLE mc_notes ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE mc_notes ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE mc_notes ADD COLUMN compiled_source_revision INTEGER;
+        ALTER TABLE mc_notes ADD COLUMN compiled_project_path TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_provider TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_config TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_at INTEGER;
+        ALTER TABLE mc_notes ADD COLUMN compile_status TEXT
+            CHECK (compile_status IN ('compiled', 'plain', 'refused') OR compile_status IS NULL);
+        UPDATE mc_notes SET source_revision = status_version, state_version = status_version;
+        UPDATE mc_notes SET check_status = 'uncompiled'
+         WHERE check_status NOT IN ('uncompiled', 'compiled', 'failing', 'fallback');
+
+        CREATE TRIGGER mc_notes_writer_fence_insert
+        BEFORE INSERT ON mc_notes
+        WHEN mc_note_writer_v2() IS NOT 1
+        BEGIN
+            SELECT RAISE(ABORT, 'mc_notes requires a protocol-v2 binary');
+        END;
+        CREATE TRIGGER mc_notes_writer_fence_update
+        BEFORE UPDATE ON mc_notes
+        WHEN mc_note_writer_v2() IS NOT 1
+        BEGIN
+            SELECT RAISE(ABORT, 'mc_notes requires a protocol-v2 binary');
+        END;
+        CREATE TRIGGER mc_notes_writer_fence_delete
+        BEFORE DELETE ON mc_notes
+        WHEN mc_note_writer_v2() IS NOT 1
+        BEGIN
+            SELECT RAISE(ABORT, 'mc_notes requires a protocol-v2 binary');
+        END;
+
+        CREATE TRIGGER mc_notes_feed_insert AFTER INSERT ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition, 'ready_at', NEW.ready_at,
+                    'ready_reason', NEW.ready_reason, 'manifest_json', NEW.manifest_json,
+                    'compiled_check', NEW.compiled_check, 'check_hash', NEW.check_hash,
+                    'check_cron', NEW.check_cron, 'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id,
+                    'source_revision', NEW.source_revision, 'state_version', NEW.state_version,
+                    'compiled_source_revision', NEW.compiled_source_revision,
+                    'compiled_project_path', NEW.compiled_project_path,
+                    'compiled_provider', NEW.compiled_provider,
+                    'compiled_config', NEW.compiled_config,
+                    'compiled_at', NEW.compiled_at, 'compile_status', NEW.compile_status), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_update AFTER UPDATE ON mc_notes
+        WHEN NEW.id IS NOT OLD.id OR NEW.type IS NOT OLD.type
+          OR NEW.project_path IS NOT OLD.project_path OR NEW.session_id IS NOT OLD.session_id
+          OR NEW.content IS NOT OLD.content OR NEW.status IS NOT OLD.status
+          OR NEW.surface_condition IS NOT OLD.surface_condition OR NEW.ready_at IS NOT OLD.ready_at
+          OR NEW.ready_reason IS NOT OLD.ready_reason OR NEW.manifest_json IS NOT OLD.manifest_json
+          OR NEW.compiled_check IS NOT OLD.compiled_check OR NEW.check_hash IS NOT OLD.check_hash
+          OR NEW.check_cron IS NOT OLD.check_cron
+          OR NEW.check_failure_count IS NOT OLD.check_failure_count
+          OR NEW.check_network_failure_count IS NOT OLD.check_network_failure_count
+          OR NEW.check_quarantined_until IS NOT OLD.check_quarantined_until
+          OR NEW.check_next_due_at IS NOT OLD.check_next_due_at
+          OR NEW.check_compiled_at IS NOT OLD.check_compiled_at
+          OR NEW.check_false_since_at IS NOT OLD.check_false_since_at
+          OR NEW.check_last_liveness_at IS NOT OLD.check_last_liveness_at
+          OR NEW.last_checked_at IS NOT OLD.last_checked_at OR NEW.check_status IS NOT OLD.check_status
+          OR NEW.check_version IS NOT OLD.check_version OR NEW.policy_version IS NOT OLD.policy_version
+          OR NEW.harness IS NOT OLD.harness OR NEW.anchor_block_id IS NOT OLD.anchor_block_id
+          OR NEW.anchor_ordinal IS NOT OLD.anchor_ordinal OR NEW.dismissed_at IS NOT OLD.dismissed_at
+          OR NEW.dismissal_resolution IS NOT OLD.dismissal_resolution
+          OR NEW.status_version IS NOT OLD.status_version
+          OR NEW.created_at_ms IS NOT OLD.created_at_ms OR NEW.updated_at_ms IS NOT OLD.updated_at_ms
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+          OR NEW.source_revision IS NOT OLD.source_revision
+          OR NEW.state_version IS NOT OLD.state_version
+          OR NEW.compiled_source_revision IS NOT OLD.compiled_source_revision
+          OR NEW.compiled_project_path IS NOT OLD.compiled_project_path
+          OR NEW.compiled_provider IS NOT OLD.compiled_provider
+          OR NEW.compiled_config IS NOT OLD.compiled_config
+          OR NEW.compiled_at IS NOT OLD.compiled_at
+          OR NEW.compile_status IS NOT OLD.compile_status
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition, 'ready_at', NEW.ready_at,
+                    'ready_reason', NEW.ready_reason, 'manifest_json', NEW.manifest_json,
+                    'compiled_check', NEW.compiled_check, 'check_hash', NEW.check_hash,
+                    'check_cron', NEW.check_cron, 'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id,
+                    'source_revision', NEW.source_revision, 'state_version', NEW.state_version,
+                    'compiled_source_revision', NEW.compiled_source_revision,
+                    'compiled_project_path', NEW.compiled_project_path,
+                    'compiled_provider', NEW.compiled_provider,
+                    'compiled_config', NEW.compiled_config,
+                    'compiled_at', NEW.compiled_at, 'compile_status', NEW.compile_status), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_delete AFTER DELETE ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'tombstone', OLD.id,
+                json_object(
+                    'id', OLD.id, 'type', OLD.type, 'project_path', OLD.project_path,
+                    'session_id', OLD.session_id, 'content', OLD.content, 'status', OLD.status,
+                    'surface_condition', OLD.surface_condition, 'ready_at', OLD.ready_at,
+                    'ready_reason', OLD.ready_reason, 'manifest_json', OLD.manifest_json,
+                    'compiled_check', OLD.compiled_check, 'check_hash', OLD.check_hash,
+                    'check_cron', OLD.check_cron, 'check_failure_count', OLD.check_failure_count,
+                    'check_network_failure_count', OLD.check_network_failure_count,
+                    'check_quarantined_until', OLD.check_quarantined_until,
+                    'check_next_due_at', OLD.check_next_due_at, 'check_compiled_at', OLD.check_compiled_at,
+                    'check_false_since_at', OLD.check_false_since_at,
+                    'check_last_liveness_at', OLD.check_last_liveness_at,
+                    'last_checked_at', OLD.last_checked_at, 'check_status', OLD.check_status,
+                    'check_version', OLD.check_version, 'policy_version', OLD.policy_version,
+                    'harness', OLD.harness, 'anchor_block_id', OLD.anchor_block_id,
+                    'anchor_ordinal', OLD.anchor_ordinal, 'dismissed_at', OLD.dismissed_at,
+                    'dismissal_resolution', OLD.dismissal_resolution,
+                    'status_version', OLD.status_version, 'created_at_ms', OLD.created_at_ms,
+                    'updated_at_ms', OLD.updated_at_ms, 'context_store_uuid', OLD.context_store_uuid,
+                    'context_row_id', OLD.context_row_id,
+                    'source_revision', OLD.source_revision, 'state_version', OLD.state_version,
+                    'compiled_source_revision', OLD.compiled_source_revision,
+                    'compiled_project_path', OLD.compiled_project_path,
+                    'compiled_provider', OLD.compiled_provider,
+                    'compiled_config', OLD.compiled_config,
+                    'compiled_at', OLD.compiled_at, 'compile_status', OLD.compile_status), NULL);
+        END;
+    "#,
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4176,7 +4344,19 @@ pub struct NoteWriteInput<'a> {
     pub surface_condition: Option<&'a str>,
     pub anchor_block_id: Option<&'a str>,
     pub anchor_ordinal: Option<i64>,
+    pub compiled_provider: Option<&'a str>,
+    pub compiled_config: Option<&'a str>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<&'a str>,
     pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoteConditionCompile<'a> {
+    pub compiled_provider: Option<&'a str>,
+    pub compiled_config: Option<&'a str>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4211,6 +4391,14 @@ pub struct StoredNote {
     pub dismissed_at: Option<i64>,
     pub dismissal_resolution: Option<String>,
     pub status_version: i64,
+    pub source_revision: i64,
+    pub state_version: i64,
+    pub compiled_source_revision: Option<i64>,
+    pub compiled_project_path: Option<String>,
+    pub compiled_provider: Option<String>,
+    pub compiled_config: Option<String>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub context_store_uuid: Option<String>,
@@ -5778,8 +5966,9 @@ impl<'a> FacadeMutationTxn<'a> {
             .execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
+                  compiled_at, compile_status, created_at_ms, updated_at_ms)
+                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -5791,6 +5980,10 @@ impl<'a> FacadeMutationTxn<'a> {
                         .filter(|value| !value.is_empty()),
                     input.anchor_block_id,
                     input.anchor_ordinal,
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.now_ms,
                 ],
             )
@@ -5807,6 +6000,7 @@ impl<'a> FacadeMutationTxn<'a> {
         expected_version: i64,
         content: Option<&str>,
         surface_condition: Option<Option<&str>>,
+        condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
         let current = load_note_tx(self.tx, note_id)
@@ -5834,30 +6028,38 @@ impl<'a> FacadeMutationTxn<'a> {
             .flatten()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let next_status = if condition_changed && next_condition.is_some() {
+        let content_changed = next_content != current.content;
+        let compiler_edit = condition_changed || content_changed;
+        let remaining_condition = if condition_changed {
+            next_condition
+        } else {
+            current
+                .surface_condition
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let next_status = if compiler_edit && remaining_condition.is_some() {
             "pending"
         } else {
             current.status.as_str()
         };
+        let compile = condition_compile.unwrap_or_default();
         let changed = self
             .tx
             .execute(
-                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
-                    last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
-                    ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
-                    ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
-                    compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
-                    manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
-                    check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
-                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                NOTE_CAS_UPDATE_SQL,
                 params![
                     next_content,
                     condition_changed,
                     next_condition,
                     next_status,
+                    compiler_edit,
                     now_ms,
+                    compile.compiled_provider,
+                    compile.compiled_config,
+                    compile.compiled_at,
+                    compile.compile_status,
                     note_id,
                     project_path,
                     expected_status,
@@ -5909,7 +6111,8 @@ impl<'a> FacadeMutationTxn<'a> {
             .execute(
                 "UPDATE mc_notes
                     SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, updated_at_ms = ?2,
+                        status_version = status_version + 1, state_version = state_version + 1,
+                        updated_at_ms = ?2,
                         dismissed_at = ?2, dismissal_resolution = ?3
                   WHERE id = ?4 AND project_path = ?5
                     AND status = ?6 AND status_version = ?7",
@@ -6181,6 +6384,12 @@ impl McStore {
                 },
             )?;
             conn.create_scalar_function(
+                "mc_note_writer_v2",
+                0,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |_context| Ok(1i64),
+            )?;
+            conn.create_scalar_function(
                 "mc_facade_authority_route",
                 0,
                 FunctionFlags::SQLITE_UTF8,
@@ -6220,6 +6429,7 @@ impl McStore {
             historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
         };
         store.repair_migration_30_authority_routes()?;
+        store.repair_note_artifacts_v51()?;
         store.prune_transform_session_roots()?;
         Ok(store)
     }
@@ -6449,6 +6659,45 @@ impl McStore {
                 normalize_authority_route_tx(tx, &context_store_uuid, &project, &route_project_root)
             })?;
         }
+        Ok(())
+    }
+
+    /// Verify pre-v51 compiled artifacts once, then record completion in mc_cache_state.
+    /// This repair does not advance any note revision.
+    fn repair_note_artifacts_v51(&self) -> Result<(), McStoreError> {
+        const FLAG_KEY: &str = "note_artifact_repair_v51_done";
+        let done = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                params![FLAG_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+        })? != 0;
+        if done {
+            return Ok(());
+        }
+        let projects = self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT project_path FROM mc_notes
+                  WHERE compiled_check IS NOT NULL AND compiled_source_revision IS NULL
+                  ORDER BY project_path",
+            )?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        for project in projects {
+            self.with_note_conn_fenced(&project, |tx| repair_note_artifacts_tx(tx, &project))?;
+        }
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO mc_cache_state (session_id, row_version, core_state, meta)
+                 VALUES (?1, 0, '', '')",
+                params![FLAG_KEY],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -10370,7 +10619,10 @@ impl McStore {
                                     check_false_since_at, check_last_liveness_at, last_checked_at,
                                     check_status, check_version, policy_version, harness,
                                     anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution,
-                                    status_version, created_at_ms, updated_at_ms, NULL, NULL
+                                    status_version, created_at_ms, updated_at_ms, NULL, NULL,
+                                    source_revision, state_version, compiled_source_revision,
+                                    compiled_project_path, compiled_provider, compiled_config,
+                                    compiled_at, compile_status
                                FROM mc_notes
                               WHERE session_id = ?2 AND project_path = ?3 AND type = 'session'"
                         ),
@@ -12858,8 +13110,9 @@ impl McStore {
             tx.execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
+                  compiled_at, compile_status, created_at_ms, updated_at_ms)
+                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -12871,6 +13124,10 @@ impl McStore {
                         .filter(|value| !value.is_empty()),
                     input.anchor_block_id,
                     input.anchor_ordinal,
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.now_ms,
                 ],
             )?;
@@ -13056,6 +13313,7 @@ impl McStore {
             current.status_version,
             Some(content),
             None,
+            None,
             now_ms,
         )? {
             NoteCasOutcome::Applied(note) => Ok(Some(note)),
@@ -13074,6 +13332,7 @@ impl McStore {
         expected_version: i64,
         content: Option<&str>,
         surface_condition: Option<Option<&str>>,
+        condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, McStoreError> {
         self.require_note_project(project_path, note_id)?;
@@ -13083,42 +13342,56 @@ impl McStore {
                 return Ok(NoteCasOutcome::Conflict { current: None });
             };
             if current.project_path != project_path {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                });
             }
             if current.status != expected_status || current.status_version != expected_version {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                });
             }
             let next_content = content.map(str::trim).unwrap_or(&current.content);
             if next_content.is_empty() {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                });
             }
             let condition_changed = surface_condition.is_some();
             let next_condition = surface_condition
                 .flatten()
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            let next_status = if condition_changed && next_condition.is_some() {
+            let content_changed = next_content != current.content;
+            let compiler_edit = condition_changed || content_changed;
+            let remaining_condition = if condition_changed {
+                next_condition
+            } else {
+                current
+                    .surface_condition
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            };
+            let next_status = if compiler_edit && remaining_condition.is_some() {
                 "pending"
             } else {
                 current.status.as_str()
             };
+            let compile = condition_compile.unwrap_or_default();
             let changed = tx.execute(
-                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
-                    last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
-                    ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
-                    ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
-                    compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
-                    manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
-                    check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
-                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                NOTE_CAS_UPDATE_SQL,
                 params![
                     next_content,
                     condition_changed,
                     next_condition,
                     next_status,
+                    compiler_edit,
                     now_ms,
+                    compile.compiled_provider,
+                    compile.compiled_config,
+                    compile.compiled_at,
+                    compile.compile_status,
                     note_id,
                     project_path,
                     expected_status,
@@ -13126,7 +13399,9 @@ impl McStore {
                 ],
             )?;
             if changed == 0 {
-                return Ok(NoteCasOutcome::Conflict { current: load_note_tx(tx, note_id).optional()? });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: load_note_tx(tx, note_id).optional()?,
+                });
             }
             Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
         })?;
@@ -13166,7 +13441,8 @@ impl McStore {
             let changed = tx.execute(
                 "UPDATE mc_notes
                     SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, updated_at_ms = ?2,
+                        status_version = status_version + 1, state_version = state_version + 1,
+                        updated_at_ms = ?2,
                         dismissed_at = ?2, dismissal_resolution = ?3
                   WHERE id = ?4 AND project_path = ?5
                     AND status = ?6 AND status_version = ?7",
@@ -13250,6 +13526,7 @@ impl McStore {
             let status = if input.verdict { "ready" } else { "pending" };
             tx.execute(
                 "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
+                    state_version = state_version + 1,
                     updated_at_ms = ?2, ready_at = CASE WHEN ?1 = 'ready' THEN ?2 ELSE ready_at END,
                     ready_reason = CASE WHEN ?1 = 'ready' THEN 'condition_true' ELSE ready_reason END,
                     compiled_check = ?3, manifest_json = ?4, check_hash = ?5,
@@ -13319,6 +13596,7 @@ impl McStore {
             }
             tx.execute(
                 "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
+                    state_version = state_version + 1,
                     updated_at_ms = ?2,
                     ready_at = CASE WHEN ?1 = 'ready' THEN COALESCE(ready_at, ?2) ELSE ready_at END,
                     ready_reason = CASE WHEN ?1 = 'ready' THEN COALESCE(?3, ready_reason) ELSE ready_reason END,
@@ -13355,7 +13633,8 @@ impl McStore {
                 .optional()?;
             let Some(note) = note else { return Ok(None) };
             let changed = tx.execute(
-                "UPDATE mc_notes SET status_version = status_version + 1, updated_at_ms = ?1
+                "UPDATE mc_notes SET status_version = status_version + 1,
+                    state_version = state_version + 1, updated_at_ms = ?1
                    WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND status_version = ?4",
                 params![now_ms, note.id, project_path, note.status_version],
             )?;
@@ -13428,6 +13707,7 @@ impl McStore {
                 if note.status == "ready" {
                     let changed = tx.execute(
                         "UPDATE mc_notes SET status = 'surfacing', status_version = status_version + 1,
+                            state_version = state_version + 1,
                             updated_at_ms = ?1
                           WHERE id = ?2 AND project_path = ?3 AND status = 'ready' AND status_version = ?4",
                         params![now_ms, note.id, project_path, note.status_version],
@@ -13508,7 +13788,7 @@ impl McStore {
                 )?;
                 tx.execute(
                     "UPDATE mc_notes SET status = 'surfaced', status_version = status_version + 1,
-                        updated_at_ms = ?1
+                        state_version = state_version + 1, updated_at_ms = ?1
                       WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
                     params![now_ms, id, project_path],
                 )?;
@@ -13544,7 +13824,7 @@ impl McStore {
             for id in &ids {
                 tx.execute(
                     "UPDATE mc_notes SET status = 'ready', status_version = status_version + 1,
-                        updated_at_ms = ?1
+                        state_version = state_version + 1, updated_at_ms = ?1
                       WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
                     params![now_ms, id, project_path],
                 )?;
@@ -15028,7 +15308,8 @@ impl McStore {
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37,
+                     ?38, ?39, ?40, ?41)
                  ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
                     type=excluded.type, project_path=excluded.project_path,
                     session_id=excluded.session_id, content=excluded.content,
@@ -15048,7 +15329,13 @@ impl McStore {
                     anchor_ordinal=excluded.anchor_ordinal, dismissed_at=excluded.dismissed_at,
                     dismissal_resolution=excluded.dismissal_resolution,
                     status_version=excluded.status_version, created_at_ms=excluded.created_at_ms,
-                    updated_at_ms=excluded.updated_at_ms"
+                    updated_at_ms=excluded.updated_at_ms,
+                    source_revision=excluded.source_revision, state_version=excluded.state_version,
+                    compiled_source_revision=excluded.compiled_source_revision,
+                    compiled_project_path=excluded.compiled_project_path,
+                    compiled_provider=excluded.compiled_provider,
+                    compiled_config=excluded.compiled_config,
+                    compiled_at=excluded.compiled_at, compile_status=excluded.compile_status"
             ))?;
             let mut note_by_source = tx.prepare(
                 "SELECT id FROM mc_notes
@@ -15101,6 +15388,18 @@ impl McStore {
                     integer("updated_at_ms").or_else(|| integer("updated_at")).unwrap_or(0),
                     context_store_uuid,
                     source_row_id,
+                    integer("source_revision")
+                        .or_else(|| integer("status_version"))
+                        .unwrap_or(0),
+                    integer("state_version")
+                        .or_else(|| integer("status_version"))
+                        .unwrap_or(0),
+                    integer("compiled_source_revision"),
+                    text("compiled_project_path"),
+                    text("compiled_provider"),
+                    text("compiled_config"),
+                    integer("compiled_at"),
+                    text("compile_status"),
                 ])?;
                 let module_row_id: i64 = note_by_source.query_row(
                     params![context_store_uuid, project, source_row_id],
@@ -16063,8 +16362,40 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
     })
 }
 
-const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
-const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
+const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
+
+// ?2 = condition changed, ?5 = compiler-input edit (content or condition). A compiler-input
+// edit advances source_revision and resets compiled evaluation state; ?7..?10 replace the
+// compile authoring metadata only when the condition changed.
+const NOTE_CAS_UPDATE_SQL: &str = "UPDATE mc_notes SET content = ?1,
+    surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
+    status = ?4, status_version = status_version + 1, state_version = state_version + 1,
+    source_revision = source_revision + CASE WHEN ?5 THEN 1 ELSE 0 END,
+    updated_at_ms = ?6,
+    last_checked_at = CASE WHEN ?5 THEN NULL ELSE last_checked_at END,
+    ready_at = CASE WHEN ?5 THEN NULL ELSE ready_at END,
+    ready_reason = CASE WHEN ?5 THEN NULL ELSE ready_reason END,
+    compiled_check = CASE WHEN ?5 THEN NULL ELSE compiled_check END,
+    manifest_json = CASE WHEN ?5 THEN NULL ELSE manifest_json END,
+    check_hash = CASE WHEN ?5 THEN NULL ELSE check_hash END,
+    check_cron = CASE WHEN ?5 THEN NULL ELSE check_cron END,
+    compiled_source_revision = CASE WHEN ?5 THEN NULL ELSE compiled_source_revision END,
+    compiled_project_path = CASE WHEN ?5 THEN NULL ELSE compiled_project_path END,
+    check_version = CASE WHEN ?5 THEN 0 ELSE check_version END,
+    check_status = CASE WHEN ?5 THEN 'uncompiled' ELSE check_status END,
+    check_failure_count = CASE WHEN ?5 THEN 0 ELSE check_failure_count END,
+    check_network_failure_count = CASE WHEN ?5 THEN 0 ELSE check_network_failure_count END,
+    check_quarantined_until = CASE WHEN ?5 THEN NULL ELSE check_quarantined_until END,
+    check_next_due_at = CASE WHEN ?5 THEN NULL ELSE check_next_due_at END,
+    check_compiled_at = CASE WHEN ?5 THEN NULL ELSE check_compiled_at END,
+    check_false_since_at = CASE WHEN ?5 THEN NULL ELSE check_false_since_at END,
+    check_last_liveness_at = CASE WHEN ?5 THEN NULL ELSE check_last_liveness_at END,
+    compiled_provider = CASE WHEN ?2 THEN ?7 ELSE compiled_provider END,
+    compiled_config = CASE WHEN ?2 THEN ?8 ELSE compiled_config END,
+    compiled_at = CASE WHEN ?2 THEN ?9 ELSE compiled_at END,
+    compile_status = CASE WHEN ?2 THEN ?10 ELSE compile_status END
+  WHERE id = ?11 AND project_path = ?12 AND status = ?13 AND status_version = ?14";
 
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
@@ -16102,6 +16433,14 @@ fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
         updated_at_ms: r.get(31)?,
         context_store_uuid: r.get(32)?,
         context_row_id: r.get(33)?,
+        source_revision: r.get(34)?,
+        state_version: r.get(35)?,
+        compiled_source_revision: r.get(36)?,
+        compiled_project_path: r.get(37)?,
+        compiled_provider: r.get(38)?,
+        compiled_config: r.get(39)?,
+        compiled_at: r.get(40)?,
+        compile_status: r.get(41)?,
     })
 }
 
@@ -16111,6 +16450,93 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
         params![id],
         stored_note_from_row,
     )
+}
+
+/// Mirrors hashCheck in packages/plugin smart-notes/compiler.ts; manifest_json is hashed
+/// exactly as stored so both sides produce the same hex digest.
+fn note_check_digest(
+    surface_condition: Option<&str>,
+    compiled_check: &str,
+    manifest_json: Option<&str>,
+    check_cron: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(surface_condition.unwrap_or("").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(compiled_check.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(manifest_json.unwrap_or("").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(check_cron.unwrap_or("").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn repair_note_artifacts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+) -> rusqlite::Result<()> {
+    struct Candidate {
+        id: i64,
+        surface_condition: Option<String>,
+        compiled_check: String,
+        manifest_json: Option<String>,
+        check_hash: Option<String>,
+        check_cron: Option<String>,
+        source_revision: i64,
+    }
+    let candidates = {
+        let mut statement = tx.prepare(
+            "SELECT id, surface_condition, compiled_check, manifest_json, check_hash,
+                    check_cron, source_revision
+               FROM mc_notes
+              WHERE project_path = ?1 AND compiled_check IS NOT NULL
+                AND compiled_source_revision IS NULL
+              ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![project_path], |row| {
+                Ok(Candidate {
+                    id: row.get(0)?,
+                    surface_condition: row.get(1)?,
+                    compiled_check: row.get(2)?,
+                    manifest_json: row.get(3)?,
+                    check_hash: row.get(4)?,
+                    check_cron: row.get(5)?,
+                    source_revision: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for candidate in candidates {
+        let verified = candidate.check_hash.as_deref().is_some_and(|hash| {
+            note_check_digest(
+                candidate.surface_condition.as_deref(),
+                &candidate.compiled_check,
+                candidate.manifest_json.as_deref(),
+                candidate.check_cron.as_deref(),
+            ) == hash
+        });
+        if verified {
+            tx.execute(
+                "UPDATE mc_notes
+                    SET compiled_source_revision = ?1, compiled_project_path = ?2
+                  WHERE id = ?3",
+                params![candidate.source_revision, project_path, candidate.id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE mc_notes
+                    SET compiled_check = NULL, manifest_json = NULL, check_hash = NULL,
+                        check_cron = NULL, compiled_source_revision = NULL,
+                        compiled_project_path = NULL, check_version = 0,
+                        check_status = 'uncompiled'
+                  WHERE id = ?1",
+                params![candidate.id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn promote_facts_tx(
@@ -17176,6 +17602,10 @@ mod tests {
                 surface_condition: Some("later"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -17263,8 +17693,10 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let session = "counter-cas";
         let core = CoreState::default();
-        let mut initial_meta = ModuleMeta::default();
-        initial_meta.boundary_divergence_pending_count = 0;
+        let initial_meta = ModuleMeta {
+            boundary_divergence_pending_count: 0,
+            ..Default::default()
+        };
         store.commit(session, None, &core, &initial_meta).unwrap();
 
         let left = store.load(session).unwrap();
@@ -20527,6 +20959,10 @@ mod tests {
                 surface_condition: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -22364,6 +22800,10 @@ mod tests {
                 surface_condition: Some("shared condition"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 3,
             })
             .unwrap();
@@ -22487,6 +22927,10 @@ mod tests {
                 surface_condition: Some("release exists"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 10,
             })
             .unwrap();
@@ -22498,6 +22942,7 @@ mod tests {
                 "pending",
                 note.status_version,
                 Some("wait for the release tag"),
+                None,
                 None,
                 11,
             )
@@ -22517,6 +22962,7 @@ mod tests {
                 "pending",
                 note.status_version,
                 Some("cross-project write"),
+                None,
                 None,
                 11,
             ),
@@ -22600,6 +23046,10 @@ mod tests {
                 surface_condition: Some("condition"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -22659,6 +23109,10 @@ mod tests {
                     surface_condition: Some("condition"),
                     anchor_block_id: None,
                     anchor_ordinal: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     now_ms: 1,
                 })
                 .unwrap();
@@ -22716,6 +23170,10 @@ mod tests {
                     surface_condition: None,
                     anchor_block_id: None,
                     anchor_ordinal: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     now_ms: 1,
                 })
                 .unwrap();
@@ -22744,6 +23202,497 @@ mod tests {
             .unwrap();
         assert_eq!(page.len(), 5);
         assert!(page.iter().all(|note| note.project_path == "git:proj"));
+    }
+
+    fn insert_smart_note_with_compile(
+        store: &McStore,
+        project: &str,
+        content: &str,
+        condition: Option<&str>,
+        compile: Option<NoteConditionCompile<'_>>,
+    ) -> StoredNote {
+        let compile = compile.unwrap_or_default();
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: project,
+                route_project_root: None,
+                session_id: Some("writer"),
+                content,
+                surface_condition: condition,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: compile.compiled_provider,
+                compiled_config: compile.compiled_config,
+                compiled_at: compile.compiled_at,
+                compile_status: compile.compile_status,
+                now_ms: 1,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn note_create_initializes_revisions_equal_and_content_edits_keep_them_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note =
+            insert_smart_note_with_compile(&store, "git:proj", "first body", Some("cond"), None);
+        assert_eq!(note.source_revision, 0);
+        assert_eq!(note.state_version, 0);
+        assert_eq!(note.status_version, 0);
+        let mut current = note;
+        for step in 1..=3i64 {
+            let body = format!("body {step}");
+            current = match store
+                .update_note_cas(
+                    "git:proj",
+                    current.id,
+                    &current.status,
+                    current.status_version,
+                    Some(&body),
+                    None,
+                    None,
+                    10 + step,
+                )
+                .unwrap()
+            {
+                NoteCasOutcome::Applied(note) => note,
+                other => panic!("unexpected content edit outcome: {other:?}"),
+            };
+            assert_eq!(current.source_revision, step);
+            assert_eq!(current.state_version, step);
+            assert_eq!(current.status_version, step);
+        }
+    }
+
+    #[test]
+    fn note_content_edit_advances_source_revision_and_resets_evaluation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = insert_smart_note_with_compile(
+            &store,
+            "git:proj",
+            "watch the release",
+            Some("release exists"),
+            Some(NoteConditionCompile {
+                compiled_provider: Some("retina-1"),
+                compiled_config: Some("{\"model\":\"a\"}"),
+                compiled_at: Some(7),
+                compile_status: Some("compiled"),
+            }),
+        );
+        store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: 0,
+                verdict: false,
+                compiled_check: Some("check-code"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: Some(50),
+                now_ms: 2,
+            })
+            .unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_notes SET check_failure_count = 3, check_network_failure_count = 2,
+                        check_quarantined_until = 9, check_compiled_at = 8,
+                        check_false_since_at = 7, check_last_liveness_at = 6,
+                        check_cron = '0 * * * *', check_version = 4,
+                        compiled_source_revision = 0, compiled_project_path = 'git:proj'
+                      WHERE id = ?1",
+                    params![note.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let edited = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                1,
+                Some("new body"),
+                None,
+                None,
+                3,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected content edit outcome: {other:?}"),
+        };
+        assert_eq!(edited.source_revision, 1);
+        assert_eq!(edited.state_version, 2);
+        assert_eq!(edited.status_version, 2);
+        assert_eq!(edited.status, "pending");
+        assert_eq!(edited.compiled_check, None);
+        assert_eq!(edited.manifest_json, None);
+        assert_eq!(edited.check_hash, None);
+        assert_eq!(edited.check_cron, None);
+        assert_eq!(edited.compiled_source_revision, None);
+        assert_eq!(edited.compiled_project_path, None);
+        assert_eq!(edited.check_version, Some(0));
+        assert_eq!(edited.check_status.as_deref(), Some("uncompiled"));
+        assert_eq!(edited.check_failure_count, 0);
+        assert_eq!(edited.check_network_failure_count, 0);
+        assert_eq!(edited.check_quarantined_until, None);
+        assert_eq!(edited.check_next_due_at, None);
+        assert_eq!(edited.check_compiled_at, None);
+        assert_eq!(edited.check_false_since_at, None);
+        assert_eq!(edited.check_last_liveness_at, None);
+        assert_eq!(edited.last_checked_at, None);
+        assert_eq!(edited.ready_at, None);
+        assert_eq!(edited.ready_reason, None);
+        assert_eq!(edited.compiled_provider.as_deref(), Some("retina-1"));
+        assert_eq!(edited.compiled_config.as_deref(), Some("{\"model\":\"a\"}"));
+        assert_eq!(edited.compiled_at, Some(7));
+        assert_eq!(edited.compile_status.as_deref(), Some("compiled"));
+    }
+
+    #[test]
+    fn note_condition_edit_resets_evaluation_state_and_replaces_compile_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = insert_smart_note_with_compile(
+            &store,
+            "git:proj",
+            "watch the release",
+            Some("release exists"),
+            Some(NoteConditionCompile {
+                compiled_provider: Some("retina-1"),
+                compiled_config: Some("{\"model\":\"a\"}"),
+                compiled_at: Some(7),
+                compile_status: Some("compiled"),
+            }),
+        );
+        store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: 0,
+                verdict: false,
+                compiled_check: Some("check-code"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: Some(50),
+                now_ms: 2,
+            })
+            .unwrap();
+        let recompiled = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                1,
+                None,
+                Some(Some("tag advances")),
+                Some(NoteConditionCompile {
+                    compiled_provider: Some("retina-2"),
+                    compiled_config: Some("{\"model\":\"b\"}"),
+                    compiled_at: Some(9),
+                    compile_status: Some("plain"),
+                }),
+                3,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected condition edit outcome: {other:?}"),
+        };
+        assert_eq!(recompiled.source_revision, 1);
+        assert_eq!(recompiled.state_version, 2);
+        assert_eq!(recompiled.status_version, 2);
+        assert_eq!(recompiled.status, "pending");
+        assert_eq!(
+            recompiled.surface_condition.as_deref(),
+            Some("tag advances")
+        );
+        assert_eq!(recompiled.compiled_check, None);
+        assert_eq!(recompiled.manifest_json, None);
+        assert_eq!(recompiled.check_hash, None);
+        assert_eq!(recompiled.check_status.as_deref(), Some("uncompiled"));
+        assert_eq!(recompiled.compiled_provider.as_deref(), Some("retina-2"));
+        assert_eq!(
+            recompiled.compiled_config.as_deref(),
+            Some("{\"model\":\"b\"}")
+        );
+        assert_eq!(recompiled.compiled_at, Some(9));
+        assert_eq!(recompiled.compile_status.as_deref(), Some("plain"));
+        let cleared = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                2,
+                None,
+                Some(Some("third condition")),
+                None,
+                4,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected condition edit outcome: {other:?}"),
+        };
+        assert_eq!(cleared.source_revision, 2);
+        assert_eq!(cleared.state_version, 3);
+        assert_eq!(cleared.compiled_provider, None);
+        assert_eq!(cleared.compiled_config, None);
+        assert_eq!(cleared.compiled_at, None);
+        assert_eq!(cleared.compile_status, None);
+    }
+
+    #[test]
+    fn note_lifecycle_transitions_advance_state_but_not_source_and_keep_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = insert_smart_note_with_compile(
+            &store,
+            "git:proj",
+            "surface me",
+            Some("release exists"),
+            None,
+        );
+        let ready = match store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: 0,
+                verdict: true,
+                compiled_check: Some("check-code"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected evaluation outcome: {other:?}"),
+        };
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.status_version, 1);
+        assert_eq!(ready.state_version, 1);
+        assert_eq!(ready.source_revision, 0);
+        let (surfacing, _) = store
+            .claim_note_delivery("git:proj", "session", "fingerprint", "pass", 3)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(surfacing.status, "surfacing");
+        assert_eq!(surfacing.status_version, 2);
+        assert_eq!(surfacing.state_version, 2);
+        assert_eq!(surfacing.source_revision, 0);
+        store
+            .ack_note_delivery("git:proj", "session", "pass", 4)
+            .unwrap();
+        let surfaced = store
+            .get_note_by_id("git:proj", "session", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(surfaced.status, "surfaced");
+        assert_eq!(surfaced.status_version, 3);
+        assert_eq!(surfaced.state_version, 3);
+        assert_eq!(surfaced.source_revision, 0);
+        let dismissed = match store
+            .dismiss_note_cas("git:proj", note.id, "surfaced", 3, Some("done"), 5)
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected dismissal outcome: {other:?}"),
+        };
+        assert_eq!(dismissed.status, "dismissed");
+        assert_eq!(dismissed.status_version, 4);
+        assert_eq!(dismissed.state_version, 4);
+        assert_eq!(dismissed.source_revision, 0);
+        assert_eq!(dismissed.compiled_check.as_deref(), Some("check-code"));
+        assert_eq!(dismissed.manifest_json.as_deref(), Some("{}"));
+        assert_eq!(dismissed.check_hash.as_deref(), Some("hash"));
+
+        let due =
+            insert_smart_note_with_compile(&store, "git:proj", "due note", Some("cond"), None);
+        let claimed = store.claim_due_note("git:proj", 10).unwrap().unwrap();
+        assert_eq!(claimed.id, due.id);
+        assert_eq!(claimed.status_version, 1);
+        assert_eq!(claimed.state_version, 1);
+        assert_eq!(claimed.source_revision, 0);
+    }
+
+    fn register_pre_v2_note_functions(conn: &rusqlite::Connection, project: &'static str) {
+        conn.create_scalar_function(
+            "mc_note_caller_project",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_context| Ok(project.to_string()),
+        )
+        .unwrap();
+        conn.create_scalar_function(
+            "mc_facade_authority_domain",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(String::new()),
+        )
+        .unwrap();
+        conn.create_scalar_function(
+            "mc_facade_authority_route",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(String::new()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_v51_backfill_initializes_revisions_and_normalizes_check_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        drop(McStore::open(&descriptor(dir.path())).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        register_pre_v2_note_functions(&conn, "git:proj");
+        conn.create_scalar_function(
+            "mc_note_writer_v2",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(1i64),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_notes
+                (type, project_path, session_id, content, status, check_status,
+                 status_version, created_at_ms, updated_at_ms)
+             VALUES ('smart', 'git:proj', 'writer', 'legacy row', 'pending', 'true', 7, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mc_notes SET source_revision = status_version, state_version = status_version",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mc_notes SET check_status = 'uncompiled'
+              WHERE check_status NOT IN ('uncompiled', 'compiled', 'failing', 'fallback')",
+            [],
+        )
+        .unwrap();
+        let (source, state, status_version, check_status) = conn
+            .query_row(
+                "SELECT source_revision, state_version, status_version, check_status
+                   FROM mc_notes WHERE content = 'legacy row'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((source, state, status_version), (7, 7, 7));
+        assert_eq!(check_status, "uncompiled");
+    }
+
+    #[test]
+    fn note_artifact_repair_verifies_digest_or_clears_compiled_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let good = insert_smart_note_with_compile(&store, "git:proj", "good", Some("cond"), None);
+        let bad = insert_smart_note_with_compile(&store, "git:proj", "bad", Some("cond"), None);
+        let manifest = "{\"hosts\":[]}";
+        let good_hash = note_check_digest(
+            Some("cond"),
+            "check-code",
+            Some(manifest),
+            Some("0 * * * *"),
+        );
+        store
+            .inner
+            .with_conn(|conn| {
+                for (id, hash) in [(good.id, good_hash.as_str()), (bad.id, "forged")] {
+                    conn.execute(
+                        "UPDATE mc_notes SET compiled_check = 'check-code', manifest_json = ?2,
+                            check_hash = ?3, check_cron = '0 * * * *',
+                            check_status = 'compiled', check_version = 4
+                          WHERE id = ?1",
+                        params![id, manifest, hash],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM mc_cache_state WHERE session_id = 'note_artifact_repair_v51_done'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store.repair_note_artifacts_v51().unwrap();
+        let verified = store
+            .get_note_by_id("git:proj", "writer", good.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.compiled_check.as_deref(), Some("check-code"));
+        assert_eq!(verified.manifest_json.as_deref(), Some(manifest));
+        assert_eq!(verified.check_hash.as_deref(), Some(good_hash.as_str()));
+        assert_eq!(verified.compiled_source_revision, Some(0));
+        assert_eq!(verified.compiled_project_path.as_deref(), Some("git:proj"));
+        assert_eq!(verified.check_status.as_deref(), Some("compiled"));
+        assert_eq!(verified.check_version, Some(4));
+        assert_eq!(verified.status_version, 0);
+        assert_eq!(verified.state_version, 0);
+        assert_eq!(verified.source_revision, 0);
+        let cleared = store
+            .get_note_by_id("git:proj", "writer", bad.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.compiled_check, None);
+        assert_eq!(cleared.manifest_json, None);
+        assert_eq!(cleared.check_hash, None);
+        assert_eq!(cleared.check_cron, None);
+        assert_eq!(cleared.compiled_source_revision, None);
+        assert_eq!(cleared.compiled_project_path, None);
+        assert_eq!(cleared.check_version, Some(0));
+        assert_eq!(cleared.check_status.as_deref(), Some("uncompiled"));
+        assert_eq!(cleared.content, "bad");
+        assert_eq!(cleared.status, "pending");
+        assert_eq!(cleared.status_version, 0);
+        assert_eq!(cleared.state_version, 0);
+        assert_eq!(cleared.source_revision, 0);
+        store.repair_note_artifacts_v51().unwrap();
+    }
+
+    #[test]
+    fn mc_notes_writer_fence_blocks_connections_without_the_v2_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        drop(McStore::open(&descriptor(dir.path())).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        register_pre_v2_note_functions(&conn, "git:proj");
+        let insert = "INSERT INTO mc_notes
+                (type, project_path, session_id, content, status, created_at_ms, updated_at_ms)
+             VALUES ('smart', 'git:proj', 'writer', 'fenced write', 'active', 1, 1)";
+        let error = conn.execute(insert, []).unwrap_err().to_string();
+        assert!(error.contains("mc_note_writer_v2"), "{error}");
+        conn.create_scalar_function(
+            "mc_note_writer_v2",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(1i64),
+        )
+        .unwrap();
+        conn.execute(insert, []).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mc_notes WHERE content = 'fenced write'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

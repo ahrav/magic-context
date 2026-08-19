@@ -10998,6 +10998,10 @@ impl McHandler {
                                         surface_condition: Some(condition),
                                         anchor_block_id: anchor.as_deref(),
                                         anchor_ordinal: None,
+                                        compiled_provider: None,
+                                        compiled_config: None,
+                                        compiled_at: None,
+                                        compile_status: None,
                                         now_ms: now,
                                     })
                                     .map_err(|error| error.to_string())?;
@@ -11167,6 +11171,7 @@ impl McHandler {
                                     current.status_version,
                                     content,
                                     condition.map(Some),
+                                    None,
                                     now,
                                 )
                                 .map_err(|error| error.to_string())?
@@ -21848,6 +21853,10 @@ mod tests {
                 surface_condition: Some("when ready"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -21888,6 +21897,10 @@ mod tests {
                 surface_condition: Some("when ready"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -21992,6 +22005,10 @@ mod tests {
                     surface_condition: Some("condition"),
                     anchor_block_id: None,
                     anchor_ordinal: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     now_ms: index,
                 })
                 .unwrap();

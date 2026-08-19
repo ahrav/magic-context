@@ -664,9 +664,7 @@ export function dismissNote(db: Database, noteId: number, scope: NoteMutationSco
         return false;
     }
 
-    const revisionBump = noteRevisionColumnsExist(db)
-        ? ", state_version = state_version + 1"
-        : "";
+    const revisionBump = noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
     const result = db
         .prepare(
             `UPDATE notes SET status = 'dismissed', updated_at = ?${revisionBump} WHERE id = ? AND status != 'dismissed'`,
@@ -677,9 +675,7 @@ export function dismissNote(db: Database, noteId: number, scope: NoteMutationSco
 
 export function markNoteReady(db: Database, noteId: number, reason?: string): void {
     const now = Date.now();
-    const revisionBump = noteRevisionColumnsExist(db)
-        ? ", state_version = state_version + 1"
-        : "";
+    const revisionBump = noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
     db.prepare(
         `UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, last_checked_at = ?${revisionBump} WHERE id = ? AND type = 'smart'`,
     ).run(now, reason ?? null, now, now, noteId);
@@ -687,9 +683,7 @@ export function markNoteReady(db: Database, noteId: number, reason?: string): vo
 
 export function markNoteChecked(db: Database, noteId: number): void {
     const now = Date.now();
-    const revisionBump = noteRevisionColumnsExist(db)
-        ? ", state_version = state_version + 1"
-        : "";
+    const revisionBump = noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
     db.prepare(
         `UPDATE notes SET last_checked_at = ?, updated_at = ?${revisionBump} WHERE id = ? AND type = 'smart'`,
     ).run(now, now, noteId);

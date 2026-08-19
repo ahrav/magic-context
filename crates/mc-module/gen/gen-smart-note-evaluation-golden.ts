@@ -23,13 +23,24 @@ const genDir = dirname(fileURLToPath(import.meta.url));
 const pluginDir = join(genDir, "..", "..", "..", "packages", "plugin");
 const resolve = (m: string) => Bun.resolveSync(m, pluginDir);
 
-const storage = await import(resolve("./src/features/magic-context/smart-notes/storage"));
-const storageNotes = await import(resolve("./src/features/magic-context/storage-notes"));
-const schedule = await import(resolve("./src/features/magic-context/smart-notes/schedule"));
-const types = await import(resolve("./src/features/magic-context/smart-notes/types"));
+const storage = await import(
+    resolve("./src/features/magic-context/smart-notes/storage")
+);
+const storageNotes = await import(
+    resolve("./src/features/magic-context/storage-notes")
+);
+const schedule = await import(
+    resolve("./src/features/magic-context/smart-notes/schedule")
+);
+const types = await import(
+    resolve("./src/features/magic-context/smart-notes/types")
+);
 
-const { getDueCompiledSmartNoteChecks, getSmartNotesNeedingCompilation, getStaleCompiledSmartNotes } =
-    storage;
+const {
+    getDueCompiledSmartNoteChecks,
+    getSmartNotesNeedingCompilation,
+    getStaleCompiledSmartNotes,
+} = storage;
 const { getPendingSmartNotes } = storageNotes;
 const { nextSmartNoteCheckDueAt } = schedule;
 const { parseSmartNoteManifest } = types;
@@ -37,17 +48,22 @@ const { parseSmartNoteManifest } = types;
 // Do not edit the legacy writers below: reducers must match this behavior,
 // never the reverse.
 
-const SMART_NOTE_CHECK_POLICY_VERSION = types.SMART_NOTE_CHECK_POLICY_VERSION as number;
+const SMART_NOTE_CHECK_POLICY_VERSION =
+    types.SMART_NOTE_CHECK_POLICY_VERSION as number;
 
 function legacyBackoffMs(failureCount: number): number {
     const minutes = Math.min(24 * 60, 5 * 2 ** Math.max(0, failureCount - 1));
     return minutes * 60 * 1000;
 }
 
-function legacyReadFailureCount(db: Database, noteId: number, column: string): number {
-    const row = db.prepare(`SELECT ${column} AS count FROM notes WHERE id = ?`).get(noteId) as
-        | { count?: number | null }
-        | undefined;
+function legacyReadFailureCount(
+    db: Database,
+    noteId: number,
+    column: string,
+): number {
+    const row = db
+        .prepare(`SELECT ${column} AS count FROM notes WHERE id = ?`)
+        .get(noteId) as { count?: number | null } | undefined;
     return row?.count ?? 0;
 }
 
@@ -95,7 +111,12 @@ function storeCompiledSmartNoteCheck(
     );
 }
 
-function markCompiledCheckFalse(db: Database, noteId: number, nextDueAt: number, now: number): void {
+function markCompiledCheckFalse(
+    db: Database,
+    noteId: number,
+    nextDueAt: number,
+    now: number,
+): void {
     db.prepare(
         `UPDATE notes
          SET last_checked_at = ?,
@@ -114,7 +135,8 @@ function markCompiledCheckLogicFailure(
     now: number,
     maxFailures: number,
 ): void {
-    const failureCount = legacyReadFailureCount(db, noteId, "check_failure_count") + 1;
+    const failureCount =
+        legacyReadFailureCount(db, noteId, "check_failure_count") + 1;
     const status = failureCount >= maxFailures ? "failing" : "compiled";
     db.prepare(
         `UPDATE notes
@@ -123,7 +145,13 @@ function markCompiledCheckLogicFailure(
              check_next_due_at = ?,
              updated_at = ?
          WHERE id = ? AND type = 'smart'`,
-    ).run(failureCount, status, now + legacyBackoffMs(failureCount), now, noteId);
+    ).run(
+        failureCount,
+        status,
+        now + legacyBackoffMs(failureCount),
+        now,
+        noteId,
+    );
 }
 
 function markCompiledCheckNetworkFailure(
@@ -132,7 +160,8 @@ function markCompiledCheckNetworkFailure(
     now: number,
     maxFailures: number,
 ): void {
-    const failureCount = legacyReadFailureCount(db, noteId, "check_network_failure_count") + 1;
+    const failureCount =
+        legacyReadFailureCount(db, noteId, "check_network_failure_count") + 1;
     const quarantinedUntil = now + legacyBackoffMs(failureCount);
     const status = failureCount >= maxFailures ? "failing" : "compiled";
     db.prepare(
@@ -143,10 +172,21 @@ function markCompiledCheckNetworkFailure(
              check_quarantined_until = ?,
              updated_at = ?
          WHERE id = ? AND type = 'smart'`,
-    ).run(failureCount, status, quarantinedUntil, quarantinedUntil, now, noteId);
+    ).run(
+        failureCount,
+        status,
+        quarantinedUntil,
+        quarantinedUntil,
+        now,
+        noteId,
+    );
 }
 
-function markSmartNoteLivenessChecked(db: Database, noteId: number, now: number): void {
+function markSmartNoteLivenessChecked(
+    db: Database,
+    noteId: number,
+    now: number,
+): void {
     db.prepare(
         `UPDATE notes
          SET check_last_liveness_at = ?, updated_at = ?
@@ -154,7 +194,12 @@ function markSmartNoteLivenessChecked(db: Database, noteId: number, now: number)
     ).run(now, now, noteId);
 }
 
-function markSmartNoteCheckStatus(db: Database, noteId: number, status: string, now: number): void {
+function markSmartNoteCheckStatus(
+    db: Database,
+    noteId: number,
+    status: string,
+    now: number,
+): void {
     db.prepare(
         `UPDATE notes SET check_status = ?, updated_at = ? WHERE id = ? AND type = 'smart'`,
     ).run(status, now, noteId);
@@ -166,7 +211,8 @@ function markSmartNoteCompilationFailure(
     now: number,
     maxFailures: number,
 ): void {
-    const failureCount = legacyReadFailureCount(db, noteId, "check_failure_count") + 1;
+    const failureCount =
+        legacyReadFailureCount(db, noteId, "check_failure_count") + 1;
     const status = failureCount >= maxFailures ? "fallback" : "uncompiled";
     db.prepare(
         `UPDATE notes
@@ -175,7 +221,13 @@ function markSmartNoteCompilationFailure(
              check_next_due_at = ?,
              updated_at = ?
          WHERE id = ? AND type = 'smart'`,
-    ).run(failureCount, status, now + legacyBackoffMs(failureCount), now, noteId);
+    ).run(
+        failureCount,
+        status,
+        now + legacyBackoffMs(failureCount),
+        now,
+        noteId,
+    );
 }
 
 function markNoteReady(db: Database, noteId: number, reason?: string): void {
@@ -352,7 +404,9 @@ function insertNote(db: Database, seed: NoteSeed): void {
 }
 
 function readLifecycle(db: Database, id: number): Lifecycle {
-    const row = db.prepare("SELECT * FROM notes WHERE id = ?").get(id) as Record<string, unknown>;
+    const row = db
+        .prepare("SELECT * FROM notes WHERE id = ?")
+        .get(id) as Record<string, unknown>;
     const out = {} as Lifecycle;
     for (const col of LIFECYCLE_COLUMNS) out[col] = row[col] ?? null;
     return out;
@@ -425,7 +479,12 @@ function transitionCase(args: {
     db.close();
 }
 
-function applyCompileSuccess(db: Database, noteId: number, now: number, met: boolean): void {
+function applyCompileSuccess(
+    db: Database,
+    noteId: number,
+    now: number,
+    met: boolean,
+): void {
     const nextDueAt = nextSmartNoteCheckDueAt(ARTIFACT.check_cron, {
         now,
         noteId,
@@ -441,7 +500,11 @@ function applyCompileSuccess(db: Database, noteId: number, now: number, met: boo
         now,
     });
     if (met) {
-        markNoteReady(db, noteId, `Smart note #${noteId}: compiled check returned met=true`);
+        markNoteReady(
+            db,
+            noteId,
+            `Smart note #${noteId}: compiled check returned met=true`,
+        );
     } else {
         markCompiledCheckFalse(db, noteId, nextDueAt, now);
     }
@@ -450,7 +513,10 @@ function applyCompileSuccess(db: Database, noteId: number, now: number, met: boo
 // runner.ts hostGeneratedReadyReason
 function dueReadyReason(noteId: number, manifestJson: string | null): string {
     const manifest = parseSmartNoteManifest(manifestJson);
-    const signal = manifest.signals?.[0] ?? manifest.summary ?? "compiled check returned met=true";
+    const signal =
+        manifest.signals?.[0] ??
+        manifest.summary ??
+        "compiled check returned met=true";
     return `Smart note #${noteId}: ${signal}`.slice(0, 240);
 }
 
@@ -548,14 +614,18 @@ transitionCase({
     phase: "due",
     outcome: { kind: "met" },
     seed: dueSeed(10),
-    apply: (db, id) => markNoteReady(db, id, dueReadyReason(id, ARTIFACT.manifest_json)),
+    apply: (db, id) =>
+        markNoteReady(db, id, dueReadyReason(id, ARTIFACT.manifest_json)),
 });
 transitionCase({
     id: "due_met_summary_fallback_reason",
     phase: "due",
     outcome: { kind: "met" },
     seed: dueSeed(11, {
-        manifest_json: JSON.stringify({ capabilities: [], summary: "watch the release page" }),
+        manifest_json: JSON.stringify({
+            capabilities: [],
+            summary: "watch the release page",
+        }),
     }),
     apply: (db, id) =>
         markNoteReady(
@@ -563,7 +633,10 @@ transitionCase({
             id,
             dueReadyReason(
                 id,
-                JSON.stringify({ capabilities: [], summary: "watch the release page" }),
+                JSON.stringify({
+                    capabilities: [],
+                    summary: "watch the release page",
+                }),
             ),
         ),
 });
@@ -571,7 +644,10 @@ transitionCase({
     id: "due_false_resets_counters_preserves_false_since",
     phase: "due",
     outcome: { kind: "false" },
-    seed: dueSeed(12, { check_failure_count: 2, check_network_failure_count: 1 }),
+    seed: dueSeed(12, {
+        check_failure_count: 2,
+        check_network_failure_count: 1,
+    }),
     apply: (db, id, now) => {
         const nextDueAt = nextSmartNoteCheckDueAt(ARTIFACT.check_cron, {
             now,
@@ -641,7 +717,10 @@ transitionCase({
     id: "due_counters_independent",
     phase: "due",
     outcome: { kind: "network_failed" },
-    seed: dueSeed(19, { check_failure_count: 2, check_network_failure_count: 1 }),
+    seed: dueSeed(19, {
+        check_failure_count: 2,
+        check_network_failure_count: 1,
+    }),
     apply: (db, id, now) => markCompiledCheckNetworkFailure(db, id, now, 3),
 });
 
@@ -660,14 +739,21 @@ transitionCase({
     seed: livenessSeed(20),
     apply: (db, id, now) => {
         markSmartNoteLivenessChecked(db, id, now);
-        markNoteReady(db, id, `Smart note #${id}: max-staleness liveness check returned met=true`);
+        markNoteReady(
+            db,
+            id,
+            `Smart note #${id}: max-staleness liveness check returned met=true`,
+        );
     },
 });
 transitionCase({
     id: "liveness_false_reschedules",
     phase: "liveness",
     outcome: { kind: "false" },
-    seed: livenessSeed(21, { check_failure_count: 1, check_network_failure_count: 1 }),
+    seed: livenessSeed(21, {
+        check_failure_count: 1,
+        check_network_failure_count: 1,
+    }),
     apply: (db, id, now) => {
         const nextDueAt = nextSmartNoteCheckDueAt(ARTIFACT.check_cron, {
             now,
@@ -750,11 +836,21 @@ function scheduleCase(
         now_ms: nowMs,
         note_id: noteId,
         hash,
-        expected_due_at: nextSmartNoteCheckDueAt(cron, { now: nowMs, noteId, hash }),
+        expected_due_at: nextSmartNoteCheckDueAt(cron, {
+            now: nowMs,
+            noteId,
+            hash,
+        }),
     });
 }
 
-scheduleCase("hourly_baseline", "0 * * * *", "2026-06-15T17:23:45Z", 42, "c".repeat(64));
+scheduleCase(
+    "hourly_baseline",
+    "0 * * * *",
+    "2026-06-15T17:23:45Z",
+    42,
+    "c".repeat(64),
+);
 scheduleCase(
     "every_five_minutes_floor_clamp",
     "*/5 * * * *",
@@ -762,10 +858,34 @@ scheduleCase(
     42,
     "c".repeat(64),
 );
-scheduleCase("every_minute_floor_clamp", "* * * * *", "2026-06-15T17:23:45Z", 7, "d".repeat(64));
-scheduleCase("daily_ceiling_clamp", "0 3 * * *", "2026-06-15T11:00:00Z", 9, "e".repeat(64));
-scheduleCase("no_cron_default_interval", null, "2026-06-15T17:23:45Z", 42, "c".repeat(64));
-scheduleCase("empty_cron_default_interval", "", "2026-06-15T17:23:45Z", 42, "c".repeat(64));
+scheduleCase(
+    "every_minute_floor_clamp",
+    "* * * * *",
+    "2026-06-15T17:23:45Z",
+    7,
+    "d".repeat(64),
+);
+scheduleCase(
+    "daily_ceiling_clamp",
+    "0 3 * * *",
+    "2026-06-15T11:00:00Z",
+    9,
+    "e".repeat(64),
+);
+scheduleCase(
+    "no_cron_default_interval",
+    null,
+    "2026-06-15T17:23:45Z",
+    42,
+    "c".repeat(64),
+);
+scheduleCase(
+    "empty_cron_default_interval",
+    "",
+    "2026-06-15T17:23:45Z",
+    42,
+    "c".repeat(64),
+);
 scheduleCase(
     "invalid_cron_default_interval",
     "99 * * * *",
@@ -782,7 +902,13 @@ scheduleCase(
     42,
     "c".repeat(64),
 );
-scheduleCase("dst_spring_forward_cross", "0 3 * * *", "2026-03-08T09:30:00Z", 42, "c".repeat(64));
+scheduleCase(
+    "dst_spring_forward_cross",
+    "0 3 * * *",
+    "2026-03-08T09:30:00Z",
+    42,
+    "c".repeat(64),
+);
 // America/Los_Angeles fall-back day: the 01:00 local hour repeats; the search
 // must return the first matching instant, not double-fire the repeated hour.
 scheduleCase(
@@ -800,11 +926,35 @@ scheduleCase(
     "c".repeat(64),
 );
 // Rare schedules.
-scheduleCase("feb29_beyond_ceiling_clamps", "0 0 29 2 *", "2026-06-15T17:00:00Z", 42, "c".repeat(64));
-scheduleCase("vixie_dom_dow_or", "0 12 15 * 3", "2026-06-10T17:00:00Z", 42, "c".repeat(64));
+scheduleCase(
+    "feb29_beyond_ceiling_clamps",
+    "0 0 29 2 *",
+    "2026-06-15T17:00:00Z",
+    42,
+    "c".repeat(64),
+);
+scheduleCase(
+    "vixie_dom_dow_or",
+    "0 12 15 * 3",
+    "2026-06-10T17:00:00Z",
+    42,
+    "c".repeat(64),
+);
 // Jitter determinism across ids/hashes.
-scheduleCase("jitter_varies_by_note_id", "0 * * * *", "2026-06-15T17:23:45Z", 43, "c".repeat(64));
-scheduleCase("jitter_varies_by_hash", "0 * * * *", "2026-06-15T17:23:45Z", 42, "f".repeat(64));
+scheduleCase(
+    "jitter_varies_by_note_id",
+    "0 * * * *",
+    "2026-06-15T17:23:45Z",
+    43,
+    "c".repeat(64),
+);
+scheduleCase(
+    "jitter_varies_by_hash",
+    "0 * * * *",
+    "2026-06-15T17:23:45Z",
+    42,
+    "f".repeat(64),
+);
 scheduleCase("jitter_null_hash", "0 * * * *", "2026-06-15T17:23:45Z", 42, null);
 
 // ---------------------------------------------------------------------------
@@ -855,9 +1005,15 @@ selectionCase({
         dueSeed(1, { check_next_due_at: BASE - 5_000 }),
         dueSeed(2, { check_next_due_at: BASE - 10_000 }),
         dueSeed(3, { check_next_due_at: BASE + 60_000 }), // not due yet
-        dueSeed(4, { check_next_due_at: BASE - 10_000, check_quarantined_until: BASE + 60_000 }), // quarantined
+        dueSeed(4, {
+            check_next_due_at: BASE - 10_000,
+            check_quarantined_until: BASE + 60_000,
+        }), // quarantined
         dueSeed(5, { check_next_due_at: BASE - 1_000, policy_version: 0 }), // policy mismatch
-        dueSeed(6, { check_next_due_at: BASE - 1_000, check_status: "failing" }), // not compiled
+        dueSeed(6, {
+            check_next_due_at: BASE - 1_000,
+            check_status: "failing",
+        }), // not compiled
         dueSeed(7, { check_next_due_at: null }), // null due date = due
         dueSeed(8, { check_next_due_at: BASE - 10_000, status: "ready" }), // not pending
     ],
@@ -880,11 +1036,18 @@ selectionCase({
     limit: 10,
     retinaHandoff: true,
     notes: [
-        dueSeed(1, { check_next_due_at: BASE - 5_000, compile_status: "compiled" }),
-        dueSeed(2, { check_next_due_at: BASE - 10_000, compile_status: "plain" }),
+        dueSeed(1, {
+            check_next_due_at: BASE - 5_000,
+            compile_status: "compiled",
+        }),
+        dueSeed(2, {
+            check_next_due_at: BASE - 10_000,
+            compile_status: "plain",
+        }),
         dueSeed(3, { check_next_due_at: BASE - 1_000 }),
     ],
-    select: (db, now) => getDueCompiledSmartNoteChecks(db, PROJECT, now, 10, true),
+    select: (db, now) =>
+        getDueCompiledSmartNoteChecks(db, PROJECT, now, 10, true),
 });
 selectionCase({
     id: "compile_ordering_by_created_at",
@@ -895,7 +1058,10 @@ selectionCase({
         { id: 2, created_at: BASE - 10_000 },
         { id: 3, created_at: BASE - 10_000 }, // created_at tie -> id order
         dueSeed(4, { check_next_due_at: BASE - 1_000 }), // compiled + current policy: not a candidate
-        dueSeed(5, { check_next_due_at: BASE - 1_000, check_status: "failing" }), // failing -> recompile
+        dueSeed(5, {
+            check_next_due_at: BASE - 1_000,
+            check_status: "failing",
+        }), // failing -> recompile
         dueSeed(6, { check_next_due_at: BASE - 1_000, policy_version: 0 }), // policy mismatch -> recompile
         { id: 7, check_next_due_at: BASE + 60_000 }, // backoff not elapsed
         // The compile predicate matches fallback rows with NULL compiled_check.
@@ -919,8 +1085,12 @@ selectionCase({
     phase: "liveness",
     limit: 3,
     notes: [
-        livenessSeed(1, { check_false_since_at: BASE - CONSTANTS.max_staleness_ms - 7_200_000 }),
-        livenessSeed(2, { check_false_since_at: BASE - CONSTANTS.max_staleness_ms - 3_600_000 }),
+        livenessSeed(1, {
+            check_false_since_at: BASE - CONSTANTS.max_staleness_ms - 7_200_000,
+        }),
+        livenessSeed(2, {
+            check_false_since_at: BASE - CONSTANTS.max_staleness_ms - 3_600_000,
+        }),
         livenessSeed(3, { check_false_since_at: BASE - 3_600_000 }), // not stale
         livenessSeed(4, {
             check_false_since_at: BASE - CONSTANTS.max_staleness_ms - 3_600_000,
@@ -928,7 +1098,8 @@ selectionCase({
         }),
         livenessSeed(5, {
             check_false_since_at: BASE - CONSTANTS.max_staleness_ms - 3_600_000,
-            check_last_liveness_at: BASE - CONSTANTS.liveness_recheck_ms - 60_000, // due again
+            check_last_liveness_at:
+                BASE - CONSTANTS.liveness_recheck_ms - 60_000, // due again
         }),
     ],
     select: (db, now) => getStaleCompiledSmartNotes(db, PROJECT, now, 3),
@@ -938,17 +1109,45 @@ selectionCase({
     phase: "fallback",
     limit: 3,
     notes: [
-        { id: 1, check_status: "fallback", check_failure_count: 3, created_at: BASE - 5_000 },
+        {
+            id: 1,
+            check_status: "fallback",
+            check_failure_count: 3,
+            created_at: BASE - 5_000,
+        },
         { id: 2, check_status: "uncompiled", created_at: BASE - 4_000 },
-        { id: 3, check_status: "fallback", check_failure_count: 3, created_at: BASE - 3_000 },
-        { id: 4, check_status: "fallback", check_failure_count: 3, created_at: BASE - 2_000 },
-        { id: 5, check_status: "fallback", check_failure_count: 3, created_at: BASE - 1_000 },
-        { id: 6, check_status: "fallback", check_failure_count: 3, status: "ready" },
+        {
+            id: 3,
+            check_status: "fallback",
+            check_failure_count: 3,
+            created_at: BASE - 3_000,
+        },
+        {
+            id: 4,
+            check_status: "fallback",
+            check_failure_count: 3,
+            created_at: BASE - 2_000,
+        },
+        {
+            id: 5,
+            check_status: "fallback",
+            check_failure_count: 3,
+            created_at: BASE - 1_000,
+        },
+        {
+            id: 6,
+            check_status: "fallback",
+            check_failure_count: 3,
+            status: "ready",
+        },
     ],
     // evaluate-smart-notes.ts: pendingNotes().filter(checkStatus === 'fallback').slice(0, 3)
     select: (db) =>
         getPendingSmartNotes(db, PROJECT)
-            .filter((note: { checkStatus: string | null }) => note.checkStatus === "fallback")
+            .filter(
+                (note: { checkStatus: string | null }) =>
+                    note.checkStatus === "fallback",
+            )
             .slice(0, 3),
 });
 selectionCase({
@@ -957,14 +1156,23 @@ selectionCase({
     limit: 3,
     retinaHandoff: true,
     notes: [
-        { id: 1, check_status: "fallback", check_failure_count: 3, compile_status: "compiled" },
+        {
+            id: 1,
+            check_status: "fallback",
+            check_failure_count: 3,
+            compile_status: "compiled",
+        },
         { id: 2, check_status: "fallback", check_failure_count: 3 },
     ],
     select: (db) =>
         getPendingSmartNotes(db, PROJECT)
             .filter(
-                (note: { checkStatus: string | null; compileStatus: string | null }) =>
-                    note.compileStatus !== "compiled" && note.checkStatus === "fallback",
+                (note: {
+                    checkStatus: string | null;
+                    compileStatus: string | null;
+                }) =>
+                    note.compileStatus !== "compiled" &&
+                    note.checkStatus === "fallback",
             )
             .slice(0, 3),
 });
@@ -985,7 +1193,12 @@ const golden = {
     selection_cases: selectionCases,
 };
 
-const outPath = join(genDir, "..", "testdata", "smart-note-evaluation-golden.json");
+const outPath = join(
+    genDir,
+    "..",
+    "testdata",
+    "smart-note-evaluation-golden.json",
+);
 writeFileSync(outPath, `${JSON.stringify(golden, null, 2)}\n`);
 console.log(
     `wrote ${outPath}: ${transitionCases.length} transition, ${scheduleCases.length} schedule, ${selectionCases.length} selection cases`,
