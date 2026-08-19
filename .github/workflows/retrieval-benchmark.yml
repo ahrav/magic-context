@@ -1,0 +1,154 @@
+name: Retrieval Benchmark (reference hosts)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Reference profile(s) to run
+        type: choice
+        default: both
+        options:
+          - arm-neon
+          - x86-avx2
+          - both
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  reference-arm-neon:
+    name: Reference host (ARM64/NEON, arm-neon profile)
+    if: >-
+      github.event_name == 'schedule' ||
+      inputs.profile == 'arm-neon' ||
+      inputs.profile == 'both'
+    runs-on: [self-hosted, ARM64]
+    concurrency:
+      group: retrieval-benchmark-arm-neon
+      cancel-in-progress: false
+    timeout-minutes: 900
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify host matches arm-neon profile
+        run: |
+          arch="$(bun -e 'console.log(process.arch)')"
+          if [ "$arch" != "arm64" ]; then
+            echo "host arch $arch does not match the arm-neon profile" >&2
+            exit 1
+          fi
+
+      - name: Record host evidence
+        run: |
+          mkdir -p benchmark-artifacts
+          uname -a > benchmark-artifacts/host-evidence.txt
+          bun -e '
+            const os = require("node:os");
+            console.log(JSON.stringify({
+              arch: process.arch,
+              platform: process.platform,
+              cpus: os.cpus().map((c) => c.model),
+              totalMemoryBytes: os.totalmem(),
+            }, null, 2));
+          ' >> benchmark-artifacts/host-evidence.txt
+
+      - name: Run matrix (three complete runs)
+        run: |
+          for run in 1 2 3; do
+            bun packages/plugin/scripts/benchmark-retrieval.ts matrix \
+              --profile arm-neon \
+              --out "benchmark-artifacts/run-$run-report.json" \
+              --candidate-pool "benchmark-artifacts/run-$run-pool.json"
+          done
+
+      - name: Apply regression policy
+        run: |
+          bun packages/plugin/scripts/benchmark-retrieval.ts regression \
+            --profile arm-neon \
+            --candidate benchmark-artifacts/run-1-report.json \
+            --candidate benchmark-artifacts/run-2-report.json \
+            --candidate benchmark-artifacts/run-3-report.json \
+            --out benchmark-artifacts/regression.json
+
+      - name: Archive reports and host evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-benchmark-arm-neon
+          path: benchmark-artifacts/
+          if-no-files-found: error
+
+  reference-x86-avx2:
+    name: Reference host (X64/AVX2, x86-avx2 profile)
+    if: >-
+      github.event_name == 'schedule' ||
+      inputs.profile == 'x86-avx2' ||
+      inputs.profile == 'both'
+    runs-on: [self-hosted, X64]
+    concurrency:
+      group: retrieval-benchmark-x86-avx2
+      cancel-in-progress: false
+    timeout-minutes: 900
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify host matches x86-avx2 profile
+        run: |
+          arch="$(bun -e 'console.log(process.arch)')"
+          if [ "$arch" != "x64" ]; then
+            echo "host arch $arch does not match the x86-avx2 profile" >&2
+            exit 1
+          fi
+
+      - name: Record host evidence
+        run: |
+          mkdir -p benchmark-artifacts
+          uname -a > benchmark-artifacts/host-evidence.txt
+          bun -e '
+            const os = require("node:os");
+            console.log(JSON.stringify({
+              arch: process.arch,
+              platform: process.platform,
+              cpus: os.cpus().map((c) => c.model),
+              totalMemoryBytes: os.totalmem(),
+            }, null, 2));
+          ' >> benchmark-artifacts/host-evidence.txt
+
+      - name: Run matrix (three complete runs)
+        run: |
+          for run in 1 2 3; do
+            bun packages/plugin/scripts/benchmark-retrieval.ts matrix \
+              --profile x86-avx2 \
+              --out "benchmark-artifacts/run-$run-report.json" \
+              --candidate-pool "benchmark-artifacts/run-$run-pool.json"
+          done
+
+      - name: Apply regression policy
+        run: |
+          bun packages/plugin/scripts/benchmark-retrieval.ts regression \
+            --profile x86-avx2 \
+            --candidate benchmark-artifacts/run-1-report.json \
+            --candidate benchmark-artifacts/run-2-report.json \
+            --candidate benchmark-artifacts/run-3-report.json \
+            --out benchmark-artifacts/regression.json
+
+      - name: Archive reports and host evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-benchmark-x86-avx2
+          path: benchmark-artifacts/
+          if-no-files-found: error

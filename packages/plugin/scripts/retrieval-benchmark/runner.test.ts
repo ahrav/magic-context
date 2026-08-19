@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -486,4 +486,106 @@ describe("CLI surface (scenario 9)", () => {
         },
         120_000,
     );
+});
+
+describe("workflow and package-script contract (U7 scenario 5)", () => {
+    const REPO_ROOT = join(import.meta.dir, "..", "..", "..", "..");
+    const PROFILE_DIR = join(import.meta.dir, "..", "fixtures", "retrieval-benchmark", "profiles", "v1");
+
+    interface WorkflowStep {
+        run?: string;
+        uses?: string;
+    }
+    interface WorkflowJob {
+        "runs-on"?: unknown;
+        needs?: unknown;
+        steps?: WorkflowStep[];
+    }
+    interface Workflow {
+        jobs: Record<string, WorkflowJob>;
+    }
+
+    function loadWorkflow(name: string): { parsed: Workflow; raw: string } {
+        const raw = readFileSync(join(REPO_ROOT, ".github", "workflows", name), "utf8");
+        return { parsed: Bun.YAML.parse(raw) as Workflow, raw };
+    }
+
+    function commands(job: WorkflowJob): string {
+        return (job.steps ?? []).map((step) => step.run ?? "").join("\n");
+    }
+
+    function allCommands(workflow: Workflow): string {
+        return Object.values(workflow.jobs).map(commands).join("\n");
+    }
+
+    function profileHostClass(name: string): string {
+        const parsed = JSON.parse(readFileSync(join(PROFILE_DIR, `${name}.json`), "utf8")) as {
+            host: { class: string; cpuArchitecture: string };
+        };
+        return parsed.host.class;
+    }
+
+    it("package scripts invoke the same CLI and ci profile the workflows use", () => {
+        const pkg = JSON.parse(
+            readFileSync(join(REPO_ROOT, "packages", "plugin", "package.json"), "utf8"),
+        ) as { scripts: Record<string, string> };
+        expect(pkg.scripts["bench:retrieval"]).toBe("bun scripts/benchmark-retrieval.ts");
+        expect(pkg.scripts["bench:retrieval:check"]).toBe(
+            "bun scripts/benchmark-retrieval.ts check --profile ci",
+        );
+        expect(existsSync(CLI_PATH)).toBe(true);
+        expect(existsSync(join(PROFILE_DIR, "ci.json"))).toBe(true);
+    });
+
+    it("ci.yml runs the ci-profile check after plugin checks and archives the report", () => {
+        const { parsed } = loadWorkflow("ci.yml");
+        const job = parsed.jobs["benchmark-retrieval-check"];
+        expect(job).toBeDefined();
+        expect(job["runs-on"]).toBe("ubuntu-latest");
+        expect(job.needs).toEqual(["check-plugin"]);
+
+        const run = commands(job);
+        expect(run).toContain("packages/plugin/scripts/benchmark-retrieval.ts check");
+        expect(run).toContain("--profile ci");
+        expect(run).toContain("--out");
+        expect(run).toContain("--candidate-pool");
+        expect(profileHostClass("ci")).toBe("ci");
+        expect(
+            (job.steps ?? []).some((step) => step.uses?.startsWith("actions/upload-artifact@")),
+        ).toBe(true);
+    });
+
+    it("hosted CI never creates baselines or claims reference-host latency", () => {
+        const { parsed } = loadWorkflow("ci.yml");
+        const run = allCommands(parsed);
+        expect(run).not.toContain("baseline-create");
+        expect(run).not.toContain("--latency-baseline");
+        expect(run).not.toContain("--profile arm-neon");
+        expect(run).not.toContain("--profile x86-avx2");
+    });
+
+    it("reference-host jobs run their declared profiles on self-hosted labels only", () => {
+        const { parsed, raw } = loadWorkflow("retrieval-benchmark.yml");
+        const expectations = [
+            { jobId: "reference-arm-neon", profile: "arm-neon", arch: "arm64", label: "ARM64" },
+            { jobId: "reference-x86-avx2", profile: "x86-avx2", arch: "x64", label: "X64" },
+        ] as const;
+        for (const expected of expectations) {
+            const job = parsed.jobs[expected.jobId];
+            expect(job).toBeDefined();
+            expect(job["runs-on"]).toEqual(["self-hosted", expected.label]);
+
+            const run = commands(job);
+            expect(run).toContain("packages/plugin/scripts/benchmark-retrieval.ts matrix");
+            expect(run).toContain(`--profile ${expected.profile}`);
+            expect(run).toContain("packages/plugin/scripts/benchmark-retrieval.ts regression");
+            expect(run).toContain(`"$arch" != "${expected.arch}"`);
+            expect(profileHostClass(expected.profile)).toBe(expected.profile);
+        }
+        expect(allCommands(parsed)).not.toContain("baseline-create");
+        expect(raw).toContain("workflow_dispatch");
+        for (const option of ["arm-neon", "x86-avx2", "both"]) {
+            expect(raw).toContain(`- ${option}`);
+        }
+    });
 });
