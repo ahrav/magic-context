@@ -14,6 +14,7 @@ import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
     applyMirrorPage,
+    chainMirrorDomainSync,
     disposeModuleNoteEvaluationBridges,
     ensureContextStoreUuid,
     getMirrorCursor,
@@ -818,27 +819,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             if (!response.page.has_more || next === cursor) break;
         }
     };
-    // Each pull reads the durable cursor before requesting a page, so two
-    // concurrent pulls for one domain request the same page and the loser
-    // throws a cursor mismatch in applyMirrorPage (the process-global
-    // evaluator bridge lets several callers reach the notes sync at once).
-    // Chain pulls per domain so each run observes the previous run's
-    // committed cursor.
-    const moduleDomainSyncChains: Record<"memories" | "notes", Promise<void>> = {
-        memories: Promise.resolve(),
-        notes: Promise.resolve(),
-    };
-    const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> => {
-        const run = moduleDomainSyncChains[domain].then(
-            () => runModuleDomainSync(domain),
-            () => runModuleDomainSync(domain),
-        );
-        moduleDomainSyncChains[domain] = run.then(
-            () => undefined,
-            () => undefined,
-        );
-        return run;
-    };
+    // Chained process-globally per (store, domain): several plugin instances
+    // can share this database file, and interleaved pulls throw a cursor
+    // mismatch in applyMirrorPage.
+    const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> =>
+        chainMirrorDomainSync(db, domain, () => runModuleDomainSync(domain));
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
     const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
     const rustToolBackends: RustToolBackends | undefined =
@@ -1016,12 +1001,42 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // Evaluator LLM children need a parent session so they nest in the
         // picker and recordChildInvocation captures their token telemetry
         // (both require a parent id). Resolved per claim: the bridge outlives
-        // any one session, so a memoized id would go stale.
-        const resolveEvaluatorParentSession = async (): Promise<string | undefined> => {
+        // any one session, so a memoized id would go stale. The SDK call has
+        // no abort plumbing, so it races the claim's signal and a hard
+        // timeout — a stalled lookup would otherwise pin the claim executor
+        // while lease renewals keep it alive and dispose() waits forever.
+        const resolveEvaluatorParentSession = async (
+            signal: AbortSignal,
+        ): Promise<string | undefined> => {
             try {
-                const listResponse = await deps.client.session.list({
-                    query: { directory: bridgeProjectRoot },
-                });
+                const listResponse = await Promise.race([
+                    deps.client.session.list({ query: { directory: bridgeProjectRoot } }),
+                    new Promise<never>((_, reject) => {
+                        const fail = (reason: unknown) =>
+                            reject(
+                                reason instanceof Error
+                                    ? reason
+                                    : new Error("parent session lookup aborted"),
+                            );
+                        if (signal.aborted) {
+                            fail(signal.reason);
+                            return;
+                        }
+                        const timer = setTimeout(
+                            () => fail(new Error("parent session lookup timed out")),
+                            5_000,
+                        );
+                        if (typeof timer.unref === "function") timer.unref();
+                        signal.addEventListener(
+                            "abort",
+                            () => {
+                                clearTimeout(timer);
+                                fail(signal.reason);
+                            },
+                            { once: true },
+                        );
+                    }),
+                ]);
                 const sessions = normalizeSDKResponse(listResponse, [] as { id?: string }[], {
                     preferResponseOnMissingData: true,
                 });
@@ -1054,7 +1069,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     compileSmartNoteCheck({
                         client: deps.client,
                         db,
-                        parentSessionId: await resolveEvaluatorParentSession(),
+                        parentSessionId: await resolveEvaluatorParentSession(signal),
                         sessionDirectory: bridgeProjectRoot,
                         projectIdentity: bridgeProjectPath,
                         model: evaluatorTaskConfig?.model,
@@ -1079,7 +1094,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     confirmSmartNoteReadOnly({
                         client: deps.client,
                         db,
-                        parentSessionId: await resolveEvaluatorParentSession(),
+                        parentSessionId: await resolveEvaluatorParentSession(signal),
                         sessionDirectory: bridgeProjectRoot,
                         projectIdentity: bridgeProjectPath,
                         model: evaluatorTaskConfig?.model,

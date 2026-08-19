@@ -218,6 +218,37 @@ export function ensureContextStoreUuid(db: Database): string {
     return getContextStoreUuid(db) ?? minted;
 }
 
+/** Tails keyed by store uuid + domain; process-global so every plugin instance
+ * sharing one database file joins the same chain. */
+const mirrorDomainSyncChains = new Map<string, Promise<void>>();
+
+/**
+ * Serialize mirror pulls for one (database, domain) across every caller in
+ * the process. Each pull reads the durable cursor before requesting a page,
+ * so two concurrent pulls request the same page and the loser throws a
+ * cursor mismatch in {@link applyMirrorPage}. Instance-local chains are not
+ * enough: several plugin instances can share one database file (the shared
+ * evaluator bridge holds one instance's sync while another instance's tool
+ * backend syncs the same domain), so the chain is keyed by the store uuid.
+ */
+export function chainMirrorDomainSync(
+    db: Database,
+    domain: "memories" | "notes",
+    run: () => Promise<void>,
+): Promise<void> {
+    const key = `${ensureContextStoreUuid(db)}\u0000${domain}`;
+    const tail = mirrorDomainSyncChains.get(key) ?? Promise.resolve();
+    const next = tail.then(run, run);
+    mirrorDomainSyncChains.set(
+        key,
+        next.then(
+            () => undefined,
+            () => undefined,
+        ),
+    );
+    return next;
+}
+
 export interface AuthorityManagedMarker {
     project_path: string;
     context_store_uuid: string;
