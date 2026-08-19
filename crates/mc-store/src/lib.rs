@@ -17061,7 +17061,19 @@ impl McStore {
                 return Ok(NoteEvalAcquireOutcome::Busy);
             }
             let claim = NoteEvalClaim {
-                claim_id: format!("nec:{project}:{acquisition_id}"),
+                // The module's wire protocol caps id fields at 128 bytes and
+                // the client echoes this id on every renew/complete/abandon,
+                // so it must stay bounded regardless of how long the project
+                // identity or acquisition id are. The digest keeps it
+                // deterministic per (project, acquisition); a replayed
+                // acquisition reads the stored row.
+                claim_id: {
+                    let mut hasher = Sha256::new();
+                    hasher.update(project.as_bytes());
+                    hasher.update([0u8]);
+                    hasher.update(acquisition_id.as_bytes());
+                    format!("nec:{:x}", hasher.finalize())
+                },
                 note_id: note.id,
                 phase,
                 acquisition_id: acquisition_id.to_string(),
@@ -25076,6 +25088,58 @@ mod tests {
             NoteEvalAcquireOutcome::Invalid,
             "a different slot must not steal a replayed acquisition identity"
         );
+    }
+
+    #[test]
+    fn note_eval_claim_ids_fit_the_wire_id_limit_for_long_project_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        // The module rejects id fields over 128 bytes, so a claim id must stay
+        // bounded even when the project identity alone exceeds that budget.
+        let project = format!("dir:/{}", "p".repeat(200));
+        let preparing = store
+            .authority_begin_prepare("ctx", &project, "notes")
+            .unwrap();
+        store
+            .authority_finish_prepare(
+                "ctx",
+                &project,
+                "notes",
+                preparing.generation,
+                "hash",
+                "hash",
+                true,
+            )
+            .unwrap();
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: &project,
+                route_project_root: None,
+                session_id: Some("writer"),
+                content: "watch the build",
+                surface_condition: Some("condition"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        match store
+            .acquire_note_evaluation(&project, "acq-long", "eval-a", 0, 1, pick_first, 100)
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { claim, .. } => {
+                assert!(
+                    claim.claim_id.len() <= 128,
+                    "claim id must fit the module's 128-byte id fields, got {} bytes",
+                    claim.claim_id.len()
+                );
+            }
+            other => panic!("expected claim, got {other:?}"),
+        }
     }
 
     #[test]
