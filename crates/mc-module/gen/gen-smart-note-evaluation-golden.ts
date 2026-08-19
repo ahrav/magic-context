@@ -16,9 +16,11 @@ process.env.TZ = "America/Los_Angeles";
 
 import { Database } from "bun:sqlite";
 import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const pluginDir = join(import.meta.dir, "..", "..", "..", "packages", "plugin");
+const genDir = dirname(fileURLToPath(import.meta.url));
+const pluginDir = join(genDir, "..", "..", "..", "packages", "plugin");
 const resolve = (m: string) => Bun.resolveSync(m, pluginDir);
 
 const storage = await import(resolve("./src/features/magic-context/smart-notes/storage"));
@@ -832,7 +834,7 @@ const golden = {
     selection_cases: selectionCases,
 };
 
-const outPath = join(import.meta.dir, "..", "testdata", "smart-note-evaluation-golden.json");
+const outPath = join(genDir, "..", "testdata", "smart-note-evaluation-golden.json");
 writeFileSync(outPath, `${JSON.stringify(golden, null, 2)}\n`);
 console.log(
     `wrote ${outPath}: ${transitionCases.length} transition, ${scheduleCases.length} schedule, ${selectionCases.length} selection cases`,
