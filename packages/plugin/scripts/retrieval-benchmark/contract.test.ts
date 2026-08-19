@@ -444,6 +444,23 @@ describe("validateRelease", () => {
         ).toContain(
             "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
         );
+        // Locators beyond MAX_SAFE_INTEGER are rejected even when they
+        // survive a Number -> String round-trip (2^53 does): seeding
+        // subtracts from and sorts the value as a JS number, and locators
+        // like "0" can never come back from AUTOINCREMENT.
+        for (const locator of [String(2 ** 53), "0"]) {
+            const unsafeRelease = makeValidRelease();
+            const unsafeDoc = unsafeRelease.corpus.documents.find(
+                (d) => d.id === "d-exact-symbol-path-dev",
+            );
+            if (!unsafeDoc) throw new Error("fixture document missing");
+            unsafeDoc.aliases[0].locator = locator;
+            expect(
+                diagnosticsOf(() => validateRelease(unsafeRelease.corpus, unsafeRelease.judgments)),
+            ).toContain(
+                "corpus: target has no production-producible alias (q-exact-symbol-path-dev, d-exact-symbol-path-dev)",
+            );
+        }
         // Compartments, primers, and notes carry numeric production ids too.
         const noteRelease = makeValidRelease();
         const noteDoc = noteRelease.corpus.documents.find(

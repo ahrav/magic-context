@@ -364,6 +364,14 @@ export function parseProfile(value: unknown): BenchmarkProfile {
                   ? predicateSources
                   : lanes.filter((lane) => predicateSources.includes(lane));
         if (effectiveLanes === null) hasAllLanes = true;
+        // A disjoint lane axis and predicate would execute NO source lane:
+        // every query returns empty rankings while the case still counts as
+        // evidence. Reject the contradiction at parse time.
+        if (effectiveLanes !== null && effectiveLanes.length === 0) {
+            diagnostics.push(
+                `profile.cases[${index}].sourceLanes: empty effective lane set (sourceLanes and selectivity.predicate.sources do not intersect)`,
+            );
+        }
         if (effectiveLanes !== null && effectiveLanes.length === 1) {
             hasSingleLane = true;
         }

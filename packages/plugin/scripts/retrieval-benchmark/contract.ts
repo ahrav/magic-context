@@ -29,12 +29,19 @@ export const CORPUS_SCHEMA_VERSION = "retrieval-benchmark-corpus/v1";
 /** Canonical-decimal numeric locator production can actually emit: SQLite
  *  AUTOINCREMENT ids start at 1 (so "0" is never producible — the cursor
  *  advance would set sqlite_sequence to -1 and the emitted row would come
- *  back as id 1), and production interpolates the id through a JS number,
- *  so the value must survive a Number -> String round-trip byte-exactly
- *  (rejects "042" and ids above MAX_SAFE_INTEGER). One predicate shared by
- *  corpus validation and seeding so both gates agree on producibility. */
+ *  back as id 1), the value must be a safe integer (seeding subtracts from
+ *  and sorts it as a JS number), and production interpolates the id
+ *  through a JS number, so it must survive a Number -> String round-trip
+ *  byte-exactly (rejects "042" and ids above MAX_SAFE_INTEGER). One
+ *  predicate shared by corpus validation and seeding so both gates agree
+ *  on producibility. */
 export function isProducibleNumericLocator(locator: string): boolean {
-    return /^[1-9]\d*$/.test(locator) && String(Number(locator)) === locator;
+    const numeric = Number(locator);
+    return (
+        /^[1-9]\d*$/.test(locator) &&
+        Number.isSafeInteger(numeric) &&
+        String(numeric) === locator
+    );
 }
 export const JUDGMENTS_SCHEMA_VERSION = "retrieval-benchmark-judgments/v1";
 export const SYNTHETIC_SCHEMA_VERSION = "retrieval-benchmark-synthetic/v1";
