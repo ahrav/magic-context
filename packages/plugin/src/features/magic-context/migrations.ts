@@ -3080,6 +3080,15 @@ export const MIGRATIONS: Migration[] = [
             installValueSensitiveMemoriesFtsUpdateTrigger(db);
         },
     },
+    {
+        version: 81,
+        description: "smart-note evaluation revisions: source_revision and state_version",
+        up(db: Database): void {
+            if (!tableExists(db, "notes")) return;
+            ensureColumn(db, "notes", "source_revision", "INTEGER NOT NULL DEFAULT 0");
+            ensureColumn(db, "notes", "state_version", "INTEGER NOT NULL DEFAULT 0");
+        },
+    },
 ];
 
 /**

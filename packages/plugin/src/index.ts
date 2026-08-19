@@ -593,6 +593,9 @@ const server: Plugin = async (ctx) => {
                 } catch {
                     // best-effort
                 }
+                void magicContextRuntime.magicContext
+                    ?.disposeNoteEvaluationBridges()
+                    .catch(() => {});
                 try {
                     rpcServer?.stop();
                 } catch {

@@ -43,6 +43,8 @@ export interface Note {
     checkFalseSinceAt: number | null;
     checkLastLivenessAt: number | null;
     policyVersion: number | null;
+    sourceRevision: number;
+    stateVersion: number;
 }
 
 export interface GetNotesOptions {
@@ -104,6 +106,8 @@ interface NoteRow {
     check_false_since_at?: number | null;
     check_last_liveness_at?: number | null;
     policy_version?: number | null;
+    source_revision?: number | null;
+    state_version?: number | null;
 }
 
 interface SessionNoteInput {
@@ -209,16 +213,36 @@ function toNote(row: NoteRow): Note {
         checkFalseSinceAt: toNullableNumber(row.check_false_since_at),
         checkLastLivenessAt: toNullableNumber(row.check_last_liveness_at),
         policyVersion: toNullableNumber(row.policy_version),
+        sourceRevision: toNullableNumber(row.source_revision) ?? 0,
+        stateVersion: toNullableNumber(row.state_version) ?? 0,
     };
 }
 
-function noteCheckColumnsExist(db: Database): boolean {
+function noteColumnExists(db: Database, column: string): boolean {
     try {
         const rows = db.prepare("PRAGMA table_info(notes)").all() as Array<{ name?: string }>;
-        return rows.some((row) => row.name === "compiled_check");
+        return rows.some((row) => row.name === column);
     } catch {
         return false;
     }
+}
+
+function noteCheckColumnsExist(db: Database): boolean {
+    return noteColumnExists(db, "compiled_check");
+}
+
+function noteRevisionColumnsExist(db: Database): boolean {
+    return noteColumnExists(db, "state_version");
+}
+
+/**
+ * SQL fragment bumping the optimistic-concurrency revision counter, or ""
+ * pre-migration. Every smart-note mutator must include it: a write path that
+ * skips the bump silently defeats the claim revision fence in
+ * `smart-notes/storage.ts` (`claimExpectedState`).
+ */
+function revisionBumpSql(db: Database): string {
+    return noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
 }
 
 function getNoteById(db: Database, noteId: number): Note | null {
@@ -548,8 +572,22 @@ export function updateNote(
         existing.type === "smart" &&
         updates.surfaceCondition !== undefined &&
         updates.surfaceCondition !== existing.surfaceCondition;
+    // Changing projectPath invalidates the compiled artifact.
+    const compilerInputChanged =
+        existing.type === "smart" &&
+        (smartConditionChanged ||
+            (updates.content !== undefined && updates.content !== existing.content) ||
+            (updates.projectPath !== undefined && updates.projectPath !== existing.projectPath));
 
-    if (updates.status !== undefined && !smartConditionChanged) {
+    // A compiler-input edit forces status='pending' below; silently overriding
+    // a contradictory explicit status would persist the wrong state, so fail
+    // loud instead. Callers change status in a separate call.
+    if (updates.status !== undefined && compilerInputChanged && updates.status !== "pending") {
+        throw new Error(
+            `updateNote: cannot combine status '${updates.status}' with a smart-note compiler-input edit (content/condition/projectPath force status='pending')`,
+        );
+    }
+    if (updates.status !== undefined && !compilerInputChanged) {
         sets.push("status = ?");
         params.push(updates.status);
     }
@@ -563,7 +601,7 @@ export function updateNote(
             sets.push("surface_condition = ?");
             params.push(updates.surfaceCondition);
         }
-        if (smartConditionChanged) {
+        if (compilerInputChanged) {
             // A new trigger has not been evaluated yet; clear stale readiness so
             // the note cannot keep surfacing under the previous condition.
             sets.push(
@@ -572,18 +610,38 @@ export function updateNote(
                 "ready_at = NULL",
                 "ready_reason = NULL",
             );
-            sets.push(
-                "compiled_provider = ?",
-                "compiled_config = ?",
-                "compiled_at = ?",
-                "compile_status = ?",
-            );
-            params.push(
-                updates.compiledProvider ?? null,
-                updates.compiledConfig ?? null,
-                updates.compiledAt ?? null,
-                updates.compileStatus ?? null,
-            );
+            if (smartConditionChanged) {
+                sets.push(
+                    "compiled_provider = ?",
+                    "compiled_config = ?",
+                    "compiled_at = ?",
+                    "compile_status = ?",
+                );
+                params.push(
+                    updates.compiledProvider ?? null,
+                    updates.compiledConfig ?? null,
+                    updates.compiledAt ?? null,
+                    updates.compileStatus ?? null,
+                );
+            } else if (
+                updates.projectPath !== undefined &&
+                updates.projectPath !== existing.projectPath &&
+                existing.compileStatus === "compiled"
+            ) {
+                // A project move keeps the condition text but invalidates a
+                // Retina compilation: local-fs compiled configs resolve
+                // relative paths and default repositories against the project
+                // root, and a preserved compile_status='compiled' keeps the
+                // note Retina-owned watching the old checkout instead of being
+                // recompiled for the new one. 'plain'/'refused' verdicts carry
+                // no project-relative artifact and stay.
+                sets.push(
+                    "compiled_provider = NULL",
+                    "compiled_config = NULL",
+                    "compiled_at = NULL",
+                    "compile_status = NULL",
+                );
+            }
             if (noteCheckColumnsExist(db)) {
                 sets.push(
                     "compiled_check = NULL",
@@ -621,6 +679,13 @@ export function updateNote(
         return null;
     }
 
+    if (existing.type === "smart" && noteRevisionColumnsExist(db)) {
+        sets.push("state_version = state_version + 1");
+        if (compilerInputChanged) {
+            sets.push("source_revision = source_revision + 1");
+        }
+    }
+
     params.push(noteId);
     const result = db
         .prepare(`UPDATE notes SET ${sets.join(", ")} WHERE id = ? RETURNING *`)
@@ -634,9 +699,10 @@ export function dismissNote(db: Database, noteId: number, scope: NoteMutationSco
         return false;
     }
 
+    const revisionBump = revisionBumpSql(db);
     const result = db
         .prepare(
-            "UPDATE notes SET status = 'dismissed', updated_at = ? WHERE id = ? AND status != 'dismissed'",
+            `UPDATE notes SET status = 'dismissed', updated_at = ?${revisionBump} WHERE id = ? AND status != 'dismissed'`,
         )
         .run(Date.now(), noteId);
     return result.changes > 0;
@@ -644,15 +710,17 @@ export function dismissNote(db: Database, noteId: number, scope: NoteMutationSco
 
 export function markNoteReady(db: Database, noteId: number, reason?: string): void {
     const now = Date.now();
+    const revisionBump = revisionBumpSql(db);
     db.prepare(
-        "UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, last_checked_at = ? WHERE id = ? AND type = 'smart'",
+        `UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, last_checked_at = ?${revisionBump} WHERE id = ? AND type = 'smart'`,
     ).run(now, reason ?? null, now, now, noteId);
 }
 
 export function markNoteChecked(db: Database, noteId: number): void {
     const now = Date.now();
+    const revisionBump = revisionBumpSql(db);
     db.prepare(
-        "UPDATE notes SET last_checked_at = ?, updated_at = ? WHERE id = ? AND type = 'smart'",
+        `UPDATE notes SET last_checked_at = ?, updated_at = ?${revisionBump} WHERE id = ? AND type = 'smart'`,
     ).run(now, now, noteId);
 }
 

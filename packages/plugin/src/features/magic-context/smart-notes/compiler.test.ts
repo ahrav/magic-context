@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -122,6 +123,37 @@ describe("smart-note compiler output bounds", () => {
                 signals: Array.from({ length: 100 }, (_, index) => `signal-${index}`),
             }).signals,
         ).toHaveLength(64);
-        expect(() => normalizeCron("*".repeat(257))).toThrow(/256 characters/);
+        // Few entries but oversized strings: the module rejects a serialized
+        // manifest over 32 KiB at completion, so the compiler must fail first.
+        expect(() =>
+            normalizeManifest({
+                capabilities: [],
+                signals: Array.from(
+                    { length: 4 },
+                    (_, index) => `${index}-${"s".repeat(10 * 1024)}`,
+                ),
+            }),
+        ).toThrow(/32 KiB/);
+        expect(() => normalizeCron("*".repeat(257))).toThrow(/256 bytes/);
+    });
+});
+
+describe("wire-limit parity with the Rust module (static)", () => {
+    test("MAX_MANIFEST_BYTES matches NOTE_EVALUATOR_MAX_MANIFEST_BYTES", () => {
+        // No codegen or shared constant ties these two literals together, and
+        // drift in the "TS accepts, module rejects" direction wastes a
+        // billable compile prompt before the module refuses the manifest.
+        const tsSource = readFileSync(path.join(import.meta.dir, "compiler.ts"), "utf8");
+        const rustSource = readFileSync(
+            path.join(import.meta.dir, "../../../../../../crates/mc-module/src/lib.rs"),
+            "utf8",
+        );
+        const tsLimit = tsSource.match(/const MAX_MANIFEST_BYTES = (.+);/)?.[1];
+        const rustLimit = rustSource.match(
+            /const NOTE_EVALUATOR_MAX_MANIFEST_BYTES: usize = (.+);/,
+        )?.[1];
+        expect(tsLimit).toBeDefined();
+        expect(rustLimit).toBeDefined();
+        expect(tsLimit).toBe(rustLimit);
     });
 });

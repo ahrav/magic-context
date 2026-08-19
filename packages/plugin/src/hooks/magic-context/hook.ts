@@ -13,13 +13,17 @@ import {
 import type { ResolvedTransformMode } from "../../config/transform-mode";
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
 import {
-    applyMirroredNoteCompileFields,
     applyMirrorPage,
+    chainMirrorDomainSync,
+    disposeModuleNoteEvaluationBridges,
     ensureContextStoreUuid,
     getMirrorCursor,
     getModuleNoteEvaluationBridge,
+    moduleNoteEvaluationBridgeKey,
     registerModuleNoteEvaluationBridge,
+    retainModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
+import { confirmSmartNoteReadOnly } from "../../features/magic-context/dreamer/evaluate-smart-notes";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
 import {
@@ -44,6 +48,11 @@ import {
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
+import { createSmartNoteCapabilities } from "../../features/magic-context/smart-notes/capabilities";
+import { compileSmartNoteCheck } from "../../features/magic-context/smart-notes/compiler";
+import { SmartNoteEvaluatorWorker } from "../../features/magic-context/smart-notes/evaluator-worker";
+import { runCompiledSmartNoteCheck } from "../../features/magic-context/smart-notes/sandbox-runner";
+import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
 import {
     getDatabasePersistenceError,
     getSessionsWithPendingMarker,
@@ -63,6 +72,7 @@ import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
+import { normalizeSDKResponse } from "../../shared/normalize-sdk-response";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import { resolveFallbackChain } from "../../shared/resolve-fallbacks";
@@ -221,38 +231,6 @@ function notifyMagicContextDisabled(client: PluginContext["client"], reason: str
         .catch((error) => {
             log("[magic-context] failed to show disabled toast:", error);
         });
-}
-
-function moduleNoteRowId(response: unknown, depth = 0): number | null {
-    if (depth > 4 || response === null || response === undefined) return null;
-    if (typeof response === "string") {
-        const match = response.match(/\b(?:smart\s+)?note\s+#(\d+)/i);
-        return match ? Number(match[1]) : null;
-    }
-    if (Array.isArray(response)) {
-        for (const item of response) {
-            const id = moduleNoteRowId(item, depth + 1);
-            if (id !== null) return id;
-        }
-        return null;
-    }
-    if (typeof response !== "object") return null;
-    const record = response as Record<string, unknown>;
-    return (
-        moduleNoteRowId(record.result, depth + 1) ??
-        moduleNoteRowId(record.content, depth + 1) ??
-        moduleNoteRowId(record.text, depth + 1)
-    );
-}
-
-function moduleNoteResponseIsError(response: unknown, depth = 0): boolean {
-    if (depth > 4 || response === null || typeof response !== "object") return false;
-    if (Array.isArray(response)) {
-        return response.some((item) => moduleNoteResponseIsError(item, depth + 1));
-    }
-    const record = response as Record<string, unknown>;
-    if (record.isError === true || record.ok === false || record.error !== undefined) return true;
-    return moduleNoteResponseIsError(record.result, depth + 1);
 }
 
 export function createMagicContextHook(deps: MagicContextDeps) {
@@ -828,7 +806,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
-    const syncModuleDomain = async (domain: "memories" | "notes"): Promise<void> => {
+    const runModuleDomainSync = async (domain: "memories" | "notes"): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
         for (;;) {
             const cursor = getMirrorCursor(db, domain);
@@ -841,6 +819,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             if (!response.page.has_more || next === cursor) break;
         }
     };
+    // Chained process-globally per (store, domain): several plugin instances
+    // can share this database file, and interleaved pulls throw a cursor
+    // mismatch in applyMirrorPage.
+    const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> =>
+        chainMirrorDomainSync(db, domain, () => runModuleDomainSync(domain));
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
     const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
     const rustToolBackends: RustToolBackends | undefined =
@@ -898,6 +881,14 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                                   content,
                                   memory_project: memoryProject,
                                   surface_condition: surfaceCondition,
+                                  ...(compileStatus
+                                      ? {
+                                            compiled_provider: compiledProvider,
+                                            compiled_config: compiledConfig,
+                                            compiled_at: compiledAt,
+                                            compile_status: compileStatus,
+                                        }
+                                      : {}),
                                   filter,
                                   limit,
                                   offset,
@@ -908,28 +899,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       // The module is authoritative, but context.db remains the local
                       // read model for note nudges and dashboard/RPC consumers.
                       await syncModuleNotes();
-                      if (compileStatus && !moduleNoteResponseIsError(response)) {
-                          const moduleRowId =
-                              action === "write" ? moduleNoteRowId(response) : (noteId ?? null);
-                          if (
-                              moduleRowId === null ||
-                              !applyMirroredNoteCompileFields({
-                                  db,
-                                  moduleProject: memoryProject,
-                                  moduleRowId,
-                                  fields: {
-                                      compiledProvider: compiledProvider ?? null,
-                                      compiledConfig: compiledConfig ?? null,
-                                      compiledAt: compiledAt ?? null,
-                                      compileStatus,
-                                  },
-                              })
-                          ) {
-                              throw new Error(
-                                  "Rust note was written but its host compilation metadata could not be mirrored",
-                              );
-                          }
-                      }
                       return response;
                   },
                   memory: async ({
@@ -966,7 +935,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                       return response;
                   },
                   noteEvaluationAvailable: (evaluationProjectPath: string) =>
-                      getModuleNoteEvaluationBridge(evaluationProjectPath) !== undefined,
+                      getModuleNoteEvaluationBridge(evaluationProjectPath)?.available() === true,
                   memorySync: (sessionId: string) => {
                       rustMemorySyncRequestedSessions.add(sessionId);
                   },
@@ -976,46 +945,219 @@ export function createMagicContextHook(deps: MagicContextDeps) {
     // than the plugin's launch directory (a /cd switch, multi-project hosts).
     // Registration is therefore an idempotent ensure invoked for every project
     // that reaches rust-mode preparation, not a one-shot at construction.
-    const ensureModuleNoteEvaluationBridge = (bridgeProjectPath: string): void => {
-        if (!rustModeModuleClient?.mirrorPull) return;
-        if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
-        registerModuleNoteEvaluationBridge(bridgeProjectPath, {
-            sync: syncModuleNotes,
-            async evaluate({ contextNoteId, sessionId, verdict }): Promise<void> {
-                const identity = db
-                    .prepare(
-                        `SELECT identity.module_row_id, revision.status_version
-                           FROM mirror_identity identity
-                           JOIN mirror_note_revisions revision
-                             ON revision.module_project = identity.module_project
-                            AND revision.module_row_id = identity.module_row_id
-                          WHERE identity.domain = 'notes' AND identity.module_project = ?
-                            AND identity.context_row_id = ?`,
-                    )
-                    .get(bridgeProjectPath, contextNoteId) as
-                    | { module_row_id: number; status_version: number }
-                    | undefined;
-                if (!identity) {
-                    throw new Error(`module identity is missing for smart note ${contextNoteId}`);
-                }
-                await rustModeModuleClient.call({
-                    sessionId,
-                    projectRoot: deps.directory,
-                    method: "note.evaluate",
-                    body: {
-                        method: "note.evaluate",
-                        v: 1,
-                        session_id: sessionId,
-                        note_id: identity.module_row_id,
-                        source_revision: identity.status_version,
-                        verdict,
-                    },
+    const evaluatorTransport = rustModeModuleClient ? new SubcModuleTransport() : undefined;
+    // Bridge keys this hook instance registered. Instance disposal must tear
+    // down only these: the registry is process-global and Desktop hosts several
+    // plugin instances in one process.
+    const ownedBridgeProjects = new Set<string>();
+    // The bridge runs the same task as the scheduled evaluate-smart-notes
+    // sweep, so its LLM helpers follow the same model ladder (task override →
+    // dreamer model, with the configured fallback chain).
+    const evaluatorTaskConfig = dreamerConfig
+        ? buildDreamTaskRuntimeConfigs(dreamerConfig).find(
+              (config) => config.task === "evaluate-smart-notes",
+          )
+        : undefined;
+    const ensureModuleNoteEvaluationBridge = (
+        bridgeProjectPath: string,
+        bridgeProjectRoot: string,
+    ): void => {
+        if (!rustModeModuleClient?.mirrorPull || !evaluatorTransport) return;
+        // A disabled dreamer schedules no drains: an advertised evaluator with
+        // no drain path would accept conditioned notes that then sit pending
+        // forever. Without a registration the live-evaluator gate fails closed
+        // at write time instead.
+        if (!dreamerRunnable) return;
+        // A disabled per-task schedule ("" = never due) disables evaluation the
+        // same way: the timer drain is unconditional once a bridge exists, so
+        // honoring the task disable means no registration — conditioned writes
+        // fail closed at write time, and no billable compile/fallback work runs.
+        if ((evaluatorTaskConfig?.schedule ?? "").trim() === "") return;
+        // Keyed by identity AND root: two worktrees of one repository share a
+        // project identity, and discarding the second bridge would evaluate
+        // its file-dependent conditions against the first checkout.
+        const bridgeKeyId = moduleNoteEvaluationBridgeKey(bridgeProjectPath, bridgeProjectRoot);
+        const existingBridge = getModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot);
+        if (existingBridge) {
+            // Another plugin instance already registered this exact bridge.
+            // Record shared ownership (once per instance) so that instance's
+            // disposal cannot tear down a bridge this one still routes
+            // conditioned writes and drains through.
+            if (!ownedBridgeProjects.has(bridgeKeyId)) {
+                const retained = retainModuleNoteEvaluationBridge(
+                    bridgeProjectPath,
+                    bridgeProjectRoot,
+                );
+                if (retained) ownedBridgeProjects.add(retained);
+            }
+            // The eager boot registration can run before authority preparation
+            // flips notes to MODULE and be rejected; preparation re-invokes
+            // this ensure, so retry the registration here instead of leaving
+            // conditioned writes refused until a timer drain recovers it.
+            void existingBridge.ensureRegistered?.().catch((error) => {
+                log(`[magic-context] evaluator registration retry failed: ${error}`);
+            });
+            return;
+        }
+        // The module derives evaluator scope from the server-side route root,
+        // and filesystem capabilities resolve against the checkout, so both
+        // must use the prepared project's root — not the plugin launch
+        // directory — or the bridge registers against and drains the wrong
+        // project's notes.
+        const capabilityFactory = (signal: AbortSignal) =>
+            createSmartNoteCapabilities({ projectRoot: bridgeProjectRoot, signal });
+        // Evaluator LLM children need a parent session so they nest in the
+        // picker and recordChildInvocation captures their token telemetry
+        // (both require a parent id). Resolved per claim: the bridge outlives
+        // any one session, so a memoized id would go stale. The SDK call has
+        // no abort plumbing, so it races the claim's signal and a hard
+        // timeout — a stalled lookup would otherwise pin the claim executor
+        // while lease renewals keep it alive and dispose() waits forever.
+        const resolveEvaluatorParentSession = async (
+            signal: AbortSignal,
+        ): Promise<string | undefined> => {
+            try {
+                const listResponse = await Promise.race([
+                    deps.client.session.list({ query: { directory: bridgeProjectRoot } }),
+                    new Promise<never>((_, reject) => {
+                        const fail = (reason: unknown) =>
+                            reject(
+                                reason instanceof Error
+                                    ? reason
+                                    : new Error("parent session lookup aborted"),
+                            );
+                        if (signal.aborted) {
+                            fail(signal.reason);
+                            return;
+                        }
+                        const timer = setTimeout(
+                            () => fail(new Error("parent session lookup timed out")),
+                            5_000,
+                        );
+                        if (typeof timer.unref === "function") timer.unref();
+                        signal.addEventListener(
+                            "abort",
+                            () => {
+                                clearTimeout(timer);
+                                fail(signal.reason);
+                            },
+                            { once: true },
+                        );
+                    }),
+                ]);
+                const sessions = normalizeSDKResponse(listResponse, [] as { id?: string }[], {
+                    preferResponseOnMissingData: true,
                 });
-                await syncModuleNotes();
+                return sessions?.find((s) => typeof s?.id === "string")?.id;
+            } catch {
+                return undefined;
+            }
+        };
+        const workerPolicy = {
+            retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
+            wakeOwned: false,
+        };
+        const worker = new SmartNoteEvaluatorWorker({
+            transport: {
+                call: ({ method, body, signal }) =>
+                    evaluatorTransport.call({
+                        sessionId: `note-evaluator:${bridgeProjectPath}`,
+                        projectRoot: bridgeProjectRoot,
+                        method,
+                        body: { method, ...(body as Record<string, unknown>) },
+                        signal,
+                    }),
             },
+            // No pre-reserved sandbox slot: each QuickJS execution serializes
+            // itself for exactly its own window. Wrapping these in a held
+            // reservation would keep the process-wide slot across the compile and
+            // fallback LLM round-trips, stalling every other project's sweep.
+            executors: (snapshot, signal, deadline) => ({
+                compile: async () =>
+                    compileSmartNoteCheck({
+                        client: deps.client,
+                        db,
+                        parentSessionId: await resolveEvaluatorParentSession(signal),
+                        sessionDirectory: bridgeProjectRoot,
+                        projectIdentity: bridgeProjectPath,
+                        model: evaluatorTaskConfig?.model,
+                        fallbackModels: evaluatorTaskConfig?.fallbackModels,
+                        note: {
+                            id: snapshot.noteId,
+                            content: snapshot.content,
+                            surfaceCondition: snapshot.surfaceCondition,
+                        },
+                        capabilityFactory,
+                        signal,
+                        deadline,
+                    }),
+                runCompiled: (compiledCheck) =>
+                    runCompiledSmartNoteCheck({
+                        compiledCheck,
+                        capabilityFactory,
+                        signal,
+                        timeoutMs: 2_000,
+                    }),
+                confirmFallback: async () =>
+                    confirmSmartNoteReadOnly({
+                        client: deps.client,
+                        db,
+                        parentSessionId: await resolveEvaluatorParentSession(signal),
+                        sessionDirectory: bridgeProjectRoot,
+                        projectIdentity: bridgeProjectPath,
+                        model: evaluatorTaskConfig?.model,
+                        fallbackModels: evaluatorTaskConfig?.fallbackModels,
+                        deadline,
+                        noteId: snapshot.noteId,
+                        content: snapshot.content,
+                        surfaceCondition: snapshot.surfaceCondition,
+                        signal,
+                    }),
+            }),
+            policy: () => ({ ...workerPolicy }),
+        });
+        const bridgeKey = registerModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot, {
+            sync: syncModuleNotes,
+            available: () => worker.registered,
+            async ensureRegistered() {
+                if (!worker.registered) await worker.register();
+            },
+            async drain(drainArgs) {
+                const wakePresent = (await wakePlaneStatus()) === "present";
+                const wakeReleased = workerPolicy.wakeOwned && !wakePresent;
+                workerPolicy.wakeOwned = wakePresent;
+                if (wakePresent) {
+                    // The wake plane owns standalone evaluations: claim no work
+                    // locally, but keep the registration and its policy live so
+                    // the module can apply the wake-owner veto and a failed
+                    // boot registration still recovers on the timer.
+                    if (worker.registered) await worker.heartbeat();
+                    else await worker.register(drainArgs.signal);
+                    // The remote evaluator still surfaces notes in the module;
+                    // pull the changefeed so nudges and the dashboard see them.
+                    await syncModuleNotes();
+                    return { claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true };
+                }
+                // Polls carry no policy fields, so after a present-to-absent
+                // wake transition the module still holds wake_owned=true and
+                // vetoes every poll until a heartbeat publishes the release.
+                // Publish it before polling; otherwise pending work waits out
+                // a full timer period.
+                if (wakeReleased && worker.registered) await worker.heartbeat();
+                const result = await worker.drainOnce(drainArgs);
+                await syncModuleNotes();
+                return result;
+            },
+            dispose: () => worker.dispose(),
+        });
+        ownedBridgeProjects.add(bridgeKey);
+        // Register eagerly so conditioned ctx_note writes pass the
+        // live-evaluator gate before the first drain.
+        void worker.register().catch((error) => {
+            log(`[magic-context] evaluator registration failed: ${error}`);
         });
     };
-    ensureModuleNoteEvaluationBridge(projectPath);
+    ensureModuleNoteEvaluationBridge(projectPath, deps.directory);
     const notifyRustModeParked = (sessionId: string, message: string): void => {
         const client = deps.client as {
             tui?: {
@@ -1345,7 +1487,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                   projectPath,
                   // Manual /ctx-dream → Dreamer v2 per-task scheduler. Runs in this
                   // hook's own checkout (not a stale sibling worktree from the
-                  // shared git:<sha> identity map).
+                  // shared git:<sha> identity map). The evaluate-smart-notes task
+                  // itself drains the module bridge, so the manual path needs no
+                  // separate drain.
                   runManual: (task) =>
                       runManualDream({
                           db,
@@ -1447,6 +1591,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         "experimental.chat.messages.transform": transform,
         "experimental.chat.system.transform": systemPromptHashHandler,
         "experimental.text.complete": createTextCompleteHandler(),
+        // Instance disposal tears down only the evaluator bridges this hook
+        // registered; the registry is process-global across plugin instances.
+        disposeNoteEvaluationBridges: () => disposeModuleNoteEvaluationBridges(ownedBridgeProjects),
         "chat.message": createChatMessageHook({
             db,
             liveModelBySession,

@@ -40,7 +40,7 @@ function v78DatabaseWithNotes(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
-    db.exec("DELETE FROM schema_migrations WHERE version IN (79, 80)");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 79");
     db.exec(`
         DROP TRIGGER IF EXISTS notes_fts_ai;
         DROP TRIGGER IF EXISTS notes_fts_ad;
@@ -53,6 +53,8 @@ function v78DatabaseWithNotes(): Database {
         DROP TRIGGER IF EXISTS memory_stats_authority_guard_update;
         DROP TRIGGER IF EXISTS memory_stats_authority_guard_delete;
         DROP TABLE IF EXISTS memory_stats;
+        ALTER TABLE notes DROP COLUMN source_revision;
+        ALTER TABLE notes DROP COLUMN state_version;
     `);
     return db;
 }

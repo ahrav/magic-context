@@ -1489,13 +1489,9 @@ mod tests {
 full narrative
 </p2>
 <p2>condensed</p2><p3>outcome</p3><p4/></compartment><meta><unprocessed_from>3</unprocessed_from></meta></output>"#;
-        let validated = validate_historian_output(
-            mangled,
-            &chunk(1, 2),
-            &[],
-            ValidateOptions::default(),
-        )
-        .expect("mismatched close must parse leniently into a tiered compartment");
+        let validated =
+            validate_historian_output(mangled, &chunk(1, 2), &[], ValidateOptions::default())
+                .expect("mismatched close must parse leniently into a tiered compartment");
         let compartment = &validated.compartments[0];
         assert_eq!(compartment.p1.as_deref(), Some("full narrative"));
         assert_eq!(compartment.content, "full narrative"); // mirrors P1

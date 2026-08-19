@@ -1,0 +1,17 @@
+{
+    "compilerOptions": {
+        "target": "ESNext",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "strict": true,
+        "noEmit": true,
+        "skipLibCheck": true,
+        "resolveJsonModule": true,
+        "typeRoots": [
+            "../../../packages/plugin/node_modules/@types",
+            "../../../packages/plugin/node_modules"
+        ],
+        "types": ["node", "bun-types"]
+    },
+    "include": ["*.ts"]
+}

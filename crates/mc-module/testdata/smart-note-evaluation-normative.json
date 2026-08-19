@@ -1,0 +1,104 @@
+{
+    "schema": "smart-note-evaluation-normative",
+    "provenance": {
+        "authored": "hand-written from the Revision and Migration Contract in docs/plans/2026-08-19-0219-refactor-smart-note-evaluator-authority-boundary-plan.md",
+        "review": "expected rows derive from the plan's matrix, not from either store implementation"
+    },
+    "revision_matrix_cases": [
+        {
+            "id": "migrate_pre_v2_row",
+            "event": "migrate",
+            "pre": { "status_version": 7 },
+            "expected": { "source_revision": 7, "state_version": 7, "status_version": 7 }
+        },
+        {
+            "id": "create_note",
+            "event": "create",
+            "pre": null,
+            "expected": { "source_revision": 0, "state_version": 0, "status_version": 0 }
+        },
+        {
+            "id": "edit_content",
+            "event": "edit_compiler_input",
+            "pre": { "source_revision": 2, "state_version": 5, "status_version": 5 },
+            "expected": {
+                "source_revision": 3,
+                "state_version": 6,
+                "status_version": 6,
+                "artifact_cleared": true,
+                "active_claims_fenced": true
+            }
+        },
+        {
+            "id": "edit_condition",
+            "event": "edit_compiler_input",
+            "pre": { "source_revision": 0, "state_version": 0, "status_version": 0 },
+            "expected": {
+                "source_revision": 1,
+                "state_version": 1,
+                "status_version": 1,
+                "artifact_cleared": true,
+                "active_claims_fenced": true
+            }
+        },
+        {
+            "id": "edit_project",
+            "event": "edit_compiler_input",
+            "pre": { "source_revision": 1, "state_version": 3, "status_version": 3 },
+            "expected": {
+                "source_revision": 2,
+                "state_version": 4,
+                "status_version": 4,
+                "artifact_cleared": true
+            }
+        },
+        {
+            "id": "apply_evaluation",
+            "event": "lifecycle_transition",
+            "pre": { "source_revision": 1, "state_version": 4, "status_version": 4 },
+            "expected": {
+                "source_revision": 1,
+                "state_version": 5,
+                "status_version": 5,
+                "artifact_cleared": false,
+                "active_claims_fenced": false
+            }
+        },
+        {
+            "id": "delivery_transition",
+            "event": "lifecycle_transition",
+            "pre": { "source_revision": 1, "state_version": 5, "status_version": 5 },
+            "expected": {
+                "source_revision": 1,
+                "state_version": 6,
+                "status_version": 6,
+                "artifact_cleared": false,
+                "active_claims_fenced": false
+            }
+        },
+        {
+            "id": "dismiss_note",
+            "event": "dismiss",
+            "pre": { "source_revision": 1, "state_version": 6, "status_version": 6 },
+            "expected": {
+                "source_revision": 1,
+                "state_version": 7,
+                "status_version": 7,
+                "artifact_cleared": false,
+                "active_claims_fenced": true
+            }
+        },
+        {
+            "id": "seed_or_drain",
+            "event": "authority_transfer",
+            "pre": { "source_revision": 3, "state_version": 9, "status_version": 9 },
+            "expected": { "source_revision": 3, "state_version": 9, "status_version": 9 }
+        }
+    ],
+    "invariants": [
+        "state_version equals status_version after every mutation",
+        "source_revision advances only for compiler-input edits (content, condition, project)",
+        "authority seed, drain, and mirror rebuild preserve all revisions exactly",
+        "compiled artifacts record compiled_source_revision equal to the claim's source_revision"
+    ]
+}

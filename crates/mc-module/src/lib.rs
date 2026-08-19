@@ -42,6 +42,7 @@ mod retained_size;
 pub mod scheduler;
 pub mod selection;
 pub mod session_resolver;
+pub mod smart_note_evaluation;
 mod tail_hygiene;
 pub mod transform;
 
@@ -57,6 +58,12 @@ use std::time::{Duration, Instant};
 use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
+use crate::smart_note_evaluation::{
+    is_valid_smart_note_cron, reduce_smart_note_evaluation, select_next_smart_note_evaluation,
+    select_nonbillable_smart_note_evaluation, CheckOutcome, CompileOutcome, CompiledCheckArtifact,
+    FallbackOutcome, SmartNoteEvaluationOutcome, SmartNoteLifecycleState,
+    SmartNoteSelectionSnapshot,
+};
 use chrono::{Local, TimeZone};
 use cortexkit_lease::LeaseError;
 use cortexkit_store::StoreError;
@@ -68,12 +75,13 @@ use mc_store::{
     FacadeMutationOutcome, HistorianPhase, InsertMemoryInput, MappingUpdate, McStore, McStoreError,
     ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
     ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
-    NoteCasOutcome, NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput,
-    PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
-    RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
-    LATEST_MIGRATION_VERSION,
+    NoteCasOutcome, NoteConditionCompile, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome,
+    NoteEvalCandidate, NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState,
+    NoteEvalRenewOutcome, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
+    PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -3025,9 +3033,14 @@ pub struct McHandler {
     /// lock-free map) is appropriate because writes are rare (once per route open/close)
     /// and reads are one cheap lookup per transform.
     bindings: Mutex<HashMap<u16, SessionBinding>>,
-    /// Per-project evaluator capability asserted by the host's state-sync payload. Absence is
-    /// fail-closed so a Rust-authority smart note cannot become permanently pending.
+    /// The host state-sync payload carries this legacy per-project evaluator flag for wire
+    /// compatibility. Conditioned-write gating reads live protocol-v2 registrations instead:
+    /// state sync is not a liveness signal.
     note_evaluation_capabilities: Mutex<HashMap<String, bool>>,
+    /// Evaluator registrations exist only in memory and are keyed by notes-authority
+    /// project, so restart exposes zero evaluator capacity until a fresh route registers.
+    note_evaluator_registrations: Mutex<HashMap<String, Vec<NoteEvaluatorRegistration>>>,
+    note_evaluator_registration_seq: AtomicU64,
     /// Validated transform channel → (session, route root). The root is part of provenance;
     /// a cache row for the same session cannot authenticate a facade opened on another root.
     transform_route_channels: Mutex<HashMap<u16, (String, PathBuf)>>,
@@ -3045,6 +3058,33 @@ pub struct McHandler {
     /// Back-compat facade callers may omit the host tool-call id. Warn once per resolved session
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
+}
+
+const NOTE_EVALUATOR_LEASE_MS: i64 = 120_000;
+const NOTE_EVALUATOR_HEARTBEAT_MS: i64 = 60_000;
+const NOTE_EVALUATOR_PROTOCOL_VERSION: &str = "2.0";
+const NOTE_EVALUATOR_ID_MAX_BYTES: usize = 128;
+const NOTE_EVALUATOR_MAX_CAPACITY: i64 = 16;
+/// Live registrations retained per project. `evaluator_instance` is caller-chosen,
+/// so this bounds both memory and the O(n) expiry purge.
+const NOTE_EVALUATOR_MAX_REGISTRATIONS: usize = 32;
+const NOTE_EVALUATOR_MAX_COMPILED_CHECK_BYTES: usize = 64 * 1024;
+const NOTE_EVALUATOR_MAX_MANIFEST_BYTES: usize = 32 * 1024;
+const NOTE_EVALUATOR_MAX_CRON_BYTES: usize = 256;
+
+/// The project key is resolved from the server-side route binding, never from
+/// a request body.
+#[derive(Debug, Clone)]
+struct NoteEvaluatorRegistration {
+    token: String,
+    registration_generation: i64,
+    evaluator_instance: String,
+    channel: u16,
+    policy_version: i64,
+    capacity: i64,
+    retina_handoff: bool,
+    wake_owned: bool,
+    expires_at: i64,
 }
 
 #[async_trait]
@@ -3455,6 +3495,8 @@ impl McHandler {
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
+            note_evaluator_registrations: Mutex::new(HashMap::new()),
+            note_evaluator_registration_seq: AtomicU64::new(0),
             transform_route_channels: Mutex::new(HashMap::new()),
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
@@ -3709,6 +3751,8 @@ impl McHandler {
             publication_fence_write_hook: Arc::new(Mutex::new(None)),
             bindings: Mutex::new(HashMap::new()),
             note_evaluation_capabilities: Mutex::new(HashMap::new()),
+            note_evaluator_registrations: Mutex::new(HashMap::new()),
+            note_evaluator_registration_seq: AtomicU64::new(0),
             transform_route_channels: Mutex::new(HashMap::new()),
             transform_session_roots: Mutex::new(HashMap::new()),
             state_sync_seeds: Mutex::new(StateSyncSeedCoordinator::default()),
@@ -3725,6 +3769,7 @@ impl McHandler {
     /// reused channel — the daemon won't reuse a channel without a `route.gone` first, so
     /// this only overwrites a stale entry that somehow survived (defensive).
     fn bind_route(&self, channel: u16, binding: SessionBinding) {
+        self.remove_note_evaluator_registrations_for_channel(channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -3790,15 +3835,6 @@ impl McHandler {
             );
     }
 
-    fn note_evaluation_capability(&self, project_root: &Path) -> bool {
-        self.note_evaluation_capabilities
-            .lock()
-            .expect("note evaluation capability mutex")
-            .get(&Self::note_evaluation_capability_key(project_root))
-            .copied()
-            .unwrap_or(false)
-    }
-
     fn clear_note_evaluation_capability_if_unbound(&self, project_root: &Path) {
         let key = Self::note_evaluation_capability_key(project_root);
         let still_bound = self
@@ -3813,6 +3849,123 @@ impl McHandler {
                 .expect("note evaluation capability mutex")
                 .remove(&key);
         }
+    }
+
+    fn purge_expired_note_evaluator_registrations(&self, now: i64) {
+        let mut registrations = self
+            .note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex");
+        registrations.retain(|_, entries| {
+            entries.retain(|entry| entry.expires_at > now);
+            !entries.is_empty()
+        });
+    }
+
+    fn remove_note_evaluator_registrations_for_channel(&self, channel: u16) {
+        let mut registrations = self
+            .note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex");
+        registrations.retain(|_, entries| {
+            entries.retain(|entry| entry.channel != channel);
+            !entries.is_empty()
+        });
+    }
+
+    fn has_live_note_evaluator(&self, project: &str, now: i64) -> bool {
+        self.note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex")
+            .get(project)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.expires_at > now))
+    }
+
+    /// Returns whether any live registration for `project` sets each policy.
+    fn live_note_evaluator_policy(&self, project: &str, now: i64) -> (bool, bool) {
+        let registrations = self
+            .note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex");
+        let live = registrations
+            .get(project)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.expires_at > now);
+        let mut retina_handoff = false;
+        let mut wake_owned = false;
+        for entry in live {
+            retina_handoff |= entry.retina_handoff;
+            wake_owned |= entry.wake_owned;
+        }
+        (retina_handoff, wake_owned)
+    }
+
+    /// Resolve the notes-authority project scoping this evaluator route. The
+    /// body never chooses the project; only the server-side route binding does.
+    fn resolve_note_evaluator_project(&self, channel: u16) -> Result<String, HandlerOutcome> {
+        let binding = self
+            .facade_binding(channel)
+            .map_err(|_| session_unresolved_error())?;
+        let route_project_root = binding.project_root.to_string_lossy().to_string();
+        let Some(store) = self.store.get() else {
+            return Err(store_unavailable_error());
+        };
+        let authority = store
+            .authority_project_state_for_route(&route_project_root, "notes")
+            .map_err(|error| HandlerOutcome::Error {
+                code: "authority_route_lookup_failed".to_string(),
+                message: error.to_string(),
+            })?;
+        match authority {
+            Some((project, state)) if state == "MODULE" => Ok(project),
+            Some((_, state)) if state == "DRAINING" => Err(authority_draining_error("notes")),
+            _ => Err(HandlerOutcome::Error {
+                code: "authority_not_module".to_string(),
+                message: "evaluator registration requires MODULE notes authority on this route"
+                    .to_string(),
+            }),
+        }
+    }
+
+    fn validated_note_evaluator_registration(
+        &self,
+        project: &str,
+        channel: u16,
+        token: &str,
+        registration_generation: i64,
+        evaluator_instance: &str,
+        now: i64,
+    ) -> Result<NoteEvaluatorRegistration, HandlerOutcome> {
+        self.purge_expired_note_evaluator_registrations(now);
+        self.note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex")
+            .get(project)
+            .and_then(|entries| {
+                entries.iter().find(|entry| {
+                    entry.token == token
+                        && entry.registration_generation == registration_generation
+                        && entry.evaluator_instance == evaluator_instance
+                        && entry.channel == channel
+                        && entry.expires_at > now
+                })
+            })
+            .cloned()
+            .ok_or_else(note_evaluation_registration_unknown)
+    }
+
+    fn mint_note_evaluator_credentials(&self) -> (i64, String) {
+        let seq = self
+            .note_evaluator_registration_seq
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let token = sha256_hex(format!("note-evaluator:{nanos}:{seq}").as_bytes());
+        (seq as i64, token)
     }
 
     fn discard_state_sync_seed(&self, session_id: &str) {
@@ -4073,6 +4226,7 @@ impl McHandler {
 
     /// Remove a route and evict process-local session state after its final binding closes.
     fn unbind_route(&self, channel: u16) {
+        self.remove_note_evaluator_registrations_for_channel(channel);
         self.transform_route_channels
             .lock()
             .expect("transform route channels mutex")
@@ -10764,80 +10918,506 @@ impl McHandler {
         )
     }
 
-    async fn handle_note_evaluation_value(&self, channel: u16, request: &Value) -> HandlerOutcome {
-        let Some(note_id) = request
-            .get("note_id")
-            .and_then(Value::as_i64)
-            .filter(|id| *id > 0)
-        else {
-            return HandlerOutcome::Error {
-                code: "bad_request".to_string(),
-                message: "note.evaluate requires a positive note_id".to_string(),
-            };
-        };
-        let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
-            return HandlerOutcome::Error {
-                code: "bad_request".to_string(),
-                message: "note.evaluate requires session_id".to_string(),
-            };
-        };
-        let scope = match self
-            .resolve_facade_scope(channel, None, "notes", false)
-            .await
-        {
-            Ok(scope) => scope,
+    fn handle_note_evaluation_register(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let body = match note_evaluation_body(
+            request,
+            &[
+                "v",
+                "evaluator_instance",
+                "protocol_version",
+                "policy_version",
+                "capacity",
+                "retina_handoff",
+                "wake_owned",
+            ],
+        ) {
+            Ok(body) => body,
             Err(outcome) => return outcome,
         };
-        if scope.conversation_key != session_id {
+        let evaluator_instance = match note_evaluation_id_field(body, "evaluator_instance") {
+            Ok(value) => value.to_string(),
+            Err(outcome) => return outcome,
+        };
+        let protocol_version = match note_evaluation_id_field(body, "protocol_version") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        if protocol_version != NOTE_EVALUATOR_PROTOCOL_VERSION {
             return HandlerOutcome::Error {
-                code: "session_mismatch".to_string(),
-                message: "note.evaluate session_id does not match the channel binding".to_string(),
+                code: "protocol_unsupported".to_string(),
+                message: format!(
+                    "evaluator protocol {protocol_version} is unsupported; this module accepts {NOTE_EVALUATOR_PROTOCOL_VERSION}"
+                ),
             };
+        }
+        let policy_version = match note_evaluation_i64_field(body, "policy_version") {
+            Ok(value) if value >= 0 => value,
+            Ok(_) => return note_evaluation_bad_request("'policy_version' must be >= 0"),
+            Err(outcome) => return outcome,
+        };
+        let capacity = match note_evaluation_i64_field(body, "capacity") {
+            Ok(value) if (1..=NOTE_EVALUATOR_MAX_CAPACITY).contains(&value) => value,
+            Ok(_) => return note_evaluation_bad_request("'capacity' must be in 1..=16"),
+            Err(outcome) => return outcome,
+        };
+        let retina_handoff = match note_evaluation_bool_field(body, "retina_handoff") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let wake_owned = match note_evaluation_bool_field(body, "wake_owned") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let project = match self.resolve_note_evaluator_project(channel) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        let now = now_ms();
+        self.purge_expired_note_evaluator_registrations(now);
+        let (registration_generation, token) = self.mint_note_evaluator_credentials();
+        let expires_at = now + NOTE_EVALUATOR_LEASE_MS;
+        {
+            let mut registrations = self
+                .note_evaluator_registrations
+                .lock()
+                .expect("note evaluator registrations mutex");
+            let entries = registrations.entry(project).or_default();
+            entries.retain(|entry| {
+                !(entry.evaluator_instance == evaluator_instance && entry.channel == channel)
+            });
+            // `evaluator_instance` is caller-chosen, so without a cap a single
+            // bound channel could retain unbounded live entries for a full lease
+            // and make the O(n) expiry purge superlinear in injected entries.
+            if entries.len() >= NOTE_EVALUATOR_MAX_REGISTRATIONS {
+                return note_evaluation_bad_request(format!(
+                    "project already has {NOTE_EVALUATOR_MAX_REGISTRATIONS} live evaluator registrations"
+                ));
+            }
+            entries.push(NoteEvaluatorRegistration {
+                token: token.clone(),
+                registration_generation,
+                evaluator_instance,
+                channel,
+                policy_version,
+                capacity,
+                retina_handoff,
+                wake_owned,
+                expires_at,
+            });
+        }
+        respond(json!({
+            "ok": true,
+            "registration_generation": registration_generation,
+            "token": token,
+            "expires_at": expires_at,
+            "lease_ms": NOTE_EVALUATOR_LEASE_MS,
+            "heartbeat_ms": NOTE_EVALUATOR_HEARTBEAT_MS,
+        }))
+    }
+
+    fn handle_note_evaluation_heartbeat(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let body = match note_evaluation_body(
+            request,
+            &[
+                "v",
+                "token",
+                "registration_generation",
+                "evaluator_instance",
+                "retina_handoff",
+                "wake_owned",
+            ],
+        ) {
+            Ok(body) => body,
+            Err(outcome) => return outcome,
+        };
+        let identity = match note_evaluation_identity_fields(body) {
+            Ok(identity) => identity,
+            Err(outcome) => return outcome,
+        };
+        let retina_handoff = match note_evaluation_opt_bool_field(body, "retina_handoff") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let wake_owned = match note_evaluation_opt_bool_field(body, "wake_owned") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let project = match self.resolve_note_evaluator_project(channel) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        let now = now_ms();
+        self.purge_expired_note_evaluator_registrations(now);
+        let mut registrations = self
+            .note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex");
+        let Some(entry) = registrations.get_mut(&project).and_then(|entries| {
+            entries.iter_mut().find(|entry| {
+                entry.token == identity.token
+                    && entry.registration_generation == identity.registration_generation
+                    && entry.evaluator_instance == identity.evaluator_instance
+                    && entry.channel == channel
+                    && entry.expires_at > now
+            })
+        }) else {
+            return note_evaluation_registration_unknown();
+        };
+        entry.expires_at = now + NOTE_EVALUATOR_LEASE_MS;
+        let mut policy_changed = false;
+        if let Some(retina_handoff) = retina_handoff {
+            policy_changed |= entry.retina_handoff != retina_handoff;
+            entry.retina_handoff = retina_handoff;
+        }
+        if let Some(wake_owned) = wake_owned {
+            policy_changed |= entry.wake_owned != wake_owned;
+            entry.wake_owned = wake_owned;
+        }
+        if policy_changed {
+            entry.policy_version += 1;
+        }
+        respond(json!({
+            "ok": true,
+            "expires_at": entry.expires_at,
+            "policy_version": entry.policy_version,
+        }))
+    }
+
+    fn handle_note_evaluation_unregister(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let body = match note_evaluation_body(
+            request,
+            &[
+                "v",
+                "token",
+                "registration_generation",
+                "evaluator_instance",
+            ],
+        ) {
+            Ok(body) => body,
+            Err(outcome) => return outcome,
+        };
+        let identity = match note_evaluation_identity_fields(body) {
+            Ok(identity) => identity,
+            Err(outcome) => return outcome,
+        };
+        let project = match self.resolve_note_evaluator_project(channel) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        let mut registrations = self
+            .note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex");
+        if let Some(entries) = registrations.get_mut(&project) {
+            entries.retain(|entry| {
+                !(entry.token == identity.token
+                    && entry.registration_generation == identity.registration_generation
+                    && entry.evaluator_instance == identity.evaluator_instance
+                    && entry.channel == channel)
+            });
+            if entries.is_empty() {
+                registrations.remove(&project);
+            }
+        }
+        respond(json!({ "ok": true }))
+    }
+
+    fn handle_note_evaluation_next(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let body = match note_evaluation_body(
+            request,
+            &[
+                "v",
+                "token",
+                "registration_generation",
+                "evaluator_instance",
+                "evaluator_slot",
+                "acquisition_id",
+                "wait_ms",
+                "exclude_billable",
+            ],
+        ) {
+            Ok(body) => body,
+            Err(outcome) => return outcome,
+        };
+        let identity = match note_evaluation_identity_fields(body) {
+            Ok(identity) => identity,
+            Err(outcome) => return outcome,
+        };
+        let acquisition_id = match note_evaluation_id_field(body, "acquisition_id") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let evaluator_slot = match note_evaluation_i64_field(body, "evaluator_slot") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let wait_ms = match body.get("wait_ms") {
+            None => 0,
+            Some(value) => match value.as_i64() {
+                Some(wait_ms) => wait_ms,
+                None => return note_evaluation_bad_request("'wait_ms' must be an integer"),
+            },
+        };
+        let exclude_billable = match note_evaluation_opt_bool_field(body, "exclude_billable") {
+            Ok(value) => value.unwrap_or(false),
+            Err(outcome) => return outcome,
+        };
+        if wait_ms != 0 {
+            return HandlerOutcome::Error {
+                code: "positive_wait_unsupported".to_string(),
+                message: "protocol v2.0 accepts only wait_ms=0".to_string(),
+            };
+        }
+        let project = match self.resolve_note_evaluator_project(channel) {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
+        let now = now_ms();
+        let registration = match self.validated_note_evaluator_registration(
+            &project,
+            channel,
+            identity.token,
+            identity.registration_generation,
+            identity.evaluator_instance,
+            now,
+        ) {
+            Ok(registration) => registration,
+            Err(outcome) => return outcome,
+        };
+        if evaluator_slot < 0 || evaluator_slot >= registration.capacity {
+            return note_evaluation_bad_request("'evaluator_slot' must be in 0..capacity");
+        }
+        let (retina_handoff, wake_owned) = self.live_note_evaluator_policy(&project, now);
+        if wake_owned {
+            // The wake flag can flip before the next poll, so this veto skips
+            // the store and leaves no replayable acquisition decision behind.
+            return respond(json!({ "result": "no_work", "wake_owned": true }));
         }
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
-        let Some(source_revision) = request.get("source_revision").and_then(Value::as_i64) else {
-            return HandlerOutcome::Error {
-                code: "bad_request".to_string(),
-                message: "note.evaluate requires source_revision".to_string(),
+        match store.acquire_note_evaluation(
+            &project,
+            acquisition_id,
+            identity.evaluator_instance,
+            evaluator_slot,
+            identity.registration_generation,
+            |candidates| {
+                let snapshots: Vec<SmartNoteSelectionSnapshot> = candidates
+                    .iter()
+                    .map(smart_note_selection_snapshot)
+                    .collect();
+                if exclude_billable {
+                    // The per-tick maintenance drain runs only sandbox
+                    // phases; handing it a compile or fallback claim would
+                    // force a claim-and-abandon round per tick and block
+                    // liveness behind the strict phase priority.
+                    select_nonbillable_smart_note_evaluation(&snapshots, now, retina_handoff)
+                } else {
+                    select_next_smart_note_evaluation(&snapshots, now, retina_handoff)
+                }
+            },
+            now,
+        ) {
+            Ok(outcome) => note_evaluation_acquire_response(outcome),
+            Err(error) => HandlerOutcome::Error {
+                code: "note_store_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_note_evaluation_renew(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let body = match note_evaluation_body(
+            request,
+            &[
+                "v",
+                "token",
+                "registration_generation",
+                "evaluator_instance",
+                "evaluator_slot",
+                "claim_id",
+            ],
+        ) {
+            Ok(body) => body,
+            Err(outcome) => return outcome,
+        };
+        let now = now_ms();
+        let (identity, evaluator_slot, claim_id, project) =
+            match self.note_evaluation_claim_scope(channel, body, now) {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
             };
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
         };
-        let input = NoteEvaluationInput {
-            project_path: scope.memory_project_path.as_str(),
-            note_id,
-            source_revision,
-            verdict: request
-                .get("verdict")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            compiled_check: request.get("compiled_check").and_then(Value::as_str),
-            manifest_json: request.get("manifest_json").and_then(Value::as_str),
-            check_hash: request.get("check_hash").and_then(Value::as_str),
-            next_due_at: request.get("next_due_at").and_then(Value::as_i64),
-            now_ms: now_ms(),
-        };
-        match store.write_note_evaluation(input) {
-            Ok(NoteCasOutcome::Applied(note)) => respond(json!({
-                "ok": true,
-                "note_id": note.id,
-                "status": note.status,
-                "status_version": note.status_version,
-            })),
-            Ok(NoteCasOutcome::Conflict { current }) => respond(json!({
-                "ok": false,
-                "conflict": true,
-                "note": current.map(|note| json!({
-                    "id": note.id,
-                    "status": note.status,
-                    "status_version": note.status_version,
-                })),
+        match store.renew_note_evaluation_claim(
+            &project,
+            claim_id,
+            identity.evaluator_instance,
+            evaluator_slot,
+            identity.registration_generation,
+            now,
+        ) {
+            Ok(NoteEvalRenewOutcome::Renewed { expires_at }) => {
+                respond(json!({ "result": "renewed", "expires_at": expires_at }))
+            }
+            Ok(NoteEvalRenewOutcome::Expired) => respond(json!({ "result": "expired" })),
+            Ok(NoteEvalRenewOutcome::AuthorityChanged) => {
+                respond(json!({ "result": "authority_changed" }))
+            }
+            Ok(NoteEvalRenewOutcome::UnknownClaim) => respond(json!({ "result": "unknown_claim" })),
+            Ok(NoteEvalRenewOutcome::Invalid) => respond(json!({ "result": "invalid" })),
+            Ok(NoteEvalRenewOutcome::TerminalReplay { kind, response }) => respond(json!({
+                "result": kind,
+                "response": note_evaluation_response_value(response),
             })),
             Err(error) => HandlerOutcome::Error {
                 code: "note_store_failed".to_string(),
                 message: error.to_string(),
             },
         }
+    }
+
+    fn handle_note_evaluation_complete(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let body = match note_evaluation_body(
+            request,
+            &[
+                "v",
+                "token",
+                "registration_generation",
+                "evaluator_instance",
+                "evaluator_slot",
+                "claim_id",
+                "completion_id",
+                "outcome",
+            ],
+        ) {
+            Ok(body) => body,
+            Err(outcome) => return outcome,
+        };
+        let completion_id = match note_evaluation_id_field(body, "completion_id") {
+            Ok(value) => value,
+            Err(outcome) => return outcome,
+        };
+        let Some(outcome_value) = body.get("outcome") else {
+            return note_evaluation_bad_request("'outcome' is required");
+        };
+        let (phase, outcome) = match parse_note_evaluation_wire_outcome(outcome_value) {
+            Ok(parsed) => parsed,
+            Err(handler_outcome) => return handler_outcome,
+        };
+        let now = now_ms();
+        let (identity, evaluator_slot, claim_id, project) =
+            match self.note_evaluation_claim_scope(channel, body, now) {
+                Ok(scope) => scope,
+                Err(handler_outcome) => return handler_outcome,
+            };
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let project_for_apply = project.clone();
+        match store.complete_note_evaluation(
+            &project,
+            claim_id,
+            completion_id,
+            identity.evaluator_instance,
+            evaluator_slot,
+            now,
+            move |claim, note| {
+                apply_note_evaluation_outcome(
+                    claim,
+                    note,
+                    &phase,
+                    &outcome,
+                    &project_for_apply,
+                    now,
+                )
+            },
+        ) {
+            Ok(NoteEvalCompleteOutcome::Applied { response_json, .. }) => {
+                respond(note_evaluation_response_value(Some(response_json)))
+            }
+            Ok(NoteEvalCompleteOutcome::Replayed { response_json }) => respond(json!({
+                "result": "replayed",
+                "response": note_evaluation_response_value(Some(response_json)),
+            })),
+            Ok(NoteEvalCompleteOutcome::Conflict { kind }) => respond(json!({ "result": kind })),
+            Err(error) => HandlerOutcome::Error {
+                code: "note_store_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_note_evaluation_abandon(&self, channel: u16, request: &Value) -> HandlerOutcome {
+        let body = match note_evaluation_body(
+            request,
+            &[
+                "v",
+                "token",
+                "registration_generation",
+                "evaluator_instance",
+                "evaluator_slot",
+                "claim_id",
+            ],
+        ) {
+            Ok(body) => body,
+            Err(outcome) => return outcome,
+        };
+        let now = now_ms();
+        let (identity, evaluator_slot, claim_id, project) =
+            match self.note_evaluation_claim_scope(channel, body, now) {
+                Ok(scope) => scope,
+                Err(outcome) => return outcome,
+            };
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        match store.abandon_note_evaluation_claim(
+            &project,
+            claim_id,
+            identity.evaluator_instance,
+            evaluator_slot,
+            now,
+        ) {
+            Ok(NoteEvalAbandonOutcome::Abandoned) => respond(json!({ "result": "abandoned" })),
+            Ok(NoteEvalAbandonOutcome::Replayed { kind }) => respond(json!({ "result": kind })),
+            Ok(NoteEvalAbandonOutcome::UnknownClaim) => {
+                respond(json!({ "result": "unknown_claim" }))
+            }
+            Ok(NoteEvalAbandonOutcome::Invalid) => respond(json!({ "result": "invalid" })),
+            Err(error) => HandlerOutcome::Error {
+                code: "note_store_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn note_evaluation_claim_scope<'a>(
+        &self,
+        channel: u16,
+        body: &'a Map<String, Value>,
+        now: i64,
+    ) -> Result<(NoteEvaluationIdentity<'a>, i64, &'a str, String), HandlerOutcome> {
+        let identity = note_evaluation_identity_fields(body)?;
+        let evaluator_slot = note_evaluation_i64_field(body, "evaluator_slot")?;
+        let claim_id = note_evaluation_id_field(body, "claim_id")?;
+        let project = self.resolve_note_evaluator_project(channel)?;
+        let registration = self.validated_note_evaluator_registration(
+            &project,
+            channel,
+            identity.token,
+            identity.registration_generation,
+            identity.evaluator_instance,
+            now,
+        )?;
+        if evaluator_slot < 0 || evaluator_slot >= registration.capacity {
+            return Err(note_evaluation_bad_request(
+                "'evaluator_slot' must be in 0..capacity",
+            ));
+        }
+        Ok((identity, evaluator_slot, claim_id, project))
     }
 
     async fn handle_note_delivery_value(
@@ -10911,6 +11491,9 @@ impl McHandler {
         let args = &args;
         if let Err(error) = validate_string_cap(args, "content", MAX_NOTE_CONTENT_BYTES)
             .and_then(|_| validate_string_cap(args, "surface_condition", MAX_SHORT_FIELD_BYTES))
+            .and_then(|_| validate_string_cap(args, "compiled_provider", 128))
+            .and_then(|_| validate_string_cap(args, "compiled_config", MAX_SHORT_FIELD_BYTES))
+            .and_then(|_| validate_string_cap(args, "compile_status", 32))
         {
             return tool_error_result(format!("Error: {error}."));
         }
@@ -10968,13 +11551,19 @@ impl McHandler {
                 let condition = string_arg(args, "surface_condition")
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
-                if condition.is_some()
-                    && !self.note_evaluation_capability(Path::new(&facade_scope.route_project_root))
-                {
-                    return tool_error_result(
+                if condition.is_some() && !self.has_live_note_evaluator(project, now) {
+                    return refuse_conditioned_note_without_evaluator(
+                        store,
+                        session,
+                        action,
+                        command_id.as_deref(),
                         "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.",
                     );
                 }
+                let condition_compile = match note_condition_compile_args(args) {
+                    Ok(compile) => compile,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 if let Some(condition) = condition {
                     facade_command_outcome(
                         store.with_facade_command(
@@ -10997,6 +11586,18 @@ impl McHandler {
                                         surface_condition: Some(condition),
                                         anchor_block_id: anchor.as_deref(),
                                         anchor_ordinal: None,
+                                        compiled_provider: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compiled_provider),
+                                        compiled_config: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compiled_config),
+                                        compiled_at: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compiled_at),
+                                        compile_status: condition_compile
+                                            .as_ref()
+                                            .and_then(|c| c.compile_status),
                                         now_ms: now,
                                     })
                                     .map_err(|error| error.to_string())?;
@@ -11134,6 +11735,10 @@ impl McHandler {
                             .to_string(),
                     );
                 }
+                let condition_compile = match note_condition_compile_args(args) {
+                    Ok(compile) => compile,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 let current = match store.get_note_by_id(project, session, note_id) {
                     Ok(note) => note.filter(|note| {
                         matches!(
@@ -11148,6 +11753,24 @@ impl McHandler {
                         "Error: Note #{note_id} not found in your session/project or has no compatible fields to update."
                     ));
                 };
+                // Only an update that introduces or CHANGES the condition needs a
+                // live evaluator, because that new condition must be compiled
+                // before it can ever surface. A content-only edit on an
+                // already-conditioned note resets the compiled artifact, which the
+                // evaluator recompiles once it is available again; refusing it here
+                // would make every conditioned note uneditable for as long as the
+                // evaluator is down.
+                let condition_changed = condition
+                    .is_some_and(|value| current.surface_condition.as_deref() != Some(value));
+                if condition_changed && !self.has_live_note_evaluator(project, now) {
+                    return refuse_conditioned_note_without_evaluator(
+                        store,
+                        session,
+                        action,
+                        command_id.as_deref(),
+                        "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not updated.",
+                    );
+                }
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -11166,6 +11789,7 @@ impl McHandler {
                                     current.status_version,
                                     content,
                                     condition.map(Some),
+                                    condition_compile,
                                     now,
                                 )
                                 .map_err(|error| error.to_string())?
@@ -11352,7 +11976,22 @@ impl McHandler {
                 "state_sync" => self.handle_state_sync_value(channel, request),
                 "state_import" => self.handle_state_import_value(channel, request),
                 "agent_drops.append" => self.handle_agent_drops_value(channel, request),
-                "note.evaluate" => self.handle_note_evaluation_value(channel, &request).await,
+                "note.evaluate" => note_evaluation_protocol_retired(),
+                "note.evaluation.register" => {
+                    self.handle_note_evaluation_register(channel, &request)
+                }
+                "note.evaluation.heartbeat" => {
+                    self.handle_note_evaluation_heartbeat(channel, &request)
+                }
+                "note.evaluation.unregister" => {
+                    self.handle_note_evaluation_unregister(channel, &request)
+                }
+                "note.evaluation.next" => self.handle_note_evaluation_next(channel, &request),
+                "note.evaluation.renew" => self.handle_note_evaluation_renew(channel, &request),
+                "note.evaluation.complete" => {
+                    self.handle_note_evaluation_complete(channel, &request)
+                }
+                "note.evaluation.abandon" => self.handle_note_evaluation_abandon(channel, &request),
                 "transform.ack" => {
                     self.handle_note_delivery_value(channel, &request, true)
                         .await
@@ -12918,6 +13557,415 @@ fn store_unavailable_error() -> HandlerOutcome {
     }
 }
 
+fn note_evaluation_protocol_retired() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "protocol_retired".to_string(),
+        message: "note.evaluate verdict writes are retired; use the note.evaluation.* evaluator protocol v2".to_string(),
+    }
+}
+
+fn note_evaluation_bad_request(message: impl Into<String>) -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "bad_request".to_string(),
+        message: message.into(),
+    }
+}
+
+fn note_evaluation_registration_unknown() -> HandlerOutcome {
+    HandlerOutcome::Error {
+        code: "registration_unknown".to_string(),
+        message:
+            "no live evaluator registration matches this token, generation, instance, and route"
+                .to_string(),
+    }
+}
+
+/// Closed-schema decode for the flat note.evaluation.* bodies: unknown fields
+/// are rejected before any waiter or store allocation, and every body must
+/// carry the protocol marker `v: 2`.
+fn note_evaluation_body<'a>(
+    request: &'a Value,
+    allowed: &[&str],
+) -> Result<&'a Map<String, Value>, HandlerOutcome> {
+    let Some(body) = request.as_object() else {
+        return Err(note_evaluation_bad_request(
+            "request body must be a JSON object",
+        ));
+    };
+    for key in body.keys() {
+        if key != "method" && key != "kind" && !allowed.contains(&key.as_str()) {
+            return Err(note_evaluation_bad_request(format!(
+                "unknown field '{key}'"
+            )));
+        }
+    }
+    if body.get("v").and_then(Value::as_i64) != Some(2) {
+        return Err(note_evaluation_bad_request("'v' must be 2"));
+    }
+    Ok(body)
+}
+
+struct NoteEvaluationIdentity<'a> {
+    token: &'a str,
+    registration_generation: i64,
+    evaluator_instance: &'a str,
+}
+
+fn note_evaluation_identity_fields(
+    body: &Map<String, Value>,
+) -> Result<NoteEvaluationIdentity<'_>, HandlerOutcome> {
+    Ok(NoteEvaluationIdentity {
+        token: note_evaluation_id_field(body, "token")?,
+        registration_generation: note_evaluation_i64_field(body, "registration_generation")?,
+        evaluator_instance: note_evaluation_id_field(body, "evaluator_instance")?,
+    })
+}
+
+fn note_evaluation_id_field<'a>(
+    body: &'a Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, HandlerOutcome> {
+    match body.get(key).and_then(Value::as_str) {
+        Some(value) if !value.is_empty() && value.len() <= NOTE_EVALUATOR_ID_MAX_BYTES => Ok(value),
+        _ => Err(note_evaluation_bad_request(format!(
+            "'{key}' must be a non-empty string of at most {NOTE_EVALUATOR_ID_MAX_BYTES} bytes"
+        ))),
+    }
+}
+
+fn note_evaluation_i64_field(body: &Map<String, Value>, key: &str) -> Result<i64, HandlerOutcome> {
+    body.get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| note_evaluation_bad_request(format!("'{key}' must be an integer")))
+}
+
+fn note_evaluation_bool_field(
+    body: &Map<String, Value>,
+    key: &str,
+) -> Result<bool, HandlerOutcome> {
+    body.get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| note_evaluation_bad_request(format!("'{key}' must be a boolean")))
+}
+
+fn note_evaluation_opt_bool_field(
+    body: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<bool>, HandlerOutcome> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(note_evaluation_bad_request(format!(
+            "'{key}' must be a boolean"
+        ))),
+    }
+}
+
+fn smart_note_selection_snapshot(note: &NoteEvalCandidate) -> SmartNoteSelectionSnapshot {
+    SmartNoteSelectionSnapshot {
+        id: note.id,
+        status: note.status.clone(),
+        compile_status: note.compile_status.clone(),
+        created_at: note.created_at_ms,
+        has_compiled_check: note.has_compiled_check,
+        check_status: note
+            .check_status
+            .clone()
+            .unwrap_or_else(|| "uncompiled".to_string()),
+        check_quarantined_until: note.check_quarantined_until,
+        check_next_due_at: note.check_next_due_at,
+        check_false_since_at: note.check_false_since_at,
+        check_last_liveness_at: note.check_last_liveness_at,
+        policy_version: note.policy_version.unwrap_or(0),
+    }
+}
+
+fn note_evaluation_response_value(response: Option<String>) -> Value {
+    match response {
+        Some(raw) => serde_json::from_str(&raw).unwrap_or(Value::String(raw)),
+        None => Value::Null,
+    }
+}
+
+fn note_evaluation_acquire_response(outcome: NoteEvalAcquireOutcome) -> HandlerOutcome {
+    match outcome {
+        NoteEvalAcquireOutcome::Claim {
+            claim,
+            note,
+            replayed,
+        } => respond(json!({
+            "result": "claim",
+            "claim_id": claim.claim_id,
+            "note_id": claim.note_id,
+            "phase": claim.phase,
+            "expires_at": claim.expires_at,
+            "source_revision": claim.source_revision,
+            "state_version": claim.state_version,
+            "policy_version": claim.policy_version,
+            "protocol_epoch": claim.protocol_epoch,
+            "authority_generation": claim.authority_generation,
+            "replayed": replayed,
+            "snapshot": {
+                "content": note.content,
+                "surface_condition": note.surface_condition,
+                "compiled_check": note.compiled_check,
+                "manifest_json": note.manifest_json,
+                "check_hash": note.check_hash,
+                "check_cron": note.check_cron,
+                "check_status": note.check_status,
+                "check_failure_count": note.check_failure_count,
+                "check_network_failure_count": note.check_network_failure_count,
+                "check_false_since_at": note.check_false_since_at,
+            },
+        })),
+        NoteEvalAcquireOutcome::NoWork { replayed } => {
+            respond(json!({ "result": "no_work", "replayed": replayed }))
+        }
+        NoteEvalAcquireOutcome::Expired => respond(json!({ "result": "expired" })),
+        NoteEvalAcquireOutcome::Terminal { kind, response } => respond(json!({
+            "result": kind,
+            "response": note_evaluation_response_value(response),
+        })),
+        NoteEvalAcquireOutcome::Busy => respond(json!({ "result": "busy" })),
+        NoteEvalAcquireOutcome::AuthorityChanged => {
+            respond(json!({ "result": "authority_changed" }))
+        }
+        NoteEvalAcquireOutcome::Invalid => {
+            note_evaluation_bad_request("the store rejected this acquisition identity")
+        }
+    }
+}
+
+/// Decode one phase-scoped wire outcome; a kind that belongs to another phase
+/// cannot pass because the pairing is matched exactly.
+fn parse_note_evaluation_wire_outcome(
+    value: &Value,
+) -> Result<(String, SmartNoteEvaluationOutcome), HandlerOutcome> {
+    let Some(outcome) = value.as_object() else {
+        return Err(note_evaluation_bad_request("'outcome' must be an object"));
+    };
+    for key in outcome.keys() {
+        if !matches!(key.as_str(), "phase" | "kind" | "artifact") {
+            return Err(note_evaluation_bad_request(format!(
+                "unknown outcome field '{key}'"
+            )));
+        }
+    }
+    let Some(phase) = outcome.get("phase").and_then(Value::as_str) else {
+        return Err(note_evaluation_bad_request("'phase' must be a string"));
+    };
+    let Some(kind) = outcome.get("kind").and_then(Value::as_str) else {
+        return Err(note_evaluation_bad_request("'kind' must be a string"));
+    };
+    let artifact_expected = phase == "compile" && matches!(kind, "compiled_met" | "compiled_false");
+    let artifact_value = outcome.get("artifact");
+    if artifact_expected != artifact_value.is_some() {
+        return Err(note_evaluation_bad_request(
+            "'artifact' is required for compiled_met/compiled_false and forbidden otherwise",
+        ));
+    }
+    let mut artifact = artifact_value
+        .map(parse_note_evaluation_wire_artifact)
+        .transpose()?;
+    let check = |kind: &str| match kind {
+        "met" => Ok(CheckOutcome::Met),
+        "false" => Ok(CheckOutcome::False),
+        "logic_failed" => Ok(CheckOutcome::LogicFailed),
+        "network_failed" => Ok(CheckOutcome::NetworkFailed),
+        _ => Err(note_evaluation_bad_request(format!(
+            "kind '{kind}' is not valid for a check phase"
+        ))),
+    };
+    let parsed = match (phase, kind) {
+        ("compile", "compiled_met") => SmartNoteEvaluationOutcome::Compile(
+            CompileOutcome::CompiledMet(artifact.take().expect("artifact presence checked")),
+        ),
+        ("compile", "compiled_false") => SmartNoteEvaluationOutcome::Compile(
+            CompileOutcome::CompiledFalse(artifact.take().expect("artifact presence checked")),
+        ),
+        ("compile", "compilation_failed") => {
+            SmartNoteEvaluationOutcome::Compile(CompileOutcome::CompilationFailed)
+        }
+        ("due", kind) => SmartNoteEvaluationOutcome::Due(check(kind)?),
+        ("liveness", kind) => SmartNoteEvaluationOutcome::Liveness(check(kind)?),
+        ("fallback", "met") => SmartNoteEvaluationOutcome::Fallback(FallbackOutcome::Met),
+        ("fallback", "false") => SmartNoteEvaluationOutcome::Fallback(FallbackOutcome::False),
+        (phase, kind) => {
+            return Err(note_evaluation_bad_request(format!(
+                "kind '{kind}' is not valid for phase '{phase}'"
+            )))
+        }
+    };
+    Ok((phase.to_string(), parsed))
+}
+
+fn parse_note_evaluation_wire_artifact(
+    value: &Value,
+) -> Result<CompiledCheckArtifact, HandlerOutcome> {
+    let Some(artifact) = value.as_object() else {
+        return Err(note_evaluation_bad_request("'artifact' must be an object"));
+    };
+    for key in artifact.keys() {
+        if !matches!(
+            key.as_str(),
+            "compiled_check" | "manifest_json" | "check_hash" | "check_cron"
+        ) {
+            return Err(note_evaluation_bad_request(format!(
+                "unknown artifact field '{key}'"
+            )));
+        }
+    }
+    let field = |key: &str| {
+        artifact.get(key).and_then(Value::as_str).ok_or_else(|| {
+            note_evaluation_bad_request(format!("artifact '{key}' must be a string"))
+        })
+    };
+    let compiled_check = field("compiled_check")?;
+    if compiled_check.len() > NOTE_EVALUATOR_MAX_COMPILED_CHECK_BYTES {
+        return Err(note_evaluation_bad_request(
+            "artifact 'compiled_check' exceeds 64 KiB",
+        ));
+    }
+    let manifest_json = field("manifest_json")?;
+    if manifest_json.len() > NOTE_EVALUATOR_MAX_MANIFEST_BYTES {
+        return Err(note_evaluation_bad_request(
+            "artifact 'manifest_json' exceeds 32 KiB",
+        ));
+    }
+    if !serde_json::from_str::<Value>(manifest_json).is_ok_and(|parsed| parsed.is_object()) {
+        return Err(note_evaluation_bad_request(
+            "artifact 'manifest_json' must parse as a JSON object",
+        ));
+    }
+    let check_hash = field("check_hash")?;
+    if check_hash.len() != 64
+        || !check_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(note_evaluation_bad_request(
+            "artifact 'check_hash' must be 64 lowercase hex characters",
+        ));
+    }
+    let check_cron = field("check_cron")?;
+    if check_cron.len() > NOTE_EVALUATOR_MAX_CRON_BYTES || !is_valid_smart_note_cron(check_cron) {
+        return Err(note_evaluation_bad_request(
+            "artifact 'check_cron' must be a valid 5-field cron of at most 256 bytes",
+        ));
+    }
+    Ok(CompiledCheckArtifact {
+        compiled_check: compiled_check.to_string(),
+        manifest_json: manifest_json.to_string(),
+        check_hash: check_hash.to_string(),
+        check_cron: check_cron.to_string(),
+    })
+}
+
+/// Canonical artifact digest matching hashCheck in smart-notes/compiler.ts:
+/// condition, code, manifest JSON, and cron separated by NUL bytes. Delegates to
+/// the single definition in `mc-store` so the admission gate here and the v51
+/// artifact repair there can never disagree about what the digest is.
+fn smart_note_check_digest(
+    surface_condition: Option<&str>,
+    artifact: &CompiledCheckArtifact,
+) -> String {
+    mc_store::note_check_digest(
+        surface_condition,
+        &artifact.compiled_check,
+        Some(artifact.manifest_json.as_str()),
+        Some(artifact.check_cron.as_str()),
+    )
+}
+
+/// The reducer step run inside the store's completion transaction. The digest
+/// for compile outcomes is recomputed from the authoritative note condition
+/// rather than trusted from the wire.
+fn apply_note_evaluation_outcome(
+    claim: &NoteEvalClaim,
+    note: &StoredNote,
+    phase: &str,
+    outcome: &SmartNoteEvaluationOutcome,
+    project: &str,
+    now: i64,
+) -> Result<NoteEvalReducedState, String> {
+    if claim.phase != phase {
+        return Err(format!(
+            "outcome phase '{phase}' does not match the claimed phase '{}'",
+            claim.phase
+        ));
+    }
+    let compiled_artifact = match outcome {
+        SmartNoteEvaluationOutcome::Compile(CompileOutcome::CompiledMet(artifact))
+        | SmartNoteEvaluationOutcome::Compile(CompileOutcome::CompiledFalse(artifact)) => {
+            Some(artifact)
+        }
+        _ => None,
+    };
+    if let Some(artifact) = compiled_artifact {
+        let expected = smart_note_check_digest(note.surface_condition.as_deref(), artifact);
+        if expected != artifact.check_hash {
+            return Err("check_hash does not match the canonical artifact digest".to_string());
+        }
+    }
+    let pre = SmartNoteLifecycleState {
+        status: note.status.clone(),
+        ready_at: note.ready_at,
+        ready_reason: note.ready_reason.clone(),
+        last_checked_at: note.last_checked_at,
+        updated_at: note.updated_at_ms,
+        compiled_check: note.compiled_check.clone(),
+        manifest_json: note.manifest_json.clone(),
+        check_hash: note.check_hash.clone(),
+        check_cron: note.check_cron.clone(),
+        check_version: note.check_version.unwrap_or(0),
+        check_status: note
+            .check_status
+            .clone()
+            .unwrap_or_else(|| "uncompiled".to_string()),
+        check_failure_count: note.check_failure_count,
+        check_network_failure_count: note.check_network_failure_count,
+        check_quarantined_until: note.check_quarantined_until,
+        check_next_due_at: note.check_next_due_at,
+        check_compiled_at: note.check_compiled_at,
+        check_false_since_at: note.check_false_since_at,
+        check_last_liveness_at: note.check_last_liveness_at,
+        policy_version: note.policy_version.unwrap_or(0),
+    };
+    let reduction = reduce_smart_note_evaluation(&pre, outcome, note.id, now, &chrono::Local);
+    let next = reduction.next;
+    let (compiled_source_revision, compiled_project_path) = if compiled_artifact.is_some() {
+        (Some(claim.source_revision), Some(project.to_string()))
+    } else {
+        (
+            note.compiled_source_revision,
+            note.compiled_project_path.clone(),
+        )
+    };
+    Ok(NoteEvalReducedState {
+        status: next.status,
+        ready_at: next.ready_at,
+        ready_reason: next.ready_reason,
+        last_checked_at: next.last_checked_at,
+        updated_at_ms: next.updated_at,
+        compiled_check: next.compiled_check,
+        manifest_json: next.manifest_json,
+        check_hash: next.check_hash,
+        check_cron: next.check_cron,
+        check_version: Some(next.check_version),
+        check_status: Some(next.check_status),
+        check_failure_count: next.check_failure_count,
+        check_network_failure_count: next.check_network_failure_count,
+        check_quarantined_until: next.check_quarantined_until,
+        check_next_due_at: next.check_next_due_at,
+        check_compiled_at: next.check_compiled_at,
+        check_false_since_at: next.check_false_since_at,
+        check_last_liveness_at: next.check_last_liveness_at,
+        policy_version: Some(next.policy_version),
+        compiled_source_revision,
+        compiled_project_path,
+    })
+}
+
 const MAX_FACADE_FRAME_BYTES: usize = 1024 * 1024;
 /// Transform-class requests carry a session's full message array. The transport
 /// frame ceiling is 64 MiB; half that leaves headroom for envelope overhead while
@@ -13066,6 +14114,32 @@ fn non_empty_string_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&
 
 fn i64_arg(args: &Map<String, Value>, key: &str) -> Option<i64> {
     args.get(key).and_then(Value::as_i64)
+}
+
+fn note_condition_compile_args<'a>(
+    args: &'a Map<String, Value>,
+) -> Result<Option<NoteConditionCompile<'a>>, String> {
+    let provider = string_arg(args, "compiled_provider");
+    let config = string_arg(args, "compiled_config");
+    let compiled_at = i64_arg(args, "compiled_at");
+    let status = string_arg(args, "compile_status");
+    if provider.is_none() && config.is_none() && compiled_at.is_none() && status.is_none() {
+        return Ok(None);
+    }
+    match status {
+        Some("compiled") | Some("plain") | Some("refused") | None => {}
+        Some(other) => {
+            return Err(format!(
+                "compile_status must be compiled, plain, or refused (got {other})"
+            ));
+        }
+    }
+    Ok(Some(NoteConditionCompile {
+        compiled_provider: provider,
+        compiled_config: config,
+        compiled_at,
+        compile_status: status,
+    }))
 }
 
 fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
@@ -14009,6 +15083,34 @@ fn facade_command_outcome(
     }
 }
 
+/// Refusal path for a conditioned `ctx_note` mutation with no live evaluator.
+/// `with_facade_command` replays recorded outcomes only after this gate, so a
+/// retried command whose original mutation committed (response lost, module
+/// restarted, lease expired) must consult the durable response ledger here:
+/// the liveness gate protects first-time mutations, never replays.
+fn refuse_conditioned_note_without_evaluator(
+    store: &McStore,
+    identity_scope: &str,
+    action: &str,
+    command_id: Option<&str>,
+    refusal: &str,
+) -> HandlerOutcome {
+    if let Some(command_id) = command_id {
+        match store.facade_mutation_ledger_response(identity_scope, "ctx_note", action, command_id)
+        {
+            Ok(Some(stored)) => {
+                return facade_command_outcome(
+                    Ok(FacadeMutationOutcome::Duplicate(stored)),
+                    "notes",
+                )
+            }
+            Ok(None) => {}
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        }
+    }
+    tool_error_result(refusal)
+}
+
 fn authority_source_path(
     source_path: Option<&str>,
     store_project_path: &str,
@@ -14704,8 +15806,8 @@ mod tests {
     use historian_producer::{ProducerOutput, RunHandle, RunState};
     use mc_core::CoreState;
     use mc_store::{
-        HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, PendingAgentDrop,
-        StoredCompartment, TagMintInput,
+        HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, NoteEvaluationInput,
+        PendingAgentDrop, StoredCompartment, TagMintInput,
     };
     use tokio::sync::Notify;
 
@@ -21182,26 +22284,123 @@ mod tests {
         assert!(store.load("other").unwrap().row_version.is_none());
     }
 
+    fn activate_notes_module_authority_via_finish_prepare(
+        store: &McStore,
+        route_root: &str,
+    ) -> String {
+        let identity = "git:notes-eval";
+        let preparing = store
+            .authority_begin_prepare("ctx-eval", identity, "notes")
+            .unwrap();
+        store
+            .authority_finish_prepare(
+                "ctx-eval",
+                identity,
+                "notes",
+                preparing.generation,
+                "hash",
+                "hash",
+                true,
+            )
+            .unwrap();
+        store
+            .bind_authority_route("ctx-eval", identity, route_root)
+            .unwrap();
+        identity.to_string()
+    }
+
+    async fn register_note_evaluator(
+        handler: &McHandler,
+        channel: u16,
+        instance: &str,
+        retina_handoff: bool,
+        wake_owned: bool,
+    ) -> (i64, String) {
+        let response = call_dispatch_request_on_channel(
+            handler,
+            channel,
+            json!({
+                "method": "note.evaluation.register",
+                "v": 2,
+                "evaluator_instance": instance,
+                "protocol_version": "2.0",
+                "policy_version": 0,
+                "capacity": 2,
+                "retina_handoff": retina_handoff,
+                "wake_owned": wake_owned,
+            }),
+        )
+        .await;
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["lease_ms"], json!(120_000));
+        assert_eq!(response["heartbeat_ms"], json!(60_000));
+        (
+            response["registration_generation"].as_i64().unwrap(),
+            response["token"].as_str().unwrap().to_string(),
+        )
+    }
+
+    fn note_evaluation_next_body(
+        token: &str,
+        generation: i64,
+        instance: &str,
+        acquisition_id: &str,
+    ) -> Value {
+        json!({
+            "method": "note.evaluation.next",
+            "v": 2,
+            "token": token,
+            "registration_generation": generation,
+            "evaluator_instance": instance,
+            "evaluator_slot": 0,
+            "acquisition_id": acquisition_id,
+            "wait_ms": 0,
+        })
+    }
+
+    fn insert_conditioned_note(
+        store: &McStore,
+        project: &str,
+        route_root: &str,
+        condition: &str,
+        compile_status: Option<&str>,
+    ) -> StoredNote {
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: project,
+                route_project_root: Some(route_root),
+                session_id: Some("ses"),
+                content: "conditioned note body",
+                surface_condition: Some(condition),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status,
+                now_ms: 1,
+            })
+            .unwrap()
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn smart_note_writes_require_the_host_evaluator_capability() {
+    async fn smart_note_writes_require_a_live_protocol_v2_registration() {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
-        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
             Arc::new(ProducerState::default()),
             default_test_config(),
             resolver,
         );
-        let refused = call_facade(
-            &handler,
-            "ctx_note",
-            json!({
-                "action": "write",
-                "content": "pending without evaluator",
-                "surface_condition": "when evaluated",
-            }),
-        )
-        .await;
-        let refused_text = tool_text(refused);
-        assert!(refused_text.contains("Smart-note evaluation is unavailable"));
+        let route_root = project.to_str().unwrap().to_string();
+        activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+
+        let conditioned = json!({
+            "action": "write",
+            "content": "pending without evaluator",
+            "surface_condition": "when evaluated",
+        });
+        let refused = call_facade(&handler, "ctx_note", conditioned.clone()).await;
+        assert!(tool_text(refused).contains("Smart-note evaluation is unavailable"));
 
         let plain = call_facade(
             &handler,
@@ -21224,31 +22423,617 @@ mod tests {
                 }),
             )
             .await;
+        assert!(matches!(state_sync, HandlerOutcome::Response(_)));
+        let still_refused = call_facade(&handler, "ctx_note", conditioned.clone()).await;
         assert!(
-            matches!(state_sync, HandlerOutcome::Response(_)),
-            "{state_sync:?}"
+            tool_text(still_refused).contains("Smart-note evaluation is unavailable"),
+            "state_sync must not open the conditioned-write gate"
         );
 
-        let accepted = call_facade(
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        let accepted = call_facade(&handler, "ctx_note", conditioned.clone()).await;
+        let accepted_text = tool_text(accepted);
+        assert!(accepted_text.contains("Created smart note"));
+        let note_id: i64 = accepted_text
+            .split('#')
+            .nth(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let heartbeat = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "note.evaluation.heartbeat",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+            }),
+        )
+        .await;
+        assert_eq!(heartbeat["ok"], json!(true));
+
+        let unregistered = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "note.evaluation.unregister",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+            }),
+        )
+        .await;
+        assert_eq!(unregistered["ok"], json!(true));
+        let refused_again = call_facade(&handler, "ctx_note", conditioned.clone()).await;
+        assert!(tool_text(refused_again).contains("Smart-note evaluation is unavailable"));
+
+        let dismissed = call_facade(
+            &handler,
+            "ctx_note",
+            json!({"action": "dismiss", "note_id": note_id}),
+        )
+        .await;
+        assert!(
+            !tool_is_error(dismissed),
+            "dismissal must not require an evaluator"
+        );
+        let read = call_facade(&handler, "ctx_note", json!({"action": "read"})).await;
+        assert!(!tool_is_error(read));
+
+        let (expired_generation, expired_token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        {
+            let mut registrations = handler.note_evaluator_registrations.lock().unwrap();
+            for entries in registrations.values_mut() {
+                for entry in entries.iter_mut() {
+                    entry.expires_at = 0;
+                }
+            }
+        }
+        let ttl_refused = call_facade(&handler, "ctx_note", conditioned).await;
+        assert!(tool_text(ttl_refused).contains("Smart-note evaluation is unavailable"));
+        let stale_heartbeat = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "note.evaluation.heartbeat",
+                    "v": 2,
+                    "token": expired_token,
+                    "registration_generation": expired_generation,
+                    "evaluator_instance": "eval-a",
+                }),
+            )
+            .await;
+        assert_eq!(error_code(stale_heartbeat), "registration_unknown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conditioned_write_replays_recorded_response_without_live_evaluator() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+
+        register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        let conditioned = json!({
+            "action": "write",
+            "content": "conditioned write with a command id",
+            "surface_condition": "when evaluated",
+            "command_id": "cmd-conditioned-replay",
+        });
+        let created = call_facade(&handler, "ctx_note", conditioned.clone()).await;
+        assert!(tool_text(created).contains("Created smart note"));
+
+        // The retry models a caller that lost the response and re-sends after
+        // the evaluator lease lapsed.
+        {
+            let mut registrations = handler.note_evaluator_registrations.lock().unwrap();
+            for entries in registrations.values_mut() {
+                for entry in entries.iter_mut() {
+                    entry.expires_at = 0;
+                }
+            }
+        }
+        let replayed = call_facade(&handler, "ctx_note", conditioned).await;
+        let replayed_text = tool_text(replayed);
+        assert!(
+            replayed_text.contains("Created smart note"),
+            "a recorded response must replay past the liveness gate: {replayed_text}"
+        );
+
+        let fresh = call_facade(
             &handler,
             "ctx_note",
             json!({
                 "action": "write",
-                "content": "smart note with evaluator",
+                "content": "fresh conditioned write",
+                "surface_condition": "when evaluated",
+                "command_id": "cmd-conditioned-fresh",
+            }),
+        )
+        .await;
+        assert!(tool_text(fresh).contains("Smart-note evaluation is unavailable"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluator_registration_rejects_wrong_versions_and_stale_credentials() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        insert_conditioned_note(&store, &identity, &route_root, "when evaluated", None);
+
+        let v1 = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "note.evaluation.register",
+                    "v": 2,
+                    "evaluator_instance": "eval-a",
+                    "protocol_version": "1.0",
+                    "policy_version": 0,
+                    "capacity": 1,
+                    "retina_handoff": false,
+                    "wake_owned": false,
+                }),
+            )
+            .await;
+        assert_eq!(error_code(v1), "protocol_unsupported");
+
+        let (stale_generation, stale_token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        assert!(generation > stale_generation);
+
+        let mut positive_wait = note_evaluation_next_body(&token, generation, "eval-a", "acq-1");
+        positive_wait["wait_ms"] = json!(50);
+        let positive = handler.dispatch_value(7, positive_wait).await;
+        assert_eq!(error_code(positive), "positive_wait_unsupported");
+
+        let stale = handler
+            .dispatch_value(
+                7,
+                note_evaluation_next_body(&stale_token, stale_generation, "eval-a", "acq-1"),
+            )
+            .await;
+        assert_eq!(error_code(stale), "registration_unknown");
+
+        handler.bind_route(9, binding(&route_root, "ses"));
+        let wrong_channel = handler
+            .dispatch_value(
+                9,
+                note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+            )
+            .await;
+        assert_eq!(error_code(wrong_channel), "registration_unknown");
+
+        let unknown_field = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "note.evaluation.next",
+                    "v": 2,
+                    "token": token,
+                    "registration_generation": generation,
+                    "evaluator_instance": "eval-a",
+                    "evaluator_slot": 0,
+                    "acquisition_id": "acq-1",
+                    "wait_ms": 0,
+                    "note_id": 1,
+                }),
+            )
+            .await;
+        assert_eq!(error_code(unknown_field), "bad_request");
+
+        // The same acquisition id claims fresh work, proving every rejected
+        // attempt above stopped before the store recorded a decision.
+        let next = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(next["result"], "claim");
+        assert_eq!(next["replayed"], json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluator_route_teardown_withdraws_registrations() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        assert!(handler.has_live_note_evaluator(&identity, now_ms()));
+
+        handler.unbind_route(7);
+        assert!(!handler.has_live_note_evaluator(&identity, now_ms()));
+
+        handler.bind_route(7, binding(&route_root, "ses"));
+        let stale = handler
+            .dispatch_value(
+                7,
+                note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+            )
+            .await;
+        assert_eq!(error_code(stale), "registration_unknown");
+        let refused = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "write",
+                "content": "conditioned after teardown",
                 "surface_condition": "when evaluated",
             }),
         )
         .await;
-        let accepted_text = tool_text(accepted);
-        assert!(accepted_text.contains("Created smart note"));
+        assert!(tool_text(refused).contains("Smart-note evaluation is unavailable"));
+    }
 
-        let plain_with_capability = call_facade(
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_end_to_end_compile_flow_applies_and_replays() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        let condition = "when the build passes";
+        let note = insert_conditioned_note(&store, &identity, &route_root, condition, None);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let claim = call_dispatch_request(
             &handler,
-            "ctx_note",
-            json!({"action": "write", "content": "plain note still works"}),
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
         )
         .await;
-        assert!(!tool_is_error(plain_with_capability));
+        assert_eq!(claim["result"], "claim");
+        assert_eq!(claim["phase"], "compile");
+        assert_eq!(claim["note_id"], json!(note.id));
+        assert_eq!(claim["protocol_epoch"], json!(2));
+        assert_eq!(claim["source_revision"], json!(note.source_revision));
+        assert_eq!(claim["snapshot"]["surface_condition"], json!(condition));
+        let claim_id = claim["claim_id"].as_str().unwrap().to_string();
+
+        let renewed = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "note.evaluation.renew",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+                "evaluator_slot": 0,
+                "claim_id": claim_id,
+            }),
+        )
+        .await;
+        assert_eq!(renewed["result"], "renewed");
+
+        let artifact_body = CompiledCheckArtifact {
+            compiled_check: "return { met: true };".to_string(),
+            manifest_json: "{\"summary\":\"build watch\"}".to_string(),
+            check_hash: String::new(),
+            check_cron: "0 * * * *".to_string(),
+        };
+        let check_hash = smart_note_check_digest(Some(condition), &artifact_body);
+        let complete_body = |completion_id: &str| {
+            json!({
+                "method": "note.evaluation.complete",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+                "evaluator_slot": 0,
+                "claim_id": claim_id,
+                "completion_id": completion_id,
+                "outcome": {
+                    "phase": "compile",
+                    "kind": "compiled_met",
+                    "artifact": {
+                        "compiled_check": artifact_body.compiled_check,
+                        "manifest_json": artifact_body.manifest_json,
+                        "check_hash": check_hash,
+                        "check_cron": artifact_body.check_cron,
+                    },
+                },
+            })
+        };
+        let applied = call_dispatch_request(&handler, complete_body("comp-1")).await;
+        assert_eq!(applied["result"], "applied");
+        assert_eq!(applied["status"], "ready");
+        assert_eq!(applied["state_version"], json!(note.state_version + 1));
+
+        let stored = store
+            .get_note_by_id(&identity, "ses", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "ready");
+        assert_eq!(stored.check_status.as_deref(), Some("compiled"));
+        assert_eq!(stored.check_hash.as_deref(), Some(check_hash.as_str()));
+        assert_eq!(stored.compiled_source_revision, Some(note.source_revision));
+        assert_eq!(
+            stored.compiled_project_path.as_deref(),
+            Some(identity.as_str())
+        );
+        assert_eq!(stored.state_version, note.state_version + 1);
+        assert_eq!(stored.status_version, stored.state_version);
+
+        let replayed = call_dispatch_request(&handler, complete_body("comp-1")).await;
+        assert_eq!(replayed["result"], "replayed");
+        assert_eq!(replayed["response"]["result"], "applied");
+
+        let no_work = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
+        )
+        .await;
+        assert_eq!(no_work["result"], "no_work");
+        assert_eq!(no_work["replayed"], json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_rejects_forged_oversized_and_phase_smuggled_completions() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        let note = insert_conditioned_note(&store, &identity, &route_root, "when evaluated", None);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        let claim_id = claim["claim_id"].as_str().unwrap().to_string();
+        let complete_with_outcome = |outcome: Value| {
+            json!({
+                "method": "note.evaluation.complete",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+                "evaluator_slot": 0,
+                "claim_id": claim_id,
+                "completion_id": "comp-1",
+                "outcome": outcome,
+            })
+        };
+
+        let oversized = handler
+            .dispatch_value(
+                7,
+                complete_with_outcome(json!({
+                    "phase": "compile",
+                    "kind": "compiled_met",
+                    "artifact": {
+                        "compiled_check": "x".repeat(64 * 1024 + 1),
+                        "manifest_json": "{}",
+                        "check_hash": "a".repeat(64),
+                        "check_cron": "0 * * * *",
+                    },
+                })),
+            )
+            .await;
+        assert_eq!(error_code(oversized), "bad_request");
+
+        let smuggled = handler
+            .dispatch_value(
+                7,
+                complete_with_outcome(json!({ "phase": "fallback", "kind": "logic_failed" })),
+            )
+            .await;
+        assert_eq!(error_code(smuggled), "bad_request");
+
+        let phase_mismatch = call_dispatch_request(
+            &handler,
+            complete_with_outcome(json!({ "phase": "due", "kind": "met" })),
+        )
+        .await;
+        assert_eq!(phase_mismatch["result"], "invalid");
+
+        let claim_two = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
+        )
+        .await;
+        assert_eq!(claim_two["result"], "claim");
+        let forged = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "note.evaluation.complete",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+                "evaluator_slot": 0,
+                "claim_id": claim_two["claim_id"],
+                "completion_id": "comp-2",
+                "outcome": {
+                    "phase": "compile",
+                    "kind": "compiled_met",
+                    "artifact": {
+                        "compiled_check": "return { met: true };",
+                        "manifest_json": "{}",
+                        "check_hash": "a".repeat(64),
+                        "check_cron": "0 * * * *",
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(forged["result"], "invalid");
+
+        let unchanged = store
+            .get_note_by_id(&identity, "ses", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "pending");
+        assert_eq!(unchanged.check_status.as_deref(), Some("uncompiled"));
+        assert_eq!(unchanged.state_version, note.state_version);
+        assert_eq!(unchanged.check_failure_count, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_wake_owned_suppression_records_no_durable_decision() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        insert_conditioned_note(&store, &identity, &route_root, "when evaluated", None);
+        let (generation_a, token_a) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        let (generation_b, token_b) =
+            register_note_evaluator(&handler, 7, "eval-b", false, true).await;
+
+        let suppressed = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token_a, generation_a, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(suppressed["result"], "no_work");
+        assert_eq!(suppressed["wake_owned"], json!(true));
+
+        let heartbeat = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "note.evaluation.heartbeat",
+                "v": 2,
+                "token": token_b,
+                "registration_generation": generation_b,
+                "evaluator_instance": "eval-b",
+                "wake_owned": false,
+            }),
+        )
+        .await;
+        assert_eq!(heartbeat["ok"], json!(true));
+        assert_eq!(heartbeat["policy_version"], json!(1));
+
+        // The identical acquisition id now yields a fresh claim: the earlier
+        // wake veto left no durable no_work decision behind.
+        let claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token_a, generation_a, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(claim["result"], "claim");
+        assert_eq!(claim["replayed"], json!(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_exclude_billable_skips_compile_work() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        // Uncompiled conditioned note: selectable only through the billable
+        // compile phase.
+        insert_conditioned_note(&store, &identity, &route_root, "when evaluated", None);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let mut nonbillable = note_evaluation_next_body(&token, generation, "eval-a", "acq-nb");
+        nonbillable["exclude_billable"] = json!(true);
+        let skipped = call_dispatch_request(&handler, nonbillable).await;
+        assert_eq!(
+            skipped["result"], "no_work",
+            "an exclude-billable poll must not hand out compile work"
+        );
+
+        let claimed = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-full"),
+        )
+        .await;
+        assert_eq!(claimed["result"], "claim");
+        assert_eq!(claimed["phase"], "compile");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_retina_handoff_excludes_retina_compiled_notes() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        let note = insert_conditioned_note(
+            &store,
+            &identity,
+            &route_root,
+            "when evaluated",
+            Some("compiled"),
+        );
+        let (generation, token) = register_note_evaluator(&handler, 7, "eval-a", true, false).await;
+
+        let excluded = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(excluded["result"], "no_work");
+
+        let heartbeat = call_dispatch_request(
+            &handler,
+            json!({
+                "method": "note.evaluation.heartbeat",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+                "retina_handoff": false,
+            }),
+        )
+        .await;
+        assert_eq!(heartbeat["ok"], json!(true));
+
+        let claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
+        )
+        .await;
+        assert_eq!(claim["result"], "claim");
+        assert_eq!(claim["note_id"], json!(note.id));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21433,7 +23218,7 @@ mod tests {
         assert!(message.contains("[tool: read #read:1]"));
         assert!(message.contains("input: {\"filePath\":\"src/lib.rs\"}"));
 
-        let write = tool_text(
+        let refused = tool_text(
             call_facade(
                 &handler,
                 "ctx_note",
@@ -21441,7 +23226,10 @@ mod tests {
             )
             .await,
         );
-        assert!(write.contains("Created smart note"));
+        assert!(
+            refused.contains("Smart-note evaluation is unavailable"),
+            "a conditioned write without a live evaluator registration must fail closed"
+        );
         let write = tool_text(
             call_facade(
                 &handler,
@@ -21831,7 +23619,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn note_evaluator_verdict_transitions_a_module_note_to_ready_and_visible() {
+    async fn note_evaluate_verdict_writes_are_protocol_retired() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
             FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
@@ -21847,24 +23635,33 @@ mod tests {
                 surface_condition: Some("when ready"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
 
-        let evaluated = call_dispatch_request(
-            &handler,
-            json!({
-                "method": "note.evaluate",
-                "session_id": "session",
-                "note_id": note.id,
-                "source_revision": note.status_version,
-                "verdict": true
-            }),
-        )
-        .await;
-        assert_eq!(evaluated["status"], "ready");
-        let output = tool_text(call_facade(&handler, "ctx_note", json!({"action": "read"})).await);
-        assert!(output.contains("surface after evaluation"));
+        let evaluated = handler
+            .dispatch_value(
+                7,
+                json!({
+                    "method": "note.evaluate",
+                    "session_id": "session",
+                    "note_id": note.id,
+                    "source_revision": note.status_version,
+                    "verdict": true
+                }),
+            )
+            .await;
+        assert_eq!(error_code(evaluated), "protocol_retired");
+        let unchanged = store
+            .get_note_by_id("/repo", "session", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "pending");
+        assert_eq!(unchanged.state_version, note.state_version);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -21887,23 +23684,28 @@ mod tests {
                 surface_condition: Some("when ready"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
 
-        let evaluated = handler
-            .dispatch_value(
-                7,
-                json!({
-                    "method": "note.evaluate",
-                    "session_id": "ses",
-                    "note_id": note.id,
-                    "source_revision": note.status_version,
-                    "verdict": true
-                }),
-            )
-            .await;
-        assert!(matches!(evaluated, HandlerOutcome::Response(_)));
+        let evaluated = store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:identity",
+                note_id: note.id,
+                source_revision: note.status_version,
+                verdict: true,
+                compiled_check: None,
+                manifest_json: None,
+                check_hash: None,
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap();
+        assert!(matches!(evaluated, NoteCasOutcome::Applied(_)));
 
         let rendered = call_transform_request_on_channel(
             &handler,
@@ -21991,6 +23793,10 @@ mod tests {
                     surface_condition: Some("condition"),
                     anchor_block_id: None,
                     anchor_ordinal: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     now_ms: index,
                 })
                 .unwrap();

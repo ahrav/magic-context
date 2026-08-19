@@ -2401,6 +2401,217 @@ const MIGRATIONS: &[Migration] = &[
         ALTER TABLE mc_chunk_transcripts ADD COLUMN raw_messages_deflate BLOB NULL;
         ",
     },
+    Migration {
+        version: 51,
+        // Backfilling both new revision counters from status_version keeps them equal on
+        // pre-v51 rows, so CAS predicates that still compare status_version stay valid.
+        // The fence triggers guard against binaries older than this migration: they never
+        // register mc_note_writer_v2, so their mc_notes writes abort instead of advancing
+        // status_version while leaving the new counters behind.
+        // commentlint: allow(JUDGE)
+        statements: r#"
+        DROP TRIGGER IF EXISTS mc_notes_feed_insert;
+        DROP TRIGGER IF EXISTS mc_notes_feed_update;
+        DROP TRIGGER IF EXISTS mc_notes_feed_delete;
+        ALTER TABLE mc_notes ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE mc_notes ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE mc_notes ADD COLUMN compiled_source_revision INTEGER;
+        ALTER TABLE mc_notes ADD COLUMN compiled_project_path TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_provider TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_config TEXT;
+        ALTER TABLE mc_notes ADD COLUMN compiled_at INTEGER;
+        ALTER TABLE mc_notes ADD COLUMN compile_status TEXT
+            CHECK (compile_status IN ('compiled', 'plain', 'refused') OR compile_status IS NULL);
+        UPDATE mc_notes SET source_revision = status_version, state_version = status_version;
+        UPDATE mc_notes SET check_status = 'uncompiled'
+         WHERE check_status NOT IN ('uncompiled', 'compiled', 'failing', 'fallback');
+
+        CREATE TRIGGER mc_notes_writer_fence_insert
+        BEFORE INSERT ON mc_notes
+        WHEN mc_note_writer_v2() IS NOT 1
+        BEGIN
+            SELECT RAISE(ABORT, 'mc_notes requires a protocol-v2 binary');
+        END;
+        CREATE TRIGGER mc_notes_writer_fence_update
+        BEFORE UPDATE ON mc_notes
+        WHEN mc_note_writer_v2() IS NOT 1
+        BEGIN
+            SELECT RAISE(ABORT, 'mc_notes requires a protocol-v2 binary');
+        END;
+        CREATE TRIGGER mc_notes_writer_fence_delete
+        BEFORE DELETE ON mc_notes
+        WHEN mc_note_writer_v2() IS NOT 1
+        BEGIN
+            SELECT RAISE(ABORT, 'mc_notes requires a protocol-v2 binary');
+        END;
+
+        CREATE TRIGGER mc_notes_feed_insert AFTER INSERT ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'insert', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition, 'ready_at', NEW.ready_at,
+                    'ready_reason', NEW.ready_reason, 'manifest_json', NEW.manifest_json,
+                    'compiled_check', NEW.compiled_check, 'check_hash', NEW.check_hash,
+                    'check_cron', NEW.check_cron, 'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id,
+                    'source_revision', NEW.source_revision, 'state_version', NEW.state_version,
+                    'compiled_source_revision', NEW.compiled_source_revision,
+                    'compiled_project_path', NEW.compiled_project_path,
+                    'compiled_provider', NEW.compiled_provider,
+                    'compiled_config', NEW.compiled_config,
+                    'compiled_at', NEW.compiled_at, 'compile_status', NEW.compile_status), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_update AFTER UPDATE ON mc_notes
+        WHEN NEW.id IS NOT OLD.id OR NEW.type IS NOT OLD.type
+          OR NEW.project_path IS NOT OLD.project_path OR NEW.session_id IS NOT OLD.session_id
+          OR NEW.content IS NOT OLD.content OR NEW.status IS NOT OLD.status
+          OR NEW.surface_condition IS NOT OLD.surface_condition OR NEW.ready_at IS NOT OLD.ready_at
+          OR NEW.ready_reason IS NOT OLD.ready_reason OR NEW.manifest_json IS NOT OLD.manifest_json
+          OR NEW.compiled_check IS NOT OLD.compiled_check OR NEW.check_hash IS NOT OLD.check_hash
+          OR NEW.check_cron IS NOT OLD.check_cron
+          OR NEW.check_failure_count IS NOT OLD.check_failure_count
+          OR NEW.check_network_failure_count IS NOT OLD.check_network_failure_count
+          OR NEW.check_quarantined_until IS NOT OLD.check_quarantined_until
+          OR NEW.check_next_due_at IS NOT OLD.check_next_due_at
+          OR NEW.check_compiled_at IS NOT OLD.check_compiled_at
+          OR NEW.check_false_since_at IS NOT OLD.check_false_since_at
+          OR NEW.check_last_liveness_at IS NOT OLD.check_last_liveness_at
+          OR NEW.last_checked_at IS NOT OLD.last_checked_at OR NEW.check_status IS NOT OLD.check_status
+          OR NEW.check_version IS NOT OLD.check_version OR NEW.policy_version IS NOT OLD.policy_version
+          OR NEW.harness IS NOT OLD.harness OR NEW.anchor_block_id IS NOT OLD.anchor_block_id
+          OR NEW.anchor_ordinal IS NOT OLD.anchor_ordinal OR NEW.dismissed_at IS NOT OLD.dismissed_at
+          OR NEW.dismissal_resolution IS NOT OLD.dismissal_resolution
+          OR NEW.status_version IS NOT OLD.status_version
+          OR NEW.created_at_ms IS NOT OLD.created_at_ms OR NEW.updated_at_ms IS NOT OLD.updated_at_ms
+          OR NEW.context_store_uuid IS NOT OLD.context_store_uuid
+          OR NEW.context_row_id IS NOT OLD.context_row_id
+          OR NEW.source_revision IS NOT OLD.source_revision
+          OR NEW.state_version IS NOT OLD.state_version
+          OR NEW.compiled_source_revision IS NOT OLD.compiled_source_revision
+          OR NEW.compiled_project_path IS NOT OLD.compiled_project_path
+          OR NEW.compiled_provider IS NOT OLD.compiled_provider
+          OR NEW.compiled_config IS NOT OLD.compiled_config
+          OR NEW.compiled_at IS NOT OLD.compiled_at
+          OR NEW.compile_status IS NOT OLD.compile_status
+        BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'update', NEW.id,
+                json_object(
+                    'id', NEW.id, 'type', NEW.type, 'project_path', NEW.project_path,
+                    'session_id', NEW.session_id, 'content', NEW.content, 'status', NEW.status,
+                    'surface_condition', NEW.surface_condition, 'ready_at', NEW.ready_at,
+                    'ready_reason', NEW.ready_reason, 'manifest_json', NEW.manifest_json,
+                    'compiled_check', NEW.compiled_check, 'check_hash', NEW.check_hash,
+                    'check_cron', NEW.check_cron, 'check_failure_count', NEW.check_failure_count,
+                    'check_network_failure_count', NEW.check_network_failure_count,
+                    'check_quarantined_until', NEW.check_quarantined_until,
+                    'check_next_due_at', NEW.check_next_due_at, 'check_compiled_at', NEW.check_compiled_at,
+                    'check_false_since_at', NEW.check_false_since_at,
+                    'check_last_liveness_at', NEW.check_last_liveness_at,
+                    'last_checked_at', NEW.last_checked_at, 'check_status', NEW.check_status,
+                    'check_version', NEW.check_version, 'policy_version', NEW.policy_version,
+                    'harness', NEW.harness, 'anchor_block_id', NEW.anchor_block_id,
+                    'anchor_ordinal', NEW.anchor_ordinal, 'dismissed_at', NEW.dismissed_at,
+                    'dismissal_resolution', NEW.dismissal_resolution,
+                    'status_version', NEW.status_version, 'created_at_ms', NEW.created_at_ms,
+                    'updated_at_ms', NEW.updated_at_ms, 'context_store_uuid', NEW.context_store_uuid,
+                    'context_row_id', NEW.context_row_id,
+                    'source_revision', NEW.source_revision, 'state_version', NEW.state_version,
+                    'compiled_source_revision', NEW.compiled_source_revision,
+                    'compiled_project_path', NEW.compiled_project_path,
+                    'compiled_provider', NEW.compiled_provider,
+                    'compiled_config', NEW.compiled_config,
+                    'compiled_at', NEW.compiled_at, 'compile_status', NEW.compile_status), NULL);
+        END;
+        CREATE TRIGGER mc_notes_feed_delete AFTER DELETE ON mc_notes BEGIN
+            INSERT INTO mc_changefeed(domain, op, module_row_id, full_row_snapshot, content_hash)
+            VALUES ('notes', 'tombstone', OLD.id,
+                json_object(
+                    'id', OLD.id, 'type', OLD.type, 'project_path', OLD.project_path,
+                    'session_id', OLD.session_id, 'content', OLD.content, 'status', OLD.status,
+                    'surface_condition', OLD.surface_condition, 'ready_at', OLD.ready_at,
+                    'ready_reason', OLD.ready_reason, 'manifest_json', OLD.manifest_json,
+                    'compiled_check', OLD.compiled_check, 'check_hash', OLD.check_hash,
+                    'check_cron', OLD.check_cron, 'check_failure_count', OLD.check_failure_count,
+                    'check_network_failure_count', OLD.check_network_failure_count,
+                    'check_quarantined_until', OLD.check_quarantined_until,
+                    'check_next_due_at', OLD.check_next_due_at, 'check_compiled_at', OLD.check_compiled_at,
+                    'check_false_since_at', OLD.check_false_since_at,
+                    'check_last_liveness_at', OLD.check_last_liveness_at,
+                    'last_checked_at', OLD.last_checked_at, 'check_status', OLD.check_status,
+                    'check_version', OLD.check_version, 'policy_version', OLD.policy_version,
+                    'harness', OLD.harness, 'anchor_block_id', OLD.anchor_block_id,
+                    'anchor_ordinal', OLD.anchor_ordinal, 'dismissed_at', OLD.dismissed_at,
+                    'dismissal_resolution', OLD.dismissal_resolution,
+                    'status_version', OLD.status_version, 'created_at_ms', OLD.created_at_ms,
+                    'updated_at_ms', OLD.updated_at_ms, 'context_store_uuid', OLD.context_store_uuid,
+                    'context_row_id', OLD.context_row_id,
+                    'source_revision', OLD.source_revision, 'state_version', OLD.state_version,
+                    'compiled_source_revision', OLD.compiled_source_revision,
+                    'compiled_project_path', OLD.compiled_project_path,
+                    'compiled_provider', OLD.compiled_provider,
+                    'compiled_config', OLD.compiled_config,
+                    'compiled_at', OLD.compiled_at, 'compile_status', OLD.compile_status), NULL);
+        END;
+    "#,
+    },
+    Migration {
+        version: 52,
+        statements: "
+        ALTER TABLE mc_authority ADD COLUMN note_eval_protocol_epoch INTEGER NOT NULL DEFAULT 1;
+        UPDATE mc_authority SET note_eval_protocol_epoch = 2, generation = generation + 1
+         WHERE domain = 'notes';
+        CREATE TABLE IF NOT EXISTS mc_note_eval_claims (
+            claim_id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            note_id INTEGER NOT NULL,
+            phase TEXT NOT NULL CHECK (phase IN ('compile', 'due', 'liveness', 'fallback')),
+            acquisition_id TEXT NOT NULL,
+            evaluator_instance TEXT NOT NULL,
+            evaluator_slot INTEGER NOT NULL,
+            registration_generation INTEGER NOT NULL,
+            source_revision INTEGER NOT NULL,
+            state_version INTEGER NOT NULL,
+            policy_version INTEGER NOT NULL,
+            protocol_epoch INTEGER NOT NULL,
+            authority_generation INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            completion_id TEXT,
+            terminal_kind TEXT,
+            terminal_response TEXT,
+            terminal_at_ms INTEGER,
+            UNIQUE (project, acquisition_id)
+        );
+        CREATE UNIQUE INDEX idx_mc_note_eval_claims_active_note
+            ON mc_note_eval_claims(project, note_id) WHERE terminal_kind IS NULL;
+        CREATE UNIQUE INDEX idx_mc_note_eval_claims_active_slot
+            ON mc_note_eval_claims(project, evaluator_instance, evaluator_slot)
+            WHERE terminal_kind IS NULL;
+        CREATE TABLE IF NOT EXISTS mc_note_eval_acquisitions (
+            project TEXT NOT NULL,
+            acquisition_id TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (project, acquisition_id)
+        );
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -4176,7 +4387,19 @@ pub struct NoteWriteInput<'a> {
     pub surface_condition: Option<&'a str>,
     pub anchor_block_id: Option<&'a str>,
     pub anchor_ordinal: Option<i64>,
+    pub compiled_provider: Option<&'a str>,
+    pub compiled_config: Option<&'a str>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<&'a str>,
     pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoteConditionCompile<'a> {
+    pub compiled_provider: Option<&'a str>,
+    pub compiled_config: Option<&'a str>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4211,6 +4434,14 @@ pub struct StoredNote {
     pub dismissed_at: Option<i64>,
     pub dismissal_resolution: Option<String>,
     pub status_version: i64,
+    pub source_revision: i64,
+    pub state_version: i64,
+    pub compiled_source_revision: Option<i64>,
+    pub compiled_project_path: Option<String>,
+    pub compiled_provider: Option<String>,
+    pub compiled_config: Option<String>,
+    pub compiled_at: Option<i64>,
+    pub compile_status: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub context_store_uuid: Option<String>,
@@ -4254,6 +4485,119 @@ pub struct NoteEvaluationInput<'a> {
     pub check_hash: Option<&'a str>,
     pub next_due_at: Option<i64>,
     pub now_ms: i64,
+}
+
+/// Lease length for one durable smart-note evaluation claim.
+pub const NOTE_EVAL_CLAIM_LEASE_MS: i64 = 2 * 60_000;
+/// Replay retention for a `no_work` acquisition decision.
+pub const NOTE_EVAL_NO_WORK_RETENTION_MS: i64 = 10 * 60_000;
+/// Replay retention for a terminal claim result.
+pub const NOTE_EVAL_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60_000;
+/// How long a terminal claim keeps its `terminal_response` before redaction.
+/// The response exists only so a worker that lost the completion reply can
+/// replay it; that window is minutes, not days. Nulling it well before the
+/// row itself ages out keeps evaluator-supplied response text from being
+/// retained for the full terminal-retention window.
+pub const NOTE_EVAL_RESPONSE_REDACT_MS: i64 = 24 * 60 * 60_000;
+/// Per-project row cap for each evaluation ledger.
+pub const NOTE_EVAL_LEDGER_CAP: i64 = 10_000;
+/// Rows repaired per committed batch by the v51 compiled-artifact repair.
+const NOTE_ARTIFACT_REPAIR_BATCH: i64 = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEvalClaim {
+    pub claim_id: String,
+    pub note_id: i64,
+    pub phase: String,
+    pub acquisition_id: String,
+    pub evaluator_instance: String,
+    pub evaluator_slot: i64,
+    pub registration_generation: i64,
+    pub source_revision: i64,
+    pub state_version: i64,
+    pub policy_version: i64,
+    pub protocol_epoch: i64,
+    pub authority_generation: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum NoteEvalAcquireOutcome {
+    Claim {
+        claim: NoteEvalClaim,
+        note: StoredNote,
+        replayed: bool,
+    },
+    NoWork {
+        replayed: bool,
+    },
+    /// The acquisition identity replays an expired decision.
+    Expired,
+    /// The acquisition identity replays a terminal claim result.
+    Terminal {
+        kind: String,
+        response: Option<String>,
+    },
+    Busy,
+    AuthorityChanged,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteEvalRenewOutcome {
+    Renewed {
+        expires_at: i64,
+    },
+    Expired,
+    AuthorityChanged,
+    UnknownClaim,
+    Invalid,
+    TerminalReplay {
+        kind: String,
+        response: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum NoteEvalCompleteOutcome {
+    Applied { response_json: String },
+    Replayed { response_json: String },
+    Conflict { kind: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteEvalAbandonOutcome {
+    Abandoned,
+    Replayed { kind: String },
+    UnknownClaim,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEvalReducedState {
+    pub status: String,
+    pub ready_at: Option<i64>,
+    pub ready_reason: Option<String>,
+    pub last_checked_at: Option<i64>,
+    pub updated_at_ms: i64,
+    pub compiled_check: Option<String>,
+    pub manifest_json: Option<String>,
+    pub check_hash: Option<String>,
+    pub check_cron: Option<String>,
+    pub check_version: Option<i64>,
+    pub check_status: Option<String>,
+    pub check_failure_count: i64,
+    pub check_network_failure_count: i64,
+    pub check_quarantined_until: Option<i64>,
+    pub check_next_due_at: Option<i64>,
+    pub check_compiled_at: Option<i64>,
+    pub check_false_since_at: Option<i64>,
+    pub check_last_liveness_at: Option<i64>,
+    pub policy_version: Option<i64>,
+    pub compiled_source_revision: Option<i64>,
+    pub compiled_project_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5778,8 +6122,9 @@ impl<'a> FacadeMutationTxn<'a> {
             .execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
+                  compiled_at, compile_status, created_at_ms, updated_at_ms)
+                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -5791,6 +6136,10 @@ impl<'a> FacadeMutationTxn<'a> {
                         .filter(|value| !value.is_empty()),
                     input.anchor_block_id,
                     input.anchor_ordinal,
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.now_ms,
                 ],
             )
@@ -5807,6 +6156,7 @@ impl<'a> FacadeMutationTxn<'a> {
         expected_version: i64,
         content: Option<&str>,
         surface_condition: Option<Option<&str>>,
+        condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, String> {
         let current = load_note_tx(self.tx, note_id)
@@ -5834,30 +6184,38 @@ impl<'a> FacadeMutationTxn<'a> {
             .flatten()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let next_status = if condition_changed && next_condition.is_some() {
+        let content_changed = next_content != current.content;
+        let compiler_edit = condition_changed || content_changed;
+        let remaining_condition = if condition_changed {
+            next_condition
+        } else {
+            current
+                .surface_condition
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let next_status = if compiler_edit && remaining_condition.is_some() {
             "pending"
         } else {
             current.status.as_str()
         };
+        let compile = condition_compile.unwrap_or_default();
         let changed = self
             .tx
             .execute(
-                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
-                    last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
-                    ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
-                    ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
-                    compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
-                    manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
-                    check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
-                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                NOTE_CAS_UPDATE_SQL,
                 params![
                     next_content,
                     condition_changed,
                     next_condition,
                     next_status,
+                    compiler_edit,
                     now_ms,
+                    compile.compiled_provider,
+                    compile.compiled_config,
+                    compile.compiled_at,
+                    compile.compile_status,
                     note_id,
                     project_path,
                     expected_status,
@@ -5871,6 +6229,10 @@ impl<'a> FacadeMutationTxn<'a> {
                     .optional()
                     .map_err(|error| error.to_string())?,
             });
+        }
+        if compiler_edit {
+            fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
+                .map_err(|error| error.to_string())?;
         }
         Ok(NoteCasOutcome::Applied(
             load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
@@ -5909,7 +6271,8 @@ impl<'a> FacadeMutationTxn<'a> {
             .execute(
                 "UPDATE mc_notes
                     SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, updated_at_ms = ?2,
+                        status_version = status_version + 1, state_version = state_version + 1,
+                        updated_at_ms = ?2,
                         dismissed_at = ?2, dismissal_resolution = ?3
                   WHERE id = ?4 AND project_path = ?5
                     AND status = ?6 AND status_version = ?7",
@@ -5927,6 +6290,8 @@ impl<'a> FacadeMutationTxn<'a> {
         if changed == 0 {
             return Ok(None);
         }
+        fence_active_note_claims_tx(self.tx, project_path, Some(note_id), "stale", now_ms)
+            .map_err(|error| error.to_string())?;
         Ok(Some(
             load_note_tx(self.tx, note_id).map_err(|error| error.to_string())?,
         ))
@@ -6181,6 +6546,12 @@ impl McStore {
                 },
             )?;
             conn.create_scalar_function(
+                "mc_note_writer_v2",
+                0,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |_context| Ok(1i64),
+            )?;
+            conn.create_scalar_function(
                 "mc_facade_authority_route",
                 0,
                 FunctionFlags::SQLITE_UTF8,
@@ -6220,6 +6591,7 @@ impl McStore {
             historian_side_channel_fail_once: Mutex::new(BTreeSet::new()),
         };
         store.repair_migration_30_authority_routes()?;
+        store.repair_note_artifacts_v51()?;
         store.prune_transform_session_roots()?;
         Ok(store)
     }
@@ -6449,6 +6821,55 @@ impl McStore {
                 normalize_authority_route_tx(tx, &context_store_uuid, &project, &route_project_root)
             })?;
         }
+        Ok(())
+    }
+
+    /// Verify pre-v51 compiled artifacts once, then record completion in mc_cache_state.
+    /// This repair does not advance any note revision.
+    fn repair_note_artifacts_v51(&self) -> Result<(), McStoreError> {
+        const FLAG_KEY: &str = "note_artifact_repair_v51_done";
+        let done = self.inner.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
+                params![FLAG_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+        })? != 0;
+        if done {
+            return Ok(());
+        }
+        let projects = self.inner.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT project_path FROM mc_notes
+                  WHERE compiled_check IS NOT NULL AND compiled_source_revision IS NULL
+                  ORDER BY project_path",
+            )?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        for project in projects {
+            // Commit in bounded batches so a kill mid-repair keeps the work
+            // already done instead of rolling back a whole project and redoing it
+            // on every subsequent boot. The query re-selects unrepaired rows each
+            // pass, so this is naturally resumable.
+            loop {
+                let processed = self
+                    .with_note_conn_fenced(&project, |tx| repair_note_artifacts_tx(tx, &project))?;
+                if processed < NOTE_ARTIFACT_REPAIR_BATCH as usize {
+                    break;
+                }
+            }
+        }
+        self.inner.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO mc_cache_state (session_id, row_version, core_state, meta)
+                 VALUES (?1, 0, '', '')",
+                params![FLAG_KEY],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -10370,7 +10791,10 @@ impl McStore {
                                     check_false_since_at, check_last_liveness_at, last_checked_at,
                                     check_status, check_version, policy_version, harness,
                                     anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution,
-                                    status_version, created_at_ms, updated_at_ms, NULL, NULL
+                                    status_version, created_at_ms, updated_at_ms, NULL, NULL,
+                                    source_revision, state_version, compiled_source_revision,
+                                    compiled_project_path, compiled_provider, compiled_config,
+                                    compiled_at, compile_status
                                FROM mc_notes
                               WHERE session_id = ?2 AND project_path = ?3 AND type = 'session'"
                         ),
@@ -12858,8 +13282,9 @@ impl McStore {
             tx.execute(
                 "INSERT INTO mc_notes
                  (type, project_path, session_id, content, status, surface_condition,
-                  anchor_block_id, anchor_ordinal, harness, created_at_ms, updated_at_ms)
-                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?8)",
+                  anchor_block_id, anchor_ordinal, harness, compiled_provider, compiled_config,
+                  compiled_at, compile_status, created_at_ms, updated_at_ms)
+                 VALUES ('smart', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'module', ?8, ?9, ?10, ?11, ?12, ?12)",
                 params![
                     input.project_path,
                     input.session_id,
@@ -12871,6 +13296,10 @@ impl McStore {
                         .filter(|value| !value.is_empty()),
                     input.anchor_block_id,
                     input.anchor_ordinal,
+                    input.compiled_provider,
+                    input.compiled_config,
+                    input.compiled_at,
+                    input.compile_status,
                     input.now_ms,
                 ],
             )?;
@@ -13056,6 +13485,7 @@ impl McStore {
             current.status_version,
             Some(content),
             None,
+            None,
             now_ms,
         )? {
             NoteCasOutcome::Applied(note) => Ok(Some(note)),
@@ -13074,6 +13504,7 @@ impl McStore {
         expected_version: i64,
         content: Option<&str>,
         surface_condition: Option<Option<&str>>,
+        condition_compile: Option<NoteConditionCompile<'_>>,
         now_ms: i64,
     ) -> Result<NoteCasOutcome, McStoreError> {
         self.require_note_project(project_path, note_id)?;
@@ -13083,42 +13514,67 @@ impl McStore {
                 return Ok(NoteCasOutcome::Conflict { current: None });
             };
             if current.project_path != project_path {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                });
             }
             if current.status != expected_status || current.status_version != expected_version {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                });
             }
             let next_content = content.map(str::trim).unwrap_or(&current.content);
             if next_content.is_empty() {
-                return Ok(NoteCasOutcome::Conflict { current: Some(current) });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: Some(current),
+                });
             }
-            let condition_changed = surface_condition.is_some();
             let next_condition = surface_condition
                 .flatten()
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
-            let next_status = if condition_changed && next_condition.is_some() {
+            let current_condition = current
+                .surface_condition
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            // Presence alone is not an edit: an update that re-supplies the
+            // existing condition unchanged must not invalidate the compiled
+            // artifact, reset a ready note to pending, or fence active claims.
+            let condition_changed =
+                surface_condition.is_some() && next_condition != current_condition;
+            let content_changed = next_content != current.content;
+            let compiler_edit = condition_changed || content_changed;
+            if !compiler_edit {
+                // A fully unchanged update is mutation-neutral: bumping the
+                // versions would fence an active evaluation claim and re-run
+                // billable work for compiler inputs that did not change.
+                return Ok(NoteCasOutcome::Applied(current));
+            }
+            let remaining_condition = if condition_changed {
+                next_condition
+            } else {
+                current_condition
+            };
+            let next_status = if compiler_edit && remaining_condition.is_some() {
                 "pending"
             } else {
                 current.status.as_str()
             };
+            let compile = condition_compile.unwrap_or_default();
             let changed = tx.execute(
-                "UPDATE mc_notes SET content = ?1, surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
-                    status = ?4, status_version = status_version + 1, updated_at_ms = ?5,
-                    last_checked_at = CASE WHEN ?2 THEN NULL ELSE last_checked_at END,
-                    ready_at = CASE WHEN ?2 THEN NULL ELSE ready_at END,
-                    ready_reason = CASE WHEN ?2 THEN NULL ELSE ready_reason END,
-                    compiled_check = CASE WHEN ?2 THEN NULL ELSE compiled_check END,
-                    manifest_json = CASE WHEN ?2 THEN NULL ELSE manifest_json END,
-                    check_hash = CASE WHEN ?2 THEN NULL ELSE check_hash END,
-                    check_status = CASE WHEN ?2 THEN 'uncompiled' ELSE check_status END
-                  WHERE id = ?6 AND project_path = ?7 AND status = ?8 AND status_version = ?9",
+                NOTE_CAS_UPDATE_SQL,
                 params![
                     next_content,
                     condition_changed,
                     next_condition,
                     next_status,
+                    compiler_edit,
                     now_ms,
+                    compile.compiled_provider,
+                    compile.compiled_config,
+                    compile.compiled_at,
+                    compile.compile_status,
                     note_id,
                     project_path,
                     expected_status,
@@ -13126,7 +13582,12 @@ impl McStore {
                 ],
             )?;
             if changed == 0 {
-                return Ok(NoteCasOutcome::Conflict { current: load_note_tx(tx, note_id).optional()? });
+                return Ok(NoteCasOutcome::Conflict {
+                    current: load_note_tx(tx, note_id).optional()?,
+                });
+            }
+            if compiler_edit {
+                fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
             }
             Ok(NoteCasOutcome::Applied(load_note_tx(tx, note_id)?))
         })?;
@@ -13166,7 +13627,8 @@ impl McStore {
             let changed = tx.execute(
                 "UPDATE mc_notes
                     SET status = 'dismissed', content = ?1,
-                        status_version = status_version + 1, updated_at_ms = ?2,
+                        status_version = status_version + 1, state_version = state_version + 1,
+                        updated_at_ms = ?2,
                         dismissed_at = ?2, dismissal_resolution = ?3
                   WHERE id = ?4 AND project_path = ?5
                     AND status = ?6 AND status_version = ?7",
@@ -13183,6 +13645,7 @@ impl McStore {
             if changed == 0 {
                 return Ok(None);
             }
+            fence_active_note_claims_tx(tx, project_path, Some(note_id), "stale", now_ms)?;
             Ok(Some(load_note_tx(tx, note_id)?))
         })
     }
@@ -13250,6 +13713,7 @@ impl McStore {
             let status = if input.verdict { "ready" } else { "pending" };
             tx.execute(
                 "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
+                    state_version = state_version + 1,
                     updated_at_ms = ?2, ready_at = CASE WHEN ?1 = 'ready' THEN ?2 ELSE ready_at END,
                     ready_reason = CASE WHEN ?1 = 'ready' THEN 'condition_true' ELSE ready_reason END,
                     compiled_check = ?3, manifest_json = ?4, check_hash = ?5,
@@ -13319,6 +13783,7 @@ impl McStore {
             }
             tx.execute(
                 "UPDATE mc_notes SET status = ?1, status_version = status_version + 1,
+                    state_version = state_version + 1,
                     updated_at_ms = ?2,
                     ready_at = CASE WHEN ?1 = 'ready' THEN COALESCE(ready_at, ?2) ELSE ready_at END,
                     ready_reason = CASE WHEN ?1 = 'ready' THEN COALESCE(?3, ready_reason) ELSE ready_reason END,
@@ -13355,7 +13820,8 @@ impl McStore {
                 .optional()?;
             let Some(note) = note else { return Ok(None) };
             let changed = tx.execute(
-                "UPDATE mc_notes SET status_version = status_version + 1, updated_at_ms = ?1
+                "UPDATE mc_notes SET status_version = status_version + 1,
+                    state_version = state_version + 1, updated_at_ms = ?1
                    WHERE id = ?2 AND project_path = ?3 AND status = 'pending' AND status_version = ?4",
                 params![now_ms, note.id, project_path, note.status_version],
             )?;
@@ -13428,6 +13894,7 @@ impl McStore {
                 if note.status == "ready" {
                     let changed = tx.execute(
                         "UPDATE mc_notes SET status = 'surfacing', status_version = status_version + 1,
+                            state_version = state_version + 1,
                             updated_at_ms = ?1
                           WHERE id = ?2 AND project_path = ?3 AND status = 'ready' AND status_version = ?4",
                         params![now_ms, note.id, project_path, note.status_version],
@@ -13508,7 +13975,7 @@ impl McStore {
                 )?;
                 tx.execute(
                     "UPDATE mc_notes SET status = 'surfaced', status_version = status_version + 1,
-                        updated_at_ms = ?1
+                        state_version = state_version + 1, updated_at_ms = ?1
                       WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
                     params![now_ms, id, project_path],
                 )?;
@@ -13544,7 +14011,7 @@ impl McStore {
             for id in &ids {
                 tx.execute(
                     "UPDATE mc_notes SET status = 'ready', status_version = status_version + 1,
-                        updated_at_ms = ?1
+                        state_version = state_version + 1, updated_at_ms = ?1
                       WHERE id = ?2 AND project_path = ?3 AND status IN ('surfacing', 'surfaced')",
                     params![now_ms, id, project_path],
                 )?;
@@ -13905,6 +14372,19 @@ impl McStore {
                         "DELETE FROM mc_authority_seed_rows WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
                         params![context_store_uuid, project, domain],
                     )?;
+                    if domain == "notes" {
+                        // A claim surviving from an earlier MODULE period must
+                        // not block its note under the new generation for a
+                        // full lease; completion is already generation-fenced,
+                        // so terminalize it like the drain transition does.
+                        fence_active_note_claims_tx(
+                            tx,
+                            project,
+                            None,
+                            "authority_changed",
+                            current_time_ms(),
+                        )?;
+                    }
                     tx.execute(
                         "UPDATE mc_authority SET state = 'PREPARING', generation = generation + 1,
                                 checksum_expected = NULL, checksum_actual = NULL, checksum_ok = NULL
@@ -14015,8 +14495,23 @@ impl McStore {
                         },
                     )));
                 }
+                if domain == "notes" {
+                    // Same fence as the drain transition: a stale claim from a
+                    // prior MODULE period cannot complete under the new
+                    // generation, but left active it blocks its note for a
+                    // full lease.
+                    fence_active_note_claims_tx(
+                        tx,
+                        project,
+                        None,
+                        "authority_changed",
+                        current_time_ms(),
+                    )?;
+                }
                 tx.execute(
-                    "UPDATE mc_authority SET state = 'MODULE', generation = generation + 1
+                    "UPDATE mc_authority SET state = 'MODULE', generation = generation + 1,
+                            note_eval_protocol_epoch = CASE WHEN domain = 'notes' THEN 2
+                                ELSE note_eval_protocol_epoch END
                        WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3",
                     params![context_store_uuid, project, domain],
                 )?;
@@ -14077,11 +14572,33 @@ impl McStore {
                     )));
                 }
                 let next_state = if verified { "MODULE" } else { "TS" };
-                tx.execute(
+                if domain == "notes" {
+                    // Same fence as the drain transition: a stale claim from a
+                    // prior MODULE period cannot complete under the new
+                    // generation, but left active it blocks its note for a
+                    // full lease.
+                    fence_active_note_claims_tx(
+                        tx,
+                        project,
+                        None,
+                        "authority_changed",
+                        current_time_ms(),
+                    )?;
+                }
+                let update_sql = if verified && domain == "notes" {
+                    "UPDATE mc_authority
+                        SET state = ?1, generation = generation + 1,
+                            checksum_expected = ?2, checksum_actual = ?3, checksum_ok = ?4,
+                            note_eval_protocol_epoch = 2
+                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7"
+                } else {
                     "UPDATE mc_authority
                         SET state = ?1, generation = generation + 1,
                             checksum_expected = ?2, checksum_actual = ?3, checksum_ok = ?4
-                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7",
+                      WHERE context_store_uuid = ?5 AND project = ?6 AND domain = ?7"
+                };
+                tx.execute(
+                    update_sql,
                     params![
                         next_state,
                         checksum_expected,
@@ -14196,6 +14713,9 @@ impl McStore {
                     params![domain],
                     |row| row.get(0),
                 )?;
+                if domain == "notes" {
+                    fence_active_note_claims_tx(tx, project, None, "authority_changed", now_ms)?;
+                }
                 let next_generation = current.generation + 1;
                 let token = mint_coordinator_token(lease, lease_expires_at, next_generation);
                 tx.execute(
@@ -15028,7 +15548,8 @@ impl McStore {
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                     ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37,
+                     ?38, ?39, ?40, ?41)
                  ON CONFLICT(context_store_uuid, context_row_id) DO UPDATE SET
                     type=excluded.type, project_path=excluded.project_path,
                     session_id=excluded.session_id, content=excluded.content,
@@ -15048,7 +15569,13 @@ impl McStore {
                     anchor_ordinal=excluded.anchor_ordinal, dismissed_at=excluded.dismissed_at,
                     dismissal_resolution=excluded.dismissal_resolution,
                     status_version=excluded.status_version, created_at_ms=excluded.created_at_ms,
-                    updated_at_ms=excluded.updated_at_ms"
+                    updated_at_ms=excluded.updated_at_ms,
+                    source_revision=excluded.source_revision, state_version=excluded.state_version,
+                    compiled_source_revision=excluded.compiled_source_revision,
+                    compiled_project_path=excluded.compiled_project_path,
+                    compiled_provider=excluded.compiled_provider,
+                    compiled_config=excluded.compiled_config,
+                    compiled_at=excluded.compiled_at, compile_status=excluded.compile_status"
             ))?;
             let mut note_by_source = tx.prepare(
                 "SELECT id FROM mc_notes
@@ -15101,6 +15628,18 @@ impl McStore {
                     integer("updated_at_ms").or_else(|| integer("updated_at")).unwrap_or(0),
                     context_store_uuid,
                     source_row_id,
+                    integer("source_revision")
+                        .or_else(|| integer("status_version"))
+                        .unwrap_or(0),
+                    integer("state_version")
+                        .or_else(|| integer("status_version"))
+                        .unwrap_or(0),
+                    integer("compiled_source_revision"),
+                    text("compiled_project_path"),
+                    text("compiled_provider"),
+                    text("compiled_config"),
+                    integer("compiled_at"),
+                    text("compile_status"),
                 ])?;
                 let module_row_id: i64 = note_by_source.query_row(
                     params![context_store_uuid, project, source_row_id],
@@ -15113,6 +15652,16 @@ impl McStore {
                     snapshot_json,
                 ])?;
                 module_row_ids.push(module_row_id);
+            }
+            // Seeds can import pre-v51 artifacts (compiled_check present,
+            // compiled_source_revision NULL) after the boot-time repair
+            // already recorded its completion marker; verify them here so an
+            // unvalidated compiled check never becomes selectable.
+            loop {
+                let processed = repair_note_artifacts_tx(tx, project)?;
+                if processed < NOTE_ARTIFACT_REPAIR_BATCH as usize {
+                    break;
+                }
             }
             Ok(module_row_ids)
         })
@@ -16063,8 +16612,40 @@ fn tag_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<McTagRow> {
     })
 }
 
-const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
-const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id";
+const NOTE_SELECT_COLUMNS: &str = "id, type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
+const NOTE_INSERT_COLUMNS: &str = "type, project_path, session_id, content, status, surface_condition, ready_at, ready_reason, manifest_json, compiled_check, check_hash, check_cron, check_failure_count, check_network_failure_count, check_quarantined_until, check_next_due_at, check_compiled_at, check_false_since_at, check_last_liveness_at, last_checked_at, check_status, check_version, policy_version, harness, anchor_block_id, anchor_ordinal, dismissed_at, dismissal_resolution, status_version, created_at_ms, updated_at_ms, context_store_uuid, context_row_id, source_revision, state_version, compiled_source_revision, compiled_project_path, compiled_provider, compiled_config, compiled_at, compile_status";
+
+// ?2 = condition changed, ?5 = compiler-input edit (content or condition). A compiler-input
+// edit advances source_revision and resets compiled evaluation state; ?7..?10 replace the
+// compile authoring metadata only when the condition changed.
+const NOTE_CAS_UPDATE_SQL: &str = "UPDATE mc_notes SET content = ?1,
+    surface_condition = CASE WHEN ?2 THEN ?3 ELSE surface_condition END,
+    status = ?4, status_version = status_version + 1, state_version = state_version + 1,
+    source_revision = source_revision + CASE WHEN ?5 THEN 1 ELSE 0 END,
+    updated_at_ms = ?6,
+    last_checked_at = CASE WHEN ?5 THEN NULL ELSE last_checked_at END,
+    ready_at = CASE WHEN ?5 THEN NULL ELSE ready_at END,
+    ready_reason = CASE WHEN ?5 THEN NULL ELSE ready_reason END,
+    compiled_check = CASE WHEN ?5 THEN NULL ELSE compiled_check END,
+    manifest_json = CASE WHEN ?5 THEN NULL ELSE manifest_json END,
+    check_hash = CASE WHEN ?5 THEN NULL ELSE check_hash END,
+    check_cron = CASE WHEN ?5 THEN NULL ELSE check_cron END,
+    compiled_source_revision = CASE WHEN ?5 THEN NULL ELSE compiled_source_revision END,
+    compiled_project_path = CASE WHEN ?5 THEN NULL ELSE compiled_project_path END,
+    check_version = CASE WHEN ?5 THEN 0 ELSE check_version END,
+    check_status = CASE WHEN ?5 THEN 'uncompiled' ELSE check_status END,
+    check_failure_count = CASE WHEN ?5 THEN 0 ELSE check_failure_count END,
+    check_network_failure_count = CASE WHEN ?5 THEN 0 ELSE check_network_failure_count END,
+    check_quarantined_until = CASE WHEN ?5 THEN NULL ELSE check_quarantined_until END,
+    check_next_due_at = CASE WHEN ?5 THEN NULL ELSE check_next_due_at END,
+    check_compiled_at = CASE WHEN ?5 THEN NULL ELSE check_compiled_at END,
+    check_false_since_at = CASE WHEN ?5 THEN NULL ELSE check_false_since_at END,
+    check_last_liveness_at = CASE WHEN ?5 THEN NULL ELSE check_last_liveness_at END,
+    compiled_provider = CASE WHEN ?2 THEN ?7 ELSE compiled_provider END,
+    compiled_config = CASE WHEN ?2 THEN ?8 ELSE compiled_config END,
+    compiled_at = CASE WHEN ?2 THEN ?9 ELSE compiled_at END,
+    compile_status = CASE WHEN ?2 THEN ?10 ELSE compile_status END
+  WHERE id = ?11 AND project_path = ?12 AND status = ?13 AND status_version = ?14";
 
 fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
     Ok(StoredNote {
@@ -16102,6 +16683,14 @@ fn stored_note_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredNote> {
         updated_at_ms: r.get(31)?,
         context_store_uuid: r.get(32)?,
         context_row_id: r.get(33)?,
+        source_revision: r.get(34)?,
+        state_version: r.get(35)?,
+        compiled_source_revision: r.get(36)?,
+        compiled_project_path: r.get(37)?,
+        compiled_provider: r.get(38)?,
+        compiled_config: r.get(39)?,
+        compiled_at: r.get(40)?,
+        compile_status: r.get(41)?,
     })
 }
 
@@ -16111,6 +16700,916 @@ fn load_note_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> rusqlite::Result<Sto
         params![id],
         stored_note_from_row,
     )
+}
+
+const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id, \
+    evaluator_instance, evaluator_slot, registration_generation, source_revision, \
+    state_version, policy_version, protocol_epoch, authority_generation, expires_at, \
+    completion_id, terminal_kind, terminal_response";
+
+/// Columns the work selector actually reads. Acquisition polls the pending set on
+/// every call, so this deliberately excludes `content`, `manifest_json`, and the
+/// compiled artifact body (bounded at `MAX_COMPILED_CHECK_BYTES`); the selector
+/// only needs to know WHETHER an artifact exists. The full row is loaded once, for
+/// the single note that wins selection.
+const NOTE_EVAL_CANDIDATE_COLUMNS: &str = "id, status, compile_status, created_at_ms, \
+    compiled_check IS NOT NULL, check_status, check_quarantined_until, check_next_due_at, \
+    check_false_since_at, check_last_liveness_at, policy_version";
+
+/// One pending smart note as seen by the work selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEvalCandidate {
+    pub id: i64,
+    pub status: String,
+    pub compile_status: Option<String>,
+    pub created_at_ms: i64,
+    pub has_compiled_check: bool,
+    pub check_status: Option<String>,
+    pub check_quarantined_until: Option<i64>,
+    pub check_next_due_at: Option<i64>,
+    pub check_false_since_at: Option<i64>,
+    pub check_last_liveness_at: Option<i64>,
+    pub policy_version: Option<i64>,
+}
+
+fn note_eval_candidate_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteEvalCandidate> {
+    Ok(NoteEvalCandidate {
+        id: r.get(0)?,
+        status: r.get(1)?,
+        compile_status: r.get(2)?,
+        created_at_ms: r.get(3)?,
+        has_compiled_check: r.get(4)?,
+        check_status: r.get(5)?,
+        check_quarantined_until: r.get(6)?,
+        check_next_due_at: r.get(7)?,
+        check_false_since_at: r.get(8)?,
+        check_last_liveness_at: r.get(9)?,
+        policy_version: r.get(10)?,
+    })
+}
+
+const NOTE_EVAL_ID_MAX_LEN: usize = 200;
+const NOTE_EVAL_RESPONSE_MAX_LEN: usize = 2048;
+
+struct NoteEvalClaimRow {
+    claim: NoteEvalClaim,
+    completion_id: Option<String>,
+    terminal_kind: Option<String>,
+    terminal_response: Option<String>,
+}
+
+fn note_eval_claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteEvalClaimRow> {
+    Ok(NoteEvalClaimRow {
+        claim: NoteEvalClaim {
+            claim_id: row.get(0)?,
+            note_id: row.get(1)?,
+            phase: row.get(2)?,
+            acquisition_id: row.get(3)?,
+            evaluator_instance: row.get(4)?,
+            evaluator_slot: row.get(5)?,
+            registration_generation: row.get(6)?,
+            source_revision: row.get(7)?,
+            state_version: row.get(8)?,
+            policy_version: row.get(9)?,
+            protocol_epoch: row.get(10)?,
+            authority_generation: row.get(11)?,
+            expires_at: row.get(12)?,
+        },
+        completion_id: row.get(13)?,
+        terminal_kind: row.get(14)?,
+        terminal_response: row.get(15)?,
+    })
+}
+
+fn note_eval_valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= NOTE_EVAL_ID_MAX_LEN
+}
+
+fn note_eval_bound_response(response: &str) -> String {
+    if response.len() <= NOTE_EVAL_RESPONSE_MAX_LEN {
+        return response.to_string();
+    }
+    let mut end = NOTE_EVAL_RESPONSE_MAX_LEN;
+    while !response.is_char_boundary(end) {
+        end -= 1;
+    }
+    response[..end].to_string()
+}
+
+fn note_eval_kind_response(kind: &str) -> String {
+    serde_json::json!({ "result": kind }).to_string()
+}
+
+/// Resolve the notes-authority row this project's evaluation protocol is fenced on.
+/// A MODULE row wins over stale twins under other context store UUIDs, matching
+/// `module_authority_for_project`; otherwise the lowest UUID reports current state.
+fn note_eval_authority_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+) -> rusqlite::Result<Option<(i64, i64, String)>> {
+    tx.query_row(
+        "SELECT generation, note_eval_protocol_epoch, state
+           FROM mc_authority
+          WHERE project = ?1 AND domain = 'notes'
+          ORDER BY CASE WHEN state = 'MODULE' THEN 0 ELSE 1 END, context_store_uuid
+          LIMIT 1",
+        params![project],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+fn note_eval_module_authority_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+) -> rusqlite::Result<Option<(i64, i64)>> {
+    Ok(note_eval_authority_tx(tx, project)?
+        .filter(|(_, _, state)| state == "MODULE")
+        .map(|(generation, epoch, _)| (generation, epoch)))
+}
+
+fn load_note_eval_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    claim_id: &str,
+) -> rusqlite::Result<Option<NoteEvalClaimRow>> {
+    tx.query_row(
+        &format!(
+            "SELECT {NOTE_EVAL_CLAIM_COLUMNS} FROM mc_note_eval_claims
+              WHERE project = ?1 AND claim_id = ?2"
+        ),
+        params![project, claim_id],
+        note_eval_claim_from_row,
+    )
+    .optional()
+}
+
+fn mark_note_eval_claim_terminal_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    claim_id: &str,
+    kind: &str,
+    completion_id: Option<&str>,
+    response: &str,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "UPDATE mc_note_eval_claims
+            SET terminal_kind = ?1, completion_id = COALESCE(?2, completion_id),
+                terminal_response = ?3, terminal_at_ms = ?4
+          WHERE project = ?5 AND claim_id = ?6 AND terminal_kind IS NULL",
+        params![kind, completion_id, response, now_ms, project, claim_id],
+    )
+}
+
+/// Terminally fence active claims so in-flight evaluations lose their completion
+/// instead of surfacing stale work. `note_id = None` fences the whole project.
+fn fence_active_note_claims_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    note_id: Option<i64>,
+    kind: &str,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "UPDATE mc_note_eval_claims
+            SET terminal_kind = ?1, terminal_response = ?2, terminal_at_ms = ?3
+          WHERE project = ?4 AND terminal_kind IS NULL AND (?5 IS NULL OR note_id = ?5)",
+        params![
+            kind,
+            note_eval_kind_response(kind),
+            now_ms,
+            project,
+            note_id
+        ],
+    )
+}
+
+/// Ledger garbage collection: expire overdue active claims, tombstone expired
+/// `no_work` decisions (`decision = ''` keeps replay identity), then null the
+/// response of terminal claims once their completion-replay window has passed
+/// (`NOTE_EVAL_RESPONSE_REDACT_MS`, well before row deletion at
+/// `NOTE_EVAL_TERMINAL_RETENTION_MS`). Tombstoned rows replay as `Expired`;
+/// they no longer count against either cap.
+fn collect_note_eval_ledgers_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE mc_note_eval_claims
+            SET terminal_kind = 'expired', terminal_response = ?1, terminal_at_ms = ?2
+          WHERE project = ?3 AND terminal_kind IS NULL AND expires_at <= ?2",
+        params![note_eval_kind_response("expired"), now_ms, project],
+    )?;
+    tx.execute(
+        "UPDATE mc_note_eval_acquisitions SET decision = ''
+          WHERE project = ?1 AND decision <> '' AND expires_at <= ?2",
+        params![project, now_ms],
+    )?;
+    tx.execute(
+        "UPDATE mc_note_eval_claims SET terminal_response = NULL
+          WHERE project = ?1 AND terminal_kind IS NOT NULL AND terminal_response IS NOT NULL
+            AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
+        params![project, now_ms - NOTE_EVAL_RESPONSE_REDACT_MS],
+    )?;
+    // Reclaim rows, not just columns. Blanking `decision`/`terminal_response`
+    // stops a row counting toward the cap but leaves it on disk forever, so both
+    // ledgers would grow without bound - one acquisition row per poll, including
+    // every idle no-work poll - and the per-poll GC and cap counts would degrade
+    // into ever-longer scans.
+    tx.execute(
+        "DELETE FROM mc_note_eval_acquisitions
+          WHERE project = ?1 AND decision = '' AND expires_at <= ?2",
+        params![project, now_ms - NOTE_EVAL_NO_WORK_RETENTION_MS],
+    )?;
+    tx.execute(
+        "DELETE FROM mc_note_eval_claims
+          WHERE project = ?1 AND terminal_kind IS NOT NULL
+            AND terminal_at_ms IS NOT NULL AND terminal_at_ms <= ?2",
+        params![project, now_ms - NOTE_EVAL_TERMINAL_RETENTION_MS],
+    )?;
+    Ok(())
+}
+
+impl McStore {
+    /// Acquire one durable evaluation claim or a replayable `no_work` decision.
+    /// `select` receives the pending, unclaimed smart notes and picks (note, phase);
+    /// the decision commits atomically under (project, acquisition_id) uniqueness so
+    /// the same acquisition ID always returns the same decision after response loss.
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire_note_evaluation(
+        &self,
+        project: &str,
+        acquisition_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        registration_generation: i64,
+        select: impl FnOnce(&[NoteEvalCandidate]) -> Option<(i64, String)>,
+        now_ms: i64,
+    ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
+        self.acquire_note_evaluation_with_cap(
+            project,
+            acquisition_id,
+            evaluator_instance,
+            evaluator_slot,
+            registration_generation,
+            select,
+            now_ms,
+            NOTE_EVAL_LEDGER_CAP,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_note_evaluation_with_cap(
+        &self,
+        project: &str,
+        acquisition_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        registration_generation: i64,
+        select: impl FnOnce(&[NoteEvalCandidate]) -> Option<(i64, String)>,
+        now_ms: i64,
+        ledger_cap: i64,
+    ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
+        if project.is_empty()
+            || !note_eval_valid_id(acquisition_id)
+            || !note_eval_valid_id(evaluator_instance)
+            || evaluator_slot < 0
+        {
+            return Ok(NoteEvalAcquireOutcome::Invalid);
+        }
+        self.with_note_conn_fenced(project, |tx| {
+            collect_note_eval_ledgers_tx(tx, project, now_ms)?;
+            let replayed_claim = tx
+                .query_row(
+                    &format!(
+                        "SELECT {NOTE_EVAL_CLAIM_COLUMNS} FROM mc_note_eval_claims
+                          WHERE project = ?1 AND acquisition_id = ?2"
+                    ),
+                    params![project, acquisition_id],
+                    note_eval_claim_from_row,
+                )
+                .optional()?;
+            if let Some(row) = replayed_claim {
+                if let Some(kind) = row.terminal_kind {
+                    return Ok(NoteEvalAcquireOutcome::Terminal {
+                        kind,
+                        response: row.terminal_response,
+                    });
+                }
+                if row.claim.evaluator_instance != evaluator_instance
+                    || row.claim.evaluator_slot != evaluator_slot
+                {
+                    return Ok(NoteEvalAcquireOutcome::Invalid);
+                }
+                return rebind_note_eval_claim_tx(
+                    tx,
+                    project,
+                    row.claim,
+                    acquisition_id,
+                    registration_generation,
+                    now_ms,
+                );
+            }
+            let replayed_decision = tx
+                .query_row(
+                    "SELECT decision FROM mc_note_eval_acquisitions
+                      WHERE project = ?1 AND acquisition_id = ?2",
+                    params![project, acquisition_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(decision) = replayed_decision {
+                return Ok(if decision.is_empty() {
+                    NoteEvalAcquireOutcome::Expired
+                } else {
+                    NoteEvalAcquireOutcome::NoWork { replayed: true }
+                });
+            }
+            let Some((authority_generation, protocol_epoch)) =
+                note_eval_module_authority_tx(tx, project)?
+            else {
+                return Ok(NoteEvalAcquireOutcome::AuthorityChanged);
+            };
+            let slot_claim = tx
+                .query_row(
+                    &format!(
+                        "SELECT {NOTE_EVAL_CLAIM_COLUMNS} FROM mc_note_eval_claims
+                          WHERE project = ?1 AND evaluator_instance = ?2
+                            AND evaluator_slot = ?3 AND terminal_kind IS NULL"
+                    ),
+                    params![project, evaluator_instance, evaluator_slot],
+                    note_eval_claim_from_row,
+                )
+                .optional()?;
+            if let Some(row) = slot_claim {
+                return rebind_note_eval_claim_tx(
+                    tx,
+                    project,
+                    row.claim,
+                    acquisition_id,
+                    registration_generation,
+                    now_ms,
+                );
+            }
+            let candidates = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {NOTE_EVAL_CANDIDATE_COLUMNS} FROM mc_notes
+                      WHERE project_path = ?1 AND type = 'smart' AND status = 'pending'
+                        AND id NOT IN (SELECT note_id FROM mc_note_eval_claims
+                                        WHERE project = ?1 AND terminal_kind IS NULL)
+                      ORDER BY id"
+                ))?;
+                let rows = stmt
+                    .query_map(params![project], note_eval_candidate_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let Some((note_id, phase)) = select(&candidates) else {
+                let live: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM mc_note_eval_acquisitions
+                      WHERE project = ?1 AND decision <> ''",
+                    params![project],
+                    |row| row.get(0),
+                )?;
+                if live >= ledger_cap {
+                    return Ok(NoteEvalAcquireOutcome::Busy);
+                }
+                tx.execute(
+                    "INSERT INTO mc_note_eval_acquisitions(
+                         project, acquisition_id, decision, created_at_ms, expires_at)
+                     VALUES (?1, ?2, 'no_work', ?3, ?4)",
+                    params![
+                        project,
+                        acquisition_id,
+                        now_ms,
+                        now_ms + NOTE_EVAL_NO_WORK_RETENTION_MS
+                    ],
+                )?;
+                return Ok(NoteEvalAcquireOutcome::NoWork { replayed: false });
+            };
+            if !matches!(phase.as_str(), "compile" | "due" | "liveness" | "fallback") {
+                return Ok(NoteEvalAcquireOutcome::Invalid);
+            }
+            let Some(candidate) = candidates.into_iter().find(|note| note.id == note_id) else {
+                return Ok(NoteEvalAcquireOutcome::Invalid);
+            };
+            // Selection ran on the narrow projection; load the full row once for
+            // the note that actually won so the claim snapshot has content,
+            // condition, and the compiled artifact.
+            let note = load_note_tx(tx, candidate.id)?;
+            // Bound IN-FLIGHT claims only. Counting terminal rows still inside the
+            // replay-retention window would turn this cap into a rolling
+            // throughput ceiling: once a project completed `ledger_cap`
+            // evaluations within the retention window every further acquisition
+            // would return Busy and all evaluation would stall until rows aged
+            // out. Terminal-row volume is bounded by deletion in
+            // `collect_note_eval_ledgers_tx` instead.
+            let live: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM mc_note_eval_claims
+                  WHERE project = ?1 AND terminal_kind IS NULL",
+                params![project],
+                |row| row.get(0),
+            )?;
+            if live >= ledger_cap {
+                return Ok(NoteEvalAcquireOutcome::Busy);
+            }
+            let claim = NoteEvalClaim {
+                // The module's wire protocol caps id fields at 128 bytes and
+                // the client echoes this id on every renew/complete/abandon,
+                // so it must stay bounded regardless of how long the project
+                // identity or acquisition id are. The digest keeps it
+                // deterministic per (project, acquisition); a replayed
+                // acquisition reads the stored row.
+                claim_id: {
+                    let mut hasher = Sha256::new();
+                    hasher.update(project.as_bytes());
+                    hasher.update([0u8]);
+                    hasher.update(acquisition_id.as_bytes());
+                    format!("nec:{:x}", hasher.finalize())
+                },
+                note_id: note.id,
+                phase,
+                acquisition_id: acquisition_id.to_string(),
+                evaluator_instance: evaluator_instance.to_string(),
+                evaluator_slot,
+                registration_generation,
+                source_revision: note.source_revision,
+                state_version: note.state_version,
+                policy_version: note.policy_version.unwrap_or(1),
+                protocol_epoch,
+                authority_generation,
+                expires_at: now_ms + NOTE_EVAL_CLAIM_LEASE_MS,
+            };
+            tx.execute(
+                "INSERT INTO mc_note_eval_claims(
+                     claim_id, project, note_id, phase, acquisition_id, evaluator_instance,
+                     evaluator_slot, registration_generation, source_revision, state_version,
+                     policy_version, protocol_epoch, authority_generation, expires_at,
+                     created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    claim.claim_id,
+                    project,
+                    claim.note_id,
+                    claim.phase,
+                    claim.acquisition_id,
+                    claim.evaluator_instance,
+                    claim.evaluator_slot,
+                    claim.registration_generation,
+                    claim.source_revision,
+                    claim.state_version,
+                    claim.policy_version,
+                    claim.protocol_epoch,
+                    claim.authority_generation,
+                    claim.expires_at,
+                    now_ms,
+                ],
+            )?;
+            Ok(NoteEvalAcquireOutcome::Claim {
+                claim,
+                note,
+                replayed: false,
+            })
+        })
+    }
+
+    /// Extend an active claim's lease by one lease interval.
+    pub fn renew_note_evaluation_claim(
+        &self,
+        project: &str,
+        claim_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        registration_generation: i64,
+        now_ms: i64,
+    ) -> Result<NoteEvalRenewOutcome, McStoreError> {
+        self.with_note_conn_fenced(project, |tx| {
+            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                return Ok(NoteEvalRenewOutcome::UnknownClaim);
+            };
+            if let Some(kind) = row.terminal_kind {
+                return Ok(NoteEvalRenewOutcome::TerminalReplay {
+                    kind,
+                    response: row.terminal_response,
+                });
+            }
+            if row.claim.evaluator_instance != evaluator_instance
+                || row.claim.evaluator_slot != evaluator_slot
+            {
+                return Ok(NoteEvalRenewOutcome::Invalid);
+            }
+            if row.claim.expires_at <= now_ms {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "expired",
+                    None,
+                    &note_eval_kind_response("expired"),
+                    now_ms,
+                )?;
+                return Ok(NoteEvalRenewOutcome::Expired);
+            }
+            match note_eval_module_authority_tx(tx, project)? {
+                Some((generation, _)) if generation == row.claim.authority_generation => {}
+                _ => return Ok(NoteEvalRenewOutcome::AuthorityChanged),
+            }
+            let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
+            tx.execute(
+                "UPDATE mc_note_eval_claims
+                    SET expires_at = ?1, registration_generation = ?2
+                  WHERE project = ?3 AND claim_id = ?4 AND terminal_kind IS NULL",
+                params![expires_at, registration_generation, project, claim_id],
+            )?;
+            Ok(NoteEvalRenewOutcome::Renewed { expires_at })
+        })
+    }
+
+    /// Commit one evaluation outcome. `apply` receives the fenced note snapshot and
+    /// returns the reduced lifecycle columns; every fence (identity, lease, authority
+    /// generation, source revision, state version, pending status) is revalidated in
+    /// the same transaction that writes the note and the replayable terminal result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_note_evaluation(
+        &self,
+        project: &str,
+        claim_id: &str,
+        completion_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        now_ms: i64,
+        apply: impl FnOnce(&NoteEvalClaim, &StoredNote) -> Result<NoteEvalReducedState, String>,
+    ) -> Result<NoteEvalCompleteOutcome, McStoreError> {
+        if !note_eval_valid_id(completion_id) {
+            return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+        }
+        self.with_note_conn_fenced(project, |tx| {
+            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                return Ok(NoteEvalCompleteOutcome::Conflict {
+                    kind: "unknown_claim",
+                });
+            };
+            if let Some(kind) = row.terminal_kind {
+                return Ok(match row.completion_id {
+                    Some(stored) if stored == completion_id => match row.terminal_response {
+                        Some(response_json) => NoteEvalCompleteOutcome::Replayed { response_json },
+                        None => NoteEvalCompleteOutcome::Conflict { kind: "expired" },
+                    },
+                    Some(_) => NoteEvalCompleteOutcome::Conflict {
+                        kind: "completion_conflict",
+                    },
+                    None => NoteEvalCompleteOutcome::Conflict {
+                        kind: match kind.as_str() {
+                            "stale" => "stale",
+                            "expired" => "expired",
+                            "authority_changed" => "authority_changed",
+                            _ => "invalid",
+                        },
+                    },
+                });
+            }
+            if row.claim.evaluator_instance != evaluator_instance
+                || row.claim.evaluator_slot != evaluator_slot
+            {
+                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+            }
+            if row.claim.expires_at <= now_ms {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "expired",
+                    None,
+                    &note_eval_kind_response("expired"),
+                    now_ms,
+                )?;
+                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "expired" });
+            }
+            match note_eval_module_authority_tx(tx, project)? {
+                Some((generation, _)) if generation == row.claim.authority_generation => {}
+                _ => {
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "authority_changed",
+                        None,
+                        &note_eval_kind_response("authority_changed"),
+                        now_ms,
+                    )?;
+                    return Ok(NoteEvalCompleteOutcome::Conflict {
+                        kind: "authority_changed",
+                    });
+                }
+            }
+            let stale = |tx: &rusqlite::Transaction<'_>| -> rusqlite::Result<_> {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "stale",
+                    None,
+                    &note_eval_kind_response("stale"),
+                    now_ms,
+                )?;
+                Ok(NoteEvalCompleteOutcome::Conflict { kind: "stale" })
+            };
+            let note = load_note_tx(tx, row.claim.note_id).optional()?;
+            let Some(note) = note.filter(|note| note.project_path == project) else {
+                return stale(tx);
+            };
+            if note.source_revision != row.claim.source_revision
+                || note.state_version != row.claim.state_version
+                || note.status != "pending"
+            {
+                return stale(tx);
+            }
+            let reduced = match apply(&row.claim, &note) {
+                Ok(reduced) => reduced,
+                Err(message) => {
+                    let response = serde_json::json!({
+                        "result": "invalid",
+                        "error": note_eval_bound_response(&message),
+                    })
+                    .to_string();
+                    mark_note_eval_claim_terminal_tx(
+                        tx,
+                        project,
+                        claim_id,
+                        "invalid",
+                        None,
+                        &note_eval_bound_response(&response),
+                        now_ms,
+                    )?;
+                    return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+                }
+            };
+            if !matches!(reduced.status.as_str(), "pending" | "ready") {
+                mark_note_eval_claim_terminal_tx(
+                    tx,
+                    project,
+                    claim_id,
+                    "invalid",
+                    None,
+                    &note_eval_kind_response("invalid"),
+                    now_ms,
+                )?;
+                return Ok(NoteEvalCompleteOutcome::Conflict { kind: "invalid" });
+            }
+            let changed = tx.execute(
+                "UPDATE mc_notes SET status = ?1, ready_at = ?2, ready_reason = ?3,
+                    last_checked_at = ?4, updated_at_ms = ?5, compiled_check = ?6,
+                    manifest_json = ?7, check_hash = ?8, check_cron = ?9, check_version = ?10,
+                    check_status = ?11, check_failure_count = ?12,
+                    check_network_failure_count = ?13, check_quarantined_until = ?14,
+                    check_next_due_at = ?15, check_compiled_at = ?16,
+                    check_false_since_at = ?17, check_last_liveness_at = ?18,
+                    policy_version = ?19, compiled_source_revision = ?20,
+                    compiled_project_path = ?21,
+                    status_version = status_version + 1, state_version = state_version + 1
+                  WHERE id = ?22 AND project_path = ?23 AND status = 'pending'
+                    AND state_version = ?24",
+                params![
+                    reduced.status,
+                    reduced.ready_at,
+                    reduced.ready_reason,
+                    reduced.last_checked_at,
+                    reduced.updated_at_ms,
+                    reduced.compiled_check,
+                    reduced.manifest_json,
+                    reduced.check_hash,
+                    reduced.check_cron,
+                    reduced.check_version.unwrap_or(0),
+                    reduced.check_status,
+                    reduced.check_failure_count,
+                    reduced.check_network_failure_count,
+                    reduced.check_quarantined_until,
+                    reduced.check_next_due_at,
+                    reduced.check_compiled_at,
+                    reduced.check_false_since_at,
+                    reduced.check_last_liveness_at,
+                    reduced.policy_version.unwrap_or(1),
+                    reduced.compiled_source_revision,
+                    reduced.compiled_project_path,
+                    row.claim.note_id,
+                    project,
+                    row.claim.state_version,
+                ],
+            )?;
+            if changed == 0 {
+                return stale(tx);
+            }
+            // Every response field is already known locally (the CAS above
+            // asserted `state_version = row.claim.state_version`), so no
+            // re-read of the row is needed.
+            let response_json = serde_json::json!({
+                "result": "applied",
+                "note_id": row.claim.note_id,
+                "status": reduced.status,
+                "state_version": row.claim.state_version + 1,
+                "check_status": reduced.check_status,
+            })
+            .to_string();
+            mark_note_eval_claim_terminal_tx(
+                tx,
+                project,
+                claim_id,
+                "applied",
+                Some(completion_id),
+                &response_json,
+                now_ms,
+            )?;
+            Ok(NoteEvalCompleteOutcome::Applied { response_json })
+        })
+    }
+
+    /// Terminally release a claim for controlled cancellation. Never touches
+    /// `mc_notes`; abandoning an already-terminal claim replays its terminal kind.
+    pub fn abandon_note_evaluation_claim(
+        &self,
+        project: &str,
+        claim_id: &str,
+        evaluator_instance: &str,
+        evaluator_slot: i64,
+        now_ms: i64,
+    ) -> Result<NoteEvalAbandonOutcome, McStoreError> {
+        self.with_note_conn_fenced(project, |tx| {
+            let Some(row) = load_note_eval_claim_tx(tx, project, claim_id)? else {
+                return Ok(NoteEvalAbandonOutcome::UnknownClaim);
+            };
+            if let Some(kind) = row.terminal_kind {
+                return Ok(NoteEvalAbandonOutcome::Replayed { kind });
+            }
+            if row.claim.evaluator_instance != evaluator_instance
+                || row.claim.evaluator_slot != evaluator_slot
+            {
+                return Ok(NoteEvalAbandonOutcome::Invalid);
+            }
+            mark_note_eval_claim_terminal_tx(
+                tx,
+                project,
+                claim_id,
+                "abandoned",
+                None,
+                &note_eval_kind_response("abandoned"),
+                now_ms,
+            )?;
+            Ok(NoteEvalAbandonOutcome::Abandoned)
+        })
+    }
+}
+
+/// Rebind an active claim to the caller's registration and replay it with the
+/// current note snapshot. The lease is refreshed alongside the rebind: a
+/// re-registered worker schedules its first renewal a full heartbeat interval
+/// out, so replaying a claim with its original near-expiry lease would let the
+/// lease lapse mid-execution and force the billable phase to run again.
+fn rebind_note_eval_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project: &str,
+    mut claim: NoteEvalClaim,
+    acquisition_id: &str,
+    registration_generation: i64,
+    now_ms: i64,
+) -> rusqlite::Result<NoteEvalAcquireOutcome> {
+    let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
+    // The slot-recovery path reaches this rebind with a NEW acquisition id.
+    // Persisting it keeps the replay guarantee: a retry of that id hits the
+    // acquisition-keyed lookup and replays this rebind instead of re-entering
+    // slot recovery and extending the lease again.
+    tx.execute(
+        "UPDATE mc_note_eval_claims
+            SET registration_generation = ?1, expires_at = ?2, acquisition_id = ?3
+          WHERE project = ?4 AND claim_id = ?5 AND terminal_kind IS NULL",
+        params![
+            registration_generation,
+            expires_at,
+            acquisition_id,
+            project,
+            claim.claim_id
+        ],
+    )?;
+    claim.registration_generation = registration_generation;
+    claim.expires_at = expires_at;
+    claim.acquisition_id = acquisition_id.to_string();
+    let note = load_note_tx(tx, claim.note_id)
+        .optional()?
+        .filter(|note| note.project_path == project);
+    let Some(note) = note else {
+        return Ok(NoteEvalAcquireOutcome::Invalid);
+    };
+    Ok(NoteEvalAcquireOutcome::Claim {
+        claim,
+        note,
+        replayed: true,
+    })
+}
+
+/// Canonical digest binding a compiled smart-note artifact to the condition it was
+/// compiled from. Mirrors hashCheck in packages/plugin smart-notes/compiler.ts;
+/// `manifest_json` is hashed exactly as stored so both sides produce the same hex
+/// digest.
+///
+/// This is the ONE definition of that digest: `mc-module` recomputes it from the
+/// authoritative condition to admit a compile completion, and the v51 repair uses it
+/// to decide whether a legacy artifact is trustworthy. A second copy would let those
+/// two decisions drift, which either rejects every valid completion or discards every
+/// legacy artifact.
+pub fn note_check_digest(
+    surface_condition: Option<&str>,
+    compiled_check: &str,
+    manifest_json: Option<&str>,
+    check_cron: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(surface_condition.unwrap_or("").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(compiled_check.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(manifest_json.unwrap_or("").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(check_cron.unwrap_or("").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn repair_note_artifacts_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_path: &str,
+) -> rusqlite::Result<usize> {
+    struct Candidate {
+        id: i64,
+        surface_condition: Option<String>,
+        compiled_check: String,
+        manifest_json: Option<String>,
+        check_hash: Option<String>,
+        check_cron: Option<String>,
+        source_revision: i64,
+    }
+    let candidates = {
+        let mut statement = tx.prepare(
+            "SELECT id, surface_condition, compiled_check, manifest_json, check_hash,
+                    check_cron, source_revision
+               FROM mc_notes
+              WHERE project_path = ?1 AND compiled_check IS NOT NULL
+                AND compiled_source_revision IS NULL
+              ORDER BY id
+              LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![project_path, NOTE_ARTIFACT_REPAIR_BATCH], |row| {
+                Ok(Candidate {
+                    id: row.get(0)?,
+                    surface_condition: row.get(1)?,
+                    compiled_check: row.get(2)?,
+                    manifest_json: row.get(3)?,
+                    check_hash: row.get(4)?,
+                    check_cron: row.get(5)?,
+                    source_revision: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let processed = candidates.len();
+    for candidate in candidates {
+        // A row with no recorded digest cannot be verified either way. Treat it as
+        // trusted-as-is rather than discarding a real compiled artifact: wiping it
+        // forces a fresh LLM compile per note and is unrecoverable, whereas
+        // adopting it only carries forward a pre-v51 artifact the previous binary
+        // was already serving.
+        let verified = match candidate.check_hash.as_deref() {
+            None => true,
+            Some(hash) => {
+                note_check_digest(
+                    candidate.surface_condition.as_deref(),
+                    &candidate.compiled_check,
+                    candidate.manifest_json.as_deref(),
+                    candidate.check_cron.as_deref(),
+                ) == hash
+            }
+        };
+        if verified {
+            tx.execute(
+                "UPDATE mc_notes
+                    SET compiled_source_revision = ?1, compiled_project_path = ?2
+                  WHERE id = ?3",
+                params![candidate.source_revision, project_path, candidate.id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE mc_notes
+                    SET compiled_check = NULL, manifest_json = NULL, check_hash = NULL,
+                        check_cron = NULL, compiled_source_revision = NULL,
+                        compiled_project_path = NULL, check_version = 0,
+                        check_status = 'uncompiled'
+                  WHERE id = ?1",
+                params![candidate.id],
+            )?;
+        }
+    }
+    Ok(processed)
 }
 
 fn promote_facts_tx(
@@ -17176,6 +18675,10 @@ mod tests {
                 surface_condition: Some("later"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -17263,8 +18766,10 @@ mod tests {
         let store = McStore::open(&descriptor(dir.path())).unwrap();
         let session = "counter-cas";
         let core = CoreState::default();
-        let mut initial_meta = ModuleMeta::default();
-        initial_meta.boundary_divergence_pending_count = 0;
+        let initial_meta = ModuleMeta {
+            boundary_divergence_pending_count: 0,
+            ..Default::default()
+        };
         store.commit(session, None, &core, &initial_meta).unwrap();
 
         let left = store.load(session).unwrap();
@@ -20527,6 +22032,10 @@ mod tests {
                 surface_condition: None,
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -22364,6 +23873,10 @@ mod tests {
                 surface_condition: Some("shared condition"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 3,
             })
             .unwrap();
@@ -22475,6 +23988,91 @@ mod tests {
     }
 
     #[test]
+    fn note_update_with_unchanged_condition_is_not_a_compiler_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = store
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("writer-session"),
+                content: "wait for the release",
+                surface_condition: Some("release exists"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 10,
+            })
+            .unwrap();
+        let claimed = store.claim_due_note("git:proj", 20).unwrap().unwrap();
+        let ready = match store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: claimed.status_version,
+                verdict: true,
+                compiled_check: Some("release exists"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: None,
+                now_ms: 30,
+            })
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected evaluation outcome: {other:?}"),
+        };
+        assert!(ready.compiled_check.is_some());
+
+        let unchanged = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                &ready.status,
+                ready.status_version,
+                None,
+                Some(Some("  release exists  ")),
+                None,
+                40,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected unchanged-condition outcome: {other:?}"),
+        };
+        assert_eq!(unchanged.status, ready.status);
+        assert_eq!(unchanged.source_revision, ready.source_revision);
+        assert_eq!(unchanged.compiled_check, ready.compiled_check);
+        // Mutation-neutral: a version bump would fence an active claim for
+        // compiler inputs that did not change.
+        assert_eq!(unchanged.status_version, ready.status_version);
+        assert_eq!(unchanged.state_version, ready.state_version);
+
+        let changed = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                &unchanged.status,
+                unchanged.status_version,
+                None,
+                Some(Some("release tagged")),
+                None,
+                50,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected changed-condition outcome: {other:?}"),
+        };
+        assert_eq!(changed.status, "pending");
+        assert_eq!(changed.source_revision, unchanged.source_revision + 1);
+        assert!(changed.compiled_check.is_none());
+    }
+
+    #[test]
     fn project_notes_use_cas_and_at_least_once_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let store = McStore::open(&descriptor(dir.path())).unwrap();
@@ -22487,6 +24085,10 @@ mod tests {
                 surface_condition: Some("release exists"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 10,
             })
             .unwrap();
@@ -22498,6 +24100,7 @@ mod tests {
                 "pending",
                 note.status_version,
                 Some("wait for the release tag"),
+                None,
                 None,
                 11,
             )
@@ -22517,6 +24120,7 @@ mod tests {
                 "pending",
                 note.status_version,
                 Some("cross-project write"),
+                None,
                 None,
                 11,
             ),
@@ -22600,6 +24204,10 @@ mod tests {
                 surface_condition: Some("condition"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
@@ -22659,6 +24267,10 @@ mod tests {
                     surface_condition: Some("condition"),
                     anchor_block_id: None,
                     anchor_ordinal: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     now_ms: 1,
                 })
                 .unwrap();
@@ -22716,6 +24328,10 @@ mod tests {
                     surface_condition: None,
                     anchor_block_id: None,
                     anchor_ordinal: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
                     now_ms: 1,
                 })
                 .unwrap();
@@ -22744,6 +24360,497 @@ mod tests {
             .unwrap();
         assert_eq!(page.len(), 5);
         assert!(page.iter().all(|note| note.project_path == "git:proj"));
+    }
+
+    fn insert_smart_note_with_compile(
+        store: &McStore,
+        project: &str,
+        content: &str,
+        condition: Option<&str>,
+        compile: Option<NoteConditionCompile<'_>>,
+    ) -> StoredNote {
+        let compile = compile.unwrap_or_default();
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: project,
+                route_project_root: None,
+                session_id: Some("writer"),
+                content,
+                surface_condition: condition,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: compile.compiled_provider,
+                compiled_config: compile.compiled_config,
+                compiled_at: compile.compiled_at,
+                compile_status: compile.compile_status,
+                now_ms: 1,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn note_create_initializes_revisions_equal_and_content_edits_keep_them_equal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note =
+            insert_smart_note_with_compile(&store, "git:proj", "first body", Some("cond"), None);
+        assert_eq!(note.source_revision, 0);
+        assert_eq!(note.state_version, 0);
+        assert_eq!(note.status_version, 0);
+        let mut current = note;
+        for step in 1..=3i64 {
+            let body = format!("body {step}");
+            current = match store
+                .update_note_cas(
+                    "git:proj",
+                    current.id,
+                    &current.status,
+                    current.status_version,
+                    Some(&body),
+                    None,
+                    None,
+                    10 + step,
+                )
+                .unwrap()
+            {
+                NoteCasOutcome::Applied(note) => note,
+                other => panic!("unexpected content edit outcome: {other:?}"),
+            };
+            assert_eq!(current.source_revision, step);
+            assert_eq!(current.state_version, step);
+            assert_eq!(current.status_version, step);
+        }
+    }
+
+    #[test]
+    fn note_content_edit_advances_source_revision_and_resets_evaluation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = insert_smart_note_with_compile(
+            &store,
+            "git:proj",
+            "watch the release",
+            Some("release exists"),
+            Some(NoteConditionCompile {
+                compiled_provider: Some("retina-1"),
+                compiled_config: Some("{\"model\":\"a\"}"),
+                compiled_at: Some(7),
+                compile_status: Some("compiled"),
+            }),
+        );
+        store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: 0,
+                verdict: false,
+                compiled_check: Some("check-code"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: Some(50),
+                now_ms: 2,
+            })
+            .unwrap();
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_notes SET check_failure_count = 3, check_network_failure_count = 2,
+                        check_quarantined_until = 9, check_compiled_at = 8,
+                        check_false_since_at = 7, check_last_liveness_at = 6,
+                        check_cron = '0 * * * *', check_version = 4,
+                        compiled_source_revision = 0, compiled_project_path = 'git:proj'
+                      WHERE id = ?1",
+                    params![note.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let edited = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                1,
+                Some("new body"),
+                None,
+                None,
+                3,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected content edit outcome: {other:?}"),
+        };
+        assert_eq!(edited.source_revision, 1);
+        assert_eq!(edited.state_version, 2);
+        assert_eq!(edited.status_version, 2);
+        assert_eq!(edited.status, "pending");
+        assert_eq!(edited.compiled_check, None);
+        assert_eq!(edited.manifest_json, None);
+        assert_eq!(edited.check_hash, None);
+        assert_eq!(edited.check_cron, None);
+        assert_eq!(edited.compiled_source_revision, None);
+        assert_eq!(edited.compiled_project_path, None);
+        assert_eq!(edited.check_version, Some(0));
+        assert_eq!(edited.check_status.as_deref(), Some("uncompiled"));
+        assert_eq!(edited.check_failure_count, 0);
+        assert_eq!(edited.check_network_failure_count, 0);
+        assert_eq!(edited.check_quarantined_until, None);
+        assert_eq!(edited.check_next_due_at, None);
+        assert_eq!(edited.check_compiled_at, None);
+        assert_eq!(edited.check_false_since_at, None);
+        assert_eq!(edited.check_last_liveness_at, None);
+        assert_eq!(edited.last_checked_at, None);
+        assert_eq!(edited.ready_at, None);
+        assert_eq!(edited.ready_reason, None);
+        assert_eq!(edited.compiled_provider.as_deref(), Some("retina-1"));
+        assert_eq!(edited.compiled_config.as_deref(), Some("{\"model\":\"a\"}"));
+        assert_eq!(edited.compiled_at, Some(7));
+        assert_eq!(edited.compile_status.as_deref(), Some("compiled"));
+    }
+
+    #[test]
+    fn note_condition_edit_resets_evaluation_state_and_replaces_compile_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = insert_smart_note_with_compile(
+            &store,
+            "git:proj",
+            "watch the release",
+            Some("release exists"),
+            Some(NoteConditionCompile {
+                compiled_provider: Some("retina-1"),
+                compiled_config: Some("{\"model\":\"a\"}"),
+                compiled_at: Some(7),
+                compile_status: Some("compiled"),
+            }),
+        );
+        store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: 0,
+                verdict: false,
+                compiled_check: Some("check-code"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: Some(50),
+                now_ms: 2,
+            })
+            .unwrap();
+        let recompiled = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                1,
+                None,
+                Some(Some("tag advances")),
+                Some(NoteConditionCompile {
+                    compiled_provider: Some("retina-2"),
+                    compiled_config: Some("{\"model\":\"b\"}"),
+                    compiled_at: Some(9),
+                    compile_status: Some("plain"),
+                }),
+                3,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected condition edit outcome: {other:?}"),
+        };
+        assert_eq!(recompiled.source_revision, 1);
+        assert_eq!(recompiled.state_version, 2);
+        assert_eq!(recompiled.status_version, 2);
+        assert_eq!(recompiled.status, "pending");
+        assert_eq!(
+            recompiled.surface_condition.as_deref(),
+            Some("tag advances")
+        );
+        assert_eq!(recompiled.compiled_check, None);
+        assert_eq!(recompiled.manifest_json, None);
+        assert_eq!(recompiled.check_hash, None);
+        assert_eq!(recompiled.check_status.as_deref(), Some("uncompiled"));
+        assert_eq!(recompiled.compiled_provider.as_deref(), Some("retina-2"));
+        assert_eq!(
+            recompiled.compiled_config.as_deref(),
+            Some("{\"model\":\"b\"}")
+        );
+        assert_eq!(recompiled.compiled_at, Some(9));
+        assert_eq!(recompiled.compile_status.as_deref(), Some("plain"));
+        let cleared = match store
+            .update_note_cas(
+                "git:proj",
+                note.id,
+                "pending",
+                2,
+                None,
+                Some(Some("third condition")),
+                None,
+                4,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected condition edit outcome: {other:?}"),
+        };
+        assert_eq!(cleared.source_revision, 2);
+        assert_eq!(cleared.state_version, 3);
+        assert_eq!(cleared.compiled_provider, None);
+        assert_eq!(cleared.compiled_config, None);
+        assert_eq!(cleared.compiled_at, None);
+        assert_eq!(cleared.compile_status, None);
+    }
+
+    #[test]
+    fn note_lifecycle_transitions_advance_state_but_not_source_and_keep_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let note = insert_smart_note_with_compile(
+            &store,
+            "git:proj",
+            "surface me",
+            Some("release exists"),
+            None,
+        );
+        let ready = match store
+            .write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: 0,
+                verdict: true,
+                compiled_check: Some("check-code"),
+                manifest_json: Some("{}"),
+                check_hash: Some("hash"),
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected evaluation outcome: {other:?}"),
+        };
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.status_version, 1);
+        assert_eq!(ready.state_version, 1);
+        assert_eq!(ready.source_revision, 0);
+        let (surfacing, _) = store
+            .claim_note_delivery("git:proj", "session", "fingerprint", "pass", 3)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(surfacing.status, "surfacing");
+        assert_eq!(surfacing.status_version, 2);
+        assert_eq!(surfacing.state_version, 2);
+        assert_eq!(surfacing.source_revision, 0);
+        store
+            .ack_note_delivery("git:proj", "session", "pass", 4)
+            .unwrap();
+        let surfaced = store
+            .get_note_by_id("git:proj", "session", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(surfaced.status, "surfaced");
+        assert_eq!(surfaced.status_version, 3);
+        assert_eq!(surfaced.state_version, 3);
+        assert_eq!(surfaced.source_revision, 0);
+        let dismissed = match store
+            .dismiss_note_cas("git:proj", note.id, "surfaced", 3, Some("done"), 5)
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("unexpected dismissal outcome: {other:?}"),
+        };
+        assert_eq!(dismissed.status, "dismissed");
+        assert_eq!(dismissed.status_version, 4);
+        assert_eq!(dismissed.state_version, 4);
+        assert_eq!(dismissed.source_revision, 0);
+        assert_eq!(dismissed.compiled_check.as_deref(), Some("check-code"));
+        assert_eq!(dismissed.manifest_json.as_deref(), Some("{}"));
+        assert_eq!(dismissed.check_hash.as_deref(), Some("hash"));
+
+        let due =
+            insert_smart_note_with_compile(&store, "git:proj", "due note", Some("cond"), None);
+        let claimed = store.claim_due_note("git:proj", 10).unwrap().unwrap();
+        assert_eq!(claimed.id, due.id);
+        assert_eq!(claimed.status_version, 1);
+        assert_eq!(claimed.state_version, 1);
+        assert_eq!(claimed.source_revision, 0);
+    }
+
+    fn register_pre_v2_note_functions(conn: &rusqlite::Connection, project: &'static str) {
+        conn.create_scalar_function(
+            "mc_note_caller_project",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            move |_context| Ok(project.to_string()),
+        )
+        .unwrap();
+        conn.create_scalar_function(
+            "mc_facade_authority_domain",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(String::new()),
+        )
+        .unwrap();
+        conn.create_scalar_function(
+            "mc_facade_authority_route",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(String::new()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_v51_backfill_initializes_revisions_and_normalizes_check_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        drop(McStore::open(&descriptor(dir.path())).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        register_pre_v2_note_functions(&conn, "git:proj");
+        conn.create_scalar_function(
+            "mc_note_writer_v2",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(1i64),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_notes
+                (type, project_path, session_id, content, status, check_status,
+                 status_version, created_at_ms, updated_at_ms)
+             VALUES ('smart', 'git:proj', 'writer', 'legacy row', 'pending', 'true', 7, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mc_notes SET source_revision = status_version, state_version = status_version",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE mc_notes SET check_status = 'uncompiled'
+              WHERE check_status NOT IN ('uncompiled', 'compiled', 'failing', 'fallback')",
+            [],
+        )
+        .unwrap();
+        let (source, state, status_version, check_status) = conn
+            .query_row(
+                "SELECT source_revision, state_version, status_version, check_status
+                   FROM mc_notes WHERE content = 'legacy row'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((source, state, status_version), (7, 7, 7));
+        assert_eq!(check_status, "uncompiled");
+    }
+
+    #[test]
+    fn note_artifact_repair_verifies_digest_or_clears_compiled_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let good = insert_smart_note_with_compile(&store, "git:proj", "good", Some("cond"), None);
+        let bad = insert_smart_note_with_compile(&store, "git:proj", "bad", Some("cond"), None);
+        let manifest = "{\"hosts\":[]}";
+        let good_hash = note_check_digest(
+            Some("cond"),
+            "check-code",
+            Some(manifest),
+            Some("0 * * * *"),
+        );
+        store
+            .inner
+            .with_conn(|conn| {
+                for (id, hash) in [(good.id, good_hash.as_str()), (bad.id, "forged")] {
+                    conn.execute(
+                        "UPDATE mc_notes SET compiled_check = 'check-code', manifest_json = ?2,
+                            check_hash = ?3, check_cron = '0 * * * *',
+                            check_status = 'compiled', check_version = 4
+                          WHERE id = ?1",
+                        params![id, manifest, hash],
+                    )?;
+                }
+                conn.execute(
+                    "DELETE FROM mc_cache_state WHERE session_id = 'note_artifact_repair_v51_done'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store.repair_note_artifacts_v51().unwrap();
+        let verified = store
+            .get_note_by_id("git:proj", "writer", good.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.compiled_check.as_deref(), Some("check-code"));
+        assert_eq!(verified.manifest_json.as_deref(), Some(manifest));
+        assert_eq!(verified.check_hash.as_deref(), Some(good_hash.as_str()));
+        assert_eq!(verified.compiled_source_revision, Some(0));
+        assert_eq!(verified.compiled_project_path.as_deref(), Some("git:proj"));
+        assert_eq!(verified.check_status.as_deref(), Some("compiled"));
+        assert_eq!(verified.check_version, Some(4));
+        assert_eq!(verified.status_version, 0);
+        assert_eq!(verified.state_version, 0);
+        assert_eq!(verified.source_revision, 0);
+        let cleared = store
+            .get_note_by_id("git:proj", "writer", bad.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.compiled_check, None);
+        assert_eq!(cleared.manifest_json, None);
+        assert_eq!(cleared.check_hash, None);
+        assert_eq!(cleared.check_cron, None);
+        assert_eq!(cleared.compiled_source_revision, None);
+        assert_eq!(cleared.compiled_project_path, None);
+        assert_eq!(cleared.check_version, Some(0));
+        assert_eq!(cleared.check_status.as_deref(), Some("uncompiled"));
+        assert_eq!(cleared.content, "bad");
+        assert_eq!(cleared.status, "pending");
+        assert_eq!(cleared.status_version, 0);
+        assert_eq!(cleared.state_version, 0);
+        assert_eq!(cleared.source_revision, 0);
+        store.repair_note_artifacts_v51().unwrap();
+    }
+
+    #[test]
+    fn mc_notes_writer_fence_blocks_connections_without_the_v2_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.db");
+        drop(McStore::open(&descriptor(dir.path())).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        register_pre_v2_note_functions(&conn, "git:proj");
+        let insert = "INSERT INTO mc_notes
+                (type, project_path, session_id, content, status, created_at_ms, updated_at_ms)
+             VALUES ('smart', 'git:proj', 'writer', 'fenced write', 'active', 1, 1)";
+        let error = conn.execute(insert, []).unwrap_err().to_string();
+        assert!(error.contains("mc_note_writer_v2"), "{error}");
+        conn.create_scalar_function(
+            "mc_note_writer_v2",
+            0,
+            FunctionFlags::SQLITE_UTF8,
+            |_context| Ok(1i64),
+        )
+        .unwrap();
+        conn.execute(insert, []).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mc_notes WHERE content = 'fenced write'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -22998,6 +25105,978 @@ mod tests {
             store.load("ses").unwrap().meta.historian.state,
             HistorianPhase::Publishing
         );
+    }
+
+    const EVAL_PROJECT: &str = "git:proj";
+
+    fn note_eval_store(dir: &std::path::Path) -> McStore {
+        let store = McStore::open(&descriptor(dir)).unwrap();
+        let preparing = store
+            .authority_begin_prepare("ctx", EVAL_PROJECT, "notes")
+            .unwrap();
+        store
+            .authority_finish_prepare(
+                "ctx",
+                EVAL_PROJECT,
+                "notes",
+                preparing.generation,
+                "hash",
+                "hash",
+                true,
+            )
+            .unwrap();
+        store
+    }
+
+    fn eval_note(store: &McStore, content: &str) -> StoredNote {
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: EVAL_PROJECT,
+                route_project_root: None,
+                session_id: Some("writer"),
+                content,
+                surface_condition: Some("condition"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 1,
+            })
+            .unwrap()
+    }
+
+    fn pick_first(notes: &[NoteEvalCandidate]) -> Option<(i64, String)> {
+        notes.first().map(|note| (note.id, "due".to_string()))
+    }
+
+    fn eval_reduced(note: &StoredNote, status: &str, now_ms: i64) -> NoteEvalReducedState {
+        let ready = status == "ready";
+        NoteEvalReducedState {
+            status: status.to_string(),
+            ready_at: ready.then_some(now_ms),
+            ready_reason: ready.then(|| "condition_true".to_string()),
+            last_checked_at: Some(now_ms),
+            updated_at_ms: now_ms,
+            compiled_check: Some("compiled body".to_string()),
+            manifest_json: Some("{}".to_string()),
+            check_hash: Some("hash".to_string()),
+            check_cron: note.check_cron.clone(),
+            check_version: Some(1),
+            check_status: Some("compiled".to_string()),
+            check_failure_count: note.check_failure_count,
+            check_network_failure_count: note.check_network_failure_count,
+            check_quarantined_until: None,
+            check_next_due_at: Some(now_ms + 60_000),
+            check_compiled_at: Some(now_ms),
+            check_false_since_at: None,
+            check_last_liveness_at: None,
+            policy_version: note.policy_version,
+            compiled_source_revision: Some(note.source_revision),
+            compiled_project_path: Some(EVAL_PROJECT.to_string()),
+        }
+    }
+
+    fn eval_claim(store: &McStore, acquisition_id: &str, slot: i64, now_ms: i64) -> NoteEvalClaim {
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                acquisition_id,
+                "eval-a",
+                slot,
+                1,
+                pick_first,
+                now_ms,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim,
+                replayed: false,
+                ..
+            } => claim,
+            other => panic!("expected fresh claim, got {other:?}"),
+        }
+    }
+
+    fn reload_note(store: &McStore, id: i64) -> StoredNote {
+        store
+            .get_note_by_id(EVAL_PROJECT, "writer", id)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn note_eval_acquire_replays_lost_claim_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 100);
+        assert_eq!(claim.note_id, note.id);
+        match store
+            .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 2, pick_first, 200)
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: replayed,
+                replayed: true,
+                ..
+            } => {
+                assert_eq!(replayed.claim_id, claim.claim_id);
+                assert_eq!(replayed.registration_generation, 2);
+                // The rebind refreshes the lease: a reconnecting worker
+                // schedules its first renewal a full heartbeat interval out,
+                // so replaying with the original near-expiry lease would let
+                // it lapse mid-execution.
+                assert_eq!(replayed.expires_at, 200 + NOTE_EVAL_CLAIM_LEASE_MS);
+            }
+            other => panic!("expected replayed claim, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 1, 2, pick_first, 200)
+                .unwrap(),
+            NoteEvalAcquireOutcome::Invalid,
+            "a different slot must not steal a replayed acquisition identity"
+        );
+    }
+
+    #[test]
+    fn note_eval_claim_ids_fit_the_wire_id_limit_for_long_project_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        // The module rejects id fields over 128 bytes, so a claim id must stay
+        // bounded even when the project identity alone exceeds that budget.
+        let project = format!("dir:/{}", "p".repeat(200));
+        let preparing = store
+            .authority_begin_prepare("ctx", &project, "notes")
+            .unwrap();
+        store
+            .authority_finish_prepare(
+                "ctx",
+                &project,
+                "notes",
+                preparing.generation,
+                "hash",
+                "hash",
+                true,
+            )
+            .unwrap();
+        store
+            .insert_project_note(NoteWriteInput {
+                project_path: &project,
+                route_project_root: None,
+                session_id: Some("writer"),
+                content: "watch the build",
+                surface_condition: Some("condition"),
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        match store
+            .acquire_note_evaluation(&project, "acq-long", "eval-a", 0, 1, pick_first, 100)
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { claim, .. } => {
+                assert!(
+                    claim.claim_id.len() <= 128,
+                    "claim id must fit the module's 128-byte id fields, got {} bytes",
+                    claim.claim_id.len()
+                );
+            }
+            other => panic!("expected claim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn note_eval_no_work_decision_replays_after_work_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let outcome = store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-1",
+                "eval-a",
+                0,
+                1,
+                |notes| {
+                    assert!(notes.is_empty());
+                    None
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(outcome, NoteEvalAcquireOutcome::NoWork { replayed: false });
+        eval_note(&store, "new work");
+        assert_eq!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 1, pick_first, 200)
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: true },
+            "the durable decision wins over newly available work"
+        );
+        assert!(matches!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-2", "eval-a", 0, 1, pick_first, 300)
+                .unwrap(),
+            NoteEvalAcquireOutcome::Claim {
+                replayed: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn note_eval_slot_with_active_claim_recovers_it_for_a_new_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 100);
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                0,
+                2,
+                |_| panic!("selection must not run when the slot already owns a claim"),
+                200,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: recovered,
+                replayed: true,
+                ..
+            } => {
+                assert_eq!(recovered.claim_id, claim.claim_id);
+                // The rebind adopts the new acquisition id so a retry of it
+                // replays this decision from the acquisition-keyed lookup
+                // instead of re-entering slot recovery.
+                assert_eq!(recovered.acquisition_id, "acq-2");
+            }
+            other => panic!("expected recovered claim, got {other:?}"),
+        }
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                0,
+                2,
+                |_| panic!("a replayed acquisition must not re-select"),
+                300,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: replayed,
+                replayed: true,
+                ..
+            } => assert_eq!(replayed.claim_id, claim.claim_id),
+            other => panic!("expected replayed rebind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn note_eval_ledger_rows_are_reclaimed_after_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note");
+
+        // One no-work acquisition, then one terminal claim.
+        let idle_at = 1_000;
+        store
+            .acquire_note_evaluation(EVAL_PROJECT, "idle-1", "eval-a", 0, 1, |_| None, idle_at)
+            .unwrap();
+        let claim = eval_claim(&store, "acq-1", 0, idle_at);
+        store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "done-1",
+                "eval-a",
+                0,
+                idle_at,
+                |_claim, note| Ok(eval_reduced(note, "pending", idle_at)),
+            )
+            .unwrap();
+
+        let count = |table: &str| -> i64 {
+            store
+                .inner
+                .with_conn(|conn| {
+                    Ok(conn
+                        .query_row(
+                            &format!("SELECT COUNT(*) FROM {table} WHERE project = ?1"),
+                            params![EVAL_PROJECT],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap())
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            count("mc_note_eval_acquisitions"),
+            1,
+            "the idle poll records a replayable no_work decision"
+        );
+        assert_eq!(count("mc_note_eval_claims"), 1);
+
+        // Past both retention windows the GC must RECLAIM rows, not merely blank
+        // their columns; otherwise the ledgers grow for the life of the store.
+        let after_retention =
+            idle_at + NOTE_EVAL_TERMINAL_RETENTION_MS + NOTE_EVAL_NO_WORK_RETENTION_MS + 1;
+        store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "idle-2",
+                "eval-a",
+                0,
+                1,
+                |_| None,
+                after_retention,
+            )
+            .unwrap();
+        assert_eq!(
+            count("mc_note_eval_claims"),
+            0,
+            "terminal claims past retention must be deleted"
+        );
+        assert_eq!(
+            count("mc_note_eval_acquisitions"),
+            1,
+            "only the current acquisition should remain"
+        );
+    }
+
+    #[test]
+    fn note_eval_terminal_response_is_redacted_before_row_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note");
+
+        let now = 1_000;
+        let claim = eval_claim(&store, "acq-1", 0, now);
+        store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "done-1",
+                "eval-a",
+                0,
+                now,
+                |_claim, note| Ok(eval_reduced(note, "pending", now)),
+            )
+            .unwrap();
+
+        // Trigger GC via an idle poll at `at`, then report
+        // (terminal rows, terminal rows still carrying a response).
+        let response_state = |at: i64| -> (i64, i64) {
+            store
+                .acquire_note_evaluation(
+                    EVAL_PROJECT,
+                    &format!("idle-{at}"),
+                    "eval-a",
+                    0,
+                    1,
+                    |_| None,
+                    at,
+                )
+                .unwrap();
+            store
+                .inner
+                .with_conn(|conn| {
+                    let rows = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM mc_note_eval_claims WHERE project = ?1",
+                            params![EVAL_PROJECT],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap();
+                    let with_response = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM mc_note_eval_claims
+                              WHERE project = ?1 AND terminal_response IS NOT NULL",
+                            params![EVAL_PROJECT],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap();
+                    Ok((rows, with_response))
+                })
+                .unwrap()
+        };
+
+        assert_eq!(
+            response_state(now + NOTE_EVAL_RESPONSE_REDACT_MS - 1),
+            (1, 1),
+            "inside the redact window the replay payload is retained"
+        );
+        assert_eq!(
+            response_state(now + NOTE_EVAL_RESPONSE_REDACT_MS),
+            (1, 0),
+            "past the redact window the response is nulled while the row is retained"
+        );
+        assert_eq!(
+            response_state(now + NOTE_EVAL_TERMINAL_RETENTION_MS),
+            (0, 0),
+            "past terminal retention the row itself is deleted"
+        );
+    }
+
+    #[test]
+    fn note_eval_cap_counts_live_claims_not_retained_terminal_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note");
+        let now = 1_000;
+
+        // Retire one claim, leaving a terminal row inside the retention window.
+        let claim = eval_claim(&store, "acq-1", 0, now);
+        store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "done-1",
+                "eval-a",
+                0,
+                now,
+                |_claim, note| Ok(eval_reduced(note, "pending", now)),
+            )
+            .unwrap();
+
+        // With the cap squeezed to 1, a retained terminal row must NOT deny new
+        // work: counting it would turn the cap into a rolling throughput ceiling
+        // that stalls the project until rows aged out.
+        match store
+            .acquire_note_evaluation_with_cap(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                0,
+                1,
+                pick_first,
+                now + 1,
+                1,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { .. } => {}
+            other => panic!("terminal rows must not consume the live cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v51_repair_keeps_a_legacy_artifact_that_has_no_recorded_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "note");
+
+        // Legacy shape: a compiled artifact with NO check_hash, so verification is
+        // impossible either way. Discarding it would force a fresh LLM compile.
+        // The repair is one-shot per store and already ran during open(), so clear
+        // its completion flag to exercise it against this row.
+        store
+            .inner
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE mc_notes SET compiled_check = 'legacy body', manifest_json = '{}',
+                        check_hash = NULL, check_status = 'compiled',
+                        compiled_source_revision = NULL
+                      WHERE id = ?1",
+                    params![note.id],
+                )?;
+                conn.execute(
+                    "DELETE FROM mc_cache_state WHERE session_id = ?1",
+                    params!["note_artifact_repair_v51_done"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        store.repair_note_artifacts_v51().unwrap();
+
+        let repaired = reload_note(&store, note.id);
+        assert_eq!(
+            repaired.compiled_check.as_deref(),
+            Some("legacy body"),
+            "an unverifiable legacy artifact must be adopted, not destroyed"
+        );
+        assert!(
+            repaired.compiled_source_revision.is_some(),
+            "adoption must stamp the provenance so the repair does not run forever"
+        );
+    }
+
+    #[test]
+    fn note_eval_active_claims_are_unique_per_note_and_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let first = eval_note(&store, "note one");
+        let second = eval_note(&store, "note two");
+        let claim = eval_claim(&store, "acq-1", 0, 100);
+        assert_eq!(claim.note_id, first.id);
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-a",
+                1,
+                1,
+                |notes| {
+                    assert_eq!(
+                        notes.iter().map(|note| note.id).collect::<Vec<_>>(),
+                        vec![second.id],
+                        "a claimed note must not be offered again"
+                    );
+                    pick_first(notes)
+                },
+                200,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { claim, .. } => assert_eq!(claim.note_id, second.id),
+            other => panic!("expected claim on the second note, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .acquire_note_evaluation(
+                    EVAL_PROJECT,
+                    "acq-3",
+                    "eval-b",
+                    0,
+                    1,
+                    |notes| {
+                        assert!(notes.is_empty());
+                        None
+                    },
+                    300,
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: false }
+        );
+    }
+
+    #[test]
+    fn note_eval_renewal_extends_and_expiry_frees_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        assert_eq!(claim.expires_at, NOTE_EVAL_CLAIM_LEASE_MS);
+        assert_eq!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 60_000)
+                .unwrap(),
+            NoteEvalRenewOutcome::Renewed {
+                expires_at: 60_000 + NOTE_EVAL_CLAIM_LEASE_MS
+            }
+        );
+        let expiry = 60_000 + NOTE_EVAL_CLAIM_LEASE_MS;
+        assert_eq!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, expiry)
+                .unwrap(),
+            NoteEvalRenewOutcome::Expired
+        );
+        assert!(matches!(
+            store
+                .renew_note_evaluation_claim(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "eval-a",
+                    0,
+                    1,
+                    expiry + 1
+                )
+                .unwrap(),
+            NoteEvalRenewOutcome::TerminalReplay { ref kind, .. } if kind == "expired"
+        ));
+        match store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-2",
+                "eval-b",
+                0,
+                1,
+                pick_first,
+                expiry + 1,
+            )
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim {
+                claim: second,
+                replayed: false,
+                ..
+            } => assert_eq!(second.note_id, note.id),
+            other => panic!("expected the note to be claimable again, got {other:?}"),
+        }
+        let before = reload_note(&store, note.id);
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    expiry + 2,
+                    |_claim, note| Ok(eval_reduced(note, "ready", expiry + 2)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "expired" }
+        );
+        let after = reload_note(&store, note.id);
+        assert_eq!(
+            after, before,
+            "an expired completion must not mutate the note"
+        );
+    }
+
+    #[test]
+    fn note_eval_completion_applies_replays_and_detects_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        let response = match store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &claim.claim_id,
+                "comp-1",
+                "eval-a",
+                0,
+                50,
+                |_claim, note| Ok(eval_reduced(note, "pending", 50)),
+            )
+            .unwrap()
+        {
+            NoteEvalCompleteOutcome::Applied { response_json } => response_json,
+            other => panic!("expected applied completion, got {other:?}"),
+        };
+        let applied = reload_note(&store, note.id);
+        assert_eq!(applied.state_version, note.state_version + 1);
+        assert_eq!(applied.status_version, note.status_version + 1);
+        assert_eq!(applied.state_version, applied.status_version);
+        assert_eq!(applied.source_revision, note.source_revision);
+        assert_eq!(applied.status, "pending");
+        assert!(!response.contains("watch the build"));
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    60,
+                    |_, _| panic!("a replayed completion must not run the reducer"),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Replayed {
+                response_json: response.clone()
+            }
+        );
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-2",
+                    "eval-a",
+                    0,
+                    70,
+                    |_, _| panic!("a conflicting completion must not run the reducer"),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict {
+                kind: "completion_conflict"
+            }
+        );
+        let second = eval_claim(&store, "acq-2", 0, 100);
+        assert_eq!(second.note_id, note.id);
+        assert_eq!(second.state_version, applied.state_version);
+        match store
+            .complete_note_evaluation(
+                EVAL_PROJECT,
+                &second.claim_id,
+                "comp-3",
+                "eval-a",
+                0,
+                150,
+                |_claim, note| Ok(eval_reduced(note, "ready", 150)),
+            )
+            .unwrap()
+        {
+            NoteEvalCompleteOutcome::Applied { .. } => {
+                assert_eq!(reload_note(&store, note.id).status, "ready");
+            }
+            other => panic!("expected second completion to apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn note_eval_edit_and_dismissal_fence_active_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        let edited = match store
+            .update_note_cas(
+                EVAL_PROJECT,
+                note.id,
+                "pending",
+                note.status_version,
+                Some("watch the release"),
+                None,
+                None,
+                10,
+            )
+            .unwrap()
+        {
+            NoteCasOutcome::Applied(note) => note,
+            other => panic!("expected the edit to apply, got {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 20)
+                .unwrap(),
+            NoteEvalRenewOutcome::TerminalReplay { ref kind, .. } if kind == "stale"
+        ));
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    30,
+                    |_claim, note| Ok(eval_reduced(note, "ready", 30)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "stale" }
+        );
+        assert_eq!(reload_note(&store, note.id), edited);
+
+        let second = eval_note(&store, "another note");
+        let second_claim = eval_claim(&store, "acq-2", 0, 40);
+        assert_eq!(second_claim.note_id, edited.id.min(second.id));
+        store
+            .dismiss_note(
+                EVAL_PROJECT,
+                "writer",
+                second_claim.note_id,
+                Some("done"),
+                50,
+            )
+            .unwrap()
+            .expect("dismissal applies");
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &second_claim.claim_id,
+                    "comp-2",
+                    "eval-a",
+                    0,
+                    60,
+                    |_claim, note| Ok(eval_reduced(note, "ready", 60)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict { kind: "stale" }
+        );
+        assert_eq!(
+            reload_note(&store, second_claim.note_id).status,
+            "dismissed"
+        );
+    }
+
+    #[test]
+    fn note_eval_drain_fences_claims_with_authority_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        let before = reload_note(&store, note.id);
+        store
+            .authority_begin_drain("ctx", EVAL_PROJECT, "notes", "lease", 1_000_000, 10)
+            .unwrap();
+        assert!(matches!(
+            store
+                .renew_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 1, 20)
+                .unwrap(),
+            NoteEvalRenewOutcome::TerminalReplay { ref kind, .. } if kind == "authority_changed"
+        ));
+        assert_eq!(
+            store
+                .complete_note_evaluation(
+                    EVAL_PROJECT,
+                    &claim.claim_id,
+                    "comp-1",
+                    "eval-a",
+                    0,
+                    30,
+                    |_claim, note| Ok(eval_reduced(note, "ready", 30)),
+                )
+                .unwrap(),
+            NoteEvalCompleteOutcome::Conflict {
+                kind: "authority_changed"
+            }
+        );
+        assert_eq!(reload_note(&store, note.id), before);
+        assert_eq!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-2", "eval-a", 0, 1, pick_first, 40)
+                .unwrap(),
+            NoteEvalAcquireOutcome::AuthorityChanged
+        );
+    }
+
+    #[test]
+    fn note_eval_ledger_caps_return_busy_and_tombstones_replay_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "note one");
+        eval_note(&store, "note two");
+        assert!(matches!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-1",
+                    "eval-a",
+                    0,
+                    1,
+                    pick_first,
+                    0,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Claim { .. }
+        ));
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-2",
+                    "eval-a",
+                    1,
+                    1,
+                    pick_first,
+                    10,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Busy,
+            "a saturated protected claim ledger must refuse new claims"
+        );
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-3",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    20,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: false }
+        );
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-4",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    30,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Busy,
+            "a saturated no-work ledger must refuse new decisions"
+        );
+        let after_retention = 20 + NOTE_EVAL_NO_WORK_RETENTION_MS + 1;
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-4",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    after_retention,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork { replayed: false },
+            "tombstoning the expired decision frees ledger capacity"
+        );
+        assert_eq!(
+            store
+                .acquire_note_evaluation_with_cap(
+                    EVAL_PROJECT,
+                    "acq-3",
+                    "eval-b",
+                    0,
+                    1,
+                    |_| None,
+                    after_retention + 1,
+                    1
+                )
+                .unwrap(),
+            NoteEvalAcquireOutcome::Expired,
+            "a tombstoned decision replays as expired"
+        );
+    }
+
+    #[test]
+    fn note_eval_abandon_is_replayable_and_never_touches_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        let note = eval_note(&store, "watch the build");
+        let before = reload_note(&store, note.id);
+        let claim = eval_claim(&store, "acq-1", 0, 0);
+        assert_eq!(
+            store
+                .abandon_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 10)
+                .unwrap(),
+            NoteEvalAbandonOutcome::Abandoned
+        );
+        assert_eq!(
+            reload_note(&store, note.id),
+            before,
+            "abandon must not change note state or failure counters"
+        );
+        assert_eq!(
+            store
+                .abandon_note_evaluation_claim(EVAL_PROJECT, &claim.claim_id, "eval-a", 0, 20)
+                .unwrap(),
+            NoteEvalAbandonOutcome::Replayed {
+                kind: "abandoned".to_string()
+            }
+        );
+        match store
+            .acquire_note_evaluation(EVAL_PROJECT, "acq-2", "eval-a", 0, 1, pick_first, 30)
+            .unwrap()
+        {
+            NoteEvalAcquireOutcome::Claim { claim: second, .. } => {
+                assert_eq!(second.note_id, note.id)
+            }
+            other => panic!("expected the note to be claimable after abandon, got {other:?}"),
+        }
     }
 }
 

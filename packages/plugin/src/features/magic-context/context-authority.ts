@@ -69,24 +69,134 @@ export interface AuthorityModuleClient {
     }): Promise<{ page: ChangefeedPage }>;
 }
 
+import type { DrainResult } from "./smart-notes/evaluator-worker";
+
 export interface ModuleNoteEvaluationBridge {
     sync(): Promise<void>;
-    evaluate(args: { contextNoteId: number; sessionId: string; verdict: boolean }): Promise<void>;
+    drain(args: {
+        deadline: number;
+        signal?: AbortSignal;
+        /** Ask the authority for sandbox-only phases (due, liveness). */
+        excludeBillable?: boolean;
+        /** Client-side bound on billable claims; absent = legacy per-run cap. */
+        maxCompilePerRun?: number;
+        maxFallbackPerRun?: number;
+    }): Promise<DrainResult>;
+    available(): boolean;
+    /** Retry a failed or premature evaluator registration; no-op when live. */
+    ensureRegistered?(): Promise<void>;
+    dispose(): Promise<void>;
 }
 
-const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridge>();
+/** One registered bridge plus the number of plugin instances relying on it. */
+interface ModuleNoteEvaluationBridgeEntry {
+    bridge: ModuleNoteEvaluationBridge;
+    owners: number;
+}
 
+const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridgeEntry>();
+
+/**
+ * Composite registry key. Worktrees of one repository share a project
+ * identity but bind different checkout roots, and each root's bridge closes
+ * over its own transport route and filesystem capabilities, so identity alone
+ * cannot address a bridge. NUL cannot appear in a filesystem path.
+ */
+export function moduleNoteEvaluationBridgeKey(projectPath: string, projectRoot: string): string {
+    return `${projectPath}\u0000${projectRoot}`;
+}
+
+/** Registers the bridge (one owner) and returns its registry key for later disposal. */
 export function registerModuleNoteEvaluationBridge(
     projectPath: string,
+    projectRoot: string,
     bridge: ModuleNoteEvaluationBridge,
-): void {
-    moduleNoteEvaluationBridges.set(projectPath, bridge);
+): string {
+    const key = moduleNoteEvaluationBridgeKey(projectPath, projectRoot);
+    moduleNoteEvaluationBridges.set(key, { bridge, owners: 1 });
+    return key;
 }
 
+/**
+ * Record another owner of an already-registered exact bridge and return its
+ * registry key, or undefined when no such bridge exists. A second plugin
+ * instance serving the same (identity, root) must retain rather than skip:
+ * otherwise the first instance's disposal tears down the only registry entry
+ * while the second instance still routes conditioned writes through it.
+ */
+export function retainModuleNoteEvaluationBridge(
+    projectPath: string,
+    projectRoot: string,
+): string | undefined {
+    const key = moduleNoteEvaluationBridgeKey(projectPath, projectRoot);
+    const entry = moduleNoteEvaluationBridges.get(key);
+    if (!entry) return undefined;
+    entry.owners += 1;
+    return key;
+}
+
+/**
+ * With `projectRoot`: the bridge bound to that exact checkout. Without it: any
+ * bridge for the identity, for identity-scoped questions such as "does a live
+ * evaluator exist" or "does the module own drains for this project".
+ */
 export function getModuleNoteEvaluationBridge(
     projectPath: string,
+    projectRoot?: string,
 ): ModuleNoteEvaluationBridge | undefined {
-    return moduleNoteEvaluationBridges.get(projectPath);
+    if (projectRoot !== undefined) {
+        return moduleNoteEvaluationBridges.get(
+            moduleNoteEvaluationBridgeKey(projectPath, projectRoot),
+        )?.bridge;
+    }
+    const prefix = `${projectPath}\u0000`;
+    for (const [key, entry] of moduleNoteEvaluationBridges) {
+        if (key.startsWith(prefix)) return entry.bridge;
+    }
+    return undefined;
+}
+
+/**
+ * Bridge lookup for drain paths: exact (identity, root) first — worktrees of
+ * one repository share an identity, and each bridge's filesystem capabilities
+ * bind to one checkout — then any bridge for the identity, because an
+ * undrained module queue is the worse failure: pending notes would sit
+ * forever in a process whose exact-root bridge never registered. Claims carry
+ * no originating root, so the cross-root exposure already exists in claim
+ * selection itself; root-fenced selection is tracked as magic-context-c0c and
+ * must land here, once, for every drain caller.
+ */
+export function findModuleNoteEvaluationBridgeForDrain(
+    projectPath: string,
+    projectRoot: string | undefined,
+): ModuleNoteEvaluationBridge | undefined {
+    return (
+        (projectRoot !== undefined
+            ? getModuleNoteEvaluationBridge(projectPath, projectRoot)
+            : undefined) ?? getModuleNoteEvaluationBridge(projectPath)
+    );
+}
+
+/**
+ * Release the named owners' claims (registry keys returned by register or
+ * retain). The registry is process-global while plugin instances are disposed
+ * individually, so an instance passes the keys it owns; a bridge is removed
+ * and disposed only when its last owner releases it, and sibling instances'
+ * bridges stay live.
+ */
+export async function disposeModuleNoteEvaluationBridges(
+    bridgeKeys: Iterable<string>,
+): Promise<void> {
+    const bridges: ModuleNoteEvaluationBridge[] = [];
+    for (const key of bridgeKeys) {
+        const entry = moduleNoteEvaluationBridges.get(key);
+        if (!entry) continue;
+        entry.owners -= 1;
+        if (entry.owners > 0) continue;
+        moduleNoteEvaluationBridges.delete(key);
+        bridges.push(entry.bridge);
+    }
+    await Promise.allSettled(bridges.map((bridge) => bridge.dispose()));
 }
 
 export interface ChangefeedRow {
@@ -131,6 +241,37 @@ export function ensureContextStoreUuid(db: Database): string {
         }).immediate();
     });
     return getContextStoreUuid(db) ?? minted;
+}
+
+/** Tails keyed by store uuid + domain; process-global so every plugin instance
+ * sharing one database file joins the same chain. */
+const mirrorDomainSyncChains = new Map<string, Promise<void>>();
+
+/**
+ * Serialize mirror pulls for one (database, domain) across every caller in
+ * the process. Each pull reads the durable cursor before requesting a page,
+ * so two concurrent pulls request the same page and the loser throws a
+ * cursor mismatch in {@link applyMirrorPage}. Instance-local chains are not
+ * enough: several plugin instances can share one database file (the shared
+ * evaluator bridge holds one instance's sync while another instance's tool
+ * backend syncs the same domain), so the chain is keyed by the store uuid.
+ */
+export function chainMirrorDomainSync(
+    db: Database,
+    domain: "memories" | "notes",
+    run: () => Promise<void>,
+): Promise<void> {
+    const key = `${ensureContextStoreUuid(db)}\u0000${domain}`;
+    const tail = mirrorDomainSyncChains.get(key) ?? Promise.resolve();
+    const next = tail.then(run, run);
+    mirrorDomainSyncChains.set(
+        key,
+        next.then(
+            () => undefined,
+            () => undefined,
+        ),
+    );
+    return next;
 }
 
 export interface AuthorityManagedMarker {
@@ -1292,7 +1433,8 @@ function prepareMirrorPageStatements(db: Database): MirrorPageStatements {
              check_hash = ?, check_cron = ?, check_failure_count = ?, check_network_failure_count = ?,
              check_quarantined_until = ?, check_next_due_at = ?, check_compiled_at = ?, check_false_since_at = ?,
              check_last_liveness_at = ?, last_checked_at = ?, check_status = ?, check_version = ?,
-             policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ? WHERE id = ?`,
+             policy_version = ?, anchor_block_id = ?, anchor_ordinal = ?, created_at = ?, updated_at = ?,
+             source_revision = ?, state_version = ? WHERE id = ?`,
         ),
         upsertNoteRevision: db.prepare(
             "INSERT OR REPLACE INTO mirror_note_revisions(module_project, module_row_id, context_row_id, status_version) VALUES (?, ?, ?, ?)",
@@ -1392,42 +1534,6 @@ function mirrorIdentity(
             )
         ).get(domain, moduleProject, moduleRowId) as { context_row_id: number } | undefined) ?? null
     );
-}
-
-export interface MirroredNoteCompileFields {
-    compiledProvider: string | null;
-    compiledConfig: string | null;
-    compiledAt: number | null;
-    compileStatus: "compiled" | "plain" | "refused";
-}
-
-export function applyMirroredNoteCompileFields(args: {
-    db: Database;
-    moduleProject: string;
-    moduleRowId: number;
-    fields: MirroredNoteCompileFields;
-}): boolean {
-    return withPrivilegedWriter(args.db, () => {
-        const result = args.db
-            .prepare(
-                `UPDATE notes
-                    SET compiled_provider = ?, compiled_config = ?, compiled_at = ?, compile_status = ?
-                  WHERE id = (
-                        SELECT context_row_id
-                          FROM mirror_identity
-                         WHERE domain = 'notes' AND module_project = ? AND module_row_id = ?
-                  )`,
-            )
-            .run(
-                args.fields.compiledProvider,
-                args.fields.compiledConfig,
-                args.fields.compiledAt,
-                args.fields.compileStatus,
-                args.moduleProject,
-                args.moduleRowId,
-            );
-        return result.changes === 1;
-    });
 }
 
 function rememberIdentity(
@@ -1965,6 +2071,11 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
         typeof effectiveRow.anchor_ordinal === "number" ? effectiveRow.anchor_ordinal : null,
         rowNumber(effectiveRow, "created_at_ms"),
         rowNumber(effectiveRow, "updated_at_ms"),
+        // The evaluator fences claims and compile artifacts on these counters;
+        // dropping them from the mirror would rewind revisions on a drain back
+        // to TypeScript or a reseed into the module.
+        rowNumber(effectiveRow, "source_revision"),
+        rowNumber(effectiveRow, "state_version"),
         contextId,
     );
     statements.upsertNoteRevision.run(

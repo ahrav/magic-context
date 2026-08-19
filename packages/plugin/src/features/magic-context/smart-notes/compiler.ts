@@ -60,7 +60,10 @@ interface CompilerResponse {
 const MAX_COMPILER_OUTPUT_CHARS = 128 * 1024;
 const MAX_COMPILED_CHECK_BYTES = 64 * 1024;
 const MAX_MANIFEST_ENTRIES = 64;
-const MAX_CRON_CHARS = 256;
+/** Wire limit mirrored from the module's NOTE_EVALUATOR_MAX_MANIFEST_BYTES. */
+const MAX_MANIFEST_BYTES = 32 * 1024;
+/** Wire limit mirrored from the module's NOTE_EVALUATOR_MAX_CRON_BYTES. */
+const MAX_CRON_BYTES = 256;
 const MAX_COMPILER_ERROR_CHARS = 2 * 1024;
 
 export async function compileSmartNoteCheck(
@@ -206,7 +209,12 @@ export function parseCompilerOutput(output: string | null): CompilerResponse {
         throw new Error("smart-note compiler output exceeds 128 KiB");
     }
     const json = extractJsonObject(output);
-    const parsed = JSON.parse(json) as Partial<CompilerResponse>;
+    let parsed: Partial<CompilerResponse>;
+    try {
+        parsed = JSON.parse(json) as Partial<CompilerResponse>;
+    } catch {
+        throw new Error("smart-note compiler returned malformed JSON");
+    }
     if (typeof parsed.compiled_check !== "string") throw new Error("compiled_check missing");
     if (!parsed.manifest || typeof parsed.manifest !== "object")
         throw new Error("manifest missing");
@@ -249,7 +257,7 @@ export function normalizeManifest(manifest: SmartNoteCheckManifest): SmartNoteCh
                   ),
           )
         : [];
-    return {
+    const normalized: SmartNoteCheckManifest = {
         capabilities,
         readFiles: uniqueStrings(manifest.readFiles),
         hosts: uniqueStrings(manifest.hosts, (host) => host.toLowerCase()),
@@ -257,6 +265,15 @@ export function normalizeManifest(manifest: SmartNoteCheckManifest): SmartNoteCh
         signals: uniqueStrings(manifest.signals),
         summary: typeof manifest.summary === "string" ? manifest.summary.slice(0, 160) : undefined,
     };
+    // Entry counts are bounded above but individual strings are not, and the
+    // module rejects a serialized manifest over its wire limit at completion —
+    // after the billable prompt already ran. Failing here records a compile
+    // failure (with backoff) instead of an abandoned claim that stays eligible
+    // and recompiles on every drain.
+    if (Buffer.byteLength(JSON.stringify(normalized), "utf8") > MAX_MANIFEST_BYTES) {
+        throw new Error("manifest exceeds 32 KiB");
+    }
+    return normalized;
 }
 
 /**
@@ -343,8 +360,13 @@ function literalCalls(code: string, method: "readFile" | "httpGet"): string[] {
 }
 
 export function normalizeCron(cron: string): string {
-    if (cron.length > MAX_CRON_CHARS) throw new Error("check_cron exceeds 256 characters");
     const normalized = cron.trim() || "0 * * * *";
+    // The module enforces this limit in UTF-8 bytes on the wire artifact;
+    // measuring UTF-16 length here would accept a multibyte cron the module
+    // then rejects at completion, abandoning the claim without recording a
+    // compilation failure.
+    if (Buffer.byteLength(normalized, "utf8") > MAX_CRON_BYTES)
+        throw new Error("check_cron exceeds 256 bytes");
     const parsed = parseCron(normalized);
     if (!parsed.ok) throw new Error(`invalid check_cron: ${parsed.error}`);
     const next = nextOccurrence(parsed.cron, new Date(), undefined, SMART_NOTE_CHECK_CEILING_MS);

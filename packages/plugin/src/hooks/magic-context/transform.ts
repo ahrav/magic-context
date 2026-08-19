@@ -662,7 +662,7 @@ export interface TransformDeps {
      */
     tsAuthorityRecoveryModuleClient?: RustModeModuleClient;
     onRustModeParked?: (sessionId: string, message: string) => void;
-    onRustModeProjectPrepared?: (projectPath: string) => void;
+    onRustModeProjectPrepared?: (projectPath: string, projectRoot: string) => void;
     rustMemorySyncRequestedSessions?: Set<string>;
 }
 

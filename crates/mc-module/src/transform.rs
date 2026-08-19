@@ -26648,6 +26648,10 @@ pub(crate) mod tests {
                 surface_condition: Some("condition true"),
                 anchor_block_id: None,
                 anchor_ordinal: None,
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
                 now_ms: 1,
             })
             .unwrap();
