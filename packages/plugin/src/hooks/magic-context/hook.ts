@@ -20,11 +20,6 @@ import {
     registerModuleNoteEvaluationBridge,
 } from "../../features/magic-context/context-authority";
 import { confirmSmartNoteReadOnly } from "../../features/magic-context/dreamer/evaluate-smart-notes";
-import { createSmartNoteCapabilities } from "../../features/magic-context/smart-notes/capabilities";
-import { compileSmartNoteCheck } from "../../features/magic-context/smart-notes/compiler";
-import { SmartNoteEvaluatorWorker } from "../../features/magic-context/smart-notes/evaluator-worker";
-import { runCompiledSmartNoteCheck } from "../../features/magic-context/smart-notes/sandbox-runner";
-import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
 import { openOpenCodeDb } from "../../features/magic-context/dreamer/open-opencode-db";
 import { OpenCodeRetrospectiveRawProvider } from "../../features/magic-context/dreamer/retrospective-raw-provider";
 import {
@@ -49,6 +44,11 @@ import {
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
 import type { Scheduler } from "../../features/magic-context/scheduler";
+import { createSmartNoteCapabilities } from "../../features/magic-context/smart-notes/capabilities";
+import { compileSmartNoteCheck } from "../../features/magic-context/smart-notes/compiler";
+import { SmartNoteEvaluatorWorker } from "../../features/magic-context/smart-notes/evaluator-worker";
+import { runCompiledSmartNoteCheck } from "../../features/magic-context/smart-notes/sandbox-runner";
+import { wakePlaneStatus } from "../../features/magic-context/smart-notes/wake-plane";
 import {
     getDatabasePersistenceError,
     getSessionsWithPendingMarker,

@@ -12,8 +12,8 @@ import {
     getNotes,
     markNoteChecked,
     markNoteReady,
-    updateNote,
     type Note,
+    updateNote,
 } from "./storage-notes";
 
 const PROJECT = "/revision/project";

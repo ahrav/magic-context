@@ -3,8 +3,8 @@ import { getLeaseHolder, peekLeaseHolderAndExpiry } from "../dreamer/lease";
 import { leaseKeyFor } from "../dreamer/task-registry";
 import { createSmartNoteCapabilities } from "./capabilities";
 import {
-    lifecycleStateFromNote,
     applySmartNoteReduction,
+    lifecycleStateFromNote,
     reduceSmartNoteEvaluation,
 } from "./evaluation-state";
 import { evaluateSmartNotePhase } from "./evaluator";

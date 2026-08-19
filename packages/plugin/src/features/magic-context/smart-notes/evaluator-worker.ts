@@ -269,7 +269,9 @@ export class SmartNoteEvaluatorWorker {
         return result;
     }
 
-    private async next(signal?: AbortSignal): Promise<ClaimResponse | "no_work" | "retry" | "stop"> {
+    private async next(
+        signal?: AbortSignal,
+    ): Promise<ClaimResponse | "no_work" | "retry" | "stop"> {
         const acquisitionId = this.pendingAcquisitionId ?? randomUUID();
         this.pendingAcquisitionId = acquisitionId;
         let response: Record<string, unknown>;
@@ -295,7 +297,10 @@ export class SmartNoteEvaluatorWorker {
             if (
                 typeof response.claim_id !== "string" ||
                 typeof response.note_id !== "number" ||
-                (phase !== "compile" && phase !== "due" && phase !== "liveness" && phase !== "fallback")
+                (phase !== "compile" &&
+                    phase !== "due" &&
+                    phase !== "liveness" &&
+                    phase !== "fallback")
             ) {
                 return "stop";
             }
@@ -312,7 +317,9 @@ export class SmartNoteEvaluatorWorker {
                             ? snapshot.surface_condition
                             : null,
                     compiledCheck:
-                        typeof snapshot.compiled_check === "string" ? snapshot.compiled_check : null,
+                        typeof snapshot.compiled_check === "string"
+                            ? snapshot.compiled_check
+                            : null,
                 },
             };
         }

@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import type { SmartNotePhaseExecutors } from "./evaluator";
 import {
-    SmartNoteEvaluatorWorker,
     type EvaluatorMethod,
     type EvaluatorWorkerTransport,
+    SmartNoteEvaluatorWorker,
 } from "./evaluator-worker";
 
 interface RecordedCall {
@@ -107,7 +107,13 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         });
         const w = worker(transport);
         const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
-        expect(result).toEqual({ claimed: 2, completed: 2, abandoned: 0, surfaced: 0, drained: true });
+        expect(result).toEqual({
+            claimed: 2,
+            completed: 2,
+            abandoned: 0,
+            surfaced: 0,
+            drained: true,
+        });
 
         const nexts = calls.filter((c) => c.method === "note.evaluation.next");
         expect(nexts).toHaveLength(3);
@@ -134,7 +140,12 @@ describe("SmartNoteEvaluatorWorker drain", () => {
             transport,
             passthroughExecutors({
                 runCompiled: () =>
-                    Promise.resolve({ ok: false, cancelled: true, error: "aborted", network: false }),
+                    Promise.resolve({
+                        ok: false,
+                        cancelled: true,
+                        error: "aborted",
+                        network: false,
+                    }),
             }),
         );
         const result = await w.drainOnce({ deadline: Date.now() + 5_000 });
@@ -178,7 +189,13 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         });
         const w = worker(transport);
         const result = await w.drainOnce({ deadline: Date.now() + 5_000 });
-        expect(result).toEqual({ claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true });
+        expect(result).toEqual({
+            claimed: 0,
+            completed: 0,
+            abandoned: 0,
+            surfaced: 0,
+            drained: true,
+        });
         await w.dispose();
     });
 

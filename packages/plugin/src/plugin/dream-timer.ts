@@ -42,12 +42,12 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
 import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
-import { wakePlaneStatus } from "../features/magic-context/smart-notes/wake-plane";
 import {
     drainCommitBacklogForProject,
     sweepStaleEmbeddingIdentitiesForProject,
 } from "../features/magic-context/project-embedding-registry";
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
+import { wakePlaneStatus } from "../features/magic-context/smart-notes/wake-plane";
 import {
     openDatabase,
     retryPendingSessionCleanups,
