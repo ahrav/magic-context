@@ -443,6 +443,20 @@ export function buildQualityBaseline(input: {
     });
 }
 
+export function vacuousBaselineModes(artifact: QualityBaselineArtifact): QueryMode[] {
+    const modes = artifact.runs[0]?.modes ?? [];
+    return modes
+        .filter((mode) =>
+            artifact.runs.every((run) =>
+                run.modes.some(
+                    (entry) =>
+                        entry.mode === mode.mode && entry.ndcgAt10 === 0 && entry.recallAt50 === 0,
+                ),
+            ),
+        )
+        .map((mode) => mode.mode);
+}
+
 /** Core per-run host-evidence checks shared by baseline building and
  *  candidate evaluation: the exclusive run lock, canary stability, and the
  *  report's host matching its evidence. Reference comparisons stay with

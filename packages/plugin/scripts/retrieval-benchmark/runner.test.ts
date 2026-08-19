@@ -241,6 +241,22 @@ describe("mode separation (scenario 2)", () => {
     );
 });
 
+describe("embed-purpose scenario evidence", () => {
+    it(
+        "records the normalized purpose the executed searches supplied to the embedder",
+        async () => {
+            const result = await run(tinyProfile({}), { hooks: counterHooks() });
+            expect(result.report.status).toBe("complete");
+            const purposes = new Set(
+                result.report.evidence.scenarios.map((s) => s.queryEmbedPurpose),
+            );
+            expect(purposes.has("passage")).toBe(true);
+            expect(purposes.has("query")).toBe(false);
+        },
+        60_000,
+    );
+});
+
 describe("closed-loop concurrency (scenario 3)", () => {
     it(
         "uses the declared worker count and keeps per-query samples and traces separate",

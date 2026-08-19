@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { METRIC_POLICY_VERSION } from "./metrics";
+import { canonicalFingerprint } from "./canonical-json";
 import {
     aaMechanicalCheck,
     buildLatencyBaseline,
@@ -16,12 +17,14 @@ import {
     parseRegressionPolicy,
     publishBaseline,
     type QualityBaselineArtifact,
+    qualityKeyFromReport,
     RegressionError,
     regressionPolicyFingerprint,
     runLevelP95,
     tsAudit,
+    vacuousBaselineModes,
 } from "./regression";
-import { type BenchmarkReport, parseReport, REPORT_SCHEMA_VERSION } from "./report";
+import { type BenchmarkReport, evidenceDigest, parseReport, REPORT_SCHEMA_VERSION } from "./report";
 import { summarizeLatency, TIMING_POLICY_VERSION } from "./timing";
 
 const FP = "a".repeat(64);
@@ -79,6 +82,7 @@ interface RunSpec {
      *  leaving automatic mode without a scoreable holdout aggregate. */
     unscoreableAutomatic?: boolean;
     status?: "complete" | "incomplete";
+    embedPurpose?: "query" | "passage" | null;
 }
 
 function makeRun(spec: RunSpec): BenchmarkReport {
@@ -100,6 +104,7 @@ function makeRun(spec: RunSpec): BenchmarkReport {
             deliveredTokens: 100,
             deliveryReason: "delivered" as const,
             latencySamplesMs: mode === "explicit" ? cells[caseId] : [],
+            queryEmbedPurpose: spec.embedPurpose === undefined ? "passage" : spec.embedPurpose,
             metrics: {
                 metricPolicyVersion: METRIC_POLICY_VERSION,
                 recallAt10: unscoreable ? null : values.recallAt50,
@@ -630,6 +635,60 @@ describe("sparse-v1 claim eligibility (scenario 9)", () => {
             claim: "measured-win",
         });
         expect(result.verdict).toBe("quality-only");
+    });
+});
+
+describe("vacuousBaselineModes", () => {
+    it("flags a mode whose gate metrics are zero in every run", () => {
+        const zeroAutomatic = buildQualityBaseline({
+            policy: POLICY,
+            reports: [
+                makeRun({ salt: "z1", automatic: { ndcgAt10: 0, recallAt50: 0 } }),
+                makeRun({ salt: "z2", automatic: { ndcgAt10: 0, recallAt50: 0 } }),
+                makeRun({ salt: "z3", automatic: { ndcgAt10: 0, recallAt50: 0 } }),
+            ],
+            claimEligibility: "judged-support-only",
+        });
+        expect(vacuousBaselineModes(zeroAutomatic)).toEqual(["automatic"]);
+    });
+
+    it("passes a baseline whose every mode has signal in at least one run", () => {
+        const scored = buildQualityBaseline({
+            policy: POLICY,
+            reports: threeRuns("scored"),
+            claimEligibility: "judged-support-only",
+        });
+        expect(vacuousBaselineModes(scored)).toEqual([]);
+    });
+});
+
+describe("embed-purpose evidence and the quality key (KTD4)", () => {
+    it("keeps reports that differ only in observed purpose on one quality key", () => {
+        const passage = makeRun({ salt: "purpose-pre", embedPurpose: "passage" });
+        const query = makeRun({ salt: "purpose-post", embedPurpose: "query" });
+        expect(canonicalFingerprint(qualityKeyFromReport(passage))).toBe(
+            canonicalFingerprint(qualityKeyFromReport(query)),
+        );
+        expect(evidenceDigest(passage)).not.toBe(evidenceDigest(query));
+    });
+
+    it("still moves the quality key on a config or release change", () => {
+        const base = makeRun({ salt: "key-base" });
+        const otherConfig = makeRun({
+            salt: "key-config",
+            config: {
+                harness: "regression-test/v1",
+                profileFingerprint: FP,
+                instrumentation: { reportSchemaVersion: "other/v9" },
+            },
+        });
+        const otherRelease = makeRun({ salt: "key-release", releaseFp: "b".repeat(64) });
+        expect(canonicalFingerprint(qualityKeyFromReport(base))).not.toBe(
+            canonicalFingerprint(qualityKeyFromReport(otherConfig)),
+        );
+        expect(canonicalFingerprint(qualityKeyFromReport(base))).not.toBe(
+            canonicalFingerprint(qualityKeyFromReport(otherRelease)),
+        );
     });
 });
 
