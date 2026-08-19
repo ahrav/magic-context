@@ -66,6 +66,23 @@ pub enum Terminal {
     StreamEnd,
 }
 
+/// Longest handler-authored diagnostic retained on a terminal. Diagnostics
+/// are held across the egress wait without a charge, so the cap — not the
+/// frame limit — is what bounds their retained cost per pending request.
+/// Anything larger is replaced immediately, dropping the oversized strings.
+const MAX_TERMINAL_CODE_LEN: usize = 128;
+const MAX_TERMINAL_MESSAGE_LEN: usize = 4096;
+
+fn bounded_terminal_error(code: String, message: String) -> Terminal {
+    if code.len() > MAX_TERMINAL_CODE_LEN || message.len() > MAX_TERMINAL_MESSAGE_LEN {
+        return Terminal::Error {
+            code: CODE_INTERNAL_ERROR.to_owned(),
+            message: "handler error exceeds diagnostic limit".to_owned(),
+        };
+    }
+    Terminal::Error { code, message }
+}
+
 /// Serialized length of `s` inside a JSON string, without materializing it:
 /// `"` and `\` and the short control escapes emit two bytes, remaining
 /// control characters emit six (`\u00XX`), and everything else (including
@@ -718,7 +735,14 @@ pub async fn dispatch_request<H: McHostHandler>(
                         code: CODE_INTERNAL_ERROR.to_owned(),
                         message: "handler response exceeds frame limit".to_owned(),
                     },
-                    Ok(RequestOutcome::Error { code, message }) => Terminal::Error { code, message },
+                    Ok(RequestOutcome::Error { code, message }) => {
+                        // Normalized before the terminal is held across the
+                        // egress wait: the handler task permit is already
+                        // released, so oversized owned strings would otherwise
+                        // accumulate uncharged across up to
+                        // max_pending_requests settlements.
+                        bounded_terminal_error(code, message)
+                    }
                     Ok(RequestOutcome::Streamed) => Terminal::StreamEnd,
                     Err(join_err) if join_err.is_panic() => Terminal::Error {
                         code: CODE_INTERNAL_ERROR.to_owned(),
@@ -942,7 +966,19 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
                 for abort in &aborts {
                     abort.abort();
                 }
-                let _ = timeout(shared.timing.route_close_budget, tracker.wait()).await;
+                // Abort only takes effect at an await point, so a future that
+                // never yields cannot be stopped by any mechanism; shutdown
+                // must still terminate. Surface the violated ordering instead
+                // of proceeding silently.
+                if timeout(shared.timing.route_close_budget, tracker.wait())
+                    .await
+                    .is_err()
+                {
+                    shared.fatal.trip(
+                        &shared.shutdown,
+                        "dispatch task did not stop before route-gone".to_owned(),
+                    );
+                }
             }
             // Aborted tasks never removed their own pending entries.
             {
@@ -1006,7 +1042,17 @@ pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>
             // their handles: the tracker lives in the registry, so abort_all
             // plus this wait still proves no request code is running.
             tracker.close();
-            let _ = timeout(shared.timing.lifecycle_callback_deadline, tracker.wait()).await;
+            if timeout(shared.timing.lifecycle_callback_deadline, tracker.wait())
+                .await
+                .is_err()
+            {
+                // Same limit as the graceful path: an unyielding future cannot
+                // be stopped, and the forced path cannot wait forever.
+                shared.fatal.trip(
+                    &shared.shutdown,
+                    "dispatch task did not stop before route-gone".to_owned(),
+                );
+            }
             run_route_gone(&shared, handle).await;
             shared.registry.finalize_close(handle);
         });

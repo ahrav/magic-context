@@ -367,26 +367,30 @@ async fn read_loop<H: McHostHandler>(
                             // writer has not yet confirmed written is retained
                             // for the write-completion hook to reconcile.
                             Some(probe) if probe.flags == header.flags.0 => {
-                                // Scheduler delay must not extend the
-                                // configured deadline: a Pong arriving past
-                                // it leaves the probe for expiry.
-                                let in_deadline = shared.liveness.as_ref().is_none_or(|p| {
-                                    now.duration_since(probe.sent) < p.pong_deadline
-                                });
-                                if in_deadline {
-                                    match probe.written_at {
-                                        // The write already completed: this
-                                        // answer followed the bytes.
-                                        Some(completed_at) if now >= completed_at => {
+                                match probe.written_at {
+                                    // Completion recorded: `sent` is the
+                                    // completion instant, so the deadline
+                                    // applies here. Scheduler delay must not
+                                    // extend it — a late Pong leaves the
+                                    // probe for expiry.
+                                    Some(_) => {
+                                        let in_deadline =
+                                            shared.liveness.as_ref().is_none_or(|p| {
+                                                now.duration_since(probe.sent) < p.pong_deadline
+                                            });
+                                        if in_deadline {
                                             pings.remove(&header.corr);
                                         }
-                                        // Completion not yet recorded: park
-                                        // the arrival instant for the hook to
-                                        // reconcile against completion.
-                                        None => probe.answered_at = Some(now),
-                                        // Recorded, but this Pong predates it.
-                                        Some(_) => {}
                                     }
+                                    // Completion unknown: `sent` is only the
+                                    // provisional enqueue instant, so no
+                                    // deadline can be evaluated yet (a Ping
+                                    // queued behind large frames would
+                                    // otherwise have its answer rejected
+                                    // before it was even written). Park the
+                                    // arrival; the hook decides against the
+                                    // completion instant.
+                                    None => probe.answered_at = Some(now),
                                 }
                             }
                             _ => {}
@@ -683,13 +687,18 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         // async notification would leave a gap where a fast (or adversarial
         // pre-answering) Pong races the flag update.
         let gen_probe = Arc::clone(&gen);
+        let pong_deadline = policy.pong_deadline;
         let written_hook = Box::new(move |completed_at: Instant| {
             let mut pings = gen_probe.pings.lock().expect("pings lock");
             if let Some(probe) = pings.get_mut(&corr) {
                 match probe.answered_at {
                     // A Pong the read loop parked while completion was
-                    // unrecorded: accept it only if it followed the bytes.
-                    Some(answered_at) if answered_at >= completed_at => {
+                    // unrecorded: accept it only if it followed the bytes and
+                    // landed inside the deadline measured from completion.
+                    Some(answered_at)
+                        if answered_at >= completed_at
+                            && answered_at.duration_since(completed_at) < pong_deadline =>
+                    {
                         pings.remove(&corr);
                     }
                     // No answer yet, or a pre-answer: arm the deadline from

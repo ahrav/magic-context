@@ -357,20 +357,28 @@ fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
     } else {
         PathBuf::new()
     };
-    let mut saw_component = false;
-
+    // Collected first so the traversal knows which component is final: every
+    // INTERMEDIATE must already be replacement-proof (we must not chmod
+    // directories we do not own, such as /tmp or $HOME), while the final
+    // directory is validated and then tightened to 0700 through its pinned
+    // descriptor below.
+    let mut names = Vec::new();
     for component in dir_path.components() {
-        let name = match component {
+        match component {
             Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => name,
+            Component::Normal(name) => names.push(name),
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(InstanceError::Insecure {
                     what: "runtime directory path",
                     path: dir_path.to_path_buf(),
                 });
             }
-        };
-        saw_component = true;
+        }
+    }
+    let saw_component = !names.is_empty();
+
+    let last = names.len().saturating_sub(1);
+    for (index, name) in names.into_iter().enumerate() {
         walked.push(name);
         let next = match openat(&current, name, flags, Mode::empty()) {
             Ok(fd) => fd,
@@ -403,6 +411,23 @@ fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
             }
             Err(e) => return Err(io_err("open_component", &walked, e)),
         };
+        // Intermediates must be replacement-proof: a principal who can rename
+        // or swap one can redirect the pathname to a tree of their choosing
+        // after we pin ours, so clients and successors would resolve their
+        // publication and lock inode while this host keeps using the hidden
+        // original (protocol §4.1 threat model). The final component is
+        // validated and tightened after the loop instead — we own it, so it
+        // can be repaired rather than rejected.
+        if index != last {
+            let next_stat =
+                rustix::fs::fstat(&next).map_err(|e| io_err("fstat_component", &walked, e))?;
+            if !is_safe_ancestor(&next_stat) {
+                return Err(InstanceError::Insecure {
+                    what: "runtime directory ancestor",
+                    path: walked.clone(),
+                });
+            }
+        }
         current = next;
     }
     if !saw_component {
@@ -448,8 +473,23 @@ fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
 }
 
 const S_IFMT: u32 = 0o170000;
+const S_ISVTX: u32 = 0o1000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+
+/// A directory no other principal can replace: owned by us or by root, and
+/// not group/other-writable unless sticky (a sticky directory forbids
+/// renaming entries you do not own, which is what `/tmp` relies on).
+fn is_safe_ancestor(stat: &rustix::fs::Stat) -> bool {
+    if (stat.st_mode & S_IFMT) != S_IFDIR {
+        return false;
+    }
+    let ours = rustix::process::geteuid().as_raw();
+    if stat.st_uid != ours && stat.st_uid != 0 {
+        return false;
+    }
+    stat.st_mode & 0o022 == 0 || stat.st_mode & S_ISVTX != 0
+}
 
 /// Regular file, single hard link, owned by us, no group/other bits.
 fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
@@ -607,6 +647,30 @@ mod tests {
         let meta = std::fs::symlink_metadata(&file).expect("stat file");
         assert!(meta.file_type().is_file());
         assert_eq!(meta.uid(), rustix::process::geteuid().as_raw());
+    }
+
+    #[test]
+    fn world_writable_intermediate_is_rejected() {
+        let root = temp_root();
+        // An intermediate another principal could rename cannot be repaired
+        // by us the way the final directory can, so acquisition must refuse
+        // rather than pin a tree whose pathname can be redirected.
+        let loose = root.path().join("loose");
+        std::fs::create_dir_all(&loose).expect("create intermediate");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777))
+            .expect("loosen intermediate");
+
+        let err = InstanceGuard::acquire(Some(&loose)).expect_err("must refuse");
+        assert!(
+            matches!(
+                err,
+                InstanceError::Insecure {
+                    what: "runtime directory ancestor",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
