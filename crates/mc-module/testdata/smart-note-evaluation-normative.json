@@ -42,6 +42,17 @@
             }
         },
         {
+            "id": "edit_project",
+            "event": "edit_compiler_input",
+            "pre": { "source_revision": 1, "state_version": 3, "status_version": 3 },
+            "expected": {
+                "source_revision": 2,
+                "state_version": 4,
+                "status_version": 4,
+                "artifact_cleared": true
+            }
+        },
+        {
             "id": "apply_evaluation",
             "event": "lifecycle_transition",
             "pre": { "source_revision": 1, "state_version": 4, "status_version": 4 },
@@ -49,7 +60,8 @@
                 "source_revision": 1,
                 "state_version": 5,
                 "status_version": 5,
-                "artifact_cleared": false
+                "artifact_cleared": false,
+                "active_claims_fenced": false
             }
         },
         {
@@ -60,7 +72,8 @@
                 "source_revision": 1,
                 "state_version": 6,
                 "status_version": 6,
-                "artifact_cleared": false
+                "artifact_cleared": false,
+                "active_claims_fenced": false
             }
         },
         {

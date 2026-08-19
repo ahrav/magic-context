@@ -120,7 +120,12 @@ fn parse_field(token: &str, min: u64, max: u64, dow_field: bool) -> Option<u64> 
         while v <= hi {
             let normalized = if dow_field && v == 7 { 0 } else { v };
             mask |= 1u64 << normalized;
-            v += step;
+            // A wire-supplied step near u64::MAX would wrap `v` back under
+            // `hi` and re-enter the loop; overflow means the range is done.
+            let Some(next) = v.checked_add(step) else {
+                break;
+            };
+            v = next;
         }
     }
     if mask == 0 {
@@ -178,14 +183,13 @@ fn next_occurrence<Tz: TimeZone>(
     max_search_ms: i64,
     tz: &Tz,
 ) -> Option<i64> {
-    let mut cursor_ms = after_ms.div_euclid(MINUTE_MS) * MINUTE_MS + MINUTE_MS;
-    let cap_ms = after_ms + max_search_ms.clamp(0, MAX_SEARCH_MS);
+    let mut cursor_ms = (after_ms.div_euclid(MINUTE_MS) * MINUTE_MS).checked_add(MINUTE_MS)?;
+    let cap_ms = after_ms.saturating_add(max_search_ms.clamp(0, MAX_SEARCH_MS));
     while cursor_ms <= cap_ms {
-        // An instant maps to exactly one civil time, so single() always holds.
-        let civil = tz
-            .timestamp_millis_opt(cursor_ms)
-            .single()
-            .expect("instant-to-civil conversion is unambiguous");
+        // An in-range instant maps to exactly one civil time; an instant
+        // beyond chrono's representable date range maps to none, which ends
+        // the search as "no occurrence" instead of panicking.
+        let civil = tz.timestamp_millis_opt(cursor_ms).single()?;
         if mask_has(cron.minute, civil.minute())
             && mask_has(cron.hour, civil.hour())
             && mask_has(cron.month, civil.month())
@@ -193,7 +197,7 @@ fn next_occurrence<Tz: TimeZone>(
         {
             return Some(cursor_ms);
         }
-        cursor_ms += MINUTE_MS;
+        cursor_ms = cursor_ms.checked_add(MINUTE_MS)?;
     }
     None
 }
@@ -1251,6 +1255,13 @@ mod tests {
                 }
                 "create" => note,
                 "edit_compiler_input" => {
+                    if case.id == "edit_project" {
+                        // A project move cannot be expressed through the module
+                        // authority: update_note_cas pins project_path in its
+                        // WHERE clause. The TypeScript replay in
+                        // storage-notes.test.ts covers this case.
+                        continue;
+                    }
                     let pre = pre.expect("edit pre");
                     let staged = stage(&store, note, pre.source_revision, pre.state_version);
                     stage_artifact(&store, &staged);
@@ -1281,6 +1292,7 @@ mod tests {
                     let pre = pre.expect("transition pre");
                     let staged = stage(&store, note, pre.source_revision, pre.state_version);
                     stage_artifact(&store, &staged);
+                    claim = Some(stage_claim(&store, staged.id));
                     match store
                         .transition_note(NoteTransitionInput {
                             project_path: PROJECT,
@@ -1344,25 +1356,24 @@ mod tests {
                     case.id
                 );
             }
-            if expected.active_claims_fenced == Some(true) {
-                let claim = claim.expect("fenced case stages a claim");
-                assert!(
-                    matches!(
-                        store
-                            .renew_note_evaluation_claim(
-                                PROJECT,
-                                &claim.claim_id,
-                                "eval-a",
-                                0,
-                                1,
-                                30
-                            )
-                            .unwrap(),
-                        NoteEvalRenewOutcome::TerminalReplay { .. }
-                    ),
-                    "claim fencing for case {}",
-                    case.id
-                );
+            if let Some(should_fence) = expected.active_claims_fenced {
+                let claim = claim.expect("fence-pinned case stages a claim");
+                let outcome = store
+                    .renew_note_evaluation_claim(PROJECT, &claim.claim_id, "eval-a", 0, 1, 30)
+                    .unwrap();
+                if should_fence {
+                    assert!(
+                        matches!(outcome, NoteEvalRenewOutcome::TerminalReplay { .. }),
+                        "claim fencing for case {}",
+                        case.id
+                    );
+                } else {
+                    assert!(
+                        matches!(outcome, NoteEvalRenewOutcome::Renewed { .. }),
+                        "claim must stay live for case {}",
+                        case.id
+                    );
+                }
             }
             assert_eq!(
                 post.state_version, post.status_version,

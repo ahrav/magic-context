@@ -26,7 +26,7 @@ migrations. Any pre-v51 binary of this repository (any build of commit
 `b7c6ba99` or earlier, the branch point of this work) does not register that
 function, so every `mc_notes` mutation it attempts against a migrated store
 fails closed with "no such function". The store test
-`note_writer_fence_blocks_connections_without_v2_function` exercises exactly
+`mc_notes_writer_fence_blocks_connections_without_the_v2_function` exercises exactly
 that artifact behavior by opening the migrated database with a raw connection
 that lacks the function. Supported rollback is drain-to-TypeScript plus
 restoring a pre-v51 store snapshot, or roll-forward; same-file binary

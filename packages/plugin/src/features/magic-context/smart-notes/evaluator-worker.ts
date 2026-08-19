@@ -165,21 +165,30 @@ export class SmartNoteEvaluatorWorker {
     async register(signal?: AbortSignal): Promise<boolean> {
         if (this.disposed) return false;
         const policy = this.deps.policy();
-        const response = asRecord(
-            await this.deps.transport.call({
-                method: "note.evaluation.register",
-                body: {
-                    v: 2,
-                    evaluator_instance: this.instanceId,
-                    protocol_version: EVALUATOR_PROTOCOL_VERSION,
-                    policy_version: 0,
-                    capacity: 1,
-                    retina_handoff: policy.retinaHandoff,
-                    wake_owned: policy.wakeOwned,
-                },
-                signal,
-            }),
-        );
+        let response: Record<string, unknown>;
+        try {
+            response = asRecord(
+                await this.deps.transport.call({
+                    method: "note.evaluation.register",
+                    body: {
+                        v: 2,
+                        evaluator_instance: this.instanceId,
+                        protocol_version: EVALUATOR_PROTOCOL_VERSION,
+                        policy_version: 0,
+                        capacity: 1,
+                        retina_handoff: policy.retinaHandoff,
+                        wake_owned: policy.wakeOwned,
+                    },
+                    signal,
+                }),
+            );
+        } catch (error) {
+            // A transient transport failure stays local: callers treat false as
+            // "unavailable, retry on the next drain", while a throw here would
+            // propagate out of drainOnce and abort the caller's whole sweep tick.
+            this.logLine(`registration failed: ${error}`);
+            return false;
+        }
         const token = response.token;
         const generation = response.registration_generation;
         if (typeof token !== "string" || typeof generation !== "number") {
@@ -368,7 +377,6 @@ export class SmartNoteEvaluatorWorker {
         }
         const result = response.result;
         if (result === "claim") {
-            this.pendingAcquisitionId = null;
             const snapshot = asRecord(response.snapshot);
             const phase = response.phase;
             if (
@@ -379,8 +387,14 @@ export class SmartNoteEvaluatorWorker {
                     phase !== "liveness" &&
                     phase !== "fallback")
             ) {
+                // The authority already granted a durable claim under this
+                // acquisition id. Keep the id so the next poll replays that
+                // decision instead of minting a fresh UUID and stranding the
+                // leased note until its lease expires.
+                this.logLine("next returned a malformed claim (will replay acquisition)");
                 return "stop";
             }
+            this.pendingAcquisitionId = null;
             return {
                 claimId: response.claim_id,
                 noteId: response.note_id,

@@ -91,6 +91,15 @@ describe("SmartNoteEvaluatorWorker registration", () => {
         expect(await w.register()).toBe(false);
         expect(w.registered).toBe(false);
     });
+
+    test("a thrown registration transport call reports unavailable instead of rejecting", async () => {
+        const { transport } = stubTransport(() => {
+            throw new Error("connection refused");
+        });
+        const w = worker(transport);
+        expect(await w.register()).toBe(false);
+        expect(w.registered).toBe(false);
+    });
 });
 
 describe("SmartNoteEvaluatorWorker drain", () => {
@@ -181,10 +190,39 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         await w.dispose();
     });
 
-    test("wake-owned no_work stops the drain without claiming", async () => {
+    test("a malformed claim response preserves the acquisition id for replay", async () => {
+        // The authority has already leased a note under the acquisition id by
+        // the time the payload is validated; discarding the id would strand
+        // that lease until expiry.
+        let malformed = true;
+        const sawAcquisitionIds: string[] = [];
+        const { transport } = stubTransport((method, body) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                sawAcquisitionIds.push(String(body.acquisition_id));
+                if (malformed) {
+                    malformed = false;
+                    return { result: "claim", claim_id: 42, note_id: "not-a-number" };
+                }
+                return { result: "no_work" };
+            }
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const first = await w.drainOnce({ deadline: Date.now() + 5_000 });
+        expect(first.drained).toBe(false);
+        expect(first.claimed).toBe(0);
+        const second = await w.drainOnce({ deadline: Date.now() + 5_000 });
+        expect(second.drained).toBe(true);
+        expect(sawAcquisitionIds).toHaveLength(2);
+        expect(sawAcquisitionIds[0]).toBe(sawAcquisitionIds[1]);
+        await w.dispose();
+    });
+
+    test("an immediate no_work response ends the drain without claiming", async () => {
         const { transport } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
-            if (method === "note.evaluation.next") return { result: "no_work", wake_owned: true };
+            if (method === "note.evaluation.next") return { result: "no_work" };
             return { ok: true };
         });
         const w = worker(transport);

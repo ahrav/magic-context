@@ -235,7 +235,9 @@ describe("smart-note revision matrix: normative fixture replay", () => {
                         note.id,
                         matrixCase.id === "edit_condition"
                             ? { surfaceCondition: "changed condition" }
-                            : { content: "changed content" },
+                            : matrixCase.id === "edit_project"
+                              ? { projectPath: "/moved/project" }
+                              : { content: "changed content" },
                         SCOPE,
                     );
                 } else if (matrixCase.event === "dismiss") {
