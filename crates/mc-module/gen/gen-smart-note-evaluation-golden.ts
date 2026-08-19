@@ -28,21 +28,169 @@ const storageNotes = await import(resolve("./src/features/magic-context/storage-
 const schedule = await import(resolve("./src/features/magic-context/smart-notes/schedule"));
 const types = await import(resolve("./src/features/magic-context/smart-notes/types"));
 
-const {
-    storeCompiledSmartNoteCheck,
-    markCompiledCheckFalse,
-    markCompiledCheckLogicFailure,
-    markCompiledCheckNetworkFailure,
-    markSmartNoteLivenessChecked,
-    markSmartNoteCheckStatus,
-    markSmartNoteCompilationFailure,
-    getDueCompiledSmartNoteChecks,
-    getSmartNotesNeedingCompilation,
-    getStaleCompiledSmartNotes,
-} = storage;
-const { markNoteReady, markNoteChecked, getPendingSmartNotes } = storageNotes;
+const { getDueCompiledSmartNoteChecks, getSmartNotesNeedingCompilation, getStaleCompiledSmartNotes } =
+    storage;
+const { getPendingSmartNotes } = storageNotes;
 const { nextSmartNoteCheckDueAt } = schedule;
 const { parseSmartNoteManifest } = types;
+
+// Do not edit the legacy writers below: reducers must match this behavior,
+// never the reverse.
+
+const SMART_NOTE_CHECK_POLICY_VERSION = types.SMART_NOTE_CHECK_POLICY_VERSION as number;
+
+function legacyBackoffMs(failureCount: number): number {
+    const minutes = Math.min(24 * 60, 5 * 2 ** Math.max(0, failureCount - 1));
+    return minutes * 60 * 1000;
+}
+
+function legacyReadFailureCount(db: Database, noteId: number, column: string): number {
+    const row = db.prepare(`SELECT ${column} AS count FROM notes WHERE id = ?`).get(noteId) as
+        | { count?: number | null }
+        | undefined;
+    return row?.count ?? 0;
+}
+
+function storeCompiledSmartNoteCheck(
+    db: Database,
+    args: {
+        noteId: number;
+        compiledCheck: string;
+        manifest: unknown;
+        checkHash: string;
+        checkCron: string;
+        nextDueAt: number;
+        now: number;
+    },
+): void {
+    db.prepare(
+        `UPDATE notes
+         SET compiled_check = ?,
+             manifest_json = ?,
+             check_hash = ?,
+             check_cron = ?,
+             check_version = 1,
+             check_status = 'compiled',
+             check_failure_count = 0,
+             check_network_failure_count = 0,
+             check_quarantined_until = NULL,
+             check_next_due_at = ?,
+             check_compiled_at = ?,
+             check_false_since_at = COALESCE(check_false_since_at, ?),
+             check_last_liveness_at = NULL,
+             policy_version = ?,
+             updated_at = ?
+         WHERE id = ? AND type = 'smart'`,
+    ).run(
+        args.compiledCheck,
+        JSON.stringify(args.manifest),
+        args.checkHash,
+        args.checkCron,
+        args.nextDueAt,
+        args.now,
+        args.now,
+        SMART_NOTE_CHECK_POLICY_VERSION,
+        args.now,
+        args.noteId,
+    );
+}
+
+function markCompiledCheckFalse(db: Database, noteId: number, nextDueAt: number, now: number): void {
+    db.prepare(
+        `UPDATE notes
+         SET last_checked_at = ?,
+             updated_at = ?,
+             check_next_due_at = ?,
+             check_failure_count = 0,
+             check_network_failure_count = 0,
+             check_false_since_at = COALESCE(check_false_since_at, ?)
+         WHERE id = ? AND type = 'smart'`,
+    ).run(now, now, nextDueAt, now, noteId);
+}
+
+function markCompiledCheckLogicFailure(
+    db: Database,
+    noteId: number,
+    now: number,
+    maxFailures: number,
+): void {
+    const failureCount = legacyReadFailureCount(db, noteId, "check_failure_count") + 1;
+    const status = failureCount >= maxFailures ? "failing" : "compiled";
+    db.prepare(
+        `UPDATE notes
+         SET check_failure_count = ?,
+             check_status = ?,
+             check_next_due_at = ?,
+             updated_at = ?
+         WHERE id = ? AND type = 'smart'`,
+    ).run(failureCount, status, now + legacyBackoffMs(failureCount), now, noteId);
+}
+
+function markCompiledCheckNetworkFailure(
+    db: Database,
+    noteId: number,
+    now: number,
+    maxFailures: number,
+): void {
+    const failureCount = legacyReadFailureCount(db, noteId, "check_network_failure_count") + 1;
+    const quarantinedUntil = now + legacyBackoffMs(failureCount);
+    const status = failureCount >= maxFailures ? "failing" : "compiled";
+    db.prepare(
+        `UPDATE notes
+         SET check_network_failure_count = ?,
+             check_status = ?,
+             check_next_due_at = ?,
+             check_quarantined_until = ?,
+             updated_at = ?
+         WHERE id = ? AND type = 'smart'`,
+    ).run(failureCount, status, quarantinedUntil, quarantinedUntil, now, noteId);
+}
+
+function markSmartNoteLivenessChecked(db: Database, noteId: number, now: number): void {
+    db.prepare(
+        `UPDATE notes
+         SET check_last_liveness_at = ?, updated_at = ?
+         WHERE id = ? AND type = 'smart'`,
+    ).run(now, now, noteId);
+}
+
+function markSmartNoteCheckStatus(db: Database, noteId: number, status: string, now: number): void {
+    db.prepare(
+        `UPDATE notes SET check_status = ?, updated_at = ? WHERE id = ? AND type = 'smart'`,
+    ).run(status, now, noteId);
+}
+
+function markSmartNoteCompilationFailure(
+    db: Database,
+    noteId: number,
+    now: number,
+    maxFailures: number,
+): void {
+    const failureCount = legacyReadFailureCount(db, noteId, "check_failure_count") + 1;
+    const status = failureCount >= maxFailures ? "fallback" : "uncompiled";
+    db.prepare(
+        `UPDATE notes
+         SET check_failure_count = ?,
+             check_status = ?,
+             check_next_due_at = ?,
+             updated_at = ?
+         WHERE id = ? AND type = 'smart'`,
+    ).run(failureCount, status, now + legacyBackoffMs(failureCount), now, noteId);
+}
+
+function markNoteReady(db: Database, noteId: number, reason?: string): void {
+    const now = Date.now();
+    db.prepare(
+        "UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, last_checked_at = ? WHERE id = ? AND type = 'smart'",
+    ).run(now, reason ?? null, now, now, noteId);
+}
+
+function markNoteChecked(db: Database, noteId: number): void {
+    const now = Date.now();
+    db.prepare(
+        "UPDATE notes SET last_checked_at = ?, updated_at = ? WHERE id = ? AND type = 'smart'",
+    ).run(now, now, noteId);
+}
 
 // ---------------------------------------------------------------------------
 // Constants frozen into the fixture. Values that live as private consts in
@@ -234,16 +382,19 @@ interface TransitionCase {
     expected: Lifecycle;
 }
 
+const ARTIFACT_MANIFEST = {
+    capabilities: ["readFile"],
+    readFiles: ["docs/x.md"],
+    signals: ["docs/x.md mentions release"],
+    summary: "watch docs/x.md",
+};
 const ARTIFACT = {
     compiled_check: "function check(cap) { return { met: false }; }",
-    manifest_json: JSON.stringify({
-        capabilities: ["readFile"],
-        readFiles: ["docs/x.md"],
-        signals: ["docs/x.md mentions release"],
-        summary: "watch docs/x.md",
-    }),
+    manifest_json: JSON.stringify(ARTIFACT_MANIFEST),
     check_hash: "a".repeat(64),
-    check_cron: "0 */2 * * *",
+    // Transition vectors use the test process's timezone, so check_cron must
+    // be timezone-invariant.
+    check_cron: "* * * * *",
 };
 
 const transitionCases: TransitionCase[] = [];
@@ -283,7 +434,7 @@ function applyCompileSuccess(db: Database, noteId: number, now: number, met: boo
     storeCompiledSmartNoteCheck(db, {
         noteId,
         compiledCheck: ARTIFACT.compiled_check,
-        manifest: JSON.parse(ARTIFACT.manifest_json),
+        manifest: ARTIFACT_MANIFEST,
         checkHash: ARTIFACT.check_hash,
         checkCron: ARTIFACT.check_cron,
         nextDueAt,

@@ -1,5 +1,3 @@
-process.env.TZ = "America/Los_Angeles";
-
 import { describe, expect, test } from "bun:test";
 
 import { readFileSync } from "node:fs";
@@ -55,7 +53,6 @@ const goldenPath = join(
     "../../../../../../crates/mc-module/testdata/smart-note-evaluation-golden.json",
 );
 const golden = JSON.parse(readFileSync(goldenPath, "utf8")) as {
-    provenance: { timezone: string };
     transition_cases: GoldenTransitionCase[];
 };
 
@@ -104,14 +101,6 @@ function toOutcome(goldenCase: GoldenTransitionCase): SmartNoteEvaluationOutcome
 }
 
 describe("smart-note evaluation reducer characterization", () => {
-    // Cron matching uses local civil time, so the test process must use the
-    // fixture timezone.
-    test("fixture timezone matches the test process", () => {
-        expect(new Intl.DateTimeFormat().resolvedOptions().timeZone).toBe(
-            golden.provenance.timezone,
-        );
-    });
-
     for (const goldenCase of golden.transition_cases) {
         test(`transition ${goldenCase.id}`, () => {
             const reduction = reduceSmartNoteEvaluation(

@@ -1,18 +1,19 @@
 import type { Database } from "../../../shared/sqlite";
 import { getLeaseHolder, peekLeaseHolderAndExpiry } from "../dreamer/lease";
 import { leaseKeyFor } from "../dreamer/task-registry";
-import { markNoteReady } from "../storage-notes";
 import { createSmartNoteCapabilities } from "./capabilities";
+import {
+    lifecycleStateFromNote,
+    applySmartNoteReduction,
+    reduceSmartNoteEvaluation,
+} from "./evaluation-state";
+import { evaluateSmartNotePhase } from "./evaluator";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
-import { nextSmartNoteCheckDueAt } from "./schedule";
 import {
     commitSmartNoteState,
     getDueCompiledSmartNoteChecks,
-    markCompiledCheckFalse,
-    markCompiledCheckLogicFailure,
-    markCompiledCheckNetworkFailure,
+    smartNoteCommitExpectation,
 } from "./storage";
-import { parseSmartNoteManifest } from "./types";
 import { wakePlaneStatus } from "./wake-plane";
 
 export interface RunDueCompiledSmartNoteChecksArgs {
@@ -46,7 +47,6 @@ function inferEvaluateSmartNotesLeaseHeld(
 
 const DEFAULT_MAX_CHECKS = 10;
 const DEFAULT_SWEEP_BUDGET_MS = 15_000;
-const MAX_FAILURES_BEFORE_REAUTHOR = 3;
 
 export async function runDueCompiledSmartNoteChecks(
     args: RunDueCompiledSmartNoteChecksArgs,
@@ -74,7 +74,6 @@ export async function runDueCompiledSmartNoteChecks(
     for (const note of due) {
         if (Date.now() - startedAt >= (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS)) break;
         if (!note.compiledCheck) continue;
-        const compiledCheck = note.compiledCheck;
         ran++;
         const controller = new AbortController();
         const abortFromCaller = () => controller.abort(args.signal?.reason);
@@ -89,88 +88,50 @@ export async function runDueCompiledSmartNoteChecks(
             remaining,
         );
         try {
-            const result = await runCompiledSmartNoteCheck({
-                compiledCheck,
-                capabilityFactory: (signal) =>
-                    createSmartNoteCapabilities({
-                        projectRoot: args.projectRoot,
-                        signal,
-                    }),
-                signal: controller.signal,
-                timeoutMs: Math.min(2_000, remaining),
-            });
-            const runFinishedAt = Date.now();
-            const expected = {
-                kind: "compiled-check" as const,
-                noteId: note.id,
-                compiledCheck,
-                checkHash: note.checkHash,
-                checkCompiledAt: note.checkCompiledAt,
-            };
-            if (!result.ok && result.cancelled) {
+            const evaluated = await evaluateSmartNotePhase(
+                {
+                    phase: "due",
+                    noteId: note.id,
+                    content: note.content,
+                    surfaceCondition: note.surfaceCondition,
+                    compiledCheck: note.compiledCheck,
+                },
+                {
+                    compile: () => Promise.reject(new Error("due phase does not compile")),
+                    confirmFallback: () => Promise.resolve(null),
+                    runCompiled: (compiledCheck) =>
+                        runCompiledSmartNoteCheck({
+                            compiledCheck,
+                            capabilityFactory: (signal) =>
+                                createSmartNoteCapabilities({
+                                    projectRoot: args.projectRoot,
+                                    signal,
+                                }),
+                            signal: controller.signal,
+                            timeoutMs: Math.min(2_000, remaining),
+                        }),
+                },
+            );
+            if (!evaluated.ok) {
                 continue;
             }
-            if (result.ok && result.result.met) {
-                const committed = commitSmartNoteState(args.db, {
-                    phase: "due check",
-                    expected,
-                    leaseHeld,
-                    write: () => {
-                        markNoteReady(
-                            args.db,
-                            note.id,
-                            hostGeneratedReadyReason(note.id, note.manifestJson),
-                        );
-                    },
-                });
-                if (committed) surfaced++;
-            } else if (result.ok) {
-                // Cron search is bounded and completed before the write lock so
-                // schedule evaluation cannot extend the state transaction.
-                const nextDueAt = nextSmartNoteCheckDueAt(note.checkCron, {
-                    now: runFinishedAt,
-                    noteId: note.id,
-                    hash: note.checkHash,
-                });
-                commitSmartNoteState(args.db, {
-                    phase: "due check",
-                    expected,
-                    leaseHeld,
-                    write: () => {
-                        markCompiledCheckFalse(args.db, note.id, nextDueAt, runFinishedAt);
-                    },
-                });
-            } else if (result.network) {
-                const committed = commitSmartNoteState(args.db, {
-                    phase: "network failure",
-                    expected,
-                    leaseHeld,
-                    write: () => {
-                        markCompiledCheckNetworkFailure(
-                            args.db,
-                            note.id,
-                            runFinishedAt,
-                            MAX_FAILURES_BEFORE_REAUTHOR,
-                        );
-                    },
-                });
-                if (committed) networkFailed++;
-            } else {
-                const committed = commitSmartNoteState(args.db, {
-                    phase: "logic failure",
-                    expected,
-                    leaseHeld,
-                    write: () => {
-                        markCompiledCheckLogicFailure(
-                            args.db,
-                            note.id,
-                            runFinishedAt,
-                            MAX_FAILURES_BEFORE_REAUTHOR,
-                        );
-                    },
-                });
-                if (committed) failed++;
-            }
+            // Cron search is bounded and completed before the write lock so
+            // schedule evaluation cannot extend the state transaction.
+            const reduction = reduceSmartNoteEvaluation(
+                lifecycleStateFromNote(note),
+                evaluated.outcome,
+                { noteId: note.id, now: Date.now() },
+            );
+            const committed = commitSmartNoteState(args.db, {
+                phase: `due check (${evaluated.outcome.kind})`,
+                expected: smartNoteCommitExpectation(note),
+                leaseHeld,
+                write: () => applySmartNoteReduction(args.db, note.id, reduction),
+            });
+            if (!committed) continue;
+            if (evaluated.outcome.kind === "met") surfaced++;
+            else if (evaluated.outcome.kind === "logic_failed") failed++;
+            else if (evaluated.outcome.kind === "network_failed") networkFailed++;
         } finally {
             clearTimeout(timer);
             args.signal?.removeEventListener("abort", abortFromCaller);
@@ -178,10 +139,4 @@ export async function runDueCompiledSmartNoteChecks(
     }
 
     return { ran, surfaced, failed, networkFailed };
-}
-
-function hostGeneratedReadyReason(noteId: number, manifestJson: string | null): string {
-    const manifest = parseSmartNoteManifest(manifestJson);
-    const signal = manifest.signals?.[0] ?? manifest.summary ?? "compiled check returned met=true";
-    return `Smart note #${noteId}: ${signal}`.slice(0, 240);
 }

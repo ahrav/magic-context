@@ -41,7 +41,7 @@ function v79Database(): Database {
     db.exec("PRAGMA foreign_keys=ON");
     initializeDatabase(db);
     runMigrations(db);
-    db.exec("DELETE FROM schema_migrations WHERE version = 80");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 80");
     db.exec(`
         DROP TRIGGER IF EXISTS memories_stats_ai;
         DROP TRIGGER IF EXISTS memories_telemetry_freeze_guard;
@@ -540,7 +540,7 @@ describe("migration v80: memory_stats telemetry side table", () => {
         initializeDatabase(legacy);
         runMigrations(legacy);
         legacy.exec(`
-            DELETE FROM schema_migrations WHERE version = 80;
+            DELETE FROM schema_migrations WHERE version >= 80;
             DROP TRIGGER IF EXISTS memories_stats_ai;
             DROP TRIGGER IF EXISTS memories_telemetry_freeze_guard;
             DROP TRIGGER IF EXISTS memory_stats_authority_guard_insert;

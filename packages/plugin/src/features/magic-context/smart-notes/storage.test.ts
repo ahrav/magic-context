@@ -12,12 +12,17 @@ import { acquireLease } from "../dreamer/lease";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { addNote, dismissNote, getNotes, getPendingSmartNotes, updateNote } from "../storage-notes";
+import {
+    applySmartNoteReduction,
+    lifecycleStateFromNote,
+    reduceSmartNoteEvaluation,
+} from "./evaluation-state";
 import { runDueCompiledSmartNoteChecks } from "./runner";
 import {
     commitSmartNoteState,
+    getFallbackSmartNotes,
     getSmartNotesNeedingCompilation,
-    markCompiledCheckFalse,
-    storeCompiledSmartNoteCheck,
+    smartNoteCommitExpectation,
 } from "./storage";
 import { SMART_NOTE_CHECK_POLICY_VERSION } from "./types";
 
@@ -42,6 +47,25 @@ function setCheckColumns(db: Database, noteId: number, columns: Record<string, u
     db.prepare(
         `UPDATE notes SET ${entries.map(([key]) => `${key} = ?`).join(", ")} WHERE id = ?`,
     ).run(...entries.map(([, value]) => value), noteId);
+}
+
+function compileArtifactReduction(db: Database, noteId: number, met: boolean) {
+    const note = getPendingSmartNotes(db, PROJECT).find((candidate) => candidate.id === noteId);
+    if (!note) throw new Error(`note #${noteId} is not pending`);
+    return reduceSmartNoteEvaluation(
+        lifecycleStateFromNote({ ...note, checkStatus: note.checkStatus ?? "uncompiled" }),
+        {
+            phase: "compile",
+            kind: met ? "compiled_met" : "compiled_false",
+            artifact: {
+                compiledCheck: "function check() { return { met: false }; }",
+                manifestJson: JSON.stringify({ capabilities: [] }),
+                checkHash: "hash",
+                checkCron: "* * * * *",
+            },
+        },
+        { noteId, now: Date.now() },
+    );
 }
 
 afterEach(() => {
@@ -71,6 +95,30 @@ describe("smart-note compilation selection", () => {
             expect(getSmartNotesNeedingCompilation(db, PROJECT, now, 10).map((n) => n.id)).toEqual([
                 due.id,
             ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("fallback selection returns only pending fallback notes", () => {
+        const db = freshDb();
+        try {
+            const fallback = addNote(db, "smart", {
+                projectPath: PROJECT,
+                content: "fallback",
+                surfaceCondition: "condition",
+            });
+            const plain = addNote(db, "smart", {
+                projectPath: PROJECT,
+                content: "plain",
+                surfaceCondition: "condition",
+            });
+            setCheckColumns(db, fallback.id, {
+                check_status: "fallback",
+                check_failure_count: 3,
+            });
+            expect(getFallbackSmartNotes(db, PROJECT, 3).map((n) => n.id)).toEqual([fallback.id]);
+            expect(plain.id).not.toBe(fallback.id);
         } finally {
             closeQuietly(db);
         }
@@ -166,29 +214,16 @@ describe("smart-note state compare-and-set", () => {
                 content: "compile me",
                 surfaceCondition: "when ready",
             });
+            const expected = smartNoteCommitExpectation(note);
+            const reduction = compileArtifactReduction(db, note.id, true);
             expect(dismissNote(db, note.id, { sessionId: "session", projectPath: PROJECT })).toBe(
                 true,
             );
 
             const committed = commitSmartNoteState(db, {
                 phase: "compile",
-                expected: {
-                    kind: "source-revision",
-                    noteId: note.id,
-                    content: note.content,
-                    surfaceCondition: note.surfaceCondition,
-                    updatedAt: note.updatedAt,
-                },
-                write: () =>
-                    storeCompiledSmartNoteCheck(db, {
-                        noteId: note.id,
-                        compiledCheck: "function check() { return { met: true }; }",
-                        manifest: { capabilities: [] },
-                        checkHash: "new-hash",
-                        checkCron: "* * * * *",
-                        nextDueAt: Date.now(),
-                        now: Date.now(),
-                    }),
+                expected,
+                write: () => applySmartNoteReduction(db, note.id, reduction),
             });
 
             expect(committed).toBe(false);
@@ -228,14 +263,10 @@ describe("smart-note state compare-and-set", () => {
 
             const committed = commitSmartNoteState(db, {
                 phase: "due check",
-                expected: {
-                    kind: "compiled-check",
-                    noteId: selected.id,
-                    compiledCheck: selected.compiledCheck as string,
-                    checkHash: selected.checkHash,
-                    checkCompiledAt: selected.checkCompiledAt,
+                expected: smartNoteCommitExpectation(selected),
+                write: () => {
+                    throw new Error("stale write must not run");
                 },
-                write: () => markCompiledCheckFalse(db, selected.id, 999, 456),
             });
 
             expect(committed).toBe(false);
@@ -248,7 +279,7 @@ describe("smart-note state compare-and-set", () => {
         }
     });
 
-    test("commits when the expected source revision is unchanged", () => {
+    test("commits when the claimed revisions are unchanged", () => {
         const db = freshDb();
         try {
             const note = addNote(db, "smart", {
@@ -256,30 +287,50 @@ describe("smart-note state compare-and-set", () => {
                 content: "normal",
                 surfaceCondition: "normal condition",
             });
-            const now = Date.now();
+            const reduction = compileArtifactReduction(db, note.id, false);
             const committed = commitSmartNoteState(db, {
                 phase: "compile",
-                expected: {
-                    kind: "source-revision",
-                    noteId: note.id,
-                    content: note.content,
-                    surfaceCondition: note.surfaceCondition,
-                    updatedAt: note.updatedAt,
-                },
-                write: () =>
-                    storeCompiledSmartNoteCheck(db, {
-                        noteId: note.id,
-                        compiledCheck: "function check() { return { met: false }; }",
-                        manifest: { capabilities: [] },
-                        checkHash: "hash",
-                        checkCron: "* * * * *",
-                        nextDueAt: now + 60_000,
-                        now,
-                    }),
+                expected: smartNoteCommitExpectation(note),
+                write: () => applySmartNoteReduction(db, note.id, reduction),
             });
 
             expect(committed).toBe(true);
-            expect(getPendingSmartNotes(db, PROJECT)[0].checkStatus).toBe("compiled");
+            const current = getPendingSmartNotes(db, PROJECT)[0];
+            expect(current.checkStatus).toBe("compiled");
+            expect(current.stateVersion).toBe(note.stateVersion + 1);
+            expect(current.sourceRevision).toBe(note.sourceRevision);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("an interleaved lifecycle transition discards the second commit", () => {
+        const db = freshDb();
+        try {
+            const note = addNote(db, "smart", {
+                projectPath: PROJECT,
+                content: "raced",
+                surfaceCondition: "condition",
+            });
+            const expected = smartNoteCommitExpectation(note);
+            const first = compileArtifactReduction(db, note.id, false);
+            expect(
+                commitSmartNoteState(db, {
+                    phase: "compile",
+                    expected,
+                    write: () => applySmartNoteReduction(db, note.id, first),
+                }),
+            ).toBe(true);
+
+            expect(
+                commitSmartNoteState(db, {
+                    phase: "compile replay",
+                    expected,
+                    write: () => {
+                        throw new Error("stale write must not run");
+                    },
+                }),
+            ).toBe(false);
         } finally {
             closeQuietly(db);
         }

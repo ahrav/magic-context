@@ -40,7 +40,7 @@ function v78DatabaseWithNotes(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
-    db.exec("DELETE FROM schema_migrations WHERE version IN (79, 80)");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 79");
     db.exec(`
         DROP TRIGGER IF EXISTS notes_fts_ai;
         DROP TRIGGER IF EXISTS notes_fts_ad;

@@ -34,10 +34,11 @@ const { detectOverflow, extractErrorMessage, parseReportedLimit, OVERFLOW_PATTER
         detectOverflow: (error: unknown) => {
             isOverflow: boolean;
             reportedLimit?: number;
+            reportedLimitProvenance?: string;
             matchedPattern?: string;
         };
         extractErrorMessage: (error: unknown) => string;
-        parseReportedLimit: (message: string) => number | undefined;
+        parseReportedLimit: (message: string) => { value: number } | undefined;
         OVERFLOW_PATTERNS: ReadonlyArray<RegExp>;
     };
 
