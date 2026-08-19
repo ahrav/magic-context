@@ -107,6 +107,19 @@ export function isSecretKey(key: string): boolean {
     return false;
 }
 
+/** Host-independent path rewriting: only the generic user-home patterns,
+ *  never the running host's homedir or username. Case-insensitive with both
+ *  separator styles: Windows and macOS filesystems are case-insensitive and
+ *  tools emit `c:/users/...` as readily as `C:\Users\...`. Callers that must
+ *  produce identical results on every machine (release validation) use this;
+ *  diagnostics that redact the local identity use `sanitizePathString`. */
+export function sanitizePathStringPortable(value: string): string {
+    return value
+        .replace(/\/Users\/[^/]+\//gi, "/Users/<USER>/")
+        .replace(/\/home\/[^/]+\//gi, "/home/<USER>/")
+        .replace(/[A-Za-z]:[\\/]Users[\\/][^\\/]+[\\/]/gi, "C:\\Users\\<USER>\\");
+}
+
 export function sanitizePathString(value: string): string {
     const home = homedir();
     const username = userInfo().username;
@@ -114,9 +127,7 @@ export function sanitizePathString(value: string): string {
     if (home) {
         sanitized = sanitized.replace(new RegExp(escapeRegex(home), "g"), "~");
     }
-    sanitized = sanitized.replace(/\/Users\/[^/]+\//g, "/Users/<USER>/");
-    sanitized = sanitized.replace(/\/home\/[^/]+\//g, "/home/<USER>/");
-    sanitized = sanitized.replace(/C:\\Users\\[^\\]+\\/g, "C:\\Users\\<USER>\\");
+    sanitized = sanitizePathStringPortable(sanitized);
     if (username) {
         sanitized = sanitized.replace(new RegExp(escapeRegex(username), "g"), "<USER>");
     }
@@ -219,8 +230,8 @@ export function sanitizeDiagnosticText(value: string): string {
 // REDACTION, not share-gating) does not rewrite. Kept here, NOT in
 // sanitizeDiagnosticText, so diagnostic redaction output is unchanged.
 const SHAREABILITY_SENSITIVE_PATTERNS: RegExp[] = [
-    // Windows user home, forward- OR back-slash (sanitizePathString only rewrites
-    // the backslash form).
+    // Windows user home, forward-slash form. Redundant with the portable
+    // path sanitizer's separator-agnostic rewrite; kept as defense in depth.
     /\bC:\/Users\/[^/\s]+/i,
     // A `~`-rooted home path (personal/local).
     /(?:^|\s)~\/[^\s]+/,
@@ -228,15 +239,36 @@ const SHAREABILITY_SENSITIVE_PATTERNS: RegExp[] = [
     // text (it keys on config OBJECT keys, not prose).
     /\b(?:api[_-]?key|secret|token|password|passwd|pwd|client[_-]?secret|access[_-]?key)\b\s*[:=]\s*\S+/i,
     // Local / private endpoints — environment-specific, not a shared truth.
-    /\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?\b/i,
+    // Per-arm boundaries: \b cannot sit next to the non-word "[", so the
+    // bracketed and bare IPv6 loopback forms need their own arms. The bare
+    // arm requires a non-word/non-colon/non-dot lead so suffixes of longer
+    // addresses (2001:db8::1) never match.
+    /(?:\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)\b|\[::1\]|(?:^|[^\w:.])::1\b)(?::\d+)?/i,
     /\b(?:10|127)\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/,
     /\b192\.168\.\d{1,3}\.\d{1,3}\b/,
     /\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b/,
+    // IPv4 link-local (APIPA) and IPv6 unique-local (fc00::/7) / link-local
+    // (fe80::/10) — environment-identifying just like the RFC1918 ranges.
+    /\b169\.254\.\d{1,3}\.\d{1,3}\b/,
+    /(?:^|[\s"'`=([])\[?(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9a-f:]*[0-9a-f\]]/i,
 ];
 
 export function hasShareabilitySensitiveText(text: string): boolean {
     try {
         if (sanitizeDiagnosticText(text) !== text) return true;
+        return SHAREABILITY_SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
+    } catch {
+        return true;
+    }
+}
+
+/** Host-independent variant of `hasShareabilitySensitiveText`: same secret
+ *  and shareability patterns, but never the running host's homedir or
+ *  username, so the verdict for a given string is identical on every
+ *  machine. Release-artifact validation depends on that determinism. */
+export function hasPortableSensitiveText(text: string): boolean {
+    try {
+        if (redactSecretText(sanitizePathStringPortable(text)) !== text) return true;
         return SHAREABILITY_SENSITIVE_PATTERNS.some((pattern) => pattern.test(text));
     } catch {
         return true;

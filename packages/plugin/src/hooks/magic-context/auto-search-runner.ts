@@ -36,7 +36,11 @@ import {
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { buildAutoSearchHint } from "./auto-search-hint";
-import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
+import {
+    AUTO_SEARCH_RESULT_LIMIT,
+    AUTO_SEARCH_SOURCES,
+    extractBoundedAutoSearchQuery,
+} from "./auto-search-prompt";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
@@ -104,9 +108,12 @@ export interface AutoSearchRunnerOptions {
     visibleMemoryIds?: Set<number>;
 }
 
-function collectUserPromptParts(message: MessageLike): string {
+export function collectUserPromptParts(message: MessageLike): string {
     let collected = "";
     for (const part of message.parts) {
+        // Persisted parts can hydrate as null (invalid JSON or a literal
+        // "null" row); one malformed part must not abort the whole message.
+        if (part === null || typeof part !== "object") continue;
         const p = part as { type?: string; text?: string; ignored?: boolean };
         if (p.type !== "text" || typeof p.text !== "string") continue;
         // Skip plugin-internal ignored notifications (conflict warnings, TUI setup
@@ -121,8 +128,9 @@ function collectUserPromptParts(message: MessageLike): string {
 /** Tests whether the user message already carries a stacked plugin augmentation
  *  or auto-hint block — in which case auto-search should skip so we don't double
  *  up. This runs on the RAW text (before stripping) because the whole point is
- *  to detect what the stripper would remove. */
-function hasStackedAugmentation(rawText: string): boolean {
+ *  to detect what the stripper would remove. Exported so candidate recovery
+ *  applies the same eligibility gate the live path applies. */
+export function hasStackedAugmentation(rawText: string): boolean {
     return (
         rawText.includes("<sidekick-augmentation>") ||
         rawText.includes("<ctx-search-hint>") ||
@@ -248,7 +256,7 @@ export async function runAutoSearchHint(args: {
         const gitCommitsEnabled =
             embeddingSnapshot?.gitCommitEnabled ?? options.gitCommitsEnabled ?? false;
         const searchOptions: UnifiedSearchOptions = {
-            limit: 10,
+            limit: AUTO_SEARCH_RESULT_LIMIT,
             memoryEnabled,
             embeddingEnabled,
             gitCommitsEnabled,
@@ -268,7 +276,7 @@ export async function runAutoSearchHint(args: {
             visibleMemoryIds: options.visibleMemoryIds ?? null,
             // Primers v1 are cache-neutral: they surface via explicit ctx_search
             // and dashboard only, never transform-time auto-search prompt hints.
-            sources: ["memory", "message", "git_commit"],
+            sources: [...AUTO_SEARCH_SOURCES],
         };
         results = await unifiedSearchWithTimeout(
             db,

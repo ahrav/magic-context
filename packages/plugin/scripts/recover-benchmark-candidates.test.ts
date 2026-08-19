@@ -1,0 +1,798 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import {
+    chmodSync,
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    readdirSync,
+    rmSync,
+    statSync,
+    symlinkSync,
+    utimesSync,
+    writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { Database } from "../src/shared/sqlite";
+import { normalizedQueryHash } from "../src/features/magic-context/storage-embedding-measurements";
+import { readRawSessionMessagesFromDb } from "../src/hooks/magic-context/read-session-raw";
+import {
+    type QueryCandidate,
+    type RecoveryInputRow,
+    StagingError,
+    collectSessionCandidates,
+    ensureStagingRoot,
+    purgeStaleDrafts,
+    recoverCandidates,
+    runRecovery,
+    validateMeasurementSchema,
+    writeStagedFileAtomically,
+} from "./recover-benchmark-candidates";
+
+const tempDirs: string[] = [];
+
+function tempDir(prefix: string): string {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    tempDirs.push(dir);
+    return dir;
+}
+
+afterEach(() => {
+    for (const dir of tempDirs) {
+        rmSync(dir, { recursive: true, force: true });
+    }
+    tempDirs.length = 0;
+});
+
+function makeMeasurementDb(): Database {
+    const db = new Database(":memory:");
+    db.exec(`
+        CREATE TABLE embedding_measurement_corpus (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            project_path TEXT NOT NULL DEFAULT '',
+            query_text_hash TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE session_projects (
+            session_id TEXT NOT NULL,
+            harness TEXT NOT NULL DEFAULT 'opencode',
+            project_path TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(session_id, harness)
+        );
+        CREATE TABLE session_meta (
+            session_id TEXT PRIMARY KEY,
+            auto_search_hint_decisions TEXT NOT NULL DEFAULT '[]'
+        );
+    `);
+    return db;
+}
+
+function makeHistoryDb(): Database {
+    const db = new Database(":memory:");
+    db.exec(`
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            time_created INTEGER,
+            time_updated INTEGER
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            time_created INTEGER,
+            time_updated INTEGER
+        );
+    `);
+    return db;
+}
+
+let messageCounter = 0;
+
+function insertUserMessage(db: Database, sessionId: string, text: string): string {
+    messageCounter += 1;
+    const messageId = `msg_${messageCounter}`;
+    db.prepare(
+        "INSERT INTO message (id, session_id, data, time_created) VALUES (?, ?, ?, ?)",
+    ).run(messageId, sessionId, JSON.stringify({ role: "user", id: messageId }), messageCounter);
+    const partId = `part_${messageCounter}`;
+    db.prepare(
+        "INSERT INTO part (id, message_id, session_id, data, time_created) VALUES (?, ?, ?, ?, ?)",
+    ).run(
+        partId,
+        messageId,
+        sessionId,
+        JSON.stringify({ type: "text", text }),
+        messageCounter,
+    );
+    return messageId;
+}
+
+/** Persisted evidence that auto-search ran past its gates for a message. */
+function recordHintDecision(db: Database, sessionId: string, messageId: string): void {
+    db.prepare(
+        `INSERT INTO session_meta (session_id, auto_search_hint_decisions)
+         VALUES (?, json_array(json_object('messageId', ?, 'decision', 'hint', 'text', 'hint text')))
+         ON CONFLICT(session_id) DO UPDATE SET auto_search_hint_decisions =
+             json_insert(auto_search_hint_decisions, '$[#]',
+                 json_object('messageId', ?, 'decision', 'hint', 'text', 'hint text'))`,
+    ).run(sessionId, messageId, messageId);
+}
+
+function bindSession(db: Database, sessionId: string, harness: string): void {
+    db.prepare(
+        "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, 'git:proj', 0)",
+    ).run(sessionId, harness);
+}
+
+function insertMeasurement(db: Database, sessionId: string, hash: string): void {
+    // project_path matches bindSession's: ownership correlates on
+    // (session_id, project_path), not session_id alone.
+    db.prepare(
+        "INSERT INTO embedding_measurement_corpus (session_id, project_path, query_text_hash) VALUES (?, 'git:proj', ?)",
+    ).run(sessionId, hash);
+}
+
+function row(
+    ordinal: number,
+    sessionId: string,
+    hash: string,
+    ownership: RecoveryInputRow["ownership"] = "opencode",
+): RecoveryInputRow {
+    return { ordinal, sessionId, queryTextHash: hash, ownership };
+}
+
+describe("recoverCandidates", () => {
+    const candidate = (text: string, mode: QueryCandidate["mode"] = "automatic") => ({
+        text,
+        mode,
+    });
+
+    it("recovers a unique same-session match and nothing else", () => {
+        const text = "how does the queue backpressure work";
+        const outcome = recoverCandidates({
+            rows: [row(0, "s1", normalizedQueryHash(text))],
+            candidatesBySession: new Map([["s1", [candidate(text)]]]),
+        });
+        expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "recovered" }]);
+        expect(outcome.draft.records).toEqual([
+            { ordinal: 0, mode: "automatic", queryText: text },
+        ]);
+    });
+
+    it("emits distinct allowlisted statuses for every non-recoverable case", () => {
+        const shared = "shared candidate text";
+        const collidingA = "Collision  Text";
+        const collidingB = "collision text";
+        const outcome = recoverCandidates({
+            rows: [
+                row(0, "s1", normalizedQueryHash("absent query")),
+                row(1, "s1", normalizedQueryHash(shared)),
+                row(2, "s2", normalizedQueryHash("anything"), "pi"),
+                row(3, "s3", normalizedQueryHash("anything"), "missing"),
+                row(4, "s4", normalizedQueryHash("anything"), "ambiguous"),
+                row(5, "s1", normalizedQueryHash(collidingA)),
+            ],
+            candidatesBySession: new Map([
+                ["s1", [candidate(collidingA), candidate(collidingB)]],
+                ["s5", [candidate(shared)]],
+            ]),
+        });
+        expect(outcome.report.rows.map((r) => r.status)).toEqual([
+            "zero-match",
+            "cross-session-only",
+            "owner-pi",
+            "owner-missing",
+            "owner-ambiguous",
+            "normalized-collision",
+        ]);
+        expect(outcome.draft.records).toHaveLength(0);
+    });
+
+    it("reports a defensive multi-match when the hash function collides", () => {
+        const outcome = recoverCandidates({
+            rows: [row(0, "s1", "collide")],
+            candidatesBySession: new Map([
+                ["s1", [candidate("alpha entirely"), candidate("beta different")]],
+            ]),
+            hashCandidate: () => "collide",
+        });
+        expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "multi-match" }]);
+    });
+
+    it("reports mode ambiguity instead of resolving provenance by message order", () => {
+        const text = "same text seen through both extraction paths";
+        for (const order of [
+            [candidate(text, "automatic"), candidate(text, "explicit")],
+            [candidate(text, "explicit"), candidate(text, "automatic")],
+        ]) {
+            const outcome = recoverCandidates({
+                rows: [row(0, "s1", normalizedQueryHash(text))],
+                candidatesBySession: new Map([["s1", order]]),
+            });
+            expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "mode-ambiguous" }]);
+            expect(outcome.draft.records).toHaveLength(0);
+        }
+    });
+
+    it("recovers a repeated same-mode text as a single unambiguous candidate", () => {
+        const text = "explicit search repeated verbatim";
+        const outcome = recoverCandidates({
+            rows: [row(0, "s1", normalizedQueryHash(text))],
+            candidatesBySession: new Map([
+                ["s1", [candidate(text, "explicit"), candidate(text, "explicit")]],
+            ]),
+        });
+        expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "recovered" }]);
+        expect(outcome.draft.records).toEqual([
+            { ordinal: 0, mode: "explicit", queryText: text },
+        ]);
+    });
+
+    it("privacy-rejects a matched candidate that still carries sensitive text", () => {
+        const text = "token in /home/someone/.ssh/id_rsa please";
+        const outcome = recoverCandidates({
+            rows: [row(0, "s1", normalizedQueryHash(text))],
+            candidatesBySession: new Map([["s1", [candidate(text)]]]),
+        });
+        expect(outcome.report.rows).toEqual([{ ordinal: 0, status: "privacy-rejected" }]);
+        expect(outcome.draft.records).toHaveLength(0);
+    });
+
+    it("is deterministic across runs over the same inputs", () => {
+        const args = {
+            rows: [row(0, "s1", normalizedQueryHash("query one"))],
+            candidatesBySession: new Map([["s1", [candidate("query one")]]]),
+        };
+        expect(JSON.stringify(recoverCandidates(args))).toBe(
+            JSON.stringify(recoverCandidates(args)),
+        );
+    });
+});
+
+describe("collectSessionCandidates", () => {
+    it("derives the same automatic query as the production stripper", () => {
+        const db = makeHistoryDb();
+        insertUserMessage(
+            db,
+            "s1",
+            "<system-reminder>noise</system-reminder>How does   compaction work?",
+        );
+        // Rows go through the real reconstruction path runRecovery uses, so
+        // this covers row hydration, not just the extraction helpers.
+        const candidates = collectSessionCandidates(readRawSessionMessagesFromDb(db, "s1"));
+        expect(candidates).toEqual([
+            { text: "How does compaction work?", mode: "automatic" },
+        ]);
+    });
+
+    it("applies the live eligibility gates to automatic candidates", () => {
+        const candidates = collectSessionCandidates([
+            {
+                ordinal: 1,
+                id: "m1",
+                role: "user",
+                // Stacked augmentation: the live path skips this message
+                // entirely, so recovery must not record it as automatic.
+                parts: [
+                    {
+                        type: "text",
+                        text: "<ctx-search-hint>old hint</ctx-search-hint>how does compaction work",
+                    },
+                ],
+            },
+            {
+                ordinal: 2,
+                id: "m2",
+                role: "user",
+                // Ignored notification: hasMeaningfulUserText rejects it.
+                parts: [{ type: "text", text: "plugin announcement", ignored: true }],
+            },
+            {
+                ordinal: 3,
+                id: "m3",
+                role: "user",
+                parts: [{ type: "text", text: "a real user question" }],
+            },
+            {
+                ordinal: 4,
+                id: "m4",
+                // Malformed parent rows page through as role "unknown";
+                // their tool parts must not become explicit candidates.
+                role: "unknown",
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "ctx_search",
+                        state: { status: "completed", input: { query: "from malformed parent" } },
+                    },
+                ],
+            },
+        ]);
+        expect(candidates).toEqual([{ text: "a real user question", mode: "automatic" }]);
+    });
+
+    it("requires persisted run evidence for automatic candidates when provided", () => {
+        const messages = [
+            {
+                ordinal: 1,
+                id: "msg_ran",
+                role: "user",
+                parts: [{ type: "text", text: "prompt that ran auto search" }],
+            },
+            {
+                ordinal: 2,
+                id: "msg_norun",
+                role: "user",
+                parts: [{ type: "text", text: "prompt with no decision record" }],
+            },
+        ];
+        const candidates = collectSessionCandidates(messages, {
+            autoSearchRanMessageIds: new Set(["msg_ran"]),
+        });
+        expect(candidates).toEqual([
+            { text: "prompt that ran auto search", mode: "automatic" },
+        ]);
+    });
+
+    it("skips ignored parts, unwraps imitated-reduced args, and drops malformed input", () => {
+        const candidates = collectSessionCandidates([
+            {
+                ordinal: 1,
+                id: "m1",
+                role: "user",
+                parts: [
+                    // A persisted part row holding invalid JSON hydrates as
+                    // null; it must be skipped, not crash the whole message.
+                    null,
+                    { type: "text", text: "ignored notification", ignored: true },
+                ],
+            },
+            {
+                ordinal: 2,
+                id: "m2",
+                role: "assistant",
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "ctx_search",
+                        state: {
+                            status: "completed",
+                            input: {
+                                reduced: true,
+                                summary: JSON.stringify({ query: "nested lookup" }),
+                            },
+                        },
+                    },
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: null } },
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: 123 } } },
+                    // ID-shaped queries can short-circuit past the measured
+                    // search path; provenance is unknowable, so skipped.
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: "9101" } } },
+                    // Completed but resolved with a pre-search error string:
+                    // no measurement was produced.
+                    { type: "tool", tool: "ctx_search", state: { status: "completed", input: { query: "unresolved project" }, output: "Error: Could not resolve project identity for search." } },
+                    // Never-executed lifecycle states must not become candidates.
+                    { type: "tool", tool: "ctx_search", state: { status: "pending", input: { query: "never ran" } } },
+                    { type: "tool", tool: "ctx_search", state: { status: "error", input: { query: "failed run" } } },
+                    { type: "tool", tool: "other_tool", state: { status: "completed", input: { query: "not ours" } } },
+                ],
+            },
+        ]);
+        expect(candidates).toEqual([{ text: "nested lookup", mode: "explicit" }]);
+    });
+
+    it("drops an over-cap explicit query exactly like the live tool", () => {
+        const candidates = collectSessionCandidates([
+            {
+                ordinal: 1,
+                id: "m1",
+                role: "assistant",
+                parts: [
+                    {
+                        type: "tool",
+                        tool: "ctx_search",
+                        state: { status: "completed", input: { query: "x".repeat(17 * 1024) } },
+                    },
+                ],
+            },
+        ]);
+        expect(candidates).toEqual([]);
+    });
+});
+
+describe("staging safety", () => {
+    it("rejects symlinked roots, permissive modes, VCS trees, and forbidden overlaps", () => {
+        const base = tempDir("staging-safety-");
+        const realRoot = join(base, "real");
+        mkdirSync(realRoot, { mode: 0o700 });
+        const alias = join(base, "alias");
+        symlinkSync(realRoot, alias);
+        expect(() => ensureStagingRoot(alias, [])).toThrow(StagingError);
+
+        const permissive = join(base, "permissive");
+        mkdirSync(permissive, { mode: 0o755 });
+        expect(() => ensureStagingRoot(permissive, [])).toThrow(StagingError);
+
+        const vcs = join(base, "repo", "staging");
+        mkdirSync(join(base, "repo", ".git"), { recursive: true });
+        mkdirSync(vcs, { recursive: true, mode: 0o700 });
+        expect(() => ensureStagingRoot(vcs, [])).toThrow(StagingError);
+
+        const forbidden = join(base, "forbidden", "inner");
+        mkdirSync(forbidden, { recursive: true, mode: 0o700 });
+        expect(() => ensureStagingRoot(forbidden, [join(base, "forbidden")])).toThrow(
+            StagingError,
+        );
+
+        // Reverse containment: a staging root ABOVE a forbidden tree would
+        // let the stale-draft purge recursively delete that tree.
+        const above = join(base, "above");
+        const nestedDb = join(above, "db-dir");
+        mkdirSync(nestedDb, { recursive: true, mode: 0o700 });
+        chmodSync(above, 0o700);
+        expect(() => ensureStagingRoot(above, [nestedDb])).toThrow(StagingError);
+
+        expect(() => ensureStagingRoot("relative/path", [])).toThrow(StagingError);
+    });
+
+    it("refuses existing destinations and leaves no temp file on failure", () => {
+        const root = ensureStagingRoot(join(tempDir("staging-write-"), "root"), []);
+        writeStagedFileAtomically(root, "draft.json", "{}");
+        expect(() => writeStagedFileAtomically(root, "draft.json", "{}")).toThrow(StagingError);
+        expect(readdirSync(root).sort((a, b) => a.localeCompare(b))).toEqual(["draft.json"]);
+    });
+
+    it("purges drafts older than the TTL and keeps fresh ones", () => {
+        const root = ensureStagingRoot(join(tempDir("staging-purge-"), "root"), []);
+        const past = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
+        // Recovery-owned entries age out...
+        const staleRun = join(root, "run-abc123");
+        mkdirSync(staleRun, { mode: 0o700 });
+        utimesSync(staleRun, past, past);
+        const staleLegacy = join(root, "draft.json");
+        writeFileSync(staleLegacy, "{}");
+        utimesSync(staleLegacy, past, past);
+        // ...but unrelated entries are not ours to delete, however old:
+        // arbitrary names, run-prefixed files, and run-prefixed directories
+        // that do not match the mkdtemp shape all survive.
+        const unrelated = join(root, "precious-notes.txt");
+        writeFileSync(unrelated, "keep me");
+        utimesSync(unrelated, past, past);
+        const runFile = join(root, "run-notes.txt");
+        writeFileSync(runFile, "keep me too");
+        utimesSync(runFile, past, past);
+        const runNamed = join(root, "run-production");
+        mkdirSync(runNamed, { mode: 0o700 });
+        utimesSync(runNamed, past, past);
+        writeStagedFileAtomically(root, "fresh.json", "{}");
+        purgeStaleDrafts(root, Date.now());
+        expect(existsSync(staleRun)).toBe(false);
+        expect(existsSync(staleLegacy)).toBe(false);
+        expect(existsSync(unrelated)).toBe(true);
+        expect(existsSync(runFile)).toBe(true);
+        expect(existsSync(runNamed)).toBe(true);
+        expect(existsSync(join(root, "fresh.json"))).toBe(true);
+    });
+});
+
+describe("runRecovery", () => {
+    function seededDbs() {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const text = "where is the retry backoff configured";
+        bindSession(measurementDb, "s1", "opencode");
+        insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
+        bindSession(measurementDb, "s2", "pi");
+        insertMeasurement(measurementDb, "s2", normalizedQueryHash("pi query"));
+        const messageId = insertUserMessage(historyDb, "s1", text);
+        recordHintDecision(measurementDb, "s1", messageId);
+        return { measurementDb, historyDb, text };
+    }
+
+    it("writes a de-identified draft and allowlisted report, deterministically", async () => {
+        const { measurementDb, historyDb, text } = seededDbs();
+        const rootA = join(tempDir("run-recovery-"), "a");
+        const first = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: rootA,
+            forbiddenRoots: [],
+        });
+        const draft = readFileSync(first.draftPath, "utf8");
+        const report = readFileSync(first.reportPath, "utf8");
+        expect(JSON.parse(draft).records).toEqual([
+            { ordinal: 0, mode: "automatic", queryText: text },
+        ]);
+        expect(JSON.parse(report).rows).toEqual([
+            { ordinal: 0, status: "recovered" },
+            { ordinal: 1, status: "owner-pi" },
+        ]);
+        for (const output of [draft, report]) {
+            expect(output).not.toContain("s1");
+            expect(output).not.toContain(normalizedQueryHash(text));
+        }
+        expect(report).not.toContain(text);
+
+        const rootB = join(tempDir("run-recovery-"), "b");
+        const second = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: rootB,
+            forbiddenRoots: [],
+        });
+        expect(readFileSync(second.draftPath, "utf8")).toBe(draft);
+        expect(readFileSync(second.reportPath, "utf8")).toBe(report);
+    });
+
+    it("keeps canaries in hashes, ids, and metadata out of every output channel", async () => {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const canaryText = "find sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345 in the config";
+        bindSession(measurementDb, "ses_canary_owner", "opencode");
+        insertMeasurement(measurementDb, "ses_canary_owner", normalizedQueryHash(canaryText));
+        const canaryMsg = insertUserMessage(historyDb, "ses_canary_owner", canaryText);
+        recordHintDecision(measurementDb, "ses_canary_owner", canaryMsg);
+        const root = join(tempDir("run-canary-"), "root");
+        const result = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
+            { ordinal: 0, status: "privacy-rejected" },
+        ]);
+        for (const entry of readdirSync(root, { recursive: true }) as string[]) {
+            expect(entry).not.toContain("ses_canary_owner");
+            const path = join(root, entry);
+            if (!statSync(path).isFile()) continue;
+            const content = readFileSync(path, "utf8");
+            expect(content).not.toContain("sk-ant");
+            expect(content).not.toContain("ses_canary_owner");
+        }
+    });
+
+    it("re-runs within the TTL without colliding with the previous draft", async () => {
+        const { measurementDb, historyDb, text } = seededDbs();
+        const root = join(tempDir("run-rerun-"), "root");
+        const first = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        const second = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        expect(second.draftPath).not.toBe(first.draftPath);
+        expect(readFileSync(second.draftPath, "utf8")).toBe(
+            readFileSync(first.draftPath, "utf8"),
+        );
+        expect(JSON.parse(readFileSync(second.draftPath, "utf8")).records).toEqual([
+            { ordinal: 0, mode: "automatic", queryText: text },
+        ]);
+    });
+
+    it("rejects candidates carrying a forbidden identifying token", async () => {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const text = "how does the acme-internal launch flow work";
+        bindSession(measurementDb, "s1", "opencode");
+        insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
+        const tokenMsg = insertUserMessage(historyDb, "s1", text);
+        recordHintDecision(measurementDb, "s1", tokenMsg);
+        const root = join(tempDir("run-tokens-"), "root");
+        const result = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+            forbiddenTokens: ["ACME-INTERNAL"],
+        });
+        expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
+            { ordinal: 0, status: "privacy-rejected" },
+        ]);
+        expect(JSON.parse(readFileSync(result.draftPath, "utf8")).records).toEqual([]);
+    });
+
+    it("rolls back the first transaction when the second BEGIN fails", async () => {
+        const measurementDb = makeMeasurementDb();
+        const failingHistory = {
+            exec(sql: string): void {
+                if (sql === "BEGIN") throw new Error("history connection busy");
+            },
+        } as unknown as Database;
+        const root = join(tempDir("run-beginfail-"), "root");
+        await expect(
+            runRecovery({
+                measurementDb,
+                historyDb: failingHistory,
+                stagingRoot: root,
+                forbiddenRoots: [],
+            }),
+        ).rejects.toThrow("history connection busy");
+        // A leaked read transaction would make this BEGIN throw ("cannot
+        // start a transaction within a transaction").
+        expect(() => {
+            measurementDb.exec("BEGIN");
+            measurementDb.exec("ROLLBACK");
+        }).not.toThrow();
+        expect(readdirSync(root)).toEqual([]);
+    });
+
+    it("pages past malformed history rows instead of treating them as EOF", async () => {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const text = "the question after the malformed block";
+        bindSession(measurementDb, "s1", "opencode");
+        insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
+        // A full page of rows whose time_created hydrates as TEXT precedes
+        // the valid message; SQL-side shape predicates must skip them
+        // rather than reading the empty filtered page as end-of-history.
+        for (let i = 0; i < 250; i += 1) {
+            historyDb
+                .prepare(
+                    "INSERT INTO message (id, session_id, data, time_created) VALUES (?, ?, ?, ?)",
+                )
+                .run(`bad_${i}`, "s1", JSON.stringify({ role: "user", id: `bad_${i}` }), "not-a-number");
+        }
+        const goodMsg = insertUserMessage(historyDb, "s1", text);
+        recordHintDecision(measurementDb, "s1", goodMsg);
+        const root = join(tempDir("run-malformed-page-"), "root");
+        const result = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
+            { ordinal: 0, status: "recovered" },
+        ]);
+    });
+
+    it("classifies cross-session-only under bounded candidate retention", async () => {
+        const measurementDb = makeMeasurementDb();
+        const historyDb = makeHistoryDb();
+        const text = "query that only ever ran in the other session";
+        // s1's row references a hash whose plaintext exists only in s2's
+        // history; the streaming pass must still see s2's hash union.
+        bindSession(measurementDb, "s1", "opencode");
+        insertMeasurement(measurementDb, "s1", normalizedQueryHash(text));
+        bindSession(measurementDb, "s2", "opencode");
+        insertMeasurement(measurementDb, "s2", normalizedQueryHash("s2 own query"));
+        const crossMsg = insertUserMessage(historyDb, "s2", text);
+        recordHintDecision(measurementDb, "s2", crossMsg);
+        const ownMsg = insertUserMessage(historyDb, "s2", "s2 own query");
+        recordHintDecision(measurementDb, "s2", ownMsg);
+        const root = join(tempDir("run-crosssession-"), "root");
+        const result = await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [],
+        });
+        expect(JSON.parse(readFileSync(result.reportPath, "utf8")).rows).toEqual([
+            { ordinal: 0, status: "cross-session-only" },
+            { ordinal: 1, status: "recovered" },
+        ]);
+    });
+
+    it("rejects malformed schema and out-of-bounds rows without writing anything", async () => {
+        const broken = new Database(":memory:");
+        broken.exec("CREATE TABLE embedding_measurement_corpus (id INTEGER PRIMARY KEY)");
+        const historyDb = makeHistoryDb();
+        const root = join(tempDir("run-malformed-"), "root");
+        await expect(
+            runRecovery({
+                measurementDb: broken,
+                historyDb,
+                stagingRoot: root,
+                forbiddenRoots: [],
+            }),
+        ).rejects.toThrow(StagingError);
+        expect(readdirSync(root)).toEqual([]);
+
+        const oversized = makeMeasurementDb();
+        bindSession(oversized, "s1", "opencode");
+        insertMeasurement(oversized, "s1", "not-a-hash");
+        const root2 = join(tempDir("run-oversized-"), "root");
+        await expect(
+            runRecovery({
+                measurementDb: oversized,
+                historyDb,
+                stagingRoot: root2,
+                forbiddenRoots: [],
+            }),
+        ).rejects.toThrow(StagingError);
+        expect(readdirSync(root2)).toEqual([]);
+    });
+
+    it("leaves source databases byte-identical (no writes on the query-only path)", async () => {
+        const dir = tempDir("run-readonly-");
+        const measurementPath = join(dir, "context.db");
+        const historyPath = join(dir, "opencode.db");
+        {
+            const seedMeasurement = new Database(measurementPath);
+            seedMeasurement.exec(`
+                CREATE TABLE embedding_measurement_corpus (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    project_path TEXT NOT NULL DEFAULT '',
+                    query_text_hash TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE session_projects (
+                    session_id TEXT NOT NULL,
+                    harness TEXT NOT NULL DEFAULT 'opencode',
+                    project_path TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, harness)
+                );
+                CREATE TABLE session_meta (
+                    session_id TEXT PRIMARY KEY,
+                    auto_search_hint_decisions TEXT NOT NULL DEFAULT '[]'
+                );
+            `);
+            bindSession(seedMeasurement, "s1", "opencode");
+            insertMeasurement(seedMeasurement, "s1", normalizedQueryHash("some query"));
+            seedMeasurement.close();
+            const seedHistory = new Database(historyPath);
+            seedHistory.exec(`
+                CREATE TABLE message (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL,
+                    time_created INTEGER, time_updated INTEGER
+                );
+                CREATE TABLE part (
+                    id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    data TEXT NOT NULL, time_created INTEGER, time_updated INTEGER
+                );
+            `);
+            seedHistory.close();
+        }
+        const beforeMeasurement = readFileSync(measurementPath);
+        const beforeHistory = readFileSync(historyPath);
+        const filesBefore = readdirSync(dir).sort((a, b) => a.localeCompare(b));
+
+        const measurementDb = new Database(measurementPath, { readonly: true });
+        const historyDb = new Database(historyPath, { readonly: true });
+        const root = join(tempDir("run-readonly-out-"), "root");
+        await runRecovery({
+            measurementDb,
+            historyDb,
+            stagingRoot: root,
+            forbiddenRoots: [dir],
+        });
+        measurementDb.close();
+        historyDb.close();
+
+        expect(readdirSync(dir).sort((a, b) => a.localeCompare(b))).toEqual(filesBefore);
+        expect(readFileSync(measurementPath).equals(beforeMeasurement)).toBe(true);
+        expect(readFileSync(historyPath).equals(beforeHistory)).toBe(true);
+    });
+
+    it("has no import edge to promotion or publication code", () => {
+        const source = readFileSync(
+            join(import.meta.dir, "recover-benchmark-candidates.ts"),
+            "utf8",
+        );
+        const importLines = source.split("\n").filter((line) => line.includes(" from \""));
+        for (const line of importLines) {
+            expect(line.includes("promote")).toBe(false);
+            expect(line.includes("build-benchmark-corpus")).toBe(false);
+        }
+    });
+});
+
+describe("validateMeasurementSchema", () => {
+    it("accepts the production schema shape", () => {
+        expect(() => validateMeasurementSchema(makeMeasurementDb())).not.toThrow();
+    });
+});

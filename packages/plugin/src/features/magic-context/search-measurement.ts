@@ -7,24 +7,8 @@ import {
     getShadowEmbeddingMeasurementCohort,
 } from "./memory/embedding";
 import type { CapturedQueryEmbedding, UnifiedSearchOptions, UnifiedSearchResult } from "./search";
+import { encodePhysicalResultLocator } from "./search-result-locator";
 import { recordEmbeddingMeasurement } from "./storage-embedding-measurements";
-
-function resultId(result: UnifiedSearchResult): string {
-    switch (result.source) {
-        case "memory":
-            return `memory:${result.memoryId}`;
-        case "message":
-            return `message:${result.messageId}`;
-        case "compartment":
-            return `chunk:${result.compartmentId}`;
-        case "git_commit":
-            return `commit:${result.sha}`;
-        case "primer":
-            return `primer:${result.primerId}`;
-        case "note":
-            return `note:${result.noteId}`;
-    }
-}
 
 export async function recordShadowMeasurement(args: {
     db: Database;
@@ -89,8 +73,8 @@ export async function recordShadowMeasurement(args: {
             shadowFingerprint: shadowCohort.fingerprint,
             shadowEpoch: shadowCohort.epoch,
         });
-        const primaryIds = args.primaryResults.map(resultId);
-        const shadowIds = shadowResults.map(resultId);
+        const primaryIds = args.primaryResults.map(encodePhysicalResultLocator);
+        const shadowIds = shadowResults.map(encodePhysicalResultLocator);
         const corpusHash = sha256(JSON.stringify({ query: args.query, primaryIds, shadowIds }));
         recordEmbeddingMeasurement(args.db, {
             sessionId: args.sessionId,
