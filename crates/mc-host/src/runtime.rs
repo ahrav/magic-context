@@ -17,7 +17,9 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::{HostConfig, HostLimits, HostTiming, LivenessPolicy};
 use crate::connection::{run_connection, GenerationCore};
-use crate::dispatch::{close_route, force_close_all_routes, send_connection_goodbye};
+use crate::dispatch::{
+    finish_route_close, force_close_all_routes, send_connection_goodbye, settle_route,
+};
 use crate::handler::McHostHandler;
 use crate::instance::{ConnectionKey, InstanceError, InstanceGuard};
 use crate::routing::RouteRegistry;
@@ -147,11 +149,17 @@ impl<H: McHostHandler> HostShared<H> {
     /// Joins a lifecycle callback task under the lifecycle deadline. Panic or
     /// overrun trips the fatal latch; the host must terminate rather than
     /// report graceful completion (plan KTD9).
+    ///
+    /// The error distinguishes a callback that STOPPED (panicked or aborted,
+    /// so its handle is dead) from one that did not (deadline expired while a
+    /// non-yielding poll continues). Cleanup that would let another party
+    /// touch the same route — route-gone, finalize, channel reuse — may only
+    /// proceed in the former case.
     pub async fn lifecycle_join<T>(
         &self,
         what: &'static str,
         mut task: JoinHandle<T>,
-    ) -> Result<T, ()> {
+    ) -> Result<T, LifecycleFailure> {
         match timeout(self.timing.lifecycle_callback_deadline, &mut task).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(join_err)) => {
@@ -162,7 +170,7 @@ impl<H: McHostHandler> HostShared<H> {
                 };
                 self.fatal
                     .trip(&self.shutdown, format!("{what} callback {kind}"));
-                Err(())
+                Err(LifecycleFailure { stopped: true })
             }
             Err(_) => {
                 // Abort is only observed when the callback's current poll
@@ -174,7 +182,7 @@ impl<H: McHostHandler> HostShared<H> {
                 task.abort();
                 self.fatal
                     .trip(&self.shutdown, format!("{what} callback deadline expired"));
-                Err(())
+                Err(LifecycleFailure { stopped: false })
             }
         }
     }
@@ -184,6 +192,33 @@ impl<H: McHostHandler> HostShared<H> {
             handle.abort();
         }
     }
+}
+
+/// Keeps the instance lock held until an aborted initialization task actually
+/// stops, without blocking `run`'s return. The lock is the single-instance
+/// fence: releasing it while the old callback still owns the handler and its
+/// storage descriptor would let a successor initialize the same data
+/// directory concurrently. A successor meanwhile observes `AlreadyRunning`,
+/// which is the truthful answer while that callback runs.
+fn retain_lock_until_stopped<T: Send + 'static>(
+    guard: InstanceGuard,
+    task: tokio_util::task::AbortOnDropHandle<T>,
+) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            let _ = task.await;
+            drop(guard);
+        });
+    }
+}
+
+/// Why a lifecycle callback did not produce a value, and whether it has
+/// actually stopped running.
+pub struct LifecycleFailure {
+    /// `false` means the callback is still executing (its deadline expired
+    /// inside a non-yielding poll, which `abort` cannot interrupt), so no
+    /// caller may advance cleanup for the same object.
+    pub stopped: bool,
 }
 
 /// Cancels host work if the `run` future is dropped instead of completing:
@@ -327,9 +362,14 @@ pub async fn run<H: McHostHandler>(
             }
         };
         let Some(joined) = joined else {
-            // Not joined: a non-yielding initialize would block this await
-            // forever. AbortOnDropHandle detaches it as this scope unwinds.
+            // Not joined here: a non-yielding initialize would block this
+            // await forever. The lock must still outlive the callback — it
+            // owns the handler and the initialization payload, and a
+            // successor starting against the same data directory would run a
+            // second initialization concurrently — so the guard moves into a
+            // detached reaper that waits for the task and drops it last.
             init_task.abort();
+            retain_lock_until_stopped(guard, init_task);
             return Err(HostError::InitFailed(
                 "shutdown requested during initialization".to_owned(),
             ));
@@ -355,6 +395,7 @@ pub async fn run<H: McHostHandler>(
             }
             Err(_) => {
                 init_task.abort();
+                retain_lock_until_stopped(guard, init_task);
                 return Err(HostError::InitFailed(
                     "initialize deadline expired".to_owned(),
                 ));
@@ -545,13 +586,19 @@ async fn shutdown_sequence<H: McHostHandler>(
     // 2. Fenced publication removal while the lock is held.
     guard.remove_publication();
 
-    // 3-5. Drain every route while read loops remain available to reject work
-    // arriving during the frozen-admission window. Once route cleanup is
-    // complete, fence and join read-side producers; connection Goodbyes are
-    // queued only after neither producer class can enqueue another frame.
+    // 3-5. Settle each route's admitted work (emitting its terminals) and run
+    // its route-gone while read loops are still available to refuse work
+    // arriving in the frozen-admission window — step 1's `server_busy` duty
+    // lasts as long as the host keeps reading, and fencing reads before
+    // cleanup would leave nothing to observe it. Only then fence and join
+    // read-side producers, so connection Goodbyes are queued after every
+    // drain terminal and after neither producer class can enqueue again
+    // (step 4's normative requirement).
     let drain = async {
         for handle in shared.registry.all_routes() {
-            close_route(shared, handle).await;
+            if settle_route(shared, handle).await {
+                finish_route_close(shared, handle).await;
+            }
         }
 
         let generations: Vec<Arc<GenerationCore>> = shared

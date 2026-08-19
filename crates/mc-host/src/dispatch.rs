@@ -837,11 +837,21 @@ pub async fn open_route<H: McHostHandler>(
             }
         }
     });
-    let Ok(Some(outcome)) = shared.lifecycle_join("bind", bind_task).await else {
-        shared.registry.take_rejected_bind(handle);
-        run_route_gone(&shared, handle).await;
-        shared.registry.finalize_close(handle);
-        return;
+    let outcome = match shared.lifecycle_join("bind", bind_task).await {
+        Ok(Some(outcome)) => outcome,
+        // The callback stopped (panic, abort) or self-bounded its own inner
+        // deadline, so the handle is inert and cleanup may proceed.
+        Ok(None) | Err(crate::runtime::LifecycleFailure { stopped: true }) => {
+            shared.registry.take_rejected_bind(handle);
+            if run_route_gone(&shared, handle).await {
+                shared.registry.finalize_close(handle);
+            }
+            return;
+        }
+        // Still executing: running route-gone or freeing the channel would
+        // overlap it for the same handle. The latch is already tripped, so
+        // the route stays claimed and the incarnation terminates.
+        Err(crate::runtime::LifecycleFailure { stopped: false }) => return,
     };
 
     match outcome {
@@ -866,14 +876,31 @@ pub async fn open_route<H: McHostHandler>(
                 // Close raced the bind and wins: never publish, still exactly
                 // one route-gone because the handler observed the handle
                 // (protocol AE8).
-                run_route_gone(&shared, handle).await;
-                shared.registry.finalize_close(handle);
+                if run_route_gone(&shared, handle).await {
+                    shared.registry.finalize_close(handle);
+                }
             }
         },
         crate::handler::BindOutcome::Reject { code, message } => {
+            // Normalized before the cleanup awaits below: these are
+            // handler-authored strings held across route-gone and the egress
+            // wait with no byte charge, so up to max_routes concurrent binds
+            // would otherwise retain arbitrary allocations. Same caps as
+            // request-error terminals.
+            let (code, message) =
+                if code.len() > MAX_TERMINAL_CODE_LEN || message.len() > MAX_TERMINAL_MESSAGE_LEN {
+                    (
+                        CODE_INTERNAL_ERROR.to_owned(),
+                        "bind rejection exceeds diagnostic limit".to_owned(),
+                    )
+                } else {
+                    (code, message)
+                };
             shared.registry.take_rejected_bind(handle);
-            run_route_gone(&shared, handle).await;
-            shared.registry.finalize_close(handle);
+            let stopped = run_route_gone(&shared, handle).await;
+            if stopped {
+                shared.registry.finalize_close(handle);
+            }
             let code = if code.is_empty() {
                 "bind_rejected".to_owned()
             } else {
@@ -898,9 +925,16 @@ pub async fn open_route<H: McHostHandler>(
 /// drop this caller at its deadline and `abort_all` reaps ordinary tasks, but
 /// route-gone runs exactly once and must complete (or trip the fatal latch)
 /// before handler drop, so the spawned task enforces its own deadline.
-async fn run_route_gone<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: RouteHandle) {
+/// Returns whether the callback is no longer running: `false` means its
+/// deadline expired inside a non-yielding poll, so the caller must NOT
+/// finalize the route — finalizing frees the channel for reuse, and a later
+/// bind on the same channel would overlap the still-running callback.
+async fn run_route_gone<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    handle: RouteHandle,
+) -> bool {
     if !shared.registry.mark_gone_started(handle) {
-        return;
+        return true;
     }
     let handler = Arc::clone(&shared.handler);
     let deadline = shared.timing.lifecycle_callback_deadline;
@@ -917,14 +951,21 @@ async fn run_route_gone<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: R
             );
         }
     });
-    let _ = shared.lifecycle_join("route_gone", task).await;
+    match shared.lifecycle_join("route_gone", task).await {
+        Ok(()) => true,
+        Err(failure) => failure.stopped,
+    }
 }
 
-/// Closes one route: stop dispatch, cancel admitted work, await its tasks until
-/// the close budget, abort overdue tasks, run route-gone once, and free the
-/// channel (protocol §9.4, §12).
-pub async fn close_route<H: McHostHandler>(shared: &Arc<HostShared<H>>, handle: RouteHandle) {
-    close_route_decision(shared, handle, shared.registry.begin_close(handle)).await;
+/// Phase A only, for host shutdown: settles a route's admitted work (emitting
+/// its terminals) without running route-gone, so connection Goodbyes can be
+/// queued between settlement and cleanup (protocol §12 steps 3-5). Returns
+/// whether this caller owns the route's phase B.
+pub async fn settle_route<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    handle: RouteHandle,
+) -> bool {
+    settle_route_work(shared, handle, shared.registry.begin_close(handle)).await
 }
 
 /// Completes a supplied close decision whose registry transition already
@@ -937,8 +978,32 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
     handle: RouteHandle,
     decision: CloseDecision,
 ) {
+    if settle_route_work(shared, handle, decision).await {
+        finish_route_close(shared, handle).await;
+    }
+}
+
+/// Phase B of a route close: exactly-once route-gone, then finalize only if
+/// the callback stopped. Split from settlement so host shutdown can queue
+/// connection Goodbyes between the two (protocol §12 steps 3-5).
+pub(crate) async fn finish_route_close<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    handle: RouteHandle,
+) {
+    if run_route_gone(shared, handle).await {
+        shared.registry.finalize_close(handle);
+    }
+}
+
+/// Phase A of a route close: cancel admitted work, emit its terminals, and
+/// wait for dispatch tasks to stop. Returns whether the caller owns phase B.
+pub(crate) async fn settle_route_work<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    handle: RouteHandle,
+    decision: CloseDecision,
+) -> bool {
     match decision {
-        CloseDecision::AlreadyGone | CloseDecision::DeferredToBind => {}
+        CloseDecision::AlreadyGone | CloseDecision::DeferredToBind => false,
         CloseDecision::Owner {
             gen,
             aborts,
@@ -983,7 +1048,7 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
                         &shared.shutdown,
                         "dispatch task did not stop before route-gone".to_owned(),
                     );
-                    return;
+                    return false;
                 }
             }
             // Aborted tasks never removed their own pending entries.
@@ -993,9 +1058,7 @@ pub(crate) async fn close_route_decision<H: McHostHandler>(
                     pending.remove(&key);
                 }
             }
-
-            run_route_gone(shared, handle).await;
-            shared.registry.finalize_close(handle);
+            true
         }
     }
 }
@@ -1060,8 +1123,9 @@ pub async fn force_close_all_routes<H: McHostHandler>(shared: &Arc<HostShared<H>
                 );
                 return;
             }
-            run_route_gone(&shared, handle).await;
-            shared.registry.finalize_close(handle);
+            if run_route_gone(&shared, handle).await {
+                shared.registry.finalize_close(handle);
+            }
         });
     }
     while drains.join_next().await.is_some() {}

@@ -407,10 +407,21 @@ pub struct WriterHandle {
     retired: CancellationToken,
     generation: CancellationToken,
     discard: CancellationToken,
+    finish: CancellationToken,
     admission_timeout: Duration,
 }
 
 impl WriterHandle {
+    /// Stops the writer after flushing what is already queued. Needed because
+    /// a handler that retains a `RequestCtx` keeps an `Arc<GenerationCore>` —
+    /// and therefore a sender clone — alive forever, so `rx.recv()` would
+    /// never report the channel closed and the writer task would outlive the
+    /// connection until the shutdown deadline. Unlike `discard`, queued frames
+    /// (drain terminals, Goodbye) are still written.
+    pub fn finish(&self) {
+        self.finish.cancel();
+    }
+
     /// Retires the writer AND drops every queued frame. Peer-initiated and
     /// error retirement must close silently (protocol §6.3): cancelling
     /// producers stops new frames, but responses already queued would still
@@ -510,11 +521,13 @@ where
     let (tx, mut rx) = mpsc::channel::<OutboundFrame>(queue_frames);
     let retired = CancellationToken::new();
     let discard = CancellationToken::new();
+    let finish = CancellationToken::new();
     let handle = WriterHandle {
         tx,
         retired: retired.clone(),
         generation: generation.clone(),
         discard: discard.clone(),
+        finish: finish.clone(),
         admission_timeout: write_deadline,
     };
     let task = async move {
@@ -523,6 +536,12 @@ where
             let frame = tokio::select! {
                 biased;
                 () = discard.cancelled() => break,
+                // Finished: flush what is queued, then exit without waiting
+                // for senders an inert handler may still hold.
+                () = finish.cancelled() => match rx.try_recv() {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                },
                 frame = rx.recv() => match frame {
                     Some(frame) => frame,
                     None => break,

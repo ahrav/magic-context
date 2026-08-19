@@ -150,6 +150,9 @@ pub async fn run_connection<H: McHostHandler>(
         &shared.tracker,
     );
     let mut writer_task = AbortOnDropHandle::new(writer_task);
+    // Retained past `gen`: the writer must be told to stop even when a
+    // handler still holds a sender clone through a retained RequestCtx.
+    let writer_finish = writer.clone();
 
     let gen = Arc::new(GenerationCore {
         id: shared.gen_counter.fetch_add(1, Ordering::SeqCst),
@@ -229,6 +232,10 @@ pub async fn run_connection<H: McHostHandler>(
 
     close_generation(&shared, &gen, begun_closes).await;
     drop(gen);
+    // Every legitimate producer is done (read tasks joined, routes closed,
+    // generation dropped); any surviving sender is an inert handler-held
+    // clone, so close the queue explicitly rather than waiting for it.
+    writer_finish.finish();
     // The writer drains queued terminals and Goodbye after the handles drop.
     // Its own per-frame stall deadline (`frame_deadline`, enforced inside the
     // writer task) already bounds this join, so no extra budget applies here:
