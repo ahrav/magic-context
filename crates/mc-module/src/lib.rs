@@ -11535,7 +11535,11 @@ impl McHandler {
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
                 if condition.is_some() && !self.has_live_note_evaluator(project, now) {
-                    return tool_error_result(
+                    return refuse_conditioned_note_without_evaluator(
+                        store,
+                        session,
+                        action,
+                        command_id.as_deref(),
                         "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not written.",
                     );
                 }
@@ -11742,7 +11746,11 @@ impl McHandler {
                 let condition_changed = condition
                     .is_some_and(|value| current.surface_condition.as_deref() != Some(value));
                 if condition_changed && !self.has_live_note_evaluator(project, now) {
-                    return tool_error_result(
+                    return refuse_conditioned_note_without_evaluator(
+                        store,
+                        session,
+                        action,
+                        command_id.as_deref(),
                         "Error: Smart-note evaluation is unavailable for this Rust-authority project; the note was not updated.",
                     );
                 }
@@ -15056,6 +15064,34 @@ fn facade_command_outcome(
         Err(error) if store_error_is_authority_draining(&error) => authority_draining_error(domain),
         Err(error) => tool_error_result(format!("Error: {error}")),
     }
+}
+
+/// Refusal path for a conditioned `ctx_note` mutation with no live evaluator.
+/// `with_facade_command` replays recorded outcomes only after this gate, so a
+/// retried command whose original mutation committed (response lost, module
+/// restarted, lease expired) must consult the durable response ledger here:
+/// the liveness gate protects first-time mutations, never replays.
+fn refuse_conditioned_note_without_evaluator(
+    store: &McStore,
+    identity_scope: &str,
+    action: &str,
+    command_id: Option<&str>,
+    refusal: &str,
+) -> HandlerOutcome {
+    if let Some(command_id) = command_id {
+        match store.facade_mutation_ledger_response(identity_scope, "ctx_note", action, command_id)
+        {
+            Ok(Some(stored)) => {
+                return facade_command_outcome(
+                    Ok(FacadeMutationOutcome::Duplicate(stored)),
+                    "notes",
+                )
+            }
+            Ok(None) => {}
+            Err(error) => return tool_error_result(format!("Error: {error}")),
+        }
+    }
+    tool_error_result(refusal)
 }
 
 fn authority_source_path(
@@ -22460,6 +22496,58 @@ mod tests {
             )
             .await;
         assert_eq!(error_code(stale_heartbeat), "registration_unknown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conditioned_write_replays_recorded_response_without_live_evaluator() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+
+        register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        let conditioned = json!({
+            "action": "write",
+            "content": "conditioned write with a command id",
+            "surface_condition": "when evaluated",
+            "command_id": "cmd-conditioned-replay",
+        });
+        let created = call_facade(&handler, "ctx_note", conditioned.clone()).await;
+        assert!(tool_text(created).contains("Created smart note"));
+
+        // The retry models a caller that lost the response and re-sends after
+        // the evaluator lease lapsed.
+        {
+            let mut registrations = handler.note_evaluator_registrations.lock().unwrap();
+            for entries in registrations.values_mut() {
+                for entry in entries.iter_mut() {
+                    entry.expires_at = 0;
+                }
+            }
+        }
+        let replayed = call_facade(&handler, "ctx_note", conditioned).await;
+        let replayed_text = tool_text(replayed);
+        assert!(
+            replayed_text.contains("Created smart note"),
+            "a recorded response must replay past the liveness gate: {replayed_text}"
+        );
+
+        let fresh = call_facade(
+            &handler,
+            "ctx_note",
+            json!({
+                "action": "write",
+                "content": "fresh conditioned write",
+                "surface_condition": "when evaluated",
+                "command_id": "cmd-conditioned-fresh",
+            }),
+        )
+        .await;
+        assert!(tool_text(fresh).contains("Smart-note evaluation is unavailable"));
     }
 
     #[tokio::test(flavor = "current_thread")]

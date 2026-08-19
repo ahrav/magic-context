@@ -805,7 +805,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         })();
     const rustModeModuleClient =
         deps.config.transform_mode === "rust" ? authorityRecoveryModuleClient : undefined;
-    const syncModuleDomain = async (domain: "memories" | "notes"): Promise<void> => {
+    const runModuleDomainSync = async (domain: "memories" | "notes"): Promise<void> => {
         if (!rustModeModuleClient?.mirrorPull) return;
         for (;;) {
             const cursor = getMirrorCursor(db, domain);
@@ -817,6 +817,27 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             const next = applyMirrorPage({ db, page: response.page });
             if (!response.page.has_more || next === cursor) break;
         }
+    };
+    // Each pull reads the durable cursor before requesting a page, so two
+    // concurrent pulls for one domain request the same page and the loser
+    // throws a cursor mismatch in applyMirrorPage (the process-global
+    // evaluator bridge lets several callers reach the notes sync at once).
+    // Chain pulls per domain so each run observes the previous run's
+    // committed cursor.
+    const moduleDomainSyncChains: Record<"memories" | "notes", Promise<void>> = {
+        memories: Promise.resolve(),
+        notes: Promise.resolve(),
+    };
+    const syncModuleDomain = (domain: "memories" | "notes"): Promise<void> => {
+        const run = moduleDomainSyncChains[domain].then(
+            () => runModuleDomainSync(domain),
+            () => runModuleDomainSync(domain),
+        );
+        moduleDomainSyncChains[domain] = run.then(
+            () => undefined,
+            () => undefined,
+        );
+        return run;
     };
     const syncModuleNotes = (): Promise<void> => syncModuleDomain("notes");
     const syncModuleMemories = (): Promise<void> => syncModuleDomain("memories");
@@ -1076,8 +1097,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             sync: syncModuleNotes,
             available: () => worker.registered,
             async drain(drainArgs) {
-                workerPolicy.wakeOwned = (await wakePlaneStatus()) === "present";
-                if (workerPolicy.wakeOwned) {
+                const wakePresent = (await wakePlaneStatus()) === "present";
+                const wakeReleased = workerPolicy.wakeOwned && !wakePresent;
+                workerPolicy.wakeOwned = wakePresent;
+                if (wakePresent) {
                     // The wake plane owns standalone evaluations: claim no work
                     // locally, but keep the registration and its policy live so
                     // the module can apply the wake-owner veto and a failed
@@ -1089,6 +1112,12 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     await syncModuleNotes();
                     return { claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true };
                 }
+                // Polls carry no policy fields, so after a present-to-absent
+                // wake transition the module still holds wake_owned=true and
+                // vetoes every poll until a heartbeat publishes the release.
+                // Publish it before polling; otherwise pending work waits out
+                // a full timer period.
+                if (wakeReleased && worker.registered) await worker.heartbeat();
                 const result = await worker.drainOnce(drainArgs);
                 await syncModuleNotes();
                 return result;
