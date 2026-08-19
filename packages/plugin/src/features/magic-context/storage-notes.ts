@@ -218,22 +218,31 @@ function toNote(row: NoteRow): Note {
     };
 }
 
-function noteCheckColumnsExist(db: Database): boolean {
+function noteColumnExists(db: Database, column: string): boolean {
     try {
         const rows = db.prepare("PRAGMA table_info(notes)").all() as Array<{ name?: string }>;
-        return rows.some((row) => row.name === "compiled_check");
+        return rows.some((row) => row.name === column);
     } catch {
         return false;
     }
 }
 
+function noteCheckColumnsExist(db: Database): boolean {
+    return noteColumnExists(db, "compiled_check");
+}
+
 function noteRevisionColumnsExist(db: Database): boolean {
-    try {
-        const rows = db.prepare("PRAGMA table_info(notes)").all() as Array<{ name?: string }>;
-        return rows.some((row) => row.name === "state_version");
-    } catch {
-        return false;
-    }
+    return noteColumnExists(db, "state_version");
+}
+
+/**
+ * SQL fragment bumping the optimistic-concurrency revision counter, or ""
+ * pre-migration. Every smart-note mutator must include it: a write path that
+ * skips the bump silently defeats the claim revision fence in
+ * `smart-notes/storage.ts` (`claimExpectedState`).
+ */
+function revisionBumpSql(db: Database): string {
+    return noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
 }
 
 function getNoteById(db: Database, noteId: number): Note | null {
@@ -570,6 +579,14 @@ export function updateNote(
             (updates.content !== undefined && updates.content !== existing.content) ||
             (updates.projectPath !== undefined && updates.projectPath !== existing.projectPath));
 
+    // A compiler-input edit forces status='pending' below; silently overriding
+    // a contradictory explicit status would persist the wrong state, so fail
+    // loud instead. Callers change status in a separate call.
+    if (updates.status !== undefined && compilerInputChanged && updates.status !== "pending") {
+        throw new Error(
+            `updateNote: cannot combine status '${updates.status}' with a smart-note compiler-input edit (content/condition/projectPath force status='pending')`,
+        );
+    }
     if (updates.status !== undefined && !compilerInputChanged) {
         sets.push("status = ?");
         params.push(updates.status);
@@ -682,7 +699,7 @@ export function dismissNote(db: Database, noteId: number, scope: NoteMutationSco
         return false;
     }
 
-    const revisionBump = noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
+    const revisionBump = revisionBumpSql(db);
     const result = db
         .prepare(
             `UPDATE notes SET status = 'dismissed', updated_at = ?${revisionBump} WHERE id = ? AND status != 'dismissed'`,
@@ -693,7 +710,7 @@ export function dismissNote(db: Database, noteId: number, scope: NoteMutationSco
 
 export function markNoteReady(db: Database, noteId: number, reason?: string): void {
     const now = Date.now();
-    const revisionBump = noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
+    const revisionBump = revisionBumpSql(db);
     db.prepare(
         `UPDATE notes SET status = 'ready', ready_at = ?, ready_reason = ?, updated_at = ?, last_checked_at = ?${revisionBump} WHERE id = ? AND type = 'smart'`,
     ).run(now, reason ?? null, now, now, noteId);
@@ -701,7 +718,7 @@ export function markNoteReady(db: Database, noteId: number, reason?: string): vo
 
 export function markNoteChecked(db: Database, noteId: number): void {
     const now = Date.now();
-    const revisionBump = noteRevisionColumnsExist(db) ? ", state_version = state_version + 1" : "";
+    const revisionBump = revisionBumpSql(db);
     db.prepare(
         `UPDATE notes SET last_checked_at = ?, updated_at = ?${revisionBump} WHERE id = ? AND type = 'smart'`,
     ).run(now, now, noteId);

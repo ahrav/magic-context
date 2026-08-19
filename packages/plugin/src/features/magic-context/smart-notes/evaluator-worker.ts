@@ -121,6 +121,8 @@ export class SmartNoteEvaluatorWorker {
     private activeClaimSettled: Promise<void> | null = null;
     /** Tail of the drain queue; drains run strictly one at a time. */
     private drainChain: Promise<void> = Promise.resolve();
+    /** In-flight registration attempt shared by concurrent register() callers. */
+    private registerInFlight: Promise<boolean> | null = null;
 
     constructor(deps: SmartNoteEvaluatorWorkerDeps) {
         this.deps = deps;
@@ -167,6 +169,22 @@ export class SmartNoteEvaluatorWorker {
 
     async register(signal?: AbortSignal): Promise<boolean> {
         if (this.disposed) return false;
+        if (this.registration) return true;
+        // Concurrent callers (the hook's eager startup register racing a timer
+        // drain's lazy register) must share one attempt: two successful
+        // registrations would silently overwrite each other, leaking whichever
+        // token loses as a module-side registration no heartbeat sustains.
+        if (this.registerInFlight) return this.registerInFlight;
+        const attempt = this.registerAttempt(signal);
+        this.registerInFlight = attempt;
+        try {
+            return await attempt;
+        } finally {
+            this.registerInFlight = null;
+        }
+    }
+
+    private async registerAttempt(signal?: AbortSignal): Promise<boolean> {
         const policy = this.deps.policy();
         let response: Record<string, unknown>;
         try {
