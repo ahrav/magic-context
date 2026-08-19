@@ -97,3 +97,6 @@ tests/docker/.generated/
 
 docs/plans/
 docs/fork-hardening-audit.md
+
+# perf profile binaries: host/build-specific, summaries live in docs/perf/
+docs/perf/runs/**/*.data
