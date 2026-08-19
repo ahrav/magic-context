@@ -2572,7 +2572,7 @@ describe("memory authority protocol", () => {
 
     test("note evaluation bridges are scoped per project", async () => {
         const calls: string[] = [];
-        registerModuleNoteEvaluationBridge("/project-a", {
+        registerModuleNoteEvaluationBridge("/project-a", "/checkout-a", {
             sync: async () => {
                 calls.push("sync-a");
             },
@@ -2584,9 +2584,37 @@ describe("memory authority protocol", () => {
             dispose: async () => {},
         });
         expect(getModuleNoteEvaluationBridge("/project-a")).toBeDefined();
+        expect(getModuleNoteEvaluationBridge("/project-a", "/checkout-a")).toBeDefined();
+        expect(getModuleNoteEvaluationBridge("/project-a", "/checkout-b")).toBeUndefined();
         expect(getModuleNoteEvaluationBridge("/project-b")).toBeUndefined();
         await getModuleNoteEvaluationBridge("/project-a")?.drain({ deadline: Date.now() + 1000 });
         expect(calls).toEqual(["drain-a"]);
+    });
+
+    test("worktrees sharing an identity hold distinct bridges per checkout root", async () => {
+        const drained: string[] = [];
+        const bridge = (label: string) => ({
+            sync: async () => {},
+            drain: async () => {
+                drained.push(label);
+                return { claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true };
+            },
+            available: () => true,
+            dispose: async () => {},
+        });
+        const keyA = registerModuleNoteEvaluationBridge("/shared-id", "/worktree-a", bridge("a"));
+        const keyB = registerModuleNoteEvaluationBridge("/shared-id", "/worktree-b", bridge("b"));
+        expect(keyA).not.toBe(keyB);
+        await getModuleNoteEvaluationBridge("/shared-id", "/worktree-b")?.drain({
+            deadline: Date.now() + 1000,
+        });
+        expect(drained).toEqual(["b"]);
+        // Disposing one checkout's bridge leaves the sibling registered.
+        await import("./context-authority").then((m) =>
+            m.disposeModuleNoteEvaluationBridges([keyA]),
+        );
+        expect(getModuleNoteEvaluationBridge("/shared-id", "/worktree-a")).toBeUndefined();
+        expect(getModuleNoteEvaluationBridge("/shared-id", "/worktree-b")).toBeDefined();
     });
 
     test("module-managed memory search skips retrieval_count writes", async () => {

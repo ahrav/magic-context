@@ -80,32 +80,62 @@ export interface ModuleNoteEvaluationBridge {
 
 const moduleNoteEvaluationBridges = new Map<string, ModuleNoteEvaluationBridge>();
 
-export function registerModuleNoteEvaluationBridge(
-    projectPath: string,
-    bridge: ModuleNoteEvaluationBridge,
-): void {
-    moduleNoteEvaluationBridges.set(projectPath, bridge);
+/**
+ * Composite registry key. Worktrees of one repository share a project
+ * identity but bind different checkout roots, and each root's bridge closes
+ * over its own transport route and filesystem capabilities, so identity alone
+ * cannot address a bridge. NUL cannot appear in a filesystem path.
+ */
+function moduleNoteEvaluationBridgeKey(projectPath: string, projectRoot: string): string {
+    return `${projectPath}\u0000${projectRoot}`;
 }
 
-export function getModuleNoteEvaluationBridge(
+/** Registers the bridge and returns its registry key for later disposal. */
+export function registerModuleNoteEvaluationBridge(
     projectPath: string,
-): ModuleNoteEvaluationBridge | undefined {
-    return moduleNoteEvaluationBridges.get(projectPath);
+    projectRoot: string,
+    bridge: ModuleNoteEvaluationBridge,
+): string {
+    const key = moduleNoteEvaluationBridgeKey(projectPath, projectRoot);
+    moduleNoteEvaluationBridges.set(key, bridge);
+    return key;
 }
 
 /**
- * Dispose only the named bridges. The registry is process-global while plugin
- * instances are disposed individually, so an instance passes the keys it
- * registered and sibling instances' bridges stay live.
+ * With `projectRoot`: the bridge bound to that exact checkout. Without it: any
+ * bridge for the identity, for identity-scoped questions such as "does a live
+ * evaluator exist" or "does the module own drains for this project".
+ */
+export function getModuleNoteEvaluationBridge(
+    projectPath: string,
+    projectRoot?: string,
+): ModuleNoteEvaluationBridge | undefined {
+    if (projectRoot !== undefined) {
+        return moduleNoteEvaluationBridges.get(
+            moduleNoteEvaluationBridgeKey(projectPath, projectRoot),
+        );
+    }
+    const prefix = `${projectPath}\u0000`;
+    for (const [key, bridge] of moduleNoteEvaluationBridges) {
+        if (key.startsWith(prefix)) return bridge;
+    }
+    return undefined;
+}
+
+/**
+ * Dispose only the named bridges (registry keys returned by register). The
+ * registry is process-global while plugin instances are disposed
+ * individually, so an instance passes the keys it registered and sibling
+ * instances' bridges stay live.
  */
 export async function disposeModuleNoteEvaluationBridges(
-    projectPaths: Iterable<string>,
+    bridgeKeys: Iterable<string>,
 ): Promise<void> {
     const bridges: ModuleNoteEvaluationBridge[] = [];
-    for (const projectPath of projectPaths) {
-        const bridge = moduleNoteEvaluationBridges.get(projectPath);
+    for (const key of bridgeKeys) {
+        const bridge = moduleNoteEvaluationBridges.get(key);
         if (!bridge) continue;
-        moduleNoteEvaluationBridges.delete(projectPath);
+        moduleNoteEvaluationBridges.delete(key);
         bridges.push(bridge);
     }
     await Promise.allSettled(bridges.map((bridge) => bridge.dispose()));

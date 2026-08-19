@@ -88,7 +88,13 @@ export function evaluationBackoffMs(failureCount: number): number {
 export function dueReadyReason(noteId: number, manifestJson: string | null): string {
     const manifest = parseSmartNoteManifest(manifestJson);
     const signal = manifest.signals?.[0] ?? manifest.summary ?? "compiled check returned met=true";
-    return `Smart note #${noteId}: ${signal}`.slice(0, 240);
+    const sliced = `Smart note #${noteId}: ${signal}`.slice(0, 240);
+    // slice counts UTF-16 units and can split a surrogate pair at the cap. A
+    // trailing lone high surrogate cannot survive persistence, and the Rust
+    // reducer never emits one, so drop it and store the same 239-unit value
+    // in both authorities.
+    const last = sliced.charCodeAt(sliced.length - 1);
+    return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
 }
 
 function readyFields(

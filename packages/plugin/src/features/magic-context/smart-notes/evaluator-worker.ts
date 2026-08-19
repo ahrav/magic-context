@@ -198,6 +198,25 @@ export class SmartNoteEvaluatorWorker {
             this.logLine(`registration rejected: ${JSON.stringify(response).slice(0, 200)}`);
             return false;
         }
+        if (this.disposed) {
+            // Disposal raced the in-flight registration. Installing the token
+            // would start a heartbeat that keeps the module advertising an
+            // evaluator no drain path will ever service; release it instead.
+            try {
+                await this.deps.transport.call({
+                    method: "note.evaluation.unregister",
+                    body: {
+                        v: 2,
+                        token,
+                        registration_generation: generation,
+                        evaluator_instance: this.instanceId,
+                    },
+                });
+            } catch (error) {
+                this.logLine(`post-dispose unregister failed (lease will expire): ${error}`);
+            }
+            return false;
+        }
         // Follow the authority's published renewal cadence; fall back only when
         // the field is absent so the lease and the client cannot drift apart.
         const publishedHeartbeat = response.heartbeat_ms;
@@ -259,6 +278,10 @@ export class SmartNoteEvaluatorWorker {
     private dropRegistration(): void {
         this.registration = null;
         this.stopHeartbeat();
+        // Without credentials the running claim can neither complete nor
+        // abandon (claimBody requires a registration), so letting its executor
+        // finish only burns the prompt; the claim replays after re-registration.
+        this.activeClaimController?.abort(new Error("evaluator registration dropped"));
     }
 
     async unregister(): Promise<void> {

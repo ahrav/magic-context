@@ -16942,7 +16942,13 @@ impl McStore {
                 {
                     return Ok(NoteEvalAcquireOutcome::Invalid);
                 }
-                return rebind_note_eval_claim_tx(tx, project, row.claim, registration_generation);
+                return rebind_note_eval_claim_tx(
+                    tx,
+                    project,
+                    row.claim,
+                    registration_generation,
+                    now_ms,
+                );
             }
             let replayed_decision = tx
                 .query_row(
@@ -16976,7 +16982,13 @@ impl McStore {
                 )
                 .optional()?;
             if let Some(row) = slot_claim {
-                return rebind_note_eval_claim_tx(tx, project, row.claim, registration_generation);
+                return rebind_note_eval_claim_tx(
+                    tx,
+                    project,
+                    row.claim,
+                    registration_generation,
+                    now_ms,
+                );
             }
             let candidates = {
                 let mut stmt = tx.prepare(&format!(
@@ -17376,19 +17388,25 @@ impl McStore {
 }
 
 /// Rebind an active claim to the caller's registration and replay it with the
-/// current note snapshot.
+/// current note snapshot. The lease is refreshed alongside the rebind: a
+/// re-registered worker schedules its first renewal a full heartbeat interval
+/// out, so replaying a claim with its original near-expiry lease would let the
+/// lease lapse mid-execution and force the billable phase to run again.
 fn rebind_note_eval_claim_tx(
     tx: &rusqlite::Transaction<'_>,
     project: &str,
     mut claim: NoteEvalClaim,
     registration_generation: i64,
+    now_ms: i64,
 ) -> rusqlite::Result<NoteEvalAcquireOutcome> {
+    let expires_at = now_ms + NOTE_EVAL_CLAIM_LEASE_MS;
     tx.execute(
-        "UPDATE mc_note_eval_claims SET registration_generation = ?1
-          WHERE project = ?2 AND claim_id = ?3 AND terminal_kind IS NULL",
-        params![registration_generation, project, claim.claim_id],
+        "UPDATE mc_note_eval_claims SET registration_generation = ?1, expires_at = ?2
+          WHERE project = ?3 AND claim_id = ?4 AND terminal_kind IS NULL",
+        params![registration_generation, expires_at, project, claim.claim_id],
     )?;
     claim.registration_generation = registration_generation;
+    claim.expires_at = expires_at;
     let note = load_note_tx(tx, claim.note_id)
         .optional()?
         .filter(|note| note.project_path == project);
@@ -25035,7 +25053,11 @@ mod tests {
             } => {
                 assert_eq!(replayed.claim_id, claim.claim_id);
                 assert_eq!(replayed.registration_generation, 2);
-                assert_eq!(replayed.expires_at, claim.expires_at);
+                // The rebind refreshes the lease: a reconnecting worker
+                // schedules its first renewal a full heartbeat interval out,
+                // so replaying with the original near-expiry lease would let
+                // it lapse mid-execution.
+                assert_eq!(replayed.expires_at, 200 + NOTE_EVAL_CLAIM_LEASE_MS);
             }
             other => panic!("expected replayed claim, got {other:?}"),
         }

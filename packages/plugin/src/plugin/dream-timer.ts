@@ -497,7 +497,13 @@ async function sweepProject(
 }
 
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
-    const bridge = getModuleNoteEvaluationBridge(reg.projectIdentity);
+    // Exact (identity, root) first: worktrees of one repository share an
+    // identity, and this registration must drain the bridge bound to its own
+    // checkout. Fall back to any bridge for the identity so a root mismatch
+    // still drains the shared module queue rather than nothing.
+    const bridge =
+        getModuleNoteEvaluationBridge(reg.projectIdentity, reg.directory) ??
+        getModuleNoteEvaluationBridge(reg.projectIdentity);
     if (bridge) {
         // Deliberately NOT gated on bridge.available(): drain is the path that
         // re-registers a dropped evaluator, so gating it on availability would

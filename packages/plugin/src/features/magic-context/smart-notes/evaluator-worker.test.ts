@@ -100,6 +100,32 @@ describe("SmartNoteEvaluatorWorker registration", () => {
         expect(await w.register()).toBe(false);
         expect(w.registered).toBe(false);
     });
+
+    test("a registration that resolves after dispose releases the minted token", async () => {
+        let releaseRegister: ((value: unknown) => void) | undefined;
+        const calls: RecordedCall[] = [];
+        const transport: EvaluatorWorkerTransport = {
+            call({ method, body }) {
+                calls.push({ method, body: body as Record<string, unknown> });
+                if (method === "note.evaluation.register") {
+                    return new Promise((resolve) => {
+                        releaseRegister = resolve;
+                    });
+                }
+                return Promise.resolve({ ok: true });
+            },
+        };
+        const w = worker(transport);
+        const registering = w.register();
+        await w.dispose();
+        releaseRegister?.(REGISTER_OK);
+        expect(await registering).toBe(false);
+        expect(w.registered).toBe(false);
+        // The minted token is released instead of heartbeating forever on a
+        // worker no drain path will ever service.
+        const unregister = calls.find((c) => c.method === "note.evaluation.unregister");
+        expect(unregister?.body.token).toBe("tok-1");
+    });
 });
 
 describe("SmartNoteEvaluatorWorker drain", () => {
@@ -503,7 +529,12 @@ describe("SmartNoteEvaluatorWorker wire schema conformance", () => {
         const w = worker(transport);
         expect(await w.register()).toBe(true);
         await w.heartbeat();
+        // A rejected heartbeat silently drops the registration, so assert it
+        // survived BEFORE dispose; this is the check that catches a heartbeat
+        // body carrying a field outside the server's closed set.
+        expect(w.registered).toBe(true);
         await w.drainOnce({ deadline: Date.now() + 5_000 });
+        expect(w.registered).toBe(true);
         await w.dispose();
 
         // Exercised the registration-scoped and claim-scoped methods.
@@ -522,7 +553,6 @@ describe("SmartNoteEvaluatorWorker wire schema conformance", () => {
             expect(hasSlot).toBe(slotAllowed);
         }
 
-        // Registration survived: no call was rejected.
         expect(w.registered).toBe(false); // disposed
     });
 

@@ -69,6 +69,7 @@ import type { RustToolBackends } from "../../plugin/rust-tool-backends";
 import type { PluginContext } from "../../plugin/types";
 import { getErrorMessage } from "../../shared/error-message";
 import { log } from "../../shared/logger";
+import { normalizeSDKResponse } from "../../shared/normalize-sdk-response";
 import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "../../shared/prompt-surface-runtime";
 import { resolveFallbackChain } from "../../shared/resolve-fallbacks";
@@ -959,7 +960,10 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // forever. Without a registration the live-evaluator gate fails closed
         // at write time instead.
         if (!dreamerRunnable) return;
-        if (getModuleNoteEvaluationBridge(bridgeProjectPath)) return;
+        // Keyed by identity AND root: two worktrees of one repository share a
+        // project identity, and discarding the second bridge would evaluate
+        // its file-dependent conditions against the first checkout.
+        if (getModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot)) return;
         // The module derives evaluator scope from the server-side route root,
         // and filesystem capabilities resolve against the checkout, so both
         // must use the prepared project's root — not the plugin launch
@@ -967,6 +971,23 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         // project's notes.
         const capabilityFactory = (signal: AbortSignal) =>
             createSmartNoteCapabilities({ projectRoot: bridgeProjectRoot, signal });
+        // Evaluator LLM children need a parent session so they nest in the
+        // picker and recordChildInvocation captures their token telemetry
+        // (both require a parent id). Resolved per claim: the bridge outlives
+        // any one session, so a memoized id would go stale.
+        const resolveEvaluatorParentSession = async (): Promise<string | undefined> => {
+            try {
+                const listResponse = await deps.client.session.list({
+                    query: { directory: bridgeProjectRoot },
+                });
+                const sessions = normalizeSDKResponse(listResponse, [] as { id?: string }[], {
+                    preferResponseOnMissingData: true,
+                });
+                return sessions?.find((s) => typeof s?.id === "string")?.id;
+            } catch {
+                return undefined;
+            }
+        };
         const workerPolicy = {
             retinaHandoff: deps.config.smart_notes?.retina_handoff === true,
             wakeOwned: false,
@@ -987,11 +1008,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             // reservation would keep the process-wide slot across the compile and
             // fallback LLM round-trips, stalling every other project's sweep.
             executors: (snapshot, signal, deadline) => ({
-                compile: () =>
+                compile: async () =>
                     compileSmartNoteCheck({
                         client: deps.client,
                         db,
-                        parentSessionId: undefined,
+                        parentSessionId: await resolveEvaluatorParentSession(),
                         sessionDirectory: bridgeProjectRoot,
                         projectIdentity: bridgeProjectPath,
                         model: evaluatorTaskConfig?.model,
@@ -1012,11 +1033,11 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                         signal,
                         timeoutMs: 2_000,
                     }),
-                confirmFallback: () =>
+                confirmFallback: async () =>
                     confirmSmartNoteReadOnly({
                         client: deps.client,
                         db,
-                        parentSessionId: undefined,
+                        parentSessionId: await resolveEvaluatorParentSession(),
                         sessionDirectory: bridgeProjectRoot,
                         projectIdentity: bridgeProjectPath,
                         model: evaluatorTaskConfig?.model,
@@ -1030,7 +1051,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             }),
             policy: () => ({ ...workerPolicy }),
         });
-        registerModuleNoteEvaluationBridge(bridgeProjectPath, {
+        const bridgeKey = registerModuleNoteEvaluationBridge(bridgeProjectPath, bridgeProjectRoot, {
             sync: syncModuleNotes,
             available: () => worker.registered,
             async drain(drainArgs) {
@@ -1042,6 +1063,9 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                     // boot registration still recovers on the timer.
                     if (worker.registered) await worker.heartbeat();
                     else await worker.register(drainArgs.signal);
+                    // The remote evaluator still surfaces notes in the module;
+                    // pull the changefeed so nudges and the dashboard see them.
+                    await syncModuleNotes();
                     return { claimed: 0, completed: 0, abandoned: 0, surfaced: 0, drained: true };
                 }
                 const result = await worker.drainOnce(drainArgs);
@@ -1050,7 +1074,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             },
             dispose: () => worker.dispose(),
         });
-        ownedBridgeProjects.add(bridgeProjectPath);
+        ownedBridgeProjects.add(bridgeKey);
         // Register eagerly so conditioned ctx_note writes pass the
         // live-evaluator gate before the first drain.
         void worker.register().catch((error) => {

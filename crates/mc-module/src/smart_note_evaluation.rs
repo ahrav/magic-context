@@ -183,7 +183,10 @@ fn next_occurrence<Tz: TimeZone>(
     max_search_ms: i64,
     tz: &Tz,
 ) -> Option<i64> {
-    let mut cursor_ms = (after_ms.div_euclid(MINUTE_MS) * MINUTE_MS).checked_add(MINUTE_MS)?;
+    let mut cursor_ms = after_ms
+        .div_euclid(MINUTE_MS)
+        .checked_mul(MINUTE_MS)?
+        .checked_add(MINUTE_MS)?;
     let cap_ms = after_ms.saturating_add(max_search_ms.clamp(0, MAX_SEARCH_MS));
     while cursor_ms <= cap_ms {
         // An in-range instant maps to exactly one civil time; an instant
@@ -1414,6 +1417,22 @@ mod tests {
         assert_eq!(
             due_ready_reason(7, Some(manifest)),
             "Smart note #7: build is green"
+        );
+    }
+
+    #[test]
+    fn next_occurrence_survives_extreme_instants() {
+        // i64::MIN underflows the minute-floor multiplication and i64::MAX
+        // overflows the cap; both must resolve to "no occurrence", never a
+        // debug-build panic.
+        let utc = chrono::Utc;
+        assert_eq!(
+            next_due_at_ms("* * * * *", i64::MIN, MAX_SEARCH_MS, &utc),
+            None
+        );
+        assert_eq!(
+            next_due_at_ms("* * * * *", i64::MAX, MAX_SEARCH_MS, &utc),
+            None
         );
     }
 }
