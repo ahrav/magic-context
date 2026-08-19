@@ -11746,7 +11746,7 @@ impl McHandler {
                                     current.status_version,
                                     content,
                                     condition.map(Some),
-                                    condition_compile.clone(),
+                                    condition_compile,
                                     now,
                                 )
                                 .map_err(|error| error.to_string())?

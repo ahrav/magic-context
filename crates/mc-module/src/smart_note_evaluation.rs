@@ -1022,4 +1022,326 @@ mod tests {
             assert_eq!(ids, case.expected_ids, "selection case {}", case.id);
         }
     }
+
+    #[test]
+    fn smart_note_revision_matrix_normative_matches_mc_store() {
+        use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+        use mc_store::{
+            McStore, NoteCasOutcome, NoteEvalAcquireOutcome, NoteEvalClaim, NoteEvalRenewOutcome,
+            NoteTransitionInput, NoteWriteInput, StoredNote,
+        };
+
+        #[derive(Deserialize)]
+        struct Normative {
+            revision_matrix_cases: Vec<RevisionCase>,
+        }
+
+        #[derive(Deserialize)]
+        struct RevisionCase {
+            id: String,
+            event: String,
+            pre: Option<RevisionPre>,
+            expected: RevisionExpected,
+        }
+
+        #[derive(Deserialize, Default)]
+        struct RevisionPre {
+            #[serde(default)]
+            source_revision: i64,
+            #[serde(default)]
+            state_version: i64,
+            status_version: i64,
+        }
+
+        #[derive(Deserialize)]
+        struct RevisionExpected {
+            source_revision: i64,
+            state_version: i64,
+            status_version: i64,
+            artifact_cleared: Option<bool>,
+            active_claims_fenced: Option<bool>,
+        }
+
+        const PROJECT: &str = "git:rev-matrix";
+
+        fn open_store(dir: &std::path::Path) -> McStore {
+            let store = McStore::open(&StorageDescriptor {
+                module_id: "magic-context-test".to_string(),
+                storage_namespace: "mc_cache".to_string(),
+                isolation: Isolation::Module,
+                backend: StorageBackend::Sqlite {
+                    path: dir.join("store.db").to_string_lossy().to_string(),
+                },
+            })
+            .unwrap();
+            let preparing = store
+                .authority_begin_prepare("ctx", PROJECT, "notes")
+                .unwrap();
+            store
+                .authority_finish_prepare(
+                    "ctx",
+                    PROJECT,
+                    "notes",
+                    preparing.generation,
+                    "hash",
+                    "hash",
+                    true,
+                )
+                .unwrap();
+            store
+        }
+
+        fn insert_note(store: &McStore) -> StoredNote {
+            store
+                .insert_project_note(NoteWriteInput {
+                    project_path: PROJECT,
+                    route_project_root: None,
+                    session_id: Some("writer"),
+                    content: "base content",
+                    surface_condition: Some("base condition"),
+                    anchor_block_id: None,
+                    anchor_ordinal: None,
+                    compiled_provider: None,
+                    compiled_config: None,
+                    compiled_at: None,
+                    compile_status: None,
+                    now_ms: 1,
+                })
+                .unwrap()
+        }
+
+        /// Content edits increment source_revision and state_version;
+        /// pending-to-pending transitions increment state_version only.
+        fn stage(store: &McStore, mut note: StoredNote, src: i64, state: i64) -> StoredNote {
+            for i in 0..src {
+                note = match store
+                    .update_note_cas(
+                        PROJECT,
+                        note.id,
+                        "pending",
+                        note.status_version,
+                        Some(&format!("staged content {i}")),
+                        None,
+                        None,
+                        2,
+                    )
+                    .unwrap()
+                {
+                    NoteCasOutcome::Applied(next) => next,
+                    other => panic!("staging content edit failed: {other:?}"),
+                };
+            }
+            while note.state_version < state {
+                note = match store
+                    .transition_note(NoteTransitionInput {
+                        project_path: PROJECT,
+                        note_id: note.id,
+                        from_status: "pending",
+                        source_revision: note.status_version,
+                        to_status: "pending",
+                        result: None,
+                        now_ms: 3,
+                    })
+                    .unwrap()
+                {
+                    NoteCasOutcome::Applied(next) => next,
+                    other => panic!("staging transition failed: {other:?}"),
+                };
+            }
+            assert_eq!(
+                (
+                    note.source_revision,
+                    note.state_version,
+                    note.status_version
+                ),
+                (src, state, state),
+                "pre-state staging"
+            );
+            note
+        }
+
+        fn stage_artifact(store: &McStore, note: &StoredNote) {
+            store
+                .execute_tag_sql_for_test(&format!(
+                    "UPDATE mc_notes SET compiled_check = 'check-code', manifest_json = '{{}}',
+                        check_hash = 'hash', check_status = 'compiled', check_version = 1,
+                        compiled_source_revision = {}, compiled_project_path = '{PROJECT}'
+                      WHERE id = {}",
+                    note.source_revision, note.id
+                ))
+                .unwrap();
+        }
+
+        fn stage_claim(store: &McStore, note_id: i64) -> NoteEvalClaim {
+            match store
+                .acquire_note_evaluation(
+                    PROJECT,
+                    "acq-1",
+                    "eval-a",
+                    0,
+                    1,
+                    |notes| {
+                        notes
+                            .iter()
+                            .find(|note| note.id == note_id)
+                            .map(|note| (note.id, "due".to_string()))
+                    },
+                    10,
+                )
+                .unwrap()
+            {
+                NoteEvalAcquireOutcome::Claim { claim, .. } => claim,
+                other => panic!("claim staging failed: {other:?}"),
+            }
+        }
+
+        let raw = include_str!("../testdata/smart-note-evaluation-normative.json");
+        let normative: Normative = serde_json::from_str(raw).expect("parse normative fixture");
+
+        for case in &normative.revision_matrix_cases {
+            let dir = tempfile::tempdir().unwrap();
+            let store = open_store(dir.path());
+            let note = insert_note(&store);
+            let pre = case.pre.as_ref();
+            let mut claim = None;
+
+            let post = match case.event.as_str() {
+                "migrate" => {
+                    let pre = pre.expect("migrate pre");
+                    store
+                        .execute_tag_sql_for_test(&format!(
+                            "UPDATE mc_notes SET status_version = {}, source_revision = 0,
+                                state_version = 0 WHERE id = {};
+                             UPDATE mc_notes SET source_revision = status_version,
+                                state_version = status_version;",
+                            pre.status_version, note.id
+                        ))
+                        .unwrap();
+                    store
+                        .get_note_by_id(PROJECT, "writer", note.id)
+                        .unwrap()
+                        .unwrap()
+                }
+                "create" => note,
+                "edit_compiler_input" => {
+                    let pre = pre.expect("edit pre");
+                    let staged = stage(&store, note, pre.source_revision, pre.state_version);
+                    stage_artifact(&store, &staged);
+                    claim = Some(stage_claim(&store, staged.id));
+                    let (content, condition) = if case.id.contains("condition") {
+                        (None, Some(Some("edited condition")))
+                    } else {
+                        (Some("edited body"), None)
+                    };
+                    match store
+                        .update_note_cas(
+                            PROJECT,
+                            staged.id,
+                            "pending",
+                            staged.status_version,
+                            content,
+                            condition,
+                            None,
+                            20,
+                        )
+                        .unwrap()
+                    {
+                        NoteCasOutcome::Applied(next) => next,
+                        other => panic!("case {}: edit failed: {other:?}", case.id),
+                    }
+                }
+                "lifecycle_transition" => {
+                    let pre = pre.expect("transition pre");
+                    let staged = stage(&store, note, pre.source_revision, pre.state_version);
+                    stage_artifact(&store, &staged);
+                    match store
+                        .transition_note(NoteTransitionInput {
+                            project_path: PROJECT,
+                            note_id: staged.id,
+                            from_status: "pending",
+                            source_revision: staged.status_version,
+                            to_status: "ready",
+                            result: Some("condition_true"),
+                            now_ms: 20,
+                        })
+                        .unwrap()
+                    {
+                        NoteCasOutcome::Applied(next) => next,
+                        other => panic!("case {}: transition failed: {other:?}", case.id),
+                    }
+                }
+                "dismiss" => {
+                    let pre = pre.expect("dismiss pre");
+                    let staged = stage(&store, note, pre.source_revision, pre.state_version);
+                    stage_artifact(&store, &staged);
+                    claim = Some(stage_claim(&store, staged.id));
+                    store
+                        .dismiss_note(PROJECT, "writer", staged.id, Some("done"), 20)
+                        .unwrap()
+                        .expect("dismissal applies")
+                }
+                "authority_transfer" => {
+                    let pre = pre.expect("transfer pre");
+                    let staged = stage(&store, note, pre.source_revision, pre.state_version);
+                    store
+                        .authority_begin_drain("ctx", PROJECT, "notes", "lease", 1_000_000, 20)
+                        .unwrap();
+                    store
+                        .get_note_by_id(PROJECT, "writer", staged.id)
+                        .unwrap()
+                        .unwrap()
+                }
+                other => panic!("unknown revision matrix event {other:?}"),
+            };
+
+            let expected = &case.expected;
+            assert_eq!(
+                (
+                    post.source_revision,
+                    post.state_version,
+                    post.status_version
+                ),
+                (
+                    expected.source_revision,
+                    expected.state_version,
+                    expected.status_version
+                ),
+                "revisions for case {}",
+                case.id
+            );
+            if let Some(cleared) = expected.artifact_cleared {
+                assert_eq!(
+                    post.compiled_check.is_none(),
+                    cleared,
+                    "artifact for case {}",
+                    case.id
+                );
+            }
+            if expected.active_claims_fenced == Some(true) {
+                let claim = claim.expect("fenced case stages a claim");
+                assert!(
+                    matches!(
+                        store
+                            .renew_note_evaluation_claim(
+                                PROJECT,
+                                &claim.claim_id,
+                                "eval-a",
+                                0,
+                                1,
+                                30
+                            )
+                            .unwrap(),
+                        NoteEvalRenewOutcome::TerminalReplay { .. }
+                    ),
+                    "claim fencing for case {}",
+                    case.id
+                );
+            }
+            assert_eq!(
+                post.state_version, post.status_version,
+                "state/status invariant for case {}",
+                case.id
+            );
+        }
+    }
 }

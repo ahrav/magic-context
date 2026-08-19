@@ -2,6 +2,9 @@
 
 import { describe, expect, test } from "bun:test";
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { runMigrations } from "./migrations";
@@ -188,4 +191,75 @@ describe("smart-note revision matrix: dismissal", () => {
             closeQuietly(db);
         }
     });
+});
+
+interface NormativeCase {
+    id: string;
+    event: string;
+    pre: { source_revision?: number; state_version?: number } | null;
+    expected: { source_revision: number; state_version: number; artifact_cleared?: boolean };
+}
+
+const normative = JSON.parse(
+    readFileSync(
+        join(
+            import.meta.dir,
+            "../../../../../crates/mc-module/testdata/smart-note-evaluation-normative.json",
+        ),
+        "utf8",
+    ),
+) as { revision_matrix_cases: NormativeCase[] };
+
+describe("smart-note revision matrix: normative fixture replay", () => {
+    // Fixture cases use different absolute pre-states; compare revision
+    // deltas instead.
+    for (const matrixCase of normative.revision_matrix_cases) {
+        if (
+            matrixCase.event === "migrate" ||
+            matrixCase.event === "authority_transfer" ||
+            matrixCase.event === "create"
+        ) {
+            continue;
+        }
+        test(`replays ${matrixCase.id}`, () => {
+            const db = freshDb();
+            try {
+                const note = smartNote(db);
+                setCompiled(db, note.id);
+                const before = currentNote(db, note.id);
+                if (matrixCase.event === "edit_compiler_input") {
+                    updateNote(
+                        db,
+                        note.id,
+                        matrixCase.id === "edit_condition"
+                            ? { surfaceCondition: "changed condition" }
+                            : { content: "changed content" },
+                        SCOPE,
+                    );
+                } else if (matrixCase.event === "dismiss") {
+                    expect(dismissNote(db, note.id, SCOPE)).toBe(true);
+                } else {
+                    markNoteChecked(db, note.id);
+                }
+                const after = getNotes(db, { type: "smart" }).find(
+                    (candidate) => candidate.id === note.id,
+                );
+                if (!after) throw new Error("note vanished");
+                const pre = matrixCase.pre ?? { source_revision: 0, state_version: 0 };
+                expect(after.sourceRevision - before.sourceRevision).toBe(
+                    matrixCase.expected.source_revision - (pre.source_revision ?? 0),
+                );
+                expect(after.stateVersion - before.stateVersion).toBe(
+                    matrixCase.expected.state_version - (pre.state_version ?? 0),
+                );
+                if (matrixCase.expected.artifact_cleared !== undefined) {
+                    expect(after.compiledCheck === null).toBe(
+                        matrixCase.expected.artifact_cleared,
+                    );
+                }
+            } finally {
+                closeQuietly(db);
+            }
+        });
+    }
 });
