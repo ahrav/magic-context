@@ -1,61 +1,39 @@
-name: Claude Code Review
+name: Claude Auto Review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
-
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+    types: [opened, synchronize]
 
 jobs:
-  claude-review:
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login == 'ahrav' &&
-      github.actor == 'ahrav' &&
-      !github.event.pull_request.draft
+  review:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
-      issues: write
       id-token: write
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 1
-          persist-credentials: false
 
-      - name: Checkout Claude plugin marketplace
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          repository: anthropics/claude-code
-          ref: c3d2e35e554060b5a20ee6b28140fbdbd4eb0048
-          path: .claude-code-marketplace
-          sparse-checkout: |
-            .claude-plugin
-            plugins
-          persist-credentials: false
-
-      - name: Run Claude Code review
-        uses: anthropics/claude-code-action@d40ddef4c030e508327d6e35a9c45f3368482c50 # v1
+      - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          plugin_marketplaces: "./.claude-code-marketplace"
-          plugins: "code-review@claude-code-plugins"
-          prompt: >-
-            /code-review:code-review
-            ${{ github.repository }}/pull/${{ github.event.pull_request.number }}
-            --comment
-            ${{ github.event.action != 'opened'
-              && 'Override the skip conditions: proceed even if Claude already commented on this PR. The pull request changed state or received a new push, so review the current diff.'
-              || '' }}
-          claude_args: >-
-            --model claude-opus-5
-            --allowedTools
-            "Task,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue
-            list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr
-            view:*),Bash(gh pr list:*),mcp__github_inline_comment__create_inline_comment"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request with a focus on:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Security implications
+            - Performance considerations
+
+            Note: The PR branch is already checked out in the current working directory.
+
+            Use `gh pr comment` for top-level feedback.
+            Use `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
+            Only post GitHub comments - don't submit review text as messages.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
