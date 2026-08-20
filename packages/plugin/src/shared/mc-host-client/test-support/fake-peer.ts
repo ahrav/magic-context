@@ -440,14 +440,18 @@ export class FakePeer {
             if (candidate && !candidate.socket.destroyed) return Promise.resolve(candidate);
         }
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(
-                () => reject(new Error("fake peer timed out waiting for a connection")),
-                timeoutMs,
-            );
-            this.connectionWaiters.push((connection) => {
+            const waiter = (connection: FakePeerConnection): void => {
                 clearTimeout(timer);
                 resolve(connection);
-            });
+            };
+            const timer = setTimeout(() => {
+                // Remove the expired waiter so it cannot consume the next
+                // connection ahead of a live waiter.
+                const index = this.connectionWaiters.indexOf(waiter);
+                if (index >= 0) this.connectionWaiters.splice(index, 1);
+                reject(new Error("fake peer timed out waiting for a connection"));
+            }, timeoutMs);
+            this.connectionWaiters.push(waiter);
         });
     }
 
