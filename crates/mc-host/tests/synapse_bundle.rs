@@ -102,6 +102,15 @@ fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
     std::fs::write(&path, serde_json::to_vec(&manifest).expect("serialize")).expect("write");
 }
 
+fn edit_certified_manifest(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    edit_manifest(dir, |value| {
+        edit(value);
+        let manifest: mc_host::synapse::bundle::BundleManifest =
+            serde_json::from_value(value.clone()).expect("edited manifest");
+        value["fingerprint"] = mc_host::synapse::bundle::canonical_fingerprint(&manifest).into();
+    });
+}
+
 fn corpus() -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(fixture_dir().join("corpus.json")).expect("corpus"))
         .expect("corpus json")
@@ -464,7 +473,7 @@ async fn wrong_but_dimension_compatible_output_fails_certification() {
     let Some(ort) = ort_library() else { return };
     let dir = tempfile::tempdir().expect("temp bundle dir");
     copy_fixture_to(dir.path());
-    edit_manifest(dir.path(), |m| {
+    edit_certified_manifest(dir.path(), |m| {
         m["output"] = serde_json::json!({"name": "token_embeddings"});
     });
     let component = initialize(config_for(dir.path(), &ort)).await;
@@ -476,7 +485,7 @@ async fn wrong_pooling_fails_certification() {
     let Some(ort) = ort_library() else { return };
     let dir = tempfile::tempdir().expect("temp bundle dir");
     copy_fixture_to(dir.path());
-    edit_manifest(dir.path(), |m| m["pooling"] = "cls".into());
+    edit_certified_manifest(dir.path(), |m| m["pooling"] = "cls".into());
     let component = initialize(config_for(dir.path(), &ort)).await;
     assert!(disabled_reason(&component).contains("semantic certification"));
 }
