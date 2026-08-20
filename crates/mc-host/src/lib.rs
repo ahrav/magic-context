@@ -5,6 +5,7 @@
 pub mod composite;
 pub mod config;
 pub mod handler;
+pub mod synapse;
 
 mod connection;
 mod control;

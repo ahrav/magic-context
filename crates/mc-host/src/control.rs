@@ -471,7 +471,7 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
 /// object keys outright. A conforming client never sends duplicates, and
 /// accepting repeated fields would make handling depend on decoder or field
 /// order (protocol §7.1).
-mod strict_json {
+pub(crate) mod strict_json {
     use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
     use serde_json::Value;
     use std::fmt;
