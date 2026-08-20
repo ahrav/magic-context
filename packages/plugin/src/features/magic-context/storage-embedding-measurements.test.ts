@@ -340,7 +340,6 @@ describe("synapse batch ledger CAS journal", () => {
                 markSynapseLedgerOutcome(db, {
                     rowId: created.rowId,
                     expectedStateVersion: snapshotVersion,
-                    state: "failed",
                     disposition: "retryable",
                 }),
             ).toThrow(SynapseLedgerConflictError);
@@ -420,7 +419,6 @@ describe("synapse batch ledger CAS journal", () => {
             let page = markSynapseLedgerOutcome(db, {
                 rowId: retryable.rowId,
                 expectedStateVersion: retryable.stateVersion,
-                state: "failed",
                 disposition: "retryable",
             });
             page = retrySynapseLedgerPage(db, {
@@ -437,7 +435,6 @@ describe("synapse batch ledger CAS journal", () => {
             const failed = markSynapseLedgerOutcome(db, {
                 rowId: permanent.rowId,
                 expectedStateVersion: permanent.stateVersion,
-                state: "failed",
                 disposition: "permanent",
             });
             expect(() =>
@@ -457,7 +454,6 @@ describe("synapse batch ledger CAS journal", () => {
             const expiredFailed = markSynapseLedgerOutcome(db, {
                 rowId: expired.rowId,
                 expectedStateVersion: expired.stateVersion,
-                state: "partial",
                 disposition: "retryable",
             });
             expect(() =>
@@ -500,7 +496,6 @@ describe("synapse batch ledger CAS journal", () => {
                 markSynapseLedgerOutcome(db, {
                     rowId: page.rowId,
                     expectedStateVersion: page.stateVersion,
-                    state: "failed",
                     disposition: "retryable",
                 }),
             ).toThrow(SynapseLedgerConflictError);

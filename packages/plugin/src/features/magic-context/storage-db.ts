@@ -37,6 +37,7 @@ import {
     ensureColumn,
     healAllNullColumns,
     MEMORIES_AU_TRIGGER_BODY,
+    synapseBatchLedgerDdl,
     synapseBatchLedgerIndexDdl,
 } from "./storage-schema-helpers";
 import {
@@ -1061,27 +1062,7 @@ export function initializeDatabase(db: Database): void {
       updated_at INTEGER NOT NULL DEFAULT 0
     );
 
-    CREATE TABLE IF NOT EXISTS synapse_batch_ledger (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project_path TEXT NOT NULL DEFAULT '',
-      session_id TEXT NOT NULL,
-      scope TEXT NOT NULL DEFAULT '',
-      lane_role TEXT NOT NULL DEFAULT 'primary' CHECK(lane_role IN ('primary', 'shadow')),
-      destination_model TEXT NOT NULL DEFAULT '',
-      application_group TEXT NOT NULL DEFAULT '',
-      request_key TEXT NOT NULL DEFAULT '',
-      manifest_json TEXT NOT NULL DEFAULT '[]',
-      state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'polling', 'ready', 'complete', 'partial', 'failed', 'obsolete')),
-      state_version INTEGER NOT NULL DEFAULT 0,
-      attempt_id TEXT,
-      job_id TEXT,
-      cursor TEXT,
-      deadline_at INTEGER,
-      restart_count INTEGER NOT NULL DEFAULT 0,
-      failure_disposition TEXT CHECK(failure_disposition IS NULL OR failure_disposition IN ('retryable', 'permanent')),
-      created_at INTEGER NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL DEFAULT 0
-    );
+    ${synapseBatchLedgerDdl("synapse_batch_ledger", true)}
 
     CREATE TABLE IF NOT EXISTS shadow_embedding_registrations (
       project_path TEXT NOT NULL,

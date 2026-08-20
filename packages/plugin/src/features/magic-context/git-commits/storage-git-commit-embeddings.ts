@@ -110,13 +110,6 @@ export function hasCommitEmbedding(db: Database, sha: string, modelId: string): 
     );
 }
 
-export function deleteCommitEmbedding(db: Database, sha: string, modelId: string): void {
-    db.prepare("DELETE FROM git_commit_embeddings WHERE sha = ? AND model_id = ?").run(
-        sha,
-        modelId,
-    );
-}
-
 /** The join to `git_commits` drops embeddings whose commit row is gone, so an
  *  orphan vector can never reach ranking. */
 export function loadProjectCommitEmbeddings(

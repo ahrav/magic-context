@@ -197,7 +197,6 @@ export type SynapseLedgerState =
     | "polling"
     | "ready"
     | "complete"
-    | "partial"
     | "failed"
     | "obsolete";
 
@@ -511,13 +510,12 @@ export function markSynapseLedgerReady(
     );
 }
 
-/** pending|polling -> partial|failed with an explicit retry disposition. */
+/** pending|polling -> failed with an explicit retry disposition. */
 export function markSynapseLedgerOutcome(
     db: Database,
     args: {
         rowId: number;
         expectedStateVersion: number;
-        state: "partial" | "failed";
         disposition: SynapseFailureDisposition;
     },
 ): SynapseLedgerPage {
@@ -528,11 +526,11 @@ export function markSynapseLedgerOutcome(
             stateVersion: args.expectedStateVersion,
             states: ["pending", "polling"],
         },
-        { state: args.state, failure_disposition: args.disposition },
+        { state: "failed", failure_disposition: args.disposition },
     );
 }
 
-/** partial|failed -> pending for a new attempt: requires a retryable
+/** failed -> pending for a new attempt: requires a retryable
  *  disposition and remaining time inside the original deadline (KTD12). */
 export function retrySynapseLedgerPage(
     db: Database,
@@ -544,7 +542,7 @@ export function retrySynapseLedgerPage(
         {
             rowId: args.rowId,
             stateVersion: args.expectedStateVersion,
-            states: ["partial", "failed"],
+            states: ["failed"],
             extraWhere:
                 "failure_disposition = 'retryable' AND deadline_at IS NOT NULL AND deadline_at > ?",
             extraParams: [now],
@@ -607,7 +605,7 @@ export function markSynapseLedgerObsolete(
         {
             rowId: args.rowId,
             stateVersion: args.expectedStateVersion,
-            states: ["pending", "polling", "ready", "partial", "failed"],
+            states: ["pending", "polling", "ready", "failed"],
         },
         { state: "obsolete" },
     );
@@ -738,7 +736,10 @@ export function reopenCompleteSynapseLedgerPageWithProof(
         rowId: number;
         deadlineAt: number;
         destinationState: (item: SynapseLedgerManifestItem) => "absent" | "stale" | "current";
-        invalidateDestination: (item: SynapseLedgerManifestItem) => void;
+        /** Invalidate one stale destination row; omitted when the caller's
+         *  lane can never prove staleness (destinationState never returns
+         *  "stale"). */
+        invalidateDestination?: (item: SynapseLedgerManifestItem) => void;
     },
 ): boolean {
     let reopened = false;
@@ -750,7 +751,7 @@ export function reopenCompleteSynapseLedgerPageWithProof(
             const state = args.destinationState(item);
             if (state === "current") continue;
             proven = true;
-            if (state === "stale") args.invalidateDestination(item);
+            if (state === "stale") args.invalidateDestination?.(item);
         }
         if (!proven) return;
         reopenCompleteSynapseLedgerPage(db, {

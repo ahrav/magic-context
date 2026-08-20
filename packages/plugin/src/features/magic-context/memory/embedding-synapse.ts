@@ -772,7 +772,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             error.ledgerRowId = row.rowId;
             throw error;
         }
-        if (row.state === "partial" || row.state === "failed") {
+        if (row.state === "failed") {
             if (row.failureDisposition === "retryable" && (row.deadlineAt ?? 0) > Date.now()) {
                 row = retrySynapseLedgerPage(db, {
                     rowId: row.rowId,
@@ -789,7 +789,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         if (row.state === "ready") {
             // A ready row without applied destinations means the vectors were
             // lost with the process; re-derive them from the retained job (R20).
-            if (row.jobId) {
+            // An already-expired page deadline makes the re-derive impossible
+            // (collectJobPages times out before its first poll, and the
+            // recovery signal `module_restarted` would never be observed), so
+            // such a row is obsoleted and rebuilt like a restarted module.
+            if (row.jobId && (row.deadlineAt ?? 0) > Date.now()) {
                 try {
                     const vectors = await this.collectJobPages(
                         row.jobId,
@@ -898,7 +902,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 row = markSynapseLedgerOutcome(db, {
                     rowId: row.rowId,
                     expectedStateVersion: row.stateVersion,
-                    state: "failed",
                     disposition: classified.permanent ? "permanent" : "retryable",
                 });
             } catch (casError) {

@@ -257,12 +257,27 @@ export async function startDreamScheduleTimer(
     };
 }
 
+/** Shared chunk-backfill budget for ONE tick across every registered project.
+ *  Kept under DREAM_TIMER_INTERVAL_MS so a multi-project backlog drain can
+ *  never outrun the interval that scheduled it. */
+const CHUNK_BACKFILL_TICK_BUDGET_MS = 10 * 60 * 1000;
+
+/** One tick runs at a time: interval ticks are fire-and-forget, so without
+ *  this guard a backlogged tick would overlap its successor and stack
+ *  maintenance passes over the same projects. */
+let tickInProgress = false;
+
 /**
  * Single tick body. Runs global message-history maintenance once, then
  * iterates every registered project for its per-directory work.
  */
 function runTick(origin: "startup" | "interval"): void {
+    if (tickInProgress) {
+        log(`[dreamer] timer tick (${origin}) skipped — previous tick still running`);
+        return;
+    }
     log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
+    tickInProgress = true;
     void (async () => {
         try {
             const db = openTimerDatabaseOrNull("maintenance tick");
@@ -272,11 +287,12 @@ function runTick(origin: "startup" | "interval"): void {
             // dream queue processing. We iterate all registered projects so
             // Desktop's "open all projects at once" workflow indexes every one,
             // not just whichever project happened to register the timer first.
+            const chunkDeadlineAt = Date.now() + CHUNK_BACKFILL_TICK_BUDGET_MS;
             for (const reg of registeredProjects.values()) {
                 if (origin === "startup") {
                     scheduleInitialProjectRun(reg, db);
                 } else {
-                    await runProjectMaintenance(reg, origin, db);
+                    await runProjectMaintenance(reg, origin, db, chunkDeadlineAt);
                 }
             }
             if (origin === "startup") return;
@@ -286,6 +302,8 @@ function runTick(origin: "startup" | "interval"): void {
             runSqliteOptimize(db);
         } catch (error) {
             log("[magic-context] timer-triggered maintenance check failed:", error);
+        } finally {
+            tickInProgress = false;
         }
     })();
 }
@@ -334,6 +352,10 @@ async function runProjectMaintenance(
     reg: ProjectRegistration,
     origin: "startup" | "interval",
     db: Database,
+    /** Shared chunk-backfill deadline for the whole maintenance pass; a
+     *  per-project fallback applies on the jittered startup path, where
+     *  projects do not run back to back. */
+    chunkDeadlineAt?: number,
 ): Promise<void> {
     const projectMaintenanceEnabled =
         Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
@@ -354,6 +376,7 @@ async function runProjectMaintenance(
             const chunkCount = await embedUnembeddedCompartmentChunksForProject(
                 db,
                 reg.projectIdentity,
+                chunkDeadlineAt,
             );
             if (chunkCount > 0) {
                 log(

@@ -33,9 +33,10 @@ export const MEMORIES_AU_TRIGGER_BODY = `AFTER UPDATE OF content, category ON me
  * retired receipts stay durable and queryable while a fresh attempt for the
  * same page identity can occupy a new row.
  */
-export function synapseBatchLedgerDdl(tableName: string): string {
+export function synapseBatchLedgerDdl(tableName: string, ifNotExists = false): string {
+    const clause = ifNotExists ? "IF NOT EXISTS " : "";
     return `
-        CREATE TABLE ${tableName} (
+        CREATE TABLE ${clause}${tableName} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_path TEXT NOT NULL DEFAULT '',
             session_id TEXT NOT NULL,
@@ -45,7 +46,7 @@ export function synapseBatchLedgerDdl(tableName: string): string {
             application_group TEXT NOT NULL DEFAULT '',
             request_key TEXT NOT NULL DEFAULT '',
             manifest_json TEXT NOT NULL DEFAULT '[]',
-            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'polling', 'ready', 'complete', 'partial', 'failed', 'obsolete')),
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'polling', 'ready', 'complete', 'failed', 'obsolete')),
             state_version INTEGER NOT NULL DEFAULT 0,
             attempt_id TEXT,
             job_id TEXT,

@@ -44,13 +44,6 @@ pub enum TargetKind {
 }
 
 impl TargetKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ToolProvider => "tool_provider",
-            Self::ManagementSurface => "management_surface",
-        }
-    }
-
     pub fn parse(kind: &str) -> Option<Self> {
         match kind {
             "tool_provider" => Some(Self::ToolProvider),

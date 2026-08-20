@@ -3152,6 +3152,11 @@ export const MIGRATIONS: Migration[] = [
                     count: number;
                 }
             ).count;
+            // A staging copy can survive a failed prior attempt under
+            // transaction adapters that do not honor the requested begin mode;
+            // a leftover copy must not wedge every future open (same defense
+            // as the v49 staging tables).
+            db.exec("DROP TABLE IF EXISTS synapse_batch_ledger_legacy_v81");
             // Stage the legacy rows in a plain copy instead of ALTER RENAME:
             // a rename forces SQLite to re-resolve every trigger in the schema,
             // which fails closed on databases whose memories_au trigger dangles
@@ -3220,10 +3225,14 @@ export const MIGRATIONS: Migration[] = [
  * compatibility cannot be proven from durable state, inside the v83 migration
  * transaction (R24). Coverage, precisely:
  *
- * - `memory_embeddings` and `git_commit_embeddings`: rows under a Synapse lane
- *   identity (`model_id LIKE 'synapse:v1:%'`) carry no per-row source hash, so
- *   exact source compatibility is unprovable -- deleted. Normal memory/commit
- *   selectors rebuild them on demand.
+ * - `memory_embeddings`: rows under a Synapse lane identity
+ *   (`model_id LIKE 'synapse:v1:%'`) carry no per-row source hash and memory
+ *   content is mutable, so exact source compatibility is unprovable --
+ *   deleted. Normal memory selectors rebuild them on demand.
+ * - `git_commit_embeddings`: a commit's source text is fixed by its SHA (rows
+ *   cascade-delete with `git_commits`) and `model_id` pins the lane
+ *   (model+fingerprint), so source and lane compatibility are provable from
+ *   durable state -- retained.
  * - `compartment_chunk_embeddings`: each row carries its source hash
  *   (`chunk_hash`, re-verified against recomputed windows by the read path
  *   before any use) and its lane identity (`model_id` pins model+fingerprint),
@@ -3235,15 +3244,22 @@ export const MIGRATIONS: Migration[] = [
 function invalidateUnprovenSynapseDestinationRowsV83(db: Database): void {
     const laneLike = "synapse:v1:%";
     if (tableExists(db, "memory_embeddings")) {
-        db.prepare("DELETE FROM memory_embeddings WHERE model_id LIKE ?").run(laneLike);
-    }
-    if (tableExists(db, "git_commit_embeddings")) {
-        db.prepare("DELETE FROM git_commit_embeddings WHERE model_id LIKE ?").run(laneLike);
+        const deleted = db
+            .prepare("DELETE FROM memory_embeddings WHERE model_id LIKE ?")
+            .run(laneLike).changes;
+        if (deleted > 0) {
+            log(`[migrations] v83: invalidated ${deleted} unproven synapse memory embedding(s)`);
+        }
     }
     if (tableExists(db, "compartment_chunk_embeddings")) {
-        db.prepare(
-            "DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ? AND (chunk_hash IS NULL OR chunk_hash = '')",
-        ).run(laneLike);
+        const deleted = db
+            .prepare(
+                "DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ? AND (chunk_hash IS NULL OR chunk_hash = '')",
+            )
+            .run(laneLike).changes;
+        if (deleted > 0) {
+            log(`[migrations] v83: invalidated ${deleted} unproven synapse chunk embedding(s)`);
+        }
     }
 }
 

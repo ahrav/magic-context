@@ -193,6 +193,8 @@ describe("migration v83: context-complete synapse batch ledger", () => {
             const synapseModel = "synapse:v1:abc123";
             insertMemoryEmbedding(db, synapseModel);
             insertMemoryEmbedding(db, "local-model");
+            // commit rows are provable by construction: the SHA fixes the
+            // source text and model_id pins the lane, so both survive.
             insertCommitEmbedding(db, "a".repeat(40), synapseModel);
             insertCommitEmbedding(db, "b".repeat(40), "local-model");
             // chunk rows carry their source hash; a non-empty hash is the
@@ -216,7 +218,7 @@ describe("migration v83: context-complete synapse batch ledger", () => {
                     .prepare("SELECT model_id FROM git_commit_embeddings ORDER BY model_id")
                     .all() as Array<{ model_id: string }>
             ).map((row) => row.model_id);
-            expect(commitModels).toEqual(["local-model"]);
+            expect(commitModels).toEqual(["local-model", synapseModel]);
             const chunkRows = db
                 .prepare(
                     "SELECT model_id, chunk_hash FROM compartment_chunk_embeddings ORDER BY model_id, chunk_hash",
@@ -237,9 +239,13 @@ describe("migration v83: context-complete synapse batch ledger", () => {
         try {
             insertLegacyLedgerRow(db, { sessionId: "ses-1", requestKey: "k1" });
             insertMemoryEmbedding(db, "synapse:v1:abc123");
-            // Occupying the quarantine rename target makes the first v83
-            // statement throw, which must roll back the whole migration.
-            db.exec("CREATE TABLE synapse_batch_ledger_legacy_v81 (id INTEGER PRIMARY KEY)");
+            // Occupying the live-identity index name makes the index creation
+            // (after the staging copy and table swap) throw, which must roll
+            // back the whole migration.
+            db.exec(`
+                CREATE TABLE v83_index_decoy (id INTEGER PRIMARY KEY);
+                CREATE UNIQUE INDEX idx_synapse_batch_ledger_identity ON v83_index_decoy(id);
+            `);
 
             expect(() => runMigrations(db)).toThrow(/Migration v83 failed/);
             closeQuietly(db);
@@ -255,6 +261,13 @@ describe("migration v83: context-complete synapse batch ledger", () => {
             );
             expect(columns.has("status")).toBe(true);
             expect(columns.has("state_version")).toBe(false);
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE name = 'synapse_batch_ledger_legacy_v81'",
+                    )
+                    .get(),
+            ).toBeNull();
             expect(
                 (
                     db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
@@ -272,6 +285,37 @@ describe("migration v83: context-complete synapse batch ledger", () => {
             expect(
                 db.prepare("SELECT 1 FROM schema_migrations WHERE version = 83").get(),
             ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a leftover staging copy from a failed prior attempt does not wedge the migration", () => {
+        const dbPath = fileDbPath("migrations-v83-stale-staging-");
+        const db = v81Database(dbPath);
+        try {
+            insertLegacyLedgerRow(db, { sessionId: "ses-1", requestKey: "k1" });
+            // A transaction adapter that does not honor the requested begin
+            // mode can leave the staging copy behind after a failed attempt;
+            // the retry must replace it instead of failing forever.
+            db.exec("CREATE TABLE synapse_batch_ledger_legacy_v81 (id INTEGER PRIMARY KEY)");
+
+            runMigrations(db);
+
+            const rows = db
+                .prepare("SELECT state, request_key FROM synapse_batch_ledger ORDER BY id")
+                .all() as Array<{ state: string; request_key: string }>;
+            expect(rows).toEqual([{ state: "obsolete", request_key: "k1" }]);
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE name = 'synapse_batch_ledger_legacy_v81'",
+                    )
+                    .get(),
+            ).toBeNull();
+            expect(
+                db.prepare("SELECT 1 FROM schema_migrations WHERE version = 83").get(),
+            ).not.toBeNull();
         } finally {
             closeQuietly(db);
         }

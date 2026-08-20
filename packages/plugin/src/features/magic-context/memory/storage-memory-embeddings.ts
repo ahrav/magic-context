@@ -183,13 +183,6 @@ export function hasMemoryEmbedding(db: Database, memoryId: number, modelId: stri
     );
 }
 
-export function deleteEmbeddingForModel(db: Database, memoryId: number, modelId: string): void {
-    db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ? AND model_id = ?").run(
-        memoryId,
-        modelId,
-    );
-}
-
 export function getStoredModelId(db: Database, projectPath: string): string | null {
     const row = getStoredModelIdStatement(db).get(projectPath) as StoredModelIdRow | undefined;
     return typeof row?.modelId === "string" ? row.modelId : null;

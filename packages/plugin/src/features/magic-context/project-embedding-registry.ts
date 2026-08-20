@@ -23,7 +23,6 @@ import {
 } from "./compartment-chunk-embedding";
 import {
     countEmbeddedCommits,
-    deleteCommitEmbedding,
     hasCommitEmbedding,
     loadUnembeddedCommits,
     saveCommitEmbedding,
@@ -51,7 +50,6 @@ import {
     SynapseEmbeddingProvider,
 } from "./memory/embedding-synapse";
 import {
-    deleteEmbeddingForModel,
     getMemoryEmbedCoverage,
     hasMemoryEmbedding,
     saveEmbedding,
@@ -1520,6 +1518,15 @@ function getDetailedLane(
     };
 }
 
+/** Destination-row classification for one reopen-proof transaction. */
+interface DetailedDestinationProbe {
+    /** Classify one manifest item's exact destination row. */
+    state: (item: { id: string; contentSha256: string }) => "absent" | "stale" | "current";
+    /** Invalidate stale destination rows; called only on "stale" items.
+     *  Omitted when the lane can never prove staleness. */
+    invalidate?: (item: { id: string; contentSha256: string }) => void;
+}
+
 interface DetailedApplySpec {
     db: Database;
     projectIdentity: string;
@@ -1530,11 +1537,10 @@ interface DetailedApplySpec {
     readCurrentHashes: (ids: readonly string[]) => ReadonlyMap<string, string>;
     /** Write one application group's destination rows inside that transaction. */
     writeGroup: (group: string, vectors: ReadonlyMap<string, Float32Array>) => void;
-    destinationState: (item: {
-        id: string;
-        contentSha256: string;
-    }) => "absent" | "stale" | "current";
-    invalidateDestination: (item: { id: string; contentSha256: string }) => void;
+    /** Build a fresh probe for ONE reopen-proof transaction. Any snapshot the
+     *  probe caches must not outlive that transaction: an earlier proof's
+     *  invalidation changes the destination the next proof must observe. */
+    makeDestinationProbe: () => DetailedDestinationProbe;
     signal?: AbortSignal;
 }
 
@@ -1565,11 +1571,12 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
     if (conflicted.length > 0) {
         const retryGroups = new Set<string>();
         for (const failure of conflicted) {
+            const probe = spec.makeDestinationProbe();
             const reopened = reopenCompleteSynapseLedgerPageWithProof(db, {
                 rowId: failure.rowId as number,
                 deadlineAt: Date.now() + SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
-                destinationState: spec.destinationState,
-                invalidateDestination: spec.invalidateDestination,
+                destinationState: probe.state,
+                invalidateDestination: probe.invalidate,
             });
             if (reopened) retryGroups.add(failure.applicationGroup);
         }
@@ -1650,8 +1657,13 @@ function memoryIdFromItemId(itemId: string): number {
     return Number(itemId.slice("memory:".length));
 }
 
-/** One application group per memory batch: the batch is the transaction unit,
- *  so one drifted memory aborts the whole group's writes and completions. */
+/** Memory application-group size. Memory vectors are independent rows with no
+ *  cross-row atomicity requirement, so the group only bounds how much
+ *  completed inference one failed page can discard. Chunking id-sorted
+ *  memories keeps group identity stable when the caller's candidate set
+ *  shifts: new (higher-id) memories perturb only the tail group. */
+const MEMORY_APPLICATION_GROUP_SIZE = 32;
+
 async function embedMemoryRowsDetailed(
     db: Database,
     projectIdentity: string,
@@ -1659,20 +1671,23 @@ async function embedMemoryRowsDetailed(
     memories: readonly { id: number; content: string }[],
     signal?: AbortSignal,
 ): Promise<Map<number, Float32Array>> {
-    const specs = memories.map((memory) => ({
-        id: `memory:${memory.id}`,
-        text: memory.content,
-        contentSha256: contentSha256(memory.content),
-    }));
-    const group = `memory:${sha256Prefix(
-        stableStringify(specs.map(({ id, contentSha256: hash }) => [id, hash])),
-    )}`;
-    const items: DetailedEmbedItem[] = specs.map((spec) => ({
-        ...spec,
-        applicationGroup: group,
-    }));
+    const specs = [...memories]
+        .sort((a, b) => a.id - b.id)
+        .map((memory) => ({
+            id: `memory:${memory.id}`,
+            text: memory.content,
+            contentSha256: contentSha256(memory.content),
+        }));
+    const items: DetailedEmbedItem[] = [];
+    for (let start = 0; start < specs.length; start += MEMORY_APPLICATION_GROUP_SIZE) {
+        const chunk = specs.slice(start, start + MEMORY_APPLICATION_GROUP_SIZE);
+        const group = `memory:${sha256Prefix(
+            stableStringify(chunk.map(({ id, contentSha256: hash }) => [id, hash])),
+        )}`;
+        for (const spec of chunk) items.push({ ...spec, applicationGroup: group });
+    }
     const written = new Map<number, Float32Array>();
-    const applied = await embedAndApplyDetailed({
+    await embedAndApplyDetailed({
         db,
         projectIdentity,
         scope: "memory",
@@ -1681,16 +1696,20 @@ async function embedMemoryRowsDetailed(
         signal,
         readCurrentHashes: (ids) => {
             const map = new Map<string, string>();
-            for (const id of ids) {
-                const row = db
-                    .prepare(
-                        "SELECT content FROM memories WHERE id = ? AND project_path = ? AND status = 'active'",
-                    )
-                    .get(memoryIdFromItemId(id), projectIdentity) as
-                    | { content?: unknown }
-                    | undefined;
-                if (row && typeof row.content === "string") {
-                    map.set(id, contentSha256(row.content));
+            if (ids.length === 0) return map;
+            const placeholders = ids.map(() => "?").join(",");
+            const rows = db
+                .prepare(
+                    `SELECT id, content FROM memories
+                     WHERE project_path = ? AND status = 'active' AND id IN (${placeholders})`,
+                )
+                .all(projectIdentity, ...ids.map(memoryIdFromItemId)) as Array<{
+                id: number;
+                content: unknown;
+            }>;
+            for (const row of rows) {
+                if (typeof row.content === "string") {
+                    map.set(`memory:${row.id}`, contentSha256(row.content));
                 }
             }
             return map;
@@ -1701,14 +1720,16 @@ async function embedMemoryRowsDetailed(
                 written.set(memoryIdFromItemId(id), vector);
             }
         },
-        destinationState: (item) =>
-            hasMemoryEmbedding(db, memoryIdFromItemId(item.id), lane.modelId)
-                ? "current"
-                : "absent",
-        invalidateDestination: (item) =>
-            deleteEmbeddingForModel(db, memoryIdFromItemId(item.id), lane.modelId),
+        // Memory staleness is unprovable from the destination row (no per-row
+        // source hash), so the probe never reports "stale" and carries no
+        // invalidator; content edits delete the row, which reads as "absent".
+        makeDestinationProbe: () => ({
+            state: (item) =>
+                hasMemoryEmbedding(db, memoryIdFromItemId(item.id), lane.modelId)
+                    ? "current"
+                    : "absent",
+        }),
     });
-    if (!applied.has(group)) return new Map();
     return written;
 }
 
@@ -1758,12 +1779,20 @@ async function embedCommitRowsDetailed(
         items,
         readCurrentHashes: (ids) => {
             const map = new Map<string, string>();
-            for (const id of ids) {
-                const row = db
-                    .prepare("SELECT message FROM git_commits WHERE sha = ? AND project_path = ?")
-                    .get(shaFromItemId(id), projectIdentity) as { message?: unknown } | undefined;
-                if (row && typeof row.message === "string") {
-                    map.set(id, contentSha256(row.message));
+            if (ids.length === 0) return map;
+            const placeholders = ids.map(() => "?").join(",");
+            const rows = db
+                .prepare(
+                    `SELECT sha, message FROM git_commits
+                     WHERE project_path = ? AND sha IN (${placeholders})`,
+                )
+                .all(projectIdentity, ...ids.map(shaFromItemId)) as Array<{
+                sha: string;
+                message: unknown;
+            }>;
+            for (const row of rows) {
+                if (typeof row.message === "string") {
+                    map.set(`commit:${row.sha}`, contentSha256(row.message));
                 }
             }
             return map;
@@ -1773,10 +1802,12 @@ async function embedCommitRowsDetailed(
                 saveCommitEmbedding(db, shaFromItemId(id), vector, lane.modelId);
             }
         },
-        destinationState: (item) =>
-            hasCommitEmbedding(db, shaFromItemId(item.id), lane.modelId) ? "current" : "absent",
-        invalidateDestination: (item) =>
-            deleteCommitEmbedding(db, shaFromItemId(item.id), lane.modelId),
+        // A commit's source text is fixed by its SHA, so an existing row can
+        // never be source-stale; the probe carries no invalidator.
+        makeDestinationProbe: () => ({
+            state: (item) =>
+                hasCommitEmbedding(db, shaFromItemId(item.id), lane.modelId) ? "current" : "absent",
+        }),
     });
     const shas = new Set<string>();
     for (const ids of applied.values()) {
@@ -1892,25 +1923,39 @@ async function applyCompartmentWindowsDetailed(
             });
             replaceCompartmentChunkEmbeddings(db, rowsToWrite);
         },
-        destinationState: (() => {
-            // One snapshot per proof transaction: the proof calls this once
+        makeDestinationProbe: () => {
+            // One snapshot per proof transaction: the proof calls state() once
             // per manifest item, and re-reading the whole hash map each time
             // is O(items x windows) for the identical in-transaction answer.
+            // The snapshot must not outlive the proof: an earlier proof's
+            // invalidation deletes the rows the next proof must re-observe.
             let existing: ReadonlyMap<number, string> | null = null;
-            return (item: { id: string; contentSha256: string }) => {
-                existing ??= getExistingChunkHashes(
-                    db,
-                    args.compartmentId,
-                    lane.chunkModelId,
-                    projectIdentity,
-                );
-                if (existing.size === 0) return "absent";
-                const hash = existing.get(windowIndexFromItemId(item.id));
-                return hash === item.contentSha256 ? "current" : "stale";
+            // Invalidation is compartment-wide, so one call per proof
+            // transaction covers every stale window in its manifest.
+            let invalidated = false;
+            return {
+                state: (item: { id: string; contentSha256: string }) => {
+                    existing ??= getExistingChunkHashes(
+                        db,
+                        args.compartmentId,
+                        lane.chunkModelId,
+                        projectIdentity,
+                    );
+                    if (existing.size === 0) return "absent";
+                    const hash = existing.get(windowIndexFromItemId(item.id));
+                    return hash === item.contentSha256 ? "current" : "stale";
+                },
+                invalidate: () => {
+                    if (invalidated) return;
+                    invalidated = true;
+                    deleteCompartmentChunkEmbeddingsForModel(
+                        db,
+                        args.compartmentId,
+                        lane.chunkModelId,
+                    );
+                },
             };
-        })(),
-        invalidateDestination: () =>
-            deleteCompartmentChunkEmbeddingsForModel(db, args.compartmentId, lane.chunkModelId),
+        },
     });
     return applied.has(group);
 }
@@ -2846,15 +2891,16 @@ async function drainCompartmentChunkBacklogForProject(
     return total;
 }
 
+/** Passive missing-chunk drain for one project. `deadlineAt` is the shared
+ *  wall-clock budget of the maintenance pass that invoked it — callers that
+ *  iterate several projects must pass ONE deadline across all of them so a
+ *  multi-project pass cannot outrun the caller's own schedule. */
 export async function embedUnembeddedCompartmentChunksForProject(
     db: Database,
     projectIdentity: string,
+    deadlineAt: number = Date.now() + SWEEP_MAX_WALL_CLOCK_MS,
 ): Promise<number> {
-    return drainCompartmentChunkBacklogForProject(
-        db,
-        projectIdentity,
-        Date.now() + SWEEP_MAX_WALL_CLOCK_MS,
-    );
+    return drainCompartmentChunkBacklogForProject(db, projectIdentity, deadlineAt);
 }
 
 export interface SessionChunkBackfillProgress {

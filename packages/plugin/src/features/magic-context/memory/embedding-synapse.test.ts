@@ -11,6 +11,7 @@ import {
     createSynapseLedgerPage,
     getSynapseLedgerPage,
     markSynapseLedgerPolling,
+    markSynapseLedgerReady,
     recordSynapseLedgerCursor,
 } from "../storage-embedding-measurements";
 import type { DetailedEmbedContext, DetailedEmbedItem } from "./embedding-provider";
@@ -852,6 +853,61 @@ describe("embedItemsDetailed", () => {
             expect(host.batchCalls()).toHaveLength(0);
             expect(observedCursors[0]).toBeNull();
             expect(getSynapseLedgerPage(db, seeded.rowId)?.state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("rebuilds a ready row whose page deadline already expired instead of wedging on it", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([
+                { id: "memory:1", group: "g1" },
+                { id: "memory:2", group: "g1" },
+            ]);
+            const requestKey = getSynapseBatchRequestKey({
+                model: MODEL,
+                fingerprint: FP,
+                tableEpoch: 0,
+                items,
+            });
+            const created = createSynapseLedgerPage(db, {
+                projectPath: "/repo",
+                sessionId: "ses-1",
+                scope: "memory",
+                laneRole: "primary",
+                destinationModel: getSynapseLaneIdentity(MODEL, FP),
+                applicationGroup: "g1",
+                requestKey,
+                manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                deadlineAt: Date.now() - 1,
+            });
+            let seeded = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-crashed",
+                jobId: "job-retained",
+            });
+            seeded = markSynapseLedgerReady(db, {
+                rowId: seeded.rowId,
+                expectedStateVersion: seeded.stateVersion,
+                jobId: "job-retained",
+            });
+
+            const result = await provider.embedItemsDetailed(items, detailedContext(db));
+
+            // The expired retained job is never polled (its deadline makes the
+            // re-derive impossible); the row is obsoleted and a fresh page runs.
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].rowId).not.toBe(seeded.rowId);
+            expect(
+                host.resultCalls().filter((call) => call.params.job_id === "job-retained"),
+            ).toHaveLength(0);
+            expect(host.batchCalls()).toHaveLength(1);
+            expect(getSynapseLedgerPage(db, seeded.rowId)?.state).toBe("obsolete");
         } finally {
             closeQuietly(db);
         }
