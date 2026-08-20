@@ -4,11 +4,21 @@
  * Consumers recognize these by wire-visible shape (`name`, `code`, `kind`,
  * `message`) rather than `instanceof`, because a plugin bundle can carry a
  * different copy of the client than the code that threw. Every name, code,
- * and kind value here must therefore stay recognizable across bundled copies
- * (plan R3).
+ * and kind value here must therefore stay recognizable across bundled copies.
  *
  * Leaf module: no imports from connection or facade code.
  */
+
+/**
+ * Cross-bundle recognition of {@link SubcCallError}: `instanceof` for a
+ * same-bundle error, wire-visible `name` for an error thrown by a different
+ * bundled copy of this class.
+ */
+export function isSubcCallError(error: unknown): error is SubcCallError {
+    return (
+        error instanceof SubcCallError || (error instanceof Error && error.name === "SubcCallError")
+    );
+}
 
 /**
  * Send-outcome classification for a managed call failure.

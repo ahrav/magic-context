@@ -3,7 +3,7 @@
  *
  * Leaf module: imports nothing from connection or facade code and no npm
  * subc-client code. The shapes mirror the subset of `@cortexkit/subc-client`
- * 0.4.1 that in-repo consumers actually use, per plan KTD1/R2. Wire semantics
+ * 0.4.1 that in-repo consumers actually use. Wire semantics
  * come from `docs/mc-host-wire-protocol.md`.
  */
 
@@ -45,7 +45,7 @@ export interface CatalogEntry {
 /**
  * Scheduling priority carried in flags bits 1-2. Runtime const object plus a
  * union type (never a TypeScript enum) so bundled Node/Bun loading needs no
- * enum transform (plan U1 approach item 5).
+ * enum transform.
  */
 export const Priority = {
     Passive: 0,

@@ -433,8 +433,12 @@ export class FakePeer {
     }
 
     waitForConnection(timeoutMs = 5_000): Promise<FakePeerConnection> {
-        const existing = this.connections[this.connections.length - 1];
-        if (existing) return Promise.resolve(existing);
+        // Skip destroyed sockets: after a client reconnect, the last entry
+        // can be the closed prior connection rather than the new one.
+        for (let i = this.connections.length - 1; i >= 0; i--) {
+            const candidate = this.connections[i];
+            if (candidate && !candidate.socket.destroyed) return Promise.resolve(candidate);
+        }
         return new Promise((resolve, reject) => {
             const timer = setTimeout(
                 () => reject(new Error("fake peer timed out waiting for a connection")),

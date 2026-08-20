@@ -1,5 +1,5 @@
 /**
- * Bounded connection-generation engine (plan U3; KTD4-KTD7, KTD10, KTD11).
+ * Bounded connection-generation engine.
  *
  * One `ConnectionGeneration` owns the `node:net` socket, dial, the auth
  * byte-I/O adaptation over U2's pure handshake, the incremental frame
@@ -8,7 +8,7 @@
  * It owns no route cache and no reconnect policy; the facade layer above
  * reacts to retirement but is never imported here.
  *
- * Send-outcome boundary (KTD4): a queued request is classified `not_sent`
+ * Send-outcome boundary: a queued request is classified `not_sent`
  * until the writer invokes `socket.write()` for any of its bytes. After
  * invocation, only a matching terminal frame is authoritative; losing the
  * terminal (retirement, timeout, abort, EOF, error, close) classifies the
@@ -18,7 +18,7 @@
 
 import { Socket } from "node:net";
 import { type AuthByteIo, AuthError, authenticateClient } from "./auth";
-import type { Deadline, MonotonicClock } from "./deadline";
+import type { Deadline } from "./deadline";
 import { SocketClosedError, SocketTimeoutError, SubcCallError } from "./errors";
 import {
     buildFlags,
@@ -130,8 +130,6 @@ export interface ConnectionGenerationOptions {
     host: string;
     port: number;
     credentials: { key: Uint8Array; daemonId: Uint8Array };
-    /** Injectable monotonic clock for internally created deadlines. */
-    clock?: MonotonicClock;
     /** Frame deadline starting at the FIRST header byte (wire doc 6.3). */
     frameDeadlineMs?: number;
     /** Injectable body cap for scaled tests; defaults to the exact 64 MiB limit. */
@@ -141,7 +139,7 @@ export interface ConnectionGenerationOptions {
     maxQueuedFrames?: number;
     maxQueuedBytes?: number;
     controlReserveFrames?: number;
-    /** Bounded cleanup-ticket deadline for post-write aborts (KTD10). */
+    /** Bounded cleanup-ticket deadline for post-write aborts. */
     cleanupTicketMs?: number;
     /** Test seam so correlation exhaustion is reachable; defaults to 1n. */
     firstCorrelation?: bigint;
@@ -1400,7 +1398,7 @@ export class ConnectionGeneration {
      * Resolve once every queued frame byte has been handed to the socket and
      * every write callback fired, the generation retires, or `deadline`
      * expires — a bounded, best-effort primitive for the facade's awaitable
-     * Goodbye teardown (plan U4 approach item 7). Never blocks retirement.
+     * Goodbye teardown. Never blocks retirement.
      */
     flushWrites(deadline: Deadline): Promise<void> {
         if (this.retiredInfo !== null || this.writerIdle()) return Promise.resolve();

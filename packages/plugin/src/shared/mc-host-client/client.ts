@@ -1,13 +1,13 @@
 /**
  * Thin routed and managed consumer facade over the connection-generation
- * engine (plan U4; KTD1, KTD8, KTD9, KTD10, KTD12).
+ * engine.
  *
  * `SubcClient` owns connection coalescing (single-flight connect), reconnect
  * after generation retirement (reread the connection file plus full reauth),
  * the managed-route cache, control-plane response validation, and bounded
  * redacted diagnostics. The generation layer below never imports this file.
  *
- * Replay ownership (KTD8): raw `request()` never replays a body. Managed
+ * Replay ownership: raw `request()` never replays a body. Managed
  * `call()` owns exactly one replay token per call, spendable only on a
  * proven `not_sent` or a terminal `unknown_channel` (route evicted first),
  * only while the caller is active and the operation deadline is live.
@@ -25,7 +25,7 @@ import {
 } from "./connection";
 import { type ConnectionSnapshot, readConnectionFile } from "./connection-file";
 import { Deadline, type MonotonicClock } from "./deadline";
-import { SubcCallError, SubcError } from "./errors";
+import { isSubcCallError, SubcCallError, SubcError } from "./errors";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -124,7 +124,7 @@ export interface SubcClientOptions extends ConnectOptions {
 
 interface ActiveConnection {
     readonly generation: ConnectionGeneration;
-    /** Opaque token binding this connection's route handles (plan R3). */
+    /** Opaque token binding this connection's route handles. */
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
 }
@@ -192,7 +192,7 @@ export async function connectionFileExists(path: string): Promise<boolean> {
 /**
  * Reconnect-transience classification, semantics-compatible with npm
  * subc-client 0.4.1. Recognition works cross-bundle by error `name` and
- * `kind`/`code` shape, not only `instanceof` (plan R3).
+ * `kind`/`code` shape, not only `instanceof`.
  */
 export function isConsumerReconnectTransient(err: unknown): boolean {
     if (err instanceof SubcCallError) {
@@ -457,7 +457,6 @@ export class SubcClient {
             host: snapshot.endpoint.host,
             port: snapshot.endpoint.port,
             credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
-            clock: this.clock,
             onRetired: (info) => {
                 if (conn) this.onGenerationRetired(conn, info);
             },
@@ -813,7 +812,7 @@ export class SubcClient {
                 cached.handle = handle;
                 return handle;
             } catch (error) {
-                if (!(error instanceof SubcCallError)) {
+                if (!isSubcCallError(error)) {
                     throw new SubcCallError(
                         "terminal",
                         `route.open failed for module ${cached.target.module_id}${causeMessage(error)}`,

@@ -1,5 +1,5 @@
 /**
- * Descriptor-anchored connection-file snapshot (plan KTD3, R5-R6).
+ * Descriptor-anchored connection-file snapshot.
  *
  * Normative authority: `docs/mc-host-wire-protocol.md` Section 4. Two
  * explicit validation paths exist:
@@ -95,7 +95,7 @@ export interface ReadConnectionFileOptions {
 }
 
 /**
- * Exact-length JSON byte-array validation (plan KTD3): every element must be
+ * Exact-length JSON byte-array validation: every element must be
  * an own integer in `[0, 255]`. Sparse holes, `null`, fractions, negatives,
  * and values above 255 are all rejected without coercion.
  */
@@ -368,8 +368,8 @@ function validateSnapshotJson(parsed: unknown): ConnectionSnapshot {
         );
     }
     const pid = record.pid;
-    if (typeof pid !== "number" || !Number.isSafeInteger(pid)) {
-        throw invalid("invalid_pid", "connection file pid must be a safe integer");
+    if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) {
+        throw invalid("invalid_pid", "connection file pid must be a positive integer");
     }
     const daemonVer = record.daemon_ver;
     if (typeof daemonVer !== "string" || daemonVer.length === 0) {

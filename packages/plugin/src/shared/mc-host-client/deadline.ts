@@ -1,5 +1,5 @@
 /**
- * One immutable absolute deadline per operation (plan KTD5, R14).
+ * One immutable absolute deadline per operation.
  *
  * The deadline is fixed on the injected monotonic timeline at creation.
  * Derived stage budgets may shorten a wait but can never extend or reset the
@@ -63,6 +63,10 @@ export class Deadline {
      * `min(now + capMs, operation end)` on the same clock.
      */
     stage(capMs: number): Deadline {
-        return new Deadline(this.clock() + this.stageBudgetMs(capMs), this.clock);
+        const budgetMs = this.stageBudgetMs(capMs);
+        // Clamp to the operation end: the clock advances between the budget
+        // sample and this sample, and that drift must never extend the stage
+        // past the operation's absolute end.
+        return new Deadline(Math.min(this.clock() + budgetMs, this.endMs), this.clock);
     }
 }

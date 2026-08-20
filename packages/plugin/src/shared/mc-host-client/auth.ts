@@ -1,9 +1,9 @@
 /**
- * Pure client authentication state machine (plan R7, wire doc Section 5).
+ * Pure client authentication state machine (wire doc Section 5).
  *
  * Runs the exact three-message handshake — ClientHello, ServerProof,
  * ClientAuth — over injected bounded byte I/O. This module owns no socket
- * and never imports `node:net`; the U3 connection engine adapts its socket
+ * and never imports `node:net`; the connection engine adapts its socket
  * to {@link AuthByteIo}.
  *
  * Each message is a `u32` little-endian byte length followed by at most

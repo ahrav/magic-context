@@ -59,6 +59,16 @@ describe("Deadline", () => {
         expect(operation.isExpired()).toBe(true);
     });
 
+    test("a stage deadline cannot pass the operation end when the clock advances between samples", () => {
+        let now = 0;
+        // Every read advances the clock, as a real clock does between the
+        // budget sample and the end-computation sample inside stage().
+        const clock: MonotonicClock = () => (now += 50);
+        const operation = Deadline.start(1_000, clock);
+        const stage = operation.stage(30_000);
+        expect(stage.endMs).toBeLessThanOrEqual(operation.endMs);
+    });
+
     test("repeated stage derivation across retries cannot reset the deadline", () => {
         const { clock, advance } = fakeClock();
         const operation = Deadline.start(1_000, clock);

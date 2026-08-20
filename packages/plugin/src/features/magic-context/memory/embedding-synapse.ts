@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
-import { SubcCallError, SubcClient } from "../../../shared/mc-host-client";
+import { isSubcCallError, SubcClient } from "../../../shared/mc-host-client";
 import type { EmbeddingProvider } from "./embedding-provider";
 
 export const SYNAPSE_DEFAULT_MODEL = "gte-modernbert-base-f16";
@@ -745,8 +745,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             } catch (error) {
                 const classified = classifyError(error);
                 if (classified.code === "idempotency_conflict") throw classified;
-                const outcomeUnknown =
-                    error instanceof SubcCallError && error.kind === "outcome_unknown";
+                const outcomeUnknown = isSubcCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
                 if (!retryable || attempt >= 3) throw classified;
                 const delay = classified.retryAfterMs ?? Math.min(2_000, 100 * 2 ** attempt);

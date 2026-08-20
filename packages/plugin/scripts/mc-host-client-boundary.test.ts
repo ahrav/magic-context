@@ -71,22 +71,32 @@ describe("mc-host-client dependency boundary", () => {
     });
 
     test("lockfile resolves the npm client only through the E2E package", () => {
-        const lock = fs.readFileSync(path.join(repoRoot, "bun.lock"), "utf-8");
-        const references = lock.split("\n").filter((line) => line.includes(NPM_CLIENT));
-        expect(references.length).toBeGreaterThan(0);
-        for (const pkg of PRODUCTION_PACKAGES) {
-            const manifest = JSON.parse(
-                fs.readFileSync(path.join(repoRoot, pkg, "package.json"), "utf-8"),
-            ) as { name: string };
-            // bun.lock lists each workspace's dependencies on its workspace
-            // entry line, so no production package name may share a line with
-            // the npm client.
-            for (const line of references) {
-                expect(
-                    line.includes(`"${manifest.name}"`),
-                    `bun.lock ties ${NPM_CLIENT} to ${manifest.name}`,
-                ).toBe(false);
-            }
-        }
+        const raw = fs.readFileSync(path.join(repoRoot, "bun.lock"), "utf-8");
+        // bun.lock is JSONC whose only non-JSON feature is trailing commas.
+        const lock = JSON.parse(raw.replace(/,(\s*[}\]])/g, "$1")) as {
+            workspaces: Record<string, Record<string, unknown>>;
+        };
+        const sections = [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ];
+        const declaringWorkspaces = Object.entries(lock.workspaces)
+            .filter(([, entry]) =>
+                sections.some((section) => {
+                    const deps = entry[section];
+                    return (
+                        typeof deps === "object" &&
+                        deps !== null &&
+                        NPM_CLIENT in (deps as Record<string, string>)
+                    );
+                }),
+            )
+            .map(([workspacePath]) => workspacePath);
+        expect(
+            declaringWorkspaces,
+            `only packages/e2e-tests may declare ${NPM_CLIENT} in bun.lock`,
+        ).toEqual(["packages/e2e-tests"]);
     });
 });

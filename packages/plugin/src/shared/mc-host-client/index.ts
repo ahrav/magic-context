@@ -8,6 +8,7 @@ export {
 } from "./client";
 export { Deadline, type MonotonicClock } from "./deadline";
 export {
+    isSubcCallError,
     SocketClosedError,
     SocketTimeoutError,
     SubcCallError,

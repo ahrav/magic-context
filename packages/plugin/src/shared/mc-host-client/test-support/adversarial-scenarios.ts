@@ -1,9 +1,9 @@
 /**
- * Runtime-neutral adversarial scenario harness (plan U3/U7, R23).
+ * Runtime-neutral adversarial scenario harness.
  *
  * Each scenario drives a real `ConnectionGeneration` against the
  * independent `FakePeer` using `node:assert/strict` only — no bun:test —
- * so U7 can execute the SAME scenarios under Node 24. `connection.test.ts`
+ * so the same scenarios also execute under Node 24. `connection.test.ts`
  * wraps every scenario in a bun test and adds bun-specific cases on top.
  */
 

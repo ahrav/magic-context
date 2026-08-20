@@ -323,6 +323,8 @@ describe("snapshot JSON validation", () => {
     test("rejects an unsafe or missing pid", async () => {
         await writeInvalid(validJson({ pid: 2 ** 53 }), "invalid_pid");
         await writeInvalid(validJson({ pid: "4242" }), "invalid_pid");
+        await writeInvalid(validJson({ pid: 0 }), "invalid_pid");
+        await writeInvalid(validJson({ pid: -1 }), "invalid_pid");
         const noPid = validJson();
         delete noPid.pid;
         await writeInvalid(noPid, "invalid_pid");
