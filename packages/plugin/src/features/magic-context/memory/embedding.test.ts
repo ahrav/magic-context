@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { cosineSimilarity } from "./cosine-similarity";
-import { embedText, initializeEmbedding } from "./embedding";
+import { _resetEmbeddingConfigForTests, embedText, initializeEmbedding } from "./embedding";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { LocalEmbeddingProvider } from "./embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
@@ -134,7 +134,7 @@ describe("embedding module", () => {
         });
 
         afterEach(() => {
-            initializeEmbedding({ provider: "off" });
+            _resetEmbeddingConfigForTests();
             fetchSpy.mockRestore();
         });
 

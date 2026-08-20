@@ -18,7 +18,7 @@ import {
 import { appendCompartments, getCompartments, replaceSessionFacts } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
 import { getMemoryById, insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
-import { initializeEmbedding } from "./memory/embedding";
+import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
 import {
@@ -1454,7 +1454,7 @@ describe("query-purpose provider boundary (U30)", () => {
     });
 
     afterEach(() => {
-        initializeEmbedding({ provider: "off" });
+        _resetEmbeddingConfigForTests();
         fetchSpy.mockRestore();
         closeQuietly(db);
     });
