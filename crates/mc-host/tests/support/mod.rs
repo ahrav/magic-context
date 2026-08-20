@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod raw_client;
+pub mod synapse;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
