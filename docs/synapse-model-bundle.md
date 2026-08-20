@@ -76,6 +76,42 @@ new fingerprint, and changing the destination-table layout is a new
 `table_epoch`; the TypeScript ledger and destination guards treat both as a
 different, incompatible lane.
 
+The host does not take `fingerprint` on trust: it recomputes the canonical
+value from the manifest and rejects a bundle whose declared fingerprint
+disagrees, naming the expected digest in the disable reason. Otherwise an
+owner who edited the embedding space but left the fingerprint alone would
+serve a different space under the old lane identity, and clients — whose only
+substitution guard is `required_fingerprint` — would mix vector spaces inside
+one destination table.
+
+The canonical value is `sha256` over the UTF-8 bytes of a newline-joined
+`key=value` serialization, starting with a format tag and listing exactly the
+fields that determine a served vector:
+
+```text
+mc-synapse-fingerprint-v1
+model_file=<sha256>
+external_initializer=<sha256>     # repeated, in manifest order, may be absent
+tokenizer=<sha256>
+config=<sha256>
+special_tokens_map=<sha256>
+tokenizer_config=<sha256>
+pooling=<mean|cls>
+quantization=<none|…>
+output=<name:NAME | index:N | only_one>
+max_tokens=<int>
+dims=<int>
+table_epoch=<int>
+corpus=<sha256>
+```
+
+There is no trailing newline. Fields that cannot change a served vector —
+`model`, `provenance`, `recommended_batch` — are excluded, so tuning them
+never forces a new lane identity. `canonical_fingerprint` in
+`crates/mc-host/src/synapse/bundle.rs` is the source of truth;
+`generate-synapse-tiny.py` mirrors it, and packaging tools must recompute the
+digest whenever any listed field changes.
+
 ## 3. Native runtime identity
 
 The host loads ONNX Runtime dynamically and commits it process-globally
@@ -134,7 +170,8 @@ is unset; every pre-ORT rejection path runs hermetically without it.
 ## 6. Upgrade rules
 
 - Replacing model bytes, tokenizer files, pooling, output selection,
-  truncation, or quantization requires a new `fingerprint`.
+  truncation, or quantization requires a new `fingerprint`, which the host
+  recomputes and enforces (§2).
 - A destination-table layout change requires a new `table_epoch`.
 - Bundles are immutable in place: ship a new directory and point trusted
   configuration at it. The host never watches, reloads, or mutates a bundle.

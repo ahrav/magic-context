@@ -1626,9 +1626,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       END;
     `);
 
-    // The ledger's live-identity indexes reference v82 columns; on a
+    // The ledger's live-identity indexes reference v83 columns; on a
     // pre-migration database the legacy-shape table exists without them, so
-    // index creation must wait for migration v82's table replacement.
+    // index creation must wait for migration v83's table replacement.
     const ledgerColumns = new Set(
         (
             db.prepare("PRAGMA table_info(synapse_batch_ledger)").all() as Array<{ name: string }>

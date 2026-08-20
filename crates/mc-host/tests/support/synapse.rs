@@ -28,6 +28,7 @@ pub fn test_lane() -> LaneInfo {
         fingerprint: "a2b4c6d8e0f01234a2b4c6d8e0f01234a2b4c6d8e0f01234a2b4c6d8e0f01234".to_owned(),
         table_epoch: 1,
         dims: 8,
+        max_tokens: 512,
         provenance: serde_json::json!({"source": "deterministic test engine"}),
         recommended_rows: 16,
         recommended_token_budget: 8192,
@@ -255,8 +256,12 @@ pub async fn call(
         )
         .await
         .expect("send request");
-    let frame = client.frame_within(BUDGET).await.expect("terminal");
-    assert_eq!(frame.corr, corr, "terminal matches its correlation");
+    // Correlation-filtered so unsolicited frames (e.g. liveness pings) can
+    // never be mistaken for the terminal.
+    let (_skipped, frame) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("terminal");
     frame
 }
 

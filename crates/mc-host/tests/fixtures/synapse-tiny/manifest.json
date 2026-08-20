@@ -10,7 +10,7 @@
    "sha256": "ffccd76e11144eb737f28a45f9a51e5d70a2cc443f7f56a7e44a5608d5a75efc"
   }
  ],
- "fingerprint": "0bf0fab06faffd2e1da2776311b97a4c9dad91ebc0ca80adcb4f66c7664986ab",
+ "fingerprint": "2dc077caff50f5713f4f32c013562cbe68e2824b5b3c1197ba98df4867cc0895",
  "max_tokens": 8,
  "model": "tiny-test-model",
  "model_file": {

@@ -87,6 +87,9 @@ pub struct LaneInfo {
     pub fingerprint: String,
     pub table_epoch: u64,
     pub dims: usize,
+    /// Token window inference truncates at; published so clients chunk to
+    /// the real boundary instead of a hardcoded guess.
+    pub max_tokens: u32,
     pub provenance: serde_json::Value,
     pub recommended_rows: u32,
     pub recommended_token_budget: u32,
@@ -99,6 +102,9 @@ impl LaneInfo {
             fingerprint: manifest.fingerprint.clone(),
             table_epoch: manifest.table_epoch,
             dims: manifest.dims as usize,
+            // Bounded by the manifest schema (at most 1_048_576), so the
+            // narrowing cast is lossless.
+            max_tokens: manifest.max_tokens as u32,
             provenance: manifest.provenance.clone(),
             recommended_rows: manifest.recommended_batch.rows,
             recommended_token_budget: manifest.recommended_batch.token_budget,
@@ -240,6 +246,18 @@ fn mark_failing(inner: &SynapseInner, reason: String) {
     }
 }
 
+/// The reason the lane is no longer servable, or `None` while it is ready.
+/// Callers hold an `Arc<ReadyLane>` captured at admission, which outlives the
+/// state machine's verdict: the CPU permit can be granted after a predecessor
+/// marked the lane failing, and running that captured backend anyway would
+/// serve a vector from a suspect engine.
+fn lane_failure_reason(inner: &SynapseInner) -> Option<String> {
+    match &*inner.state.lock().expect("synapse state lock") {
+        LaneState::Ready(_) => None,
+        LaneState::Disabled { reason } | LaneState::Failing { reason } => Some(reason.clone()),
+    }
+}
+
 fn embed_via(
     inner: &SynapseInner,
     lane: &ReadyLane,
@@ -304,6 +322,35 @@ async fn respond(ctx: &RequestCtx, body: Vec<u8>) -> RequestOutcome {
     }
 }
 
+/// Reserves output before the body exists, then serializes into it. Only
+/// vector-bearing bodies take this path: they run to the page cap and up to
+/// `max_handler_tasks` of them are in flight at once, so building the body
+/// first would hold megabytes outside the resident-byte budget the
+/// reservation contract exists to enforce. The reservation is sized from the
+/// page's own items rather than the cap, because the charge is held for the
+/// buffer's whole lifetime and an oversized reservation would strand egress
+/// budget the remaining handlers need. Fixed-size bodies keep using
+/// [`respond`], where the body is a small bounded constant.
+async fn respond_vectors(
+    ctx: &RequestCtx,
+    lane: &LaneInfo,
+    items: &[protocol::VectorItemView<'_>],
+    done: bool,
+    next_cursor: Option<&str>,
+) -> RequestOutcome {
+    let reservation = protocol::vector_body_reservation(lane, items, next_cursor);
+    let Ok(mut output) = ctx.reserve_output(reservation).await else {
+        return app_error("internal_error", "output reservation failed");
+    };
+    if protocol::write_vector_body(&mut output, lane, items, done, next_cursor).is_err() {
+        return app_error("internal_error", "output reservation too small");
+    }
+    RequestOutcome::Response {
+        body: output,
+        binary: false,
+    }
+}
+
 impl SynapseComponent {
     async fn handle_query(
         &self,
@@ -343,6 +390,14 @@ impl SynapseComponent {
                 ))));
                 return;
             };
+            // Serialized queries queue behind one another, so a predecessor's
+            // invariant failure can condemn the lane while this call waits.
+            // The lane is already marked, so this reports the existing fault
+            // rather than declaring a new one.
+            if let Some(reason) = lane_failure_reason(&inner) {
+                let _ = tx.send(Err(QueryFault::Engine(InferenceError::Artifact(reason))));
+                return;
+            }
             let lane_blocking = Arc::clone(&lane_task);
             let joined =
                 tokio::task::spawn_blocking(move || lane_blocking.backend.embed(&[text.as_str()]))
@@ -361,11 +416,12 @@ impl SynapseComponent {
         match result {
             Ok(vectors) => match vectors.first() {
                 Some(vector) => {
-                    respond(
-                        ctx,
-                        protocol::query_body(&lane.lane, &content_sha256, vector),
-                    )
-                    .await
+                    let items = [protocol::VectorItemView {
+                        id: "query",
+                        content_sha256: &content_sha256,
+                        vector,
+                    }];
+                    respond_vectors(ctx, &lane.lane, &items, true, None).await
                 }
                 None => {
                     mark_failing(
@@ -451,6 +507,16 @@ impl SynapseComponent {
                 permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
             };
             let Ok(_permit) = permit else { return };
+            // A queued batch inherits the same hazard as a queued query: the
+            // lane can be condemned while this worker waits for the permit,
+            // and the job fails against the existing reason instead of
+            // running the suspect backend.
+            if let Some(reason) = lane_failure_reason(&inner) {
+                inner
+                    .jobs
+                    .publish_failed(seq, "artifact_invalid".to_owned(), reason);
+                return;
+            }
             let Some(items) = inner.jobs.start(seq) else {
                 return;
             };
@@ -508,7 +574,23 @@ impl SynapseComponent {
                 .await
             }
             PollOutcome::Page(page) => {
-                respond(ctx, protocol::result_page_body(&lane.lane, &page)).await
+                let items: Vec<protocol::VectorItemView<'_>> = page
+                    .vectors
+                    .iter()
+                    .map(|(id, hash, vector)| protocol::VectorItemView {
+                        id,
+                        content_sha256: hash,
+                        vector,
+                    })
+                    .collect();
+                respond_vectors(
+                    ctx,
+                    &lane.lane,
+                    &items,
+                    page.done,
+                    page.next_cursor.as_deref(),
+                )
+                .await
             }
         }
     }
@@ -612,9 +694,27 @@ impl SecondaryComponent for SynapseComponent {
             return Ok(());
         };
         // Blocking work (file reads, hashing, native model construction,
-        // probe inference) leaves the async lifecycle thread.
-        let loaded = tokio::task::spawn_blocking(move || {
+        // probe inference) leaves the async lifecycle thread. Blocking tasks
+        // detach on drop and cannot be stopped once running, so completion is
+        // routed through the incarnation tracker: if this future is dropped
+        // at the await (initialization abort), the tracked wrapper still owns
+        // the closure's completion, and `shutdown`'s tracker drain holds
+        // until the native load actually stops.
+        let blocking = tokio::task::spawn_blocking(move || {
             let bundle = bundle::load_bundle(&config.bundle_dir)?;
+            // The recommended batch is advertised to clients verbatim, and
+            // admission rejects any page over max_batch_items, so a manifest
+            // recommending more rows would make every conforming client
+            // build pages this host always refuses. The inconsistency is an
+            // artifact fault, not something to clamp silently.
+            let recommended_rows = bundle.manifest.recommended_batch.rows as usize;
+            if recommended_rows > config.limits.max_batch_items {
+                return Err(bundle::BundleError(format!(
+                    "recommended batch rows ({recommended_rows}) exceed the host's max batch \
+                     items ({})",
+                    config.limits.max_batch_items
+                )));
+            }
             let ort = OrtIdentity {
                 library: config.ort_library.clone(),
                 sha256: config.ort_library_sha256.clone(),
@@ -625,8 +725,13 @@ impl SecondaryComponent for SynapseComponent {
                 lane: LaneInfo::from_manifest(&bundle.manifest),
                 backend: Arc::new(backend),
             })
-        })
-        .await;
+        });
+        let loaded = match self.inner.tracker.spawn(blocking).await {
+            Ok(joined) => joined,
+            // The wrapper never panics and is never aborted, so a lost
+            // wrapper is the same initialization failure as a lost closure.
+            Err(join_error) => Err(join_error),
+        };
         let mut state = self.inner.state.lock().expect("synapse state lock");
         match loaded {
             Ok(Ok(lane)) => {

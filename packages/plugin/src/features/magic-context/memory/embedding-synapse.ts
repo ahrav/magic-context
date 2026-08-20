@@ -63,6 +63,8 @@ export interface SynapseCatalogEntry {
     recommended_batch?: number;
     /** Token ceiling per embed.batch call; pages split on whichever limit hits first. */
     recommended_token_budget?: number;
+    /** Advertised per-input token window; absent catalogs keep the client default. */
+    max_input_tokens?: number;
     provenance?: unknown;
     certified?: boolean;
     status?: string;
@@ -95,6 +97,7 @@ export interface SynapseEmbeddingProviderOptions {
     tableEpoch?: number;
     dims?: number;
     recommendedBatch?: number;
+    maxInputTokens?: number;
     provenance?: unknown;
     moduleId?: string;
     queryTimeoutMs?: number;
@@ -284,6 +287,7 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
         const recommendedBatch =
             typeof rawBatch === "number" ? rawBatch : batchRecord ? batchRecord.rows : undefined;
         const recommendedTokenBudget = batchRecord ? batchRecord.token_budget : undefined;
+        const maxInputTokens = record.max_input_tokens ?? record.maxInputTokens;
         const state = typeof record.state === "string" ? record.state : undefined;
         return [
             {
@@ -296,6 +300,11 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
                     : {}),
                 ...(typeof recommendedTokenBudget === "number" && recommendedTokenBudget > 0
                     ? { recommended_token_budget: Math.floor(recommendedTokenBudget) }
+                    : {}),
+                ...(typeof maxInputTokens === "number" &&
+                Number.isInteger(maxInputTokens) &&
+                maxInputTokens > 0
+                    ? { max_input_tokens: maxInputTokens }
                     : {}),
                 ...(record.provenance !== undefined ? { provenance: record.provenance } : {}),
                 ...(typeof record.certified === "boolean" ? { certified: record.certified } : {}),
@@ -402,7 +411,7 @@ async function getSharedClient(
 
 export class SynapseEmbeddingProvider implements EmbeddingProvider {
     modelId: string;
-    readonly maxInputTokens = SYNAPSE_MAX_INPUT_TOKENS;
+    maxInputTokens: number;
     metadata: SynapseLaneMetadata | null;
 
     private readonly options: SynapseEmbeddingProviderOptions;
@@ -417,6 +426,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         this.options = options;
         const model = options.model || SYNAPSE_DEFAULT_MODEL;
         const fingerprint = options.fingerprint ?? "";
+        const maxInputTokens =
+            typeof options.maxInputTokens === "number" &&
+            Number.isInteger(options.maxInputTokens) &&
+            options.maxInputTokens > 0
+                ? options.maxInputTokens
+                : undefined;
         this.metadata =
             fingerprint &&
             Number.isInteger(options.tableEpoch) &&
@@ -430,6 +445,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                       ...(options.recommendedBatch
                           ? { recommended_batch: Math.max(1, Math.floor(options.recommendedBatch)) }
                           : {}),
+                      ...(maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}),
                       ...(options.provenance !== undefined
                           ? { provenance: options.provenance }
                           : {}),
@@ -439,6 +455,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         this.modelId = this.metadata?.laneIdentity ?? "synapse:v1:pending";
         this.batchLimit = this.metadata?.recommended_batch ?? 16;
         this.tokenBudget = this.metadata?.recommended_token_budget ?? null;
+        this.maxInputTokens = maxInputTokens ?? SYNAPSE_MAX_INPUT_TOKENS;
     }
 
     /**
@@ -511,6 +528,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     this.modelId = metadata.laneIdentity;
                     this.batchLimit = metadata.recommended_batch ?? this.batchLimit;
                     this.tokenBudget = metadata.recommended_token_budget ?? this.tokenBudget;
+                    this.maxInputTokens = metadata.max_input_tokens ?? this.maxInputTokens;
                 }
                 this.initialized = true;
                 return true;
@@ -976,8 +994,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             if (parsed.done !== true && (!hasVectors || parsed.next_cursor == null)) {
                 // done:false without a next cursor is explicit pending, never
                 // termination (R13): wait the bounded delay and poll again.
+                // The 10ms floor keeps a served retry_after_ms of 0 from
+                // busy-looping the event loop with full-rate embed.result calls.
                 const delay = Math.min(
-                    readRetryAfter(parsed) ?? 50,
+                    Math.max(readRetryAfter(parsed) ?? 50, 10),
                     Math.max(0, deadlineAt - Date.now()),
                 );
                 await wait(delay);

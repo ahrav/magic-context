@@ -36,6 +36,9 @@ struct FakeComponent {
     disabled: Arc<AtomicBool>,
     health: Arc<Mutex<HealthReport>>,
     events: Arc<Mutex<Vec<Ev>>>,
+    /// Id-tagged event log; `fake_pair` shares one between both components
+    /// so cross-component ordering is observable.
+    timeline: Arc<Mutex<Vec<(&'static str, Ev)>>>,
 }
 
 impl FakeComponent {
@@ -46,6 +49,7 @@ impl FakeComponent {
             disabled: Arc::new(AtomicBool::new(false)),
             health: Arc::new(Mutex::new(HealthReport::ok())),
             events: Arc::new(Mutex::new(Vec::new())),
+            timeline: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -70,7 +74,15 @@ impl FakeComponent {
         self.events.lock().expect("events lock").clone()
     }
 
+    fn timeline(&self) -> Vec<(&'static str, Ev)> {
+        self.timeline.lock().expect("timeline lock").clone()
+    }
+
     fn push(&self, event: Ev) {
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push((self.id, event.clone()));
         self.events.lock().expect("events lock").push(event);
     }
 }
@@ -143,10 +155,10 @@ impl SecondaryComponent for FakeComponent {
 }
 
 fn fake_pair() -> (FakeComponent, FakeComponent) {
-    (
-        FakeComponent::new("magic-context", "tool_provider"),
-        FakeComponent::new("synapse", "management_surface"),
-    )
+    let primary = FakeComponent::new("magic-context", "tool_provider");
+    let mut secondary = FakeComponent::new("synapse", "management_surface");
+    secondary.timeline = primary.timeline.clone();
+    (primary, secondary)
 }
 
 struct CompositeHost {
@@ -451,6 +463,19 @@ async fn shutdown_runs_after_route_cleanup_and_orders_children() {
     };
     assert!(gone_index(&primary_events) < shutdown_index(&primary_events));
     assert!(gone_index(&secondary_events) < shutdown_index(&secondary_events));
+    // The composite shuts children down sequentially, optional secondary
+    // before mandatory primary.
+    let timeline = primary.timeline();
+    let shutdown_at = |id: &str| {
+        timeline
+            .iter()
+            .position(|(component, event)| *component == id && *event == Ev::Shutdown)
+            .expect("shutdown recorded in the shared timeline")
+    };
+    assert!(
+        shutdown_at("synapse") < shutdown_at("magic-context"),
+        "secondary shuts down before primary"
+    );
     assert_eq!(
         primary_events
             .iter()
@@ -586,4 +611,71 @@ async fn invalid_manifest_sets_fail_before_publication() {
     expect_init_failure(vec![manifest("a", &["mystery_role"])]).await;
     expect_init_failure(vec![manifest("a", &["tool_provider", "tool_provider"])]).await;
     expect_init_failure(vec![manifest("a", &[])]).await;
+}
+
+/// A secondary whose shutdown always panics, for proving the composite still
+/// drains the mandatory primary before re-raising.
+struct PanickingShutdownSecondary {
+    shutdown_entered: Arc<AtomicBool>,
+}
+
+impl CompositeComponent for PanickingShutdownSecondary {
+    fn manifest(&self) -> ManifestSnapshot {
+        ManifestSnapshot {
+            module_id: "synapse".to_owned(),
+            module_version: "0.0.1".to_owned(),
+            provides: vec![serde_json::json!({"role": "management_surface"})],
+            control_ops: Vec::new(),
+        }
+    }
+
+    async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
+        BindOutcome::Accept
+    }
+
+    async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
+        RequestOutcome::Error {
+            code: "internal_error".to_owned(),
+            message: "unreachable".to_owned(),
+        }
+    }
+
+    async fn route_gone(&self, _route: RouteHandle) {}
+
+    async fn health(&self) -> HealthReport {
+        HealthReport::ok()
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown_entered.store(true, Ordering::SeqCst);
+        panic!("secondary shutdown panic");
+    }
+}
+
+impl SecondaryComponent for PanickingShutdownSecondary {
+    async fn initialize(&self) -> Result<(), InitError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_secondary_shutdown_still_drains_the_primary_and_repanics() {
+    let primary = FakeComponent::new("magic-context", "tool_provider");
+    let shutdown_entered = Arc::new(AtomicBool::new(false));
+    let secondary = PanickingShutdownSecondary {
+        shutdown_entered: Arc::clone(&shutdown_entered),
+    };
+    let composite = StaticComposite::new(primary.clone(), secondary).expect("distinct ids");
+
+    let joined = tokio::spawn(async move { composite.shutdown().await }).await;
+    let err = joined.expect_err("the composite must re-raise the secondary's panic");
+    assert!(
+        err.is_panic(),
+        "the re-raised payload is a panic, not an abort"
+    );
+    assert!(shutdown_entered.load(Ordering::SeqCst));
+    assert!(
+        primary.events().contains(&Ev::Shutdown),
+        "the primary's shutdown must run despite the secondary's panic"
+    );
 }

@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import type { EmbeddingPageReceipt } from "./memory/embedding-provider";
 import { runMigrations } from "./migrations";
 import { closeDatabase, openDatabase } from "./storage";
 import { initializeDatabase } from "./storage-db";
 import {
+    applySynapseReceiptGroup,
     completeSynapseLedgerReceipt,
     createSynapseLedgerPage,
     findSynapseLedgerPage,
@@ -536,6 +538,85 @@ describe("synapse batch ledger CAS journal", () => {
             ]) {
                 expect(attempt).toThrow(SynapseLedgerConflictError);
             }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("retires every drifted receipt of a group in one application pass", () => {
+        const db = ledgerDb();
+        try {
+            const group = "memory:drift-group";
+            const toReady = (page: { rowId: number; stateVersion: number }, jobId: string) => {
+                const polling = markSynapseLedgerPolling(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion,
+                    attemptId: `attempt-${jobId}`,
+                    jobId,
+                });
+                return markSynapseLedgerReady(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: polling.stateVersion,
+                    jobId,
+                });
+            };
+            const first = toReady(
+                createSynapseLedgerPage(
+                    db,
+                    pageInput({
+                        applicationGroup: group,
+                        manifest: [{ id: "memory:1", contentSha256: "h1" }],
+                    }),
+                ),
+                "job-1",
+            );
+            const second = toReady(
+                createSynapseLedgerPage(
+                    db,
+                    pageInput({
+                        applicationGroup: group,
+                        requestKey: "m".repeat(64),
+                        manifest: [{ id: "memory:2", contentSha256: "h2" }],
+                    }),
+                ),
+                "job-2",
+            );
+            const receipts: EmbeddingPageReceipt[] = [
+                {
+                    rowId: first.rowId,
+                    stateVersion: first.stateVersion,
+                    applicationGroup: group,
+                    items: [{ id: "memory:1", contentSha256: "h1" }],
+                    vectors: new Map([["memory:1", new Float32Array([1])]]),
+                },
+                {
+                    rowId: second.rowId,
+                    stateVersion: second.stateVersion,
+                    applicationGroup: group,
+                    items: [{ id: "memory:2", contentSha256: "h2" }],
+                    vectors: new Map([["memory:2", new Float32Array([2])]]),
+                },
+            ];
+            let wroteDestination = false;
+
+            expect(() =>
+                applySynapseReceiptGroup(db, {
+                    receipts,
+                    expectation: {
+                        scope: "memory",
+                        laneRole: "primary",
+                        destinationModel: "synapse:v1:m",
+                    },
+                    readCurrentHashes: (ids) => new Map(ids.map((id) => [id, `drifted:${id}`])),
+                    writeDestination: () => {
+                        wroteDestination = true;
+                    },
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+
+            expect(wroteDestination).toBe(false);
+            expect(getSynapseLedgerPage(db, first.rowId)?.state).toBe("obsolete");
+            expect(getSynapseLedgerPage(db, second.rowId)?.state).toBe("obsolete");
         } finally {
             closeQuietly(db);
         }

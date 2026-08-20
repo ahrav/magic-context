@@ -115,6 +115,40 @@ describe("SynapseEmbeddingProvider", () => {
         });
     });
 
+    it("adopts the catalog's advertised max_input_tokens over the default window", async () => {
+        const client = new MockSynapseClient();
+        client.call = async <Response = unknown>(
+            _module: string,
+            method: string,
+            params?: unknown,
+        ) => {
+            client.requests.push({ method, params });
+            if (method === "models.list") {
+                return {
+                    models: [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-live",
+                            table_epoch: 0,
+                            dims: 3,
+                            max_input_tokens: 2048,
+                        },
+                    ],
+                } as Response;
+            }
+            throw new Error(`unexpected method ${method}`);
+        };
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            clientFactory: async () => client,
+        });
+
+        expect(await provider.initialize()).toBe(true);
+        expect(provider.maxInputTokens).toBe(2048);
+    });
+
     it("honors the live recommended batch size and retries model loading with retry_after_ms", async () => {
         const client = new MockSynapseClient(1);
         const provider = new SynapseEmbeddingProvider({

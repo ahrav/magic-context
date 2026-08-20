@@ -112,6 +112,47 @@ def write_json(name: str, value) -> None:
         f.write("\n")
 
 
+def canonical_fingerprint(
+    artifacts, *, pooling, quantization, output, max_tokens, dims, table_epoch
+) -> str:
+    """The lane fingerprint the host recomputes and enforces.
+
+    Mirrors `canonical_fingerprint` in crates/mc-host/src/synapse/bundle.rs,
+    which is the source of truth: SHA-256 over a versioned, newline-joined
+    `key=value` serialization of exactly the fields that determine the
+    embedding space. A change there must land here in the same edit, or the
+    host rejects every bundle this generator writes.
+    """
+    if output.get("name") is not None:
+        selector = f"name:{output['name']}"
+    elif output.get("index") is not None:
+        selector = f"index:{output['index']}"
+    elif output.get("only_one") is True:
+        selector = "only_one"
+    else:
+        raise ValueError("output selects no tensor")
+    tokenizer = artifacts["tokenizer"]
+    lines = [
+        "mc-synapse-fingerprint-v1",
+        f"model_file={artifacts['model_file']['sha256']}",
+    ]
+    lines += [f"external_initializer={a['sha256']}" for a in artifacts["external_initializers"]]
+    lines += [
+        f"tokenizer={tokenizer['tokenizer']['sha256']}",
+        f"config={tokenizer['config']['sha256']}",
+        f"special_tokens_map={tokenizer['special_tokens_map']['sha256']}",
+        f"tokenizer_config={tokenizer['tokenizer_config']['sha256']}",
+        f"pooling={pooling}",
+        f"quantization={quantization}",
+        f"output={selector}",
+        f"max_tokens={max_tokens}",
+        f"dims={dims}",
+        f"table_epoch={table_epoch}",
+        f"corpus={artifacts['corpus']['sha256']}",
+    ]
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
 def main() -> None:
     model = build_model()
     with open("model.onnx", "wb") as f:
@@ -179,24 +220,11 @@ def main() -> None:
         "corpus": {"name": "corpus.json", "sha256": sha256_file("corpus.json")},
     }
 
-    contract = {
-        "model": "tiny-test-model",
-        "dims": DIMS,
-        "pooling": "mean",
-        "quantization": "none",
-        "output": {"name": "last_hidden_state"},
-        "max_tokens": MAX_TOKENS,
-        "l2_normalized": True,
-        "artifacts": artifacts,
-    }
-    fingerprint = hashlib.sha256(
-        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
+    # The manifest is the single declaration of the embedding-space fields;
+    # the fingerprint is derived from it so the two can never disagree.
     manifest = {
         "schema_version": 1,
         "model": "tiny-test-model",
-        "fingerprint": fingerprint,
         "table_epoch": 1,
         "dims": DIMS,
         "pooling": "mean",
@@ -207,6 +235,16 @@ def main() -> None:
         "recommended_batch": {"rows": 16, "token_budget": 8192},
         **artifacts,
     }
+    fingerprint = canonical_fingerprint(
+        artifacts,
+        pooling=manifest["pooling"],
+        quantization=manifest["quantization"],
+        output=manifest["output"],
+        max_tokens=manifest["max_tokens"],
+        dims=manifest["dims"],
+        table_epoch=manifest["table_epoch"],
+    )
+    manifest["fingerprint"] = fingerprint
     write_json("manifest.json", manifest)
     print("fingerprint:", fingerprint)
 

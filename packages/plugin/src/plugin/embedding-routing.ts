@@ -7,6 +7,7 @@ import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../config/schema/magic-context";
 import {
     getSynapseLaneIdentity,
     SYNAPSE_DEFAULT_MODEL,
+    SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
     type SynapseLaneMetadata,
 } from "../features/magic-context/memory/embedding-synapse";
@@ -15,7 +16,9 @@ import { log } from "../shared/logger";
 export interface ResolvedSynapseEmbeddingConfig {
     provider: "synapse";
     model: string;
-    max_input_tokens: 8192;
+    /** Advertised per-input token window; SYNAPSE_MAX_INPUT_TOKENS when the
+     *  catalog omits it. */
+    max_input_tokens: number;
     synapse_connection_file: string;
     synapse_fingerprint: string;
     synapse_table_epoch: number;
@@ -97,6 +100,7 @@ function synapseOptions(
                   tableEpoch: metadata.table_epoch,
                   dims: metadata.dims,
                   recommendedBatch: metadata.recommended_batch,
+                  maxInputTokens: metadata.max_input_tokens,
                   provenance: metadata.provenance,
               }
             : {}),
@@ -137,7 +141,7 @@ function resolvedSynapseConfig(
     return {
         provider: "synapse",
         model: metadata.model,
-        max_input_tokens: 8192,
+        max_input_tokens: metadata.max_input_tokens ?? SYNAPSE_MAX_INPUT_TOKENS,
         synapse_connection_file: subc.connection_file,
         synapse_fingerprint: metadata.fingerprint,
         synapse_table_epoch: metadata.table_epoch,

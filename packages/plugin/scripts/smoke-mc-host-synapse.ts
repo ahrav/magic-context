@@ -191,9 +191,10 @@ const corpus = readBundleJson(String(manifest.corpus?.name ?? "corpus.json")) as
 
 if (mode === "production") {
     // The release smoke must never silently pass on the toy bundle or a
-    // placeholder identity.
-    if (manifest.provenance?.production === false) {
-        fail("production mode refuses the committed toy bundle");
+    // placeholder identity. Only the positive assertion counts: an omitted or
+    // non-boolean provenance flag is refused, not waved through.
+    if (manifest.provenance?.production !== true) {
+        fail("production mode requires provenance.production === true");
     }
     const placeholder = /^(.)\1{63}$/;
     for (const value of [manifest.fingerprint, manifest.model_file?.sha256]) {
@@ -527,7 +528,11 @@ try {
                 for (const receipt of detailed.receipts) {
                     for (const [id, vector] of receipt.vectors) {
                         const memoryId = Number(id.slice("memory:".length));
-                        insert.run(memoryId, Buffer.from(vector.buffer), provider.modelId);
+                        insert.run(
+                            memoryId,
+                            Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength),
+                            provider.modelId,
+                        );
                     }
                 }
             },

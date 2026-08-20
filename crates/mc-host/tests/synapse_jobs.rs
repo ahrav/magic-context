@@ -6,6 +6,7 @@ mod support;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use mc_host::synapse::jobs::{AdmitOutcome, BatchItem, JobTable, PollOutcome};
 use mc_host::synapse::SynapseLimits;
 use support::synapse::{
     batch_params, call, constraints, items, open_synapse_route, ready_component, request_key,
@@ -438,7 +439,16 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
         .await;
         assert!(frame.json()["result"]["job_id"].is_string());
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Shutdown must observe the second job mid-flight, so wait until it has
+    // entered the native call before cancelling.
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while engine.calls.load(Ordering::SeqCst) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "running job never started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     // Graceful shutdown joins the running native call, cancels the queued
     // wrapper, and releases retention before the handler drops.
@@ -447,4 +457,59 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
     // The queued job never ran: one call for the retained job, one for the
     // running job.
     assert_eq!(engine.calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_vector_count_that_disagrees_with_the_job_fails_only_that_job() {
+    // Pairing results with item metadata indexes by position, so an engine
+    // that returns a different count would index out of bounds while the job
+    // table's lock is held — poisoning it for every later caller, including
+    // shutdown's admission close. The engine trait is an open seam, so the
+    // table cannot assume the count was validated upstream.
+    let jobs = JobTable::new(SynapseLimits::default());
+    let batch = |id: &str| {
+        vec![BatchItem {
+            id: id.to_owned(),
+            content_sha256: "0".repeat(64),
+            text: "alpha".to_owned(),
+        }]
+    };
+
+    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-1".to_owned(), batch("item:0"))
+    else {
+        panic!("the first job is admitted");
+    };
+    jobs.start(seq).expect("the job starts");
+    // Two vectors for a one-item job.
+    jobs.publish_ready(seq, vec![vec![0.5, 0.5], vec![0.5, 0.5]]);
+
+    match jobs.poll(&job_id, "key-1", None) {
+        PollOutcome::Failed { code, message } => {
+            assert_eq!(code, "artifact_invalid");
+            assert!(
+                message.contains("item count"),
+                "message {message:?} does not name the count disagreement"
+            );
+        }
+        other => panic!(
+            "expected a failed job, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+
+    // The table survives: a later job still admits, publishes, and serves.
+    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-2".to_owned(), batch("item:1"))
+    else {
+        panic!("the second job is admitted");
+    };
+    jobs.start(seq).expect("the job starts");
+    jobs.publish_ready(seq, vec![vec![1.0, 0.0]]);
+    match jobs.poll(&job_id, "key-2", None) {
+        PollOutcome::Page(page) => {
+            assert!(page.done);
+            assert_eq!(page.vectors.len(), 1);
+            assert_eq!(page.vectors[0].0, "item:1");
+        }
+        _ => panic!("expected a served page after the failed job"),
+    }
 }

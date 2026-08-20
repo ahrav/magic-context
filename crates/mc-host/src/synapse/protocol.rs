@@ -379,6 +379,7 @@ pub fn models_list_body(lane: &LaneInfo) -> Vec<u8> {
                 "fingerprint": lane.fingerprint,
                 "table_epoch": lane.table_epoch,
                 "dims": lane.dims,
+                "max_input_tokens": lane.max_tokens,
                 "certified": true,
                 "status": "ready",
                 "provenance": lane.provenance,
@@ -392,22 +393,113 @@ pub fn models_list_body(lane: &LaneInfo) -> Vec<u8> {
     serde_json::to_vec(&body).expect("models.list body serializes")
 }
 
-pub fn query_body(lane: &LaneInfo, content_sha256: &str, vector: &[f32]) -> Vec<u8> {
-    let body = serde_json::json!({
-        "result": {
-            "model": lane.model,
-            "fingerprint": lane.fingerprint,
-            "table_epoch": lane.table_epoch,
-            "dims": lane.dims,
-            "done": true,
-            "vectors": [{
-                "id": "query",
-                "content_sha256": content_sha256,
-                "vector": vector,
-            }],
+/// One borrowed result item. Vector-bearing bodies are serialized straight
+/// from the job table's own buffers: an intermediate `serde_json::Value` tree
+/// holds roughly ten bytes per component, so materializing one for a
+/// page-capped body would put megabytes outside the host's resident-byte
+/// budget before any reservation exists.
+pub struct VectorItemView<'a> {
+    pub id: &'a str,
+    pub content_sha256: &'a str,
+    pub vector: &'a [f32],
+}
+
+#[derive(serde::Serialize)]
+struct VectorItemBody<'a> {
+    id: &'a str,
+    content_sha256: &'a str,
+    vector: &'a [f32],
+}
+
+#[derive(serde::Serialize)]
+struct VectorResultBody<'a> {
+    model: &'a str,
+    fingerprint: &'a str,
+    table_epoch: u64,
+    dims: usize,
+    done: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<&'a str>,
+    vectors: VectorItemsBody<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct VectorBody<'a> {
+    result: VectorResultBody<'a>,
+}
+
+/// Streams the item array without collecting an owned intermediate.
+struct VectorItemsBody<'a>(&'a [VectorItemView<'a>]);
+
+impl serde::Serialize for VectorItemsBody<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for item in self.0 {
+            seq.serialize_element(&VectorItemBody {
+                id: item.id,
+                content_sha256: item.content_sha256,
+                vector: item.vector,
+            })?;
+        }
+        seq.end()
+    }
+}
+
+/// Fixed JSON envelope around a vector-bearing body: the `result` wrapper,
+/// the lane-identity and paging field names, and the array punctuation.
+/// Deliberately generous, because this feeds an output reservation an
+/// undercount would exhaust mid-serialization.
+const VECTOR_BODY_ENVELOPE: usize = 256;
+
+/// Upper bound on the serialized length of a vector-bearing body, built from
+/// the same per-item accounting the job table splits pages with — so a page
+/// that fit the page cap also fits the reservation taken from this estimate.
+pub fn vector_body_reservation(
+    lane: &LaneInfo,
+    items: &[VectorItemView<'_>],
+    next_cursor: Option<&str>,
+) -> usize {
+    let items: usize = items
+        .iter()
+        .map(|item| {
+            super::jobs::JobTable::encoded_item_cost(
+                item.vector.len(),
+                item.id,
+                item.content_sha256,
+            )
+        })
+        .sum();
+    items
+        + lane.model.len()
+        + lane.fingerprint.len()
+        + next_cursor.map_or(0, str::len)
+        + VECTOR_BODY_ENVELOPE
+}
+
+/// Serializes a vector-bearing body into caller-supplied output storage,
+/// which the caller reserved from [`vector_body_reservation`].
+pub fn write_vector_body<W: std::io::Write>(
+    out: W,
+    lane: &LaneInfo,
+    items: &[VectorItemView<'_>],
+    done: bool,
+    next_cursor: Option<&str>,
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer(
+        out,
+        &VectorBody {
+            result: VectorResultBody {
+                model: &lane.model,
+                fingerprint: &lane.fingerprint,
+                table_epoch: lane.table_epoch,
+                dims: lane.dims,
+                done,
+                next_cursor,
+                vectors: VectorItemsBody(items),
+            },
         },
-    });
-    serde_json::to_vec(&body).expect("query body serializes")
+    )
 }
 
 pub fn job_descriptor_body(
@@ -440,32 +532,6 @@ pub fn pending_body(job_id: &str, status: &str, retry_after_ms: u64) -> Vec<u8> 
     serde_json::to_vec(&body).expect("pending body serializes")
 }
 
-pub fn result_page_body(lane: &LaneInfo, page: &super::jobs::ResultPage) -> Vec<u8> {
-    let vectors: Vec<serde_json::Value> = page
-        .vectors
-        .iter()
-        .map(|(id, hash, vector)| {
-            serde_json::json!({
-                "id": id,
-                "content_sha256": hash,
-                "vector": vector,
-            })
-        })
-        .collect();
-    let mut result = serde_json::json!({
-        "model": lane.model,
-        "fingerprint": lane.fingerprint,
-        "table_epoch": lane.table_epoch,
-        "dims": lane.dims,
-        "done": page.done,
-        "vectors": vectors,
-    });
-    if let Some(next_cursor) = &page.next_cursor {
-        result["next_cursor"] = serde_json::Value::String(next_cursor.clone());
-    }
-    serde_json::to_vec(&serde_json::json!({ "result": result })).expect("page body serializes")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +542,7 @@ mod tests {
             fingerprint: "fp-1".to_owned(),
             table_epoch: 1,
             dims: 8,
+            max_tokens: 512,
             provenance: serde_json::Value::Null,
             recommended_rows: 16,
             recommended_token_budget: 8192,

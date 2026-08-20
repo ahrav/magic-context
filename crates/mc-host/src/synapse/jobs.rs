@@ -261,6 +261,20 @@ impl JobTable {
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
+        // An engine that returns the wrong item count must fail this one
+        // job: pairing vectors with item_meta below indexes by position, and
+        // a panic here would poison the table lock for every later caller,
+        // including shutdown's close_admission. The engine trait is an open
+        // seam, so the count cannot be assumed pre-validated.
+        if vectors.len() != job.item_meta.len() {
+            self.fail_job(
+                &mut jobs,
+                seq,
+                "artifact_invalid".to_owned(),
+                "inference returned a different item count".to_owned(),
+            );
+            return;
+        }
         let meta_bytes: u64 = job
             .item_meta
             .iter()
@@ -284,6 +298,12 @@ impl JobTable {
 
     pub fn publish_failed(&self, seq: u64, code: String, message: String) {
         let mut jobs = self.inner.lock().expect("job table lock");
+        self.fail_job(&mut jobs, seq, code, message);
+    }
+
+    /// Terminal-failure bookkeeping shared by every failure path: queued
+    /// text is released, the retention clock starts, and eviction runs.
+    fn fail_job(&self, jobs: &mut Jobs, seq: u64, code: String, message: String) {
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
@@ -292,7 +312,7 @@ impl JobTable {
         job.state = JobState::Failed { code, message };
         job.completed_at = Some(Instant::now());
         jobs.queued_text_bytes -= text_bytes;
-        self.enforce_retention(&mut jobs, Some(seq));
+        self.enforce_retention(jobs, Some(seq));
     }
 
     pub fn poll(&self, job_id: &str, key: &str, cursor: Option<&str>) -> PollOutcome {
@@ -370,7 +390,9 @@ impl JobTable {
     /// Estimated encoded page cost of one result item. Deliberately
     /// conservative: undercounting could split a ready job into a page whose
     /// JSON body exceeds the frame limit, which no cursor could ever serve.
-    fn encoded_item_cost(vector_len: usize, id: &str, hash: &str) -> usize {
+    /// The response encoder reserves output from the same estimate, so it is
+    /// also the upper bound on one item's serialized bytes.
+    pub(crate) fn encoded_item_cost(vector_len: usize, id: &str, hash: &str) -> usize {
         vector_len * Self::ENCODED_BYTES_PER_COMPONENT
             + id.len()
             + hash.len()

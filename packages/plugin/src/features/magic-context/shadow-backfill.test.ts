@@ -596,6 +596,7 @@ describe("shadow lane writes through versioned synapse receipts", () => {
         const ledger = db
             .prepare("SELECT state FROM synapse_batch_ledger ORDER BY id")
             .all() as Array<{ state: string }>;
+        expect(ledger.length).toBeGreaterThan(0);
         expect(ledger.every((row) => row.state !== "complete")).toBe(true);
     });
 });

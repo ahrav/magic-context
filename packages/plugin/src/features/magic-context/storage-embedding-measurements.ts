@@ -694,12 +694,21 @@ export function applySynapseReceiptGroup(
             }
             const ids = [...manifestHashes.keys()];
             const current = args.readCurrentHashes(ids);
+            // Walk the full manifest before throwing so every drifted
+            // receipt's row is collected and the catch handler retires them
+            // all in one pass instead of one per application attempt.
+            const driftedItems: string[] = [];
             for (const [id, hash] of manifestHashes) {
                 if (current.get(id) !== hash) {
+                    driftedItems.push(id);
                     const rowId = rowIdByItem.get(id);
                     if (rowId !== undefined) driftedRowIds.add(rowId);
-                    throw new SynapseLedgerConflictError(`source drifted for item ${id}`);
                 }
+            }
+            if (driftedItems.length > 0) {
+                throw new SynapseLedgerConflictError(
+                    `source drifted for ${driftedItems.length} item(s), first: ${driftedItems[0]}`,
+                );
             }
             args.writeDestination();
             for (const receipt of receipts) {

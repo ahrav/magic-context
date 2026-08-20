@@ -5,12 +5,17 @@
 //! library. Set `MC_SYNAPSE_TEST_ORT_LIBRARY` to its path; without it those
 //! tests skip (loudly) while every pre-ORT rejection path still runs.
 
+mod support;
+
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use mc_host::synapse::inference::InferenceError;
 use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits, SynapseStatus};
-use mc_host::{CompositeComponent, SecondaryComponent};
+use mc_host::{CompositeComponent, HostError, SecondaryComponent, StaticComposite};
 use sha2::{Digest, Sha256};
+
+use support::synapse::EchoPrimary;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/synapse-tiny")
@@ -189,14 +194,16 @@ async fn unlisted_extra_file_disables_the_lane() {
 
 #[tokio::test]
 async fn symlinked_artifact_disables_the_lane() {
+    // The entry set stays exactly as listed so this exercises the symlink
+    // rejection itself, not the unlisted-entry check that runs first. The
+    // validator uses symlink_metadata, so the target never has to exist.
     expect_disabled_with(
         |dir| {
             let real = dir.join("model.onnx");
-            let moved = dir.join("model.onnx.real");
-            std::fs::rename(&real, &moved).expect("rename");
-            std::os::unix::fs::symlink(&moved, &real).expect("symlink");
+            std::fs::remove_file(&real).expect("remove");
+            std::os::unix::fs::symlink("/nonexistent/elsewhere", &real).expect("symlink");
         },
-        "unlisted",
+        "not a regular file",
     )
     .await;
 }
@@ -217,6 +224,60 @@ async fn duplicate_manifest_key_disables_the_lane() {
         "strict JSON",
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_stale_fingerprint_disables_the_lane() {
+    // Every artifact is hash-verified against the manifest, so an owner who
+    // edits the embedding space and forgets to bump the fingerprint would
+    // otherwise serve a different space under the same lane identity. The
+    // digest stays well-formed here: only its binding to the contents breaks.
+    expect_disabled_with(
+        |dir| edit_manifest(dir, |m| m["fingerprint"] = "a1".repeat(32).into()),
+        "canonical embedding-space fingerprint",
+    )
+    .await;
+    // A single embedding-space field moving without the fingerprint is the
+    // same fault from the other direction.
+    expect_disabled_with(
+        |dir| edit_manifest(dir, |m| m["table_epoch"] = 9.into()),
+        "canonical embedding-space fingerprint",
+    )
+    .await;
+}
+
+#[test]
+fn the_committed_fixture_carries_its_canonical_fingerprint() {
+    // Guards against fixture drift in the default test run: the certified
+    // load path that would otherwise catch a stale fingerprint needs a native
+    // ONNX Runtime and skips without one, and every rejection test above
+    // passes whether or not this digest is correct.
+    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir())
+        .expect("the committed fixture bundle loads");
+    assert_eq!(
+        bundle.manifest.fingerprint,
+        mc_host::synapse::bundle::canonical_fingerprint(&bundle.manifest),
+        "regenerate the fixture with generate-synapse-tiny.py"
+    );
+}
+
+#[tokio::test]
+async fn a_recommended_batch_above_the_admission_cap_disables_the_lane() {
+    // The recommended page size is published to clients verbatim while
+    // admission rejects anything over max_batch_items, so a manifest
+    // recommending more rows would make every conforming client build pages
+    // this host always refuses.
+    let dir = tempfile::tempdir().expect("temp bundle dir");
+    copy_fixture_to(dir.path());
+    let ort = pre_ort_identity();
+    let mut config = config_for(dir.path(), &ort);
+    config.limits.max_batch_items = 8;
+    let component = initialize(config).await;
+    let reason = disabled_reason(&component);
+    assert!(
+        reason.contains("recommended batch rows") && reason.contains("max batch items"),
+        "reason {reason:?} does not name the admission mismatch"
+    );
 }
 
 #[tokio::test]
@@ -429,4 +490,167 @@ async fn wrong_ort_identity_disables_the_lane() {
     placeholder.ort_library_sha256 = "0".repeat(64);
     let component = initialize(placeholder).await;
     assert!(disabled_reason(&component).contains("not a real digest"));
+}
+
+// ---------------------------------------------------------------------------
+// Initialization-abort ownership: the blocking load is owned by the
+// component's incarnation tracker, so an abandoned `initialize` can outlive
+// neither the component's shutdown drain nor the instance lock.
+// ---------------------------------------------------------------------------
+
+/// A current-thread runtime with exactly one blocking thread, so one gate
+/// closure can deterministically queue every later `spawn_blocking`.
+fn single_blocking_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("test runtime")
+}
+
+/// Occupies the runtime's only blocking thread until the sender drops, so a
+/// later `spawn_blocking` (the component's bundle load) stays queued behind
+/// it — a deterministic window in which `initialize` can be dropped before
+/// its blocking work ran.
+fn blocking_pool_gate() -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let gate = tokio::task::spawn_blocking(move || {
+        let _ = rx.recv();
+    });
+    (tx, gate)
+}
+
+#[test]
+fn a_dropped_initialize_keeps_shutdown_waiting_for_the_blocking_load() {
+    single_blocking_thread_runtime().block_on(async {
+        let dir = tempfile::tempdir().expect("temp bundle dir");
+        copy_fixture_to(dir.path());
+        let component = SynapseComponent::new(Some(config_for(dir.path(), &pre_ort_identity())));
+        let (gate_tx, gate) = blocking_pool_gate();
+
+        // One poll spawns the queued blocking load and the tracked wrapper
+        // that owns its completion; the drop then abandons `initialize`
+        // exactly at its await on that wrapper.
+        let mut init = Box::pin(component.initialize());
+        tokio::select! {
+            biased;
+            _ = init.as_mut() => {
+                panic!("initialize cannot complete while the blocking thread is occupied")
+            }
+            () = tokio::task::yield_now() => {}
+        }
+        drop(init);
+
+        // The load has not run, so the incarnation tracker still owns it and
+        // shutdown's drain must hold.
+        let waited = tokio::time::timeout(Duration::from_millis(200), component.shutdown()).await;
+        assert!(
+            waited.is_err(),
+            "shutdown must wait for the abandoned blocking load"
+        );
+
+        drop(gate_tx);
+        gate.await.expect("gate closure joins");
+        tokio::time::timeout(Duration::from_secs(10), component.shutdown())
+            .await
+            .expect("shutdown completes once the blocking load stopped");
+
+        // The dropped initialize never installed a lane: the load's result
+        // was discarded at the tracked wrapper.
+        assert!(matches!(component.status(), SynapseStatus::Disabled { .. }));
+    });
+}
+
+fn host_config(data_root: &Path) -> mc_host::HostConfig {
+    mc_host::HostConfig {
+        data_dir: Some(data_root.to_path_buf()),
+        daemon_ver: "mc-host/test".to_owned(),
+        limits: mc_host::HostLimits {
+            max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn probe_composite() -> StaticComposite<EchoPrimary, SynapseComponent> {
+    StaticComposite::new(EchoPrimary, SynapseComponent::new(None)).expect("distinct component ids")
+}
+
+#[test]
+fn an_aborted_initialization_holds_the_instance_lock_until_the_blocking_load_stops() {
+    single_blocking_thread_runtime().block_on(async {
+        let bundle_dir = tempfile::tempdir().expect("temp bundle dir");
+        copy_fixture_to(bundle_dir.path());
+        let data_root = tempfile::tempdir().expect("temp data root");
+        let (gate_tx, gate) = blocking_pool_gate();
+
+        let synapse =
+            SynapseComponent::new(Some(config_for(bundle_dir.path(), &pre_ort_identity())));
+        let composite = StaticComposite::new(EchoPrimary, synapse).expect("distinct component ids");
+        let shutdown = mc_host::CancellationToken::new();
+        let run_shutdown = shutdown.clone();
+        let config = host_config(data_root.path());
+        let host = tokio::spawn(async move { mc_host::run(composite, config, run_shutdown).await });
+
+        // The first poll of the initialization task queues the blocking load
+        // and parks on the tracked join; the sleep yields far more than one
+        // scheduling pass before the abort.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.cancel();
+        let result = host.await.expect("run task joins");
+        assert!(
+            matches!(result, Err(HostError::InitFailed(_))),
+            "shutdown during initialization fails startup, got {result:?}"
+        );
+
+        // `run` returned, but the reaper still owns the guard and is draining
+        // the component, whose tracker holds the queued blocking load: the
+        // lock must refuse a successor.
+        let refused = mc_host::run(
+            probe_composite(),
+            host_config(data_root.path()),
+            mc_host::CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(HostError::Instance(_))),
+            "the lock must stay held while the blocking load is owned, got {refused:?}"
+        );
+
+        // Releasing the gate lets the load run to completion; only then does
+        // the reaper drop the guard.
+        drop(gate_tx);
+        gate.await.expect("gate closure joins");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            // A pre-cancelled token makes each probe self-contained: `run`
+            // acquires the lock, observes shutdown before initialization
+            // completes, and hands its own guard to a reaper that releases
+            // it promptly — no listener, no publication.
+            let probe_shutdown = mc_host::CancellationToken::new();
+            probe_shutdown.cancel();
+            let outcome = mc_host::run(
+                probe_composite(),
+                host_config(data_root.path()),
+                probe_shutdown,
+            )
+            .await;
+            match outcome {
+                Err(HostError::Instance(_)) => {}
+                other => {
+                    assert!(
+                        matches!(other, Err(HostError::InitFailed(_))),
+                        "a pre-cancelled probe reports its own aborted initialization, got {other:?}"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the lock must release once the blocking load stopped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
 }

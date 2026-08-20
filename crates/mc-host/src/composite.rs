@@ -183,7 +183,28 @@ impl<P: PrimaryComponent, S: SecondaryComponent> McHostHandler for StaticComposi
     }
 
     async fn shutdown(&self) {
-        self.secondary.shutdown().await;
+        // The optional secondary drains first, but its panic must not skip
+        // the mandatory primary's drain: an unwinding future would return
+        // before `primary.shutdown()` runs, and the runtime would release
+        // the instance fence while primary-owned background work is still
+        // live. Each poll is caught instead, the primary always drains, and
+        // the payload is re-raised so the runtime still classifies this
+        // callback as panicked rather than cleanly returned.
+        let secondary = {
+            let mut shutdown = std::pin::pin!(self.secondary.shutdown());
+            std::future::poll_fn(move |cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    shutdown.as_mut().poll(cx)
+                })) {
+                    Ok(poll) => poll.map(Ok),
+                    Err(payload) => std::task::Poll::Ready(Err(payload)),
+                }
+            })
+            .await
+        };
         self.primary.shutdown().await;
+        if let Err(payload) = secondary {
+            std::panic::resume_unwind(payload);
+        }
     }
 }

@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 use super::protocol::sha256_hex;
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+/// Aggregate byte budget for all model weights a loaded bundle retains: the
+/// ONNX graph plus every external initializer together. One budget bounds
+/// the total because every buffer stays resident for the component's
+/// lifetime, and an oversized bundle must degrade only this lane, never
+/// exhaust host memory.
 const MAX_MODEL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_SIDE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXTERNAL_INITIALIZERS: usize = 16;
@@ -27,7 +32,9 @@ const OUTPUT_NAME_ALLOWLIST: &[&str] = &[
 const MAX_OUTPUT_INDEX: u64 = 7;
 
 /// Why a bundle was refused. The message is a stable, bounded reason that
-/// never carries file contents or hashes.
+/// never carries artifact bytes; the fingerprint-mismatch reason alone
+/// includes the expected canonical digest, which owners need to repair
+/// their manifest.
 #[derive(Debug, Clone)]
 pub struct BundleError(pub String);
 
@@ -197,6 +204,14 @@ pub fn load_bundle(dir: &Path) -> Result<VerifiedBundle, BundleError> {
         Ok(bytes)
     };
 
+    // Metadata-only pre-check: an oversized weight total fails here, before
+    // any large read makes the bytes resident.
+    let mut weight_lens = vec![artifact_len(dir, &manifest.model_file.name)?];
+    for artifact in &manifest.external_initializers {
+        weight_lens.push(artifact_len(dir, &artifact.name)?);
+    }
+    validate_weights_budget(weight_lens, MAX_MODEL_BYTES)?;
+
     let onnx = read_verified(&manifest.model_file, MAX_MODEL_BYTES)?;
     let mut initializers = Vec::with_capacity(manifest.external_initializers.len());
     for artifact in &manifest.external_initializers {
@@ -215,6 +230,20 @@ pub fn load_bundle(dir: &Path) -> Result<VerifiedBundle, BundleError> {
 
     validate_tokenizer_config(&tokenizer_config_file, manifest.max_tokens)?;
     let corpus = parse_corpus(&corpus_bytes, manifest.dims as usize)?;
+
+    // The fingerprint must be derived from the embedding-space fields, not
+    // merely well-formed: every artifact byte is verified against its
+    // manifest hash above, so binding the fingerprint to those hashes makes
+    // it impossible to edit the space and keep the old lane identity. Field
+    // checks run first so a specific fault reports its own reason; this is
+    // the final coherence gate.
+    let expected = canonical_fingerprint(&manifest);
+    if manifest.fingerprint != expected {
+        return Err(err(format!(
+            "manifest fingerprint does not match the canonical embedding-space fingerprint \
+             (expected {expected})"
+        )));
+    }
 
     Ok(VerifiedBundle {
         manifest,
@@ -307,17 +336,95 @@ fn validate_hash(hash: &str) -> Result<(), BundleError> {
     Ok(())
 }
 
-fn read_artifact(dir: &Path, name: &str, cap: u64) -> Result<Vec<u8>, BundleError> {
+/// The canonical lane fingerprint: SHA-256 over a versioned, newline-joined
+/// `key=value` serialization of exactly the manifest fields that determine
+/// the embedding space — artifact hashes, pooling, quantization, output
+/// selection, truncation length, dimensions, and the destination-table
+/// epoch. Fields that cannot change a served vector (model name,
+/// provenance, `recommended_batch`) are excluded, so tuning them never
+/// forces a new lane identity. `docs/synapse-model-bundle.md` documents the
+/// exact byte layout; packaging tools mirror it.
+///
+/// Assumes an already-validated manifest: hashes are lowercase hex and the
+/// enumerated fields hold allowlisted values, so no serialized value can
+/// contain `\n` or forge another line.
+pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
+    let output = match (
+        &manifest.output.name,
+        manifest.output.index,
+        manifest.output.only_one,
+    ) {
+        (Some(name), None, None) => format!("name:{name}"),
+        (None, Some(index), None) => format!("index:{index}"),
+        (None, None, Some(true)) => "only_one".to_owned(),
+        // validate_manifest rejects every other combination before the
+        // fingerprint comparison, so this arm never reaches enforcement.
+        _ => "unselected".to_owned(),
+    };
+    let mut lines = String::from("mc-synapse-fingerprint-v1");
+    let mut line = |key: &str, value: &str| {
+        lines.push('\n');
+        lines.push_str(key);
+        lines.push('=');
+        lines.push_str(value);
+    };
+    line("model_file", &manifest.model_file.sha256);
+    for artifact in &manifest.external_initializers {
+        line("external_initializer", &artifact.sha256);
+    }
+    line("tokenizer", &manifest.tokenizer.tokenizer.sha256);
+    line("config", &manifest.tokenizer.config.sha256);
+    line(
+        "special_tokens_map",
+        &manifest.tokenizer.special_tokens_map.sha256,
+    );
+    line(
+        "tokenizer_config",
+        &manifest.tokenizer.tokenizer_config.sha256,
+    );
+    line("pooling", &manifest.pooling);
+    line("quantization", &manifest.quantization);
+    line("output", &output);
+    line("max_tokens", &manifest.max_tokens.to_string());
+    line("dims", &manifest.dims.to_string());
+    line("table_epoch", &manifest.table_epoch.to_string());
+    line("corpus", &manifest.corpus.sha256);
+    sha256_hex(lines.as_bytes())
+}
+
+/// Declared on-disk length of one confined regular-file artifact, without
+/// reading it.
+fn artifact_len(dir: &Path, name: &str) -> Result<u64, BundleError> {
     let path: PathBuf = dir.join(name);
     let metadata = std::fs::symlink_metadata(&path)
         .map_err(|_| err(format!("artifact is missing: {name}")))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(err(format!("artifact is not a regular file: {name}")));
     }
-    if metadata.len() > cap {
+    Ok(metadata.len())
+}
+
+/// Rejects a weight set whose total exceeds `budget`. Saturating addition:
+/// a sum that would overflow is by definition over any real budget.
+fn validate_weights_budget(
+    lengths: impl IntoIterator<Item = u64>,
+    budget: u64,
+) -> Result<(), BundleError> {
+    let mut total: u64 = 0;
+    for length in lengths {
+        total = total.saturating_add(length);
+        if total > budget {
+            return Err(err("model weights exceed the aggregate byte budget"));
+        }
+    }
+    Ok(())
+}
+
+fn read_artifact(dir: &Path, name: &str, cap: u64) -> Result<Vec<u8>, BundleError> {
+    if artifact_len(dir, name)? > cap {
         return Err(err(format!("artifact exceeds its size bound: {name}")));
     }
-    std::fs::read(&path).map_err(|_| err(format!("artifact read failed: {name}")))
+    std::fs::read(dir.join(name)).map_err(|_| err(format!("artifact read failed: {name}")))
 }
 
 fn reject_unlisted_entries(dir: &Path, listed: &[&str]) -> Result<(), BundleError> {
@@ -397,4 +504,25 @@ fn parse_corpus(bytes: &[u8], dims: usize) -> Result<Corpus, BundleError> {
         tolerance: raw.tolerance,
         items,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weights_budget_accepts_up_to_and_rejects_over_the_cap() {
+        assert!(validate_weights_budget([], 10).is_ok());
+        assert!(validate_weights_budget([4, 6], 10).is_ok());
+        assert!(validate_weights_budget([4, 7], 10).is_err());
+        assert!(validate_weights_budget([11], 10).is_err());
+        // Sixteen small initializers each under a per-file view of the cap
+        // still fail in aggregate.
+        assert!(validate_weights_budget(vec![1u64; 16], 10).is_err());
+    }
+
+    #[test]
+    fn weights_budget_saturates_instead_of_overflowing() {
+        assert!(validate_weights_budget([u64::MAX, u64::MAX], u64::MAX - 1).is_err());
+    }
 }

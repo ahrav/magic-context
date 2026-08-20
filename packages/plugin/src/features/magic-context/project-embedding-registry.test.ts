@@ -1800,7 +1800,9 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
 
         expect(embedded).toBe(0);
         expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
-        expect(ledgerRows(db).every((row) => row.state === "ready")).toBe(true);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.state === "ready")).toBe(true);
     });
 
     it("commit drain routes through receipts and completes only with the vector write", async () => {

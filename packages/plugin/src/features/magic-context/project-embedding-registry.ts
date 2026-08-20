@@ -439,6 +439,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
     if (config.provider === "synapse") {
         const synapse = config as EmbeddingConfig & {
             model?: string;
+            max_input_tokens?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
@@ -449,7 +450,12 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
         return {
             provider: "synapse",
             model: synapse.model?.trim() || "gte-modernbert-base-f16",
-            max_input_tokens: SYNAPSE_MAX_INPUT_TOKENS,
+            max_input_tokens:
+                typeof synapse.max_input_tokens === "number" &&
+                Number.isInteger(synapse.max_input_tokens) &&
+                synapse.max_input_tokens > 0
+                    ? synapse.max_input_tokens
+                    : SYNAPSE_MAX_INPUT_TOKENS,
             ...(synapse.synapse_connection_file
                 ? { synapse_connection_file: synapse.synapse_connection_file }
                 : {}),
@@ -509,6 +515,7 @@ function createProvider(
     if (config.provider === "synapse") {
         const synapse = config as EmbeddingConfig & {
             model?: string;
+            max_input_tokens?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
@@ -525,6 +532,7 @@ function createProvider(
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
+            maxInputTokens: synapse.max_input_tokens,
             provenance: synapse.synapse_provenance,
         });
     }

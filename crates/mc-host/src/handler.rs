@@ -428,5 +428,15 @@ pub trait McHostHandler: Send + Sync + 'static {
 
     fn health(&self) -> impl Future<Output = HealthReport> + Send;
 
+    /// Drains handler-owned work and releases handler-owned resources. The
+    /// host awaits this before it releases the single-instance fence, so a
+    /// successor cannot start against work this call has not stopped.
+    ///
+    /// Runs at most once per incarnation, and it can run against a handler
+    /// whose `initialize` was interrupted rather than completed: an aborted
+    /// initialization can already have handed work to handler-owned trackers,
+    /// and only this call stops it. Implementations must therefore tolerate
+    /// partially initialized state — cancel, close, and drain whatever exists
+    /// instead of asserting that setup finished.
     fn shutdown(&self) -> impl Future<Output = ()> + Send;
 }
