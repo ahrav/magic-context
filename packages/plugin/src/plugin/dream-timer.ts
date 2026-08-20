@@ -132,6 +132,17 @@ const startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const startupJitters = new Map<string, number>();
 let nextStartupJitterSlot = 0;
 
+/**
+ * Clear the module-scope startup jitter slots. Slots are handed out for the
+ * lifetime of the module and are otherwise released only when the last project
+ * unregisters, so a test whose timing depends on which slots its projects
+ * receive must clear them before registering.
+ */
+export function resetStartupJitterSlotsForTests(): void {
+    startupJitters.clear();
+    nextStartupJitterSlot = 0;
+}
+
 /** True when `directory` exists and is a directory. Any stat error (gone,
  *  permission, ENOENT) → false: a directory we can't read is treated as gone for
  *  the dead-directory guard. */

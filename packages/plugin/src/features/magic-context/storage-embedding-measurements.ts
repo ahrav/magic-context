@@ -573,8 +573,8 @@ export function completeSynapseLedgerReceipt(
 
 /** complete -> pending. 'complete' is absorbing (R24): call ONLY from a
  *  destination-owning selector that, in this same transaction, proved the
- *  receipt's exact destination rows absent or source/lane-stale and
- *  invalidated any stale rows before retrying. */
+ *  application group's destination rows absent or source/lane-stale and
+ *  invalidated the group's surviving rows before retrying. */
 export function reopenCompleteSynapseLedgerPage(
     db: Database,
     args: { rowId: number; expectedStateVersion: number; deadlineAt: number },
@@ -733,42 +733,62 @@ export function applySynapseReceiptGroup(
 }
 
 /**
- * Reopen a 'complete' receipt ONLY with destination proof (R24). Inside one
- * transaction the selector proves every manifest item's exact destination row
- * absent or stale, invalidates the stale rows, and CASes complete->pending.
- * Returns false (and changes nothing) when the destination is truthfully
- * complete — 'complete' stays absorbing.
+ * Reopen one application group's 'complete' pages with destination proof (R24).
+ *
+ * The group is the atomic application unit: `applySynapseReceiptGroup` writes
+ * every destination row and completes every contributing page in ONE
+ * transaction. 'complete' on a page therefore asserts that the whole group's
+ * destination was written, so proving ANY page of the group absent or stale
+ * falsifies that assertion for all of them: the sibling pages' surviving rows
+ * are the residue of an application that has to be redone as a whole. Every
+ * complete page in `rowIds` reopens together, and every item of every reopened
+ * page is invalidated — including items whose row is still current, because a
+ * destination row that outlives its receipt is exactly the split state the
+ * ledger exists to prevent.
+ *
+ * Reopening only the pages that carry their own proof is what strands a group:
+ * a sibling left 'complete' answers idempotency_conflict on every attempt, so
+ * its receipt never returns and the group's item coverage is never met.
+ *
+ * All `destinationState` reads happen before the first `invalidateDestination`,
+ * so one destination snapshot serves the whole proof. Returns the number of
+ * pages reopened; 0 changes nothing — 'complete' stays absorbing for a group
+ * whose destination is truthfully there.
  */
-export function reopenCompleteSynapseLedgerPageWithProof(
+export function reopenCompleteSynapseLedgerGroupWithProof(
     db: Database,
     args: {
-        rowId: number;
+        /** Ledger rows of ONE application group. */
+        rowIds: readonly number[];
         deadlineAt: number;
         destinationState: (item: SynapseLedgerManifestItem) => "absent" | "stale" | "current";
-        /** Invalidate one stale destination row; omitted when the caller's
-         *  lane can never prove staleness (destinationState never returns
-         *  "stale"). */
-        invalidateDestination?: (item: SynapseLedgerManifestItem) => void;
+        /** Remove one item's destination row. */
+        invalidateDestination: (item: SynapseLedgerManifestItem) => void;
     },
-): boolean {
-    let reopened = false;
+): number {
+    let reopened = 0;
     db.transaction(() => {
-        const row = getSynapseLedgerPage(db, args.rowId);
-        if (row?.state !== "complete") return;
+        const pages: SynapseLedgerPage[] = [];
+        for (const rowId of args.rowIds) {
+            const page = getSynapseLedgerPage(db, rowId);
+            if (page?.state === "complete") pages.push(page);
+        }
         let proven = false;
-        for (const item of row.manifest) {
-            const state = args.destinationState(item);
-            if (state === "current") continue;
-            proven = true;
-            if (state === "stale") args.invalidateDestination?.(item);
+        for (const page of pages) {
+            for (const item of page.manifest) {
+                if (args.destinationState(item) !== "current") proven = true;
+            }
         }
         if (!proven) return;
-        reopenCompleteSynapseLedgerPage(db, {
-            rowId: row.rowId,
-            expectedStateVersion: row.stateVersion,
-            deadlineAt: args.deadlineAt,
-        });
-        reopened = true;
+        for (const page of pages) {
+            for (const item of page.manifest) args.invalidateDestination(item);
+            reopenCompleteSynapseLedgerPage(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+                deadlineAt: args.deadlineAt,
+            });
+            reopened += 1;
+        }
     })();
     return reopened;
 }

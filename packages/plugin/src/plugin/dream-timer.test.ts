@@ -1,10 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../features/magic-context/storage";
 import { BOOT_QUIET_MS, setBootQuietPeriodForTests } from "./boot-quiet";
-import { startDreamScheduleTimer } from "./dream-timer";
+import { resetStartupJitterSlotsForTests, startDreamScheduleTimer } from "./dream-timer";
 
 /**
  * Regression coverage for the schema-fence / null-DB crash:
@@ -178,6 +178,13 @@ describe("dream-timer normal chunk recovery trigger (static)", () => {
 describe("dream-timer startup maintenance", () => {
     const dirs: string[] = [];
     const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+    // Jitter slots live at module scope and are shared by every test in this
+    // file, so the slot pair this test's projects receive — and therefore the
+    // delay between their two passes — is only known once the slots are cleared.
+    beforeEach(() => {
+        resetStartupJitterSlotsForTests();
+    });
 
     afterEach(() => {
         setBootQuietPeriodForTests(null);

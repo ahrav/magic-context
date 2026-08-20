@@ -746,3 +746,37 @@ async fn wrong_request_key_for_a_live_job_is_a_schema_violation() {
 
     host.shutdown().await.expect("graceful shutdown");
 }
+
+/// An out-of-envelope top-level field can carry an array of arbitrarily many
+/// two-byte elements. A `serde_json::Value` node costs 32 bytes, so admitting
+/// the field and materializing its value spends an order of magnitude more
+/// transient memory than the body the ingress charge covers. Refusing the
+/// field at its key leaves the array unread.
+#[test]
+fn an_unknown_top_level_field_is_rejected_without_reading_its_value() {
+    let lane = test_lane();
+    let limits = SynapseLimits::default();
+
+    let elements = 4 * 1024 * 1024;
+    let mut body = Vec::with_capacity(elements * 2 + 64);
+    body.extend_from_slice(br#"{"method":"models.list","x":["#);
+    for _ in 0..elements {
+        body.extend_from_slice(b"0,");
+    }
+    body.truncate(body.len() - 1);
+    body.extend_from_slice(b"]}");
+    assert!(
+        body.len() < 32 * 1024 * 1024,
+        "the payload must stay under the body cap so the schema is the rejecting rule"
+    );
+
+    let error = protocol::parse_request(&body, false, &lane, &limits)
+        .expect_err("a field outside the request envelope is refused");
+    assert_eq!(error.code, "schema_violation");
+
+    // The identical request without that field still parses, so the rejection
+    // is the unknown field and not the request shape.
+    let accepted = protocol::parse_request(br#"{"method":"models.list"}"#, false, &lane, &limits)
+        .expect("the envelope without out-of-schema fields is accepted");
+    assert_eq!(accepted, protocol::Request::ModelsList);
+}

@@ -611,6 +611,43 @@ describe("connect discovery and retry policy", () => {
         expect(queryCalls).toBe(4);
     });
 
+    it("retries queue-full admission through the request deadline", async () => {
+        let queryCalls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 5_000,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(): Promise<Response> {
+                        queryCalls += 1;
+                        if (queryCalls <= 4) {
+                            const error = new Error("query admission is full") as Error & {
+                                code: string;
+                                retry_after_ms: number;
+                            };
+                            error.code = "queue_full";
+                            error.retry_after_ms = 0;
+                            throw error;
+                        }
+                        return {
+                            vector: [1, 2, 3],
+                            fingerprint: "fp-live",
+                            table_epoch: 0,
+                        } as Response;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        expect(await provider.embed("hello")).toEqual(new Float32Array([1, 2, 3]));
+        expect(queryCalls).toBe(5);
+    });
+
     it("stops retrying when the next delay would cross the absolute deadline", async () => {
         let queryCalls = 0;
         const provider = new SynapseEmbeddingProvider({
@@ -680,8 +717,9 @@ describe("embedItemsDetailed", () => {
         params: Record<string, unknown>;
     }
 
-    /** Deterministic host double: embed.batch always answers with a job
-     *  descriptor and embed.result serves scripted pages per job. */
+    /** Deterministic host double: embed.batch answers with a job descriptor
+     *  unless a scripted submit failure is set, and embed.result serves
+     *  scripted pages per job. */
     class DetailedHost implements SynapseClientLike {
         readonly calls: RecordedCall[] = [];
         private jobCounter = 0;
@@ -689,6 +727,7 @@ describe("embedItemsDetailed", () => {
             string,
             Array<{ id: string; content_sha256: string }>
         >();
+        batchError?: (batchCallIndex: number) => Error | null;
         resultPages?: (
             jobId: string,
             items: Array<{ id: string; content_sha256: string }>,
@@ -712,6 +751,8 @@ describe("embedItemsDetailed", () => {
             const record = { method, params: (params ?? {}) as Record<string, unknown> };
             this.calls.push(record);
             if (method === "embed.batch") {
+                const scripted = this.batchError?.(this.batchCalls().length - 1);
+                if (scripted) throw scripted;
                 this.jobCounter += 1;
                 const jobId = `job-${this.jobCounter}`;
                 this.jobItems.set(
@@ -1242,13 +1283,93 @@ describe("embedItemsDetailed", () => {
 
             expect(result.receipts).toEqual([]);
             expect(result.failures).toHaveLength(1);
-            expect(result.failures[0].code).toBe("module_restarted");
-            expect(result.failures[0].disposition).toBe("retryable");
+            expect(result.failures[0].code).toBe("page_terminal");
+            expect(result.failures[0].disposition).toBe("permanent");
             expect(host.batchCalls()).toHaveLength(2);
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("failed");
-            expect(row.failure_disposition).toBe("retryable");
+            // A retryable row inside a live deadline is handed back to
+            // `pending` with its restart_count intact, so only a permanent
+            // disposition stops the page from resubmitting on every pass.
+            expect(row.failure_disposition).toBe("permanent");
             expect(row.restart_count).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("keeps a module_restarted retryable while the page still has restart budget", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            // The submit itself restarts, so the durable restart CAS never
+            // runs and the page's single restart stays unspent.
+            host.batchError = () => moduleRestartedError();
+            const provider = detailedProvider(host);
+            const result = await provider.embedItemsDetailed(
+                detailedItems([{ id: "memory:1", group: "g1" }]),
+                detailedContext(db),
+            );
+
+            expect(result.receipts).toEqual([]);
+            expect(result.failures).toHaveLength(1);
+            expect(result.failures[0].code).toBe("module_restarted");
+            expect(result.failures[0].disposition).toBe("retryable");
+            expect(host.batchCalls()).toHaveLength(1);
+            const row = ledgerRows(db)[0];
+            expect(row.state).toBe("failed");
+            expect(row.failure_disposition).toBe("retryable");
+            expect(row.restart_count).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("scopes an exhausted restart budget to its page and leaves sibling pages runnable", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            // Only the first group's job keeps restarting, so that page burns
+            // its single durable restart and goes terminal while the second
+            // group's page reaches the daemon with its own budget intact.
+            host.resultPages = (_jobId, items) => {
+                if (items.some((item) => item.id === "memory:1")) return moduleRestartedError();
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+            const provider = detailedProvider(host);
+            const result = await provider.embedItemsDetailed(
+                detailedItems([
+                    { id: "memory:1", group: "g1" },
+                    { id: "memory:2", group: "g2" },
+                ]),
+                detailedContext(db),
+            );
+
+            expect(result.failures).toHaveLength(1);
+            expect(result.failures[0].applicationGroup).toBe("g1");
+            expect(result.failures[0].code).toBe("page_terminal");
+            expect(result.failures[0].disposition).toBe("permanent");
+            // The lane is still live: a disabled lane reports `artifact_invalid`
+            // for every later page instead of embedding it.
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].applicationGroup).toBe("g2");
+            expect(result.receipts[0].vectors.size).toBe(1);
+            const rows = ledgerRows(db);
+            expect(rows.map((row) => row.application_group)).toEqual(["g1", "g2"]);
+            expect(rows[0].state).toBe("failed");
+            expect(rows[0].failure_disposition).toBe("permanent");
+            expect(rows[0].restart_count).toBe(1);
+            expect(rows[1].state).toBe("ready");
         } finally {
             closeQuietly(db);
         }

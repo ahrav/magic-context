@@ -178,7 +178,29 @@ impl<P: PrimaryComponent, S: SecondaryComponent> McHostHandler for StaticComposi
 
     async fn health(&self) -> HealthReport {
         let primary = self.primary.health().await;
-        let secondary = self.secondary.health().await;
+        // The runtime trips its fatal cell when a health callback unwinds, so
+        // an escaping panic from the optional secondary would tear down the
+        // whole host over a component the host can run without. Each poll is
+        // caught and the payload dropped rather than re-raised: the fault
+        // becomes a failing report for this component, and the mandatory
+        // primary's report keeps deciding the aggregate.
+        let secondary = {
+            let mut health = std::pin::pin!(self.secondary.health());
+            std::future::poll_fn(move |cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    health.as_mut().poll(cx)
+                })) {
+                    Ok(poll) => poll.map(Some),
+                    Err(_payload) => std::task::Poll::Ready(None),
+                }
+            })
+            .await
+        }
+        .unwrap_or_else(|| HealthReport {
+            status: HealthStatus::Failing,
+            detail: Some(format!("{} health check panicked", self.secondary_id)),
+            metrics: None,
+        });
         // Ok < Degraded < Failing, with the mandatory primary reported first
         // on ties so its detail is not masked by the optional component.
         if severity(primary.status) >= severity(secondary.status) {

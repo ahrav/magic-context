@@ -62,7 +62,7 @@ import {
 import {
     applySynapseReceiptGroup,
     pruneSynapseBatchLedgerForProject,
-    reopenCompleteSynapseLedgerPageWithProof,
+    reopenCompleteSynapseLedgerGroupWithProof,
 } from "./storage-embedding-measurements";
 
 const OFF_PROVIDER_IDENTITY = "embedding-provider:off";
@@ -1538,9 +1538,10 @@ function getDetailedLane(
 interface DetailedDestinationProbe {
     /** Classify one manifest item's exact destination row. */
     state: (item: { id: string; contentSha256: string }) => "absent" | "stale" | "current";
-    /** Invalidate stale destination rows; called only on "stale" items.
-     *  Omitted when the lane can never prove staleness. */
-    invalidate?: (item: { id: string; contentSha256: string }) => void;
+    /** Remove one manifest item's destination row. A group reopen invalidates
+     *  every item of every page it reopens, so this runs for lanes that cannot
+     *  prove staleness too. */
+    invalidate: (item: { id: string; contentSha256: string }) => void;
 }
 
 interface DetailedApplySpec {
@@ -1565,8 +1566,9 @@ interface DetailedApplySpec {
  * fully-covered application group atomically: destination writes and every
  * contributing receipt's ready->complete CAS share one transaction; a group
  * with any failed page, missing vector, drifted source, or stale receipt
- * version applies nothing. A 'complete' ledger row whose exact destination is
- * proven absent or stale is reopened with proof and retried once.
+ * version applies nothing. When a group's pages report idempotency_conflict,
+ * the group's complete pages are reopened together against one destination
+ * proof and retried once.
  * Returns the applied item ids per application group.
  */
 async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<string, Set<string>>> {
@@ -1585,16 +1587,25 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
         (failure) => failure.code === "idempotency_conflict" && failure.rowId !== null,
     );
     if (conflicted.length > 0) {
-        const retryGroups = new Set<string>();
+        // The conflicting rows of one group are its complete pages for this
+        // exact item set, and the group applies only when every one of them
+        // yields a receipt — so they are proven and reopened as one set.
+        const conflictedRowIdsByGroup = new Map<string, number[]>();
         for (const failure of conflicted) {
+            const rowIds = conflictedRowIdsByGroup.get(failure.applicationGroup);
+            if (rowIds) rowIds.push(failure.rowId as number);
+            else conflictedRowIdsByGroup.set(failure.applicationGroup, [failure.rowId as number]);
+        }
+        const retryGroups = new Set<string>();
+        for (const [group, rowIds] of conflictedRowIdsByGroup) {
             const probe = spec.makeDestinationProbe();
-            const reopened = reopenCompleteSynapseLedgerPageWithProof(db, {
-                rowId: failure.rowId as number,
+            const reopened = reopenCompleteSynapseLedgerGroupWithProof(db, {
+                rowIds,
                 deadlineAt: Date.now() + SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
                 destinationState: probe.state,
                 invalidateDestination: probe.invalidate,
             });
-            if (reopened) retryGroups.add(failure.applicationGroup);
+            if (reopened > 0) retryGroups.add(group);
         }
         if (retryGroups.size > 0) {
             const retryItems = items.filter((item) => retryGroups.has(item.applicationGroup));
@@ -1737,13 +1748,18 @@ async function embedMemoryRowsDetailed(
             }
         },
         // Memory staleness is unprovable from the destination row (no per-row
-        // source hash), so the probe never reports "stale" and carries no
-        // invalidator; content edits delete the row, which reads as "absent".
+        // source hash), so the probe never reports "stale"; content edits
+        // delete the row, which reads as "absent".
         makeDestinationProbe: () => ({
             state: (item) =>
                 hasMemoryEmbedding(db, memoryIdFromItemId(item.id), lane.modelId)
                     ? "current"
                     : "absent",
+            invalidate: (item) => {
+                db.prepare(
+                    "DELETE FROM memory_embeddings WHERE memory_id = ? AND model_id = ?",
+                ).run(memoryIdFromItemId(item.id), lane.modelId);
+            },
         }),
     });
     // writeGroup runs inside the apply transaction, so `inferred` also holds
@@ -1784,11 +1800,16 @@ async function embedCommitRowsDetailed(
     lane: DetailedLane,
     rows: readonly { sha: string; message: string }[],
 ): Promise<Set<string>> {
-    const specs = rows.map((row) => ({
-        id: `commit:${row.sha}`,
-        text: row.message,
-        contentSha256: contentSha256(row.message),
-    }));
+    // An empty message is rejected by the host's item schema, and one rejected
+    // item fails every page of its application group. Dropping it before the
+    // group is formed keeps a messageless commit from discarding its batch.
+    const specs = rows
+        .filter((row) => row.message.length > 0)
+        .map((row) => ({
+            id: `commit:${row.sha}`,
+            text: row.message,
+            contentSha256: contentSha256(row.message),
+        }));
     const group = `commit:${sha256Prefix(
         stableStringify(specs.map(({ id, contentSha256: hash }) => [id, hash])),
     )}`;
@@ -1829,10 +1850,16 @@ async function embedCommitRowsDetailed(
             }
         },
         // A commit's source text is fixed by its SHA, so an existing row can
-        // never be source-stale; the probe carries no invalidator.
+        // never be source-stale; the probe reports only current or absent.
         makeDestinationProbe: () => ({
             state: (item) =>
                 hasCommitEmbedding(db, shaFromItemId(item.id), lane.modelId) ? "current" : "absent",
+            invalidate: (item) => {
+                db.prepare("DELETE FROM git_commit_embeddings WHERE sha = ? AND model_id = ?").run(
+                    shaFromItemId(item.id),
+                    lane.modelId,
+                );
+            },
         }),
     });
     const shas = new Set<string>();
@@ -1957,7 +1984,7 @@ async function applyCompartmentWindowsDetailed(
             // invalidation deletes the rows the next proof must re-observe.
             let existing: ReadonlyMap<number, string> | null = null;
             // Invalidation is compartment-wide, so one call per proof
-            // transaction covers every stale window in its manifest.
+            // transaction covers every window in its manifest.
             let invalidated = false;
             return {
                 state: (item: { id: string; contentSha256: string }) => {
@@ -2116,6 +2143,10 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
         start_message: number;
         end_message: number;
     }>;
+    // One window ceiling for the whole item: the initial windows and the
+    // in-transaction recomputation must window identically, or every hash
+    // comparison against the recomputed set fails.
+    const maxInputTokens = laneMaxInputTokens(registration);
     const prepared = candidates.flatMap((candidate) => {
         const text =
             buildCanonicalChunkTextFromFts(
@@ -2129,7 +2160,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             text,
             candidate.start_message,
             candidate.end_message,
-            SYNAPSE_MAX_INPUT_TOKENS,
+            maxInputTokens,
         );
         return windows.length > 0 ? [{ candidate, windows }] : [];
     });
@@ -2152,7 +2183,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
                         text,
                         preparedItem.candidate.start_message,
                         preparedItem.candidate.end_message,
-                        SYNAPSE_MAX_INPUT_TOKENS,
+                        maxInputTokens,
                     );
                 },
             });
@@ -2289,8 +2320,12 @@ export function getProjectChunkEmbeddingModelId(projectIdentity: string): string
     return registration && !registration.observationMode ? registration.chunkModelId : "off";
 }
 
-export function getProjectEmbeddingMaxInputTokens(projectIdentity: string): number {
-    const registration = projectRegistrations.get(projectIdentity);
+/** Chunk window ceiling for one lane: the provider's advertised window when it
+ *  reports one (the host can advertise a different window than the config's
+ *  default), else the lane's configured cap. */
+function laneMaxInputTokens(
+    registration: { config: EmbeddingConfig; provider: EmbeddingProvider | null } | undefined,
+): number {
     const configMax =
         registration?.config && "max_input_tokens" in registration.config
             ? registration.config.max_input_tokens
@@ -2298,6 +2333,10 @@ export function getProjectEmbeddingMaxInputTokens(projectIdentity: string): numb
     return normalizeCompartmentChunkMaxInputTokens(
         registration?.provider?.maxInputTokens ?? configMax,
     );
+}
+
+export function getProjectEmbeddingMaxInputTokens(projectIdentity: string): number {
+    return laneMaxInputTokens(projectRegistrations.get(projectIdentity));
 }
 
 function getOrCreateProjectProvider(

@@ -119,19 +119,15 @@ digest whenever any listed field changes.
 
 The host loads ONNX Runtime dynamically and commits it process-globally
 exactly once. Startup configuration supplies the library path plus the
-SHA-256 of its source bytes. On Linux, the host copies those bytes into an
-exclusively created staging file that requests mode `0600` inside a private
-`0700` directory whose name uses OS-generated random bytes. The process umask
-can only remove permissions from the requested file mode. After hash-verifying
-the staged copy and changing it to `0400`, the host unlinks its directory entry,
-removes the private directory, and directs ORT to the exact open file object through
-`/proc/self/fd/<fd>`. The `ort` crate uses first-wins dynamic loading and does
-not expose the winning path, so the executable must leave ORT initialization
-to mc-host; this workspace contains no other initialization call. Subject to
-that process-composition contract, path replacement cannot change the bytes
-loaded by mc-host. Unsupported non-Linux hosts fail closed. A missing file,
-wrong hash, placeholder hash, or preinitialized ORT environment disables the
-lane.
+SHA-256 of its source bytes. On Linux, the host hash-verifies those bytes,
+copies them into an executable anonymous `memfd`, and seals writes and size
+changes before directing ORT to that exact file object through
+`/proc/self/fd/<fd>`. No pathname replacement can change the sealed bytes. The
+`ort` crate uses first-wins dynamic loading and does not expose the winning
+path, so the executable must leave ORT initialization to mc-host; this
+workspace contains no other initialization call. Unsupported non-Linux hosts
+fail closed. A missing file, wrong hash, placeholder hash, memfd failure, or
+preinitialized ORT environment disables the lane.
 The resolved crate graph is pinned to `fastembed 6.0.0` and
 `ort 2.0.0-rc.13` with defaults disabled: the only ORT-related features are
 `std`, `ndarray`, `api-17`..`api-24`, `load-dynamic`, `preload-dylibs`, and

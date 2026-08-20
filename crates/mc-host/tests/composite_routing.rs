@@ -610,9 +610,12 @@ async fn expect_init_failure(manifests: Vec<ManifestSnapshot>) {
         data_dir: Some(data_root.path().to_path_buf()),
         ..Default::default()
     };
-    let shutdown = CancellationToken::new();
-    shutdown.cancel();
-    let result = mc_host::run(BadManifestHandler { manifests }, config, shutdown).await;
+    let result = mc_host::run(
+        BadManifestHandler { manifests },
+        config,
+        CancellationToken::new(),
+    )
+    .await;
     assert!(
         matches!(result, Err(HostError::InitFailed(_))),
         "invalid manifest sets must fail before publication"
@@ -704,5 +707,85 @@ async fn a_panicking_secondary_shutdown_still_drains_the_primary_and_repanics() 
     assert!(
         primary.events().contains(&Ev::Shutdown),
         "the primary's shutdown must run despite the secondary's panic"
+    );
+}
+
+/// A secondary whose health probe always panics, for proving the composite
+/// reports the fault instead of unwinding into the host's fatal path.
+struct PanickingHealthSecondary {
+    health_entered: Arc<AtomicBool>,
+}
+
+impl CompositeComponent for PanickingHealthSecondary {
+    fn manifest(&self) -> ManifestSnapshot {
+        ManifestSnapshot {
+            module_id: "synapse".to_owned(),
+            module_version: "0.0.1".to_owned(),
+            provides: vec![serde_json::json!({"role": "management_surface"})],
+            control_ops: Vec::new(),
+        }
+    }
+
+    async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
+        BindOutcome::Accept
+    }
+
+    async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
+        RequestOutcome::Error {
+            code: "internal_error".to_owned(),
+            message: "unreachable".to_owned(),
+        }
+    }
+
+    async fn route_gone(&self, _route: RouteHandle) {}
+
+    async fn health(&self) -> HealthReport {
+        self.health_entered.store(true, Ordering::SeqCst);
+        panic!("secondary health panic");
+    }
+
+    async fn shutdown(&self) {}
+}
+
+impl SecondaryComponent for PanickingHealthSecondary {
+    async fn initialize(&self) -> Result<(), InitError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_secondary_health_reports_failing_without_unwinding() {
+    let primary = FakeComponent::new("magic-context", "tool_provider");
+    let health_entered = Arc::new(AtomicBool::new(false));
+    let composite = StaticComposite::new(
+        primary.clone(),
+        PanickingHealthSecondary {
+            health_entered: Arc::clone(&health_entered),
+        },
+    )
+    .expect("distinct ids");
+
+    let report = composite.health().await;
+    assert!(health_entered.load(Ordering::SeqCst));
+    assert_eq!(report.status, HealthStatus::Failing);
+    assert_eq!(
+        report.detail.as_deref(),
+        Some("synapse health check panicked")
+    );
+
+    primary.set_health(HealthStatus::Degraded, "primary degraded");
+    let report = composite.health().await;
+    assert_eq!(
+        report.detail.as_deref(),
+        Some("synapse health check panicked"),
+        "the caught fault outranks a merely degraded primary"
+    );
+
+    primary.set_health(HealthStatus::Failing, "primary failing");
+    let report = composite.health().await;
+    assert_eq!(
+        report.detail.as_deref(),
+        Some("primary failing"),
+        "the mandatory component still wins severity ties"
     );
 }

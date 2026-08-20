@@ -2,6 +2,8 @@
 //! validation, the cross-language canonical request key, and response
 //! encoding.
 
+use std::borrow::Cow;
+
 use sha2::{Digest, Sha256};
 
 use super::jobs::BatchItem;
@@ -9,7 +11,6 @@ use super::LaneInfo;
 use super::SynapseLimits;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_BODY_DEPTH: usize = 8;
 const MAX_ID_BYTES: usize = 256;
 const MAX_JOB_ID_BYTES: usize = 128;
 const MAX_CURSOR_BYTES: usize = 128;
@@ -56,6 +57,156 @@ pub enum Request {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Request schema. Every string field borrows out of the caller's body buffer,
+// and every object is a closed struct: a `serde_json::Value` tree spends 32
+// bytes per node on input elements as small as two bytes, so materializing one
+// would put transient parse scratch an order of magnitude above the resident
+// budget the already-charged body was admitted against. Typed deserialization
+// keeps scratch proportional to the body, and `deny_unknown_fields` refuses
+// junk at the key instead of allocating a node for it.
+// ---------------------------------------------------------------------------
+
+/// The envelope read to learn `method`. `params` is skipped rather than
+/// decoded, because its schema is not known until `method` is: JSON object
+/// order is not guaranteed, so `params` may precede it. `IgnoredAny` walks the
+/// subtree without allocating or recursing.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MethodEnvelope<'a> {
+    #[serde(borrow)]
+    method: Cow<'a, str>,
+    #[serde(default, rename = "params")]
+    _params: serde::de::IgnoredAny,
+}
+
+/// Forces the object form. A derived `Deserialize` also accepts a JSON
+/// sequence, filling fields positionally, which would admit an array in place
+/// of the request body, its params, or a batch item.
+struct MapOnly<T>(T);
+
+impl<T: Default> Default for MapOnly<T> {
+    fn default() -> Self {
+        Self(T::default())
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for MapOnly<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+            type Value = T;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+
+        deserializer
+            .deserialize_map(ObjectVisitor(std::marker::PhantomData))
+            .map(Self)
+    }
+}
+
+/// Envelope for an operation whose parameters may be omitted entirely.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OptionalParams<P> {
+    #[serde(rename = "method")]
+    _method: serde::de::IgnoredAny,
+    #[serde(default, rename = "params")]
+    _params: MapOnly<P>,
+}
+
+/// Envelope for an operation whose parameters carry the mandatory lane
+/// constraints, so an absent `params` is a schema violation rather than a
+/// defaulted — and therefore substituted — set of constraints.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequiredParams<P> {
+    #[serde(rename = "method")]
+    _method: serde::de::IgnoredAny,
+    params: MapOnly<P>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct NoParams {}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryParams<'a> {
+    #[serde(borrow)]
+    model: Cow<'a, str>,
+    #[serde(borrow)]
+    required_fingerprint: Cow<'a, str>,
+    required_epoch: u64,
+    allow_equivalent: bool,
+    accept_declared: bool,
+    #[serde(borrow)]
+    text: Cow<'a, str>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchParams<'a> {
+    #[serde(borrow)]
+    model: Cow<'a, str>,
+    #[serde(borrow)]
+    required_fingerprint: Cow<'a, str>,
+    required_epoch: u64,
+    allow_equivalent: bool,
+    accept_declared: bool,
+    #[serde(borrow)]
+    request_key: Cow<'a, str>,
+    #[serde(borrow)]
+    items: Vec<MapOnly<ItemParams<'a>>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ItemParams<'a> {
+    #[serde(borrow)]
+    id: Cow<'a, str>,
+    #[serde(borrow)]
+    text: Cow<'a, str>,
+    #[serde(borrow)]
+    content_sha256: Cow<'a, str>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultParams<'a> {
+    #[serde(borrow)]
+    model: Cow<'a, str>,
+    #[serde(borrow)]
+    required_fingerprint: Cow<'a, str>,
+    required_epoch: u64,
+    allow_equivalent: bool,
+    accept_declared: bool,
+    #[serde(borrow)]
+    job_id: Cow<'a, str>,
+    #[serde(borrow)]
+    request_key: Cow<'a, str>,
+    #[serde(default)]
+    cursor: Option<Cow<'a, str>>,
+}
+
+/// Decodes one typed shape out of the body, classifying every deserialization
+/// failure — malformed JSON, wrong type, unknown field, duplicate key, missing
+/// field — as a schema violation, which is the single classification all of
+/// those carry.
+fn decode<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, RequestError> {
+    serde_json::from_slice(body).map_err(|err| schema(err.to_string()))
+}
+
 pub fn parse_request(
     body: &[u8],
     binary: bool,
@@ -68,39 +219,27 @@ pub fn parse_request(
     if body.len() > MAX_BODY_BYTES {
         return Err(schema("request body exceeds the profile cap"));
     }
-    let root = crate::control::strict_json::parse(body)
-        .map_err(|_| schema("request body is not strict JSON"))?;
-    let serde_json::Value::Object(fields) = root else {
-        return Err(schema("request body must be a JSON object"));
-    };
-    if fields
-        .values()
-        .map(value_depth)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1)
-        > MAX_BODY_DEPTH
-    {
-        return Err(schema("request body too deeply nested"));
-    }
-    let Some(serde_json::Value::String(method)) = fields.get("method") else {
-        return Err(schema("method must be a string"));
-    };
-    let params = match fields.get("params") {
-        None => &serde_json::Map::new(),
-        Some(serde_json::Value::Object(params)) => params,
-        Some(_) => return Err(schema("params must be an object")),
-    };
-    match method.as_str() {
+    let envelope: MapOnly<MethodEnvelope> = decode(body)?;
+    // Nesting needs no explicit depth cap: the schema bottoms out in scalars,
+    // so a nested value in a scalar slot fails on its opening token, and an
+    // unknown key is refused before its value is read.
+    match envelope.0.method.as_ref() {
         "models.list" => {
-            if !params.is_empty() {
-                return Err(schema("models.list takes no parameters"));
-            }
+            let _: MapOnly<OptionalParams<NoParams>> = decode(body)?;
             Ok(Request::ModelsList)
         }
-        "embed.query" => parse_query(params, lane, limits),
-        "embed.batch" => parse_batch(params, lane, limits),
-        "embed.result" => parse_result(params, lane),
+        "embed.query" => {
+            let envelope: MapOnly<RequiredParams<QueryParams<'_>>> = decode(body)?;
+            parse_query(envelope.0.params.0, lane, limits)
+        }
+        "embed.batch" => {
+            let envelope: MapOnly<RequiredParams<BatchParams<'_>>> = decode(body)?;
+            parse_batch(envelope.0.params.0, lane, limits)
+        }
+        "embed.result" => {
+            let envelope: MapOnly<RequiredParams<ResultParams<'_>>> = decode(body)?;
+            parse_result(envelope.0.params.0, lane)
+        }
         _ => Err(schema("unsupported synapse method")),
     }
 }
@@ -110,149 +249,105 @@ pub fn parse_request(
 /// value is a rejected substitution — the service never adapts to another
 /// embedding space.
 fn check_constraints(
-    params: &serde_json::Map<String, serde_json::Value>,
+    model: &str,
+    fingerprint: &str,
+    epoch: u64,
+    allow_equivalent: bool,
+    accept_declared: bool,
     lane: &LaneInfo,
 ) -> Result<(), RequestError> {
-    let Some(serde_json::Value::String(model)) = params.get("model") else {
-        return Err(schema("model must be a string"));
-    };
-    if *model != lane.model {
+    if model != lane.model {
         return Err(substitution("requested model is not served by this lane"));
     }
-    let Some(serde_json::Value::String(fingerprint)) = params.get("required_fingerprint") else {
-        return Err(schema("required_fingerprint must be a string"));
-    };
-    if *fingerprint != lane.fingerprint {
+    if fingerprint != lane.fingerprint {
         return Err(substitution("required fingerprint does not match"));
     }
-    let Some(epoch) = params.get("required_epoch").and_then(|v| v.as_u64()) else {
-        return Err(schema("required_epoch must be an unsigned integer"));
-    };
     if epoch != lane.table_epoch {
         return Err(substitution("required table epoch does not match"));
     }
-    for flag in ["allow_equivalent", "accept_declared"] {
-        match params.get(flag) {
-            Some(serde_json::Value::Bool(false)) => {}
-            Some(serde_json::Value::Bool(true)) => {
-                return Err(substitution(format!("{flag} must be false")));
-            }
-            _ => return Err(schema(format!("{flag} must be a boolean"))),
+    for (flag, value) in [
+        ("allow_equivalent", allow_equivalent),
+        ("accept_declared", accept_declared),
+    ] {
+        if value {
+            return Err(substitution(format!("{flag} must be false")));
         }
     }
     Ok(())
 }
-
-fn known_fields(
-    params: &serde_json::Map<String, serde_json::Value>,
-    allowed: &[&str],
-) -> Result<(), RequestError> {
-    for key in params.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(schema(format!("unexpected field: {key}")));
-        }
-    }
-    Ok(())
-}
-
-const CONSTRAINT_FIELDS: [&str; 5] = [
-    "model",
-    "required_fingerprint",
-    "required_epoch",
-    "allow_equivalent",
-    "accept_declared",
-];
 
 fn parse_query(
-    params: &serde_json::Map<String, serde_json::Value>,
+    params: QueryParams<'_>,
     lane: &LaneInfo,
     limits: &SynapseLimits,
 ) -> Result<Request, RequestError> {
-    let mut allowed = CONSTRAINT_FIELDS.to_vec();
-    allowed.extend(["text", "deadline_ms"]);
-    known_fields(params, &allowed)?;
-    check_constraints(params, lane)?;
-    let Some(serde_json::Value::String(text)) = params.get("text") else {
-        return Err(schema("text must be a string"));
-    };
-    if text.is_empty() || text.len() > limits.max_text_bytes {
+    check_constraints(
+        &params.model,
+        &params.required_fingerprint,
+        params.required_epoch,
+        params.allow_equivalent,
+        params.accept_declared,
+        lane,
+    )?;
+    if params.text.is_empty() || params.text.len() > limits.max_text_bytes {
         return Err(schema("text length out of bounds"));
     }
-    let deadline_ms = match params.get("deadline_ms") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(value) => {
-            let Some(ms) = value.as_u64() else {
-                return Err(schema("deadline_ms must be an unsigned integer"));
-            };
-            if ms == 0 || ms > MAX_DEADLINE_MS {
-                return Err(schema("deadline_ms out of bounds"));
-            }
-            Some(ms)
+    if let Some(ms) = params.deadline_ms {
+        if ms == 0 || ms > MAX_DEADLINE_MS {
+            return Err(schema("deadline_ms out of bounds"));
         }
-    };
+    }
     Ok(Request::EmbedQuery {
-        text: text.clone(),
-        deadline_ms,
+        text: params.text.into_owned(),
+        deadline_ms: params.deadline_ms,
     })
 }
 
 fn parse_batch(
-    params: &serde_json::Map<String, serde_json::Value>,
+    params: BatchParams<'_>,
     lane: &LaneInfo,
     limits: &SynapseLimits,
 ) -> Result<Request, RequestError> {
-    let mut allowed = CONSTRAINT_FIELDS.to_vec();
-    allowed.extend(["request_key", "items"]);
-    known_fields(params, &allowed)?;
-    check_constraints(params, lane)?;
-    let Some(serde_json::Value::String(request_key)) = params.get("request_key") else {
-        return Err(schema("request_key must be a string"));
-    };
-    if !is_lower_hex_64(request_key) {
+    check_constraints(
+        &params.model,
+        &params.required_fingerprint,
+        params.required_epoch,
+        params.allow_equivalent,
+        params.accept_declared,
+        lane,
+    )?;
+    if !is_lower_hex_64(&params.request_key) {
         return Err(schema("request_key must be 64 lowercase hex characters"));
     }
-    let Some(serde_json::Value::Array(raw_items)) = params.get("items") else {
-        return Err(schema("items must be an array"));
-    };
-    if raw_items.is_empty() || raw_items.len() > limits.max_batch_items {
+    if params.items.is_empty() || params.items.len() > limits.max_batch_items {
         return Err(schema("item count out of bounds"));
     }
-    let mut items = Vec::with_capacity(raw_items.len());
+    let mut items = Vec::with_capacity(params.items.len());
     let mut total_text_bytes = 0usize;
-    for raw in raw_items {
-        let serde_json::Value::Object(fields) = raw else {
-            return Err(schema("each item must be an object"));
-        };
-        known_fields(fields, &["id", "text", "content_sha256"])?;
-        let Some(serde_json::Value::String(id)) = fields.get("id") else {
-            return Err(schema("item id must be a string"));
-        };
-        if id.is_empty() || id.len() > MAX_ID_BYTES {
+    for raw in &params.items {
+        if raw.0.id.is_empty() || raw.0.id.len() > MAX_ID_BYTES {
             return Err(schema("item id length out of bounds"));
         }
-        let Some(serde_json::Value::String(text)) = fields.get("text") else {
-            return Err(schema("item text must be a string"));
-        };
-        if text.is_empty() || text.len() > limits.max_text_bytes {
+        if raw.0.text.is_empty() || raw.0.text.len() > limits.max_text_bytes {
             return Err(schema("item text length out of bounds"));
         }
-        total_text_bytes += text.len();
-        let Some(serde_json::Value::String(supplied_hash)) = fields.get("content_sha256") else {
-            return Err(schema("item content_sha256 must be a string"));
-        };
+        total_text_bytes += raw.0.text.len();
         // Recomputed, never trusted: a wrong supplied hash would poison the
         // durable ledger's content identity.
-        let actual = sha256_hex(text.as_bytes());
-        if *supplied_hash != actual {
+        let actual = sha256_hex(raw.0.text.as_bytes());
+        if raw.0.content_sha256 != actual {
             return Err(schema("item content_sha256 does not match its text"));
         }
-        if items.iter().any(|existing: &BatchItem| existing.id == *id) {
+        if items
+            .iter()
+            .any(|existing: &BatchItem| existing.id == raw.0.id)
+        {
             return Err(schema("duplicate item id"));
         }
         items.push(BatchItem {
-            id: id.clone(),
+            id: raw.0.id.to_string(),
             content_sha256: actual,
-            text: text.clone(),
+            text: raw.0.text.to_string(),
         });
     }
     if total_text_bytes > limits.max_batch_text_bytes {
@@ -263,45 +358,39 @@ fn parse_batch(
     // rather than schema_violation.
     let canonical_key = canonical_request_key(lane, &items);
     Ok(Request::EmbedBatch {
-        request_key: request_key.clone(),
+        request_key: params.request_key.into_owned(),
         canonical_key,
         items,
     })
 }
 
-fn parse_result(
-    params: &serde_json::Map<String, serde_json::Value>,
-    lane: &LaneInfo,
-) -> Result<Request, RequestError> {
-    let mut allowed = CONSTRAINT_FIELDS.to_vec();
-    allowed.extend(["job_id", "request_key", "cursor"]);
-    known_fields(params, &allowed)?;
-    check_constraints(params, lane)?;
-    let Some(serde_json::Value::String(job_id)) = params.get("job_id") else {
-        return Err(schema("job_id must be a string"));
-    };
-    if job_id.is_empty() || job_id.len() > MAX_JOB_ID_BYTES {
+fn parse_result(params: ResultParams<'_>, lane: &LaneInfo) -> Result<Request, RequestError> {
+    check_constraints(
+        &params.model,
+        &params.required_fingerprint,
+        params.required_epoch,
+        params.allow_equivalent,
+        params.accept_declared,
+        lane,
+    )?;
+    if params.job_id.is_empty() || params.job_id.len() > MAX_JOB_ID_BYTES {
         return Err(schema("job_id length out of bounds"));
     }
-    let Some(serde_json::Value::String(request_key)) = params.get("request_key") else {
-        return Err(schema("request_key must be a string"));
-    };
-    if !is_lower_hex_64(request_key) {
+    if !is_lower_hex_64(&params.request_key) {
         return Err(schema("request_key must be 64 lowercase hex characters"));
     }
-    let cursor = match params.get("cursor") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(serde_json::Value::String(cursor)) => {
+    let cursor = match params.cursor {
+        None => None,
+        Some(cursor) => {
             if cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES {
                 return Err(schema("cursor length out of bounds"));
             }
-            Some(cursor.clone())
+            Some(cursor.into_owned())
         }
-        Some(_) => return Err(schema("cursor must be a string or null")),
     };
     Ok(Request::EmbedResult {
-        job_id: job_id.clone(),
-        request_key: request_key.clone(),
+        job_id: params.job_id.into_owned(),
+        request_key: params.request_key.into_owned(),
         cursor,
     })
 }
@@ -356,14 +445,6 @@ fn is_lower_hex_64(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-}
-
-fn value_depth(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Array(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
-        serde_json::Value::Object(map) => 1 + map.values().map(value_depth).max().unwrap_or(0),
-        _ => 1,
-    }
 }
 
 // ---------------------------------------------------------------------------

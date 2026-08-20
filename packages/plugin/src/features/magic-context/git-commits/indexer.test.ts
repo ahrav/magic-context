@@ -20,7 +20,7 @@ import {
 } from "../synapse-detailed-test-support";
 import type { GitCommit } from "./git-log-reader";
 import { _resetIndexerGuards, embedUnembeddedCommits } from "./indexer";
-import { countEmbeddedCommits } from "./storage-git-commit-embeddings";
+import { countEmbeddedCommits, loadUnembeddedCommits } from "./storage-git-commit-embeddings";
 import { upsertCommits } from "./storage-git-commits";
 
 class FakeLocalProvider implements EmbeddingProvider {
@@ -48,12 +48,12 @@ class FakeLocalProvider implements EmbeddingProvider {
     }
 }
 
-function makeGitCommit(shaSeed: string, committedAtMs: number): GitCommit {
+function makeGitCommit(shaSeed: string, committedAtMs: number, message?: string): GitCommit {
     const sha = shaSeed.padEnd(40, "0");
     return {
         sha,
         shortSha: sha.slice(0, 7),
-        message: `commit ${shaSeed}`,
+        message: message ?? `commit ${shaSeed}`,
         author: "dev@example.com",
         committedAtMs,
     };
@@ -198,6 +198,39 @@ describe("commit indexer embedding through versioned receipts", () => {
             },
         ).toEqual({ count: 0 });
         expect(ledgerRows(db).every((row) => row.state !== "complete")).toBe(true);
+    });
+
+    it("drains past an empty-message commit instead of failing its batch forever", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:indexer-empty-message";
+        const host = new DetailedSynapseTestHost();
+        // The empty-message commit is the newest, so an unfiltered selection
+        // puts it in every batch the drain takes.
+        const withMessage = makeGitCommit("fff", 6000);
+        const empty = makeGitCommit("999", 7000, "");
+        upsertCommits(db, projectIdentity, [withMessage, empty]);
+        registerSynapseProject(db, projectIdentity, host);
+
+        expect(
+            loadUnembeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY, 10).map(
+                (row) => row.sha,
+            ),
+        ).toEqual([withMessage.sha]);
+
+        const embedded = await embedUnembeddedCommits(db, projectIdentity);
+
+        expect(embedded).toBe(1);
+        expect(countEmbeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(1);
+        const batchedIds = host
+            .batchCalls()
+            .flatMap((call) => call.params.items as Array<{ id: string }>)
+            .map((item) => item.id);
+        expect(batchedIds).toEqual([`commit:${withMessage.sha}`]);
+        expect(ledgerRows(db).every((row) => row.state === "complete")).toBe(true);
+        // Nothing is left to re-select, so the next sweep does no work at all.
+        expect(loadUnembeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY, 10)).toEqual(
+            [],
+        );
     });
 
     it("keeps non-synapse providers on their existing path with zero ledger rows", async () => {

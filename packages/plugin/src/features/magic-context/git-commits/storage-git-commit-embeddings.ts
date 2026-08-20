@@ -71,7 +71,7 @@ function getLoadUnembeddedStatement(db: Database): PreparedStatement {
             `SELECT c.sha AS sha, c.message AS message
              FROM git_commits c
              LEFT JOIN git_commit_embeddings e ON c.sha = e.sha AND e.model_id = ?
-             WHERE c.project_path = ? AND e.sha IS NULL
+             WHERE c.project_path = ? AND e.sha IS NULL AND c.message != ''
              ORDER BY c.committed_at DESC
              LIMIT ?`,
         );
@@ -136,6 +136,17 @@ export function loadProjectCommitEmbeddings(
     return map;
 }
 
+/**
+ * Commits with no embedding row for `modelId`, newest first.
+ *
+ * A commit created with an empty message carries no embeddable text: the host
+ * rejects an empty item, and one rejected item fails every page of the batch's
+ * application group. Because such a row is never embeddable, selecting it makes
+ * the newest batch fail forever and the drain — which stops as soon as a batch
+ * embeds nothing — never reaches the commits behind it. Excluding it in the
+ * selection is what retires it: it is permanently not work, so it never enters
+ * a batch and never blocks one.
+ */
 export function loadUnembeddedCommits(
     db: Database,
     projectPath: string,

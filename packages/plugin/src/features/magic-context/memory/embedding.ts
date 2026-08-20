@@ -139,6 +139,7 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
             synapse_provenance?: unknown;
         };
         return new SynapseEmbeddingProvider({
@@ -150,6 +151,7 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
+            recommendedTokenBudget: synapse.synapse_recommended_token_budget,
             provenance: synapse.synapse_provenance,
         });
     }

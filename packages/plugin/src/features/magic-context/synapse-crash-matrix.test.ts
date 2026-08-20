@@ -14,7 +14,7 @@ import {
     applySynapseReceiptGroup,
     getSynapseLedgerPage,
     pruneSynapseBatchLedgerForProject,
-    reopenCompleteSynapseLedgerPageWithProof,
+    reopenCompleteSynapseLedgerGroupWithProof,
     SynapseLedgerConflictError,
 } from "./storage-embedding-measurements";
 import {
@@ -394,26 +394,26 @@ describe("synapse crash matrix (file-backed)", () => {
                 : ("absent" as const);
 
         expect(
-            reopenCompleteSynapseLedgerPageWithProof(db, {
-                rowId,
+            reopenCompleteSynapseLedgerGroupWithProof(db, {
+                rowIds: [rowId],
                 deadlineAt: Date.now() + 60_000,
                 destinationState,
                 invalidateDestination: () => {},
             }),
-        ).toBe(false);
+        ).toBe(0);
         expect(getSynapseLedgerPage(db, rowId)?.state).toBe("complete");
 
         db.prepare("DELETE FROM memory_embeddings WHERE model_id = ?").run(
             SYNAPSE_TEST_LANE_IDENTITY,
         );
         expect(
-            reopenCompleteSynapseLedgerPageWithProof(db, {
-                rowId,
+            reopenCompleteSynapseLedgerGroupWithProof(db, {
+                rowIds: [rowId],
                 deadlineAt: Date.now() + 60_000,
                 destinationState,
                 invalidateDestination: () => {},
             }),
-        ).toBe(true);
+        ).toBe(1);
         expect(getSynapseLedgerPage(db, rowId)?.state).toBe("pending");
 
         const rerun = await embedToReceipts(db, host, memoryItems(memories));

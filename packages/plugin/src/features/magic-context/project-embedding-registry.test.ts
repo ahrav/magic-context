@@ -46,7 +46,7 @@ import {
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
-import { createSynapseLedgerPage } from "./storage-embedding-measurements";
+import { createSynapseLedgerPage, getSynapseLedgerPage } from "./storage-embedding-measurements";
 import {
     crashingDatabase,
     DetailedSynapseTestHost,
@@ -1760,6 +1760,65 @@ describe("project embedding registry", () => {
         const embeddings = loadAllEmbeddings(db, projectIdentity, shadow.modelId);
         expect([...embeddings.keys()].sort((a, b) => a - b)).toEqual(ids.map(Number));
     });
+
+    it("windows shadow chunks against the shadow provider's advertised token window", async () => {
+        // The shadow provider advertises a far smaller window than the config
+        // default, so honoring it produces strictly more windows than the
+        // primary lane's default-window split.
+        const shadowWindowTokens = 96;
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "local"
+                ? new FakeEmbeddingProvider(config.model)
+                : new (class extends FakeEmbeddingProvider {
+                      readonly maxInputTokens = shadowWindowTokens;
+                  })("shadow"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-chunk-window";
+        const sessionId = "ses-shadow-chunk-window";
+        const compartmentId = seedOversizedCompartmentWithFts(db, sessionId);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-chunk-window",
+        );
+        await embedUnembeddedCompartmentChunksForProject(db, projectIdentity);
+        const primaryWindows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            sessionId,
+            projectIdentity,
+            currentChunkModelId(projectIdentity),
+        ).length;
+        expect(primaryWindows).toBeGreaterThan(0);
+
+        const shadow = registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            {
+                provider: "synapse",
+                model: "synapse-model",
+                synapse_fingerprint: "fp-chunk-window",
+            } as unknown as EmbeddingConfig,
+            "/tmp/shadow-chunk-window",
+        );
+        if (!shadow) throw new Error("failed to register shadow provider");
+        enqueueShadowEmbeddingItems(projectIdentity, "chunk", [String(compartmentId)]);
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        const shadowRows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            sessionId,
+            projectIdentity,
+            shadow.chunkModelId,
+        );
+        expect(shadowRows.length).toBeGreaterThan(primaryWindows);
+        expect(new Set(shadowRows.map((row) => row.compartmentId))).toEqual(
+            new Set([compartmentId]),
+        );
+    });
 });
 
 describe("detailed synapse writers apply complete receipt groups atomically", () => {
@@ -1947,6 +2006,60 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         const rows = ledgerRows(db);
         expect(rows.length).toBeGreaterThan(0);
         expect(rows.every((row) => row.state === "ready")).toBe(true);
+    });
+
+    it("retries a whole conflicted group when only one of its pages lost its destination", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-group-reopen";
+        const host = new DetailedSynapseTestHost();
+        // The test provider pages two items at a time, so four memories in one
+        // application group span two pages.
+        const memories = ["g1", "g2", "g3", "g4"].map((content) => {
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content,
+            });
+            return { id: memory.id, content: memory.content };
+        });
+        registerDetailed(db, projectIdentity, host);
+
+        const first = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+        expect(first?.size).toBe(4);
+        const pageRowIds = (
+            db.prepare("SELECT id FROM synapse_batch_ledger ORDER BY id").all() as Array<{
+                id: number;
+            }>
+        ).map((row) => row.id);
+        expect(pageRowIds.length).toBe(2);
+        expect(ledgerRows(db).every((row) => row.state === "complete")).toBe(true);
+
+        // Drop the destination rows of the FIRST page only: that page is
+        // provably unapplied while its sibling stays complete and current.
+        const lostPage = getSynapseLedgerPage(db, pageRowIds[0]);
+        if (!lostPage) throw new Error("expected the first page's ledger row");
+        const lostIds = lostPage.manifest.map((item) => Number(item.id.slice("memory:".length)));
+        expect(lostIds.length).toBe(2);
+        for (const memoryId of lostIds) {
+            db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ? AND model_id = ?").run(
+                memoryId,
+                SYNAPSE_TEST_LANE_IDENTITY,
+            );
+        }
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(2);
+
+        const second = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+
+        // Both pages reopened against the one proof, so the retry covers the
+        // whole group and the group applies.
+        expect([...(second?.keys() ?? [])].sort((a, b) => a - b)).toEqual(
+            memories.map((memory) => memory.id),
+        );
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(4);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBe(2);
+        expect(rows.every((row) => row.state === "complete")).toBe(true);
+        expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
     });
 
     it("commit drain routes through receipts and completes only with the vector write", async () => {

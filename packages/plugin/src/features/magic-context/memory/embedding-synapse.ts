@@ -1012,8 +1012,22 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
                         // The single durable restart is already spent or the
                         // deadline passed: this page cannot resubmit (R21).
+                        // `page_terminal` carries both properties this outcome
+                        // needs. It is permanent because a retryable
+                        // disposition never spends the budget:
+                        // `retrySynapseLedgerPage` returns any retryable row to
+                        // `pending` while its deadline is still live and leaves
+                        // `restart_count` untouched, so the next pass resubmits
+                        // the same page forever. It is a ledger-state code
+                        // because the spent budget belongs to this row alone:
+                        // the daemon restart it counts is evidence about one
+                        // page's history, not about the lane's model artifacts,
+                        // and a sibling page holding its own unspent budget can
+                        // still complete. It is also the code every later pass
+                        // reports for this row once the permanent disposition
+                        // lands, so one condition reads the same throughout.
                         throw new SynapseEmbeddingError(
-                            "module_restarted",
+                            "page_terminal",
                             "restart budget or page deadline exhausted",
                         );
                     }
@@ -1329,8 +1343,15 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 if (classified.code === "module_restarted") throw classified;
                 const outcomeUnknown = isSubcCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
-                if (!retryable || attempt >= 3) throw classified;
-                const delay = classified.retryAfterMs ?? Math.min(2_000, 100 * 2 ** attempt);
+                // A queue-full reply creates no host state. Retry it through
+                // the request deadline so the host's bounded query lane sheds
+                // global handler occupancy without silently dropping a
+                // concurrent search after the generic four-attempt cap.
+                const retryQueryAdmission =
+                    method === "embed.query" && classified.code === "queue_full";
+                if (!retryable || (!retryQueryAdmission && attempt >= 3)) throw classified;
+                const delay =
+                    classified.retryAfterMs ?? Math.min(2_000, 100 * 2 ** Math.min(attempt, 4));
                 if (Date.now() + delay >= deadlineAtMs) throw classified;
                 attempt += 1;
                 await wait(delay);
