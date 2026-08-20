@@ -21,6 +21,7 @@ import {
     __setProjectIdentityTestHooks,
     resolveProjectIdentity,
 } from "../../features/magic-context/memory/project-identity";
+import { runInMemoryClaimsWriteTransaction } from "../../features/magic-context/memory/storage-memory-claims";
 import { __resetMessageIndexAsyncForTests } from "../../features/magic-context/message-index-async";
 import {
     _resetProjectEmbeddingRegistryForTests,
@@ -646,29 +647,33 @@ describe("magic-context hook", () => {
         const hook = requireHook(createMagicContextHook(deps));
         const db = openDatabase();
         const projectPath = resolveProjectIdentity("/tmp");
-        db.prepare(
-            "INSERT INTO memories (project_path, category, content, normalized_hash, source_session_id, source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at, verification_status, verified_at, superseded_by_memory_id, merged_from, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ).run(
-            projectPath,
-            "CONFIG_VALUES",
-            "Dream me",
-            "dream-me-notification",
-            "ses-seed",
-            "historian",
-            1,
-            0,
-            Date.now(),
-            Date.now(),
-            Date.now(),
-            Date.now(),
-            null,
-            "active",
-            null,
-            "unverified",
-            null,
-            null,
-            null,
-            null,
+        runInMemoryClaimsWriteTransaction(db, () =>
+            db
+                .prepare(
+                    "INSERT INTO memories (project_path, category, content, normalized_hash, source_session_id, source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at, verification_status, verified_at, superseded_by_memory_id, merged_from, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .run(
+                    projectPath,
+                    "CONFIG_VALUES",
+                    "Dream me",
+                    "dream-me-notification",
+                    "ses-seed",
+                    "historian",
+                    1,
+                    0,
+                    Date.now(),
+                    Date.now(),
+                    Date.now(),
+                    Date.now(),
+                    null,
+                    "active",
+                    null,
+                    "unverified",
+                    null,
+                    null,
+                    null,
+                    null,
+                ),
         );
 
         await expectSentinel(
@@ -945,29 +950,33 @@ describe("magic-context hook", () => {
                 retryCount: 0,
             });
 
-            db.prepare(
-                "INSERT INTO memories (project_path, category, content, normalized_hash, source_session_id, source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at, verification_status, verified_at, superseded_by_memory_id, merged_from, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ).run(
-                projectPath,
-                "ARCHITECTURE_DECISIONS",
-                "Dream me",
-                "dream-me",
-                "ses-seed",
-                "historian",
-                1,
-                0,
-                now,
-                now,
-                now,
-                now,
-                null,
-                "active",
-                null,
-                "unverified",
-                null,
-                null,
-                null,
-                null,
+            runInMemoryClaimsWriteTransaction(db, () =>
+                db
+                    .prepare(
+                        "INSERT INTO memories (project_path, category, content, normalized_hash, source_session_id, source_type, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at, last_retrieved_at, status, expires_at, verification_status, verified_at, superseded_by_memory_id, merged_from, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .run(
+                        projectPath,
+                        "ARCHITECTURE_DECISIONS",
+                        "Dream me",
+                        "dream-me",
+                        "ses-seed",
+                        "historian",
+                        1,
+                        0,
+                        now,
+                        now,
+                        now,
+                        now,
+                        null,
+                        "active",
+                        null,
+                        "unverified",
+                        null,
+                        null,
+                        null,
+                        null,
+                    ),
             );
 
             await hook.event!({

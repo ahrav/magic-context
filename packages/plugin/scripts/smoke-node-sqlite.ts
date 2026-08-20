@@ -19,7 +19,20 @@ import {
     createSourceSpan,
     ensureProject,
 } from "../src/features/magic-context/memory/storage-claims.ts";
+import {
+    clearMemoryClaimFailpoints,
+    createMemoryWithClaimsInCurrentTransaction,
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+    setMemoryClaimFailpoint,
+    updateMemoryContentWithClaimsInCurrentTransaction,
+} from "../src/features/magic-context/memory/storage-memory-claims.ts";
+import { readMemoryProjectionRow } from "../src/features/magic-context/memory/storage-memory-projection.ts";
 import { createClaimsAndEvidenceSchema } from "../src/features/magic-context/storage-claims-schema.ts";
+import {
+    createMemoryClaimsCompatSchema,
+    installMemoryClaimsWriteGuards,
+} from "../src/features/magic-context/storage-memory-claims-schema.ts";
 import { Database } from "../src/shared/sqlite.ts";
 
 let failures = 0;
@@ -188,6 +201,163 @@ try {
         );
     }
     claimsDb.close();
+
+    const kernelDb = new Database(join(dir, "kernel.db"));
+    kernelDb.exec("PRAGMA foreign_keys=ON");
+    kernelDb.exec(`
+        CREATE TABLE memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path TEXT NOT NULL,
+            category TEXT NOT NULL,
+            content TEXT NOT NULL,
+            normalized_hash TEXT NOT NULL,
+            importance INTEGER,
+            scope TEXT NOT NULL DEFAULT 'project',
+            shareable INTEGER NOT NULL DEFAULT 0,
+            source_session_id TEXT,
+            source_type TEXT DEFAULT 'historian',
+            seen_count INTEGER DEFAULT 1,
+            retrieval_count INTEGER DEFAULT 0,
+            first_seen_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            last_retrieved_at INTEGER,
+            status TEXT DEFAULT 'active',
+            expires_at INTEGER,
+            verification_status TEXT DEFAULT 'unverified',
+            verified_at INTEGER,
+            classified_at INTEGER,
+            superseded_by_memory_id INTEGER,
+            merged_from TEXT,
+            metadata_json TEXT,
+            mural_cue TEXT,
+            mural_cue_hash TEXT,
+            mural_cue_at INTEGER,
+            mural_cue_rejection_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(project_path, category, normalized_hash)
+        );
+        CREATE TABLE memory_embeddings (
+            memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            embedding BLOB NOT NULL,
+            model_id TEXT NOT NULL,
+            PRIMARY KEY(memory_id, model_id)
+        );
+        CREATE TABLE memory_verifications (
+            memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            verified_at INTEGER NOT NULL,
+            mapped_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (memory_id, file_path)
+        );
+        CREATE TABLE memory_stats (
+            memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+            seen_count INTEGER NOT NULL,
+            retrieval_count INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            last_retrieved_at INTEGER,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TRIGGER memories_stats_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memory_stats (memory_id, seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at)
+            VALUES (NEW.id, COALESCE(NEW.seen_count, 1), COALESCE(NEW.retrieval_count, 0), NEW.last_seen_at, NEW.last_retrieved_at, NEW.updated_at);
+        END;
+        CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    `);
+    createClaimsAndEvidenceSchema(kernelDb);
+    createMemoryClaimsCompatSchema(kernelDb);
+    installMemoryClaimsWriteGuards(kernelDb);
+
+    let guardBlocked = false;
+    try {
+        kernelDb.exec(
+            "INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES ('git:kernel', 'CONSTRAINTS', 'bare', 'h0', 1, 1, 1, 1)",
+        );
+    } catch {
+        guardBlocked = true;
+    }
+    check("v83 guard rejects a bare semantic insert", guardBlocked);
+
+    const kernelCreated = runInMemoryClaimsWriteTransaction(kernelDb, () =>
+        createMemoryWithClaimsInCurrentTransaction(
+            kernelDb,
+            { producer: "node-smoke", operationKey: "create-1", requestDigest: "a".repeat(64) },
+            {
+                projectPath: "git:kernel",
+                category: "CONSTRAINTS",
+                content: "node kernel fact",
+                normalizedHash: "hash:node kernel fact",
+                nowMs: 1_000,
+            },
+        ),
+    );
+    check(
+        "v83 kernel create links a claim",
+        kernelCreated.result.claimId !== null && kernelCreated.result.revisionId !== null,
+        JSON.stringify(kernelCreated),
+    );
+
+    kernelDb.transaction(() => {
+        runInMemoryClaimsWriteTransaction(kernelDb, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                kernelDb,
+                { producer: "node-smoke", operationKey: "update-1", requestDigest: "b".repeat(64) },
+                {
+                    memoryId: kernelCreated.result.memoryId,
+                    content: "node kernel fact v2",
+                    normalizedHash: "hash:node kernel fact v2",
+                },
+            ),
+        );
+    }).immediate();
+    const currentClaim = getCurrentMemoryClaimByLegacyMemoryId(kernelDb, kernelCreated.result.memoryId);
+    check("v83 nested update advanced to revision 2", currentClaim?.revision === 2);
+
+    const tupleCounts = (): string =>
+        JSON.stringify({
+            memories: kernelDb.prepare("SELECT COUNT(*) c FROM memories").get(),
+            revisions: kernelDb.prepare("SELECT COUNT(*) c FROM claim_revisions").get(),
+            outbox: kernelDb.prepare("SELECT COUNT(*) c FROM claim_change_outbox").get(),
+            generations: kernelDb.prepare("SELECT COUNT(*) c FROM claim_project_generations").get(),
+        });
+    const countsBefore = tupleCounts();
+    setMemoryClaimFailpoint("memory-claim.050.commit.before", () => {
+        throw new Error("smoke rollback");
+    });
+    let rolledBack = false;
+    try {
+        runInMemoryClaimsWriteTransaction(kernelDb, () =>
+            createMemoryWithClaimsInCurrentTransaction(
+                kernelDb,
+                { producer: "node-smoke", operationKey: "doomed-1", requestDigest: "c".repeat(64) },
+                {
+                    projectPath: "git:kernel",
+                    category: "CONSTRAINTS",
+                    content: "doomed fact",
+                    normalizedHash: "hash:doomed fact",
+                },
+            ),
+        );
+    } catch {
+        rolledBack = true;
+    }
+    clearMemoryClaimFailpoints();
+    check(
+        "v83 failpoint rollback leaves no tuple residue",
+        rolledBack && tupleCounts() === countsBefore,
+        tupleCounts(),
+    );
+
+    const projectionRow = readMemoryProjectionRow(kernelDb, kernelCreated.result.memoryId);
+    check(
+        "v83 legacy projection and current claim read the same state",
+        projectionRow?.content === currentClaim?.content &&
+            projectionRow?.category === currentClaim?.category &&
+            projectionRow?.normalized_hash === currentClaim?.normalizedHash &&
+            projectionRow?.status === currentClaim?.state,
+        JSON.stringify({ projectionRow, currentClaim }),
+    );
+    kernelDb.close();
 } finally {
     rmSync(dir, { recursive: true, force: true });
 }

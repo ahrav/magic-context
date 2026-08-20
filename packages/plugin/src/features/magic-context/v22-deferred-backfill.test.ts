@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { ProjectIdentityError } from "./memory/project-identity";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { getProjectState } from "./storage-project-state";
@@ -31,16 +32,18 @@ function makeTempDir(prefix = "mc-v22-backfill-"): string {
 }
 
 function insertMemory(database: Database, projectPath: string, normalizedHash: string): number {
-    const result = database
-        .prepare(
-            `INSERT INTO memories
+    return runInMemoryClaimsWriteTransaction(database, () => {
+        const result = database
+            .prepare(
+                `INSERT INTO memories
                 (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
              VALUES (?, 'CONSTRAINTS', ?, ?, 1, 1, 1, 1)`,
-        )
-        .run(projectPath, `content-${normalizedHash}`, normalizedHash) as {
-        lastInsertRowid: number;
-    };
-    return Number(result.lastInsertRowid);
+            )
+            .run(projectPath, `content-${normalizedHash}`, normalizedHash) as {
+            lastInsertRowid: number;
+        };
+        return Number(result.lastInsertRowid);
+    });
 }
 
 function metaValue(database: Database, key: string): string | null {

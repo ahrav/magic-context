@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
@@ -26,6 +26,12 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
+import { sha256Utf8Hex } from "../memory/storage-claims";
+import {
+    hasMemoryClaimsCompatSchema,
+    runInMemoryClaimsWriteTransaction,
+    updateMemoryContentWithClaimsInCurrentTransaction,
+} from "../memory/storage-memory-claims";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
@@ -516,6 +522,22 @@ function isPrimaryMutable(memory: Memory | null): memory is Memory {
  *  new content + hash, reset shareable + classified_at (re-scored later by
  *  classify), drop stale embeddings/cache, and clear old file mappings. */
 function rewriteMemoryContent(db: Database, memory: Memory, content: string, hash: string): void {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        runInMemoryClaimsWriteTransaction(db, () => {
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "dreamer-verify",
+                    operationKey: `update:${randomUUID()}`,
+                    requestDigest: sha256Utf8Hex(JSON.stringify({ id: memory.id, content, hash })),
+                },
+                { memoryId: memory.id, content, normalizedHash: hash },
+            );
+            db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memory.id);
+        });
+        invalidateMemory(memory.projectPath, memory.id);
+        return;
+    }
     db.prepare(
         "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
     ).run(content, hash, Date.now(), memory.id);

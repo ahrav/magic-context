@@ -25,10 +25,16 @@ import {
 } from "../../features/magic-context/memory/embedding";
 import { invalidateMemory } from "../../features/magic-context/memory/embedding-cache";
 import { computeNormalizedHash } from "../../features/magic-context/memory/normalize-hash";
+import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
 import {
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
 } from "../../features/magic-context/memory/storage-memory";
+import {
+    hasMemoryClaimsCompatSchema,
+    updateMemoryContentWithClaimsInCurrentTransaction,
+    withClaimsWriteCapabilityInCurrentTransaction,
+} from "../../features/magic-context/memory/storage-memory-claims";
 import {
     normalizeStoredProjectPath,
     queueMemoryMutation,
@@ -335,6 +341,23 @@ function updateMemoryContentInCurrentTransaction(
     content: string,
     normalizedHash: string,
 ): void {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        withClaimsWriteCapabilityInCurrentTransaction(db, () => {
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "ctx-memory-opencode",
+                    operationKey: `update:${crypto.randomUUID()}`,
+                    requestDigest: sha256Utf8Hex(
+                        JSON.stringify({ id: memory.id, content, normalizedHash }),
+                    ),
+                },
+                { memoryId: memory.id, content, normalizedHash },
+            );
+        });
+        invalidateMemory(memory.projectPath, memory.id);
+        return;
+    }
     db.prepare(
         "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
     ).run(content, normalizedHash, Date.now(), memory.id);

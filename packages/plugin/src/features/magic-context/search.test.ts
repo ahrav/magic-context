@@ -19,6 +19,7 @@ import { appendCompartments, getCompartments, replaceSessionFacts } from "./comp
 import { upsertCommits } from "./git-commits";
 import { getMemoryById, insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
 import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
 import {
@@ -239,7 +240,9 @@ describe("unifiedSearch", () => {
             category: "CONSTRAINTS",
             content: "foreign constraint needle",
         });
-        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignShared.id);
+        });
         const foreignHidden = insertMemory(db, {
             projectPath: "git:foreign",
             category: "NAMING",
@@ -322,7 +325,9 @@ describe("unifiedSearch", () => {
             category: "CONSTRAINTS",
             content: "foreign legacy-null constraint needle",
         });
-        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignConstraint.id);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(foreignConstraint.id);
+        });
         const foreignNaming = insertMemory(db, {
             projectPath: "git:foreign",
             category: "NAMING",
@@ -2290,8 +2295,10 @@ describe("resolveMemoriesByIdsForSearch (R35)", () => {
             category: "CONSTRAINTS",
             content: "own archived row",
         });
-        db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(allowedForeign.id);
-        db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(ownArchived.id);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(allowedForeign.id);
+            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(ownArchived.id);
+        });
         return { allowedForeign: allowedForeign.id, ownArchived: ownArchived.id };
     }
 
@@ -2319,7 +2326,9 @@ describe("resolveMemoriesByIdsForSearch (R35)", () => {
 
     it("returns the null fallback sentinel when every id is missing or hidden", () => {
         const seeded = seedWorkspace();
-        db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(seeded.allowedForeign);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET shareable = 0 WHERE id = ?").run(seeded.allowedForeign);
+        });
 
         expect(
             resolveMemoriesByIdsForSearch({

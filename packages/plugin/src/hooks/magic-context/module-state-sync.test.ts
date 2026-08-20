@@ -5,6 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import { runInMemoryClaimsWriteTransaction } from "../../features/magic-context/memory/storage-memory-claims";
 import { runMigrations } from "../../features/magic-context/migrations";
 import {
     addProcessedImageStrippedIds,
@@ -714,12 +715,14 @@ describe("module state sync section deltas", () => {
 describe("module state authority direction", () => {
     it("omits module-owned memory sections from the TypeScript sender payload", async () => {
         const db = createContextDb();
-        db.prepare(
-            `INSERT INTO memories
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memories
                 (project_path, category, content, normalized_hash, first_seen_at, created_at,
                  updated_at, last_seen_at, classified_at)
              VALUES (?, 'CONSTRAINTS', 'module-owned fact', 'hash', 0, 0, 0, 0, 1234)`,
-        ).run("/tmp/project");
+            ).run("/tmp/project");
+        });
         const calls: unknown[] = [];
         const state = syncState();
 

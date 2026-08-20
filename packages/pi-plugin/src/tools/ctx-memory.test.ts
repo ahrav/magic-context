@@ -4,6 +4,7 @@ import {
 	getMemoryById,
 	insertMemory,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import { getMemoryMutationsForRender } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestDb, fakeContext } from "../test-utils.test";
@@ -804,8 +805,10 @@ describe("createCtxMemoryTool", () => {
 				category: "CONSTRAINTS",
 				content: "Use bun for tests.",
 			});
-			db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-				archived.id,
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+					.run(archived.id),
 			);
 
 			const update = await primary.execute(
@@ -850,8 +853,10 @@ describe("createCtxMemoryTool", () => {
 				category: "CONSTRAINTS",
 				content: "Use bun for scripts.",
 			});
-			db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-				archived.id,
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+					.run(archived.id),
 			);
 
 			const archivedAgain = await primary.execute(
@@ -893,8 +898,10 @@ describe("createCtxMemoryTool", () => {
 				category: "CONSTRAINTS",
 				content: "Use bun for tests.",
 			});
-			db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-				archived.id,
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+					.run(archived.id),
 			);
 
 			const result = await dreamer.execute(
@@ -970,8 +977,10 @@ describe("createCtxMemoryTool", () => {
 					category: "KNOWN_ISSUES",
 					content: "Retired issue the user just referenced.",
 				});
-				db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-					memory.id,
+				runInMemoryClaimsWriteTransaction(db, () =>
+					db
+						.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+						.run(memory.id),
 				);
 				const primary = createCtxMemoryTool({
 					db,

@@ -62,6 +62,12 @@ import {
 	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
+import {
+	hasMemoryClaimsCompatSchema,
+	updateMemoryContentWithClaimsInCurrentTransaction,
+	withClaimsWriteCapabilityInCurrentTransaction,
+} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	type ContextDatabase,
 	queueMemoryMutation,
@@ -277,6 +283,23 @@ function updateMemoryContentInCurrentTransaction(
 	content: string,
 	normalizedHash: string,
 ): void {
+	if (hasMemoryClaimsCompatSchema(db)) {
+		withClaimsWriteCapabilityInCurrentTransaction(db, () => {
+			updateMemoryContentWithClaimsInCurrentTransaction(
+				db,
+				{
+					producer: "ctx-memory-pi",
+					operationKey: `update:${crypto.randomUUID()}`,
+					requestDigest: sha256Utf8Hex(
+						JSON.stringify({ id: memory.id, content, normalizedHash }),
+					),
+				},
+				{ memoryId: memory.id, content, normalizedHash },
+			);
+		});
+		invalidateMemory(memory.projectPath, memory.id);
+		return;
+	}
 	db.prepare(
 		"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
 	).run(content, normalizedHash, Date.now(), memory.id);

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { insertMemory, recordMemoryVerifications, setMemoryClassification } from "../memory";
+import { runInMemoryClaimsWriteTransaction } from "../memory/storage-memory-claims";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
@@ -70,9 +71,10 @@ describe("dream task backlog probes", () => {
         });
         recordMemoryVerifications(db, pending.id, ["src/pending.ts"], Date.now());
         recordMemoryVerifications(db, verified.id, ["src/verified.ts"], Date.now());
-        db.prepare("UPDATE memory_verifications SET verified_at = ? WHERE memory_id = ?").run(
-            0,
-            pending.id,
+        runInMemoryClaimsWriteTransaction(db, () =>
+            db
+                .prepare("UPDATE memory_verifications SET verified_at = ? WHERE memory_id = ?")
+                .run(0, pending.id),
         );
 
         expect(getDreamTaskBacklog(db, projectIdentity, "verify")).toEqual({

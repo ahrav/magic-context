@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { closeDatabase, initializeDatabase, openDatabase } from "./storage-db";
 
@@ -36,21 +37,26 @@ describe("migration v12 — FK cascades and orphan cleanup", () => {
     test("fresh database enables foreign keys and cascades memory_embeddings", () => {
         useTempDataHome("v12-fresh-");
         const db = openDatabase();
+        if (!db) throw new Error("openDatabase() returned null in test setup");
 
         const foreignKeys = db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number };
         expect(foreignKeys.foreign_keys).toBe(1);
 
-        db.prepare(
-            `INSERT INTO memories (
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memories (
                 id, project_path, category, content, normalized_hash,
                 first_seen_at, created_at, updated_at, last_seen_at
              ) VALUES (1, '/repo', 'ENVIRONMENT', 'content', 'hash', 1, 1, 1, 1)`,
-        ).run();
+            ).run();
+        });
         db.prepare(
             "INSERT INTO memory_embeddings (memory_id, embedding, model_id) VALUES (1, ?, 'model')",
         ).run(Buffer.from([1, 2, 3]));
 
-        db.prepare("DELETE FROM memories WHERE id = 1").run();
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("DELETE FROM memories WHERE id = 1").run();
+        });
 
         expect(count(db, "memory_embeddings")).toBe(0);
     });

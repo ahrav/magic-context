@@ -42,6 +42,7 @@ import {
 } from "./index";
 import { computeNormalizedHash } from "./normalize-hash";
 import { rekeyMemoryRowWithCollisionMerge } from "./relocate-memory";
+import { runInMemoryClaimsWriteTransaction } from "./storage-memory-claims";
 
 let db: Database;
 
@@ -861,14 +862,18 @@ describe("migrated-v82 mutation inventory characterization", () => {
             nowMs: 1_000,
         });
         saveEmbedding(migrated, memory.id, new Float32Array([0.5, 0.25]), "local:model-a");
-        migrated
-            .prepare(
-                `UPDATE memories SET shareable = 1, classified_at = 111, verification_status = 'verified',
-                    verified_at = 222, mural_cue = 'cue', mural_cue_hash = 'cuehash', mural_cue_at = 333,
-                    mural_cue_rejection_count = 2
-                  WHERE id = ?`,
-            )
-            .run(memory.id);
+        // Fixture seeding of pre-existing semantic state must hold the v83
+        // claims-write capability; the guards reject bare semantic UPDATEs.
+        runInMemoryClaimsWriteTransaction(migrated, () => {
+            migrated
+                .prepare(
+                    `UPDATE memories SET shareable = 1, classified_at = 111, verification_status = 'verified',
+                        verified_at = 222, mural_cue = 'cue', mural_cue_hash = 'cuehash', mural_cue_at = 333,
+                        mural_cue_rejection_count = 2
+                      WHERE id = ?`,
+                )
+                .run(memory.id);
+        });
 
         updateMemoryContent(
             migrated,

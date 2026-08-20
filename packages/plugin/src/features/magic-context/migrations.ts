@@ -7,6 +7,13 @@ import {
     createClaimsAndEvidenceSchema,
 } from "./storage-claims-schema";
 import {
+    assertMemoryClaimsSchemaForeignKeys,
+    CLAIMS_BACKFILL_META_KEYS,
+    createMemoryClaimsCompatSchema,
+    installMemoryClaimsWriteGuards,
+    MEMORY_CLAIMS_COMPAT_TABLES,
+} from "./storage-memory-claims-schema";
+import {
     assertProjectRegistrySeed,
     resolveProjectIdentitySeed,
     seedProjectRegistry,
@@ -3126,6 +3133,80 @@ export const MIGRATIONS: Migration[] = [
             seedProjectRegistry(db, seed, Date.now());
             assertProjectRegistrySeed(db, seed);
             assertClaimsSchemaForeignKeys(db);
+        },
+    },
+    {
+        version: 83,
+        description:
+            "memories-to-claims compatibility contract: crosswalk, revision metadata, operation envelope, outbox, generations, and semantic write guards",
+        up(db: Database): void {
+            // A replayed v83 must no-op over its own published schema, but a
+            // partial or foreign `legacy_memory_claims` table is corruption.
+            if (tableExists(db, "legacy_memory_claims")) {
+                const missing = MEMORY_CLAIMS_COMPAT_TABLES.filter(
+                    (table) => !tableExists(db, table),
+                );
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v83 replay guard: legacy_memory_claims exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                return;
+            }
+            createMemoryClaimsCompatSchema(db);
+
+            // Sparse legacy databases that never ran v22 lack the meta table.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS schema_migrations_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            `);
+            const writeMeta = db.prepare(
+                `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            );
+            const hasMemories = tableExists(db, "memories");
+            const corpus = hasMemories
+                ? (db
+                      .prepare(
+                          "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS boundary FROM memories",
+                      )
+                      .get() as { count: number; boundary: number })
+                : { count: 0, boundary: 0 };
+            // Record the high-water boundary and expected link count BEFORE the
+            // guards install: the boundary guard triggers read this meta row.
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.boundaryMemoryId, String(corpus.boundary));
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.expectedRowCount, String(corpus.count));
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
+            const v22Status = db
+                .prepare(
+                    "SELECT value FROM schema_migrations_meta WHERE key = 'v22_legacy_memory_backfill'",
+                )
+                .get() as { value: string } | undefined;
+            writeMeta.run(
+                CLAIMS_BACKFILL_META_KEYS.v22Takeover,
+                v22Status && v22Status.value !== "complete" ? "pending" : "none",
+            );
+            if (corpus.count === 0) {
+                // An empty corpus completes synchronously in the migration
+                // (R7): there is nothing to convert, so the completion
+                // checkpoint and U8 watermark publish here.
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.mode, "empty");
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.phase, "complete");
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.reconciliationVersion, "1");
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.finalOutboxWatermark, "0");
+            } else {
+                // Without checked-in calibration evidence every nonempty
+                // corpus uses lazy mode (R7). The bounded runner is U5; v83
+                // only records the pending state.
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.mode, "lazy");
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.phase, "rows");
+            }
+
+            if (hasMemories) installMemoryClaimsWriteGuards(db);
+            assertMemoryClaimsSchemaForeignKeys(db);
         },
     },
 ];

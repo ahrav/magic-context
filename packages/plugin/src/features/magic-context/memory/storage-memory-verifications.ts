@@ -1,4 +1,12 @@
+import { randomUUID } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
+import { sha256Utf8Hex } from "./storage-claims";
+import {
+    hasMemoryClaimsCompatSchema,
+    replaceMemoryVerificationFilesWithClaimsInCurrentTransaction,
+    runInMemoryClaimsWriteTransaction,
+    withClaimsWriteCapabilityInCurrentTransaction,
+} from "./storage-memory-claims";
 
 export const MEMORY_VERIFICATION_SENTINEL = "";
 
@@ -43,6 +51,20 @@ export function recordMemoryMapping(
     now: number,
 ): number {
     const realFiles = uniqueSortedFiles(normalizedFiles);
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "storage-memory-verifications",
+                    operationKey: `map:${randomUUID()}`,
+                    requestDigest: sha256Utf8Hex(JSON.stringify({ memoryId, realFiles, now })),
+                },
+                { memoryId, files: realFiles, now, verified: false },
+            ),
+        );
+        return outcome.result.rowsWritten;
+    }
     const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
     db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
     const insert = db.prepare(
@@ -66,6 +88,20 @@ export function recordMemoryVerifications(
     now: number,
 ): number {
     const realFiles = uniqueSortedFiles(normalizedFiles);
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "storage-memory-verifications",
+                    operationKey: `verify:${randomUUID()}`,
+                    requestDigest: sha256Utf8Hex(JSON.stringify({ memoryId, realFiles, now })),
+                },
+                { memoryId, files: realFiles, now, verified: true },
+            ),
+        );
+        return outcome.result.rowsWritten;
+    }
     const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
     db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
     const insert = db.prepare(
@@ -92,6 +128,14 @@ export function getUnmappedMemoryIds(db: Database, memoryIds: readonly number[])
 }
 
 export function clearMemoryVerifications(db: Database, memoryId: number): void {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        db.transaction(() =>
+            withClaimsWriteCapabilityInCurrentTransaction(db, () => {
+                db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
+            }),
+        ).immediate();
+        return;
+    }
     db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
 }
 

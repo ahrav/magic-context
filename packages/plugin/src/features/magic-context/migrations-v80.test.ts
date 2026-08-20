@@ -15,8 +15,10 @@ import {
     updateMemoryRetrievalCount,
     updateMemorySeenCount,
 } from "./memory/storage-memory";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
+import { dropMemoryClaimsCompatObjectsForTests } from "./storage-memory-claims-schema";
 
 const V80_OBJECT_NAMES = [
     "memory_stats",
@@ -42,6 +44,7 @@ function v79Database(): Database {
     initializeDatabase(db);
     runMigrations(db);
     db.exec("DELETE FROM schema_migrations WHERE version >= 80");
+    dropMemoryClaimsCompatObjectsForTests(db);
     db.exec(`
         DROP TRIGGER IF EXISTS memories_stats_ai;
         DROP TRIGGER IF EXISTS memories_telemetry_freeze_guard;
@@ -70,26 +73,36 @@ function insertLegacyMemory(
     },
 ): number {
     const hash = `hash:${args.content}`;
-    const result = db
-        .prepare(
-            `INSERT INTO memories (project_path, category, content, normalized_hash,
+    const guarded = Boolean(
+        db
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_compatibility_write_state'",
+            )
+            .get(),
+    );
+    const insert = (): number => {
+        const result = db
+            .prepare(
+                `INSERT INTO memories (project_path, category, content, normalized_hash,
                 seen_count, retrieval_count, first_seen_at, created_at, updated_at,
                 last_seen_at, last_retrieved_at)
              VALUES (?, 'CONSTRAINTS', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-            args.projectPath,
-            args.content,
-            hash,
-            args.seenCount ?? 1,
-            args.retrievalCount ?? 0,
-            args.firstSeenAt ?? 1000,
-            args.createdAt ?? 1000,
-            args.updatedAt ?? 1000,
-            args.lastSeenAt ?? 1000,
-            args.lastRetrievedAt ?? null,
-        ) as { lastInsertRowid: number | bigint };
-    return Number(result.lastInsertRowid);
+            )
+            .run(
+                args.projectPath,
+                args.content,
+                hash,
+                args.seenCount ?? 1,
+                args.retrievalCount ?? 0,
+                args.firstSeenAt ?? 1000,
+                args.createdAt ?? 1000,
+                args.updatedAt ?? 1000,
+                args.lastSeenAt ?? 1000,
+                args.lastRetrievedAt ?? null,
+            ) as { lastInsertRowid: number | bigint };
+        return Number(result.lastInsertRowid);
+    };
+    return guarded ? runInMemoryClaimsWriteTransaction(db, insert) : insert();
 }
 
 function objectSql(db: Database, name: string): string | null {
@@ -504,7 +517,9 @@ describe("migration v80: memory_stats telemetry side table", () => {
                 category: "CONSTRAINTS",
                 content: "survivor",
             });
-            db.prepare("DELETE FROM memories WHERE id = ?").run(doomed.id);
+            runInMemoryClaimsWriteTransaction(db, () => {
+                db.prepare("DELETE FROM memories WHERE id = ?").run(doomed.id);
+            });
             expect(statsRow(db, doomed.id) ?? null).toBeNull();
             expect(statsRow(db, survivor.id)).toBeDefined();
             expect(db.prepare("PRAGMA foreign_key_check(memory_stats)").all()).toEqual([]);
@@ -559,14 +574,21 @@ describe("migration v80: memory_stats telemetry side table", () => {
         cleanups.push(() => closeQuietly(migrator));
 
         // The held-open v79 statement inserts and receives stats atomically.
-        const result = legacy
-            .prepare(
-                `INSERT INTO memories (project_path, category, content, normalized_hash,
+        // On a v83 database bare inserts are guard-rejected (AE8), so the
+        // legacy-shaped statement runs under the claims-write capability to
+        // keep exercising the v80 stats trigger.
+        const result = runInMemoryClaimsWriteTransaction(
+            legacy,
+            () =>
+                legacy
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
                     seen_count, retrieval_count, first_seen_at, created_at, updated_at,
                     last_seen_at, last_retrieved_at)
                  VALUES ('git:legacy', 'CONSTRAINTS', 'held-open insert', 'hash:held', 2, 1, 1, 1, 9, 8, 7)`,
-            )
-            .run() as { lastInsertRowid: number | bigint };
+                    )
+                    .run() as { lastInsertRowid: number | bigint },
+        );
         const id = Number(result.lastInsertRowid);
         expect(statsRow(migrator, id)).toEqual({
             memory_id: id,

@@ -19,6 +19,7 @@ import {
     registerModuleNoteEvaluationBridge,
 } from "./context-authority";
 import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/storage-memory";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
 import { runMigrations } from "./migrations";
 import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
@@ -817,11 +818,13 @@ describe("memory authority protocol", () => {
             }),
         ).rejects.toThrow("verification failed");
         expect(getAuthorityManagedMarker(database, "/repo")).toBeNull();
-        database
-            .prepare(
-                "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'ts works', 'h', 0, 0, 0, 0)",
-            )
-            .run("/repo");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'ts works', 'h', 0, 0, 0, 0)",
+                )
+                .run("/repo");
+        });
         expect(database.prepare("SELECT COUNT(*) AS count FROM memories").get()).toEqual({
             count: 1,
         });
@@ -2357,11 +2360,13 @@ describe("memory authority protocol", () => {
 
     test("installs the marker before reading the stable seed set", async () => {
         const database = db();
-        database
-            .prepare(
-                "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'before marker', 'h1', 0, 0, 0, 0)",
-            )
-            .run("/repo");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'before marker', 'h1', 0, 0, 0, 0)",
+                )
+                .run("/repo");
+        });
         let seededIds: number[] = [];
         await prepareAuthority({
             db: database,
@@ -2505,11 +2510,13 @@ describe("memory authority protocol", () => {
 
     test("privileged same-connection UPDATE between capture and verify aborts prepare", async () => {
         const database = db();
-        database
-            .prepare(
-                "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed', 'h1', 0, 0, 0, 0)",
-            )
-            .run("/repo");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at) VALUES (?, 'CONSTRAINTS', 'seed', 'h1', 0, 0, 0, 0)",
+                )
+                .run("/repo");
+        });
         const module = protocol({ bytes: [] });
         const ordinaryPrepare = module.authorityPrepare;
         module.authorityPrepare = async (args) => {
@@ -2631,17 +2638,19 @@ describe("memory authority protocol", () => {
                 "INSERT INTO workspace_members(workspace_id, project_path, display_name, display_path, added_at) VALUES (1, '/own', 'own', '/own', 0), (1, '/foreign', 'foreign', '/foreign', 0)",
             )
             .run();
-        database
-            .prepare(
-                `INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at, status, shareable, scope, expires_at)
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memories(project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at, status, shareable, scope, expires_at)
                  VALUES
                  ('/own', 'CONSTRAINTS', 'own archived', 'h1', 0, 0, 0, 0, 'archived', 0, 'project', NULL),
                  ('/foreign', 'CONSTRAINTS', 'foreign archived', 'h2', 0, 0, 0, 0, 'archived', 1, 'project', NULL),
                  ('/foreign', 'CONSTRAINTS', 'foreign expired', 'h3', 0, 0, 0, 0, 'active', 1, 'project', ?),
                  ('/foreign', 'CONSTRAINTS', 'foreign private', 'h4', 0, 0, 0, 0, 'active', 0, 'project', NULL),
                  ('/foreign', 'CONSTRAINTS', 'foreign visible', 'h5', 0, 0, 0, 0, 'active', 1, 'project', NULL)`,
-            )
-            .run(now - 1);
+                )
+                .run(now - 1);
+        });
         const rows = getMemoriesByProjects(
             database,
             ["/own", "/foreign"],

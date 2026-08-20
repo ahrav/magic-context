@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
     initializeDatabase,
     runMigrations,
@@ -174,16 +175,18 @@ function makeDb(): Database {
 }
 
 function insertMemory(database: Database, projectPath: string, normalizedHash: string): number {
-    const result = database
-        .prepare(
-            `INSERT INTO memories
+    return runInMemoryClaimsWriteTransaction(database, () => {
+        const result = database
+            .prepare(
+                `INSERT INTO memories
                 (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
              VALUES (?, 'CONSTRAINTS', ?, ?, 1, 1, 1, 1)`,
-        )
-        .run(projectPath, `content-${normalizedHash}`, normalizedHash) as {
-        lastInsertRowid: number;
-    };
-    return Number(result.lastInsertRowid);
+            )
+            .run(projectPath, `content-${normalizedHash}`, normalizedHash) as {
+            lastInsertRowid: number;
+        };
+        return Number(result.lastInsertRowid);
+    });
 }
 
 function metaValue(database: Database, key: string): string | null {

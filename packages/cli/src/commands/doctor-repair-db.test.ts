@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
     initializeDatabase,
@@ -130,7 +131,7 @@ function seedCurrentDatabase(dbPath: string): void {
             (project_path, started_at, finished_at, holder_id, tasks_json)
          VALUES ('/project', ?, ?, 'test-holder', '[]')`,
     );
-    db.transaction(() => {
+    runInMemoryClaimsWriteTransaction(db, () => {
         for (let index = 1; index <= 300; index++) {
             const content = `tag-${index}-${"t".repeat(700)}`;
             insertTag.run("session-main", Buffer.byteLength(content), index);
@@ -160,7 +161,7 @@ function seedCurrentDatabase(dbPath: string): void {
         }
         for (let index = 1; index <= 4; index++) insertNote.run(`note-${index}`, index, index);
         for (let index = 1; index <= 3; index++) insertDreamRun.run(index, index);
-    })();
+    });
     db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     db.exec("PRAGMA journal_mode=DELETE");
     db.close();

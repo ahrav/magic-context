@@ -15,6 +15,7 @@ import { closeDatabase, openDatabase } from "../storage";
 import { ensureMemoryEmbeddings } from "./embedding-backfill";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 import { insertMemory } from "./storage-memory";
+import { runInMemoryClaimsWriteTransaction } from "./storage-memory-claims";
 import { loadAllEmbeddings } from "./storage-memory-embeddings";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
@@ -67,7 +68,9 @@ describe("ensureMemoryEmbeddings (read-path backfill)", () => {
         const dir = mkdtempSync(join(tmpdir(), "embedding-backfill-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        if (!db) throw new Error("openDatabase() returned null in test setup");
+        return db;
     }
 
     afterEach(() => {
@@ -163,11 +166,12 @@ describe("ensureMemoryEmbeddings (read-path backfill)", () => {
             existingEmbeddings: new Map(),
         });
         await started;
-        // Edit the memory while the provider call is in flight: the vector the
-        // backfill receives was computed from the OLD content.
-        db.prepare(
-            "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-        ).run("New memory body (edited)", "new-memory-hash", Date.now(), memory.id);
+        // The in-flight vector was computed from the old content.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+            ).run("New memory body (edited)", "new-memory-hash", Date.now(), memory.id);
+        });
         release?.();
 
         const cache = await inFlight;

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { partitionVerifyScope } from "./dreamer/verify-gate";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { auditIdentityMerge, mergeProjectIdentities } from "./storage-identity-merge";
@@ -21,14 +22,16 @@ function insertMemory(
     content: string,
     hash: string,
 ): number {
-    const result = database
-        .prepare(
-            `INSERT INTO memories
+    return runInMemoryClaimsWriteTransaction(database, () => {
+        const result = database
+            .prepare(
+                `INSERT INTO memories
                 (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
              VALUES (?, 'CONSTRAINTS', ?, ?, 1, 1, 1, 1)`,
-        )
-        .run(projectPath, content, hash) as { lastInsertRowid?: number };
-    return Number(result.lastInsertRowid);
+            )
+            .run(projectPath, content, hash) as { lastInsertRowid?: number };
+        return Number(result.lastInsertRowid);
+    });
 }
 
 afterEach(() => {
@@ -125,12 +128,14 @@ describe("project identity merge", () => {
         const database = makeDb();
         insertMemory(database, "dir:old", "legacy", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
-        database
-            .prepare(
-                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
                  VALUES (?, 'src/banked.ts', 150, 150)`,
-            )
-            .run(targetId);
+                )
+                .run(targetId);
+        });
         database
             .prepare(
                 `INSERT INTO task_schedule_state
@@ -175,34 +180,36 @@ describe("project identity merge", () => {
         const database = makeDb();
         const sourceId = insertMemory(database, "dir:old", "legacy", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
-        database
-            .prepare(
-                `UPDATE memories
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `UPDATE memories
                     SET importance = 91, scope = 'workspace', shareable = 1, classified_at = 20,
                         mural_cue = 'new cue', mural_cue_hash = 'cue-hash', mural_cue_at = 30,
                         mural_cue_rejection_count = 2
                   WHERE id = ?`,
-            )
-            .run(sourceId);
-        database
-            .prepare(
-                `UPDATE memories
+                )
+                .run(sourceId);
+            database
+                .prepare(
+                    `UPDATE memories
                     SET importance = 12, scope = 'project', shareable = 0, classified_at = 10
                   WHERE id = ?`,
-            )
-            .run(targetId);
-        database
-            .prepare(
-                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                )
+                .run(targetId);
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
                  VALUES (?, 'src/shared.ts', 40, 35), (?, 'src/source.ts', 30, 25)`,
-            )
-            .run(sourceId, sourceId);
-        database
-            .prepare(
-                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                )
+                .run(sourceId, sourceId);
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
                  VALUES (?, 'src/shared.ts', 15, 10)`,
-            )
-            .run(targetId);
+                )
+                .run(targetId);
+        });
 
         mergeProjectIdentities(database, "dir:old", "git:new", { now: 50 });
 

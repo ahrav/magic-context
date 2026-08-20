@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
@@ -70,6 +71,9 @@ describe("migration v49 — per-model embedding coexistence", () => {
                 CREATE INDEX idx_cce_session ON compartment_chunk_embeddings(session_id);
                 CREATE INDEX idx_cce_project_model ON compartment_chunk_embeddings(project_path, model_id);
 
+            `);
+            runInMemoryClaimsWriteTransaction(db, () => {
+                db.exec(`
                 INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
                 VALUES
                     (1, 'git:v49', 'CONSTRAINTS', 'legacy null model', 'h1', 1, 1, 1, 1),
@@ -88,7 +92,8 @@ describe("migration v49 — per-model embedding coexistence", () => {
                     compartment_id, session_id, project_path, harness, window_index,
                     start_ordinal, end_ordinal, chunk_hash, model_id, dims, vector, created_at
                 ) VALUES (1, 'ses-v49', 'git:v49', 'opencode', 0, 1, 2, 'hash-a', 'model:a', 2, x'0004', 1);
-            `);
+                `);
+            });
 
             runMigrations(db);
 

@@ -4,6 +4,10 @@ import {
     hasMemoryStatsTable,
     requireEffectiveSeenCount,
 } from "./storage-memory";
+import {
+    hasMemoryClaimsCompatSchema,
+    withClaimsWriteCapabilityInCurrentTransaction,
+} from "./storage-memory-claims";
 import type { MemoryStatus } from "./types";
 
 /**
@@ -59,6 +63,20 @@ export function selectRelocatableMemoryIds(
  * transaction.
  */
 export function rekeyMemoryRowWithCollisionMerge(
+    db: Database,
+    rowId: number,
+    fromProjectPath: string,
+    toIdentity: string,
+): boolean {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        return withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+            rekeyMemoryRowWithCollisionMergeInner(db, rowId, fromProjectPath, toIdentity),
+        );
+    }
+    return rekeyMemoryRowWithCollisionMergeInner(db, rowId, fromProjectPath, toIdentity);
+}
+
+function rekeyMemoryRowWithCollisionMergeInner(
     db: Database,
     rowId: number,
     fromProjectPath: string,
@@ -190,6 +208,19 @@ function getMemoryCopyColumns(db: Database): string[] {
  * preserved for provenance. MUST run inside a transaction.
  */
 export function copyMemoriesToProject(
+    db: Database,
+    ids: number[],
+    toIdentity: string,
+): RelocateResult {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        return withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+            copyMemoriesToProjectInner(db, ids, toIdentity),
+        );
+    }
+    return copyMemoriesToProjectInner(db, ids, toIdentity);
+}
+
+function copyMemoriesToProjectInner(
     db: Database,
     ids: number[],
     toIdentity: string,

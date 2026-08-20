@@ -1,8 +1,24 @@
+import { randomUUID } from "node:crypto";
 import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
 import { hasMuralCueColumns, hasMuralCueRejectionCountColumn } from "../mural/storage-mural-cues";
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
+import { sha256Utf8Hex } from "./storage-claims";
+import {
+    createMemoryWithClaimsInCurrentTransaction,
+    deleteMemoryWithClaimsInCurrentTransaction,
+    hasMemoryClaimsCompatSchema,
+    type MemoryClaimOperationEnvelope,
+    MemoryClaimsStatsIntegrityError,
+    mergeMemoryStatsWithClaimsInCurrentTransaction,
+    runInMemoryClaimsWriteTransaction,
+    setMemoryStatusWithClaimsInCurrentTransaction,
+    supersedeMemoryWithClaimsInCurrentTransaction,
+    updateMemoryClassificationWithClaimsInCurrentTransaction,
+    updateMemoryContentWithClaimsInCurrentTransaction,
+    updateMemoryVerificationWithClaimsInCurrentTransaction,
+} from "./storage-memory-claims";
 import type {
     Memory,
     MemoryCategory,
@@ -778,6 +794,17 @@ export class ModuleMemoryAuthorityError extends Error {
     }
 }
 
+function storageMemoryClaimEnvelope(
+    operation: string,
+    request: unknown,
+): MemoryClaimOperationEnvelope {
+    return {
+        producer: "storage-memory",
+        operationKey: `${operation}:${randomUUID()}`,
+        requestDigest: sha256Utf8Hex(JSON.stringify(request)),
+    };
+}
+
 function assertTsMemoryWriteAllowed(db: Database, projectPath: string): void {
     try {
         const managed = db
@@ -803,6 +830,31 @@ export function insertMemory(db: Database, input: MemoryInput): Memory {
     assertTsMemoryWriteAllowed(db, input.projectPath);
     const now = input.nowMs ?? Date.now();
     const normalizedHash = computeNormalizedHash(input.content);
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("insert", {
+            projectPath: input.projectPath,
+            category: input.category,
+            normalizedHash,
+            content: input.content,
+        });
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            createMemoryWithClaimsInCurrentTransaction(db, envelope, {
+                projectPath: input.projectPath,
+                category: input.category,
+                content: input.content,
+                normalizedHash,
+                importance: input.importance ?? 50,
+                sourceSessionId: input.sourceSessionId ?? null,
+                sourceType: input.sourceType,
+                expiresAt: input.expiresAt ?? null,
+                metadataJson: input.metadataJson ?? null,
+                nowMs: now,
+            }),
+        );
+        const inserted = loadInsertedMemory(db, outcome.result.memoryId);
+        invalidateProject(input.projectPath);
+        return inserted;
+    }
     const insertValues = buildInsertMemoryValues(
         input,
         normalizedHash,
@@ -1228,6 +1280,16 @@ export function updateMemoryRetrievalCount(db: Database, id: number): void {
 
 export function updateMemoryStatus(db: Database, id: number, status: MemoryStatus): void {
     assertTsMemoryIdWriteAllowed(db, id);
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("set-status", { id, status });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(db, envelope, {
+                memoryId: id,
+                status,
+            }),
+        );
+        return;
+    }
     getUpdateMemoryStatusStatement(db).run(status, Date.now(), id);
 }
 
@@ -1257,6 +1319,21 @@ export function updateMemoryVerification(
 ): void {
     assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("update-verification", {
+            id,
+            verificationStatus,
+            now,
+        });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(db, envelope, {
+                memoryId: id,
+                verificationStatus,
+                nowMs: now,
+            }),
+        );
+        return;
+    }
     getUpdateMemoryVerificationStatement(db).run(
         verificationStatus,
         verificationStatus,
@@ -1276,6 +1353,25 @@ export function updateMemoryContent(
     // modification can happen. The projectPath is only used for cache invalidation after
     // the write, which self-heals on next search if stale.
     const memory = assertTsMemoryIdWriteAllowed(db, id);
+
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("update-content", {
+            id,
+            content,
+            normalizedHash,
+        });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(db, envelope, {
+                memoryId: id,
+                content,
+                normalizedHash,
+            }),
+        );
+        if (memory) {
+            invalidateMemory(memory.projectPath, id);
+        }
+        return;
+    }
 
     db.transaction(() => {
         getUpdateMemoryContentStatement(db).run(content, normalizedHash, Date.now(), id);
@@ -1381,6 +1477,30 @@ export function setMemoryClassification(
     // we add the marker (the return value reports real change, for telemetry).
     const fieldChanged = assignments.length > 0;
 
+    if (hasMemoryClaimsCompatSchema(db)) {
+        if (!fieldChanged) {
+            // The classified_at stamp alone is a run-gate marker, not a
+            // semantic change: no revision, no claim work, no outbox.
+            db.prepare("UPDATE memories SET classified_at = ? WHERE id = ?").run(Date.now(), id);
+            return false;
+        }
+        const changed: { importance?: number; scope?: string; shareable?: number } = {};
+        for (let index = 0; index < assignments.length; index += 1) {
+            const column = assignments[index];
+            if (column.startsWith("importance")) changed.importance = values[index] as number;
+            else if (column.startsWith("scope")) changed.scope = values[index] as string;
+            else if (column.startsWith("shareable")) changed.shareable = values[index] as number;
+        }
+        const envelope = storageMemoryClaimEnvelope("classify", { id, ...changed });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryClassificationWithClaimsInCurrentTransaction(db, envelope, {
+                memoryId: id,
+                ...changed,
+            }),
+        );
+        return true;
+    }
+
     // Always stamp classified_at (even when no column value changed) so the
     // run-gate / Stage-3 partition treats this memory as classified and won't
     // re-score it next run. Stamping a timestamp does not affect the rendered
@@ -1397,6 +1517,16 @@ export function setMemoryClassification(
 
 export function supersededMemory(db: Database, id: number, supersededById: number): void {
     assertTsMemoryIdWriteAllowed(db, id);
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("supersede", { id, supersededById });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(db, envelope, {
+                memoryId: id,
+                supersededByMemoryId: supersededById,
+            }),
+        );
+        return;
+    }
     getSupersededMemoryStatement(db).run(supersededById, Date.now(), id);
 }
 
@@ -1410,6 +1540,33 @@ export function mergeMemoryStats(
 ): void {
     assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("merge-stats", {
+            id,
+            seenCount,
+            retrievalCount,
+            mergedFrom,
+            status,
+        });
+        try {
+            runInMemoryClaimsWriteTransaction(db, () =>
+                mergeMemoryStatsWithClaimsInCurrentTransaction(db, envelope, {
+                    memoryId: id,
+                    seenCount,
+                    retrievalCount,
+                    mergedFrom,
+                    status,
+                    nowMs: now,
+                }),
+            );
+        } catch (error) {
+            if (error instanceof MemoryClaimsStatsIntegrityError) {
+                throw new MemoryStatsIntegrityError(id);
+            }
+            throw error;
+        }
+        return;
+    }
     if (hasMemoryStatsTable(db)) {
         // Base and stats update times come from one clock read; the canonical
         // row's last-seen and last-retrieved event timestamps stay untouched.
@@ -1450,20 +1607,38 @@ export function archiveMemory(db: Database, id: number, reason?: string): void {
         return;
     }
 
-    getUpdateArchivedMemoryStatement(db).run(
-        mergeMetadataJson(memory.metadataJson, { archive_reason: trimmedReason }),
-        Date.now(),
-        id,
-    );
+    const mergedMetadata = mergeMetadataJson(memory.metadataJson, {
+        archive_reason: trimmedReason,
+    });
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("archive", { id, reason: trimmedReason });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(db, envelope, {
+                memoryId: id,
+                status: "archived",
+                metadataJson: mergedMetadata,
+            }),
+        );
+        return;
+    }
+
+    getUpdateArchivedMemoryStatement(db).run(mergedMetadata, Date.now(), id);
 }
 
 export function deleteMemory(db: Database, id: number): void {
     const memory = assertTsMemoryIdWriteAllowed(db, id);
 
-    db.transaction(() => {
-        getDeleteMemoryEmbeddingStatement(db).run(id);
-        getDeleteMemoryStatement(db).run(id);
-    })();
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const envelope = storageMemoryClaimEnvelope("delete", { id });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(db, envelope, { memoryId: id }),
+        );
+    } else {
+        db.transaction(() => {
+            getDeleteMemoryEmbeddingStatement(db).run(id);
+            getDeleteMemoryStatement(db).run(id);
+        })();
+    }
 
     if (memory) {
         invalidateMemory(memory.projectPath, id);

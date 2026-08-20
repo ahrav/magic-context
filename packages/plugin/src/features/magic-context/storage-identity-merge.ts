@@ -1,6 +1,10 @@
 import type { Database } from "../../shared/sqlite";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 import {
+    hasMemoryClaimsCompatSchema,
+    withClaimsWriteCapabilityInCurrentTransaction,
+} from "./memory/storage-memory-claims";
+import {
     applyIdentityMergeToProjectRegistry,
     discoverIdentityTables,
     type IdentityTableInfo,
@@ -415,45 +419,61 @@ export function mergeProjectIdentities(
     if (options.dryRun) return report;
 
     const mergedAt = options.now ?? Date.now();
+    const withWriteScope = (fn: () => void): void => {
+        if (hasMemoryClaimsCompatSchema(db)) {
+            withClaimsWriteCapabilityInCurrentTransaction(db, fn);
+        } else {
+            fn();
+        }
+    };
     const run = db
         .transaction(() => {
-            // v22's identity-level map remains useful for legacy consumers; the row-level
-            // log below is the authoritative audit trail for this command.
-            if (tableExists(db, "v22_identity_rekey_map")) {
-                db.prepare(
-                    `INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at)
+            withWriteScope(() => {
+                // v22's identity-level map remains useful for legacy consumers; the row-level
+                // log below is the authoritative audit trail for this command.
+                if (tableExists(db, "v22_identity_rekey_map")) {
+                    db.prepare(
+                        `INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at)
                  VALUES (?, ?, ?)
                  ON CONFLICT(old_project_path) DO UPDATE SET
                     new_project_path = excluded.new_project_path,
                     rekeyed_at = excluded.rekeyed_at`,
-                ).run(fromIdentity, toIdentity, mergedAt);
-            }
-            applyIdentityMergeToProjectRegistry(db, fromIdentity, toIdentity, mergedAt);
-
-            for (const table of tables) {
-                const tableReport = report.auditedTables.find(
-                    (candidate) => candidate.tableName === table.name,
-                );
-                if (!tableReport || table.derived) continue;
-                const rows = tableSourceRows(db, table, fromIdentity);
-                tableReport.sourceRows = rows.length;
-                for (const row of rows) {
-                    const changed =
-                        table.name === "memories"
-                            ? mergeMemoryRow(db, row, fromIdentity, toIdentity, mergedAt)
-                            : rekeyGenericRow(db, table, row, fromIdentity, toIdentity, mergedAt);
-                    if (changed) tableReport.changedRows += 1;
+                    ).run(fromIdentity, toIdentity, mergedAt);
                 }
-            }
+                applyIdentityMergeToProjectRegistry(db, fromIdentity, toIdentity, mergedAt);
 
-            db.prepare(
-                `INSERT INTO project_state
+                for (const table of tables) {
+                    const tableReport = report.auditedTables.find(
+                        (candidate) => candidate.tableName === table.name,
+                    );
+                    if (!tableReport || table.derived) continue;
+                    const rows = tableSourceRows(db, table, fromIdentity);
+                    tableReport.sourceRows = rows.length;
+                    for (const row of rows) {
+                        const changed =
+                            table.name === "memories"
+                                ? mergeMemoryRow(db, row, fromIdentity, toIdentity, mergedAt)
+                                : rekeyGenericRow(
+                                      db,
+                                      table,
+                                      row,
+                                      fromIdentity,
+                                      toIdentity,
+                                      mergedAt,
+                                  );
+                        if (changed) tableReport.changedRows += 1;
+                    }
+                }
+
+                db.prepare(
+                    `INSERT INTO project_state
                 (project_path, project_memory_epoch, project_user_profile_version, updated_at)
              VALUES (?, 1, 0, ?)
              ON CONFLICT(project_path) DO UPDATE SET
                 project_memory_epoch = project_memory_epoch + 1,
                 updated_at = excluded.updated_at`,
-            ).run(toIdentity, mergedAt);
+                ).run(toIdentity, mergedAt);
+            });
         })
         .immediate();
     void run;
