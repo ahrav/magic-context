@@ -3,7 +3,7 @@
 //! corpus.
 
 #[cfg(target_os = "linux")]
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -56,31 +56,16 @@ impl std::error::Error for InferenceError {}
 static ORT_COMMITTED: Mutex<Option<OrtIdentity>> = Mutex::new(None);
 
 #[cfg(target_os = "linux")]
-const STAGED_ORT_NAME: &str = "onnxruntime-library";
-
-#[cfg(target_os = "linux")]
-struct OrtStagingDir {
-    path: PathBuf,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for OrtStagingDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.path.join(STAGED_ORT_NAME));
-        let _ = std::fs::remove_dir(&self.path);
-    }
-}
-
-#[cfg(target_os = "linux")]
 struct VerifiedOrtLibrary {
-    _file: std::fs::File,
-    load_path: PathBuf,
+    file: std::fs::File,
 }
 
 #[cfg(target_os = "linux")]
 impl VerifiedOrtLibrary {
-    fn load_path(&self) -> &std::path::Path {
-        &self.load_path
+    fn load_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
     }
 }
 
@@ -126,9 +111,6 @@ fn ensure_ort(_identity: &OrtIdentity) -> Result<(), InferenceError> {
 
 #[cfg(target_os = "linux")]
 fn verify_ort_library(identity: &OrtIdentity) -> Result<VerifiedOrtLibrary, InferenceError> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-
     validate_sha256_hex(&identity.sha256).map_err(|_| {
         InferenceError::Artifact("expected ONNX Runtime hash is not a real digest".to_owned())
     })?;
@@ -141,76 +123,42 @@ fn verify_ort_library(identity: &OrtIdentity) -> Result<VerifiedOrtLibrary, Infe
     }
     let bytes = std::fs::read(&identity.library)
         .map_err(|_| InferenceError::Artifact("ONNX Runtime library read failed".to_owned()))?;
-
-    let mut random = [0u8; 32];
-    getrandom::getrandom(&mut random)
-        .map_err(|_| InferenceError::Artifact("ONNX Runtime staging entropy failed".to_owned()))?;
-    let temp_root = std::fs::canonicalize(std::env::temp_dir()).map_err(|_| {
-        InferenceError::Artifact("ONNX Runtime staging directory is unavailable".to_owned())
-    })?;
-    let staging_path = temp_root.join(format!(
-        ".mc-host-ort-{}-{}",
-        std::process::id(),
-        super::protocol::sha256_hex(&random)
-    ));
-    let mut dir = std::fs::DirBuilder::new();
-    dir.mode(0o700);
-    dir.create(&staging_path).map_err(|_| {
-        InferenceError::Artifact("ONNX Runtime staging directory creation failed".to_owned())
-    })?;
-    let staging = OrtStagingDir { path: staging_path };
-    std::fs::set_permissions(&staging.path, std::fs::Permissions::from_mode(0o700)).map_err(
-        |_| {
-            InferenceError::Artifact("ONNX Runtime staging directory permissions failed".to_owned())
-        },
-    )?;
-
-    let staged_path = staging.path.join(STAGED_ORT_NAME);
-    let mut staged_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&staged_path)
-        .map_err(|_| {
-            InferenceError::Artifact("ONNX Runtime staging file creation failed".to_owned())
-        })?;
-    staged_file.write_all(&bytes).map_err(|_| {
-        InferenceError::Artifact("ONNX Runtime staging file write failed".to_owned())
-    })?;
-    drop(bytes);
-    staged_file.seek(SeekFrom::Start(0)).map_err(|_| {
-        InferenceError::Artifact("ONNX Runtime staging file seek failed".to_owned())
-    })?;
-    let mut staged_bytes = Vec::new();
-    staged_file.read_to_end(&mut staged_bytes).map_err(|_| {
-        InferenceError::Artifact("ONNX Runtime staging file read failed".to_owned())
-    })?;
-    if super::protocol::sha256_hex(&staged_bytes) != identity.sha256 {
+    if super::protocol::sha256_hex(&bytes) != identity.sha256 {
         return Err(InferenceError::Artifact(
             "ONNX Runtime library hash mismatch".to_owned(),
         ));
     }
-    drop(staged_bytes);
-    staged_file
-        .set_permissions(std::fs::Permissions::from_mode(0o400))
-        .map_err(|_| {
-            InferenceError::Artifact("ONNX Runtime staging file permissions failed".to_owned())
-        })?;
 
-    // `ort::init_from` accepts only a path. Linux's descriptor path reopens
-    // this exact verified file object; unlinking its directory entry first
-    // removes the path-swap window between verification and dynamic loading.
-    let load_path = PathBuf::from(format!("/proc/self/fd/{}", staged_file.as_raw_fd()));
-    std::fs::remove_file(&staged_path)
-        .map_err(|_| InferenceError::Artifact("ONNX Runtime staging unlink failed".to_owned()))?;
-    std::fs::remove_dir(&staging.path)
-        .map_err(|_| InferenceError::Artifact("ONNX Runtime staging cleanup failed".to_owned()))?;
-    drop(staging);
-    Ok(VerifiedOrtLibrary {
-        _file: staged_file,
-        load_path,
-    })
+    let flags = rustix::fs::MemfdFlags::CLOEXEC
+        | rustix::fs::MemfdFlags::ALLOW_SEALING
+        | rustix::fs::MemfdFlags::EXEC;
+    let fd = rustix::fs::memfd_create("mc-host-onnxruntime", flags).or_else(|error| {
+        if error == rustix::io::Errno::INVAL {
+            // Linux before MFD_EXEC treats memfds as executable by default.
+            rustix::fs::memfd_create(
+                "mc-host-onnxruntime",
+                rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+            )
+        } else {
+            Err(error)
+        }
+    });
+    let mut file =
+        std::fs::File::from(fd.map_err(|_| {
+            InferenceError::Artifact("ONNX Runtime memfd creation failed".to_owned())
+        })?);
+    file.write_all(&bytes)
+        .map_err(|_| InferenceError::Artifact("ONNX Runtime memfd write failed".to_owned()))?;
+    drop(bytes);
+    rustix::fs::fcntl_add_seals(
+        &file,
+        rustix::fs::SealFlags::SHRINK
+            | rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::WRITE
+            | rustix::fs::SealFlags::SEAL,
+    )
+    .map_err(|_| InferenceError::Artifact("ONNX Runtime memfd sealing failed".to_owned()))?;
+    Ok(VerifiedOrtLibrary { file })
 }
 
 /// One loaded certified model. `TextEmbedding::embed` needs `&mut`, so the
@@ -417,6 +365,15 @@ mod tests {
             sha256: super::super::protocol::sha256_hex(verified_bytes),
         };
         let verified = verify_ort_library(&identity).expect("verified staging");
+        let seals = rustix::fs::fcntl_get_seals(&verified.file).expect("read memfd seals");
+        assert!(seals.contains(
+            rustix::fs::SealFlags::SHRINK
+                | rustix::fs::SealFlags::GROW
+                | rustix::fs::SealFlags::WRITE
+                | rustix::fs::SealFlags::SEAL
+        ));
+        let mut writer = verified.file.try_clone().expect("clone memfd");
+        assert!(writer.write_all(b"replacement").is_err());
 
         std::fs::write(&replacement, replacement_bytes).expect("write replacement");
         std::fs::rename(&replacement, &source).expect("replace source");
