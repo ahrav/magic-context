@@ -3,6 +3,7 @@ import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { V2_MEMORY_CATEGORIES } from "./memory/constants";
 import { normalizeStoredProjectPath, storedPathBelongsToIdentity } from "./project-identity";
+import { collectAliasesForTargets } from "./storage-project-identities";
 
 export interface WorkspaceIdentitySet {
     identities: string[];
@@ -17,11 +18,6 @@ export interface ExpandedWorkspaceIdentitySet {
 interface WorkspaceMemberRow {
     identity: string;
     displayName: string;
-}
-
-interface IdentityAliasRow {
-    oldProjectPath: string;
-    newProjectPath: string;
 }
 
 interface WorkspaceShareCategoriesRow {
@@ -213,26 +209,13 @@ export function expandWorkspaceIdentitySetWithAliases(
         canonicalIdentityByStoredPath.set(identity, identity);
     }
 
-    if (canonical.length === 0 || !tableExists(db, "v22_identity_rekey_map")) {
+    if (canonical.length === 0) {
         return { expandedIdentities: [...expanded], canonicalIdentityByStoredPath };
     }
 
-    const rows = db
-        .prepare(
-            `SELECT old_project_path AS oldProjectPath, new_project_path AS newProjectPath
-               FROM v22_identity_rekey_map
-              WHERE new_project_path IN (${placeholders(canonical)})
-              ORDER BY old_project_path ASC`,
-        )
-        .all(...canonical) as IdentityAliasRow[];
-
-    for (const row of rows) {
-        if (typeof row.oldProjectPath !== "string" || typeof row.newProjectPath !== "string") {
-            continue;
-        }
-        if (!canonicalIdentityByStoredPath.has(row.newProjectPath)) continue;
-        expanded.add(row.oldProjectPath);
-        canonicalIdentityByStoredPath.set(row.oldProjectPath, row.newProjectPath);
+    for (const [alias, target] of collectAliasesForTargets(db, canonical)) {
+        expanded.add(alias);
+        canonicalIdentityByStoredPath.set(alias, target);
     }
 
     return { expandedIdentities: [...expanded], canonicalIdentityByStoredPath };

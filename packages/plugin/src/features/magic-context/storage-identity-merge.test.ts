@@ -271,4 +271,85 @@ describe("project identity merge", () => {
             project_path: "dir:module",
         });
     });
+
+    test("flattens the numeric project registry and the v22 map in the same merge", () => {
+        const database = makeDb();
+        database.exec(`
+            INSERT INTO projects (canonical_identity, created_at) VALUES ('git:source', 1), ('git:target', 1);
+            INSERT INTO project_aliases (alias_identity, project_id, created_at)
+            SELECT canonical_identity, id, 1 FROM projects;
+            INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at)
+            VALUES ('git:oldest', 'git:source', 1);
+        `);
+        insertMemory(database, "git:source", "payload", "payload-hash");
+        const targetId = (
+            database
+                .prepare("SELECT id FROM projects WHERE canonical_identity = 'git:target'")
+                .get() as { id: number }
+        ).id;
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 50 });
+
+        expect(
+            database
+                .prepare(
+                    "SELECT project_id FROM project_aliases WHERE alias_identity = 'git:source'",
+                )
+                .get(),
+        ).toEqual({ project_id: targetId });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM projects").get()).toEqual({
+            count: 1,
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT new_project_path AS target FROM v22_identity_rekey_map WHERE old_project_path = 'git:oldest'",
+                )
+                .get(),
+        ).toEqual({ target: "git:target" });
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS count FROM memories WHERE project_path = 'git:target'")
+                .get(),
+        ).toEqual({ count: 1 });
+    });
+
+    test("rolls back the whole merge when the source project owns authoritative children", () => {
+        const database = makeDb();
+        database.exec(`
+            INSERT INTO projects (canonical_identity, created_at) VALUES ('git:source', 1), ('git:target', 1);
+            INSERT INTO project_aliases (alias_identity, project_id, created_at)
+            SELECT canonical_identity, id, 1 FROM projects;
+        `);
+        const sourceId = (
+            database
+                .prepare("SELECT id FROM projects WHERE canonical_identity = 'git:source'")
+                .get() as { id: number }
+        ).id;
+        database
+            .prepare("INSERT INTO episodes (project_id, created_at) VALUES (?, 1)")
+            .run(sourceId);
+        insertMemory(database, "git:source", "payload", "payload-hash");
+
+        expect(() => mergeProjectIdentities(database, "git:source", "git:target")).toThrow(
+            /authoritative episodes or claims/,
+        );
+
+        expect(database.prepare("SELECT project_path FROM memories").get()).toEqual({
+            project_path: "git:source",
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT project_id FROM project_aliases WHERE alias_identity = 'git:source'",
+                )
+                .get(),
+        ).toEqual({ project_id: sourceId });
+        expect(
+            database.prepare("SELECT COUNT(*) AS count FROM v22_identity_rekey_map").get(),
+        ).toEqual({ count: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
+            count: 0,
+        });
+    });
 });

@@ -2,6 +2,16 @@ import { extractTiersFromInner } from "../../hooks/magic-context/compartment-par
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
+    assertClaimsSchemaForeignKeys,
+    CLAIMS_AND_EVIDENCE_TABLES,
+    createClaimsAndEvidenceSchema,
+} from "./storage-claims-schema";
+import {
+    assertProjectRegistrySeed,
+    resolveProjectIdentitySeed,
+    seedProjectRegistry,
+} from "./storage-project-identities";
+import {
     ensureColumn,
     healAllNullColumns,
     MEMORIES_AU_TRIGGER_BODY,
@@ -3087,6 +3097,31 @@ export const MIGRATIONS: Migration[] = [
             if (!tableExists(db, "notes")) return;
             ensureColumn(db, "notes", "source_revision", "INTEGER NOT NULL DEFAULT 0");
             ensureColumn(db, "notes", "state_version", "INTEGER NOT NULL DEFAULT 0");
+        },
+    },
+    {
+        version: 82,
+        description:
+            "authoritative claims and evidence schema with the numeric project identity registry",
+        up(db: Database): void {
+            // A replayed v82 must no-op over its own published schema, but a
+            // partial or foreign `projects` table is corruption, not a replay.
+            if (tableExists(db, "projects")) {
+                const missing = CLAIMS_AND_EVIDENCE_TABLES.filter(
+                    (table) => !tableExists(db, table),
+                );
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v82 replay guard: projects exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                return;
+            }
+            const seed = resolveProjectIdentitySeed(db);
+            createClaimsAndEvidenceSchema(db);
+            seedProjectRegistry(db, seed, Date.now());
+            assertProjectRegistrySeed(db, seed);
+            assertClaimsSchemaForeignKeys(db);
         },
     },
 ];
