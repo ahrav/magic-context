@@ -1,7 +1,10 @@
 //! Owner-provisioned model bundle: strict manifest schema, artifact
 //! confinement, and byte-hash verification before any model construction.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{Mode, OFlags};
 
 use super::protocol::sha256_hex;
 
@@ -202,28 +205,36 @@ pub fn load_bundle(dir: &Path) -> Result<VerifiedBundle, BundleError> {
     reject_unlisted_entries(dir, &seen_names)?;
 
     let read_verified = |artifact: &ArtifactRef, cap: u64| -> Result<Vec<u8>, BundleError> {
-        let bytes = read_artifact(dir, &artifact.name, cap)?;
-        let digest = sha256_hex(&bytes);
-        if digest != artifact.sha256 {
-            return Err(err(format!("artifact hash mismatch: {}", artifact.name)));
-        }
-        Ok(bytes)
+        read_verified_open(open_artifact(dir, &artifact.name)?, artifact, cap)
     };
 
-    // Metadata-only pre-check: an oversized weight total fails here, before
-    // any large read makes the bytes resident.
-    let mut weight_lens = vec![artifact_len(dir, &manifest.model_file.name)?];
+    // Metadata-only pre-check over the very descriptors the reads below draw
+    // from: an oversized weight total fails here, before any large read makes
+    // the bytes resident, and each descriptor's own length bounds its read.
+    let mut weights = Vec::with_capacity(1 + manifest.external_initializers.len());
+    weights.push(open_artifact(dir, &manifest.model_file.name)?);
     for artifact in &manifest.external_initializers {
-        weight_lens.push(artifact_len(dir, &artifact.name)?);
+        weights.push(open_artifact(dir, &artifact.name)?);
     }
-    validate_weights_budget(weight_lens, MAX_MODEL_BYTES)?;
+    validate_weights_budget(weights.iter().map(|weight| weight.len), MAX_MODEL_BYTES)?;
 
-    let onnx = read_verified(&manifest.model_file, MAX_MODEL_BYTES)?;
+    let mut weights = weights.into_iter();
+    let onnx = read_verified_open(
+        weights.next().expect("the model file is opened first"),
+        &manifest.model_file,
+        MAX_MODEL_BYTES,
+    )?;
     let mut initializers = Vec::with_capacity(manifest.external_initializers.len());
     for artifact in &manifest.external_initializers {
         initializers.push((
             artifact.name.clone(),
-            read_verified(artifact, MAX_MODEL_BYTES)?,
+            read_verified_open(
+                weights
+                    .next()
+                    .expect("one descriptor is opened per initializer"),
+                artifact,
+                MAX_MODEL_BYTES,
+            )?,
         ));
     }
     let tokenizer_file = read_verified(&manifest.tokenizer.tokenizer, MAX_SIDE_FILE_BYTES)?;
@@ -407,16 +418,82 @@ pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
     sha256_hex(lines.as_bytes())
 }
 
-/// Declared on-disk length of one confined regular-file artifact, without
-/// reading it.
-fn artifact_len(dir: &Path, name: &str) -> Result<u64, BundleError> {
+/// One confined artifact held open for reading, paired with the length its
+/// own descriptor reports.
+///
+/// Validation and reading share this descriptor because a path resolved twice
+/// can name two different files: bytes fetched through a second lookup are not
+/// the bytes whose type and length were checked, so a regular file that passes
+/// the bound can be replaced by a symlink or a far larger file before the
+/// read. Pinning the descriptor makes the checked file the read file.
+#[derive(Debug)]
+struct OpenArtifact {
+    file: std::fs::File,
+    len: u64,
+}
+
+/// Opens one confined artifact without following a symlink at the final
+/// component, then validates the descriptor's own metadata.
+fn open_artifact(dir: &Path, name: &str) -> Result<OpenArtifact, BundleError> {
     let path: PathBuf = dir.join(name);
-    let metadata = std::fs::symlink_metadata(&path)
+    // NOFOLLOW turns a symlink into an open failure rather than a redirect.
+    // NONBLOCK keeps the open itself from parking: a FIFO planted under an
+    // artifact name would otherwise block until a writer appears, before
+    // `fstat` can reject it as a non-regular file.
+    let fd = rustix::fs::open(
+        &path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|errno| {
+        // Under NOFOLLOW, `ELOOP` on the final component means the artifact
+        // is itself a symlink.
+        if errno == rustix::io::Errno::LOOP {
+            err(format!("artifact is not a regular file: {name}"))
+        } else {
+            err(format!("artifact is missing: {name}"))
+        }
+    })?;
+    let file = std::fs::File::from(fd);
+    let metadata = file
+        .metadata()
         .map_err(|_| err(format!("artifact is missing: {name}")))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if !metadata.is_file() {
         return Err(err(format!("artifact is not a regular file: {name}")));
     }
-    Ok(metadata.len())
+    Ok(OpenArtifact {
+        file,
+        len: metadata.len(),
+    })
+}
+
+/// Reads at most the length this descriptor reported. Growth after the length
+/// check truncates the read into a hash mismatch instead of an allocation the
+/// bound never authorized.
+fn read_open_artifact(open: OpenArtifact, name: &str) -> Result<Vec<u8>, BundleError> {
+    let mut bytes = Vec::with_capacity(open.len as usize);
+    open.file
+        .take(open.len)
+        .read_to_end(&mut bytes)
+        .map_err(|_| err(format!("artifact read failed: {name}")))?;
+    Ok(bytes)
+}
+
+/// Bound-checks, reads, and hash-verifies one opened artifact.
+fn read_verified_open(
+    open: OpenArtifact,
+    artifact: &ArtifactRef,
+    cap: u64,
+) -> Result<Vec<u8>, BundleError> {
+    let name = &artifact.name;
+    if open.len > cap {
+        return Err(err(format!("artifact exceeds its size bound: {name}")));
+    }
+    let bytes = read_open_artifact(open, name)?;
+    if sha256_hex(&bytes) != artifact.sha256 {
+        return Err(err(format!("artifact hash mismatch: {name}")));
+    }
+    Ok(bytes)
 }
 
 /// Rejects a weight set whose total exceeds `budget`. Saturating addition:
@@ -436,10 +513,11 @@ fn validate_weights_budget(
 }
 
 fn read_artifact(dir: &Path, name: &str, cap: u64) -> Result<Vec<u8>, BundleError> {
-    if artifact_len(dir, name)? > cap {
+    let open = open_artifact(dir, name)?;
+    if open.len > cap {
         return Err(err(format!("artifact exceeds its size bound: {name}")));
     }
-    std::fs::read(dir.join(name)).map_err(|_| err(format!("artifact read failed: {name}")))
+    read_open_artifact(open, name)
 }
 
 fn reject_unlisted_entries(dir: &Path, listed: &[&str]) -> Result<(), BundleError> {
@@ -598,5 +676,36 @@ mod tests {
     #[test]
     fn weights_budget_saturates_instead_of_overflowing() {
         assert!(validate_weights_budget([u64::MAX, u64::MAX], u64::MAX - 1).is_err());
+    }
+
+    #[test]
+    fn a_read_cannot_exceed_the_length_its_own_descriptor_validated() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("artifact.bin");
+        std::fs::write(&path, b"small").expect("write");
+
+        let open = open_artifact(dir.path(), "artifact.bin").expect("open");
+        assert_eq!(open.len, 5);
+
+        // The file grows on the same inode between the length check and the
+        // read, which is the window a second path lookup would read through.
+        std::fs::write(&path, vec![b'x'; 1 << 20]).expect("grow");
+
+        let bytes = read_open_artifact(open, "artifact.bin").expect("read");
+        assert_eq!(bytes.len(), 5, "the read is capped at the validated length");
+    }
+
+    #[test]
+    fn a_symlinked_artifact_never_opens() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("target.bin"), b"payload").expect("write");
+        std::os::unix::fs::symlink("target.bin", dir.path().join("artifact.bin")).expect("symlink");
+
+        let error = open_artifact(dir.path(), "artifact.bin").expect_err("symlink is refused");
+        assert!(
+            error.0.contains("not a regular file"),
+            "reason {:?} does not name the file-type refusal",
+            error.0
+        );
     }
 }
