@@ -16,6 +16,7 @@
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { toExactByteArray } from "./bytes";
 import type { Deadline } from "./deadline";
 
 export const NONCE_LEN = 32;
@@ -101,24 +102,6 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
     return timingSafeEqual(a, b);
 }
 
-/**
- * Exact-length integer byte array in `[0, 255]`, with no holes and no
- * coercion. Mirrors the connection-file validator; both modules are leaves
- * and must not depend on each other.
- */
-function toExactBytes(value: unknown, length: number): Uint8Array | null {
-    if (!Array.isArray(value) || value.length !== length) return null;
-    const bytes = new Uint8Array(length);
-    for (let i = 0; i < length; i++) {
-        if (!Object.hasOwn(value, i)) return null;
-        const element: unknown = value[i];
-        if (typeof element !== "number" || !Number.isInteger(element)) return null;
-        if (element < 0 || element > 255) return null;
-        bytes[i] = element;
-    }
-    return bytes;
-}
-
 function checkDeadline(deadline: Deadline): void {
     if (deadline.isExpired()) {
         throw new AuthError("authentication deadline expired", "deadline_expired");
@@ -202,21 +185,21 @@ function parseServerProof(message: unknown): ServerProofFields {
         throw new AuthError("ServerProof message must be a JSON object", "malformed_message");
     }
     const record = message as Record<string, unknown>;
-    const daemonId = toExactBytes(record.daemon_id, AUTH_DAEMON_ID_LEN);
+    const daemonId = toExactByteArray(record.daemon_id, AUTH_DAEMON_ID_LEN);
     if (daemonId === null) {
         throw new AuthError(
             `ServerProof daemon_id must be exactly ${AUTH_DAEMON_ID_LEN} integer bytes`,
             "malformed_message",
         );
     }
-    const serverNonce = toExactBytes(record.server_nonce, NONCE_LEN);
+    const serverNonce = toExactByteArray(record.server_nonce, NONCE_LEN);
     if (serverNonce === null) {
         throw new AuthError(
             `ServerProof server_nonce must be exactly ${NONCE_LEN} integer bytes`,
             "malformed_message",
         );
     }
-    const serverProof = toExactBytes(record.server_proof, PROOF_LEN);
+    const serverProof = toExactByteArray(record.server_proof, PROOF_LEN);
     if (serverProof === null) {
         throw new AuthError(
             `ServerProof server_proof must be exactly ${PROOF_LEN} integer bytes`,

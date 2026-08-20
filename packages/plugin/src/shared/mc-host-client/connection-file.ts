@@ -14,8 +14,11 @@
  *   prove both link and target unchanged. Any replacement fails closed.
  *
  * Failures are typed and redacted: no key or daemon-ID byte ever appears in
- * an error message. Leaf-adjacent module: imports only U1 leaves and the
- * Node standard library.
+ * an error message. Directory components of both paths are trusted:
+ * `O_NOFOLLOW` guards only the final component, and Node exposes no
+ * `openat2`/`RESOLVE_BENEATH` to constrain the prefix, so the runtime
+ * directory must not be writable by other users. Leaf-adjacent module:
+ * imports only leaf modules and the Node standard library.
  */
 
 import { constants as fsConstants } from "node:fs";
@@ -95,22 +98,12 @@ export interface ReadConnectionFileOptions {
 }
 
 /**
- * Exact-length JSON byte-array validation: every element must be
- * an own integer in `[0, 255]`. Sparse holes, `null`, fractions, negatives,
- * and values above 255 are all rejected without coercion.
+ * Exact-length JSON byte-array validation lives in the shared `bytes` leaf;
+ * re-exported here for the connection-file test suite.
  */
-export function toExactByteArray(value: unknown, length: number): Uint8Array | null {
-    if (!Array.isArray(value) || value.length !== length) return null;
-    const bytes = new Uint8Array(length);
-    for (let i = 0; i < length; i++) {
-        if (!Object.hasOwn(value, i)) return null;
-        const element: unknown = value[i];
-        if (typeof element !== "number" || !Number.isInteger(element)) return null;
-        if (element < 0 || element > 255) return null;
-        bytes[i] = element;
-    }
-    return bytes;
-}
+import { toExactByteArray } from "./bytes";
+
+export { toExactByteArray };
 
 function checkDeadline(deadline: Deadline): void {
     if (deadline.isExpired()) {
@@ -158,11 +151,15 @@ async function openNoFollow(filePath: string): Promise<FileHandle> {
 /**
  * Read up to cap + 1 bytes through the descriptor so an oversize file is
  * detected from the bytes actually read, not from possibly-stale metadata.
+ * The deadline is re-checked between reads; one in-flight `read()` cannot
+ * be cancelled, so a stalled filesystem can still exceed the budget by at
+ * most one syscall.
  */
-async function readBounded(handle: FileHandle): Promise<Uint8Array> {
+async function readBounded(handle: FileHandle, deadline: Deadline): Promise<Uint8Array> {
     const buffer = Buffer.alloc(MAX_CONNECTION_FILE_LEN + 1);
     let total = 0;
     while (total < buffer.length) {
+        checkDeadline(deadline);
         const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
         if (bytesRead === 0) break;
         total += bytesRead;
@@ -234,7 +231,7 @@ async function snapshotDirect(
         }
         validateOpenStat(during, uid, `connection file ${filePath}`);
         checkDeadline(deadline);
-        const bytes = await readBounded(handle);
+        const bytes = await readBounded(handle, deadline);
         checkDeadline(deadline);
         const after = await lstat(filePath);
         if (!after.isFile() || !sameIdentity(during, after)) {
@@ -279,7 +276,7 @@ async function snapshotTrustedSymlink(
         const target = await handle.stat();
         validateOpenStat(target, uid, `connection file target ${targetPath}`);
         checkDeadline(deadline);
-        const bytes = await readBounded(handle);
+        const bytes = await readBounded(handle, deadline);
         checkDeadline(deadline);
         const linkAfter = await lstat(linkPath);
         if (!linkAfter.isSymbolicLink() || !sameIdentity(linkBefore, linkAfter)) {

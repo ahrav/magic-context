@@ -463,7 +463,10 @@ export class SubcClient {
             onRouteGoodbye: (channel, epoch) => {
                 if (conn) this.onRouteGoodbye(conn, channel, epoch);
             },
-            onDiagnostic: (event) => this.emitDiagnostics(event),
+            // Skip per-frame event allocation entirely when no observer is
+            // configured; the generation's hook check short-circuits on
+            // undefined.
+            onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
             ...this.generationOptions,
         });
         conn = { generation, token: newConnectionToken(), snapshot };

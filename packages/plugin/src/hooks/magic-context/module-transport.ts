@@ -12,6 +12,7 @@ import {
     type BindIdentity,
     Deadline,
     isConsumerReconnectTransient,
+    isSubcCallError,
     Priority,
     type RouteHandle,
     type RouteTarget,
@@ -106,10 +107,14 @@ function isConnectionFailure(error: unknown): boolean {
     });
 }
 
-/** `SubcCallError.kind` recognized by wire-visible shape across bundled copies (plan R3). */
+/**
+ * `SubcCallError.kind` recognized via the shared cross-bundle check, which
+ * requires a real `Error` carrying the wire-visible name. The kind is still
+ * validated at runtime because a foreign bundle copy's field is untyped.
+ */
 function subcCallErrorKind(error: unknown): SubcCallError["kind"] | undefined {
-    if (!isRecord(error) || error.name !== "SubcCallError") return undefined;
-    const kind = error.kind;
+    if (!isSubcCallError(error)) return undefined;
+    const kind: unknown = error.kind;
     return kind === "not_sent" || kind === "outcome_unknown" || kind === "terminal"
         ? kind
         : undefined;
