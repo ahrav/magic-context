@@ -151,6 +151,13 @@ pub struct SynapseHost {
 
 impl SynapseHost {
     pub async fn start(synapse: SynapseComponent) -> Self {
+        Self::start_with(synapse, |_| {}).await
+    }
+
+    pub async fn start_with(
+        synapse: SynapseComponent,
+        tweak: impl FnOnce(&mut HostConfig),
+    ) -> Self {
         let composite = StaticComposite::new(EchoPrimary, synapse).expect("distinct component ids");
         let data_root = tempfile::tempdir().expect("temp data root");
         let mut config = HostConfig {
@@ -166,6 +173,7 @@ impl SynapseHost {
         config.timing.shutdown_deadline = Duration::from_secs(5);
         config.timing.route_close_budget = Duration::from_secs(2);
         config.timing.lifecycle_callback_deadline = Duration::from_secs(3);
+        tweak(&mut config);
 
         let publication = super::connection_file(data_root.path());
         let shutdown = CancellationToken::new();

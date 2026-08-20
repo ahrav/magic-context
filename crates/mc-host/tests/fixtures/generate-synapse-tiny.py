@@ -133,10 +133,13 @@ def canonical_fingerprint(
         raise ValueError("output selects no tensor")
     tokenizer = artifacts["tokenizer"]
     lines = [
-        "mc-synapse-fingerprint-v1",
+        "mc-synapse-fingerprint-v2",
         f"model_file={artifacts['model_file']['sha256']}",
     ]
-    lines += [f"external_initializer={a['sha256']}" for a in artifacts["external_initializers"]]
+    lines += [
+        f"external_initializer={len(a['name'].encode())}:{a['name']}:{a['sha256']}"
+        for a in artifacts["external_initializers"]
+    ]
     lines += [
         f"tokenizer={tokenizer['tokenizer']['sha256']}",
         f"config={tokenizer['config']['sha256']}",

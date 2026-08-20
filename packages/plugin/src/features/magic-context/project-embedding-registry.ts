@@ -445,6 +445,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
             synapse_provenance?: unknown;
         };
         return {
@@ -470,6 +471,11 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
                 : {}),
             ...(typeof synapse.synapse_recommended_batch === "number"
                 ? { synapse_recommended_batch: synapse.synapse_recommended_batch }
+                : {}),
+            ...(typeof synapse.synapse_recommended_token_budget === "number" &&
+            Number.isSafeInteger(synapse.synapse_recommended_token_budget) &&
+            synapse.synapse_recommended_token_budget > 0
+                ? { synapse_recommended_token_budget: synapse.synapse_recommended_token_budget }
                 : {}),
             ...(synapse.synapse_provenance !== undefined
                 ? { synapse_provenance: synapse.synapse_provenance }
@@ -521,6 +527,7 @@ function createProvider(
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
             synapse_provenance?: unknown;
         };
         return new SynapseEmbeddingProvider({
@@ -532,6 +539,7 @@ function createProvider(
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
+            recommendedTokenBudget: synapse.synapse_recommended_token_budget,
             maxInputTokens: synapse.max_input_tokens,
             provenance: synapse.synapse_provenance,
         });

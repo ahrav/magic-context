@@ -151,6 +151,9 @@ struct SynapseInner {
     /// One permit: at most one native inference call runs at a time, and
     /// waiters are served FIFO.
     cpu: Arc<tokio::sync::Semaphore>,
+    /// At most one query may wait for or use the serialized CPU lane. Batch
+    /// work is bounded separately by the job table.
+    query_admission: Arc<tokio::sync::Semaphore>,
     /// Owns every started native call through shutdown.
     tracker: TaskTracker,
     /// Cancels queued (not yet started) work and closes admission.
@@ -176,6 +179,7 @@ impl SynapseComponent {
                     reason: "not initialized".to_owned(),
                 }),
                 cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
             }),
@@ -199,6 +203,7 @@ impl SynapseComponent {
                     lane,
                 }))),
                 cpu: Arc::new(tokio::sync::Semaphore::new(1)),
+                query_admission: Arc::new(tokio::sync::Semaphore::new(1)),
                 tracker: TaskTracker::new(),
                 closing: CancellationToken::new(),
             }),
@@ -292,6 +297,7 @@ fn settle_inference(
 /// engine-reported error so an engine can never spoof a cancellation.
 enum QueryFault {
     Cancelled,
+    Timeout,
     Engine(InferenceError),
 }
 
@@ -362,6 +368,16 @@ impl SynapseComponent {
         if self.inner.closing.is_cancelled() {
             return app_error("cancelled", "the host is shutting down");
         }
+        let Ok(query_permit) = Arc::clone(&self.inner.query_admission).try_acquire_owned() else {
+            return app_error("queue_full", "query admission capacity is exhausted");
+        };
+        // The handler copy keeps the query lane charged while the response is
+        // produced; the worker copy keeps the charge through a native call
+        // that outlives its request deadline.
+        let _query_permit = Arc::new(query_permit);
+        let worker_query_permit = Arc::clone(&_query_permit);
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(deadline_ms.unwrap_or(protocol::MAX_DEADLINE_MS));
         let content_sha256 = protocol::sha256_hex(text.as_bytes());
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<Vec<f32>>, QueryFault>>();
         let inner = Arc::clone(&self.inner);
@@ -370,6 +386,7 @@ impl SynapseComponent {
         // the response waiter, so route loss or a deadline cancels waiting
         // without orphaning inference.
         self.inner.tracker.spawn(async move {
+            let _query_permit = worker_query_permit;
             let mut tx = tx;
             let permit = tokio::select! {
                 biased;
@@ -382,6 +399,10 @@ impl SynapseComponent {
                 // only queued; once the permit is held the call runs to
                 // completion regardless.
                 () = tx.closed() => return,
+                () = tokio::time::sleep_until(deadline) => {
+                    let _ = tx.send(Err(QueryFault::Timeout));
+                    return;
+                }
                 permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
             };
             let Ok(_permit) = permit else {
@@ -406,9 +427,7 @@ impl SynapseComponent {
             let _ = tx.send(result);
         });
 
-        let deadline =
-            std::time::Duration::from_millis(deadline_ms.unwrap_or(protocol::MAX_DEADLINE_MS));
-        let result = match tokio::time::timeout(deadline, rx).await {
+        let result = match tokio::time::timeout_at(deadline, rx).await {
             Err(_) => return app_error("timeout", "the query deadline expired host-side"),
             Ok(Err(_)) => return app_error("internal_error", "the inference task was lost"),
             Ok(Ok(result)) => result,
@@ -432,6 +451,9 @@ impl SynapseComponent {
                 }
             },
             Err(QueryFault::Cancelled) => app_error("cancelled", "the host is shutting down"),
+            Err(QueryFault::Timeout) => {
+                app_error("timeout", "the query deadline expired host-side")
+            }
             Err(QueryFault::Engine(InferenceError::Input(reason))) => {
                 app_error("schema_violation", &reason)
             }

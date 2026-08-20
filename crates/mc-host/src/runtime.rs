@@ -484,6 +484,14 @@ fn build_target_index(
         }
         target_entries.push((manifest.module_id.clone().into_boxed_str(), kinds));
     }
+    if !target_entries
+        .iter()
+        .any(|(_, kinds)| kinds.contains(&TargetKind::ToolProvider))
+    {
+        return Err(HostError::InitFailed(
+            "startup manifests do not advertise a tool_provider role".to_owned(),
+        ));
+    }
     Ok(crate::control::TargetIndex::new(target_entries))
 }
 

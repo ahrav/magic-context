@@ -278,7 +278,7 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), BundleError> {
     if manifest.model.is_empty() || manifest.model.len() > 128 {
         return Err(err("model name out of bounds"));
     }
-    validate_hash(&manifest.fingerprint)?;
+    validate_sha256_hex(&manifest.fingerprint).map_err(err)?;
     if manifest.dims == 0 || manifest.dims > MAX_DIMS {
         return Err(err("dims out of bounds"));
     }
@@ -326,37 +326,35 @@ fn validate_artifact_ref(artifact: &ArtifactRef) -> Result<(), BundleError> {
     if name == "." || name == ".." || name == "manifest.json" {
         return Err(err("artifact name is reserved"));
     }
-    validate_hash(&artifact.sha256)
+    validate_sha256_hex(&artifact.sha256).map_err(err)
 }
 
-fn validate_hash(hash: &str) -> Result<(), BundleError> {
+pub(crate) fn validate_sha256_hex(hash: &str) -> Result<(), &'static str> {
     if hash.len() != 64
         || !hash
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
     {
-        return Err(err("hash is not 64 lowercase hex characters"));
+        return Err("hash is not 64 lowercase hex characters");
     }
     // A placeholder hash can never be produced by hashing real bytes, and
     // accepting one would certify artifacts nobody hashed.
     if hash.bytes().all(|b| b == hash.as_bytes()[0]) {
-        return Err(err("hash is a placeholder"));
+        return Err("hash is a placeholder");
     }
     Ok(())
 }
 
 /// The canonical lane fingerprint: SHA-256 over a versioned, newline-joined
 /// `key=value` serialization of exactly the manifest fields that determine
-/// the embedding space — artifact hashes, pooling, quantization, output
-/// selection, truncation length, dimensions, and the destination-table
-/// epoch. Fields that cannot change a served vector (model name,
+/// the embedding space — artifact hashes, external-initializer names, pooling,
+/// quantization, output selection, truncation length, dimensions, and the
+/// destination-table epoch. Fields that cannot change a served vector (model name,
 /// provenance, `recommended_batch`) are excluded, so tuning them never
-/// forces a new lane identity. `docs/synapse-model-bundle.md` documents the
-/// exact byte layout; packaging tools mirror it.
+/// forces a new lane identity. Packaging tools mirror the exact byte layout.
 ///
-/// Assumes an already-validated manifest: hashes are lowercase hex and the
-/// enumerated fields hold allowlisted values, so no serialized value can
-/// contain `\n` or forge another line.
+/// Assumes an already-validated manifest. Initializer names are byte-length
+/// prefixed, so delimiters inside a legal filename cannot forge another field.
 pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
     let output = match (
         &manifest.output.name,
@@ -370,7 +368,7 @@ pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
         // fingerprint comparison, so this arm never reaches enforcement.
         _ => "unselected".to_owned(),
     };
-    let mut lines = String::from("mc-synapse-fingerprint-v1");
+    let mut lines = String::from("mc-synapse-fingerprint-v2");
     let mut line = |key: &str, value: &str| {
         lines.push('\n');
         lines.push_str(key);
@@ -379,7 +377,15 @@ pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
     };
     line("model_file", &manifest.model_file.sha256);
     for artifact in &manifest.external_initializers {
-        line("external_initializer", &artifact.sha256);
+        line(
+            "external_initializer",
+            &format!(
+                "{}:{}:{}",
+                artifact.name.len(),
+                artifact.name,
+                artifact.sha256
+            ),
+        );
     }
     line("tokenizer", &manifest.tokenizer.tokenizer.sha256);
     line("config", &manifest.tokenizer.config.sha256);
@@ -518,6 +524,65 @@ fn parse_corpus(bytes: &[u8], dims: usize) -> Result<Corpus, BundleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_binds_initializer_names_to_their_hashes() {
+        let artifact = |name: &str| ArtifactRef {
+            name: name.to_owned(),
+            sha256: sha256_hex(name.as_bytes()),
+        };
+        let mut manifest = BundleManifest {
+            schema_version: 1,
+            model: "test-model".to_owned(),
+            fingerprint: sha256_hex(b"fingerprint"),
+            table_epoch: 1,
+            dims: 8,
+            pooling: "mean".to_owned(),
+            quantization: "none".to_owned(),
+            output: OutputSelector {
+                name: Some("last_hidden_state".to_owned()),
+                index: None,
+                only_one: None,
+            },
+            max_tokens: 8,
+            provenance: serde_json::Value::Null,
+            recommended_batch: RecommendedBatch {
+                rows: 1,
+                token_budget: 8,
+            },
+            model_file: artifact("model.onnx"),
+            external_initializers: vec![artifact("first.bin"), artifact("second.bin")],
+            tokenizer: TokenizerRefs {
+                tokenizer: artifact("tokenizer.json"),
+                config: artifact("config.json"),
+                special_tokens_map: artifact("special_tokens_map.json"),
+                tokenizer_config: artifact("tokenizer_config.json"),
+            },
+            corpus: artifact("corpus.json"),
+        };
+
+        let hashes_before: Vec<_> = manifest
+            .external_initializers
+            .iter()
+            .map(|artifact| artifact.sha256.clone())
+            .collect();
+        let fingerprint_before = canonical_fingerprint(&manifest);
+        let (first, rest) = manifest
+            .external_initializers
+            .split_first_mut()
+            .expect("test manifest has initializers");
+        std::mem::swap(&mut first.name, &mut rest[0].name);
+
+        assert_eq!(
+            hashes_before,
+            manifest
+                .external_initializers
+                .iter()
+                .map(|artifact| artifact.sha256.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(fingerprint_before, canonical_fingerprint(&manifest));
+    }
 
     #[test]
     fn weights_budget_accepts_up_to_and_rejects_over_the_cap() {

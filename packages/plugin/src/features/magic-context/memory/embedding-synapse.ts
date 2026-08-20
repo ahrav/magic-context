@@ -98,6 +98,7 @@ export interface SynapseEmbeddingProviderOptions {
     tableEpoch?: number;
     dims?: number;
     recommendedBatch?: number;
+    recommendedTokenBudget?: number;
     maxInputTokens?: number;
     provenance?: unknown;
     moduleId?: string;
@@ -326,8 +327,10 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
                 ...(typeof recommendedBatch === "number" && recommendedBatch > 0
                     ? { recommended_batch: Math.floor(recommendedBatch) }
                     : {}),
-                ...(typeof recommendedTokenBudget === "number" && recommendedTokenBudget > 0
-                    ? { recommended_token_budget: Math.floor(recommendedTokenBudget) }
+                ...(typeof recommendedTokenBudget === "number" &&
+                Number.isSafeInteger(recommendedTokenBudget) &&
+                recommendedTokenBudget > 0
+                    ? { recommended_token_budget: recommendedTokenBudget }
                     : {}),
                 ...(typeof maxInputTokens === "number" &&
                 Number.isInteger(maxInputTokens) &&
@@ -460,6 +463,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             options.maxInputTokens > 0
                 ? options.maxInputTokens
                 : undefined;
+        const recommendedTokenBudget =
+            typeof options.recommendedTokenBudget === "number" &&
+            Number.isSafeInteger(options.recommendedTokenBudget) &&
+            options.recommendedTokenBudget > 0
+                ? options.recommendedTokenBudget
+                : undefined;
         this.metadata =
             fingerprint &&
             Number.isInteger(options.tableEpoch) &&
@@ -472,6 +481,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                       dims: options.dims as number,
                       ...(options.recommendedBatch
                           ? { recommended_batch: Math.max(1, Math.floor(options.recommendedBatch)) }
+                          : {}),
+                      ...(recommendedTokenBudget !== undefined
+                          ? { recommended_token_budget: recommendedTokenBudget }
                           : {}),
                       ...(maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}),
                       ...(options.provenance !== undefined
@@ -909,6 +921,20 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 } catch (error) {
                     const classified = classifyError(error);
                     if (classified.code !== "module_restarted") {
+                        markSynapseLedgerObsolete(db, {
+                            rowId: row.rowId,
+                            expectedStateVersion: row.stateVersion,
+                        });
+                        row = freshPage();
+                        try {
+                            row = markSynapseLedgerOutcome(db, {
+                                rowId: row.rowId,
+                                expectedStateVersion: row.stateVersion,
+                                disposition: classified.permanent ? "permanent" : "retryable",
+                            });
+                        } catch (casError) {
+                            if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
+                        }
                         classified.ledgerRowId = row.rowId;
                         throw classified;
                     }
@@ -1230,7 +1256,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
             const parsed = responseBody(body);
             const items = extractBatchItems(body);
-            if (parsed.complete !== true && items.length === 0 && allItems.length === 0) {
+            const nextCursor = parsed.next_cursor ?? parsed.cursor;
+            if (
+                parsed.complete !== true &&
+                items.length === 0 &&
+                (nextCursor === undefined || nextCursor === null)
+            ) {
                 const pendingDelay = pendingPollDelay(parsed, false, deadlineAt);
                 if (pendingDelay !== null) {
                     await wait(pendingDelay);
@@ -1238,13 +1269,14 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 }
             }
             allItems.push(...items);
-            const nextCursor = parsed.next_cursor ?? parsed.cursor;
             const done =
                 parsed.done === true ||
                 parsed.complete === true ||
                 nextCursor === undefined ||
                 nextCursor === null;
-            if (done) return { ...parsed, items: allItems };
+            if (done) {
+                return { ...parsed, result: undefined, vectors: allItems, items: allItems };
+            }
             cursor = nextCursor;
         }
     }

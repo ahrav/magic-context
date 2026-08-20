@@ -325,6 +325,63 @@ describe("recommended batch policy", () => {
         expect(calls.map((page) => page.length)).toEqual([2, 2]);
     });
 
+    it("preserves the token budget when reconstructing a pinned provider", async () => {
+        const mib = 1024 * 1024;
+        const itemBytes = Math.ceil((9.6 * mib) / 2);
+        const acceptedPageBytes: number[] = [];
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "/tmp/unused",
+            projectRoot: "/tmp/p",
+            session: "s",
+            model: "gte-modernbert-base-f16",
+            fingerprint: "fp1",
+            tableEpoch: 0,
+            dims: 3,
+            recommendedBatch: 2,
+            recommendedTokenBudget: Math.ceil(itemBytes / 4) + 1,
+            clientFactory: async () =>
+                ({
+                    async call(_m: string, method: string, params?: unknown) {
+                        if (method !== "embed.batch") throw new Error(`unexpected ${method}`);
+                        const items = (
+                            params as {
+                                items: Array<{ id: string; text: string; content_sha256: string }>;
+                            }
+                        ).items;
+                        const bytes = items.reduce((total, item) => total + item.text.length, 0);
+                        if (bytes > 5 * mib) {
+                            const error = new Error("request exceeds host cap") as Error & {
+                                code: string;
+                            };
+                            error.code = "schema_violation";
+                            throw error;
+                        }
+                        acceptedPageBytes.push(bytes);
+                        return {
+                            items: items.map((item) => ({
+                                id: item.id,
+                                embedding: [0.5, 0.5, 0.5],
+                                content_sha256: item.content_sha256,
+                                fingerprint: "fp1",
+                                table_epoch: 0,
+                            })),
+                        };
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        const text = "x".repeat(itemBytes);
+        const contentSha256 = createHash("sha256").update(text).digest("hex");
+
+        const vectors = await provider.embedItems([
+            { id: "a", text, contentSha256 },
+            { id: "b", text, contentSha256 },
+        ]);
+
+        expect(vectors.size).toBe(2);
+        expect(acceptedPageBytes).toEqual([itemBytes, itemBytes]);
+    });
+
     it("bare-number recommended_batch still sets the row limit (legacy wire shape)", async () => {
         const calls: number[] = [];
         const provider = new SynapseEmbeddingProvider({
@@ -1055,6 +1112,82 @@ describe("embedItemsDetailed", () => {
         }
     });
 
+    it("records a retained ready-job failure and lets the next call retry", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([{ id: "memory:1", group: "g1" }]);
+            const requestKey = getSynapseBatchRequestKey({
+                model: MODEL,
+                fingerprint: FP,
+                tableEpoch: 0,
+                items,
+            });
+            const created = createSynapseLedgerPage(db, {
+                projectPath: "/repo",
+                sessionId: "ses-1",
+                scope: "memory",
+                laneRole: "primary",
+                destinationModel: getSynapseLaneIdentity(MODEL, FP),
+                applicationGroup: "g1",
+                requestKey,
+                manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                deadlineAt: Date.now() + 60_000,
+            });
+            let seeded = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-crashed",
+                jobId: "job-retained",
+            });
+            seeded = markSynapseLedgerReady(db, {
+                rowId: seeded.rowId,
+                expectedStateVersion: seeded.stateVersion,
+                jobId: "job-retained",
+            });
+            host.resultPages = (jobId, jobItems) => {
+                if (jobId === "job-retained") {
+                    const error = new Error("retained job unavailable") as Error & {
+                        code: string;
+                        retry_after_ms: number;
+                    };
+                    error.code = "queue_full";
+                    error.retry_after_ms = 0;
+                    return error;
+                }
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: jobItems.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+
+            const failed = await provider.embedItemsDetailed(items, detailedContext(db));
+            expect(failed.receipts).toEqual([]);
+            expect(failed.failures).toHaveLength(1);
+            expect(failed.failures[0].disposition).toBe("retryable");
+            const failedRows = ledgerRows(db);
+            expect(failedRows.map((row) => row.state)).toEqual(["obsolete", "failed"]);
+            expect(failedRows[1].failure_disposition).toBe("retryable");
+
+            const retried = await provider.embedItemsDetailed(items, detailedContext(db));
+            expect(retried.failures).toEqual([]);
+            expect(retried.receipts).toHaveLength(1);
+            expect(retried.receipts[0].rowId).toBe(failedRows[1].id);
+            expect(ledgerRows(db).map((row) => row.state)).toEqual(["obsolete", "ready"]);
+            expect(host.batchCalls()).toHaveLength(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     it("bypasses generic retry on module_restarted and resubmits the same page key exactly once", async () => {
         const db = ledgerDb();
         try {
@@ -1407,6 +1540,62 @@ describe("embedItemsDetailed", () => {
             ]);
             expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
             expect(host.resultCalls()).toHaveLength(2);
+            expect(ledgerRows(db)).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("keeps the cursor while a later legacy result page is pending", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const cursors: unknown[] = [];
+            host.resultPages = (_jobId, items, index, cursor) => {
+                cursors.push(cursor);
+                if (index === 0) {
+                    return {
+                        result: {
+                            ...ENVELOPE,
+                            complete: false,
+                            next_cursor: "cursor-1",
+                            vectors: [
+                                {
+                                    id: items[0].id,
+                                    content_sha256: items[0].content_sha256,
+                                    vector: [1, 2, 3],
+                                },
+                            ],
+                        },
+                    };
+                }
+                if (index === 1) {
+                    return { result: { complete: false, status: "running", retry_after_ms: 0 } };
+                }
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        complete: true,
+                        vectors: [
+                            {
+                                id: items[1].id,
+                                content_sha256: items[1].content_sha256,
+                                vector: [4, 5, 6],
+                            },
+                        ],
+                    },
+                };
+            };
+            const provider = detailedProvider(host);
+
+            const vectors = await provider.embedItems([
+                { id: "memory:1", text: "one", contentSha256: "a" },
+                { id: "memory:2", text: "two", contentSha256: "b" },
+            ]);
+
+            expect([...vectors.keys()]).toEqual(["memory:1", "memory:2"]);
+            expect(vectors.get("memory:2")).toEqual(new Float32Array([4, 5, 6]));
+            expect(cursors).toEqual([null, "cursor-1", "cursor-1"]);
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);

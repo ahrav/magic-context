@@ -80,6 +80,98 @@ async fn embed_query_returns_a_bound_vector() {
 }
 
 #[tokio::test]
+async fn query_overload_preserves_tool_provider_capacity() {
+    let engine = DeterministicEngine::new();
+    engine.set_delay(std::time::Duration::from_secs(2));
+    let host = SynapseHost::start_with(
+        ready_component(engine.clone(), SynapseLimits::default()),
+        |config| config.limits.max_handler_tasks = 2,
+    )
+    .await;
+    let lane = test_lane();
+
+    let mut first_client = host.client().await;
+    let (first_channel, first_epoch) = open_synapse_route(&mut first_client).await;
+    let mut first_params = constraints(&lane);
+    first_params["text"] = "slow query".into();
+    first_params["deadline_ms"] = 3000.into();
+    let first = tokio::spawn(async move {
+        call(
+            &mut first_client,
+            first_channel,
+            first_epoch,
+            "embed.query",
+            first_params,
+        )
+        .await
+    });
+
+    let started_by = tokio::time::Instant::now() + BUDGET;
+    while engine.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < started_by,
+            "first query never reached inference"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let mut overload_client = host.client().await;
+    let (overload_channel, overload_epoch) = open_synapse_route(&mut overload_client).await;
+    let mut overload_params = constraints(&lane);
+    overload_params["text"] = "queued query".into();
+    overload_params["deadline_ms"] = 3000.into();
+    let overloaded = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        call(
+            &mut overload_client,
+            overload_channel,
+            overload_epoch,
+            "embed.query",
+            overload_params,
+        ),
+    )
+    .await
+    .expect("query overload must reject promptly");
+    assert_eq!(overloaded.error_code(), "queue_full");
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an overloaded query must not reach inference"
+    );
+
+    let mut tool_client = host.client().await;
+    let (tool_channel, tool_epoch) = tool_client
+        .route_open("magic-context", "/workspace/project", "opencode", "tool")
+        .await
+        .expect("tool-provider route");
+    let corr = tool_client.next_corr();
+    tool_client
+        .send_frame(
+            support::raw_client::TY_REQUEST,
+            support::raw_client::FLAGS_INTERACTIVE,
+            tool_channel,
+            tool_epoch,
+            corr,
+            b"tool request",
+        )
+        .await
+        .expect("send tool-provider request");
+    let (_, tool_frame) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tool_client.frames_until_corr(corr, BUDGET),
+    )
+    .await
+    .expect("tool-provider request must retain capacity")
+    .expect("tool-provider terminal");
+    assert_eq!(tool_frame.ty, support::raw_client::TY_RESPONSE);
+    assert_eq!(tool_frame.body, b"tool request");
+
+    let first = first.await.expect("first query task");
+    assert_eq!(first.ty, support::raw_client::TY_RESPONSE);
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
 async fn embed_query_rejects_every_constraint_violation() {
     let engine = DeterministicEngine::new();
     let host = SynapseHost::start(ready_component(engine.clone(), SynapseLimits::default())).await;

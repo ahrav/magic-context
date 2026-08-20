@@ -26,6 +26,7 @@ export interface ResolvedSynapseEmbeddingConfig {
     // treats a missing value as adopt-on-first-write.
     synapse_dims?: number;
     synapse_recommended_batch?: number;
+    synapse_recommended_token_budget?: number;
     synapse_provenance?: unknown;
 }
 
@@ -100,6 +101,7 @@ function synapseOptions(
                   tableEpoch: metadata.table_epoch,
                   dims: metadata.dims,
                   recommendedBatch: metadata.recommended_batch,
+                  recommendedTokenBudget: metadata.recommended_token_budget,
                   maxInputTokens: metadata.max_input_tokens,
                   provenance: metadata.provenance,
               }
@@ -148,6 +150,9 @@ function resolvedSynapseConfig(
         ...(typeof metadata.dims === "number" ? { synapse_dims: metadata.dims } : {}),
         ...(metadata.recommended_batch
             ? { synapse_recommended_batch: metadata.recommended_batch }
+            : {}),
+        ...(metadata.recommended_token_budget
+            ? { synapse_recommended_token_budget: metadata.recommended_token_budget }
             : {}),
         ...(metadata.provenance !== undefined ? { synapse_provenance: metadata.provenance } : {}),
     };

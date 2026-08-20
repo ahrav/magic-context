@@ -89,9 +89,9 @@ The canonical value is `sha256` over the UTF-8 bytes of a newline-joined
 fields that determine a served vector:
 
 ```text
-mc-synapse-fingerprint-v1
+mc-synapse-fingerprint-v2
 model_file=<sha256>
-external_initializer=<sha256>     # repeated, in manifest order, may be absent
+external_initializer=<UTF-8-byte-length-of-name>:<name>:<sha256>
 tokenizer=<sha256>
 config=<sha256>
 special_tokens_map=<sha256>
@@ -105,8 +105,11 @@ table_epoch=<int>
 corpus=<sha256>
 ```
 
-There is no trailing newline. Fields that cannot change a served vector —
-`model`, `provenance`, `recommended_batch` — are excluded, so tuning them
+There is no trailing newline. Initializer lines repeat in manifest order and
+may be absent. The UTF-8 byte-length prefix removes delimiter ambiguity, while
+the complete initializer line binds each name to its digest. Fields that
+cannot change a served vector — `model`, `provenance`, `recommended_batch` —
+are excluded, so tuning them
 never forces a new lane identity. `canonical_fingerprint` in
 `crates/mc-host/src/synapse/bundle.rs` is the source of truth;
 `generate-synapse-tiny.py` mirrors it, and packaging tools must recompute the
@@ -116,13 +119,24 @@ digest whenever any listed field changes.
 
 The host loads ONNX Runtime dynamically and commits it process-globally
 exactly once. Startup configuration supplies the library path plus the
-SHA-256 of its bytes; a missing file, wrong hash, placeholder hash, or an
-environment that something else already initialized disables the lane. The
-resolved crate graph is pinned to `fastembed 6.0.0` and `ort 2.0.0-rc.13`
-with defaults disabled: the only ORT-related features are `std`, `ndarray`,
-`api-17`..`api-24`, `load-dynamic`, `preload-dylibs`, and
-`ort-sys/disable-linking`. No download, copy, TLS/fetch, Hugging Face,
-image-model, or accelerator feature is reachable; verify with
+SHA-256 of its source bytes. On Linux, the host copies those bytes into an
+exclusively created staging file that requests mode `0600` inside a private
+`0700` directory whose name uses OS-generated random bytes. The process umask
+can only remove permissions from the requested file mode. After hash-verifying
+the staged copy and changing it to `0400`, the host unlinks its directory entry,
+removes the private directory, and directs ORT to the exact open file object through
+`/proc/self/fd/<fd>`. The `ort` crate uses first-wins dynamic loading and does
+not expose the winning path, so the executable must leave ORT initialization
+to mc-host; this workspace contains no other initialization call. Subject to
+that process-composition contract, path replacement cannot change the bytes
+loaded by mc-host. Unsupported non-Linux hosts fail closed. A missing file,
+wrong hash, placeholder hash, or preinitialized ORT environment disables the
+lane.
+The resolved crate graph is pinned to `fastembed 6.0.0` and
+`ort 2.0.0-rc.13` with defaults disabled: the only ORT-related features are
+`std`, `ndarray`, `api-17`..`api-24`, `load-dynamic`, `preload-dylibs`, and
+`ort-sys/disable-linking`. No download, TLS/fetch, Hugging Face, image-model,
+or accelerator feature is reachable; verify with
 `cargo tree -p mc-host -e features`.
 
 `magic-context-c50.8` owns installing the production bundle and shared

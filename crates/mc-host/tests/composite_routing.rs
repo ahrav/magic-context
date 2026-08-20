@@ -35,6 +35,7 @@ struct FakeComponent {
     role: &'static str,
     disabled: Arc<AtomicBool>,
     health: Arc<Mutex<HealthReport>>,
+    initialize_barrier: Arc<tokio::sync::Barrier>,
     events: Arc<Mutex<Vec<Ev>>>,
     /// Id-tagged event log; `fake_pair` shares one between both components
     /// so cross-component ordering is observable.
@@ -48,6 +49,7 @@ impl FakeComponent {
             role,
             disabled: Arc::new(AtomicBool::new(false)),
             health: Arc::new(Mutex::new(HealthReport::ok())),
+            initialize_barrier: Arc::new(tokio::sync::Barrier::new(1)),
             events: Arc::new(Mutex::new(Vec::new())),
             timeline: Arc::new(Mutex::new(Vec::new())),
         }
@@ -60,6 +62,11 @@ impl FakeComponent {
             detail: Some("artifact_invalid".to_owned()),
             metrics: None,
         };
+    }
+
+    fn with_initialize_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        self.initialize_barrier = barrier;
+        self
     }
 
     fn set_health(&self, status: HealthStatus, detail: &str) {
@@ -142,6 +149,7 @@ impl CompositeComponent for FakeComponent {
 
 impl PrimaryComponent for FakeComponent {
     async fn initialize(&self, _init: HostInit) -> Result<(), InitError> {
+        self.initialize_barrier.wait().await;
         self.push(Ev::Initialized);
         Ok(())
     }
@@ -149,6 +157,7 @@ impl PrimaryComponent for FakeComponent {
 
 impl SecondaryComponent for FakeComponent {
     async fn initialize(&self) -> Result<(), InitError> {
+        self.initialize_barrier.wait().await;
         self.push(Ev::Initialized);
         Ok(())
     }
@@ -159,6 +168,24 @@ fn fake_pair() -> (FakeComponent, FakeComponent) {
     let mut secondary = FakeComponent::new("synapse", "management_surface");
     secondary.timeline = primary.timeline.clone();
     (primary, secondary)
+}
+
+#[tokio::test]
+async fn independent_component_initializers_overlap() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let primary = FakeComponent::new("magic-context", "tool_provider")
+        .with_initialize_barrier(Arc::clone(&barrier));
+    let secondary =
+        FakeComponent::new("synapse", "management_surface").with_initialize_barrier(barrier);
+    let composite = StaticComposite::new(primary.clone(), secondary.clone()).expect("distinct ids");
+
+    tokio::time::timeout(BUDGET, composite.initialize(HostInit::default()))
+        .await
+        .expect("both initializers enter the barrier")
+        .expect("initialization succeeds");
+
+    assert_eq!(primary.events(), vec![Ev::Initialized]);
+    assert_eq!(secondary.events(), vec![Ev::Initialized]);
 }
 
 struct CompositeHost {
@@ -578,20 +605,19 @@ fn manifest(module_id: &str, roles: &[&str]) -> ManifestSnapshot {
 
 async fn expect_init_failure(manifests: Vec<ManifestSnapshot>) {
     let data_root = tempfile::tempdir().expect("temp data root");
+    let publication = support::connection_file(data_root.path());
     let config = HostConfig {
         data_dir: Some(data_root.path().to_path_buf()),
         ..Default::default()
     };
-    let result = mc_host::run(
-        BadManifestHandler { manifests },
-        config,
-        CancellationToken::new(),
-    )
-    .await;
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+    let result = mc_host::run(BadManifestHandler { manifests }, config, shutdown).await;
     assert!(
         matches!(result, Err(HostError::InitFailed(_))),
         "invalid manifest sets must fail before publication"
     );
+    assert!(!publication.exists(), "invalid manifests must not publish");
 }
 
 #[tokio::test]
@@ -611,6 +637,7 @@ async fn invalid_manifest_sets_fail_before_publication() {
     expect_init_failure(vec![manifest("a", &["mystery_role"])]).await;
     expect_init_failure(vec![manifest("a", &["tool_provider", "tool_provider"])]).await;
     expect_init_failure(vec![manifest("a", &[])]).await;
+    expect_init_failure(vec![manifest("a", &["management_surface"])]).await;
 }
 
 /// A secondary whose shutdown always panics, for proving the composite still

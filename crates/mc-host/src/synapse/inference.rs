@@ -2,6 +2,8 @@
 //! structural startup probe, and semantic certification against the bundle
 //! corpus.
 
+#[cfg(target_os = "linux")]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -10,7 +12,7 @@ use fastembed::{
     UserDefinedEmbeddingModel,
 };
 
-use super::bundle::{Corpus, SelectedOutput, VerifiedBundle};
+use super::bundle::{validate_sha256_hex, Corpus, SelectedOutput, VerifiedBundle};
 
 /// How far a returned vector's L2 norm may sit from 1.0 before the backend
 /// treats it as an invariant failure rather than rounding noise.
@@ -53,11 +55,41 @@ impl std::error::Error for InferenceError {}
 /// racing initializers so only one of them performs the commit.
 static ORT_COMMITTED: Mutex<Option<OrtIdentity>> = Mutex::new(None);
 
+#[cfg(target_os = "linux")]
+const STAGED_ORT_NAME: &str = "onnxruntime-library";
+
+#[cfg(target_os = "linux")]
+struct OrtStagingDir {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OrtStagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.path.join(STAGED_ORT_NAME));
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct VerifiedOrtLibrary {
+    _file: std::fs::File,
+    load_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedOrtLibrary {
+    fn load_path(&self) -> &std::path::Path {
+        &self.load_path
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn ensure_ort(identity: &OrtIdentity) -> Result<(), InferenceError> {
     // Verification precedes the committed-identity comparison, so an
     // invalid identity reports its verification error even after another
     // lane commits a different identity.
-    verify_ort_library(identity)?;
+    let verified = verify_ort_library(identity)?;
     let mut committed = ORT_COMMITTED
         .lock()
         .map_err(|_| InferenceError::Invariant("ORT init state is poisoned".to_owned()))?;
@@ -69,7 +101,10 @@ fn ensure_ort(identity: &OrtIdentity) -> Result<(), InferenceError> {
             "a different ONNX Runtime identity is already committed".to_owned(),
         ));
     }
-    let builder = ort::init_from(&identity.library)
+    // This is the workspace's only `ort::init_from` call. `ort` is first-wins
+    // and does not expose the winning path, so process composition must keep
+    // ORT initialization behind this owner.
+    let builder = ort::init_from(verified.load_path())
         .map_err(|_| InferenceError::Artifact("ONNX Runtime library failed to load".to_owned()))?;
     if !builder.commit() {
         // Something else already configured the process-global environment,
@@ -82,21 +117,21 @@ fn ensure_ort(identity: &OrtIdentity) -> Result<(), InferenceError> {
     Ok(())
 }
 
-fn verify_ort_library(identity: &OrtIdentity) -> Result<(), InferenceError> {
-    if identity.sha256.len() != 64
-        || !identity
-            .sha256
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        || identity
-            .sha256
-            .bytes()
-            .all(|b| b == identity.sha256.as_bytes()[0])
-    {
-        return Err(InferenceError::Artifact(
-            "expected ONNX Runtime hash is not a real digest".to_owned(),
-        ));
-    }
+#[cfg(not(target_os = "linux"))]
+fn ensure_ort(_identity: &OrtIdentity) -> Result<(), InferenceError> {
+    Err(InferenceError::Artifact(
+        "secure ONNX Runtime staging requires Linux".to_owned(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_ort_library(identity: &OrtIdentity) -> Result<VerifiedOrtLibrary, InferenceError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    validate_sha256_hex(&identity.sha256).map_err(|_| {
+        InferenceError::Artifact("expected ONNX Runtime hash is not a real digest".to_owned())
+    })?;
     let metadata = std::fs::symlink_metadata(&identity.library)
         .map_err(|_| InferenceError::Artifact("ONNX Runtime library is missing".to_owned()))?;
     if !metadata.is_file() {
@@ -106,12 +141,76 @@ fn verify_ort_library(identity: &OrtIdentity) -> Result<(), InferenceError> {
     }
     let bytes = std::fs::read(&identity.library)
         .map_err(|_| InferenceError::Artifact("ONNX Runtime library read failed".to_owned()))?;
-    if super::protocol::sha256_hex(&bytes) != identity.sha256 {
+
+    let mut random = [0u8; 32];
+    getrandom::getrandom(&mut random)
+        .map_err(|_| InferenceError::Artifact("ONNX Runtime staging entropy failed".to_owned()))?;
+    let temp_root = std::fs::canonicalize(std::env::temp_dir()).map_err(|_| {
+        InferenceError::Artifact("ONNX Runtime staging directory is unavailable".to_owned())
+    })?;
+    let staging_path = temp_root.join(format!(
+        ".mc-host-ort-{}-{}",
+        std::process::id(),
+        super::protocol::sha256_hex(&random)
+    ));
+    let mut dir = std::fs::DirBuilder::new();
+    dir.mode(0o700);
+    dir.create(&staging_path).map_err(|_| {
+        InferenceError::Artifact("ONNX Runtime staging directory creation failed".to_owned())
+    })?;
+    let staging = OrtStagingDir { path: staging_path };
+    std::fs::set_permissions(&staging.path, std::fs::Permissions::from_mode(0o700)).map_err(
+        |_| {
+            InferenceError::Artifact("ONNX Runtime staging directory permissions failed".to_owned())
+        },
+    )?;
+
+    let staged_path = staging.path.join(STAGED_ORT_NAME);
+    let mut staged_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staged_path)
+        .map_err(|_| {
+            InferenceError::Artifact("ONNX Runtime staging file creation failed".to_owned())
+        })?;
+    staged_file.write_all(&bytes).map_err(|_| {
+        InferenceError::Artifact("ONNX Runtime staging file write failed".to_owned())
+    })?;
+    drop(bytes);
+    staged_file.seek(SeekFrom::Start(0)).map_err(|_| {
+        InferenceError::Artifact("ONNX Runtime staging file seek failed".to_owned())
+    })?;
+    let mut staged_bytes = Vec::new();
+    staged_file.read_to_end(&mut staged_bytes).map_err(|_| {
+        InferenceError::Artifact("ONNX Runtime staging file read failed".to_owned())
+    })?;
+    if super::protocol::sha256_hex(&staged_bytes) != identity.sha256 {
         return Err(InferenceError::Artifact(
             "ONNX Runtime library hash mismatch".to_owned(),
         ));
     }
-    Ok(())
+    drop(staged_bytes);
+    staged_file
+        .set_permissions(std::fs::Permissions::from_mode(0o400))
+        .map_err(|_| {
+            InferenceError::Artifact("ONNX Runtime staging file permissions failed".to_owned())
+        })?;
+
+    // `ort::init_from` accepts only a path. Linux's descriptor path reopens
+    // this exact verified file object; unlinking its directory entry first
+    // removes the path-swap window between verification and dynamic loading.
+    let load_path = PathBuf::from(format!("/proc/self/fd/{}", staged_file.as_raw_fd()));
+    std::fs::remove_file(&staged_path)
+        .map_err(|_| InferenceError::Artifact("ONNX Runtime staging unlink failed".to_owned()))?;
+    std::fs::remove_dir(&staging.path)
+        .map_err(|_| InferenceError::Artifact("ONNX Runtime staging cleanup failed".to_owned()))?;
+    drop(staging);
+    Ok(VerifiedOrtLibrary {
+        _file: staged_file,
+        load_path,
+    })
 }
 
 /// One loaded certified model. `TextEmbedding::embed` needs `&mut`, so the
@@ -283,5 +382,47 @@ impl Backend {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_replacement_cannot_change_verified_loader_bytes() {
+        let source_dir = tempfile::tempdir().expect("source directory");
+        let source = source_dir.path().join("libonnxruntime.so");
+        let replacement = source_dir.path().join("replacement.so");
+        let verified_bytes = b"certified ONNX Runtime bytes";
+        let replacement_bytes = b"unverified replacement bytes";
+        std::fs::write(&source, verified_bytes).expect("write source");
+        let identity = OrtIdentity {
+            library: source.clone(),
+            sha256: super::super::protocol::sha256_hex(verified_bytes),
+        };
+        let verified = verify_ort_library(&identity).expect("verified staging");
+
+        std::fs::write(&replacement, replacement_bytes).expect("write replacement");
+        std::fs::rename(&replacement, &source).expect("replace source");
+
+        let loaded_path = verified.load_path().to_path_buf();
+        assert_ne!(loaded_path, source);
+        assert!(loaded_path.starts_with("/proc/self/fd"));
+        let loaded_bytes = std::fs::read(&loaded_path).expect("read loader path");
+        assert_eq!(loaded_bytes, verified_bytes);
+        assert_eq!(
+            super::super::protocol::sha256_hex(&loaded_bytes),
+            identity.sha256
+        );
+
+        assert_eq!(
+            std::fs::read(&source).expect("read replaced source"),
+            replacement_bytes
+        );
+
+        drop(verified);
+        assert!(!loaded_path.exists());
     }
 }

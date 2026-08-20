@@ -333,6 +333,53 @@ async fn cancelled_query_before_cpu_admission_runs_no_inference() {
 }
 
 #[tokio::test]
+async fn queued_query_wait_is_bounded_by_its_deadline() {
+    let engine = DeterministicEngine::new();
+    engine.set_delay(Duration::from_millis(400));
+    let host = SynapseHost::start(ready_component(engine.clone(), SynapseLimits::default())).await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let lane = test_lane();
+
+    let frame = call(
+        &mut client,
+        channel,
+        epoch,
+        "embed.batch",
+        batch_params(&lane, &items(&[("a", "cpu hog")])),
+    )
+    .await;
+    assert!(frame.json()["result"]["job_id"].is_string());
+    let started_by = tokio::time::Instant::now() + BUDGET;
+    while engine.calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < started_by,
+            "batch inference never started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut params = constraints(&lane);
+    params["text"] = "deadline-bound query".into();
+    params["deadline_ms"] = 50.into();
+    let frame = tokio::time::timeout(
+        Duration::from_millis(250),
+        call(&mut client, channel, epoch, "embed.query", params),
+    )
+    .await
+    .expect("query must honor its deadline");
+    assert_eq!(frame.error_code(), "timeout");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        engine.calls.load(Ordering::SeqCst),
+        1,
+        "a query whose queue deadline expires must not reach inference"
+    );
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
 async fn failed_jobs_report_their_stored_error() {
     let engine = DeterministicEngine::new();
     engine.fail_next(mc_host::synapse::inference::InferenceError::Invariant(

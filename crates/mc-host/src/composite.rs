@@ -108,8 +108,14 @@ impl<P: PrimaryComponent, S: SecondaryComponent> McHostHandler for StaticComposi
     }
 
     async fn initialize(&self, init: HostInit) -> Result<(), InitError> {
-        self.primary.initialize(init).await?;
-        self.secondary.initialize().await
+        // Fixed polling order preserves primary error precedence when both
+        // independent initializers fail in the same poll.
+        tokio::try_join!(
+            biased;
+            self.primary.initialize(init),
+            self.secondary.initialize()
+        )?;
+        Ok(())
     }
 
     async fn bind(
