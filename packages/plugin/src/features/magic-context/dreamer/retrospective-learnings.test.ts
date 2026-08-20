@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { getMemoriesByProject } from "../memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "../memory/storage-memory-claims";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
@@ -169,6 +170,12 @@ describe("applyRetrospectiveLearnings", () => {
         });
         expect(second.memoryWritten).toBe(0);
         expect(getMemoriesByProject(db, PROJECT).length).toBe(1);
+        // The duplicate write leaves the claim at revision 1.
+        const memoryId = getMemoriesByProject(db, PROJECT)[0]?.id as number;
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+        expect(claim?.revision).toBe(1);
+        expect(claim?.content).toBe("Always rebuild dists after a server-side change.");
+        expect(claim?.state).toBe("active");
     });
 
     test("rejects a near-transcription learning via sourceUserTexts", () => {

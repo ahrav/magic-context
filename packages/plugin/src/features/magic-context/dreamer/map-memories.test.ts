@@ -8,6 +8,7 @@ import path from "node:path";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { insertMemory } from "../memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "../memory/storage-memory-claims";
 import {
     getMemoryVerifications,
     recordMemoryMapping,
@@ -304,6 +305,17 @@ describe("applyBatchMappings", () => {
             expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.files).toEqual([
                 "src/fact.ts",
             ]);
+            // A mapped-only snapshot changes no claim-domain state.
+            const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+            expect(claim?.revision).toBe(1);
+            const eventCount = db
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM verification_events ve
+                       JOIN claim_revisions rev ON rev.id = ve.revision_id
+                      WHERE rev.claim_id = ?`,
+                )
+                .get(claim?.claimId) as { count: number };
+            expect(eventCount.count).toBe(0);
         } finally {
             closeQuietly(db);
         }

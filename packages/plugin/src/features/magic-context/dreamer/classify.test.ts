@@ -6,6 +6,7 @@ import { Database, withPrivilegedWriter } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { installAuthorityManagedMarker } from "../context-authority";
 import { getMemoryById, insertMemory } from "../memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "../memory/storage-memory-claims";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import {
@@ -161,6 +162,14 @@ describe("applyClassifications", () => {
             expect(after?.importance).toBe(85);
             expect(after?.scope).toBe("project");
             expect(after?.shareable).toBe(1);
+            // A classification-only change appends a same-content revision
+            // whose metadata carries the new fields.
+            const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+            expect(claim?.revision).toBe(2);
+            expect(claim?.content).toBe("Important project fact.");
+            expect(claim?.importance).toBe(85);
+            expect(claim?.memoryScope).toBe("project");
+            expect(claim?.shareable).toBe(1);
         } finally {
             closeQuietly(db);
         }

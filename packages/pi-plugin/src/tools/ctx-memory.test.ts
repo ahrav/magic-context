@@ -4,7 +4,10 @@ import {
 	getMemoryById,
 	insertMemory,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
+import {
+	getCurrentMemoryClaimByLegacyMemoryId,
+	runInMemoryClaimsWriteTransaction,
+} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import { getMemoryMutationsForRender } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestDb, fakeContext } from "../test-utils.test";
@@ -1119,5 +1122,229 @@ describe("createCtxMemoryTool", () => {
 				closeQuietly(db);
 			}
 		});
+	});
+});
+
+describe("createCtxMemoryTool on a migrated v83 database (claims kernel, U3 parity)", () => {
+	function countRows(
+		db: ReturnType<typeof createTestDb>,
+		table: string,
+		where = "1=1",
+	): number {
+		return (
+			db
+				.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`)
+				.get() as { count: number }
+		).count;
+	}
+
+	function claimRevisionContents(
+		db: ReturnType<typeof createTestDb>,
+		memoryId: number,
+	): string[] {
+		const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+		if (!claim) return [];
+		return (
+			db
+				.prepare(
+					"SELECT content FROM claim_revisions WHERE claim_id = ? ORDER BY revision",
+				)
+				.all(claim.claimId) as Array<{ content: string }>
+		).map((row) => row.content);
+	}
+
+	async function run(
+		tool: ReturnType<typeof createCtxMemoryTool>,
+		params: Record<string, unknown>,
+		call = "call-claims",
+	) {
+		return tool.execute(
+			call,
+			params as never,
+			new AbortController().signal,
+			undefined,
+			fakeContext("ses-claims") as never,
+		);
+	}
+
+	it("writing the same content twice keeps one projection row and one revision while telemetry increments (Pi parity)", async () => {
+		const db = createTestDb();
+		try {
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const first = await run(tool, {
+				action: "write",
+				category: "CONSTRAINTS",
+				content: "Use bun for scripts.",
+			});
+			expect(first.content[0]?.text).toContain("Saved memory [ID:");
+			const idMatch = first.content[0]?.text?.match(/ID:\s*(\d+)/);
+			const memoryId = Number(idMatch?.[1]);
+
+			const second = await run(tool, {
+				action: "write",
+				category: "CONSTRAINTS",
+				content: "Use bun for scripts.",
+			});
+			expect(second.content[0]?.text).toContain(
+				`Memory already exists [ID: ${memoryId}] in CONSTRAINTS (seen count incremented).`,
+			);
+
+			expect(getMemoryById(db, memoryId)?.seenCount).toBe(2);
+			expect(claimRevisionContents(db, memoryId)).toEqual([
+				"Use bun for scripts.",
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("updating an unlinked pre-v83 row adopts the preimage as revision 1 and the new content as revision 2 (Pi parity)", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			let unlinkedId = 0;
+			runInMemoryClaimsWriteTransaction(db, () => {
+				const inserted = db
+					.prepare(
+						`INSERT INTO memories (project_path, category, content, normalized_hash,
+							seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+						 VALUES (?, 'CONSTRAINTS', 'Old unlinked fact.', 'hash:old-unlinked', 1, 0, 1, 1, 1, 1)`,
+					)
+					.run(projectIdentity);
+				unlinkedId = Number(inserted.lastInsertRowid);
+			});
+			expect(getCurrentMemoryClaimByLegacyMemoryId(db, unlinkedId)).toBeNull();
+
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const result = await run(tool, {
+				action: "update",
+				ids: [unlinkedId],
+				content: "Corrected unlinked fact.",
+			});
+			expect(result.isError).toBeUndefined();
+
+			expect(claimRevisionContents(db, unlinkedId)).toEqual([
+				"Old unlinked fact.",
+				"Corrected unlinked fact.",
+			]);
+			expect(getMemoryById(db, unlinkedId)?.content).toBe(
+				"Corrected unlinked fact.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("archive commits claim retirement, projection, and archive event together (Pi parity)", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "KNOWN_ISSUES",
+				content: "Old issue entry.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+
+			const result = await run(tool, {
+				action: "archive",
+				ids: [memory.id],
+				reason: "Subsystem removed",
+			});
+			expect(result.content[0]?.text).toContain("Archived memory");
+
+			const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+			expect(claim?.state).toBe("archived");
+			expect(getMemoryById(db, memory.id)?.status).toBe("archived");
+			expect(getMemoryById(db, memory.id)?.metadataJson).toContain(
+				"Subsystem removed",
+			);
+			expect(
+				countRows(
+					db,
+					"verification_events",
+					`outcome = 'archive' AND revision_id = ${claim?.revisionId}`,
+				),
+			).toBe(1);
+			expect(
+				countRows(db, "claim_change_outbox", "effect_type = 'lifecycle'"),
+			).toBeGreaterThanOrEqual(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("same-project merge preserves stats policy, records supersession, and returns the same result shape as OpenCode", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Use bun for scripts",
+			});
+			const second = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Use bun for all scripts in this repo",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: true,
+			});
+
+			const result = await run(tool, {
+				action: "merge",
+				ids: [first.id, second.id],
+				content: "Use bun for all scripts in this repository.",
+			});
+			const text = result.content[0]?.text ?? "";
+			const canonicalMatch = text.match(/canonical memory \[ID: (\d+)\]/);
+			const canonicalId = Number(canonicalMatch?.[1]);
+			expect(text).toBe(
+				`Merged memories [${first.id}, ${second.id}] into canonical memory [ID: ${canonicalId}] in CONSTRAINTS; superseded [${first.id}, ${second.id}].`,
+			);
+
+			expect(getMemoryById(db, canonicalId)?.seenCount).toBe(2);
+			expect(getMemoryById(db, canonicalId)?.mergedFrom).toBe(
+				JSON.stringify([first.id, second.id]),
+			);
+			const canonicalClaim = getCurrentMemoryClaimByLegacyMemoryId(
+				db,
+				canonicalId,
+			);
+			expect(canonicalClaim?.state).toBe("active");
+			for (const sourceId of [first.id, second.id]) {
+				const sourceClaim = getCurrentMemoryClaimByLegacyMemoryId(db, sourceId);
+				expect(sourceClaim?.state).toBe("archived");
+				expect(
+					countRows(
+						db,
+						"claim_conflicts",
+						`relation = 'supersedes' AND right_revision_id = ${sourceClaim?.revisionId}`,
+					),
+				).toBe(1);
+			}
+			expect(countRows(db, "claim_merge_lineage")).toBe(0);
+		} finally {
+			closeQuietly(db);
+		}
 	});
 });

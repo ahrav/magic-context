@@ -8,6 +8,7 @@ import {
 	getMemoriesByProject,
 	insertMemory,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	closeDatabase,
 	openDatabase,
@@ -82,9 +83,15 @@ const MIGRATED_XML = `<migrated>
 * User prefers terse communication.
 </user_observations>`;
 
+function openTestDb() {
+	const db = openDatabase();
+	if (!db) throw new Error("openDatabase returned null in test setup");
+	return db;
+}
+
 describe("Pi memory migration (E6c)", () => {
 	it("re-evaluates memories into the 5-cat taxonomy and marks the project done", async () => {
-		const db = openDatabase();
+		const db = openTestDb();
 		const projectPath = resolveProjectIdentity(process.cwd());
 		insertMemory(db, {
 			projectPath,
@@ -115,8 +122,44 @@ describe("Pi memory migration (E6c)", () => {
 		expect(isMemoryMigrationDone(db, projectPath)).toBe(true);
 	});
 
+	it("retires each replaced memory's claim and creates claims for the rebuilt set (U3)", async () => {
+		const db = openTestDb();
+		const projectPath = resolveProjectIdentity(process.cwd());
+		const legacy = insertMemory(db, {
+			projectPath,
+			category: "ARCHITECTURE_DECISIONS",
+			content: "legacy arch fact",
+		});
+
+		const outcome = await runPiMemoryMigration({
+			db,
+			runner: runnerReturning(MIGRATED_XML),
+			model: "test/model",
+			directory: process.cwd(),
+			sessionId: "ses-pi-mig",
+			userMemoriesEnabled: true,
+		});
+		expect(outcome.ran).toBe(true);
+
+		const retired = getCurrentMemoryClaimByLegacyMemoryId(db, legacy.id);
+		expect(retired?.state).toBe("archived");
+		expect(retired?.content).toBe("legacy arch fact");
+		expect(
+			db
+				.prepare("SELECT 1 AS present FROM memories WHERE id = ?")
+				.get(legacy.id),
+		).toBeFalsy();
+
+		for (const rebuilt of getMemoriesByProject(db, projectPath)) {
+			const claim = getCurrentMemoryClaimByLegacyMemoryId(db, rebuilt.id);
+			expect(claim?.state).toBe("active");
+			expect(claim?.revision).toBe(1);
+			expect(claim?.content).toBe(rebuilt.content);
+		}
+	});
+
 	it("is idempotent — a second run does not re-migrate", async () => {
-		const db = openDatabase();
+		const db = openTestDb();
 		const projectPath = resolveProjectIdentity(process.cwd());
 		insertMemory(db, {
 			projectPath,
@@ -147,7 +190,7 @@ describe("Pi memory migration (E6c)", () => {
 	});
 
 	it("does not wipe the pool when the model returns no usable output", async () => {
-		const db = openDatabase();
+		const db = openTestDb();
 		const projectPath = resolveProjectIdentity(process.cwd());
 		insertMemory(db, {
 			projectPath,
@@ -173,7 +216,7 @@ describe("Pi memory migration (E6c)", () => {
 		// Root-cause regression (dogfood 2026-05-31): an empty <migrated></migrated>
 		// block parses successfully but has 0 v2 memories. It must NOT delete the
 		// pool and must NOT set the guard (so a retry with a real model can run).
-		const db = openDatabase();
+		const db = openTestDb();
 		const projectPath = resolveProjectIdentity(process.cwd());
 		insertMemory(db, {
 			projectPath,
@@ -196,7 +239,7 @@ describe("Pi memory migration (E6c)", () => {
 	});
 
 	it("chain = [primaryModel, ...fallbackModels] — does NOT insert the historian model between them (OpenCode parity)", async () => {
-		const db = openDatabase();
+		const db = openTestDb();
 		const projectPath = resolveProjectIdentity(process.cwd());
 		insertMemory(db, {
 			projectPath,
@@ -231,7 +274,7 @@ describe("Pi memory migration (E6c)", () => {
 	});
 
 	it("chain head falls back to the historian model when no primaryModel is given", async () => {
-		const db = openDatabase();
+		const db = openTestDb();
 		const projectPath = resolveProjectIdentity(process.cwd());
 		insertMemory(db, {
 			projectPath,

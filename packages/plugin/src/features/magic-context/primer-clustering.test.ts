@@ -184,10 +184,9 @@ function referenceBuildClusters(args: {
                     : cluster.primer?.question.toLowerCase().trim() === entry.normalizedQuestion;
                 if (textMatch) score = 1;
             }
-            const stickier =
-                cluster.primer && cluster.primer.sourceCandidateIds.includes(entry.id)
-                    ? threshold - hysteresis
-                    : threshold;
+            const stickier = cluster.primer?.sourceCandidateIds.includes(entry.id)
+                ? threshold - hysteresis
+                : threshold;
             if (score >= stickier && (!best || score > best.score)) {
                 best = { cluster, score };
             }

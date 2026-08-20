@@ -8,7 +8,7 @@ import { CATEGORY_DEFAULT_TTL } from "./constants";
 import type { EmbeddingProvider } from "./embedding-provider";
 import { computeNormalizedHash } from "./normalize-hash";
 
-const mockEmbedText = mock(async (): Promise<{ vector: Float32Array } | null> => null);
+const mockEmbedText = mock(async (_text: string): Promise<{ vector: Float32Array } | null> => null);
 const mockLog = mock(() => {});
 
 mock.module("../../../shared/logger", () => ({
@@ -31,6 +31,9 @@ const {
     insertMemory,
 } = await import("./storage-memory");
 const { embedPromotedFacts, promoteSessionFactsDurable } = await import("./promotion");
+const { getCurrentMemoryClaimByLegacyMemoryId } = await import("./storage-memory-claims");
+const { runMigrations } = await import("../migrations");
+const { initializeDatabase } = await import("../storage-db");
 
 const TEST_PROJECT_PATH = "/repo/project";
 let db: Database | null = null;
@@ -140,6 +143,7 @@ afterEach(() => {
         try {
             closeQuietly(db);
         } catch {
+            // Best-effort close; a failure here must not fail the test run.
         } finally {
             db = null;
         }
@@ -491,6 +495,42 @@ describe("promotion", () => {
                 }
             ).count;
             expect(count).toBe(0);
+        });
+    });
+
+    describe("#given a migrated v83 database", () => {
+        function migratedDb(): Database {
+            const database = new Database(":memory:");
+            initializeDatabase(database);
+            runMigrations(database);
+            return database;
+        }
+
+        it("promotes a fact as claim revision 1 and dedups a re-emitted fact without a second revision", () => {
+            db = migratedDb();
+            const project = "git:promo-project";
+            const fact = { category: "CONSTRAINTS", content: "Never use npm in this repo" };
+
+            const first = promoteSessionFactsDurable(db, "ses-1", project, [fact]);
+            expect(first.length).toBe(1);
+            const memoryId = first[0].memoryId;
+            const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+            expect(claim?.revision).toBe(1);
+            expect(claim?.content).toBe(fact.content);
+            expect(claim?.category).toBe("CONSTRAINTS");
+            expect(claim?.state).toBe("active");
+
+            const second = promoteSessionFactsDurable(db, "ses-2", project, [fact]);
+            expect(second.length).toBe(0);
+            expect(getMemoryById(db, memoryId)?.seenCount).toBe(2);
+            const after = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+            expect(after?.revision).toBe(1);
+            const memoryCount = (
+                db
+                    .prepare("SELECT COUNT(*) AS count FROM memories WHERE project_path = ?")
+                    .get(project) as { count: number }
+            ).count;
+            expect(memoryCount).toBe(1);
         });
     });
 });

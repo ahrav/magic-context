@@ -7,6 +7,7 @@ import {
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	getHistorianFailureState,
 	getOverflowState,
@@ -509,6 +510,14 @@ describe("runPiHistorian", () => {
 			expect(
 				getMemoriesByProject(db, projectPath).map((m) => m.content),
 			).toContain("Pi historian facts can promote to memory.");
+			const promoted = getMemoriesByProject(db, projectPath).find(
+				(m) => m.content === "Pi historian facts can promote to memory.",
+			);
+			if (!promoted) throw new Error("expected promoted memory");
+			const claim = getCurrentMemoryClaimByLegacyMemoryId(db, promoted.id);
+			expect(claim?.revision).toBe(1);
+			expect(claim?.state).toBe("active");
+			expect(claim?.content).toBe("Pi historian facts can promote to memory.");
 		} finally {
 			closeQuietly(db);
 		}
