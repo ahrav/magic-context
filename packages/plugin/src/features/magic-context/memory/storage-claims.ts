@@ -241,23 +241,33 @@ function normalizeEvidence(
         }
         byObservation.set(item.observationId, relation);
     }
-    const projectOf = db.prepare(
-        `SELECT episodes.project_id AS projectId
-           FROM observations
-           JOIN source_spans ON source_spans.id = observations.source_span_id
-           JOIN episodes ON episodes.id = source_spans.episode_id
-          WHERE observations.id = ?`,
-    );
+    const observationIds = [...byObservation.keys()];
+    const placeholders = observationIds.map(() => "?").join(", ");
+    const rows = db
+        .prepare(
+            `SELECT observations.id AS observationId, episodes.project_id AS projectId
+               FROM observations
+               JOIN source_spans ON source_spans.id = observations.source_span_id
+               JOIN episodes ON episodes.id = source_spans.episode_id
+              WHERE observations.id IN (${placeholders})`,
+        )
+        .all(...observationIds) as Array<{ observationId?: unknown; projectId?: unknown }>;
+    const projectByObservation = new Map<number, number>();
+    for (const row of rows) {
+        if (typeof row.observationId === "number" && typeof row.projectId === "number") {
+            projectByObservation.set(row.observationId, row.projectId);
+        }
+    }
     const normalized: NormalizedEvidence[] = [];
     for (const [observationId, relation] of byObservation) {
-        const row = projectOf.get(observationId) as { projectId?: unknown } | undefined;
-        if (typeof row?.projectId !== "number") {
+        const owner = projectByObservation.get(observationId);
+        if (owner === undefined) {
             return { ok: false, reason: `observation ${observationId} does not exist` };
         }
-        if (row.projectId !== projectId) {
+        if (owner !== projectId) {
             return {
                 ok: false,
-                reason: `observation ${observationId} belongs to project ${row.projectId}, not ${projectId}`,
+                reason: `observation ${observationId} belongs to project ${owner}, not ${projectId}`,
             };
         }
         normalized.push({ observationId, relation });
@@ -387,7 +397,7 @@ export interface AppendClaimRevisionInput {
  * Append an immutable revision. The transaction validates the caller's
  * expected pointer before inserting a revision, then advances the pointer
  * with a final CAS. BEGIN IMMEDIATE provides the cross-process serialization;
- * the pointer probe is the staleness check, not a row lock.
+ * the pointer read is the staleness check, not a row lock.
  */
 export function appendClaimRevision(
     db: Database,
@@ -395,34 +405,37 @@ export function appendClaimRevision(
 ): ClaimWriteOutcome {
     const now = Date.now();
     return withImmediateTransaction(db, (): ClaimWriteOutcome => {
-        const claimed = changeCount(
-            db
-                .prepare(
-                    "UPDATE claims SET current_revision_id = current_revision_id WHERE id = ? AND current_revision_id = ?",
-                )
-                .run(input.claimId, input.expectedCurrentRevisionId),
-        );
-        if (claimed !== 1) {
-            const exists = db.prepare("SELECT 1 FROM claims WHERE id = ?").get(input.claimId);
-            return exists ? { status: "stale" } : { status: "not_found" };
-        }
-
-        const claimRow = db
-            .prepare("SELECT project_id AS projectId FROM claims WHERE id = ?")
-            .get(input.claimId) as { projectId: number };
-        const validated = normalizeEvidence(db, claimRow.projectId, input.evidence);
-        if (!validated.ok) return { status: "invalid", reason: validated.reason };
-
-        const expected = db
-            .prepare("SELECT revision FROM claim_revisions WHERE id = ? AND claim_id = ?")
-            .get(input.expectedCurrentRevisionId, input.claimId) as
-            | { revision: number }
+        // BEGIN IMMEDIATE serializes writers, so one read of the pointer is the
+        // staleness check; the closing CAS re-asserts the same predicate. The
+        // claim_id equality mirrors the composite pointer FK for connections
+        // running with foreign keys off.
+        const current = db
+            .prepare(
+                `SELECT claims.project_id AS projectId, pointed.revision AS revision
+                   FROM claims
+                   JOIN claim_revisions AS pointed
+                     ON pointed.id = claims.current_revision_id
+                    AND pointed.claim_id = claims.id
+                  WHERE claims.id = ? AND claims.current_revision_id = ?`,
+            )
+            .get(input.claimId, input.expectedCurrentRevisionId) as
+            | { projectId: number; revision: number }
             | undefined;
-        if (!expected) {
-            throw new ClaimGraphCorruptionError(
-                `claim ${input.claimId} current pointer ${input.expectedCurrentRevisionId} has no revision row`,
-            );
+        if (!current) {
+            const claim = db
+                .prepare("SELECT current_revision_id AS pointer FROM claims WHERE id = ?")
+                .get(input.claimId) as { pointer: number | null } | undefined;
+            if (!claim) return { status: "not_found" };
+            if (claim.pointer === input.expectedCurrentRevisionId) {
+                throw new ClaimGraphCorruptionError(
+                    `claim ${input.claimId} current pointer ${input.expectedCurrentRevisionId} has no revision row`,
+                );
+            }
+            return { status: "stale" };
         }
+
+        const validated = normalizeEvidence(db, current.projectId, input.evidence);
+        if (!validated.ok) return { status: "invalid", reason: validated.reason };
 
         // A pointer repointed backward by direct SQL still passes the CAS
         // (the caller read the corrupted pointer), but the next revision
@@ -431,13 +444,13 @@ export function appendClaimRevision(
         const maxRevision = db
             .prepare("SELECT MAX(revision) AS max FROM claim_revisions WHERE claim_id = ?")
             .get(input.claimId) as { max: number | null };
-        if (maxRevision.max !== expected.revision) {
+        if (maxRevision.max !== current.revision) {
             throw new ClaimGraphCorruptionError(
-                `claim ${input.claimId} pointer targets revision ${expected.revision} but history reaches ${String(maxRevision.max)}; direct-SQL corruption`,
+                `claim ${input.claimId} pointer targets revision ${current.revision} but history reaches ${String(maxRevision.max)}; direct-SQL corruption`,
             );
         }
 
-        const revision = expected.revision + 1;
+        const revision = current.revision + 1;
         const revisionId = insertRevisionWithEvidence(db, {
             claimId: input.claimId,
             revision,
@@ -475,8 +488,9 @@ export interface ClaimConflictInput {
 /**
  * Record a revision-scoped conflict. Contradiction is symmetric, so its
  * endpoints are canonically ordered and a reverse duplicate returns the
- * existing row. Supersession keeps the caller's direction. Distinct-claim and
- * same-project rules are enforced by the database guards.
+ * existing row. Supersession keeps the caller's direction. Distinct-claim,
+ * same-project, and reverse-supersession rules are enforced by the database
+ * guards.
  */
 export function addClaimConflict(db: Database, input: ClaimConflictInput): number {
     let { leftRevisionId, rightRevisionId } = input;

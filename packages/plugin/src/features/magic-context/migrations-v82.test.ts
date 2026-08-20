@@ -159,6 +159,8 @@ describe("migration v82: claims and evidence schema", () => {
             expect(triggers).toContain("claims_semantic_freeze");
             expect(triggers).toContain("claims_pointer_clear_guard");
             expect(triggers).toContain("claim_evidence_same_project_guard");
+            expect(triggers).toContain("projects_namespace_guard_update");
+            expect(triggers).toContain("claim_conflicts_supersedes_cycle_guard");
             expect(objectNames(db, "index")).toContain("idx_project_aliases_project");
             expect(
                 db
@@ -515,8 +517,9 @@ describe("migration v82: claims and evidence schema", () => {
                     table: "claim_conflicts",
                     update: "UPDATE claim_conflicts SET relation = 'contradicts'",
                     del: "DELETE FROM claim_conflicts",
-                    replace:
-                        "INSERT OR REPLACE INTO claim_conflicts (id, relation, left_revision_id, right_revision_id, created_at) SELECT id, 'supersedes', right_revision_id, left_revision_id, 99 FROM claim_conflicts LIMIT 1",
+                    // A fresh tuple (not the reverse pair, which the supersedes
+                    // cycle guard rejects on its own) so only the id collides.
+                    replace: `INSERT OR REPLACE INTO claim_conflicts (id, relation, left_revision_id, right_revision_id, created_at) SELECT id, 'supersedes', ${graph.revisionId}, right_revision_id, 99 FROM claim_conflicts LIMIT 1`,
                 },
                 {
                     table: "verification_events",
@@ -526,6 +529,11 @@ describe("migration v82: claims and evidence schema", () => {
                         "INSERT OR REPLACE INTO verification_events (id, revision_id, outcome, verifier, created_at) SELECT id, revision_id, 'stale', 'x', 99 FROM verification_events LIMIT 1",
                 },
             ];
+            // Every append-only table must have a behavior probe: a new table
+            // passing the name-existence checks above is not enough.
+            expect(probes.map((probe) => probe.table).sort()).toEqual(
+                [...APPEND_ONLY_CLAIMS_TABLES].sort(),
+            );
             for (const probe of probes) {
                 const before = db.prepare(`SELECT * FROM ${probe.table}`).all();
                 expect(() => db.exec(probe.update), `${probe.table} update`).toThrow(/append-only/);
@@ -613,6 +621,24 @@ describe("migration v82: claims and evidence schema", () => {
                     .prepare("INSERT INTO projects (canonical_identity, created_at) VALUES (?, ?)")
                     .run("git:namespace-b", Date.now()),
             ).toThrow(/UNIQUE|collides/i);
+            // UNIQUE only covers canonical identities; the update guard must
+            // catch a direct-SQL rename onto another project's alias.
+            db.prepare(
+                "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, ?)",
+            ).run("dir:namespace-b-alias", b, Date.now());
+            expect(() =>
+                db
+                    .prepare("UPDATE projects SET canonical_identity = ? WHERE id = ?")
+                    .run("dir:namespace-b-alias", a),
+            ).toThrow(/collides/);
+            // Re-adopting an identity already aliased to the same project stays legal.
+            db.prepare(
+                "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, ?)",
+            ).run("dir:namespace-a-alias", a, Date.now());
+            db.prepare("UPDATE projects SET canonical_identity = ? WHERE id = ?").run(
+                "dir:namespace-a-alias",
+                a,
+            );
         } finally {
             closeQuietly(db);
         }

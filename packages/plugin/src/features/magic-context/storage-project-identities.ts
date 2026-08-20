@@ -302,7 +302,8 @@ export function collectAliasesForTargets(
     }
 
     if (tableExists(db, "project_aliases")) {
-        const placeholders = targets.map(() => "?").join(", ");
+        const targetList = [...targetSet];
+        const placeholders = targetList.map(() => "?").join(", ");
         const rows = db
             .prepare(
                 `SELECT alias.alias_identity AS alias, project.canonical_identity AS canonical
@@ -310,7 +311,7 @@ export function collectAliasesForTargets(
                    JOIN projects AS project ON project.id = alias.project_id
                   WHERE project.canonical_identity IN (${placeholders})`,
             )
-            .all(...targets) as Array<{ alias?: unknown; canonical?: unknown }>;
+            .all(...targetList) as Array<{ alias?: unknown; canonical?: unknown }>;
         for (const row of rows) {
             if (typeof row.alias !== "string" || typeof row.canonical !== "string") continue;
             if (row.alias !== row.canonical) result.set(row.alias, row.canonical);

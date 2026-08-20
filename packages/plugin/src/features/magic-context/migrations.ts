@@ -10,6 +10,7 @@ import {
     assertProjectRegistrySeed,
     resolveProjectIdentitySeed,
     seedProjectRegistry,
+    tableExists,
 } from "./storage-project-identities";
 import {
     ensureColumn,
@@ -57,12 +58,6 @@ function isSqliteLockError(error: unknown): boolean {
     return (
         typeof candidate.message === "string" &&
         /database is locked|sqlite_(busy|locked)/i.test(candidate.message)
-    );
-}
-
-function tableExists(db: Database, name: string): boolean {
-    return Boolean(
-        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
     );
 }
 

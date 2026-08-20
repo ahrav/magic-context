@@ -441,6 +441,15 @@ describe("storage-claims: conflicts and verification", () => {
                 )
                 .get(forward) as { l: number; r: number };
             expect(row).toEqual({ l: rightRevisionId, r: leftRevisionId });
+            // The reverse edge would make the pair mutually superseding.
+            expect(() =>
+                addClaimConflict(db, {
+                    relation: "supersedes",
+                    leftRevisionId,
+                    rightRevisionId,
+                }),
+            ).toThrow(/opposite direction/);
+            expect(rowCount(db, "claim_conflicts")).toBe(1);
         } finally {
             closeQuietly(db);
         }

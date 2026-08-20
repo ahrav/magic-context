@@ -3,7 +3,7 @@ import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { V2_MEMORY_CATEGORIES } from "./memory/constants";
 import { normalizeStoredProjectPath, storedPathBelongsToIdentity } from "./project-identity";
-import { collectAliasesForTargets } from "./storage-project-identities";
+import { collectAliasesForTargets, tableExists } from "./storage-project-identities";
 
 export interface WorkspaceIdentitySet {
     identities: string[];
@@ -26,13 +26,6 @@ interface WorkspaceShareCategoriesRow {
 
 const VALID_SHARE_CATEGORIES = new Set<string>(V2_MEMORY_CATEGORIES);
 const DEFAULT_WORKSPACE_SHARE_CATEGORIES = ["CONSTRAINTS"] as const;
-
-function tableExists(db: Database, tableName: string): boolean {
-    const row = db
-        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1")
-        .get(tableName);
-    return Boolean(row);
-}
 
 function columnExists(db: Database, tableName: string, columnName: string): boolean {
     const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name?: string }>;

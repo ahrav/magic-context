@@ -269,6 +269,16 @@ export function createClaimsAndEvidenceSchema(db: Database): void {
     )
     BEGIN SELECT RAISE(ABORT, 'project canonical identity collides with an existing alias'); END;
 
+    -- The UNIQUE constraint only covers other canonical identities; a direct
+    -- SQL UPDATE could still adopt an identity that is another project's alias.
+    CREATE TRIGGER projects_namespace_guard_update BEFORE UPDATE OF canonical_identity ON projects
+    WHEN EXISTS (
+        SELECT 1 FROM project_aliases
+        WHERE alias_identity = NEW.canonical_identity
+          AND project_id <> NEW.id
+    )
+    BEGIN SELECT RAISE(ABORT, 'project canonical identity collides with an existing alias'); END;
+
     -- Numeric FKs prove existence, not common ownership: evidence, conflict
     -- endpoints, and verification observations must share one project (KTD36).
     -- IS NOT is deliberate: a missing endpoint makes a subselect NULL and the
@@ -302,6 +312,17 @@ export function createClaimsAndEvidenceSchema(db: Database): void {
         WHERE claim_revisions.id = NEW.right_revision_id
     )
     BEGIN SELECT RAISE(ABORT, 'claim_conflicts endpoints must belong to the same project'); END;
+
+    -- Supersession is directional: recording both A→B and B→A would make the
+    -- pair mutually superseding, which no reader of the chain can interpret.
+    CREATE TRIGGER claim_conflicts_supersedes_cycle_guard BEFORE INSERT ON claim_conflicts
+    WHEN NEW.relation = 'supersedes' AND EXISTS (
+        SELECT 1 FROM claim_conflicts
+        WHERE relation = 'supersedes'
+          AND left_revision_id = NEW.right_revision_id
+          AND right_revision_id = NEW.left_revision_id
+    )
+    BEGIN SELECT RAISE(ABORT, 'supersedes conflict already recorded in the opposite direction'); END;
 
     CREATE TRIGGER verification_events_same_project_guard BEFORE INSERT ON verification_events
     WHEN NEW.observation_id IS NOT NULL AND (
