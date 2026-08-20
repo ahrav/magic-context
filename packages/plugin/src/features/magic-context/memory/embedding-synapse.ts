@@ -513,6 +513,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     async embed(text: string, signal?: AbortSignal): Promise<Float32Array | null> {
         if (!(await this.initialize()) || signal?.aborted || !this.metadata) return null;
         try {
+            // retryEmbeddings=true permits a retry after an ambiguous send
+            // even though embed.query carries no request_key: the operation
+            // is a pure computation over its input with no daemon-side state,
+            // so a duplicate dispatch wastes compute but corrupts nothing.
+            // embed.batch/embed.result carry request_key because they create
+            // ledger state the daemon must dedupe.
             const value = await this.callWithRetry(
                 "embed.query",
                 this.requestConstraints({
