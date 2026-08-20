@@ -1,98 +1,196 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
-    type BindIdentity,
-    buildFlags,
-    buildFrame,
-    CLIENT_AUTH_DOMAIN,
-    computeProof,
-    decodeHeader,
-    type EnvelopeHeader,
-    encodeFrame,
-    FrameType,
-    HEADER_LEN,
-    PROTOCOL_VERSION,
-    Priority,
+    Deadline,
     type RouteHandle,
-    type RouteTarget,
-    SERVER_PROOF_DOMAIN,
     StaleRouteHandleError,
+    SubcCallError,
     type SubcClient,
-} from "@cortexkit/subc-client";
-
+} from "../../shared/mc-host-client";
+import {
+    FakePeer,
+    type FakePeerConnection,
+    PEER_PROTOCOL_VERSION,
+    type PeerFrame,
+    PeerFrameType,
+} from "../../shared/mc-host-client/test-support/fake-peer";
+import {
+    rejection,
+    waitUntil,
+    writeConnectionFile,
+} from "../../shared/mc-host-client/test-support/test-util";
 import { __moduleTransportTest, SubcModuleTransport } from "./module-transport";
 
-class FakeServerReader {
-    private buffered = Buffer.alloc(0);
-    private readonly iterator: AsyncIterator<Uint8Array>;
+let tempDir = "";
+let fileCounter = 0;
+let peers: FakePeer[] = [];
+let transports: SubcModuleTransport[] = [];
+let savedModuleId: string | undefined;
+let savedLaunchNonce: string | undefined;
 
-    constructor(socket: Socket) {
-        this.iterator = socket[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
+beforeAll(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "module-transport-facade-"));
+    savedModuleId = process.env.SUBC_MODULE_ID;
+    savedLaunchNonce = process.env.SUBC_LAUNCH_NONCE;
+});
+
+afterAll(() => {
+    if (savedModuleId === undefined) delete process.env.SUBC_MODULE_ID;
+    else process.env.SUBC_MODULE_ID = savedModuleId;
+    if (savedLaunchNonce === undefined) delete process.env.SUBC_LAUNCH_NONCE;
+    else process.env.SUBC_LAUNCH_NONCE = savedLaunchNonce;
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+    peers = [];
+    transports = [];
+    delete process.env.SUBC_MODULE_ID;
+    delete process.env.SUBC_LAUNCH_NONCE;
+});
+
+afterEach(async () => {
+    for (const transport of transports) {
+        (transport as unknown as { invalidateConnection(): void }).invalidateConnection();
     }
-
-    async readExact(length: number): Promise<Buffer> {
-        while (this.buffered.length < length) {
-            const next = await this.iterator.next();
-            if (next.done)
-                throw new Error("fake subc peer closed before the expected bytes arrived");
-            this.buffered = Buffer.concat([this.buffered, Buffer.from(next.value)]);
-        }
-        const value = this.buffered.subarray(0, length);
-        this.buffered = this.buffered.subarray(length);
-        return value;
+    for (const peer of peers) {
+        await peer.close();
     }
+});
+
+async function startPeer(): Promise<FakePeer> {
+    const peer = await FakePeer.start();
+    peers.push(peer);
+    return peer;
 }
 
-async function readAuthMessage(reader: FakeServerReader): Promise<Record<string, unknown>> {
-    const length = (await reader.readExact(4)).readUInt32LE(0);
-    return JSON.parse((await reader.readExact(length)).toString("utf8")) as Record<string, unknown>;
+async function writeConnFile(peer: FakePeer): Promise<string> {
+    fileCounter += 1;
+    const filePath = join(tempDir, `subc-connection-${fileCounter}.json`);
+    await writeConnectionFile(filePath, peer);
+    return filePath;
 }
 
-function writeAuthMessage(socket: Socket, value: unknown): void {
-    const body = Buffer.from(JSON.stringify(value));
-    const length = Buffer.alloc(4);
-    length.writeUInt32LE(body.length, 0);
-    socket.write(Buffer.concat([length, body]));
+function trackTransport(transport: SubcModuleTransport): SubcModuleTransport {
+    transports.push(transport);
+    return transport;
 }
 
-async function readFrame(
-    reader: FakeServerReader,
-): Promise<{ header: EnvelopeHeader; body: Uint8Array }> {
-    const header = decodeHeader(await reader.readExact(HEADER_LEN));
-    const body = header.len === 0 ? new Uint8Array(0) : await reader.readExact(header.len);
-    return { header, body };
-}
-
-function writeJsonResponse(socket: Socket, request: EnvelopeHeader, body: unknown): void {
-    const bytes = Buffer.from(JSON.stringify(body));
-    socket.write(
-        encodeFrame(
-            buildFrame(
-                FrameType.Response,
-                buildFlags(false, Priority.Interactive, false),
-                request.channel,
-                request.epoch,
-                request.corr,
-                bytes,
-            ),
-        ),
+async function peerTransport(
+    requestTimeoutMs = 5_000,
+): Promise<{ peer: FakePeer; transport: SubcModuleTransport }> {
+    const peer = await startPeer();
+    const connectionFile = await writeConnFile(peer);
+    const transport = trackTransport(
+        new SubcModuleTransport(connectionFile, "magic-context", requestTimeoutMs),
     );
+    return { peer, transport };
 }
 
-async function listen(server: Server): Promise<number> {
-    await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(0, "127.0.0.1", () => resolve());
+function bodyJson(frame: PeerFrame): unknown {
+    try {
+        return JSON.parse(frame.body.toString("utf8"));
+    } catch {
+        return undefined;
+    }
+}
+
+function isRouteOpen(frame: PeerFrame): boolean {
+    if (frame.ty !== PeerFrameType.Request || frame.channel !== 0) return false;
+    const parsed = bodyJson(frame) as { op?: unknown } | undefined;
+    return parsed?.op === "route.open";
+}
+
+const isRoutedRequest =
+    (channel?: number) =>
+    (frame: PeerFrame): boolean =>
+        frame.ty === PeerFrameType.Request &&
+        frame.channel !== 0 &&
+        (channel === undefined || frame.channel === channel);
+
+interface FrameCursor {
+    next(predicate: (frame: PeerFrame) => boolean, timeoutMs?: number): Promise<PeerFrame>;
+}
+
+/** Ordered frame consumption: each `next` scans forward from the last hit. */
+function frameCursor(conn: FakePeerConnection): FrameCursor {
+    let index = 0;
+    return {
+        async next(predicate, timeoutMs = 4_000) {
+            let found: PeerFrame | null = null;
+            await conn.waitFor(() => {
+                for (let i = index; i < conn.frames.length; i++) {
+                    const frame = conn.frames[i] as PeerFrame;
+                    if (predicate(frame)) {
+                        index = i + 1;
+                        found = frame;
+                        return true;
+                    }
+                }
+                return false;
+            }, timeoutMs);
+            return found as unknown as PeerFrame;
+        },
+    };
+}
+
+function jsonBody(value: unknown): Buffer {
+    return Buffer.from(JSON.stringify(value), "utf8");
+}
+
+function sendResponse(
+    conn: FakePeerConnection,
+    corr: bigint,
+    value: unknown,
+    channel = 0,
+    epoch = 0,
+): Promise<void> {
+    return conn.send({ ty: PeerFrameType.Response, channel, epoch, corr, body: jsonBody(value) });
+}
+
+function sendErrorBody(
+    conn: FakePeerConnection,
+    corr: bigint,
+    code: string,
+    channel = 0,
+    epoch = 0,
+): Promise<void> {
+    return conn.send({
+        ty: PeerFrameType.Error,
+        channel,
+        epoch,
+        corr,
+        body: jsonBody({ code, message: `error ${code}` }),
     });
-    const address = server.address();
-    if (!address || typeof address === "string")
-        throw new Error("fake subc server has no TCP port");
-    return address.port;
+}
+
+function sendRouteOpenOk(
+    conn: FakePeerConnection,
+    corr: bigint,
+    channel: number,
+    epoch: number,
+): Promise<void> {
+    return sendResponse(conn, corr, {
+        op: "route.open",
+        route_channel: channel,
+        route_epoch: epoch,
+    });
+}
+
+/** Every routed application body the peer ever observed, across connections. */
+function routedBodies(peer: FakePeer): PeerFrame[] {
+    return peer.connections.flatMap((conn) => conn.frames.filter(isRoutedRequest()));
+}
+
+function expectCallError(error: unknown, kind: SubcCallError["kind"], code?: string): void {
+    expect((error as Error).name).toBe("SubcCallError");
+    expect((error as SubcCallError).kind).toBe(kind);
+    if (code !== undefined) expect((error as SubcCallError).code).toBe(code);
 }
 
 function deferred<T = void>(): {
@@ -110,149 +208,55 @@ function deferred<T = void>(): {
 }
 
 describe("SubcModuleTransport", () => {
-    it("uses the shared v2 client while preserving route identity and flat request bytes", async () => {
-        const tempDir = mkdtempSync(join(tmpdir(), "module-subc-v2-"));
-        const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
-        const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
-        const serverNonce = Uint8Array.from({ length: 32 }, (_, index) => 200 - index);
-        let acceptedSocket: Socket | null = null;
-        let routeOpenBody: unknown;
-        let requestBody: unknown;
-        let routeHeader: EnvelopeHeader | null = null;
-        let requestHeader: EnvelopeHeader | null = null;
-        let goodbyeHeader: EnvelopeHeader | null = null;
-        let resolveServer: (() => void) | undefined;
-        let rejectServer: ((error: unknown) => void) | undefined;
-        const serverWork = new Promise<void>((resolve, reject) => {
-            resolveServer = resolve;
-            rejectServer = reject;
-        });
-        const server = createServer((socket) => {
-            acceptedSocket = socket;
-            void (async () => {
-                const reader = new FakeServerReader(socket);
-                const hello = await readAuthMessage(reader);
-                const clientNonce = Uint8Array.from(hello.client_nonce as number[]);
-                writeAuthMessage(socket, {
-                    server_nonce: [...serverNonce],
-                    daemon_id: [...daemonId],
-                    server_proof: [
-                        ...computeProof(
-                            key,
-                            SERVER_PROOF_DOMAIN,
-                            clientNonce,
-                            serverNonce,
-                            daemonId,
-                        ),
-                    ],
-                });
-                const auth = await readAuthMessage(reader);
-                expect(auth.client_auth).toEqual([
-                    ...computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, serverNonce, daemonId),
-                ]);
-
-                const routeOpen = await readFrame(reader);
-                routeHeader = routeOpen.header;
-                routeOpenBody = JSON.parse(Buffer.from(routeOpen.body).toString("utf8"));
-                writeJsonResponse(socket, routeOpen.header, {
-                    route_channel: 7,
-                    route_epoch: 77,
-                });
-
-                const request = await readFrame(reader);
-                requestHeader = request.header;
-                requestBody = JSON.parse(Buffer.from(request.body).toString("utf8"));
-                writeJsonResponse(socket, request.header, { result: { ok: true } });
-
-                const goodbye = await readFrame(reader);
-                goodbyeHeader = goodbye.header;
-                socket.destroy();
-                resolveServer?.();
-            })().catch((error: unknown) => rejectServer?.(error));
+    it("uses the internal facade while preserving route identity and flat request bytes", async () => {
+        const { peer, transport } = await peerTransport(1_000);
+        const flatBody = {
+            method: "transform",
+            v: 1,
+            input: [{ id: "m1" }],
+        };
+        const callPromise = transport.call({
+            sessionId: "session-1",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: flatBody,
         });
 
-        try {
-            const port = await listen(server);
-            const connectionFile = join(tempDir, "subc-connection.json");
-            writeFileSync(
-                connectionFile,
-                JSON.stringify({
-                    schema: 1,
-                    endpoints: [{ host: "127.0.0.1", port }],
-                    key: [...key],
-                    daemon_id: [...daemonId],
-                    pid: process.pid,
-                    daemon_ver: "fake-v2",
-                }),
-            );
-            chmodSync(connectionFile, 0o600);
+        const conn = await peer.waitForConnection();
+        await conn.authenticated;
+        expect(conn.clientAuthValid).toBe(true);
+        const cursor = frameCursor(conn);
+        const routeOpen = await cursor.next(isRouteOpen);
+        expect(bodyJson(routeOpen)).toEqual({
+            op: "route.open",
+            target: { kind: "tool_provider", module_id: "magic-context" },
+            identity: {
+                project_root: "/workspace/project",
+                harness: "opencode",
+                session: "session-1",
+            },
+        });
+        expect(routeOpen.ver).toBe(PEER_PROTOCOL_VERSION);
+        expect(routeOpen.channel).toBe(0);
+        expect(routeOpen.epoch).toBe(0);
+        await sendRouteOpenOk(conn, routeOpen.corr, 7, 77);
 
-            const transport = new SubcModuleTransport(connectionFile, "magic-context", 1_000);
-            const flatBody = {
-                method: "transform",
-                v: 1,
-                input: [{ id: "m1" }],
-            };
-            await expect(
-                transport.call({
-                    sessionId: "session-1",
-                    projectRoot: "/workspace/project",
-                    method: "transform",
-                    body: flatBody,
-                }),
-            ).resolves.toEqual({ result: { ok: true } });
-            transport.closeSession("session-1");
-            await serverWork;
+        const request = await cursor.next(isRoutedRequest(7));
+        expect(bodyJson(request)).toEqual(flatBody);
+        expect(request.ver).toBe(PEER_PROTOCOL_VERSION);
+        expect(request.epoch).toBe(77);
+        expect(request.corr > routeOpen.corr).toBe(true);
+        // Priority.Background rides in flags bits 1-2; admission stays Normal.
+        expect((request.flags >> 1) & 0b11).toBe(2);
+        expect((request.flags >> 4) & 0b11).toBe(0);
+        await sendResponse(conn, request.corr, { result: { ok: true } }, 7, 77);
 
-            const consumerIdentity =
-                process.env.SUBC_MODULE_ID && process.env.SUBC_LAUNCH_NONCE
-                    ? {
-                          consumer_identity: {
-                              module_id: process.env.SUBC_MODULE_ID,
-                              launch_nonce: process.env.SUBC_LAUNCH_NONCE,
-                          },
-                      }
-                    : {};
-            expect(routeOpenBody).toEqual({
-                op: "route.open",
-                target: { kind: "tool_provider", module_id: "magic-context" },
-                identity: {
-                    project_root: "/workspace/project",
-                    harness: "opencode",
-                    session: "session-1",
-                },
-                ...consumerIdentity,
-            });
-            expect(requestBody).toEqual(flatBody);
-            expect(routeHeader).toEqual(
-                expect.objectContaining({
-                    ver: PROTOCOL_VERSION,
-                    ty: FrameType.Request,
-                    channel: 0,
-                    epoch: 0,
-                }),
-            );
-            expect(requestHeader).toEqual(
-                expect.objectContaining({
-                    ver: PROTOCOL_VERSION,
-                    ty: FrameType.Request,
-                    channel: 7,
-                    epoch: 77,
-                }),
-            );
-            expect(goodbyeHeader).toEqual(
-                expect.objectContaining({
-                    ver: PROTOCOL_VERSION,
-                    ty: FrameType.Goodbye,
-                    channel: 7,
-                    epoch: 77,
-                }),
-            );
-        } finally {
-            acceptedSocket?.destroy();
-            await new Promise<void>((resolve) => server.close(() => resolve()));
-            rmSync(tempDir, { recursive: true, force: true });
-        }
+        await expect(callPromise).resolves.toEqual({ result: { ok: true } });
+
+        transport.closeSession("session-1");
+        const goodbye = await cursor.next((frame) => frame.ty === PeerFrameType.Goodbye);
+        expect(goodbye.channel).toBe(7);
+        expect(goodbye.epoch).toBe(77);
     });
 
     it("recognizes a stale route error from a foreign subc-client prototype", () => {
@@ -265,7 +269,193 @@ describe("SubcModuleTransport", () => {
         expect(__moduleTransportTest.isConnectionFailure(foreignStaleRouteError)).toBe(true);
     });
 
-    it("reconnects once when a cached client reports that it closed", async () => {
+    it("propagates outcome_unknown without a second body when the connection drops after a possible send", async () => {
+        const { peer, transport } = await peerTransport(2_000);
+        const failure = transport.call({
+            sessionId: "session-dropped",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        });
+
+        const conn = await peer.waitForConnection();
+        await conn.authenticated;
+        const cursor = frameCursor(conn);
+        const routeOpen = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, routeOpen.corr, 7, 77);
+        await cursor.next(isRoutedRequest(7));
+        // The body may be on the wire; drop without a terminal.
+        conn.destroy();
+
+        expectCallError(await rejection(failure), "outcome_unknown");
+        await delay(30);
+        // Body-write counting across layers: exactly one possible send, no
+        // hidden lower-layer replay, no reconnect resend.
+        expect(routedBodies(peer)).toHaveLength(1);
+        expect(peer.connections).toHaveLength(1);
+    });
+
+    it("bounds a hung module request and propagates outcome_unknown after exactly one body", async () => {
+        const { peer, transport } = await peerTransport(500);
+        const startedAt = performance.now();
+        const failure = transport.call({
+            sessionId: "session-hung",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1 },
+        });
+
+        const conn = await peer.waitForConnection();
+        await conn.authenticated;
+        const cursor = frameCursor(conn);
+        const routeOpen = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, routeOpen.corr, 7, 77);
+        await cursor.next(isRoutedRequest(7));
+        // Never answer: the request hangs until the operation deadline.
+
+        expectCallError(await rejection(failure), "outcome_unknown");
+        expect(performance.now() - startedAt).toBeLessThan(5_000);
+        expect(routedBodies(peer)).toHaveLength(1);
+        expect(peer.connections).toHaveLength(1);
+    });
+
+    it("evicts the route and retries once on terminal unknown_channel without reconnecting", async () => {
+        const { peer, transport } = await peerTransport(5_000);
+        const args = {
+            sessionId: "session-unknown-channel",
+            projectRoot: "/workspace/project",
+            method: "transform" as const,
+            body: { method: "transform", v: 1 },
+        };
+        const first = transport.call(args);
+        const conn = await peer.waitForConnection();
+        await conn.authenticated;
+        const cursor = frameCursor(conn);
+        const open1 = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, open1.corr, 7, 77);
+        const body1 = await cursor.next(isRoutedRequest(7));
+        await sendResponse(conn, body1.corr, { result: { attempt: 1 } }, 7, 77);
+        await expect(first).resolves.toEqual({ result: { attempt: 1 } });
+
+        const second = transport.call(args);
+        const body2 = await cursor.next(isRoutedRequest(7));
+        // Host-proven no dispatch: the route died with the module restart.
+        await sendErrorBody(conn, body2.corr, "unknown_channel", 7, 77);
+        const open2 = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, open2.corr, 7, 78);
+        const body3 = await cursor.next((frame) => isRoutedRequest(7)(frame) && frame.epoch === 78);
+        expect(body3.corr > body2.corr).toBe(true);
+        expect(bodyJson(body3)).toEqual(args.body);
+        await sendResponse(conn, body3.corr, { result: { attempt: 2 } }, 7, 78);
+
+        await expect(second).resolves.toEqual({ result: { attempt: 2 } });
+        // One connection throughout: eviction, not connection invalidation.
+        expect(peer.connections).toHaveLength(1);
+        expect(routedBodies(peer)).toHaveLength(3);
+    });
+
+    it("recovers a stale cached route pre-send with a fresh correlation and at most two total body sends", async () => {
+        const { peer, transport } = await peerTransport(5_000);
+        const args = {
+            sessionId: "session-stale-route",
+            projectRoot: "/workspace/project",
+            method: "transform" as const,
+            body: { method: "transform", v: 1 },
+        };
+        const first = transport.call(args);
+        const conn1 = await peer.waitForConnection();
+        await conn1.authenticated;
+        const cursor1 = frameCursor(conn1);
+        const open1 = await cursor1.next(isRouteOpen);
+        await sendRouteOpenOk(conn1, open1.corr, 7, 77);
+        const body1 = await cursor1.next(isRoutedRequest(7));
+        await sendResponse(conn1, body1.corr, { result: { first: true } }, 7, 77);
+        await expect(first).resolves.toEqual({ result: { first: true } });
+
+        // The facade generation retires; the transport still caches the route,
+        // so the next request hits a stale handle BEFORE any body write.
+        conn1.destroy();
+        await conn1.closed;
+        await delay(50);
+
+        const second = transport.call(args);
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        const cursor2 = frameCursor(conn2);
+        const open2 = await cursor2.next(isRouteOpen);
+        await sendRouteOpenOk(conn2, open2.corr, 9, 1);
+        const body2 = await cursor2.next(isRoutedRequest(9));
+        expect(bodyJson(body2)).toEqual(args.body);
+        await sendResponse(conn2, body2.corr, { result: { second: true } }, 9, 1);
+
+        await expect(second).resolves.toEqual({ result: { second: true } });
+        // The pre-send stale handle spent the transport token on a fresh
+        // correlation; the second call's body reached exactly one socket.
+        expect(conn2.frames.filter(isRoutedRequest())).toHaveLength(1);
+        expect(routedBodies(peer)).toHaveLength(2);
+    });
+
+    it("aborts after a possible send settle promptly, fence the session lane, and let other sessions proceed", async () => {
+        const { peer, transport } = await peerTransport(10_000);
+        const controller = new AbortController();
+        const callA = transport.call({
+            sessionId: "session-fenced",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1, page: "a" },
+            signal: controller.signal,
+        });
+        const conn = await peer.waitForConnection();
+        await conn.authenticated;
+        const cursor = frameCursor(conn);
+        const openA = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, openA.corr, 7, 77);
+        const bodyA = await cursor.next(isRoutedRequest(7));
+        controller.abort();
+
+        // The caller settles promptly as outcome_unknown with a Cancel queued.
+        const abortError = await rejection(callA);
+        expectCallError(abortError, "outcome_unknown", "aborted");
+        const cancel = await cursor.next((frame) => frame.ty === PeerFrameType.Cancel);
+        expect(cancel.channel).toBe(7);
+        expect(cancel.corr).toBe(bodyA.corr);
+
+        // Same session waits behind the cleanup ticket; another session runs.
+        let callBStarted = false;
+        const callB = transport
+            .call({
+                sessionId: "session-fenced",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1, page: "b" },
+            })
+            .finally(() => {
+                callBStarted = true;
+            });
+        const callC = transport.call({
+            sessionId: "session-independent",
+            projectRoot: "/workspace/project",
+            method: "transform",
+            body: { method: "transform", v: 1, page: "c" },
+        });
+        const openC = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, openC.corr, 9, 1);
+        const bodyC = await cursor.next(isRoutedRequest(9));
+        await sendResponse(conn, bodyC.corr, { result: { page: "c" } }, 9, 1);
+        await expect(callC).resolves.toEqual({ result: { page: "c" } });
+        expect(callBStarted).toBe(false);
+        expect(conn.frames.filter(isRoutedRequest(7))).toHaveLength(1);
+
+        // The late terminal resolves the cleanup ticket and releases the lane.
+        await sendResponse(conn, bodyA.corr, { result: { late: true } }, 7, 77);
+        const bodyB = await cursor.next(isRoutedRequest(7));
+        expect(bodyJson(bodyB)).toEqual({ method: "transform", v: 1, page: "b" });
+        await sendResponse(conn, bodyB.corr, { result: { page: "b" } }, 7, 77);
+        await expect(callB).resolves.toEqual({ result: { page: "b" } });
+        expect(routedBodies(peer)).toHaveLength(3);
+    });
+
+    it("reconnects once when the request provably never reached the socket", async () => {
         const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
         const route = { channel: 7, epoch: 77 } as RouteHandle;
         let connectionCount = 0;
@@ -274,7 +464,7 @@ describe("SubcModuleTransport", () => {
             {
                 routeOpen: async () => route,
                 request: async () => {
-                    throw new Error("client closed");
+                    throw new SubcCallError("not_sent", "client closed", "connection_dropped");
                 },
                 close: () => {
                     firstCloseCount += 1;
@@ -309,14 +499,22 @@ describe("SubcModuleTransport", () => {
         expect(firstCloseCount).toBe(1);
     });
 
-    it("returns a typed generation change instead of retrying a sensitive body", async () => {
-        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+    it("stops after not_sent then unknown_channel: the transport replay token is single-use", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
         const route = { channel: 7, epoch: 77 } as RouteHandle;
-        let connectionCount = 0;
+        let requestCount = 0;
+        let routeOpenCount = 0;
         const client = {
-            routeOpen: async () => route,
+            routeOpen: async () => {
+                routeOpenCount += 1;
+                return route;
+            },
             request: async () => {
-                throw new Error("client closed");
+                requestCount += 1;
+                if (requestCount === 1) {
+                    throw new SubcCallError("not_sent", "queued rejection", "writer_queue_full");
+                }
+                throw new SubcCallError("terminal", "error unknown_channel", "unknown_channel");
             },
             close: () => undefined,
         } as unknown as SubcClient;
@@ -325,7 +523,77 @@ describe("SubcModuleTransport", () => {
             ensureConnected(): Promise<SubcClient>;
         };
         internals.ensureConnected = async () => {
-            connectionCount += 1;
+            internals.client = client;
+            return client;
+        };
+
+        const error = await rejection(
+            transport.call({
+                sessionId: "session-budget",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+            }),
+        );
+        expectCallError(error, "terminal", "unknown_channel");
+        // Two body attempts total; the exhausted budget refuses a third.
+        expect(requestCount).toBe(2);
+        expect(routeOpenCount).toBe(2);
+    });
+
+    it("an aborted caller cannot spend an unspent replay token", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 1_000);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const controller = new AbortController();
+        let requestCount = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async () => {
+                requestCount += 1;
+                controller.abort();
+                throw new SubcCallError("not_sent", "request aborted", "aborted");
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            internals.client = client;
+            return client;
+        };
+
+        const error = await rejection(
+            transport.call({
+                sessionId: "session-aborted-token",
+                projectRoot: "/workspace/project",
+                method: "transform",
+                body: { method: "transform", v: 1 },
+                signal: controller.signal,
+            }),
+        );
+        expectCallError(error, "not_sent", "aborted");
+        expect(requestCount).toBe(1);
+    });
+
+    it("returns the typed generation change for pre-send recovery when generationSensitive is set", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let requestCount = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async () => {
+                requestCount += 1;
+                throw new SubcCallError("not_sent", "client closed", "connection_dropped");
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
             internals.client = client;
             return client;
         };
@@ -343,10 +611,48 @@ describe("SubcModuleTransport", () => {
             previous_generation: 0,
             current_generation: 1,
         });
-        expect(connectionCount).toBe(1);
+        expect(requestCount).toBe(1);
     });
 
-    it("bounds a half-open route and stops after one fresh-connection retry", async () => {
+    it("propagates outcome_unknown as an error even when generationSensitive is set", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file", "magic-context", 100);
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        let requestCount = 0;
+        const client = {
+            routeOpen: async () => route,
+            request: async () => {
+                requestCount += 1;
+                throw new SubcCallError(
+                    "outcome_unknown",
+                    "connection dropped mid-request",
+                    "connection_dropped",
+                );
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            ensureConnected(): Promise<SubcClient>;
+        };
+        internals.ensureConnected = async () => {
+            internals.client = client;
+            return client;
+        };
+
+        const error = await rejection(
+            transport.call({
+                sessionId: "session-generation-sensitive-unknown",
+                projectRoot: "/workspace/project",
+                method: "state_sync",
+                body: { method: "state_sync", v: 1 },
+                generationSensitive: true,
+            }),
+        );
+        expectCallError(error, "outcome_unknown");
+        expect(requestCount).toBe(1);
+    });
+
+    it("bounds a half-open route open under the single operation deadline without any body send", async () => {
         const timeoutMs = 30;
         const transport = new SubcModuleTransport(
             "unused-connection-file",
@@ -355,23 +661,19 @@ describe("SubcModuleTransport", () => {
         );
         let connectionCount = 0;
         let routeOpenCount = 0;
-        const clients = [0, 1].map(
-            () =>
-                ({
-                    routeOpen: () => {
-                        routeOpenCount += 1;
-                        return new Promise<never>(() => undefined);
-                    },
-                    close: () => undefined,
-                }) as unknown as SubcClient,
-        );
+        const client = {
+            routeOpen: () => {
+                routeOpenCount += 1;
+                return new Promise<never>(() => undefined);
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
         const internals = transport as unknown as {
             client: SubcClient | null;
             ensureConnected(): Promise<SubcClient>;
         };
         internals.ensureConnected = async () => {
-            const client = clients[connectionCount++];
-            if (!client) throw new Error("unexpected third connection attempt");
+            connectionCount += 1;
             internals.client = client;
             return client;
         };
@@ -384,13 +686,15 @@ describe("SubcModuleTransport", () => {
             body: { method: "transform", v: 1 },
         });
 
+        // The single absolute deadline is exhausted by the hang, so the
+        // pre-send retry token cannot be spent on a second route open.
         await expect(failure).rejects.toMatchObject({ code: "ETIMEDOUT" });
         expect(performance.now() - startedAt).toBeLessThan(1_000);
-        expect(connectionCount).toBe(2);
-        expect(routeOpenCount).toBe(2);
+        expect(connectionCount).toBe(1);
+        expect(routeOpenCount).toBe(1);
     });
 
-    it("bounds hung transform attempts and stops after one fresh-connection retry", async () => {
+    it("bounds a hung stubbed request as outcome_unknown without a second attempt", async () => {
         const timeoutMs = 30;
         const transport = new SubcModuleTransport(
             "unused-connection-file",
@@ -400,24 +704,20 @@ describe("SubcModuleTransport", () => {
         const route = { channel: 8, epoch: 88 } as RouteHandle;
         let connectionCount = 0;
         let requestCount = 0;
-        const clients = [0, 1].map(
-            () =>
-                ({
-                    routeOpen: async () => route,
-                    request: () => {
-                        requestCount += 1;
-                        return new Promise<never>(() => undefined);
-                    },
-                    close: () => undefined,
-                }) as unknown as SubcClient,
-        );
+        const client = {
+            routeOpen: async () => route,
+            request: () => {
+                requestCount += 1;
+                return new Promise<never>(() => undefined);
+            },
+            close: () => undefined,
+        } as unknown as SubcClient;
         const internals = transport as unknown as {
             client: SubcClient | null;
             ensureConnected(): Promise<SubcClient>;
         };
         internals.ensureConnected = async () => {
-            const client = clients[connectionCount++];
-            if (!client) throw new Error("unexpected third connection attempt");
+            connectionCount += 1;
             internals.client = client;
             return client;
         };
@@ -430,105 +730,44 @@ describe("SubcModuleTransport", () => {
             body: { method: "transform", v: 1 },
         });
 
-        await expect(failure).rejects.toMatchObject({ code: "ETIMEDOUT" });
+        const error = await rejection(failure);
+        expectCallError(error, "outcome_unknown", "request_deadline");
         expect(performance.now() - startedAt).toBeLessThan(1_000);
-        expect(connectionCount).toBe(2);
-        expect(requestCount).toBe(2);
+        expect(connectionCount).toBe(1);
+        expect(requestCount).toBe(1);
     });
 
-    it("reopens a route and retries when a restarted module leaves a stale route token", async () => {
-        const tempDir = mkdtempSync(join(tmpdir(), "module-subc-restart-"));
-        const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
-        const daemonId = Uint8Array.from({ length: 16 }, (_, index) => 100 + index);
-        const serverNonce = Uint8Array.from({ length: 32 }, (_, index) => 200 - index);
-        const sockets = new Set<Socket>();
-        let routeOpenCount = 0;
-        let requestCount = 0;
-        let serverError: unknown;
-        let transport: SubcModuleTransport | null = null;
-        const server = createServer((socket) => {
-            sockets.add(socket);
-            socket.once("close", () => sockets.delete(socket));
-            void (async () => {
-                const reader = new FakeServerReader(socket);
-                const hello = await readAuthMessage(reader);
-                const clientNonce = Uint8Array.from(hello.client_nonce as number[]);
-                writeAuthMessage(socket, {
-                    server_nonce: [...serverNonce],
-                    daemon_id: [...daemonId],
-                    server_proof: [
-                        ...computeProof(
-                            key,
-                            SERVER_PROOF_DOMAIN,
-                            clientNonce,
-                            serverNonce,
-                            daemonId,
-                        ),
-                    ],
-                });
-                const auth = await readAuthMessage(reader);
-                expect(auth.client_auth).toEqual([
-                    ...computeProof(key, CLIENT_AUTH_DOMAIN, clientNonce, serverNonce, daemonId),
-                ]);
+    it("closeSession during an in-flight route open leaves no late cached route", async () => {
+        const transport = new SubcModuleTransport("unused-connection-file");
+        const route = { channel: 7, epoch: 77 } as RouteHandle;
+        const routeOpenStarted = deferred();
+        const releaseRouteOpen = deferred();
+        let closeRouteCount = 0;
+        const client = {
+            routeOpen: async () => {
+                routeOpenStarted.resolve();
+                await releaseRouteOpen.promise;
+                return route;
+            },
+            closeRoute: async () => {
+                closeRouteCount += 1;
+            },
+        } as unknown as SubcClient;
+        const internals = transport as unknown as {
+            client: SubcClient | null;
+            routes: Map<string, unknown>;
+            ensureRoute: (sessionId: string, projectRoot: string) => Promise<unknown>;
+        };
+        internals.client = client;
 
-                const routeOpen = await readFrame(reader);
-                routeOpenCount += 1;
-                writeJsonResponse(socket, routeOpen.header, {
-                    route_channel: 6 + routeOpenCount,
-                    route_epoch: 76 + routeOpenCount,
-                });
+        const opening = internals.ensureRoute("close-race-session", "/route-project");
+        await routeOpenStarted.promise;
+        transport.closeSession("close-race-session");
+        releaseRouteOpen.resolve();
 
-                const request = await readFrame(reader);
-                requestCount += 1;
-                writeJsonResponse(socket, request.header, { result: { requestCount } });
-            })().catch((error: unknown) => {
-                serverError = error;
-                socket.destroy();
-            });
-        });
-
-        try {
-            const port = await listen(server);
-            const connectionFile = join(tempDir, "subc-connection.json");
-            writeFileSync(
-                connectionFile,
-                JSON.stringify({
-                    schema: 1,
-                    endpoints: [{ host: "127.0.0.1", port }],
-                    key: [...key],
-                    daemon_id: [...daemonId],
-                    pid: process.pid,
-                    daemon_ver: "fake-v2",
-                }),
-            );
-            chmodSync(connectionFile, 0o600);
-
-            transport = new SubcModuleTransport(connectionFile, "magic-context", 1_000);
-            const args = {
-                sessionId: "session-restart",
-                projectRoot: "/workspace/project",
-                method: "transform" as const,
-                body: { method: "transform", v: 1 },
-            };
-            await expect(transport.call(args)).resolves.toEqual({ result: { requestCount: 1 } });
-
-            const internals = transport as unknown as {
-                client: { connectionToken: object } | null;
-            };
-            if (!internals.client) throw new Error("transport did not retain its first connection");
-            // Replacing the token emulates a module restart that invalidated the daemon route.
-            internals.client.connectionToken = Object.freeze({});
-
-            await expect(transport.call(args)).resolves.toEqual({ result: { requestCount: 2 } });
-            expect(routeOpenCount).toBe(2);
-            expect(requestCount).toBe(2);
-            expect(serverError).toBeUndefined();
-        } finally {
-            transport?.closeSession("session-restart");
-            for (const socket of sockets) socket.destroy();
-            await new Promise<void>((resolve) => server.close(() => resolve()));
-            rmSync(tempDir, { recursive: true, force: true });
-        }
+        await expect(opening).rejects.toMatchObject({ code: "ECONNRESET" });
+        expect(internals.routes.size).toBe(0);
+        expect(closeRouteCount).toBe(1);
     });
 
     it("bounds canonical-root entries with least-recently-used eviction", () => {
@@ -708,7 +947,8 @@ describe("SubcModuleTransport", () => {
                 oldRequestCount += 1;
                 if (oldRequestCount === 2) oldRequestsStarted.resolve();
                 await oldRequestsStarted.promise;
-                throw new Error("client closed");
+                // Proven pre-send rejections: the replay token may be spent.
+                throw new SubcCallError("not_sent", "client closed", "connection_dropped");
             },
             close: () => {
                 oldCloseCount += 1;
@@ -717,7 +957,7 @@ describe("SubcModuleTransport", () => {
         let routeOpenCount = 0;
         const freshRequestSessions: string[] = [];
         const freshClient = {
-            routeOpen: async (_target: RouteTarget, identity: BindIdentity) => {
+            routeOpen: async (_target: unknown, identity: { session: string }) => {
                 routeOpenCount += 1;
                 return {
                     channel: 20 + routeOpenCount,
@@ -976,6 +1216,11 @@ describe("SubcModuleTransport", () => {
     });
 });
 
+async function nthConnection(peer: FakePeer, n: number): Promise<FakePeerConnection> {
+    await waitUntil(() => peer.connections.length >= n);
+    return peer.connections[n - 1] as FakePeerConnection;
+}
+
 describe("beforeDeadline orphan safety", () => {
     it("a request rejecting after the deadline lost the race never raises an unhandled rejection", async () => {
         const transport = new SubcModuleTransport("/nonexistent-connection-file");
@@ -993,13 +1238,13 @@ describe("beforeDeadline orphan safety", () => {
                 transport as unknown as {
                     beforeDeadline(
                         op: Promise<never>,
-                        deadline: number,
+                        deadline: Deadline,
                         detail: string,
                     ): Promise<never>;
                 }
             ).beforeDeadline.bind(transport);
             // Deadline already passed relative to the operation: the race loses immediately.
-            await expect(beforeDeadline(operation, Date.now() + 5, "test")).rejects.toThrow();
+            await expect(beforeDeadline(operation, Deadline.start(5), "test")).rejects.toThrow();
             // The abandoned operation now rejects — exactly what close() does to
             // every pending request when a connection is invalidated.
             rejectLater?.(new Error("client closed"));

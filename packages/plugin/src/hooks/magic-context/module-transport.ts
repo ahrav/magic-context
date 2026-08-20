@@ -1,17 +1,5 @@
 import { realpathSync } from "node:fs";
 import { join } from "node:path";
-import {
-    AdmissionClass,
-    type BindIdentity,
-    isConsumerReconnectTransient,
-    Priority,
-    type RouteHandle,
-    type RouteTarget,
-    SocketClosedError,
-    SocketTimeoutError,
-    StaleRouteHandleError,
-    SubcClient,
-} from "@cortexkit/subc-client";
 import type {
     AuthorityDrainResponse,
     AuthorityStatus,
@@ -19,6 +7,20 @@ import type {
 } from "../../features/magic-context/context-authority";
 import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
+import {
+    AdmissionClass,
+    type BindIdentity,
+    Deadline,
+    isConsumerReconnectTransient,
+    Priority,
+    type RouteHandle,
+    type RouteTarget,
+    SocketClosedError,
+    SocketTimeoutError,
+    StaleRouteHandleError,
+    SubcCallError,
+    SubcClient,
+} from "../../shared/mc-host-client";
 import { isRecord } from "../../shared/record-type-guard";
 
 const DEFAULT_MODULE_ID = "magic-context";
@@ -53,7 +55,7 @@ function errorChainSome(
 }
 
 /** Route errors must be recognized by wire-visible shape because plugin bundles can carry a
- *  different copy of subc-client from the client that originated the error. */
+ *  different copy of the client from the code that originated the error. */
 function isStaleOrDeadRouteFailure(error: unknown): boolean {
     return errorChainSome(error, (current) => {
         const code = typeof current.code === "string" ? current.code : "";
@@ -104,6 +106,36 @@ function isConnectionFailure(error: unknown): boolean {
     });
 }
 
+/** `SubcCallError.kind` recognized by wire-visible shape across bundled copies (plan R3). */
+function subcCallErrorKind(error: unknown): SubcCallError["kind"] | undefined {
+    if (!isRecord(error) || error.name !== "SubcCallError") return undefined;
+    const kind = error.kind;
+    return kind === "not_sent" || kind === "outcome_unknown" || kind === "terminal"
+        ? kind
+        : undefined;
+}
+
+function errorCodeOf(error: unknown): string | undefined {
+    if (isRecord(error) && typeof error.code === "string") return error.code;
+    return undefined;
+}
+
+/** Pre-send proof: the facade throws this shape only before any body write. */
+function isStaleRouteHandleFailure(error: unknown): boolean {
+    if (error instanceof StaleRouteHandleError) return true;
+    return (
+        isRecord(error) &&
+        (error.name === "StaleRouteHandleError" || error.code === "stale_route_handle")
+    );
+}
+
+/** The bounded cleanup ticket the facade attaches when a caller abort races a possible send. */
+function cleanupTicketOf(error: unknown): Promise<void> | null {
+    if (!isRecord(error) || error.name !== "SubcCallError") return null;
+    const cleanup = (error as { cleanup?: unknown }).cleanup;
+    return cleanup instanceof Promise ? (cleanup as Promise<void>) : null;
+}
+
 interface CachedRoute {
     route: RouteHandle;
     generation: number;
@@ -135,7 +167,7 @@ export function isModuleTransportGenerationChangedResult(
 
 interface SerialLaneWaiter {
     signal?: AbortSignal;
-    deadlineMs: number;
+    deadline: Deadline;
     resolve: (release: () => void) => void;
     reject: (error: unknown) => void;
     onAbort: () => void;
@@ -151,6 +183,8 @@ interface SerialLane {
 interface OpeningRoute {
     client: SubcClient;
     generation: number;
+    /** Set by `closeSession` while the open is in flight; the open must not cache its route. */
+    closed: boolean;
     promise: Promise<EnsuredRoute>;
 }
 
@@ -249,8 +283,9 @@ export class SubcModuleTransport {
 
     private async beforeDeadline<T>(
         operation: Promise<T>,
-        deadlineMs: number,
+        deadline: Deadline,
         detail: string,
+        makeError: () => Error = () => this.deadlineError(detail),
     ): Promise<T> {
         // The race can abandon `operation` (deadline fires first, or the caller's
         // catch invalidates the connection). A later rejection of the abandoned
@@ -260,14 +295,14 @@ export class SubcModuleTransport {
         // receives the original settlement, and a post-race rejection is
         // delivered here instead of the process-level unhandled hook.
         operation.catch(() => {});
-        const remainingMs = deadlineMs - Date.now();
-        if (remainingMs <= 0) throw this.deadlineError(detail);
+        const remainingMs = deadline.remainingMs();
+        if (remainingMs <= 0) throw makeError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
             return await Promise.race([
                 operation,
                 new Promise<T>((_resolve, reject) => {
-                    timer = setTimeout(() => reject(this.deadlineError(detail)), remainingMs);
+                    timer = setTimeout(() => reject(makeError()), remainingMs);
                 }),
             ]);
         } finally {
@@ -309,7 +344,7 @@ export class SubcModuleTransport {
                 waiter.reject(waiter.signal.reason ?? new Error("module transport call aborted"));
                 continue;
             }
-            if (waiter.deadlineMs - Date.now() < SERIAL_LANE_MIN_REMAINING_MS) {
+            if (waiter.deadline.remainingMs() < SERIAL_LANE_MIN_REMAINING_MS) {
                 waiter.reject(this.laneTimeoutError());
                 continue;
             }
@@ -329,12 +364,12 @@ export class SubcModuleTransport {
     private acquireCorrectnessLane(
         sessionId: string,
         signal: AbortSignal | undefined,
-        deadlineMs: number,
+        deadline: Deadline,
     ): Promise<() => void> {
         if (signal?.aborted) {
             return Promise.reject(signal.reason ?? new Error("module transport call aborted"));
         }
-        if (deadlineMs - Date.now() < SERIAL_LANE_MIN_REMAINING_MS) {
+        if (deadline.remainingMs() < SERIAL_LANE_MIN_REMAINING_MS) {
             return Promise.reject(this.laneTimeoutError());
         }
         const lane = this.sessionLanes.get(sessionId) ?? { active: false, waiters: [] };
@@ -365,7 +400,7 @@ export class SubcModuleTransport {
                 this.cleanupLane(sessionId, lane);
             };
             waiter.signal = signal;
-            waiter.deadlineMs = deadlineMs;
+            waiter.deadline = deadline;
             waiter.resolve = resolve;
             waiter.reject = reject;
             waiter.settled = false;
@@ -373,7 +408,7 @@ export class SubcModuleTransport {
                 removeAndReject(signal?.reason ?? new Error("module transport call aborted"));
             waiter.timer = setTimeout(
                 () => removeAndReject(this.laneTimeoutError()),
-                Math.max(0, deadlineMs - Date.now()),
+                Math.max(0, deadline.remainingMs()),
             );
             signal?.addEventListener("abort", waiter.onAbort, { once: true });
             lane.waiters.push(waiter);
@@ -430,7 +465,7 @@ export class SubcModuleTransport {
         timeoutMs?: number;
     }): Promise<unknown> {
         const wrapupInFlight = (this.wrapupSessions.get(args.sessionId) ?? 0) > 0;
-        const attemptTimeoutMs =
+        const operationTimeoutMs =
             args.timeoutMs ??
             (args.method === "session.wrapup" ||
             (args.method === "session.status" && wrapupInFlight)
@@ -438,6 +473,10 @@ export class SubcModuleTransport {
                 : args.method === "transform"
                   ? Math.min(this.requestTimeoutMs, TRANSFORM_SEND_TIMEOUT_MS)
                   : this.requestTimeoutMs);
+        // One immutable absolute operation deadline, created before session-lane
+        // admission and shared by connect, route open, request, and any permitted
+        // replay (plan KTD5/R14). Cleanup uses the facade's separate bounded ticket.
+        const deadline = Deadline.start(operationTimeoutMs);
         const tracksWrapup = args.method === "session.wrapup";
         if (tracksWrapup) {
             this.wrapupSessions.set(
@@ -451,49 +490,55 @@ export class SubcModuleTransport {
             if (remaining > 0) this.wrapupSessions.set(args.sessionId, remaining);
             else this.wrapupSessions.delete(args.sessionId);
         };
-        const laneDeadlineMs = Date.now() + attemptTimeoutMs;
         let releaseLane: (() => void) | undefined;
         try {
-            releaseLane = await this.acquireCorrectnessLane(
-                args.sessionId,
-                args.signal,
-                laneDeadlineMs,
-            );
+            releaseLane = await this.acquireCorrectnessLane(args.sessionId, args.signal, deadline);
         } catch (error) {
             finishWrapupTracking();
             throw error;
         }
-        let activeAttemptClient: SubcClient | null = null;
-        const onAbort = () => this.invalidateConnection(activeAttemptClient ?? this.client);
-        args.signal?.addEventListener("abort", onAbort, { once: true });
+        // Post-write abort produces a bounded cleanup ticket (plan KTD10). The
+        // caller settles promptly while this session's lane stays fenced until
+        // the ticket resolves; the facade retires the generation on expiry.
+        let cleanupTicket: Promise<void> | null = null;
         try {
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-                activeAttemptClient = null;
+            // One transport-owned body-replay token (plan KTD8): this layer uses
+            // only the facade's replay-free routeOpen/request primitives, so it
+            // alone decides whether a body is ever sent a second time.
+            let replaySpent = false;
+            for (;;) {
                 let ensuredRoute: EnsuredRoute | null = null;
+                let requestInvoked = false;
                 try {
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
-                    // Each attempt gets its own timeout, apart from the queue wait limit, so a dead
-                    // socket can hit the deadline and still be replaced on one reconnect.
-                    const attemptDeadlineMs = Date.now() + attemptTimeoutMs;
                     ensuredRoute = await this.ensureRoute(
                         args.sessionId,
                         args.projectRoot,
-                        attemptDeadlineMs,
+                        deadline,
                     );
-                    activeAttemptClient = ensuredRoute.client;
                     if (args.signal?.aborted) {
                         throw args.signal.reason ?? new Error("module transport call aborted");
                     }
+                    requestInvoked = true;
                     const response = await this.beforeDeadline(
                         ensuredRoute.client.request(ensuredRoute.route, args.body, {
                             priority: Priority.Background,
                             admissionClass: AdmissionClass.Normal,
-                            timeoutMs: Math.max(1, attemptDeadlineMs - Date.now()),
+                            timeoutMs: Math.max(1, deadline.remainingMs()),
+                            signal: args.signal,
                         }),
-                        attemptDeadlineMs,
+                        deadline,
                         "waiting for the module response",
+                        // The body may be on the wire: a local deadline after
+                        // request invocation is a possible send, never not_sent.
+                        () =>
+                            new SubcCallError(
+                                "outcome_unknown",
+                                "module transport deadline expired waiting for the module response",
+                                "request_deadline",
+                            ),
                     );
                     if (
                         this.client !== ensuredRoute.client ||
@@ -505,34 +550,65 @@ export class SubcModuleTransport {
                     }
                     return response;
                 } catch (error) {
-                    if (isConnectionFailure(error)) {
-                        const previousGeneration =
-                            ensuredRoute?.generation ?? this.connectionGeneration;
+                    cleanupTicket = cleanupTicketOf(error);
+                    const kind = subcCallErrorKind(error);
+                    const callerAborted = args.signal?.aborted === true;
+                    // Host-proven no-dispatch (wire doc 10.2): evict and retry once.
+                    const unknownChannel =
+                        kind === "terminal" && errorCodeOf(error) === "unknown_channel";
+                    // Proven pre-send: a facade not_sent, a stale handle rejected
+                    // before write, or a failure before request() was invoked.
+                    const provenNotSent =
+                        kind === "not_sent" ||
+                        isStaleRouteHandleFailure(error) ||
+                        (!requestInvoked && isConnectionFailure(error));
+                    const replayEligible = unknownChannel || provenNotSent;
+                    const previousGeneration =
+                        ensuredRoute?.generation ?? this.connectionGeneration;
+                    if (unknownChannel || isStaleRouteHandleFailure(error)) {
+                        // Route-level proof only: evict the dead route and keep
+                        // the connection; the facade reconnects internally if
+                        // its own generation retired.
+                        if (ensuredRoute) {
+                            this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
+                        }
+                    } else if (cleanupTicket === null && isConnectionFailure(error)) {
+                        // Same invalidation as before, but never a body resend
+                        // after a possible send. A post-write abort relies on
+                        // Cancel plus the cleanup ticket instead (plan KTD10).
                         if (ensuredRoute) {
                             this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
                             this.invalidateConnection(ensuredRoute.client);
                         } else {
                             this.invalidateConnection();
                         }
-                        if (args.generationSensitive && !args.signal?.aborted) {
-                            return {
-                                transport_status: "connection_generation_changed",
-                                previous_generation: previousGeneration,
-                                current_generation: this.connectionGeneration,
-                            } satisfies ModuleTransportGenerationChangedResult;
-                        }
-                        // Retry once on a fresh connection generation before the caller enters its
-                        // LKG/raw fallback ladder.
-                        if (attempt === 0 && !args.signal?.aborted) continue;
                     }
+                    if (replayEligible && args.generationSensitive && !callerAborted) {
+                        // Recovery would cross a route/connection generation
+                        // before another body send; let the caller rebuild.
+                        return {
+                            transport_status: "connection_generation_changed",
+                            previous_generation: previousGeneration,
+                            current_generation: this.connectionGeneration,
+                        } satisfies ModuleTransportGenerationChangedResult;
+                    }
+                    if (replayEligible && !replaySpent && !callerAborted && !deadline.isExpired()) {
+                        replaySpent = true;
+                        continue;
+                    }
+                    // Everything else — including every outcome_unknown — propagates
+                    // so no caller mistakes a connection symptom for replay permission.
                     throw error;
                 }
             }
-            throw new Error("module transport route retry exhausted");
         } finally {
-            args.signal?.removeEventListener("abort", onAbort);
             finishWrapupTracking();
-            releaseLane();
+            if (cleanupTicket) {
+                const release = releaseLane;
+                void cleanupTicket.catch(() => {}).finally(() => release());
+            } else {
+                releaseLane();
+            }
         }
     }
 
@@ -679,10 +755,20 @@ export class SubcModuleTransport {
     closeSession(sessionId: string): void {
         const client = this.client;
         const prefix = `${sessionId}\0`;
+        // Fence in-flight opens for this session first so a late route.open
+        // success cannot repopulate the cache after the close (plan R17).
+        let closedOpenings = false;
+        for (const [key, opening] of [...this.routeOpenings.entries()]) {
+            if (!key.startsWith(prefix)) continue;
+            opening.closed = true;
+            this.routeOpenings.delete(key);
+            closedOpenings = true;
+        }
         const routes = [...this.routes.entries()].filter(([key]) => key.startsWith(prefix));
         for (const [key, cachedRoute] of routes) {
             this.routes.delete(key);
             if (client) {
+                // Best-effort close through the awaitable facade primitive.
                 void client.closeRoute(cachedRoute.route).catch((error: unknown) => {
                     if (this.client === client && isConnectionFailure(error)) {
                         this.invalidateConnection(client);
@@ -690,7 +776,7 @@ export class SubcModuleTransport {
                 });
             }
         }
-        if (routes.length === 0 && this.sessionLanes.get(sessionId)?.active) {
+        if (routes.length === 0 && !closedOpenings && this.sessionLanes.get(sessionId)?.active) {
             this.invalidateConnection(client);
         }
     }
@@ -698,7 +784,7 @@ export class SubcModuleTransport {
     private async ensureRoute(
         sessionId: string,
         rawProjectRoot: string,
-        deadlineMs = Date.now() + this.requestTimeoutMs,
+        deadline: Deadline = Deadline.start(this.requestTimeoutMs),
     ): Promise<EnsuredRoute> {
         // The transform and tool lanes can observe the same directory under different
         // spellings when the project is reached through a symlink (OpenCode reports the
@@ -712,7 +798,7 @@ export class SubcModuleTransport {
         const routeKey = `${sessionId}\0${projectRoot}`;
         // Read the cached route only after the connection is settled. The generation check
         // makes a route from any earlier connection invisible even if a cache clear is missed.
-        const client = await this.ensureConnected();
+        const client = await this.ensureConnected(deadline);
         const generation = this.connectionGeneration;
         const existing = this.routes.get(routeKey);
         if (existing?.generation === generation) {
@@ -724,7 +810,13 @@ export class SubcModuleTransport {
             return await opening.promise;
         }
 
-        const promise = (async (): Promise<EnsuredRoute> => {
+        const routeOpening: OpeningRoute = {
+            client,
+            generation,
+            closed: false,
+            promise: undefined as unknown as Promise<EnsuredRoute>,
+        };
+        routeOpening.promise = (async (): Promise<EnsuredRoute> => {
             const target: RouteTarget = { kind: "tool_provider", module_id: this.moduleId };
             const identity: BindIdentity = {
                 project_root: projectRoot,
@@ -733,10 +825,14 @@ export class SubcModuleTransport {
             };
             const route = await this.beforeDeadline(
                 client.routeOpen(target, identity),
-                deadlineMs,
+                deadline,
                 "opening the module route",
             );
-            if (this.client !== client || generation !== this.connectionGeneration) {
+            if (
+                routeOpening.closed ||
+                this.client !== client ||
+                generation !== this.connectionGeneration
+            ) {
                 await client.closeRoute(route).catch(() => undefined);
                 throw this.connectionChangedError(
                     "subc connection changed while opening module route",
@@ -745,10 +841,9 @@ export class SubcModuleTransport {
             this.routes.set(routeKey, { route, generation });
             return { client, route, routeKey, generation };
         })();
-        const routeOpening = { client, generation, promise };
         this.routeOpenings.set(routeKey, routeOpening);
         try {
-            return await promise;
+            return await routeOpening.promise;
         } finally {
             if (this.routeOpenings.get(routeKey) === routeOpening) {
                 this.routeOpenings.delete(routeKey);
@@ -786,14 +881,19 @@ export class SubcModuleTransport {
         return resolved;
     }
 
-    private connectClient(): Promise<SubcClient> {
+    private connectClient(deadline?: Deadline): Promise<SubcClient> {
+        // Derive the handshake stage from the operation deadline without ever
+        // extending the preserved 2-second handshake budget (plan KTD5).
+        const handshakeTimeoutMs = deadline
+            ? Math.max(1, deadline.stageBudgetMs(HANDSHAKE_TIMEOUT_MS))
+            : HANDSHAKE_TIMEOUT_MS;
         return SubcClient.connect({
             connectionFile: this.connectionFile,
-            handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+            handshakeTimeoutMs,
         });
     }
 
-    private async ensureConnected(): Promise<SubcClient> {
+    private async ensureConnected(deadline?: Deadline): Promise<SubcClient> {
         if (this.client) return this.client;
         if (this.connectionPromise) return await this.connectionPromise;
         const now = Date.now();
@@ -811,7 +911,7 @@ export class SubcModuleTransport {
         const connecting = (async (): Promise<SubcClient> => {
             let candidate: SubcClient | null = null;
             try {
-                candidate = await this.connectClient();
+                candidate = await this.connectClient(deadline);
                 if (generation !== this.connectionGeneration) {
                     candidate.close();
                     throw this.connectionChangedError("subc connection attempt was superseded");

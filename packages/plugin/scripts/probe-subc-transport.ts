@@ -11,7 +11,8 @@ import {
     SubcClient,
     type RequestOptions,
     type RouteHandle,
-} from "@cortexkit/subc-client";
+    type SubcDiagnosticsEvent,
+} from "../src/shared/mc-host-client";
 
 import { SubcModuleTransport } from "../src/hooks/magic-context/module-transport";
 import { buildPagedModuleTransformPayloads } from "../src/hooks/magic-context/module-wire";
@@ -33,33 +34,17 @@ type SampleSummary = {
     mean_ms: number;
 };
 
-type ActiveTrace = {
-    requestStartedAt: number;
-    sendStartedAt?: number;
-    headerAt?: number;
-    bodyCompleteAt?: number;
-    dispatchMs: number;
-    parseMs: number;
-};
-
-type RuntimeSocket = {
-    readFrame: (
-        headerDeadlineMs: number,
-        bodyDeadline: number | { afterHeaderMs: number },
-        onHeader?: () => void,
-    ) => Promise<unknown>;
-};
-
-type RuntimeClient = {
-    send: (...args: unknown[]) => Promise<unknown>;
-    dispatch: (frame: unknown) => void;
-    parseJson: (frame: unknown) => unknown;
-    sock: RuntimeSocket;
+type PhaseTrace = {
+    requestStartedAtMs: number;
+    writeStartAtMs?: number;
+    writeCompleteAtMs?: number;
+    headerAtMs?: number;
+    dispatchAtMs?: number;
 };
 
 type InstrumentedRequest = {
     response: JsonRecord;
-    trace: Required<ActiveTrace>;
+    trace: Required<PhaseTrace>;
     roundTripMs: number;
 };
 
@@ -296,81 +281,70 @@ function tailTransformBody(args: {
     };
 }
 
-function instrumentClient(client: SubcClient): {
-    request: (
-        route: RouteHandle,
-        body: JsonRecord,
-        options: RequestOptions,
-    ) => Promise<InstrumentedRequest>;
-} {
-    const runtime = client as unknown as RuntimeClient;
-    let active: ActiveTrace | null = null;
-    const originalSend = runtime.send.bind(client);
-    const originalDispatch = runtime.dispatch.bind(client);
-    const originalParseJson = runtime.parseJson.bind(client);
-    const originalReadFrame = runtime.sock.readFrame.bind(runtime.sock);
+const FRAME_TYPE_REQUEST = 0;
+const RESPONSE_TERMINAL_FRAME_TYPES = new Set<number>([1, 5]); // Response, Error
 
-    runtime.send = (...args) => {
-        if (active) active.sendStartedAt = performance.now();
-        return originalSend(...args);
-    };
-    runtime.dispatch = (frame) => {
-        const startedAt = performance.now();
-        try {
-            originalDispatch(frame);
-        } finally {
-            if (active) active.dispatchMs += performance.now() - startedAt;
-        }
-    };
-    runtime.parseJson = (frame) => {
-        const startedAt = performance.now();
-        try {
-            return originalParseJson(frame);
-        } finally {
-            if (active) active.parseMs += performance.now() - startedAt;
-        }
-    };
-    runtime.sock.readFrame = async (headerDeadlineMs, bodyDeadline, onHeader) => {
-        const boundary: { trace: ActiveTrace | null } = { trace: null };
-        const frame = await originalReadFrame(headerDeadlineMs, bodyDeadline, () => {
-            boundary.trace = active;
-            if (boundary.trace) boundary.trace.headerAt = performance.now();
-            onHeader?.();
-        });
-        if (boundary.trace) boundary.trace.bodyCompleteAt = performance.now();
-        return frame;
-    };
+let activeTrace: PhaseTrace | null = null;
+let activeChannel = -1;
+let daemonPid: number | null = null;
 
-    return {
-        async request(route, body, options) {
-            if (active) throw new Error("transport probe requests must remain sequential");
-            body.request_observed_at_ms = Date.now();
-            const trace: ActiveTrace = {
-                requestStartedAt: performance.now(),
-                dispatchMs: 0,
-                parseMs: 0,
-            };
-            active = trace;
-            try {
-                const response = (await client.request(route, body, options)) as JsonRecord;
-                const roundTripMs = performance.now() - trace.requestStartedAt;
-                if (
-                    trace.sendStartedAt === undefined ||
-                    trace.headerAt === undefined ||
-                    trace.bodyCompleteAt === undefined
-                ) {
-                    throw new Error("transport response missed a socket instrumentation boundary");
-                }
-                return {
-                    response,
-                    roundTripMs,
-                    trace: trace as Required<ActiveTrace>,
-                };
-            } finally {
-                active = null;
-            }
-        },
-    };
+function observeDiagnostics(event: SubcDiagnosticsEvent): void {
+    if (event.type === "connected") {
+        daemonPid = event.pid ?? null;
+        return;
+    }
+    const trace = activeTrace;
+    if (!trace || event.channel !== activeChannel) return;
+    if (event.frameType === FRAME_TYPE_REQUEST) {
+        if (event.type === "write_start" && trace.writeStartAtMs === undefined) {
+            trace.writeStartAtMs = event.atMs;
+        } else if (event.type === "write_complete" && trace.writeCompleteAtMs === undefined) {
+            trace.writeCompleteAtMs = event.atMs;
+        }
+        return;
+    }
+    if (event.frameType === undefined || !RESPONSE_TERMINAL_FRAME_TYPES.has(event.frameType)) {
+        return;
+    }
+    if (event.type === "header" && trace.headerAtMs === undefined) {
+        trace.headerAtMs = event.atMs;
+    } else if (event.type === "dispatch" && trace.dispatchAtMs === undefined) {
+        trace.dispatchAtMs = event.atMs;
+    }
+}
+
+async function instrumentedRequest(
+    client: SubcClient,
+    route: RouteHandle,
+    body: JsonRecord,
+    options: RequestOptions,
+): Promise<InstrumentedRequest> {
+    if (activeTrace) throw new Error("transport probe requests must remain sequential");
+    body.request_observed_at_ms = Date.now();
+    const trace: PhaseTrace = { requestStartedAtMs: Date.now() };
+    const startedAt = performance.now();
+    activeTrace = trace;
+    activeChannel = route.channel;
+    try {
+        const response = (await client.request(route, body, options)) as JsonRecord;
+        const roundTripMs = performance.now() - startedAt;
+        if (
+            trace.writeStartAtMs === undefined ||
+            trace.writeCompleteAtMs === undefined ||
+            trace.headerAtMs === undefined ||
+            trace.dispatchAtMs === undefined
+        ) {
+            throw new Error("transport response missed a diagnostics boundary");
+        }
+        return {
+            response,
+            roundTripMs,
+            trace: trace as Required<PhaseTrace>,
+        };
+    } finally {
+        activeTrace = null;
+        activeChannel = -1;
+    }
 }
 
 if (argv.includes("--help")) {
@@ -424,11 +398,15 @@ const scenarios: Scenario[] = [
 const eventLoopDelay = monitorEventLoopDelay({ resolution: 1 });
 eventLoopDelay.enable();
 const connectStartedAt = performance.now();
-const client = await SubcClient.connect({ connectionFile, handshakeTimeoutMs: timeoutMs });
+const client = await SubcClient.connect({
+    connectionFile,
+    handshakeTimeoutMs: timeoutMs,
+    diagnostics: observeDiagnostics,
+    maxDiagnosticEventsPerSecond: 100_000,
+});
 const connectMs = performance.now() - connectStartedAt;
-const daemonProcessStartedAt = processStartedAt(client.conn.pid);
+const daemonProcessStartedAt = daemonPid === null ? null : processStartedAt(daemonPid);
 const connectionFileMtime = statSync(connectionFile).mtime.toISOString();
-const instrumented = instrumentClient(client);
 let routeOpenMs = 0;
 let routeCloseMs = 0;
 const results: Array<{
@@ -440,7 +418,8 @@ const results: Array<{
 let realResponse: JsonRecord | undefined;
 const realPhases: Record<string, number[]> = {
     round_trip: [],
-    request_encode: [],
+    request_encode_and_queue: [],
+    request_write: [],
     request_ingress_and_queue: [],
     module_apply_once: [],
     module_post_attach: [],
@@ -448,9 +427,6 @@ const realPhases: Record<string, number[]> = {
     module_handler_total: [],
     response_encode_and_router: [],
     socket_read: [],
-    client_dispatch: [],
-    json_parse: [],
-    promise_settlement: [],
 };
 const realResponseBytes: number[] = [];
 const nativeReused: number[] = [];
@@ -542,7 +518,8 @@ try {
                         : tail.fingerprint;
                 continue;
             }
-            const measured = await instrumented.request(
+            const measured = await instrumentedRequest(
+                client,
                 route,
                 tail.body,
                 productionRequestOptions,
@@ -554,9 +531,10 @@ try {
                     ? measured.response.full_array_fingerprint
                     : tail.fingerprint;
             const { trace, roundTripMs, response } = measured;
-            const requestEncodeMs = trace.sendStartedAt - trace.requestStartedAt;
-            const preHeaderMs = trace.headerAt - trace.sendStartedAt;
-            const socketReadMs = trace.bodyCompleteAt - trace.headerAt;
+            const requestEncodeAndQueueMs = trace.writeStartAtMs - trace.requestStartedAtMs;
+            const requestWriteMs = trace.writeCompleteAtMs - trace.writeStartAtMs;
+            const preHeaderMs = trace.headerAtMs - trace.writeStartAtMs;
+            const socketReadMs = trace.dispatchAtMs - trace.headerAtMs;
             const ingressAndQueueMs = responseTiming(response, "request_observed_to_handler");
             const applyOnceMs = responseTiming(response, "total");
             const postAttachMs = responseTiming(response, "post_attach");
@@ -568,17 +546,9 @@ try {
                 0,
                 preHeaderMs - ingressAndQueueMs - accountedHandlerMs,
             );
-            const promiseSettlementMs = Math.max(
-                0,
-                roundTripMs -
-                    requestEncodeMs -
-                    preHeaderMs -
-                    socketReadMs -
-                    trace.dispatchMs -
-                    trace.parseMs,
-            );
             realPhases.round_trip.push(roundTripMs);
-            realPhases.request_encode.push(requestEncodeMs);
+            realPhases.request_encode_and_queue.push(requestEncodeAndQueueMs);
+            realPhases.request_write.push(requestWriteMs);
             realPhases.request_ingress_and_queue.push(ingressAndQueueMs);
             realPhases.module_apply_once.push(applyOnceMs);
             realPhases.module_post_attach.push(postAttachMs);
@@ -586,9 +556,6 @@ try {
             realPhases.module_handler_total.push(handlerTotalMs);
             realPhases.response_encode_and_router.push(responseEncodeAndRouterMs);
             realPhases.socket_read.push(socketReadMs);
-            realPhases.client_dispatch.push(trace.dispatchMs);
-            realPhases.json_parse.push(trace.parseMs);
-            realPhases.promise_settlement.push(promiseSettlementMs);
             realResponseBytes.push(serializedBytes(response));
             nativeReused.push(responseCounter(response, "native_cache_reused_messages"));
             nativeEncoded.push(responseCounter(response, "native_cache_encoded_messages"));
@@ -620,32 +587,12 @@ try {
         routeCloseMs = performance.now() - routeCloseStartedAt;
     }
 } finally {
-    client.close();
+    await client.closeAsync();
 }
 
 if (!realResponse) throw new Error("real-shape transform arm returned no measured response");
 
-type RuntimeTransport = {
-    acquireCorrectnessLane: (
-        sessionId: string,
-        signal: AbortSignal | undefined,
-        deadlineMs: number,
-    ) => Promise<() => void>;
-    invalidateConnection: () => void;
-};
-
 const transport = new SubcModuleTransport(connectionFile, moduleId, timeoutMs);
-const runtimeTransport = transport as unknown as RuntimeTransport;
-const originalAcquire = runtimeTransport.acquireCorrectnessLane.bind(transport);
-const signalIndexes = new Map<AbortSignal, number>();
-const laneWaits = Array.from<number>({ length: fifoConcurrency });
-runtimeTransport.acquireCorrectnessLane = async (sessionId, signal, deadlineMs) => {
-    const startedAt = performance.now();
-    const release = await originalAcquire(sessionId, signal, deadlineMs);
-    const index = signal ? signalIndexes.get(signal) : undefined;
-    if (index !== undefined) laneWaits[index] = performance.now() - startedAt;
-    return release;
-};
 const fifoSessions = Array.from(
     { length: fifoConcurrency },
     (_, index) => `${session}-fifo-${index}`,
@@ -664,26 +611,24 @@ for (const sessionId of fifoSessions) {
     });
 }
 const fifoCallDurations = Array.from<number>({ length: fifoConcurrency });
-const controllers = fifoSessions.map(() => new AbortController());
-controllers.forEach((controller, index) => signalIndexes.set(controller.signal, index));
-await Promise.all(
-    fifoSessions.map(async (sessionId, index) => {
-        const startedAt = performance.now();
-        await transport.call({
-            sessionId,
-            projectRoot,
-            method: "session.status",
-            body: statusBody(sessionId),
-            signal: controllers[index].signal,
-        });
-        fifoCallDurations[index] = performance.now() - startedAt;
-    }),
-);
-const afterDequeueDurations = fifoCallDurations.map(
-    (duration, index) => duration - laneWaits[index],
-);
+const fifoCalls: Promise<void>[] = [];
+fifoSessions.forEach((sessionId, index) => {
+    const startedAt = performance.now();
+    fifoCalls.push(
+        transport
+            .call({
+                sessionId,
+                projectRoot,
+                method: "session.status",
+                body: statusBody(sessionId),
+            })
+            .then(() => {
+                fifoCallDurations[index] = performance.now() - startedAt;
+            }),
+    );
+});
+await Promise.all(fifoCalls);
 for (const sessionId of fifoSessions) transport.closeSession(sessionId);
-runtimeTransport.invalidateConnection();
 eventLoopDelay.disable();
 
 const nanosecondsToMilliseconds = (value: number): number => round(value / 1_000_000);
@@ -694,8 +639,8 @@ console.log(
                 timestamp: new Date().toISOString(),
                 probe_process_started_at: probeProcessStartedAt,
                 daemon_process_started_at: daemonProcessStartedAt,
-                daemon_pid: client.conn.pid,
-                daemon_version: client.conn.daemonVer,
+                daemon_pid: daemonPid,
+                daemon_version: client.daemonVer,
                 connection_file_mtime: connectionFileMtime,
                 connection_file: connectionFile,
                 module_id: moduleId,
@@ -728,11 +673,9 @@ console.log(
                 queue_measurement:
                     "request_ingress_and_queue uses a wall timestamp written immediately before client.request and read at module handler entry; it includes request socket transit, daemon queue/dispatch, and module request JSON decode",
                 socket_measurement:
-                    "socket_read is measured from SUBC frame-header completion through full frame-body completion",
-                parse_measurement:
-                    "json_parse wraps the actual SubcClient.parseJson used for the response",
-                client_dispatch_measurement:
-                    "client_dispatch wraps the actual SubcClient.dispatch for the terminal response frame",
+                    "socket_read spans the facade's response frame-header diagnostics event to its dispatch event (full frame body received and handed to the client)",
+                client_phase_measurement:
+                    "request_encode_and_queue, request_write, and socket_read derive from the facade's redacted wall-clock diagnostics events (millisecond resolution); in-client dispatch/parse durations and promise settlement are not observable through diagnostics and are omitted rather than estimated",
                 native_attach_cache: {
                     reused_messages: summarizeScalars(nativeReused),
                     encoded_messages: summarizeScalars(nativeEncoded),
@@ -753,8 +696,6 @@ console.log(
             module_transport_fifo: {
                 concurrency: fifoConcurrency,
                 unrelated_session_status_calls: true,
-                queue_wait: summarize(laneWaits),
-                after_dequeue_to_response: summarize(afterDequeueDurations),
                 total_call: summarize(fifoCallDurations),
             },
             event_loop_delay: {
@@ -767,3 +708,5 @@ console.log(
         2,
     ),
 );
+
+process.exit(0);

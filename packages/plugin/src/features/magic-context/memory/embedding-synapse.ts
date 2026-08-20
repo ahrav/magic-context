@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { connectionFileExists, SubcCallError, SubcClient } from "@cortexkit/subc-client";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
+import { SubcCallError, SubcClient } from "../../../shared/mc-host-client";
 import type { EmbeddingProvider } from "./embedding-provider";
 
 export const SYNAPSE_DEFAULT_MODEL = "gte-modernbert-base-f16";
@@ -319,29 +319,44 @@ const factoryClients = new WeakMap<() => Promise<SynapseClientLike>, Promise<Syn
 async function getSharedClient(
     options: SynapseEmbeddingProviderOptions,
 ): Promise<SynapseClientLike> {
-    if (options.clientFactory) {
+    const factory = options.clientFactory;
+    if (factory) {
         // Factory clients (tests, embedded fixtures) memoize per factory, never
         // in the module-global slot: a cached fixture client would otherwise
         // leak across providers and poison every later real connection in the
         // same process.
-        let promise = factoryClients.get(options.clientFactory);
+        let promise = factoryClients.get(factory);
         if (!promise) {
-            promise = options.clientFactory();
-            factoryClients.set(options.clientFactory, promise);
+            promise = factory();
+            factoryClients.set(factory, promise);
+            promise.catch(() => {
+                // Evict only our own rejected promise so a later call can
+                // build a fresh client instead of reusing the poisoned one.
+                if (factoryClients.get(factory) === promise) factoryClients.delete(factory);
+            });
         }
         return promise;
     }
     if (sharedClient && sharedClientFile === options.connectionFile) return sharedClient;
     if (sharedClientPromise && sharedClientFile === options.connectionFile)
         return sharedClientPromise;
-    sharedClientFile = options.connectionFile;
-    sharedClientPromise = SubcClient.connect({ connectionFile: options.connectionFile }).then(
+    const promise = SubcClient.connect({ connectionFile: options.connectionFile }).then(
         (client) => {
             sharedClient = client;
             return client;
         },
     );
-    return sharedClientPromise;
+    promise.catch(() => {
+        // Evict only our own rejected promise so a later call can
+        // reconnect instead of reusing the poisoned one.
+        if (sharedClientPromise === promise) {
+            sharedClientPromise = null;
+            sharedClientFile = null;
+        }
+    });
+    sharedClientFile = options.connectionFile;
+    sharedClientPromise = promise;
+    return promise;
 }
 
 export class SynapseEmbeddingProvider implements EmbeddingProvider {
@@ -424,15 +439,6 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         if (this.initializing) return this.initializing;
         this.initializing = (async () => {
             try {
-                if (
-                    !this.options.clientFactory &&
-                    !(await connectionFileExists(this.options.connectionFile))
-                ) {
-                    throw new SynapseEmbeddingError(
-                        "transport",
-                        `Synapse connection file is unavailable: ${this.options.connectionFile}`,
-                    );
-                }
                 this.client = await getSharedClient(this.options);
                 if (!this.metadata) {
                     const discovered = await this.callWithRetry<SynapseCatalogEntry[]>(
@@ -693,10 +699,19 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         retryEmbeddings: boolean,
         signal?: AbortSignal,
     ): Promise<T> {
+        // One absolute application deadline spans the whole retry sequence:
+        // each retry is a new managed call bounded by the remaining budget.
+        const deadlineAtMs = Date.now() + timeoutMs;
         let attempt = 0;
         for (;;) {
             if (signal?.aborted)
                 throw new SynapseEmbeddingError("transport", "Synapse request aborted");
+            const remainingMs = deadlineAtMs - Date.now();
+            if (remainingMs <= 0)
+                throw new SynapseEmbeddingError(
+                    "timeout",
+                    `Synapse ${method} deadline of ${timeoutMs}ms exhausted`,
+                );
             try {
                 if (!this.client)
                     throw new SynapseEmbeddingError("transport", "Synapse client is unavailable");
@@ -705,7 +720,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     method,
                     params,
                     {
-                        timeoutMs,
+                        timeoutMs: remainingMs,
                         // Synapse registers exactly one provider role, ManagementSurface;
                         // every op (embed.*, models.list, jobs) is dispatched by the JSON
                         // method field over that single route.
@@ -725,6 +740,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
                 if (!retryable || attempt >= 3) throw classified;
                 const delay = classified.retryAfterMs ?? Math.min(2_000, 100 * 2 ** attempt);
+                if (Date.now() + delay >= deadlineAtMs) throw classified;
                 attempt += 1;
                 await wait(delay);
             }
@@ -800,4 +816,16 @@ export function _resetSynapseClientForTests(): void {
     sharedClient = null;
     sharedClientFile = null;
     sharedClientPromise = null;
+}
+
+export function _synapseSharedClientStateForTests(): {
+    hasClient: boolean;
+    hasPromise: boolean;
+    file: string | null;
+} {
+    return {
+        hasClient: sharedClient !== null,
+        hasPromise: sharedClientPromise !== null,
+        file: sharedClientFile,
+    };
 }
