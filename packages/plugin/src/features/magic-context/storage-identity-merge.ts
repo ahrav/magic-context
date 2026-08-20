@@ -1,18 +1,14 @@
 import type { Database } from "../../shared/sqlite";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
-
-const IDENTITY_COLUMNS = new Set(["project_path", "project_identity"]);
-const DERIVED_TABLE_SUFFIXES = [
-    "_fts",
-    "_fts_data",
-    "_fts_idx",
-    "_fts_content",
-    "_fts_docsize",
-    "_fts_config",
-];
+import {
+    applyIdentityMergeToProjectRegistry,
+    discoverIdentityTables,
+    type IdentityTableInfo,
+    quoteIdentifier,
+    tableExists,
+} from "./storage-project-identities";
 
 type SqliteRow = Record<string, unknown>;
-type TableInfo = { name: string; identityColumn: string; derived: boolean };
 
 type MergeAction = "rekeyed" | "superseded" | "collision_deleted";
 
@@ -30,52 +26,6 @@ export interface IdentityMergeReport {
     auditedTables: IdentityMergeTableReport[];
     changedRows: number;
     dryRun: boolean;
-}
-
-function quoteIdentifier(identifier: string): string {
-    return `"${identifier.replaceAll('"', '""')}"`;
-}
-
-function tableExists(db: Database, tableName: string): boolean {
-    return Boolean(
-        db
-            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
-            .get(tableName),
-    );
-}
-
-function isDerivedTable(tableName: string, sql: string | null): boolean {
-    return (
-        sql?.toUpperCase().includes("VIRTUAL TABLE") === true ||
-        DERIVED_TABLE_SUFFIXES.some((suffix) => tableName.endsWith(suffix))
-    );
-}
-
-function discoverIdentityTables(db: Database): TableInfo[] {
-    const rows = db
-        .prepare(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        )
-        .all() as Array<{ name?: unknown; sql?: unknown }>;
-    const tables: TableInfo[] = [];
-    for (const row of rows) {
-        if (typeof row.name !== "string") continue;
-        const columns = db
-            .prepare(`PRAGMA table_info(${quoteIdentifier(row.name)})`)
-            .all() as Array<{
-            name?: unknown;
-        }>;
-        const identityColumn = columns.find(
-            (column) => typeof column.name === "string" && IDENTITY_COLUMNS.has(column.name),
-        )?.name;
-        if (typeof identityColumn !== "string") continue;
-        tables.push({
-            name: row.name,
-            identityColumn,
-            derived: isDerivedTable(row.name, typeof row.sql === "string" ? row.sql : null),
-        });
-    }
-    return tables;
 }
 
 function primaryKeyColumns(db: Database, tableName: string): string[] {
@@ -140,7 +90,7 @@ function uniqueIndexes(db: Database, tableName: string): string[][] {
 
 function findUniqueCollision(
     db: Database,
-    table: TableInfo,
+    table: IdentityTableInfo,
     row: SqliteRow,
     fromIdentity: string,
     toIdentity: string,
@@ -350,7 +300,7 @@ function reconcileTaskScheduleCollision(db: Database, source: SqliteRow, target:
 
 function rekeyGenericRow(
     db: Database,
-    table: TableInfo,
+    table: IdentityTableInfo,
     row: SqliteRow,
     fromIdentity: string,
     toIdentity: string,
@@ -394,7 +344,11 @@ function rekeyGenericRow(
     return true;
 }
 
-function tableSourceRows(db: Database, table: TableInfo, fromIdentity: string): SqliteRow[] {
+function tableSourceRows(
+    db: Database,
+    table: IdentityTableInfo,
+    fromIdentity: string,
+): SqliteRow[] {
     return db
         .prepare(
             `SELECT rowid, * FROM ${quoteIdentifier(table.name)} WHERE ${quoteIdentifier(table.identityColumn)} = ?`,
@@ -474,6 +428,7 @@ export function mergeProjectIdentities(
                     rekeyed_at = excluded.rekeyed_at`,
                 ).run(fromIdentity, toIdentity, mergedAt);
             }
+            applyIdentityMergeToProjectRegistry(db, fromIdentity, toIdentity, mergedAt);
 
             for (const table of tables) {
                 const tableReport = report.auditedTables.find(

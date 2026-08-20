@@ -1037,6 +1037,8 @@ const maxCompartmentSeqStatements = new WeakMap<Database, PreparedStatement>();
 const maxMemoryIdStatements = new WeakMap<Database, PreparedStatement>();
 const legacyCompartmentCountStatements = new WeakMap<Database, PreparedStatement>();
 const markerChangeProbeStatements = new WeakMap<Database, PreparedStatement>();
+const registryAliasSignatureStatements = new WeakMap<Database, PreparedStatement>();
+const registryTableProbeStatements = new WeakMap<Database, PreparedStatement>();
 const markerReadCaches = new WeakMap<Database, BoundedSessionMap<MarkerReadCacheEntry>>();
 const m0CompartmentStatements = new WeakMap<Database, PreparedStatement>();
 const newCompartmentStatements = new WeakMap<Database, PreparedStatement>();
@@ -1235,12 +1237,32 @@ const MARKER_CHANGE_PROBE_SQL = `
       COALESCE((
         SELECT GROUP_CONCAT(signature, char(30))
           FROM (
+            -- The whole map, not just one-hop rows into canonical: workspace
+            -- expansion walks multi-hop chains, so a mid-chain rekey row can
+            -- change the expanded identity set for these targets.
             SELECT alias.old_project_path || char(31) || alias.new_project_path AS signature
               FROM v22_identity_rekey_map AS alias
-             WHERE alias.new_project_path IN (SELECT project_path FROM canonical)
              ORDER BY alias.old_project_path, alias.new_project_path
           )
       ), '') AS alias_signature`;
+
+/**
+ * Registry half of the alias signature: `project_aliases` rows feeding
+ * workspace expansion for the canonical identities. Kept as a separate
+ * statement because the registry tables are migration-owned (v82) and absent
+ * from `initializeDatabase()`-only databases.
+ */
+const REGISTRY_ALIAS_SIGNATURE_SQL = `
+    SELECT COALESCE((
+        SELECT GROUP_CONCAT(signature, char(30))
+          FROM (
+            SELECT alias.alias_identity || char(31) || project.canonical_identity AS signature
+              FROM project_aliases AS alias
+              JOIN projects AS project ON project.id = alias.project_id
+             WHERE project.canonical_identity IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+             ORDER BY alias.alias_identity
+          )
+      ), '') AS registry_alias_signature`;
 
 function workspaceIdentity(workspace: WorkspaceRenderContext): string {
     return JSON.stringify({
@@ -1295,6 +1317,29 @@ function readMarkerChangeProbe(
         args.sessionId,
         args.projectPath ?? "",
     ) as MarkerChangeProbeRow;
+    // Registry aliases feed workspace expansion alongside the rekey map, so
+    // they must invalidate the marker cache too. Queried separately: the v82
+    // registry tables are migration-owned and may be absent in
+    // initializeDatabase()-only databases. Statement-cached (not a plain
+    // tableExists call) so an unchanged marker decision stays prepare-free.
+    let registryAliasSignature = "";
+    const registryTablePresent = Boolean(
+        cachedStatement(
+            registryTableProbeStatements,
+            args.db,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_aliases' LIMIT 1",
+        ).get(),
+    );
+    if (registryTablePresent) {
+        const registryRow = cachedStatement(
+            registryAliasSignatureStatements,
+            args.db,
+            REGISTRY_ALIAS_SIGNATURE_SQL,
+        ).get(JSON.stringify(workspace.identities)) as {
+            registry_alias_signature?: string;
+        } | null;
+        registryAliasSignature = registryRow?.registry_alias_signature ?? "";
+    }
     return {
         projectMemoryEpoch: row.project_memory_epoch,
         projectUserProfileVersion: row.project_user_profile_version,
@@ -1305,7 +1350,7 @@ function readMarkerChangeProbe(
         maxMemoryMutationId: row.max_memory_mutation_id,
         workspaceSignature: row.workspace_signature,
         workspaceEpochSignature: row.workspace_epoch_signature,
-        aliasSignature: row.alias_signature,
+        aliasSignature: `${row.alias_signature}\u001d${registryAliasSignature}`,
     };
 }
 

@@ -476,7 +476,7 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | request validation, bounds, idempotency, cursors, restart fencing | `crates/mc-host/tests/synapse_protocol.rs`, `crates/mc-host/tests/synapse_jobs.rs` |
 | four operations over a real authenticated route, shutdown cleanup | `crates/mc-host/tests/synapse_roundtrip.rs` |
 | request-key golden vectors | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` (matching TypeScript golden test) |
-| durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v82.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |
+| durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v83.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |
 
 ## 8. Host and handler lifecycle
 

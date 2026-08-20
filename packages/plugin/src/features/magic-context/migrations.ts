@@ -2,6 +2,17 @@ import { extractTiersFromInner } from "../../hooks/magic-context/compartment-par
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
+    assertClaimsSchemaForeignKeys,
+    CLAIMS_AND_EVIDENCE_TABLES,
+    createClaimsAndEvidenceSchema,
+} from "./storage-claims-schema";
+import {
+    assertProjectRegistrySeed,
+    resolveProjectIdentitySeed,
+    seedProjectRegistry,
+    tableExists,
+} from "./storage-project-identities";
+import {
     ensureColumn,
     healAllNullColumns,
     MEMORIES_AU_TRIGGER_BODY,
@@ -49,12 +60,6 @@ function isSqliteLockError(error: unknown): boolean {
     return (
         typeof candidate.message === "string" &&
         /database is locked|sqlite_(busy|locked)/i.test(candidate.message)
-    );
-}
-
-function tableExists(db: Database, name: string): boolean {
-    return Boolean(
-        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
     );
 }
 
@@ -3093,6 +3098,40 @@ export const MIGRATIONS: Migration[] = [
     },
     {
         version: 82,
+        description:
+            "authoritative claims and evidence schema with the numeric project identity registry",
+        up(db: Database): void {
+            // A replayed v82 must no-op over its own published schema, but a
+            // partial or foreign `projects` table is corruption, not a replay.
+            if (tableExists(db, "projects")) {
+                const missing = CLAIMS_AND_EVIDENCE_TABLES.filter(
+                    (table) => !tableExists(db, table),
+                );
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v82 replay guard: projects exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                return;
+            }
+            const seed = resolveProjectIdentitySeed(db);
+            if (seed.skippedCycles.length > 0) {
+                // Legacy merge flows could store old→new rows with no
+                // acyclicity check; a cyclic chain must not permanently fail
+                // the migration (and disable the plugin), so those identities
+                // stay unregistered until touched by a supported writer.
+                log(
+                    `[migrations] v82: skipped ${seed.skippedCycles.length} identity chain(s) with rekey cycles: ${seed.skippedCycles.join(", ")}`,
+                );
+            }
+            createClaimsAndEvidenceSchema(db);
+            seedProjectRegistry(db, seed, Date.now());
+            assertProjectRegistrySeed(db, seed);
+            assertClaimsSchemaForeignKeys(db);
+        },
+    },
+    {
+        version: 83,
         description: "context-complete synapse batch ledger with versioned CAS state",
         up(db: Database): void {
             if (!tableExists(db, "synapse_batch_ledger")) {
@@ -3149,7 +3188,7 @@ export const MIGRATIONS: Migration[] = [
             ).count;
             if (copied !== legacyCount) {
                 throw new Error(
-                    `v82 ledger copy postcondition failed: ${copied} of ${legacyCount} rows`,
+                    `v83 ledger copy postcondition failed: ${copied} of ${legacyCount} rows`,
                 );
             }
             const duplicates = (
@@ -3167,10 +3206,10 @@ export const MIGRATIONS: Migration[] = [
             ).count;
             if (duplicates !== 0) {
                 throw new Error(
-                    `v82 ledger uniqueness postcondition failed: ${duplicates} duplicate identities`,
+                    `v83 ledger uniqueness postcondition failed: ${duplicates} duplicate identities`,
                 );
             }
-            invalidateUnprovenSynapseDestinationRowsV82(db);
+            invalidateUnprovenSynapseDestinationRowsV83(db);
             db.exec("DROP TABLE synapse_batch_ledger_legacy_v81");
         },
     },
@@ -3178,7 +3217,7 @@ export const MIGRATIONS: Migration[] = [
 
 /**
  * Invalidate Synapse-lane destination vectors whose exact source and lane
- * compatibility cannot be proven from durable state, inside the v82 migration
+ * compatibility cannot be proven from durable state, inside the v83 migration
  * transaction (R24). Coverage, precisely:
  *
  * - `memory_embeddings` and `git_commit_embeddings`: rows under a Synapse lane
@@ -3193,7 +3232,7 @@ export const MIGRATIONS: Migration[] = [
  * - Rows under any non-Synapse `model_id` (local/openai lanes) are never
  *   touched (R25).
  */
-function invalidateUnprovenSynapseDestinationRowsV82(db: Database): void {
+function invalidateUnprovenSynapseDestinationRowsV83(db: Database): void {
     const laneLike = "synapse:v1:%";
     if (tableExists(db, "memory_embeddings")) {
         db.prepare("DELETE FROM memory_embeddings WHERE model_id LIKE ?").run(laneLike);
