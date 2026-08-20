@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 
 use super::SynapseLimits;
 
+pub(crate) const MAX_ITEM_ID_BYTES: usize = 256;
+const CONTENT_SHA256_BYTES: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchItem {
     pub id: String,
@@ -36,6 +39,8 @@ pub enum AdmitOutcome {
     Admitted { job_id: String, seq: u64 },
     /// Admission capacity is exhausted and nothing evictable remains.
     Full,
+    /// This request's result cannot fit the retained-result byte cap.
+    ResultTooLarge,
     /// Shutdown already closed admission.
     Closed,
 }
@@ -87,6 +92,8 @@ struct Job {
     /// until inference replaces them with vectors.
     item_meta: Vec<(String, String)>,
     text_bytes: u64,
+    dimensions: usize,
+    reserved_result_bytes: u64,
     result_bytes: u64,
     state: JobState,
     completed_at: Option<Instant>,
@@ -150,6 +157,30 @@ fn digest_payload(key: &str, items: &[BatchItem]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn result_bytes(item_count: usize, dimensions: usize, metadata_bytes: usize) -> Option<u64> {
+    let vector_bytes = item_count
+        .checked_mul(dimensions)?
+        .checked_mul(std::mem::size_of::<f32>())?;
+    vector_bytes
+        .checked_add(metadata_bytes)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+}
+
+/// Worst retained bytes for a protocol-valid batch at one model dimension.
+pub(crate) fn max_result_bytes(item_count: usize, dimensions: usize) -> Option<u64> {
+    let metadata_bytes = item_count.checked_mul(MAX_ITEM_ID_BYTES + CONTENT_SHA256_BYTES)?;
+    result_bytes(item_count, dimensions, metadata_bytes)
+}
+
+fn admitted_result_bytes(items: &[BatchItem], dimensions: usize) -> Option<u64> {
+    let metadata_bytes = items.iter().try_fold(0usize, |total, item| {
+        total
+            .checked_add(item.id.len())?
+            .checked_add(item.content_sha256.len())
+    })?;
+    result_bytes(items.len(), dimensions, metadata_bytes)
+}
+
 impl JobTable {
     pub fn new(limits: SynapseLimits) -> Self {
         let mut nonce = [0u8; 8];
@@ -197,9 +228,10 @@ impl JobTable {
         jobs.by_key.contains_key(key)
     }
 
-    pub fn admit(&self, key: String, items: Vec<BatchItem>) -> AdmitOutcome {
+    pub fn admit(&self, key: String, items: Vec<BatchItem>, dimensions: usize) -> AdmitOutcome {
         let digest = digest_payload(&key, &items);
         let text_bytes: u64 = items.iter().map(|item| item.text.len() as u64).sum();
+        let result_bytes = admitted_result_bytes(&items, dimensions);
         let mut jobs = self.inner.lock().expect("job table lock");
         if jobs.closed {
             return AdmitOutcome::Closed;
@@ -215,6 +247,13 @@ impl JobTable {
                 });
             }
             return AdmitOutcome::Conflict;
+        }
+
+        let Some(result_bytes) = result_bytes else {
+            return AdmitOutcome::ResultTooLarge;
+        };
+        if result_bytes > self.limits.max_retained_result_bytes {
+            return AdmitOutcome::ResultTooLarge;
         }
 
         let admitted = jobs
@@ -247,6 +286,8 @@ impl JobTable {
                 payload_digest: digest,
                 item_meta,
                 text_bytes,
+                dimensions,
+                reserved_result_bytes: result_bytes,
                 result_bytes: 0,
                 state: JobState::Queued { items },
                 completed_at: None,
@@ -272,7 +313,6 @@ impl JobTable {
     }
 
     pub fn publish_ready(&self, seq: u64, vectors: Vec<Vec<f32>>) {
-        let result_bytes: u64 = vectors.iter().map(|v| (v.len() * 4) as u64).sum();
         // Converting Vec to Arc<[T]> copies the allocation. Keep that work
         // outside the global job-table lock so large inference results do not
         // block admission, polling, or shutdown bookkeeping.
@@ -295,12 +335,16 @@ impl JobTable {
             );
             return;
         }
-        let meta_bytes: u64 = job
-            .item_meta
-            .iter()
-            .map(|(id, hash)| (id.len() + hash.len()) as u64)
-            .sum();
-        let result_bytes = result_bytes + meta_bytes;
+        if vectors.iter().any(|vector| vector.len() != job.dimensions) {
+            self.fail_job(
+                &mut jobs,
+                seq,
+                "artifact_invalid".to_owned(),
+                "inference returned a different vector dimension".to_owned(),
+            );
+            return;
+        }
+        let result_bytes = job.reserved_result_bytes;
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
 
@@ -549,7 +593,9 @@ mod tests {
             content_sha256: "0".repeat(64),
             text: "alpha".to_owned(),
         }];
-        let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key".to_owned(), batch) else {
+        let AdmitOutcome::Admitted { job_id, seq } =
+            jobs.admit("key".to_owned(), batch, 256 * 1024)
+        else {
             panic!("job is admitted");
         };
         jobs.start(seq).expect("job starts");
@@ -570,5 +616,42 @@ mod tests {
         jobs.clear();
         assert_eq!(first.vectors[0].2.len(), 256 * 1024);
         assert_eq!(second.vectors[0].2[0], 0.5);
+    }
+
+    #[test]
+    fn result_byte_boundary_keeps_accepted_job_and_rejects_oversize_before_start() {
+        let dimensions = 2;
+        let exact_bytes =
+            result_bytes(1, dimensions, 1 + CONTENT_SHA256_BYTES).expect("small result size");
+        let limits = SynapseLimits {
+            max_retained_result_bytes: exact_bytes,
+            ..SynapseLimits::default()
+        };
+        let jobs = JobTable::new(limits);
+        let item = |id: &str| {
+            vec![BatchItem {
+                id: id.to_owned(),
+                content_sha256: "0".repeat(CONTENT_SHA256_BYTES),
+                text: "alpha".to_owned(),
+            }]
+        };
+
+        let AdmitOutcome::Admitted { job_id, seq } =
+            jobs.admit("exact".to_owned(), item("a"), dimensions)
+        else {
+            panic!("exact result is admitted");
+        };
+        jobs.start(seq).expect("exact job starts");
+        jobs.publish_ready(seq, vec![vec![0.5; dimensions]]);
+        assert!(matches!(
+            jobs.poll(&job_id, "exact", None),
+            PollOutcome::Page(ResultPage { done: true, .. })
+        ));
+
+        assert!(matches!(
+            jobs.admit("oversize".to_owned(), item("ab"), dimensions),
+            AdmitOutcome::ResultTooLarge
+        ));
+        assert!(!jobs.key_is_retained("oversize"));
     }
 }

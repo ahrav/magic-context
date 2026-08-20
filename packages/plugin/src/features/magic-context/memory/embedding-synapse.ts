@@ -27,6 +27,7 @@ import type {
 
 export const SYNAPSE_DEFAULT_MODEL = "gte-modernbert-base-f16";
 export const SYNAPSE_MAX_INPUT_TOKENS = 8192;
+export const SYNAPSE_MAX_INPUT_BYTES = 1024 * 1024;
 export const SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS = 3_000;
 export const SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS = 120_000;
 /**
@@ -66,6 +67,8 @@ export interface SynapseCatalogEntry {
     recommended_token_budget?: number;
     /** Advertised per-input token window; absent catalogs keep the client default. */
     max_input_tokens?: number;
+    /** Advertised per-input UTF-8 byte ceiling; absent catalogs keep the client default. */
+    max_input_bytes?: number;
     provenance?: unknown;
     certified?: boolean;
     status?: string;
@@ -100,6 +103,7 @@ export interface SynapseEmbeddingProviderOptions {
     recommendedBatch?: number;
     recommendedTokenBudget?: number;
     maxInputTokens?: number;
+    maxInputBytes?: number;
     provenance?: unknown;
     moduleId?: string;
     queryTimeoutMs?: number;
@@ -351,6 +355,15 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
             ? normalizeSynapseTokenBudget(batchRecord.token_budget)
             : undefined;
         const maxInputTokens = record.max_input_tokens ?? record.maxInputTokens;
+        const maxInputBytes = record.max_input_bytes ?? record.maxInputBytes;
+        if (
+            maxInputBytes !== undefined &&
+            (typeof maxInputBytes !== "number" ||
+                !Number.isInteger(maxInputBytes) ||
+                maxInputBytes < 4)
+        ) {
+            return [];
+        }
         const state = typeof record.state === "string" ? record.state : undefined;
         return [
             {
@@ -368,6 +381,11 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
                 Number.isInteger(maxInputTokens) &&
                 maxInputTokens > 0
                     ? { max_input_tokens: maxInputTokens }
+                    : {}),
+                ...(typeof maxInputBytes === "number" &&
+                Number.isInteger(maxInputBytes) &&
+                maxInputBytes >= 4
+                    ? { max_input_bytes: maxInputBytes }
                     : {}),
                 ...(record.provenance !== undefined ? { provenance: record.provenance } : {}),
                 ...(typeof record.certified === "boolean" ? { certified: record.certified } : {}),
@@ -475,6 +493,7 @@ async function getSharedClient(
 export class SynapseEmbeddingProvider implements EmbeddingProvider {
     modelId: string;
     maxInputTokens: number;
+    maxInputBytes: number;
     metadata: SynapseLaneMetadata | null;
 
     /// Deadline basis for every ledger page this provider opens. Resolved once
@@ -501,6 +520,12 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             options.maxInputTokens > 0
                 ? options.maxInputTokens
                 : undefined;
+        const maxInputBytes =
+            typeof options.maxInputBytes === "number" &&
+            Number.isInteger(options.maxInputBytes) &&
+            options.maxInputBytes >= 4
+                ? options.maxInputBytes
+                : undefined;
         const recommendedTokenBudget = normalizeSynapseTokenBudget(options.recommendedTokenBudget);
         this.metadata =
             fingerprint &&
@@ -519,6 +544,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                           ? { recommended_token_budget: recommendedTokenBudget }
                           : {}),
                       ...(maxInputTokens !== undefined ? { max_input_tokens: maxInputTokens } : {}),
+                      ...(maxInputBytes !== undefined ? { max_input_bytes: maxInputBytes } : {}),
                       ...(options.provenance !== undefined
                           ? { provenance: options.provenance }
                           : {}),
@@ -529,6 +555,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         this.batchLimit = this.metadata?.recommended_batch ?? 16;
         this.tokenBudget = this.metadata?.recommended_token_budget ?? null;
         this.maxInputTokens = maxInputTokens ?? SYNAPSE_MAX_INPUT_TOKENS;
+        this.maxInputBytes = maxInputBytes ?? SYNAPSE_MAX_INPUT_BYTES;
     }
 
     /**
@@ -624,6 +651,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     this.batchLimit = metadata.recommended_batch ?? this.batchLimit;
                     this.tokenBudget = metadata.recommended_token_budget ?? this.tokenBudget;
                     this.maxInputTokens = metadata.max_input_tokens ?? this.maxInputTokens;
+                    this.maxInputBytes = metadata.max_input_bytes ?? this.maxInputBytes;
                 }
                 this.initialized = true;
                 return true;

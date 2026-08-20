@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import {
+    buildCanonicalChunkTextFromFts,
     chunkCanonicalText,
     loadCompartmentChunkEmbeddingsForSearch,
     replaceCompartmentChunkEmbeddings,
@@ -18,6 +19,7 @@ import {
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import { SynapseEmbeddingError } from "./memory/embedding-synapse";
 import { insertMemory } from "./memory/storage-memory";
 import {
     getStoredModelId,
@@ -28,6 +30,7 @@ import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
+    embedCompartmentWindowsDetailedForProject,
     embedMemoriesDetailedForProject,
     embedSessionCompartmentChunks,
     embedTextForProject,
@@ -35,6 +38,7 @@ import {
     embedUnembeddedMemoriesForProject,
     enqueueShadowEmbeddingItems,
     flushShadowEmbeddingBacklog,
+    getProjectEmbeddingMaxInputTokens,
     getProjectEmbeddingSnapshot,
     getShadowBackfillStopReason,
     markProjectLoadUntrusted,
@@ -2103,6 +2107,125 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         }
     });
 
+    it("does not publish chunk receipts after the compartment source changes", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-chunk-publish-race";
+        const sessionId = "ses-detailed-chunk-publish-race";
+        const host = new DetailedSynapseTestHost();
+        const compartmentId = seedCompartmentWithFts(db, sessionId);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        registerDetailed(db, projectIdentity, host);
+        const compartment = getCompartments(db, sessionId)[0];
+        const windows = chunkCanonicalText(
+            buildCanonicalChunkTextFromFts(
+                db,
+                sessionId,
+                compartment.startMessage,
+                compartment.endMessage,
+            ),
+            compartment.startMessage,
+            compartment.endMessage,
+            getProjectEmbeddingMaxInputTokens(projectIdentity),
+        );
+        host.resultPages = (_jobId, items) => {
+            db.prepare(
+                "UPDATE message_history_fts SET content = ? WHERE session_id = ? AND message_ordinal = ?",
+            ).run("The queue source changed during inference.", sessionId, 1);
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const applied = await embedCompartmentWindowsDetailedForProject(db, projectIdentity, {
+            compartmentId,
+            sessionId,
+            windows,
+        });
+
+        expect(applied).toBe(false);
+        expect(
+            loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                sessionId,
+                projectIdentity,
+                currentChunkModelId(projectIdentity),
+            ),
+        ).toEqual([]);
+        expect(ledgerRows(db).some((row) => row.state === "obsolete")).toBe(true);
+    });
+
+    it("replaces a multi-page chunk group when one page changes", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-chunk-group-reopen";
+        const sessionId = "ses-detailed-chunk-group-reopen";
+        const host = new DetailedSynapseTestHost();
+        const compartmentId = seedCompartmentWithFts(db, sessionId);
+        const original = "a ".repeat(40_000);
+        db.prepare(
+            "UPDATE message_history_fts SET content = ? WHERE session_id = ? AND message_ordinal = ?",
+        ).run(original, sessionId, 1);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        registerDetailed(db, projectIdentity, host);
+        const compartment = getCompartments(db, sessionId)[0];
+        const buildWindows = () =>
+            chunkCanonicalText(
+                buildCanonicalChunkTextFromFts(
+                    db,
+                    sessionId,
+                    compartment.startMessage,
+                    compartment.endMessage,
+                ),
+                compartment.startMessage,
+                compartment.endMessage,
+                getProjectEmbeddingMaxInputTokens(projectIdentity),
+            );
+        const originalWindows = buildWindows();
+        expect(originalWindows.length).toBeGreaterThan(2);
+        expect(
+            await embedCompartmentWindowsDetailedForProject(db, projectIdentity, {
+                compartmentId,
+                sessionId,
+                windows: originalWindows,
+            }),
+        ).toBe(true);
+
+        db.prepare(
+            "UPDATE message_history_fts SET content = ? WHERE session_id = ? AND message_ordinal = ?",
+        ).run(`b${original.slice(1)}`, sessionId, 1);
+        const changedWindows = buildWindows();
+        expect(changedWindows).toHaveLength(originalWindows.length);
+        expect(
+            changedWindows.filter(
+                (window, index) => window.chunkHash !== originalWindows[index]?.chunkHash,
+            ),
+        ).toHaveLength(1);
+        host.vectorFor = () => [4, 5, 6];
+
+        expect(
+            await embedCompartmentWindowsDetailedForProject(db, projectIdentity, {
+                compartmentId,
+                sessionId,
+                windows: changedWindows,
+            }),
+        ).toBe(true);
+        const stored = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            sessionId,
+            projectIdentity,
+            currentChunkModelId(projectIdentity),
+        );
+        expect(stored).toHaveLength(changedWindows.length);
+        expect(stored.every((row) => Array.from(row.vector).join(",") === "4,5,6")).toBe(true);
+    });
+
     it("commit drain routes through receipts and completes only with the vector write", async () => {
         const db = useTempDb();
         const projectIdentity = "git:detailed-commit";
@@ -2117,6 +2240,57 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         const rows = ledgerRows(db);
         expect(rows.length).toBeGreaterThan(0);
         expect(rows.every((row) => row.scope === "commit" && row.state === "complete")).toBe(true);
+    });
+
+    it("skips an oversized newest commit and embeds the older valid commit", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-commit-oversized";
+        const host = new DetailedSynapseTestHost();
+        const oversized = {
+            ...makeGitCommit("oversized", 2000),
+            message: "x".repeat(1024 * 1024 + 1),
+        };
+        const valid = makeGitCommit("valid", 1000);
+        upsertCommits(db, projectIdentity, [oversized, valid]);
+        registerDetailed(db, projectIdentity, host);
+        host.resultPages = (_jobId, items) => {
+            const batchItems = host.batchCalls().at(-1)?.params.items as
+                | { text: string }[]
+                | undefined;
+            if (batchItems?.some((item) => Buffer.byteLength(item.text, "utf8") > 1024 * 1024)) {
+                return new SynapseEmbeddingError(
+                    "schema_violation",
+                    "item text exceeds the served per-text byte cap",
+                );
+            }
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const drained = await drainCommitBacklogForProject(db, projectIdentity, Date.now() + 5000);
+
+        expect(drained).toBe(1);
+        expect(countEmbeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(1);
+        expect(
+            countRows(
+                db,
+                `SELECT COUNT(*) AS count
+                 FROM git_commit_embeddings
+                 WHERE sha = ? AND model_id = ?`,
+                valid.sha,
+                SYNAPSE_TEST_LANE_IDENTITY,
+            ),
+        ).toBe(1);
+        expect(host.batchCalls()).toHaveLength(1);
     });
 
     it("chunk drain applies each compartment group atomically through its receipts", async () => {

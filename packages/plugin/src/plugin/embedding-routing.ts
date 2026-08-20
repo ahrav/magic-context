@@ -8,6 +8,7 @@ import {
     getSynapseLaneIdentity,
     normalizeSynapseTokenBudget,
     SYNAPSE_DEFAULT_MODEL,
+    SYNAPSE_MAX_INPUT_BYTES,
     SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
     type SynapseLaneMetadata,
@@ -20,6 +21,8 @@ export interface ResolvedSynapseEmbeddingConfig {
     /** Advertised per-input token window; SYNAPSE_MAX_INPUT_TOKENS when the
      *  catalog omits it. */
     max_input_tokens: number;
+    /** Advertised UTF-8 byte ceiling for one input. */
+    synapse_max_input_bytes: number;
     synapse_connection_file: string;
     synapse_fingerprint: string;
     synapse_table_epoch: number;
@@ -106,6 +109,7 @@ function synapseOptions(
                       metadata.recommended_token_budget,
                   ),
                   maxInputTokens: metadata.max_input_tokens,
+                  maxInputBytes: metadata.max_input_bytes,
                   provenance: metadata.provenance,
               }
             : {}),
@@ -148,6 +152,7 @@ function resolvedSynapseConfig(
         provider: "synapse",
         model: metadata.model,
         max_input_tokens: metadata.max_input_tokens ?? SYNAPSE_MAX_INPUT_TOKENS,
+        synapse_max_input_bytes: metadata.max_input_bytes ?? SYNAPSE_MAX_INPUT_BYTES,
         synapse_connection_file: subc.connection_file,
         synapse_fingerprint: metadata.fingerprint,
         synapse_table_epoch: metadata.table_epoch,

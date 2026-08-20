@@ -15,7 +15,12 @@ const TY_ERROR: u8 = 5;
 #[tokio::test]
 async fn models_list_returns_exactly_the_certified_entry() {
     let engine = DeterministicEngine::new();
-    let host = SynapseHost::start(ready_component(engine, SynapseLimits::default())).await;
+    let limits = SynapseLimits {
+        max_text_bytes: 123_456,
+        ..SynapseLimits::default()
+    };
+    let advertised_max_text_bytes = limits.max_text_bytes;
+    let host = SynapseHost::start(ready_component(engine, limits)).await;
     let mut client = host.client().await;
     let (channel, epoch) = open_synapse_route(&mut client).await;
 
@@ -35,6 +40,8 @@ async fn models_list_returns_exactly_the_certified_entry() {
     assert_eq!(models[0]["fingerprint"], lane.fingerprint);
     assert_eq!(models[0]["table_epoch"], lane.table_epoch);
     assert_eq!(models[0]["dims"], lane.dims);
+    assert_eq!(models[0]["max_input_tokens"], lane.max_tokens);
+    assert_eq!(models[0]["max_input_bytes"], advertised_max_text_bytes);
     assert_eq!(models[0]["certified"], true);
     assert_eq!(models[0]["status"], "ready");
     assert_eq!(models[0]["recommended_batch"]["rows"], 16);
@@ -322,6 +329,38 @@ async fn embed_batch_always_returns_a_job_descriptor() {
     assert_eq!(vectors[1]["id"], "item:1");
     assert_eq!(result["result"]["fingerprint"], lane.fingerprint);
     assert!(result["result"].get("next_cursor").is_none());
+
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn batch_result_over_retention_cap_is_rejected_before_inference() {
+    let engine = DeterministicEngine::new();
+    // Eight f32 components, one ID byte, and one 64-byte content hash.
+    let limits = SynapseLimits {
+        max_retained_result_bytes: 8 * 4 + 1 + 64,
+        ..SynapseLimits::default()
+    };
+    let host = SynapseHost::start(ready_component(engine.clone(), limits)).await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let lane = test_lane();
+    let page = items(&[("ab", "text")]);
+
+    let frame = call(
+        &mut client,
+        channel,
+        epoch,
+        "embed.batch",
+        batch_params(&lane, &page),
+    )
+    .await;
+    assert_eq!(frame.error_code(), "schema_violation");
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "oversized result must be rejected before inference"
+    );
 
     host.shutdown().await.expect("graceful shutdown");
 }

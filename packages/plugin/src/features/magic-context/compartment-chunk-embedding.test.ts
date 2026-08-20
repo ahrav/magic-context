@@ -262,6 +262,18 @@ describe("compartment chunk embedding core", () => {
         }
     });
 
+    test("every window stays under the provider byte ceiling", () => {
+        const maxInputBytes = 1_024;
+        const text = `[1] U: ${"a".repeat(maxInputBytes * 3)}`;
+
+        const windows = chunkCanonicalText(text, 1, 1, 1_048_576, maxInputBytes);
+
+        expect(windows.length).toBeGreaterThan(1);
+        for (const window of windows) {
+            expect(Buffer.byteLength(window.text, "utf8")).toBeLessThanOrEqual(maxInputBytes);
+        }
+    });
+
     test("splits a single oversized canonical line so no window exceeds the budget (#206)", () => {
         // One canonical line (a single A: span) far larger than the budget — e.g.
         // a big file dump rendered into one message. The old chunker emitted this
@@ -619,11 +631,13 @@ describe("all-window replacement through versioned synapse receipts", () => {
             const host = new DetailedSynapseTestHost();
             const chunkModelId = registerDetailedChunkProject(db, "git:chunk-span", host);
             const compartmentId = seedCompartment(db, "ses-span");
+            const windows = testWindows(5);
 
             const applied = await embedCompartmentWindowsDetailedForProject(db, "git:chunk-span", {
                 compartmentId,
                 sessionId: "ses-span",
-                windows: testWindows(5),
+                windows,
+                currentWindows: () => windows,
             });
 
             expect(applied).toBe(true);
@@ -647,6 +661,7 @@ describe("all-window replacement through versioned synapse receipts", () => {
             const host = new DetailedSynapseTestHost();
             const chunkModelId = registerDetailedChunkProject(db, "git:chunk-miss", host);
             const compartmentId = seedCompartment(db, "ses-miss");
+            const windows = testWindows(5);
 
             const priorWindow = testWindows(1)[0];
             replaceCompartmentChunkEmbeddings(db, [
@@ -683,7 +698,8 @@ describe("all-window replacement through versioned synapse receipts", () => {
             const applied = await embedCompartmentWindowsDetailedForProject(db, "git:chunk-miss", {
                 compartmentId,
                 sessionId: "ses-miss",
-                windows: testWindows(5),
+                windows,
+                currentWindows: () => windows,
             });
 
             expect(applied).toBe(false);

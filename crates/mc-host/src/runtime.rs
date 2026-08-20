@@ -228,14 +228,20 @@ impl AbortRegistry {
 
 /// Keeps the instance lock held until every tracked task — including
 /// abort-exempt lifecycle callbacks that still own the handler — has finished,
-/// without blocking `run`'s return. The wait is deliberately unbounded: while
-/// such a callback runs, a successor acquiring the same data directory would
-/// initialize concurrently with live predecessor code, and the lock dies with
-/// the process anyway, so holding it is the truthful answer.
+/// then runs handler shutdown and waits for it without blocking `run`'s return.
+/// The waits are deliberately unbounded: while either callback runs, a
+/// successor acquiring the same data directory would initialize concurrently
+/// with live predecessor code, and the lock dies with the process anyway, so
+/// holding it is the truthful answer.
 fn retain_lock_until_drained<H: McHostHandler>(shared: Arc<HostShared<H>>, guard: InstanceGuard) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
             // The tracker is already closed by the shutdown sequence.
+            shared.tracker.wait().await;
+            run_handler_shutdown(&shared).await;
+            if let Some(message) = shared.fatal.take() {
+                eprintln!("mc-host: deferred handler shutdown failed: {message}");
+            }
             shared.tracker.wait().await;
             drop(shared);
             drop(guard);

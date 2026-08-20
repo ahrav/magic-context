@@ -119,7 +119,7 @@ describe("SynapseEmbeddingProvider", () => {
         });
     });
 
-    it("adopts the catalog's advertised max_input_tokens over the default window", async () => {
+    it("adopts the catalog's advertised input limits", async () => {
         const client = new MockSynapseClient();
         client.call = async <Response = unknown>(
             _module: string,
@@ -136,6 +136,7 @@ describe("SynapseEmbeddingProvider", () => {
                             table_epoch: 0,
                             dims: 3,
                             max_input_tokens: 2048,
+                            max_input_bytes: 4096,
                         },
                     ],
                 } as Response;
@@ -151,6 +152,7 @@ describe("SynapseEmbeddingProvider", () => {
 
         expect(await provider.initialize()).toBe(true);
         expect(provider.maxInputTokens).toBe(2048);
+        expect(provider.maxInputBytes).toBe(4096);
     });
 
     it("honors the live recommended batch size and retries model loading with retry_after_ms", async () => {

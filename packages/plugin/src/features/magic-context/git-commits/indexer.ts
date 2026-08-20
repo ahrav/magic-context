@@ -12,7 +12,11 @@
 
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
-import { embedCommitRowsForProject, getProjectEmbeddingSnapshot } from "../memory/embedding";
+import {
+    embedCommitRowsForProject,
+    getProjectEmbeddingMaxInputBytes,
+    getProjectEmbeddingSnapshot,
+} from "../memory/embedding";
 import { readGitCommitsResult } from "./git-log-reader";
 import { countEmbeddedCommits, loadUnembeddedCommits } from "./storage-git-commit-embeddings";
 import {
@@ -157,11 +161,18 @@ export async function embedUnembeddedCommits(db: Database, projectPath: string):
     embedInProgress.add(projectPath);
     const startedAt = Date.now();
     const deadline = startedAt + EMBED_SWEEP_MAX_WALL_CLOCK_MS;
+    const maxInputBytes = getProjectEmbeddingMaxInputBytes(projectPath) ?? Number.MAX_SAFE_INTEGER;
     let total = 0;
 
     try {
         while (Date.now() < deadline && total < EMBED_MAX_PER_SWEEP) {
-            const rows = loadUnembeddedCommits(db, projectPath, snapshot.modelId, EMBED_BATCH_SIZE);
+            const rows = loadUnembeddedCommits(
+                db,
+                projectPath,
+                snapshot.modelId,
+                EMBED_BATCH_SIZE,
+                maxInputBytes,
+            );
             if (rows.length === 0) break;
 
             let embeddedThisBatch = 0;

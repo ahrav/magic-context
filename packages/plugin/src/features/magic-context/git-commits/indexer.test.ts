@@ -96,16 +96,20 @@ describe("commit indexer embedding through versioned receipts", () => {
         db: Database,
         projectIdentity: string,
         host: DetailedSynapseTestHost,
+        maxInputBytes?: number,
     ): void {
         _setTestProviderFactoryForProject((config) =>
             config.provider === "synapse"
-                ? detailedSynapseTestProvider(host)
+                ? detailedSynapseTestProvider(host, maxInputBytes)
                 : new FakeLocalProvider(),
         );
         registerProjectEmbedding(
             db,
             projectIdentity,
-            synapseTestConfig(),
+            {
+                ...synapseTestConfig(),
+                ...(maxInputBytes !== undefined ? { synapse_max_input_bytes: maxInputBytes } : {}),
+            } as EmbeddingConfig,
             { memoryEnabled: true, gitCommitEnabled: true },
             "/tmp/indexer-detailed",
         );
@@ -200,7 +204,7 @@ describe("commit indexer embedding through versioned receipts", () => {
         expect(ledgerRows(db).every((row) => row.state !== "complete")).toBe(true);
     });
 
-    it("drains past an empty-message commit instead of failing its batch forever", async () => {
+    it("drains past permanently unembeddable commits instead of failing its batch forever", async () => {
         const db = useTempDb();
         const projectIdentity = "git:indexer-empty-message";
         const host = new DetailedSynapseTestHost();
@@ -208,11 +212,12 @@ describe("commit indexer embedding through versioned receipts", () => {
         // puts it in every batch the drain takes.
         const withMessage = makeGitCommit("fff", 6000);
         const empty = makeGitCommit("999", 7000, "");
-        upsertCommits(db, projectIdentity, [withMessage, empty]);
-        registerSynapseProject(db, projectIdentity, host);
+        const oversized = makeGitCommit("888", 8000, "x".repeat(1025));
+        upsertCommits(db, projectIdentity, [withMessage, empty, oversized]);
+        registerSynapseProject(db, projectIdentity, host, 1024);
 
         expect(
-            loadUnembeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY, 10).map(
+            loadUnembeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY, 10, 1024).map(
                 (row) => row.sha,
             ),
         ).toEqual([withMessage.sha]);
@@ -228,9 +233,9 @@ describe("commit indexer embedding through versioned receipts", () => {
         expect(batchedIds).toEqual([`commit:${withMessage.sha}`]);
         expect(ledgerRows(db).every((row) => row.state === "complete")).toBe(true);
         // Nothing is left to re-select, so the next sweep does no work at all.
-        expect(loadUnembeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY, 10)).toEqual(
-            [],
-        );
+        expect(
+            loadUnembeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY, 10, 1024),
+        ).toEqual([]);
     });
 
     it("keeps non-synapse providers on their existing path with zero ledger rows", async () => {

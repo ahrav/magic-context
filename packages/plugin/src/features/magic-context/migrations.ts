@@ -3137,6 +3137,7 @@ export const MIGRATIONS: Migration[] = [
             if (!tableExists(db, "synapse_batch_ledger")) {
                 db.exec(synapseBatchLedgerDdl("synapse_batch_ledger"));
                 db.exec(synapseBatchLedgerIndexDdl(false));
+                invalidateUnprovenSynapseDestinationRowsV83(db);
                 return;
             }
             const columns = new Set(
@@ -3147,16 +3148,18 @@ export const MIGRATIONS: Migration[] = [
                 ).map((row) => row.name),
             );
             if (columns.has("state_version")) {
-                // `state_version` exists only once this migration's own DDL has
-                // run, so the ledger already carries the target shape. The
-                // staging copy is created after that DDL and dropped as the
-                // final statement, so its presence marks an attempt interrupted
-                // between the two -- the destination invalidation may not have
-                // run. Repeat it (deleting rows under a Synapse lane identity is
-                // idempotent) and drop the staging copy so the shape is
-                // complete.
-                if (tableExists(db, "synapse_batch_ledger_legacy_v81")) {
+                const hasInterruptedStaging = tableExists(db, "synapse_batch_ledger_legacy_v81");
+                const ledgerIsEmpty =
+                    db.prepare("SELECT 1 FROM synapse_batch_ledger LIMIT 1").get() == null;
+                // The staging table marks an interrupted replacement. An empty
+                // target ledger can also be precreated by database initialization;
+                // without any receipt, Synapse destination rows are unproven.
+                // A populated target ledger without staging may contain
+                // context-complete receipts and must remain untouched on repair reruns.
+                if (hasInterruptedStaging || ledgerIsEmpty) {
                     invalidateUnprovenSynapseDestinationRowsV83(db);
+                }
+                if (hasInterruptedStaging) {
                     db.exec("DROP TABLE synapse_batch_ledger_legacy_v81");
                 }
                 return;

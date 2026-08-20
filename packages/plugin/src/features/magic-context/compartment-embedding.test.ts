@@ -78,6 +78,32 @@ function ledgerRows(db: Database): Array<{ application_group: string; state: str
 }
 
 describe("publish path over a journaling synapse lane", () => {
+    test("applies publish-time source text before the asynchronous FTS index catches up", async () => {
+        const db = createDb();
+        try {
+            const host = new DetailedSynapseTestHost();
+            registerDetailedChunkProject(db, "git:chunk-publish", host);
+            const compartmentId = seedCompartment(db, "ses-publish");
+
+            await embedAndStoreCompartmentChunks(db, "ses-publish", "git:chunk-publish", [
+                {
+                    id: compartmentId,
+                    startMessage: 1,
+                    endMessage: 2,
+                    sourceChunkText: "[1] U: hello\n[2] A: world",
+                },
+            ]);
+
+            expect(chunkRowCount(db, compartmentId)).toBeGreaterThan(0);
+            expect(ledgerRows(db)).toEqual([
+                { application_group: `compartment:${compartmentId}`, state: "complete" },
+            ]);
+        } finally {
+            _resetProjectEmbeddingRegistryForTests();
+            closeQuietly(db);
+        }
+    });
+
     test("a lane that applies nothing is logged and does not fall back to the legacy path", async () => {
         const db = createDb();
         const sessionLog = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});

@@ -127,7 +127,10 @@ export class DetailedSynapseTestHost implements SynapseClientLike {
     close(): void {}
 }
 
-export function detailedSynapseTestProvider(host: SynapseClientLike): SynapseEmbeddingProvider {
+export function detailedSynapseTestProvider(
+    host: SynapseClientLike,
+    maxInputBytes?: number,
+): SynapseEmbeddingProvider {
     return new SynapseEmbeddingProvider({
         connectionFile: "fixture",
         projectRoot: "/repo",
@@ -137,6 +140,7 @@ export function detailedSynapseTestProvider(host: SynapseClientLike): SynapseEmb
         tableEpoch: SYNAPSE_TEST_EPOCH,
         dims: SYNAPSE_TEST_DIMS,
         recommendedBatch: 2,
+        maxInputBytes,
         batchTimeoutMs: 5_000,
         clientFactory: async () => host,
     });

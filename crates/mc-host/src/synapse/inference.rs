@@ -12,11 +12,17 @@ use fastembed::{
     UserDefinedEmbeddingModel,
 };
 
+#[cfg(target_os = "linux")]
+use super::bundle::{open_regular_file, OpenRegularFileError};
 use super::bundle::{validate_sha256_hex, Corpus, SelectedOutput, VerifiedBundle};
 
 /// How far a returned vector's L2 norm may sit from 1.0 before the backend
 /// treats it as an invariant failure rather than rounding noise.
 const NORM_TOLERANCE: f32 = 1e-3;
+/// CPU ONNX Runtime is executable code and static runtime tables, not model
+/// weights. A 512 MiB ceiling leaves wide room for monolithic CPU builds while
+/// bounding verification's source buffer plus sealed memfd copy to 1 GiB.
+const MAX_ORT_LIBRARY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The exact native runtime the owner certified: the library file plus the
 /// SHA-256 of its bytes, so a nominally matching but different build is
@@ -114,14 +120,21 @@ fn verify_ort_library(identity: &OrtIdentity) -> Result<VerifiedOrtLibrary, Infe
     validate_sha256_hex(&identity.sha256).map_err(|_| {
         InferenceError::Artifact("expected ONNX Runtime hash is not a real digest".to_owned())
     })?;
-    let metadata = std::fs::symlink_metadata(&identity.library)
-        .map_err(|_| InferenceError::Artifact("ONNX Runtime library is missing".to_owned()))?;
-    if !metadata.is_file() {
+    let open = open_regular_file(&identity.library).map_err(|error| match error {
+        OpenRegularFileError::Missing => {
+            InferenceError::Artifact("ONNX Runtime library is missing".to_owned())
+        }
+        OpenRegularFileError::NotRegular => {
+            InferenceError::Artifact("ONNX Runtime library is not a regular file".to_owned())
+        }
+    })?;
+    if open.len > MAX_ORT_LIBRARY_BYTES {
         return Err(InferenceError::Artifact(
-            "ONNX Runtime library is not a regular file".to_owned(),
+            "ONNX Runtime library exceeds the size bound".to_owned(),
         ));
     }
-    let bytes = std::fs::read(&identity.library)
+    let bytes = open
+        .read()
         .map_err(|_| InferenceError::Artifact("ONNX Runtime library read failed".to_owned()))?;
     if super::protocol::sha256_hex(&bytes) != identity.sha256 {
         return Err(InferenceError::Artifact(
@@ -183,6 +196,7 @@ impl Backend {
         // twice that bound.
         let VerifiedBundle {
             manifest,
+            max_text_bytes: _,
             onnx,
             initializers,
             tokenizer_file,
@@ -394,5 +408,32 @@ mod tests {
         );
 
         drop(verified);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_sparse_ort_library_fails_before_reading_or_allocating_its_length() {
+        let source_dir = tempfile::tempdir().expect("source directory");
+        let source = source_dir.path().join("oversized-libonnxruntime.so");
+        std::fs::File::create(&source)
+            .expect("create sparse library")
+            .set_len(MAX_ORT_LIBRARY_BYTES + 1)
+            .expect("size sparse library");
+        let identity = OrtIdentity {
+            library: source,
+            sha256: super::super::protocol::sha256_hex(b"unread oversized library"),
+        };
+
+        let error = match verify_ort_library(&identity) {
+            Err(error) => error,
+            Ok(_) => panic!("oversized library is accepted"),
+        };
+        match error {
+            InferenceError::Artifact(reason) => assert!(
+                reason.contains("size bound"),
+                "reason {reason:?} does not identify the descriptor-length bound"
+            ),
+            other => panic!("expected artifact error, got {other}"),
+        }
     }
 }

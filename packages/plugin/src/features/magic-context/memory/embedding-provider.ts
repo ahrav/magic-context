@@ -47,6 +47,8 @@ export interface EmbeddingProvider {
     readonly modelId: string;
     /** Maximum safe input window for one embedding request. Unknown providers default to 512. */
     readonly maxInputTokens?: number;
+    /** Maximum UTF-8 bytes accepted for one embedding input, when the provider has a byte cap. */
+    readonly maxInputBytes?: number;
     initialize(): Promise<boolean>;
     /** Embed a single text. `signal` lets callers abort the underlying network
      *  request (or long-running local inference) before the provider's internal

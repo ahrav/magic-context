@@ -28,7 +28,6 @@ use crate::handler::{
     BindOutcome, HealthReport, HealthStatus, InitError, ManifestSnapshot, RequestCtx,
     RequestOutcome, RouteHandle, RouteIdentity,
 };
-use bundle::BundleManifest;
 use inference::{Backend, InferenceError, OrtIdentity};
 use jobs::{AdmitOutcome, JobTable, PollOutcome};
 use protocol::{Request, RequestError};
@@ -54,12 +53,13 @@ pub struct SynapseLimits {
 
 impl Default for SynapseLimits {
     fn default() -> Self {
+        let max_batch_items = 64;
         Self {
             max_queued_jobs: 64,
             max_queued_request_bytes: 64 * 1024 * 1024,
             max_retained_jobs: 64,
             max_retained_result_bytes: 64 * 1024 * 1024,
-            max_batch_items: 64,
+            max_batch_items,
             max_batch_text_bytes: 8 * 1024 * 1024,
             max_text_bytes: 1024 * 1024,
             max_page_vectors: 16,
@@ -90,13 +90,17 @@ pub struct LaneInfo {
     /// Token window inference truncates at; published so clients chunk to
     /// the real boundary instead of a hardcoded guess.
     pub max_tokens: u32,
+    /// UTF-8 bytes accepted for one query or batch item. Token count has no
+    /// fixed byte ratio, so clients must enforce both advertised limits.
+    pub max_text_bytes: usize,
     pub provenance: serde_json::Value,
     pub recommended_rows: u32,
     pub recommended_token_budget: u32,
 }
 
 impl LaneInfo {
-    fn from_manifest(manifest: &BundleManifest) -> Self {
+    fn from_bundle(bundle: &bundle::VerifiedBundle) -> Self {
+        let manifest = &bundle.manifest;
         Self {
             model: manifest.model.clone(),
             fingerprint: manifest.fingerprint.clone(),
@@ -105,6 +109,7 @@ impl LaneInfo {
             // Bounded by the manifest schema (at most 1_048_576), so the
             // narrowing cast is lossless.
             max_tokens: manifest.max_tokens as u32,
+            max_text_bytes: bundle.max_text_bytes,
             provenance: manifest.provenance.clone(),
             recommended_rows: manifest.recommended_batch.rows,
             recommended_token_budget: manifest.recommended_batch.token_budget,
@@ -189,10 +194,11 @@ impl SynapseComponent {
     /// Test seam: a component whose lane is immediately ready over the
     /// supplied engine, bypassing bundle loading and ORT.
     pub fn ready_with_engine(
-        lane: LaneInfo,
+        mut lane: LaneInfo,
         engine: Arc<dyn EmbeddingEngine>,
         limits: SynapseLimits,
     ) -> Self {
+        lane.max_text_bytes = limits.max_text_bytes;
         Self {
             inner: Arc::new(SynapseInner {
                 config: None,
@@ -488,7 +494,11 @@ impl SynapseComponent {
             );
         }
         let retry_after_ms = self.inner.limits.retry_after_ms;
-        match self.inner.jobs.admit(request_key.clone(), items) {
+        match self
+            .inner
+            .jobs
+            .admit(request_key.clone(), items, lane.lane.dims)
+        {
             AdmitOutcome::Existing(descriptor) => {
                 respond(
                     ctx,
@@ -506,6 +516,10 @@ impl SynapseComponent {
                 "the request_key is retained with a different payload",
             ),
             AdmitOutcome::Full => app_error("queue_full", "job admission capacity is exhausted"),
+            AdmitOutcome::ResultTooLarge => app_error(
+                "schema_violation",
+                "batch result exceeds the retained-result byte limit",
+            ),
             AdmitOutcome::Closed => app_error("cancelled", "the host is shutting down"),
             AdmitOutcome::Admitted { job_id, seq } => {
                 self.spawn_batch_worker(Arc::clone(&lane), seq);
@@ -723,20 +737,7 @@ impl SecondaryComponent for SynapseComponent {
         // the closure's completion, and `shutdown`'s tracker drain holds
         // until the native load actually stops.
         let blocking = tokio::task::spawn_blocking(move || {
-            let bundle = bundle::load_bundle(&config.bundle_dir)?;
-            // The recommended batch is advertised to clients verbatim, and
-            // admission rejects any page over max_batch_items, so a manifest
-            // recommending more rows would make every conforming client
-            // build pages this host always refuses. The inconsistency is an
-            // artifact fault, not something to clamp silently.
-            let recommended_rows = bundle.manifest.recommended_batch.rows as usize;
-            if recommended_rows > config.limits.max_batch_items {
-                return Err(bundle::BundleError(format!(
-                    "recommended batch rows ({recommended_rows}) exceed the host's max batch \
-                     items ({})",
-                    config.limits.max_batch_items
-                )));
-            }
+            let bundle = bundle::load_bundle(&config.bundle_dir, &config.limits)?;
             let ort = OrtIdentity {
                 library: config.ort_library.clone(),
                 sha256: config.ort_library_sha256.clone(),
@@ -744,7 +745,7 @@ impl SecondaryComponent for SynapseComponent {
             // The advertised lane summary is derived from the manifest before
             // the bundle moves into the backend, which consumes it so the
             // weight buffers are never duplicated.
-            let lane = LaneInfo::from_manifest(&bundle.manifest);
+            let lane = LaneInfo::from_bundle(&bundle);
             let backend =
                 Backend::load(bundle, &ort).map_err(|e| bundle::BundleError(e.to_string()))?;
             Ok::<_, bundle::BundleError>(ReadyLane {

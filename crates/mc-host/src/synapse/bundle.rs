@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use rustix::fs::{Mode, OFlags};
 
 use super::protocol::sha256_hex;
+use super::{jobs, SynapseLimits};
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 /// Aggregate byte budget for all model weights a loaded bundle retains: the
@@ -19,7 +20,7 @@ const MAX_SIDE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXTERNAL_INITIALIZERS: usize = 16;
 const MAX_ARTIFACT_NAME_BYTES: usize = 255;
 const MAX_PROVENANCE_BYTES: usize = 8 * 1024;
-const MAX_DIMS: u64 = 16_384;
+pub(crate) const MAX_DIMS: u64 = 16_384;
 const MAX_MAX_TOKENS: u64 = 1_048_576;
 /// The epoch crosses the wire as a JSON number and the TypeScript client holds
 /// it in a double, which rounds above this value while the host keeps the
@@ -171,6 +172,7 @@ pub struct Corpus {
 /// directory, and verified against its manifest hash.
 pub struct VerifiedBundle {
     pub manifest: BundleManifest,
+    pub max_text_bytes: usize,
     pub onnx: Vec<u8>,
     pub initializers: Vec<(String, Vec<u8>)>,
     pub tokenizer_file: Vec<u8>,
@@ -180,7 +182,7 @@ pub struct VerifiedBundle {
     pub corpus: Corpus,
 }
 
-pub fn load_bundle(dir: &Path) -> Result<VerifiedBundle, BundleError> {
+pub fn load_bundle(dir: &Path, limits: &SynapseLimits) -> Result<VerifiedBundle, BundleError> {
     let metadata =
         std::fs::symlink_metadata(dir).map_err(|_| err("bundle directory is missing"))?;
     if !metadata.is_dir() {
@@ -190,6 +192,7 @@ pub fn load_bundle(dir: &Path) -> Result<VerifiedBundle, BundleError> {
     let manifest_bytes = read_artifact(dir, "manifest.json", MAX_MANIFEST_BYTES)?;
     let manifest = parse_manifest(&manifest_bytes)?;
     validate_manifest(&manifest)?;
+    validate_serving_limits(&manifest, limits)?;
 
     let mut listed: Vec<&ArtifactRef> = vec![&manifest.model_file, &manifest.corpus];
     listed.extend(manifest.external_initializers.iter());
@@ -264,6 +267,7 @@ pub fn load_bundle(dir: &Path) -> Result<VerifiedBundle, BundleError> {
 
     Ok(VerifiedBundle {
         manifest,
+        max_text_bytes: limits.max_text_bytes,
         onnx,
         initializers,
         tokenizer_file,
@@ -319,6 +323,56 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), BundleError> {
         .map_err(|_| err("provenance serialization failed"))?;
     if provenance_bytes.len() > MAX_PROVENANCE_BYTES {
         return Err(err("provenance too large"));
+    }
+    Ok(())
+}
+
+fn validate_serving_limits(
+    manifest: &BundleManifest,
+    limits: &SynapseLimits,
+) -> Result<(), BundleError> {
+    if limits.max_text_bytes < 4 {
+        return Err(err("host max text bytes must hold one UTF-8 code point"));
+    }
+    if limits.max_batch_items == 0 {
+        return Err(err("host max batch items must be nonzero"));
+    }
+    if limits.max_batch_text_bytes < limits.max_text_bytes {
+        return Err(err(
+            "host max batch text bytes are below the advertised max text bytes",
+        ));
+    }
+    if limits.max_retained_jobs == 0 {
+        return Err(err("host retained job count must be nonzero"));
+    }
+    if u64::try_from(limits.max_batch_text_bytes)
+        .map(|max_batch_text_bytes| limits.max_queued_request_bytes < max_batch_text_bytes)
+        .unwrap_or(true)
+    {
+        return Err(err(
+            "host queued request bytes are below the max batch text bytes",
+        ));
+    }
+    // A tokenizer token can span multiple UTF-8 bytes, so no token-to-byte
+    // conversion is universally safe. The validated byte cap travels with
+    // the bundle and is advertised beside max_tokens instead.
+
+    let recommended_rows = manifest.recommended_batch.rows as usize;
+    if recommended_rows > limits.max_batch_items {
+        return Err(err(format!(
+            "recommended batch rows ({recommended_rows}) exceed the host's max batch items ({})",
+            limits.max_batch_items
+        )));
+    }
+
+    let max_result_bytes = jobs::max_result_bytes(limits.max_batch_items, manifest.dims as usize)
+        .ok_or_else(|| err("maximum retained result size overflows"))?;
+    if max_result_bytes > limits.max_retained_result_bytes {
+        return Err(err(format!(
+            "maximum batch result ({max_result_bytes} bytes) exceeds the host's retained-result \
+             limit ({} bytes)",
+            limits.max_retained_result_bytes
+        )));
     }
     Ok(())
 }
@@ -427,61 +481,77 @@ pub fn canonical_fingerprint(manifest: &BundleManifest) -> String {
 /// the bound can be replaced by a symlink or a far larger file before the
 /// read. Pinning the descriptor makes the checked file the read file.
 #[derive(Debug)]
-struct OpenArtifact {
-    file: std::fs::File,
-    len: u64,
+pub(crate) struct OpenRegularFile {
+    pub(crate) file: std::fs::File,
+    pub(crate) len: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum OpenRegularFileError {
+    Missing,
+    NotRegular,
+}
+
+impl OpenRegularFile {
+    pub(crate) fn read(self) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.len as usize);
+        self.file.take(self.len).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Opens one path without following its final component and pins the checked
+/// regular file to a descriptor. Callers read this descriptor so replacement
+/// of the path cannot change the bytes after validation.
+pub(crate) fn open_regular_file(path: &Path) -> Result<OpenRegularFile, OpenRegularFileError> {
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|errno| {
+        if errno == rustix::io::Errno::LOOP {
+            OpenRegularFileError::NotRegular
+        } else {
+            OpenRegularFileError::Missing
+        }
+    })?;
+    let file = std::fs::File::from(fd);
+    let metadata = file.metadata().map_err(|_| OpenRegularFileError::Missing)?;
+    if !metadata.is_file() {
+        return Err(OpenRegularFileError::NotRegular);
+    }
+    Ok(OpenRegularFile {
+        file,
+        len: metadata.len(),
+    })
 }
 
 /// Opens one confined artifact without following a symlink at the final
 /// component, then validates the descriptor's own metadata.
-fn open_artifact(dir: &Path, name: &str) -> Result<OpenArtifact, BundleError> {
+fn open_artifact(dir: &Path, name: &str) -> Result<OpenRegularFile, BundleError> {
     let path: PathBuf = dir.join(name);
     // NOFOLLOW turns a symlink into an open failure rather than a redirect.
     // NONBLOCK keeps the open itself from parking: a FIFO planted under an
     // artifact name would otherwise block until a writer appears, before
     // `fstat` can reject it as a non-regular file.
-    let fd = rustix::fs::open(
-        &path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    )
-    .map_err(|errno| {
-        // Under NOFOLLOW, `ELOOP` on the final component means the artifact
-        // is itself a symlink.
-        if errno == rustix::io::Errno::LOOP {
-            err(format!("artifact is not a regular file: {name}"))
-        } else {
-            err(format!("artifact is missing: {name}"))
-        }
-    })?;
-    let file = std::fs::File::from(fd);
-    let metadata = file
-        .metadata()
-        .map_err(|_| err(format!("artifact is missing: {name}")))?;
-    if !metadata.is_file() {
-        return Err(err(format!("artifact is not a regular file: {name}")));
-    }
-    Ok(OpenArtifact {
-        file,
-        len: metadata.len(),
+    open_regular_file(&path).map_err(|error| match error {
+        OpenRegularFileError::Missing => err(format!("artifact is missing: {name}")),
+        OpenRegularFileError::NotRegular => err(format!("artifact is not a regular file: {name}")),
     })
 }
 
 /// Reads at most the length this descriptor reported. Growth after the length
 /// check truncates the read into a hash mismatch instead of an allocation the
 /// bound never authorized.
-fn read_open_artifact(open: OpenArtifact, name: &str) -> Result<Vec<u8>, BundleError> {
-    let mut bytes = Vec::with_capacity(open.len as usize);
-    open.file
-        .take(open.len)
-        .read_to_end(&mut bytes)
-        .map_err(|_| err(format!("artifact read failed: {name}")))?;
-    Ok(bytes)
+fn read_open_artifact(open: OpenRegularFile, name: &str) -> Result<Vec<u8>, BundleError> {
+    open.read()
+        .map_err(|_| err(format!("artifact read failed: {name}")))
 }
 
 /// Bound-checks, reads, and hash-verifies one opened artifact.
 fn read_verified_open(
-    open: OpenArtifact,
+    open: OpenRegularFile,
     artifact: &ArtifactRef,
     cap: u64,
 ) -> Result<Vec<u8>, BundleError> {
@@ -603,13 +673,12 @@ fn parse_corpus(bytes: &[u8], dims: usize) -> Result<Corpus, BundleError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fingerprint_binds_initializer_names_to_their_hashes() {
+    fn manifest() -> BundleManifest {
         let artifact = |name: &str| ArtifactRef {
             name: name.to_owned(),
             sha256: sha256_hex(name.as_bytes()),
         };
-        let mut manifest = BundleManifest {
+        BundleManifest {
             schema_version: 1,
             model: "test-model".to_owned(),
             fingerprint: sha256_hex(b"fingerprint"),
@@ -637,7 +706,12 @@ mod tests {
                 tokenizer_config: artifact("tokenizer_config.json"),
             },
             corpus: artifact("corpus.json"),
-        };
+        }
+    }
+
+    #[test]
+    fn fingerprint_binds_initializer_names_to_their_hashes() {
+        let mut manifest = manifest();
 
         let hashes_before: Vec<_> = manifest
             .external_initializers
@@ -660,6 +734,27 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_ne!(fingerprint_before, canonical_fingerprint(&manifest));
+    }
+
+    #[test]
+    fn maximum_batch_result_must_fit_retention() {
+        let mut manifest = manifest();
+        manifest.dims = MAX_DIMS;
+        manifest.recommended_batch.rows = 64;
+        let mut limits = SynapseLimits::default();
+        let exact = jobs::max_result_bytes(limits.max_batch_items, manifest.dims as usize)
+            .expect("bounded result size");
+
+        assert!(limits.max_retained_result_bytes >= exact);
+        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+
+        limits.max_retained_result_bytes = exact;
+        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+
+        limits.max_retained_result_bytes = exact - 1;
+        let error = validate_serving_limits(&manifest, &limits)
+            .expect_err("one byte below the maximum result is invalid");
+        assert!(error.0.contains("maximum batch result"));
     }
 
     #[test]

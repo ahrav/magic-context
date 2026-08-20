@@ -47,6 +47,7 @@ import type {
 import {
     normalizeSynapseTokenBudget,
     SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
+    SYNAPSE_MAX_INPUT_BYTES,
     SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
 } from "./memory/embedding-synapse";
@@ -441,6 +442,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
         const synapse = config as EmbeddingConfig & {
             model?: string;
             max_input_tokens?: number;
+            synapse_max_input_bytes?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
@@ -459,6 +461,12 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
                 synapse.max_input_tokens > 0
                     ? synapse.max_input_tokens
                     : SYNAPSE_MAX_INPUT_TOKENS,
+            synapse_max_input_bytes:
+                typeof synapse.synapse_max_input_bytes === "number" &&
+                Number.isInteger(synapse.synapse_max_input_bytes) &&
+                synapse.synapse_max_input_bytes >= 4
+                    ? synapse.synapse_max_input_bytes
+                    : SYNAPSE_MAX_INPUT_BYTES,
             ...(synapse.synapse_connection_file
                 ? { synapse_connection_file: synapse.synapse_connection_file }
                 : {}),
@@ -520,6 +528,7 @@ function createProvider(
         const synapse = config as EmbeddingConfig & {
             model?: string;
             max_input_tokens?: number;
+            synapse_max_input_bytes?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
@@ -541,6 +550,7 @@ function createProvider(
                 synapse.synapse_recommended_token_budget,
             ),
             maxInputTokens: synapse.max_input_tokens,
+            maxInputBytes: synapse.synapse_max_input_bytes,
             provenance: synapse.synapse_provenance,
         });
     }
@@ -585,12 +595,16 @@ function getChunkEmbeddingModelId(config: EmbeddingConfig, providerIdentity: str
     // only providerIdentity so a chunk-window change does not wipe unrelated stores.
     const chunkIdentity = {
         providerIdentity,
-        // v2: windowing targets CHUNK_WINDOW_SAFETY_RATIO * max_input_tokens
-        // instead of the raw ceiling, so boundaries shifted — bump to re-embed.
-        chunkerVersion: 2,
+        // v3 adds Synapse's advertised UTF-8 byte ceiling. Other providers have
+        // no byte cap, so they retain v2 identity and avoid a no-op re-embed.
+        chunkerVersion: config.provider === "synapse" ? 3 : 2,
         maxInputTokens: normalizeCompartmentChunkMaxInputTokens(
             "max_input_tokens" in config ? config.max_input_tokens : undefined,
         ),
+        maxInputBytes:
+            config.provider === "synapse" && "synapse_max_input_bytes" in config
+                ? config.synapse_max_input_bytes
+                : undefined,
         truncate: config.provider === "openai-compatible" ? (config.truncate ?? "") : "",
     };
     return `${providerIdentity}:chunk:${sha256Prefix(stableStringify(chunkIdentity))}`;
@@ -1606,24 +1620,45 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
         (failure) => failure.code === "idempotency_conflict" && failure.rowId !== null,
     );
     if (conflicted.length > 0) {
-        // The conflicting rows of one group are its complete pages for this
-        // exact item set, and the group applies only when every one of them
-        // yields a receipt — so they are proven and reopened as one set.
-        const conflictedRowIdsByGroup = new Map<string, number[]>();
-        for (const failure of conflicted) {
-            const rowIds = conflictedRowIdsByGroup.get(failure.applicationGroup);
-            if (rowIds) rowIds.push(failure.rowId as number);
-            else conflictedRowIdsByGroup.set(failure.applicationGroup, [failure.rowId as number]);
-        }
+        const conflictedGroups = new Set(conflicted.map((failure) => failure.applicationGroup));
         const retryGroups = new Set<string>();
-        for (const [group, rowIds] of conflictedRowIdsByGroup) {
-            const probe = spec.makeDestinationProbe();
-            const reopened = reopenCompleteSynapseLedgerGroupWithProof(db, {
-                rowIds,
-                deadlineAt: Date.now() + lane.batchTimeoutMs,
-                destinationState: probe.state,
-                invalidateDestination: probe.invalidate,
-            });
+        for (const group of conflictedGroups) {
+            const reopened = db.transaction(() => {
+                // A changed page has a fresh receipt rather than a conflict.
+                // Its destination evidence still proves every complete sibling
+                // in the atomic group must reopen.
+                const rowIds = (
+                    db
+                        .prepare(
+                            `SELECT id FROM synapse_batch_ledger
+                             WHERE project_path = ? AND session_id = ? AND scope = ?
+                               AND lane_role = ? AND destination_model = ?
+                               AND application_group = ? AND state = 'complete'`,
+                        )
+                        .all(
+                            spec.projectIdentity,
+                            lane.sessionId,
+                            spec.scope,
+                            lane.laneRole,
+                            lane.provider.modelId,
+                            group,
+                        ) as Array<{ id: number }>
+                ).map((row) => row.id);
+                const evidence = items.filter((item) => item.applicationGroup === group);
+                const probe = spec.makeDestinationProbe();
+                let destinationNeedsRepair: boolean | undefined;
+                return reopenCompleteSynapseLedgerGroupWithProof(db, {
+                    rowIds,
+                    deadlineAt: Date.now() + lane.batchTimeoutMs,
+                    destinationState: (item) => {
+                        destinationNeedsRepair ??= evidence.some(
+                            (candidate) => probe.state(candidate) !== "current",
+                        );
+                        return destinationNeedsRepair ? "stale" : probe.state(item);
+                    },
+                    invalidateDestination: probe.invalidate,
+                });
+            })();
             if (reopened > 0) retryGroups.add(group);
         }
         if (retryGroups.size > 0) {
@@ -1819,11 +1854,16 @@ async function embedCommitRowsDetailed(
     lane: DetailedLane,
     rows: readonly { sha: string; message: string }[],
 ): Promise<Set<string>> {
-    // An empty message is rejected by the host's item schema, and one rejected
-    // item fails every page of its application group. Dropping it before the
-    // group is formed keeps a messageless commit from discarding its batch.
+    // Empty and over-limit messages fail the host's item schema. Dropping them
+    // before the group is formed keeps one invalid commit from discarding its
+    // otherwise valid siblings.
     const specs = rows
-        .filter((row) => row.message.length > 0)
+        .filter(
+            (row) =>
+                row.message.length > 0 &&
+                Buffer.byteLength(row.message, "utf8") <=
+                    (lane.provider.maxInputBytes ?? SYNAPSE_MAX_INPUT_BYTES),
+        )
         .map((row) => ({
             id: `commit:${row.sha}`,
             text: row.message,
@@ -1936,7 +1976,7 @@ interface CompartmentWindowsApplication {
     sessionId: string;
     windows: readonly CompartmentChunkWindow[];
     /** Recompute the compartment's current windows inside the transaction;
-     *  defaults to the given windows for in-memory publish-time sources. */
+     *  defaults to reloading its stored source. */
     currentWindows?: () => readonly CompartmentChunkWindow[];
 }
 
@@ -1958,6 +1998,34 @@ async function applyCompartmentWindowsDetailed(
     }));
     const windowIndexFromItemId = (itemId: string): number =>
         Number(itemId.split(":")[2] ?? Number.NaN);
+    const currentWindows =
+        args.currentWindows ??
+        (() => {
+            const source = db
+                .prepare(
+                    `SELECT start_message, end_message FROM compartments
+                     WHERE id = ? AND session_id = ?`,
+                )
+                .get(args.compartmentId, args.sessionId) as {
+                start_message: number;
+                end_message: number;
+            } | null;
+            if (!source) return [];
+            const text =
+                buildCanonicalChunkTextFromFts(
+                    db,
+                    args.sessionId,
+                    source.start_message,
+                    source.end_message,
+                ) || buildCompartmentSummaryFallbackText(db, args.compartmentId);
+            return chunkCanonicalText(
+                text,
+                source.start_message,
+                source.end_message,
+                getProjectEmbeddingMaxInputTokens(projectIdentity),
+                getProjectEmbeddingMaxInputBytes(projectIdentity),
+            );
+        });
     const applied = await embedAndApplyDetailed({
         db,
         projectIdentity,
@@ -1966,7 +2034,7 @@ async function applyCompartmentWindowsDetailed(
         items,
         signal,
         readCurrentHashes: (ids) => {
-            const current = args.currentWindows ? args.currentWindows() : args.windows;
+            const current = currentWindows();
             if (current.length !== ids.length) return new Map();
             const byIndex = new Map(current.map((window) => [window.windowIndex, window]));
             const map = new Map<string, string>();
@@ -2037,7 +2105,7 @@ async function applyCompartmentWindowsDetailed(
 export async function embedCompartmentWindowsDetailedForProject(
     db: Database,
     projectIdentity: string,
-    args: { compartmentId: number; sessionId: string; windows: CompartmentChunkWindow[] },
+    args: CompartmentWindowsApplication,
 ): Promise<boolean | null> {
     const lane = getDetailedLane(projectIdentity, "primary");
     if (!lane) return null;
@@ -2166,6 +2234,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
     // in-transaction recomputation must window identically, or every hash
     // comparison against the recomputed set fails.
     const maxInputTokens = laneMaxInputTokens(registration);
+    const maxInputBytes = laneMaxInputBytes(registration);
     const prepared = candidates.flatMap((candidate) => {
         const text =
             buildCanonicalChunkTextFromFts(
@@ -2180,6 +2249,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             candidate.start_message,
             candidate.end_message,
             maxInputTokens,
+            maxInputBytes,
         );
         return windows.length > 0 ? [{ candidate, windows }] : [];
     });
@@ -2203,6 +2273,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
                         preparedItem.candidate.start_message,
                         preparedItem.candidate.end_message,
                         maxInputTokens,
+                        maxInputBytes,
                     );
                 },
             });
@@ -2354,8 +2425,28 @@ function laneMaxInputTokens(
     );
 }
 
+function laneMaxInputBytes(
+    registration: { config: EmbeddingConfig; provider: EmbeddingProvider | null } | undefined,
+): number | undefined {
+    const configMax =
+        registration?.config.provider === "synapse" &&
+        "synapse_max_input_bytes" in registration.config
+            ? registration.config.synapse_max_input_bytes
+            : undefined;
+    const maxInputBytes = registration?.provider?.maxInputBytes ?? configMax;
+    return typeof maxInputBytes === "number" &&
+        Number.isInteger(maxInputBytes) &&
+        maxInputBytes >= 4
+        ? maxInputBytes
+        : undefined;
+}
+
 export function getProjectEmbeddingMaxInputTokens(projectIdentity: string): number {
     return laneMaxInputTokens(projectRegistrations.get(projectIdentity));
+}
+
+export function getProjectEmbeddingMaxInputBytes(projectIdentity: string): number | undefined {
+    return laneMaxInputBytes(projectRegistrations.get(projectIdentity));
 }
 
 function getOrCreateProjectProvider(
@@ -2607,22 +2698,37 @@ export async function embedUnembeddedMemoriesForProject(
     }
 }
 
-/** Drain a single batch of unembedded commits. Returns how many embedded. */
+interface CommitBatchResult {
+    selected: number;
+    embedded: number;
+}
+
+/** Drain a single batch of unembedded commits. */
 async function embedCommitBatch(
     db: Database,
     projectIdentity: string,
     batchSize: number,
-): Promise<number> {
+): Promise<CommitBatchResult> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.gitCommitEnabled) return 0;
+    if (!snapshot?.gitCommitEnabled) return { selected: 0, embedded: 0 };
+    const limit = Math.max(1, Math.floor(batchSize));
+    const registration = projectRegistrations.get(projectIdentity);
+    const detailed = getDetailedLane(projectIdentity, "primary") !== null;
+    const maxInputBytes = detailed
+        ? (laneMaxInputBytes(registration) ?? SYNAPSE_MAX_INPUT_BYTES)
+        : Number.MAX_SAFE_INTEGER;
     const commits = loadUnembeddedCommits(
         db,
         projectIdentity,
         snapshot.modelId,
-        Math.max(1, Math.floor(batchSize)),
+        limit,
+        maxInputBytes,
     );
-    if (commits.length === 0) return 0;
-    return embedCommitRowsForProject(db, projectIdentity, commits);
+    if (commits.length === 0) return { selected: 0, embedded: 0 };
+    return {
+        selected: commits.length,
+        embedded: await embedCommitRowsForProject(db, projectIdentity, commits),
+    };
 }
 
 /**
@@ -2655,6 +2761,7 @@ export async function drainCommitBacklogForProject(
     }
 
     let total = 0;
+    let processed = 0;
     let leaseLost = false;
     const renewal = setInterval(() => {
         try {
@@ -2665,12 +2772,17 @@ export async function drainCommitBacklogForProject(
     }, SESSION_EMBED_LEASE_RENEWAL_MS);
     (renewal as { unref?: () => void }).unref?.();
     try {
-        while (!leaseLost && Date.now() < deadline && total < COMMIT_DRAIN_MAX_PER_SWEEP) {
-            const embedded = await embedCommitBatch(db, projectIdentity, COMMIT_DRAIN_BATCH_SIZE);
+        while (!leaseLost && Date.now() < deadline && processed < COMMIT_DRAIN_MAX_PER_SWEEP) {
+            const batchSize = Math.min(
+                COMMIT_DRAIN_BATCH_SIZE,
+                COMMIT_DRAIN_MAX_PER_SWEEP - processed,
+            );
+            const batch = await embedCommitBatch(db, projectIdentity, batchSize);
+            processed += batch.selected;
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
-            if (leaseLost || embedded === 0) break;
-            total += embedded;
-            if (embedded < COMMIT_DRAIN_BATCH_SIZE) break; // partial batch = drained
+            if (leaseLost || batch.selected === 0) break;
+            total += batch.embedded;
+            if (batch.embedded < batch.selected || batch.selected < batchSize) break;
         }
     } finally {
         clearInterval(renewal);
@@ -2756,6 +2868,7 @@ async function embedCandidateChunkBatch(
     const failed: number[] = [];
     if (candidates.length === 0) return { embedded: 0, noWork, failed };
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
+    const maxInputBytes = getProjectEmbeddingMaxInputBytes(projectIdentity);
 
     type Prepared = {
         candidate: CompartmentChunkBackfillCandidate;
@@ -2783,6 +2896,7 @@ async function embedCandidateChunkBatch(
             candidate.startMessage,
             candidate.endMessage,
             maxInputTokens,
+            maxInputBytes,
         );
         if (
             windows.length === 0 ||
@@ -2824,6 +2938,7 @@ async function embedCandidateChunkBatch(
                                 candidate.startMessage,
                                 candidate.endMessage,
                                 maxInputTokens,
+                                maxInputBytes,
                             );
                         },
                     },

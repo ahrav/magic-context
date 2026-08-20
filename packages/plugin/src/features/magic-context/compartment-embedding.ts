@@ -15,6 +15,7 @@ import {
     embedItemsForProject,
     enqueueShadowEmbeddingItems,
     getProjectChunkEmbeddingModelId,
+    getProjectEmbeddingMaxInputBytes,
     getProjectEmbeddingMaxInputTokens,
 } from "./project-embedding-registry";
 
@@ -55,6 +56,7 @@ export async function embedAndStoreCompartmentChunks(
 ): Promise<void> {
     if (compartments.length === 0) return;
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectPath);
+    const maxInputBytes = getProjectEmbeddingMaxInputBytes(projectPath);
 
     for (const compartment of compartments) {
         try {
@@ -81,6 +83,7 @@ export async function embedAndStoreCompartmentChunks(
                 compartment.startMessage,
                 compartment.endMessage,
                 maxInputTokens,
+                maxInputBytes,
             );
             if (windows.length === 0) continue;
 
@@ -102,6 +105,18 @@ export async function embedAndStoreCompartmentChunks(
                 compartmentId: compartment.id,
                 sessionId,
                 windows,
+                ...(fromMemory
+                    ? {
+                          currentWindows: () =>
+                              chunkCanonicalText(
+                                  canonicalText,
+                                  compartment.startMessage,
+                                  compartment.endMessage,
+                                  maxInputTokens,
+                                  maxInputBytes,
+                              ),
+                      }
+                    : {}),
             });
             // `null` means no journaling lane owns this project, so the legacy
             // path below embeds the windows. A boolean means the journaling lane

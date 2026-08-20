@@ -72,6 +72,7 @@ function getLoadUnembeddedStatement(db: Database): PreparedStatement {
              FROM git_commits c
              LEFT JOIN git_commit_embeddings e ON c.sha = e.sha AND e.model_id = ?
              WHERE c.project_path = ? AND e.sha IS NULL AND c.message != ''
+               AND length(CAST(c.message AS BLOB)) <= ?
              ORDER BY c.committed_at DESC
              LIMIT ?`,
         );
@@ -145,15 +146,22 @@ export function loadProjectCommitEmbeddings(
  * the newest batch fail forever and the drain — which stops as soon as a batch
  * embeds nothing — never reaches the commits behind it. Excluding it in the
  * selection is what retires it: it is permanently not work, so it never enters
- * a batch and never blocks one.
+ * a batch and never blocks one. The same applies to text above a provider's
+ * per-item byte cap.
  */
 export function loadUnembeddedCommits(
     db: Database,
     projectPath: string,
     modelId: string,
     limit: number,
+    maxInputBytes = Number.MAX_SAFE_INTEGER,
 ): Array<{ sha: string; message: string }> {
-    return getLoadUnembeddedStatement(db).all(modelId, projectPath, limit) as UnembeddedRow[];
+    return getLoadUnembeddedStatement(db).all(
+        modelId,
+        projectPath,
+        maxInputBytes,
+        limit,
+    ) as UnembeddedRow[];
 }
 
 export function countEmbeddedCommits(db: Database, projectPath: string, modelId: string): number {

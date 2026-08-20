@@ -5,6 +5,7 @@ import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { recursiveCharacterSplit } from "./recursive-text-splitter";
+import { splitUtf8Bytes } from "./search-bounds";
 import type { VectorLoadObserver } from "./search-trace";
 
 export const DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
@@ -558,6 +559,7 @@ export function chunkCanonicalText(
     startOrdinal: number,
     endOrdinal: number,
     maxInputTokens: number,
+    maxInputBytes?: number,
 ): CompartmentChunkWindow[] {
     const lines = canonicalText
         .split(/\r?\n/)
@@ -571,15 +573,18 @@ export function chunkCanonicalText(
     const effectiveMax = Math.max(1, Math.floor(normalizedMax * CHUNK_WINDOW_SAFETY_RATIO));
     const fullText = lines.join("\n");
     if (estimateTokens(fullText) <= effectiveMax) {
-        return [
-            {
-                windowIndex: 0,
-                startOrdinal,
-                endOrdinal,
-                text: fullText,
-                chunkHash: hashChunkText(fullText),
-            },
-        ];
+        return constrainWindowsByUtf8Bytes(
+            [
+                {
+                    windowIndex: 0,
+                    startOrdinal,
+                    endOrdinal,
+                    text: fullText,
+                    chunkHash: hashChunkText(fullText),
+                },
+            ],
+            maxInputBytes,
+        );
     }
 
     const windows: CompartmentChunkWindow[] = [];
@@ -647,7 +652,35 @@ export function chunkCanonicalText(
     // flush path and the oversized-line split use `windows.length + 1`), so it is
     // already gap-free and stable — preserve it (chunk identity = compartmentId +
     // windowIndex + hash; renumbering would orphan every stored chunk row).
-    return windows;
+    return constrainWindowsByUtf8Bytes(windows, maxInputBytes);
+}
+
+function constrainWindowsByUtf8Bytes(
+    windows: readonly CompartmentChunkWindow[],
+    maxInputBytes: number | undefined,
+): CompartmentChunkWindow[] {
+    if (
+        maxInputBytes === undefined ||
+        !Number.isInteger(maxInputBytes) ||
+        maxInputBytes < 1 ||
+        windows.every((window) => Buffer.byteLength(window.text, "utf8") <= maxInputBytes)
+    ) {
+        return [...windows];
+    }
+
+    return windows
+        .flatMap((window) =>
+            splitUtf8Bytes(window.text, maxInputBytes).map((text) => ({
+                startOrdinal: window.startOrdinal,
+                endOrdinal: window.endOrdinal,
+                text,
+            })),
+        )
+        .map((window, index) => ({
+            ...window,
+            windowIndex: index + 1,
+            chunkHash: hashChunkText(window.text),
+        }));
 }
 
 /**

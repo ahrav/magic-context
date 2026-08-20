@@ -29,6 +29,7 @@ pub fn test_lane() -> LaneInfo {
         table_epoch: 1,
         dims: 8,
         max_tokens: 512,
+        max_text_bytes: 1024 * 1024,
         provenance: serde_json::json!({"source": "deterministic test engine"}),
         recommended_rows: 16,
         recommended_token_budget: 8192,

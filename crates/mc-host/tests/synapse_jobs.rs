@@ -507,7 +507,7 @@ async fn shutdown_with_queued_running_and_retained_jobs_is_graceful() {
 }
 
 #[test]
-fn a_vector_count_that_disagrees_with_the_job_fails_only_that_job() {
+fn a_vector_shape_that_disagrees_with_the_job_fails_only_that_job() {
     // Pairing results with item metadata indexes by position, so an engine
     // that returns a different count would index out of bounds while the job
     // table's lock is held — poisoning it for every later caller, including
@@ -522,7 +522,7 @@ fn a_vector_count_that_disagrees_with_the_job_fails_only_that_job() {
         }]
     };
 
-    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-1".to_owned(), batch("item:0"))
+    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-1".to_owned(), batch("item:0"), 2)
     else {
         panic!("the first job is admitted");
     };
@@ -544,18 +544,39 @@ fn a_vector_count_that_disagrees_with_the_job_fails_only_that_job() {
         ),
     }
 
-    // The table survives: a later job still admits, publishes, and serves.
-    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-2".to_owned(), batch("item:1"))
+    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-2".to_owned(), batch("item:1"), 2)
     else {
         panic!("the second job is admitted");
     };
     jobs.start(seq).expect("the job starts");
-    jobs.publish_ready(seq, vec![vec![1.0, 0.0]]);
+    jobs.publish_ready(seq, vec![vec![1.0, 0.0, 2.0]]);
     match jobs.poll(&job_id, "key-2", None) {
+        PollOutcome::Failed { code, message } => {
+            assert_eq!(code, "artifact_invalid");
+            assert!(
+                message.contains("dimension"),
+                "message {message:?} does not name the dimension disagreement"
+            );
+        }
+        other => panic!(
+            "expected a failed job, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+
+    // The table and its result-byte bookkeeping survive both failures: a later
+    // job still admits, publishes, and serves.
+    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-3".to_owned(), batch("item:2"), 2)
+    else {
+        panic!("the third job is admitted");
+    };
+    jobs.start(seq).expect("the job starts");
+    jobs.publish_ready(seq, vec![vec![1.0, 0.0]]);
+    match jobs.poll(&job_id, "key-3", None) {
         PollOutcome::Page(page) => {
             assert!(page.done);
             assert_eq!(page.vectors.len(), 1);
-            assert_eq!(page.vectors[0].0, "item:1");
+            assert_eq!(page.vectors[0].0, "item:2");
         }
         _ => panic!("expected a served page after the failed job"),
     }

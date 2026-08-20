@@ -94,6 +94,18 @@ async fn expect_disabled_with(mutate: impl FnOnce(&Path), expected_fragment: &st
     );
 }
 
+async fn expect_limits_disabled(mutate: impl FnOnce(&mut SynapseLimits), expected_fragment: &str) {
+    let dir = tempfile::tempdir().expect("temp bundle dir");
+    copy_fixture_to(dir.path());
+    let mut config = config_for(dir.path(), &pre_ort_identity());
+    mutate(&mut config.limits);
+    let reason = disabled_reason(&initialize(config).await);
+    assert!(
+        reason.contains(expected_fragment),
+        "reason {reason:?} does not mention {expected_fragment:?}"
+    );
+}
+
 fn edit_manifest(dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
     let path = dir.join("manifest.json");
     let mut manifest: serde_json::Value =
@@ -261,8 +273,13 @@ fn the_committed_fixture_carries_its_canonical_fingerprint() {
     // load path that would otherwise catch a stale fingerprint needs a native
     // ONNX Runtime and skips without one, and every rejection test above
     // passes whether or not this digest is correct.
-    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir())
+    let limits = SynapseLimits {
+        max_text_bytes: 123_456,
+        ..SynapseLimits::default()
+    };
+    let bundle = mc_host::synapse::bundle::load_bundle(&fixture_dir(), &limits)
         .expect("the committed fixture bundle loads");
+    assert_eq!(bundle.max_text_bytes, limits.max_text_bytes);
     assert_eq!(
         bundle.manifest.fingerprint,
         mc_host::synapse::bundle::canonical_fingerprint(&bundle.manifest),
@@ -287,6 +304,33 @@ async fn a_recommended_batch_above_the_admission_cap_disables_the_lane() {
         reason.contains("recommended batch rows") && reason.contains("max batch items"),
         "reason {reason:?} does not name the admission mismatch"
     );
+}
+
+#[tokio::test]
+async fn retained_result_cap_below_the_manifest_batch_bound_disables_before_ort() {
+    let dir = tempfile::tempdir().expect("temp bundle dir");
+    copy_fixture_to(dir.path());
+    let mut config = config_for(dir.path(), &pre_ort_identity());
+    config.limits.max_retained_result_bytes = 1;
+
+    let component = initialize(config).await;
+    let reason = disabled_reason(&component);
+    assert!(
+        reason.contains("maximum batch result") && reason.contains("retained-result limit"),
+        "reason {reason:?} does not name the composed result bound"
+    );
+}
+
+#[tokio::test]
+async fn incoherent_host_serving_limits_disable_before_ort() {
+    expect_limits_disabled(|limits| limits.max_text_bytes = 3, "UTF-8 code point").await;
+    expect_limits_disabled(|limits| limits.max_batch_items = 0, "max batch items").await;
+    expect_limits_disabled(|limits| limits.max_retained_jobs = 0, "retained job count").await;
+    expect_limits_disabled(
+        |limits| limits.max_queued_request_bytes = limits.max_batch_text_bytes as u64 - 1,
+        "queued request bytes",
+    )
+    .await;
 }
 
 #[tokio::test]

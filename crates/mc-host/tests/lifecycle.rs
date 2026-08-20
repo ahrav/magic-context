@@ -2,9 +2,11 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use mc_host::HostError;
+use mc_host::{HostError, McHostHandler};
 
 use support::raw_client::{
     self, FLAGS_INTERACTIVE, FLAGS_PURE_HEADER, TY_GOODBYE, TY_PING, TY_PONG, TY_REQUEST,
@@ -14,6 +16,59 @@ use support::{mode_body, BindPolicy, Event, TestHandler, TestHost, LINKED_MODULE
 
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
+
+/// Blocks inside one `route_gone` poll, so task abort cannot take effect until
+/// the test releases it.
+struct DelayedRouteGoneHandler {
+    inner: TestHandler,
+    route_gone_started: Arc<AtomicBool>,
+    route_gone_release: Arc<(Mutex<bool>, Condvar)>,
+    shutdown_calls: Arc<AtomicUsize>,
+}
+
+impl McHostHandler for DelayedRouteGoneHandler {
+    fn manifests(&self) -> Vec<mc_host::ManifestSnapshot> {
+        self.inner.manifests()
+    }
+
+    async fn initialize(&self, init: mc_host::HostInit) -> Result<(), mc_host::InitError> {
+        self.inner.initialize(init).await
+    }
+
+    async fn bind(
+        &self,
+        route: mc_host::RouteHandle,
+        target: mc_host::RouteTarget,
+        identity: mc_host::RouteIdentity,
+    ) -> mc_host::BindOutcome {
+        self.inner.bind(route, target, identity).await
+    }
+
+    async fn handle(&self, ctx: mc_host::RequestCtx) -> mc_host::RequestOutcome {
+        self.inner.handle(ctx).await
+    }
+
+    async fn route_gone(&self, route: mc_host::RouteHandle) {
+        self.route_gone_started.store(true, Ordering::SeqCst);
+        {
+            let (lock, ready) = &*self.route_gone_release;
+            let mut released = lock.lock().expect("route-gone release lock");
+            while !*released {
+                released = ready.wait(released).expect("route-gone release wait");
+            }
+        }
+        self.inner.route_gone(route).await;
+    }
+
+    async fn health(&self) -> mc_host::HealthReport {
+        self.inner.health().await
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.shutdown().await;
+    }
+}
 
 #[tokio::test]
 async fn publication_follows_initialization() {
@@ -905,6 +960,128 @@ async fn shutdown_callback_deadline_expiry_retains_the_handler_until_it_stops() 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(handler.events().contains(&Event::Shutdown));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_lifecycle_callback_runs_shutdown_once_before_successor_starts() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.block_shutdown();
+    let route_gone_started = Arc::new(AtomicBool::new(false));
+    let route_gone_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let shutdown_calls = Arc::new(AtomicUsize::new(0));
+    let runtime_handler = DelayedRouteGoneHandler {
+        inner: handler.clone(),
+        route_gone_started: Arc::clone(&route_gone_started),
+        route_gone_release: Arc::clone(&route_gone_release),
+        shutdown_calls: Arc::clone(&shutdown_calls),
+    };
+    let shutdown = mc_host::CancellationToken::new();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        timing: mc_host::HostTiming {
+            shutdown_deadline: Duration::from_millis(100),
+            lifecycle_callback_deadline: Duration::from_millis(50),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let run_shutdown = shutdown.clone();
+    let task =
+        tokio::spawn(async move { mc_host::run(runtime_handler, config, run_shutdown).await });
+    let publication = support::connection_file(data_root.path());
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while !publication.exists() {
+        assert!(!task.is_finished(), "host exited before publishing");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "host did not publish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let info = raw_client::discover(&publication).expect("publication validates");
+    let mut client = raw_client::RawClient::connect(&info)
+        .await
+        .expect("client authenticates");
+    client
+        .route_open(LINKED_MODULE_ID, ROOT, "opencode", "delayed-route-gone")
+        .await
+        .expect("route");
+
+    shutdown.cancel();
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while !route_gone_started.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "route-gone callback did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let result = tokio::time::timeout(BUDGET, task)
+        .await
+        .expect("run returns after the lifecycle-chain wait")
+        .expect("run task joins");
+    assert!(
+        matches!(result, Err(HostError::LifecycleFatal(ref message))
+            if message.contains("route_gone")),
+        "the delayed callback must fail shutdown, got {result:?}"
+    );
+    assert!(
+        handler.route_gones().is_empty(),
+        "the callback must still be blocked after both lifecycle waits"
+    );
+    assert_eq!(
+        shutdown_calls.load(Ordering::SeqCst),
+        0,
+        "handler shutdown must not overlap the lifecycle callback"
+    );
+
+    let blocked = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await;
+    assert!(
+        matches!(blocked, Err(HostError::Instance(_))),
+        "the reaper must retain the lock after run returns"
+    );
+
+    {
+        let (lock, ready) = &*route_gone_release;
+        *lock.lock().expect("route-gone release lock") = true;
+        ready.notify_all();
+    }
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while shutdown_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handler shutdown did not start after route-gone drained"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        shutdown_calls.load(Ordering::SeqCst),
+        1,
+        "handler shutdown must start exactly once"
+    );
+
+    let successor =
+        assert_lock_released_only_after_shutdown_callback(&handler, data_root.path()).await;
+    assert_eq!(
+        shutdown_calls.load(Ordering::SeqCst),
+        1,
+        "handler shutdown must run exactly once"
+    );
+    assert_eq!(
+        handler
+            .events()
+            .iter()
+            .filter(|event| **event == Event::Shutdown)
+            .count(),
+        1,
+        "handler shutdown must complete exactly once"
+    );
+    successor.shutdown_gracefully().await;
 }
 
 /// Asserts the guard ordering shared by every interrupted-incarnation path:

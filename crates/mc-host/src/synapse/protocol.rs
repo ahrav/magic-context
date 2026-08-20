@@ -6,13 +6,12 @@ use std::borrow::Cow;
 
 use sha2::{Digest, Sha256};
 
-use super::jobs::BatchItem;
+use super::jobs::{BatchItem, MAX_ITEM_ID_BYTES};
 use super::LaneInfo;
 use super::SynapseLimits;
 use crate::control::check_string;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_ID_BYTES: usize = 256;
 const MAX_JOB_ID_BYTES: usize = 128;
 const MAX_CURSOR_BYTES: usize = 128;
 pub(crate) const MAX_DEADLINE_MS: u64 = 3_600_000;
@@ -324,7 +323,7 @@ fn parse_batch(
     let mut items = Vec::with_capacity(params.items.len());
     let mut total_text_bytes = 0usize;
     for raw in &params.items {
-        check_string("item id", &raw.0.id, MAX_ID_BYTES, true).map_err(schema)?;
+        check_string("item id", &raw.0.id, MAX_ITEM_ID_BYTES, true).map_err(schema)?;
         check_string("item text", &raw.0.text, limits.max_text_bytes, true).map_err(schema)?;
         total_text_bytes += raw.0.text.len();
         // Recomputed, never trusted: a wrong supplied hash would poison the
@@ -452,6 +451,7 @@ pub fn models_list_body(lane: &LaneInfo) -> Vec<u8> {
                 "table_epoch": lane.table_epoch,
                 "dims": lane.dims,
                 "max_input_tokens": lane.max_tokens,
+                "max_input_bytes": lane.max_text_bytes,
                 "certified": true,
                 "status": "ready",
                 "provenance": lane.provenance,
@@ -620,6 +620,7 @@ mod tests {
             table_epoch: 1,
             dims: 8,
             max_tokens: 512,
+            max_text_bytes: 1024 * 1024,
             provenance: serde_json::Value::Null,
             recommended_rows: 16,
             recommended_token_budget: 8192,

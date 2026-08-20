@@ -135,6 +135,29 @@ function insertChunkEmbedding(db: Database, modelId: string, chunkHash: string):
     return compartmentId;
 }
 
+function seedUnprovenDestinationRows(db: Database): void {
+    insertMemoryEmbedding(db, "synapse:v1:abc123");
+    insertMemoryEmbedding(db, "local-model");
+    insertChunkEmbedding(db, "synapse:v1:abc123", "synapse-hash");
+    insertChunkEmbedding(db, "local-model", "local-hash");
+}
+
+function expectDestinationModels(db: Database, expected: string[]): void {
+    const memoryModels = (
+        db.prepare("SELECT model_id FROM memory_embeddings ORDER BY model_id").all() as Array<{
+            model_id: string;
+        }>
+    ).map((row) => row.model_id);
+    expect(memoryModels).toEqual(expected);
+
+    const chunkModels = (
+        db
+            .prepare("SELECT model_id FROM compartment_chunk_embeddings ORDER BY model_id")
+            .all() as Array<{ model_id: string }>
+    ).map((row) => row.model_id);
+    expect(chunkModels).toEqual(expected);
+}
+
 describe("migration v83: context-complete synapse batch ledger", () => {
     test("quarantines every legacy row as obsolete with preserved count and derived lane role", () => {
         const dbPath = fileDbPath("migrations-v83-quarantine-");
@@ -233,6 +256,44 @@ describe("migration v83: context-complete synapse batch ledger", () => {
                 )
                 .all() as Array<{ model_id: string; chunk_hash: string }>;
             expect(chunkRows).toEqual([{ model_id: "local-model", chunk_hash: "" }]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("invalidates unproven destination rows when the ledger is missing", () => {
+        const dbPath = fileDbPath("migrations-v83-missing-ledger-");
+        const db = v81Database(dbPath);
+        try {
+            seedUnprovenDestinationRows(db);
+            db.exec("DROP TABLE synapse_batch_ledger");
+
+            runMigrations(db);
+
+            expectDestinationModels(db, ["local-model"]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("invalidates unproven destination rows when initialization precreates an empty v83 ledger", () => {
+        const dbPath = fileDbPath("migrations-v83-precreated-ledger-");
+        const db = v81Database(dbPath);
+        try {
+            seedUnprovenDestinationRows(db);
+            db.exec("DROP TABLE synapse_batch_ledger");
+            initializeDatabase(db);
+            expect(
+                (
+                    db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
+                        count: number;
+                    }
+                ).count,
+            ).toBe(0);
+
+            runMigrations(db);
+
+            expectDestinationModels(db, ["local-model"]);
         } finally {
             closeQuietly(db);
         }
@@ -375,7 +436,7 @@ describe("migration v83: context-complete synapse batch ledger", () => {
         }
     });
 
-    test("fresh database gets the v83 shape and live-identity uniqueness", () => {
+    test("fresh database gets the v83 shape and a replay preserves post-v83 destination rows", () => {
         const db = new Database(":memory:");
         try {
             db.exec("PRAGMA foreign_keys=ON");
@@ -392,10 +453,18 @@ describe("migration v83: context-complete synapse batch ledger", () => {
                 manifest: [{ id: "memory:1", contentSha256: "h1" }],
                 deadlineAt: Date.now() + 60_000,
             };
-            createSynapseLedgerPage(db, base);
+            const page = createSynapseLedgerPage(db, base);
             expect(() => createSynapseLedgerPage(db, base)).toThrow(SynapseLedgerConflictError);
-            // Re-running migrations against the already-migrated shape is a no-op.
+            db.prepare(
+                "UPDATE synapse_batch_ledger SET state = 'complete', state_version = 1 WHERE id = ?",
+            ).run(page.rowId);
+            insertMemoryEmbedding(db, base.destinationModel);
+            insertChunkEmbedding(db, base.destinationModel, "post-v83-hash");
+            db.exec("DELETE FROM schema_migrations WHERE version >= 83");
+
             runMigrations(db);
+
+            expectDestinationModels(db, [base.destinationModel]);
             expect(
                 (
                     db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
