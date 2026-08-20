@@ -536,6 +536,7 @@ interface QueryExecutionContext {
     /** Corpus-content IDF weights shared with the seeded document vectors;
      *  queries and documents must embed in one token-weight space. */
     tokenWeights: ReadonlyMap<string, number>;
+    observedEmbedPurposes: Set<"query" | "passage">;
 }
 
 function effectiveSources(ctx: QueryExecutionContext): SearchSource[] | undefined {
@@ -594,7 +595,12 @@ function buildSearchOptions(
         // a CapturedQueryEmbedding (generation-bearing) would always compare
         // against a null snapshot and be discarded as stale, silencing every
         // semantic scoring lane. Model ids come from the overrides above.
-        embedQuery: async (text) => deterministicTextVector(text, dims, ctx.tokenWeights),
+        // The purpose argument never changes the returned vector: reports
+        // that differ only in purpose stay quality-comparable.
+        embedQuery: async (text, _signal, purpose) => {
+            ctx.observedEmbedPurposes.add(purpose ?? "passage");
+            return deterministicTextVector(text, dims, ctx.tokenWeights);
+        },
         isEmbeddingRuntimeEnabled: () => true,
         // The predicate's visibility exclusions execute alongside the
         // query's own: both narrow the eligible memory set the preflight
@@ -709,7 +715,7 @@ function scenarioId(caseId: string, queryId: string): string {
 function buildScenario(
     ctx: RunContext,
     profileCase: ProfileCase,
-    query: QueryScenario,
+    qctx: QueryExecutionContext,
     fixture: FixtureHandle,
     outcome: {
         ranked: string[];
@@ -718,6 +724,7 @@ function buildScenario(
         tracedSpans: SearchTraceSpan[];
     },
 ): ReportScenario {
+    const query = qctx.query;
     const scope: ScenarioScope = query.fixtureScope;
     const judgedGrades = ctx.judged.get(query.id) ?? new Map<string, JudgedGrade>();
     const resolved = resolveRankedLocators(outcome.ranked, scope, ctx.release.aliasIndex);
@@ -764,6 +771,13 @@ function buildScenario(
         };
     }
 
+    const observedPurposes = [...qctx.observedEmbedPurposes].sort();
+    if (observedPurposes.length > 1) {
+        throw new RunnerError([
+            `query ${query.id}: mixed embed purposes observed (${observedPurposes.join(", ")})`,
+        ]);
+    }
+
     return {
         queryId: scenarioId(profileCase.id, query.id),
         mode: query.mode,
@@ -774,6 +788,7 @@ function buildScenario(
         deliveredTokens: outcome.delivery.tokenCount,
         deliveryReason: outcome.delivery.reason,
         latencySamplesMs: outcome.latencySamplesMs,
+        queryEmbedPurpose: observedPurposes[0] ?? null,
         metrics: {
             metricPolicyVersion: METRIC_POLICY_VERSION,
             recallAt10: values.recallAt10,
@@ -1056,6 +1071,7 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
             autoScoreThreshold: ctx.autoScoreThreshold,
             autoTimeoutMs: ctx.autoTimeoutMs,
             tokenWeights: ctx.tokenWeights,
+            observedEmbedPurposes: new Set(),
         }),
     );
     const scenarios = new Map<string, ReportScenario>();
@@ -1161,7 +1177,10 @@ async function executeCase(ctx: RunContext, profileCase: ProfileCase): Promise<C
                     state,
                 );
                 const query = state.qctx.query;
-                scenarios.set(query.id, buildScenario(ctx, profileCase, query, fixture, outcome));
+                scenarios.set(
+                    query.id,
+                    buildScenario(ctx, profileCase, state.qctx, fixture, outcome),
+                );
                 candidateRankings.set(query.id, outcome.ranked);
             }
         });

@@ -135,6 +135,39 @@ describe("recordShadowMeasurement", () => {
         }
     });
 
+    it("embeds the replayed query with purpose query, reuses the vector, and disables recursion (AE4)", async () => {
+        const db = useTempDb();
+        const embedCalls: { text: string; purpose?: EmbeddingPurpose }[] = [];
+        const shadowVector = new Float32Array([1, 2]);
+        class RecordingShadowProvider extends FakeShadowProvider {
+            override async embed(
+                text: string,
+                _signal?: AbortSignal,
+                purpose?: EmbeddingPurpose,
+            ): Promise<Float32Array> {
+                embedCalls.push({ text, ...(purpose === undefined ? {} : { purpose }) });
+                return shadowVector;
+            }
+        }
+        _setTestProviderFactoryForProject(() => new RecordingShadowProvider());
+        registerProjectShadowEmbedding(db, "git:shadow-measure", synapseConfig, "/tmp/shadow");
+
+        const seenOptions: UnifiedSearchOptions[] = [];
+        await recordShadowMeasurement({
+            ...makeMeasurementArgs(db),
+            search: async (_db, _sessionId, _projectPath, _query, options) => {
+                seenOptions.push(options ?? {});
+                const replayed = await options?.embedQuery?.("queue backpressure");
+                expect(replayed).toBe(shadowVector);
+                return [];
+            },
+        });
+
+        expect(embedCalls).toEqual([{ text: "queue backpressure", purpose: "query" }]);
+        expect(seenOptions).toHaveLength(1);
+        expect(seenOptions[0].measurementDisabled).toBe(true);
+    });
+
     it("records rank lists and corpus hash byte-identical to the legacy inline encoding", async () => {
         const db = useTempDb();
         _setTestProviderFactoryForProject(() => new FakeShadowProvider());

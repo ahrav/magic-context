@@ -32,7 +32,7 @@ import {
 } from "./metrics";
 import { TIMING_POLICY_VERSION } from "./timing";
 
-export const REPORT_SCHEMA_VERSION = "retrieval-benchmark-report/v1";
+export const REPORT_SCHEMA_VERSION = "retrieval-benchmark-report/v2";
 export const CANDIDATE_POOL_SCHEMA_VERSION = "retrieval-benchmark-candidate-pool/v1";
 export const CANDIDATE_POOL_CONSUMER = "magic-context-u51";
 
@@ -112,6 +112,7 @@ const scenarioSchema = z.strictObject({
     ]),
     /** Raw per-scenario latency samples; summaries are recomputable. */
     latencySamplesMs: z.array(z.number().min(0)),
+    queryEmbedPurpose: z.enum(["query", "passage"]).nullable(),
     metrics: scenarioMetricsSchema,
     timing: scenarioTimingSchema.nullable(),
 });

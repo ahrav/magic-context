@@ -21,6 +21,7 @@ import {
 } from "./memory";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
+import type { EmbeddingPurpose } from "./memory/embedding-provider";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
@@ -142,6 +143,7 @@ export interface UnifiedSearchOptions {
     embedQuery?: (
         text: string,
         signal?: AbortSignal,
+        purpose?: EmbeddingPurpose,
     ) => Promise<CapturedQueryEmbedding | Float32Array | null>;
     isEmbeddingRuntimeEnabled?: () => boolean;
     /** Only return message-history hits with ordinal ≤ this value (e.g. last compartment end). -1 or omit to search all. */
@@ -2114,7 +2116,7 @@ async function executeUnifiedSearch(args: {
     }
     const queryEmbeddingPromise: Promise<CapturedQueryEmbedding | Float32Array | null> =
         needsEmbedding
-            ? embedQuery(trimmedQuery, options.signal).then(
+            ? embedQuery(trimmedQuery, options.signal, "query").then(
                   (captured) => {
                       embedSpan?.end("ok");
                       return captured;

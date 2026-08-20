@@ -1,0 +1,128 @@
+{
+  "schemaVersion": "retrieval-benchmark-regression-result/v1",
+  "verdict": "quality-only",
+  "reasons": [
+    "latency: no comparable latency baseline supplied"
+  ],
+  "claim": "regression",
+  "claimEligibility": "judged-support-only",
+  "quality": [
+    {
+      "mode": "automatic",
+      "metric": "ndcgAt10",
+      "baselineMean": 1,
+      "candidateMean": 1,
+      "averageLossPoints": 0,
+      "worstRunLossPoints": 0,
+      "pass": true
+    },
+    {
+      "mode": "automatic",
+      "metric": "recallAt50",
+      "baselineMean": 1,
+      "candidateMean": 1,
+      "averageLossPoints": 0,
+      "worstRunLossPoints": 0,
+      "pass": true
+    },
+    {
+      "mode": "explicit",
+      "metric": "ndcgAt10",
+      "baselineMean": 0.6607142857142857,
+      "candidateMean": 0.6607142857142857,
+      "averageLossPoints": 0,
+      "worstRunLossPoints": 0,
+      "pass": true
+    },
+    {
+      "mode": "explicit",
+      "metric": "recallAt50",
+      "baselineMean": 0.9642857142857143,
+      "candidateMean": 0.9642857142857143,
+      "averageLossPoints": 0,
+      "worstRunLossPoints": 0,
+      "pass": true
+    }
+  ],
+  "latency": {
+    "status": "no-baseline",
+    "reasons": [
+      "latency: no baseline"
+    ],
+    "cells": []
+  },
+  "gate": {
+    "latencyRequired": false,
+    "unblocked": true
+  },
+  "audit": {
+    "schemaVersion": "retrieval-benchmark-ts-audit/v1",
+    "quality_target": "not_specified",
+    "quality": [
+      {
+        "runId": "0ad79e25b7392aa168240770b40c557f4dd61ac2a1401168b098f901425418f2",
+        "holdout": [
+          {
+            "mode": "automatic",
+            "ndcgAt10": 1,
+            "recallAt10": 1,
+            "recallAt50": 1,
+            "mrr": 1
+          },
+          {
+            "mode": "explicit",
+            "ndcgAt10": 0.6607142857142857,
+            "recallAt10": 0.6607142857142857,
+            "recallAt50": 0.9642857142857143,
+            "mrr": 0.5859328171828171
+          }
+        ]
+      },
+      {
+        "runId": "b9c99aa873f13157bdcac5a9cd1dfde216e98c08fc21c1b2b6dd24753208ee3d",
+        "holdout": [
+          {
+            "mode": "automatic",
+            "ndcgAt10": 1,
+            "recallAt10": 1,
+            "recallAt50": 1,
+            "mrr": 1
+          },
+          {
+            "mode": "explicit",
+            "ndcgAt10": 0.6607142857142857,
+            "recallAt10": 0.6607142857142857,
+            "recallAt50": 0.9642857142857143,
+            "mrr": 0.5859328171828171
+          }
+        ]
+      },
+      {
+        "runId": "6a6a2cb78cc20ee927b511cdcaf03d2640bfac0ff288342d014f89ab29b0d043",
+        "holdout": [
+          {
+            "mode": "automatic",
+            "ndcgAt10": 1,
+            "recallAt10": 1,
+            "recallAt50": 1,
+            "mrr": 1
+          },
+          {
+            "mode": "explicit",
+            "ndcgAt10": 0.6607142857142857,
+            "recallAt10": 0.6607142857142857,
+            "recallAt50": 0.9642857142857143,
+            "mrr": 0.5859328171828171
+          }
+        ]
+      }
+    ],
+    "latency_target": "not_evaluated",
+    "latency": {
+      "thresholdMs": 25,
+      "auditCaseIds": [],
+      "runP95sMs": [],
+      "medianRunP95Ms": null
+    }
+  }
+}

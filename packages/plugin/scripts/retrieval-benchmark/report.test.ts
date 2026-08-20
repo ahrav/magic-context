@@ -39,6 +39,7 @@ function makeScenario(
         deliveredTokens: 120,
         deliveryReason: "delivered",
         latencySamplesMs: [4.5, 6.25, 5.5],
+        queryEmbedPurpose: null,
         metrics: {
             metricPolicyVersion: METRIC_POLICY_VERSION,
             recallAt10: metricValue,

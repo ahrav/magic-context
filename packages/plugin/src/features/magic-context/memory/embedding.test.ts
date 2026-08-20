@@ -1,5 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { cosineSimilarity } from "./cosine-similarity";
+import { _resetEmbeddingConfigForTests, embedText, initializeEmbedding } from "./embedding";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { LocalEmbeddingProvider } from "./embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
@@ -109,6 +110,49 @@ describe("embedding module", () => {
             expect(first.modelId).toBe(rotated.modelId);
             expect(first.modelId).not.toBe(anonymous.modelId);
             expect(first.modelId).not.toContain("secret");
+        });
+    });
+
+    describe("#given the module-level embedText helper (R2)", () => {
+        let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>;
+
+        beforeEach(() => {
+            fetchSpy = spyOn(globalThis, "fetch");
+            fetchSpy.mockImplementation(
+                (async () =>
+                    new Response(JSON.stringify({ data: [{ embedding: [1, 0] }] }), {
+                        headers: { "content-type": "application/json" },
+                    })) as unknown as typeof fetch,
+            );
+            initializeEmbedding({
+                provider: "openai-compatible",
+                model: "nvidia/nv-embed",
+                endpoint: "http://127.0.0.1:65535",
+                input_type: "passage",
+                query_input_type: "query",
+            });
+        });
+
+        afterEach(() => {
+            _resetEmbeddingConfigForTests();
+            fetchSpy.mockRestore();
+        });
+
+        function sentInputType(): unknown {
+            const init = fetchSpy.mock.calls.at(-1)?.[1] as RequestInit;
+            return (JSON.parse(init.body as string) as Record<string, unknown>).input_type;
+        }
+
+        it("defaults to the passage input type when no purpose is given", async () => {
+            const vector = await embedText("stored content");
+            expect(vector).not.toBeNull();
+            expect(sentInputType()).toBe("passage");
+        });
+
+        it("forwards an explicit query purpose to the provider", async () => {
+            const vector = await embedText("search text", undefined, "query");
+            expect(vector).not.toBeNull();
+            expect(sentInputType()).toBe("query");
         });
     });
 });
