@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { SubcCallError } from "../../../shared/mc-host-client";
 import {
     _resetSynapseClientForTests,
+    _synapseSharedClientStateForTests,
     getSynapseLaneIdentity,
     SYNAPSE_MAX_INPUT_TOKENS,
     type SynapseClientLike,
@@ -317,5 +321,182 @@ describe("recommended batch policy", () => {
         const vectors = await provider.embedItems(items);
         expect(vectors.size).toBe(2);
         expect(calls).toEqual([1, 1]);
+    });
+});
+
+describe("connect discovery and retry policy", () => {
+    it("maps a missing connection file to unavailable and evicts the rejected shared promise", async () => {
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: join(tmpdir(), `synapse-missing-${Date.now()}-${Math.random()}.json`),
+            projectRoot: "/repo",
+            session: "ses-1",
+        });
+        expect(await provider.initialize()).toBe(false);
+        const state = _synapseSharedClientStateForTests();
+        expect(state.hasPromise).toBe(false);
+        expect(state.hasClient).toBe(false);
+        expect(state.file).toBeNull();
+        // Non-permanent: a later initialize is allowed to reconnect.
+        expect(await provider.initialize()).toBe(false);
+    });
+
+    it("evicts a rejected factory client promise so a later valid connect initializes", async () => {
+        let factoryCalls = 0;
+        const good = new MockSynapseClient();
+        const factory = async (): Promise<SynapseClientLike> => {
+            factoryCalls += 1;
+            if (factoryCalls === 1) throw new Error("connect refused");
+            return good;
+        };
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            clientFactory: factory,
+        });
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.initialize()).toBe(true);
+        expect(factoryCalls).toBe(2);
+    });
+
+    it("does not retry outcome_unknown for models.list, which has no idempotency policy", async () => {
+        let calls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            clientFactory: async () =>
+                ({
+                    async call() {
+                        calls += 1;
+                        throw new SubcCallError("outcome_unknown", "ambiguous send");
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        expect(await provider.initialize()).toBe(false);
+        expect(calls).toBe(1);
+    });
+
+    it("retries outcome_unknown only under the embedding idempotency policy and bounds attempts", async () => {
+        let queryCalls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 5_000,
+            clientFactory: async () =>
+                ({
+                    async call<Response = unknown>(_m: string, method: string): Promise<Response> {
+                        if (method !== "embed.query") throw new Error(`unexpected ${method}`);
+                        queryCalls += 1;
+                        if (queryCalls <= 2) {
+                            const error = new SubcCallError(
+                                "outcome_unknown",
+                                "ambiguous send",
+                            ) as SubcCallError & { retry_after_ms: number };
+                            error.retry_after_ms = 0;
+                            throw error;
+                        }
+                        return {
+                            vector: [1, 2, 3],
+                            fingerprint: "fp-live",
+                            table_epoch: 0,
+                        } as Response;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        expect(await provider.embed("hello")).toEqual(new Float32Array([1, 2, 3]));
+        expect(queryCalls).toBe(3);
+    });
+
+    it("caps the whole retry sequence at four application attempts", async () => {
+        let queryCalls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 5_000,
+            clientFactory: async () =>
+                ({
+                    async call() {
+                        queryCalls += 1;
+                        const error = new SubcCallError(
+                            "outcome_unknown",
+                            "ambiguous send",
+                        ) as SubcCallError & { retry_after_ms: number };
+                        error.retry_after_ms = 0;
+                        throw error;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        expect(await provider.embed("hello")).toBeNull();
+        expect(queryCalls).toBe(4);
+    });
+
+    it("stops retrying when the next delay would cross the absolute deadline", async () => {
+        let queryCalls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            dims: 3,
+            queryTimeoutMs: 50,
+            clientFactory: async () =>
+                ({
+                    async call() {
+                        queryCalls += 1;
+                        const error = new SubcCallError(
+                            "outcome_unknown",
+                            "ambiguous send",
+                        ) as SubcCallError & { retry_after_ms: number };
+                        error.retry_after_ms = 10_000;
+                        throw error;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        expect(await provider.embed("hello")).toBeNull();
+        expect(queryCalls).toBe(1);
+    });
+
+    it("keeps target_unavailable non-permanent so callers stay on their configured fallback", async () => {
+        let listCalls = 0;
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            clientFactory: async () =>
+                ({
+                    async call() {
+                        listCalls += 1;
+                        const error = new SubcCallError(
+                            "terminal",
+                            "route.open failed for module synapse: target_unavailable",
+                            "target_unavailable",
+                        ) as SubcCallError & { retry_after_ms: number };
+                        error.retry_after_ms = 0;
+                        throw error;
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+        expect(await provider.initialize()).toBe(false);
+        expect(await provider.embed("hello")).toBeNull();
+        const callsAfterFirstRound = listCalls;
+        expect(callsAfterFirstRound).toBeGreaterThan(0);
+        // Not a permanent failure: the lane may recover later.
+        expect(await provider.initialize()).toBe(false);
+        expect(listCalls).toBeGreaterThan(callsAfterFirstRound);
     });
 });

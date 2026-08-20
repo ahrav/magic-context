@@ -21,6 +21,7 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage-tags";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
+import { SubcCallError } from "../../shared/mc-host-client";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
@@ -127,6 +128,7 @@ function syncState(generation = 1): {
     idOrdinalMemoGeneration: number;
     idOrdinalMemo: Map<string, number>;
     seedPassPending: boolean;
+    authorityMemorySyncSkipLogged?: boolean;
 } {
     return {
         moduleGeneration: generation,
@@ -591,6 +593,56 @@ describe("module state sync section deltas", () => {
         expect(stateSyncBodies[1]).toHaveProperty("workspace");
         expect(moduleProfile).toEqual(["profile survives reconnect"]);
         expect(moduleWorkspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
+    });
+
+    it("propagates an outcome_unknown state sync failure without a rebuild or resend", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-state-sync-outcome-unknown";
+        createWorkspace(db);
+        insertUserMemory(db, "profile for uncertain send", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: loadModuleWatermarks({
+                db,
+                sessionId,
+                projectPath: "/tmp/project",
+            }),
+            seedPassPending: false,
+        };
+        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"changed"}]' });
+
+        let statusCalls = 0;
+        let callCount = 0;
+        const transport = {
+            getCachedStateSyncCapabilities: () => ({ state_sync_deltas: true }),
+            async stateSyncCapabilities() {
+                statusCalls += 1;
+                return { state_sync_deltas: true };
+            },
+            async call() {
+                callCount += 1;
+                // Possible-send drops throw; never a typed generation-change result.
+                throw new SubcCallError(
+                    "outcome_unknown",
+                    "connection dropped after a possible send",
+                    "connection_dropped",
+                );
+            },
+        };
+
+        await expect(
+            syncModuleState({
+                client: transport,
+                state,
+                pass: { db, sessionId, projectPath: "/tmp/project", nowMs: 1 },
+                projectRoot: "/tmp/project",
+                force: false,
+            }),
+        ).rejects.toMatchObject({ name: "SubcCallError", kind: "outcome_unknown" });
+
+        expect(callCount).toBe(1);
+        expect(statusCalls).toBe(0);
     });
 
     it("uses a re-probed capability shape without leaking module-owned memories", async () => {

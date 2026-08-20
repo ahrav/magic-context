@@ -1,6 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
@@ -79,6 +82,63 @@ describe("wakePlaneStatus", () => {
             throw new Error("daemon unavailable");
         });
         expect(await wakePlaneStatus()).toBe("unknown");
+    });
+
+    test("a malformed catalog stays fail-open", async () => {
+        __wakePlaneTest.setCatalogProbe(async () => [
+            { control_ops: WAKE_PLANE_CAPABILITY } as never,
+            { control_ops: 42 } as never,
+            {} as never,
+        ]);
+        expect(await wakePlaneStatus()).toBe("absent");
+    });
+
+    test("a missing connection file maps to unknown through the real probe without a preflight", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "wake-plane-missing-"));
+        const previous = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dir;
+        try {
+            expect(await wakePlaneStatus()).toBe("unknown");
+        } finally {
+            if (previous === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previous;
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("an invalid connection file maps to unknown through the real probe", async () => {
+        const dir = mkdtempSync(join(tmpdir(), "wake-plane-invalid-"));
+        const previous = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = dir;
+        try {
+            const runDir = join(dir, "cortexkit", "run");
+            mkdirSync(runDir, { recursive: true });
+            writeFileSync(join(runDir, "subc-connection.json"), "not json {", { mode: 0o600 });
+            expect(await wakePlaneStatus()).toBe("unknown");
+        } finally {
+            if (previous === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previous;
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("concurrent callers coalesce onto one in-flight probe", async () => {
+        let probes = 0;
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        __wakePlaneTest.setCatalogProbe(async () => {
+            probes += 1;
+            await gate;
+            return catalog(true);
+        });
+        const first = wakePlaneStatus();
+        const second = wakePlaneStatus();
+        release();
+        expect(await first).toBe("present");
+        expect(await second).toBe("present");
+        expect(probes).toBe(1);
     });
 
     test("re-probes after the TTL instead of retaining a stale catalog answer", async () => {

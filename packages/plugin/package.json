@@ -40,6 +40,9 @@
     "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
     "test": "bun test",
+    "test:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts adversarial",
+    "smoke:mc-host-client:bun": "bun scripts/smoke-mc-host-client.ts",
+    "smoke:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts smoke",
     "lint": "biome check .",
     "bench:retrieval": "bun scripts/benchmark-retrieval.ts",
     "bench:retrieval:check": "bun scripts/benchmark-retrieval.ts check --profile ci",
@@ -50,7 +53,6 @@
     "prepublishOnly": "bun run build && bun run build:tui"
   },
   "dependencies": {
-    "@cortexkit/subc-client": "0.4.1",
     "@huggingface/transformers": "^4.1.0",
     "@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
     "@opencode-ai/plugin": "^1.17.11",

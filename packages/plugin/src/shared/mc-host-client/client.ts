@@ -1,0 +1,1006 @@
+/**
+ * Thin routed and managed consumer facade over the connection-generation
+ * engine.
+ *
+ * `SubcClient` owns connection coalescing (single-flight connect), reconnect
+ * after generation retirement (reread the connection file plus full reauth),
+ * the managed-route cache, control-plane response validation, and bounded
+ * redacted diagnostics. The generation layer below never imports this file.
+ *
+ * Replay ownership: raw `request()` never replays a body. Managed
+ * `call()` owns exactly one replay token per call, spendable only on a
+ * proven `not_sent` or a terminal `unknown_channel` (route evicted first),
+ * only while the caller is active and the operation deadline is live.
+ * `outcome_unknown` is never replayed by any facade path.
+ */
+
+import { access } from "node:fs/promises";
+import {
+    type ConnectionDiagnosticEvent,
+    ConnectionGeneration,
+    type ConnectionGenerationOptions,
+    type PendingRequest,
+    type RequestTerminal,
+    type RetirementInfo,
+} from "./connection";
+import { type ConnectionSnapshot, readConnectionFile } from "./connection-file";
+import { Deadline, type MonotonicClock } from "./deadline";
+import { isSubcCallError, SubcCallError, SubcError } from "./errors";
+import {
+    belongsToConnection,
+    createRouteHandle,
+    newConnectionToken,
+    type RouteHandle,
+    StaleRouteHandleError,
+} from "./route-handle";
+import type {
+    BindIdentity,
+    CatalogEntry,
+    ConnectOptions,
+    ConsumerIdentity,
+    ManagedCallOptions,
+    ManagedRouteKind,
+    RequestOptions,
+    RouteTarget,
+} from "./types";
+
+/** Preserves the repo's current 2-second TypeScript handshake budget. */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
+/** Matches npm subc-client 0.4.1 `DEFAULT_REQUEST_TIMEOUT_MS`. */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+/** One bounded route-open deadline shared by the whole managed retry loop. */
+const DEFAULT_ROUTE_OPEN_DEADLINE_MS = 30_000;
+/** Separate bounded shutdown deadline for route and connection Goodbye. */
+const DEFAULT_SHUTDOWN_DEADLINE_MS = 5_000;
+/** Channel-0 control bodies are capped below the frame limit (wire doc 7.1). */
+const MAX_CONTROL_BODY_LEN = 65_536;
+const ROUTE_RETRY_BASE_MS = 100;
+const ROUTE_RETRY_CAP_MS = 2_000;
+const DEFAULT_MAX_DIAGNOSTIC_EVENTS_PER_SECOND = 500;
+const MAX_DIAGNOSTIC_STRING_LEN = 128;
+
+export const SUBC_MODULE_ID_ENV = "SUBC_MODULE_ID";
+export const SUBC_LAUNCH_NONCE_ENV = "SUBC_LAUNCH_NONCE";
+
+const DEFAULT_MANAGED_TARGET_KIND: ManagedRouteKind = "management_surface";
+
+/**
+ * One immutable, redacted diagnostics snapshot (KTD12): frame identity,
+ * byte counts, and connection metadata only — never key, proof, nonce,
+ * body bytes, or full bind identity.
+ */
+export interface SubcDiagnosticsEvent {
+    readonly type: ConnectionDiagnosticEvent["type"] | "connected" | "parse" | "retired";
+    /** Wall-clock milliseconds assigned at emission. */
+    readonly atMs: number;
+    readonly frameType?: number;
+    readonly channel?: number;
+    readonly epoch?: number;
+    readonly corr?: bigint;
+    readonly len?: number;
+    readonly daemonVer?: string;
+    readonly pid?: number;
+    readonly reason?: string;
+}
+
+export type SubcDiagnosticsObserver = (event: SubcDiagnosticsEvent) => void;
+
+/**
+ * Facade construction options. `ConnectOptions` is the consumer surface;
+ * the rest are bounded policy knobs and injectable test seams.
+ */
+export interface SubcClientOptions extends ConnectOptions {
+    /** Injectable monotonic clock for every operation deadline. */
+    clock?: MonotonicClock;
+    /** Injectable backoff sleep for deterministic retry tests. */
+    sleep?: (ms: number) => Promise<void>;
+    requestTimeoutMs?: number;
+    routeOpenDeadlineMs?: number;
+    shutdownDeadlineMs?: number;
+    /** Opt-in for the trusted-symlink connection-file form (wire doc 4.2). */
+    trustedSymlink?: boolean;
+    /**
+     * Read-only diagnostics observer (KTD12). Events are frozen, size- and
+     * rate-bounded, and redacted; observer exceptions are swallowed and
+     * excess events are dropped rather than blocking protocol work.
+     */
+    diagnostics?: SubcDiagnosticsObserver;
+    maxDiagnosticEventsPerSecond?: number;
+    /** Bounded generation-policy overrides for tests (queue caps, deadlines). */
+    generationOptions?: Partial<
+        Pick<
+            ConnectionGenerationOptions,
+            | "frameDeadlineMs"
+            | "maxBodyLen"
+            | "memoryCapBytes"
+            | "maxQueuedFrames"
+            | "maxQueuedBytes"
+            | "controlReserveFrames"
+            | "cleanupTicketMs"
+            | "generateNonce"
+        >
+    >;
+}
+
+interface ActiveConnection {
+    readonly generation: ConnectionGeneration;
+    /** Opaque token binding this connection's route handles. */
+    readonly token: object;
+    readonly snapshot: ConnectionSnapshot;
+}
+
+interface CachedManagedRoute {
+    readonly key: string;
+    readonly target: Extract<RouteTarget, { kind: ManagedRouteKind }>;
+    readonly identity: BindIdentity;
+    readonly consumerIdentity: ConsumerIdentity | undefined;
+    handle: RouteHandle | null;
+    opening: Promise<RouteHandle> | null;
+    /**
+     * Set by `closeRoute` while an open is in flight; the open must not
+     * install its handle and instead sends best-effort route Goodbye.
+     */
+    closed: boolean;
+}
+
+interface RequestParams {
+    channel: number;
+    epoch: number;
+    body: Uint8Array;
+    deadline: Deadline;
+    options: RequestOptions;
+}
+
+function errorCode(error: unknown): string | undefined {
+    if (typeof error === "object" && error !== null && "code" in error) {
+        const code = (error as { code?: unknown }).code;
+        if (typeof code === "string") return code;
+    }
+    return undefined;
+}
+
+function causeMessage(cause: unknown): string {
+    if (cause === undefined) return "";
+    return `: ${cause instanceof Error ? cause.message : String(cause)}`;
+}
+
+/**
+ * The closed set of route.open rejection codes meaning "the target is
+ * momentarily unavailable but a later route.open could succeed" (wire doc
+ * 10.2). A rejected route.open is provably pre-send for the application
+ * body, so retrying it never risks a duplicate dispatch.
+ */
+function isRetryableRouteOpenCode(code: string | undefined): boolean {
+    return (
+        code === "unknown_module" ||
+        code === "module_reloading" ||
+        code === "target_unavailable" ||
+        code === "module_timeout"
+    );
+}
+
+/** True when the connection file exists; parity with npm subc-client 0.4.1. */
+export async function connectionFileExists(path: string): Promise<boolean> {
+    try {
+        await access(path);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Reconnect-transience classification, semantics-compatible with npm
+ * subc-client 0.4.1. Recognition works cross-bundle by error `name` and
+ * `kind`/`code` shape, not only `instanceof`.
+ */
+export function isConsumerReconnectTransient(err: unknown): boolean {
+    if (err instanceof SubcCallError) {
+        return err.kind === "not_sent" || err.kind === "outcome_unknown";
+    }
+    const name = err instanceof Error ? err.name : undefined;
+    if (name === "SocketClosedError" || name === "SocketTimeoutError" || name === "AuthError") {
+        return true;
+    }
+    if (name === "SubcCallError") {
+        const kind = (err as { kind?: unknown }).kind;
+        return kind === "not_sent" || kind === "outcome_unknown";
+    }
+    if (name === "SubcError" || name === "ConnectionFileError") return false;
+    const code = errorCode(err);
+    return (
+        code === "ECONNREFUSED" ||
+        code === "ECONNRESET" ||
+        code === "EPIPE" ||
+        code === "ETIMEDOUT" ||
+        code === "ENOENT"
+    );
+}
+
+/**
+ * The consumer-facing client: connect, route open, raw request, managed
+ * call, catalog, and bounded close over one active connection generation.
+ */
+export class SubcClient {
+    private readonly connectionFile: string;
+    private readonly handshakeTimeoutMs: number;
+    private readonly requestTimeoutMs: number;
+    private readonly routeOpenDeadlineMs: number;
+    private readonly shutdownDeadlineMs: number;
+    private readonly defaultIdentity: BindIdentity | undefined;
+    private readonly defaultTargetKind: ManagedRouteKind;
+    private readonly clock: MonotonicClock | undefined;
+    private readonly sleep: (ms: number) => Promise<void>;
+    private readonly trustedSymlink: boolean;
+    private readonly generationOptions: SubcClientOptions["generationOptions"];
+    private readonly diagnostics: SubcDiagnosticsObserver | undefined;
+    private readonly maxDiagnosticEventsPerSecond: number;
+
+    private active: ActiveConnection | null = null;
+    private connecting: Promise<ActiveConnection> | null = null;
+    private readonly liveRoutes = new Map<number, RouteHandle>();
+    private readonly routes = new Map<string, CachedManagedRoute>();
+    /** In-flight route.open attempts, drained bounded during owner close. */
+    private readonly pendingRouteOpens = new Set<Promise<void>>();
+    private closeStarted = false;
+    private closePromise: Promise<void> | null = null;
+
+    private diagWindowStartMs = 0;
+    private diagWindowCount = 0;
+
+    private constructor(options: SubcClientOptions) {
+        this.connectionFile = options.connectionFile;
+        this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+        this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+        this.routeOpenDeadlineMs = options.routeOpenDeadlineMs ?? DEFAULT_ROUTE_OPEN_DEADLINE_MS;
+        this.shutdownDeadlineMs = options.shutdownDeadlineMs ?? DEFAULT_SHUTDOWN_DEADLINE_MS;
+        this.defaultIdentity = options.identity;
+        this.defaultTargetKind = options.targetKind ?? DEFAULT_MANAGED_TARGET_KIND;
+        this.clock = options.clock;
+        this.sleep =
+            options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+        this.trustedSymlink = options.trustedSymlink ?? false;
+        this.generationOptions = options.generationOptions;
+        this.diagnostics = options.diagnostics;
+        this.maxDiagnosticEventsPerSecond =
+            options.maxDiagnosticEventsPerSecond ?? DEFAULT_MAX_DIAGNOSTIC_EVENTS_PER_SECOND;
+    }
+
+    /**
+     * Read the connection file, dial, and authenticate under one handshake
+     * deadline, then return the ready client.
+     */
+    static async connect(options: SubcClientOptions): Promise<SubcClient> {
+        const client = new SubcClient(options);
+        await client.ensureConnection(Deadline.start(client.handshakeTimeoutMs, client.clock));
+        return client;
+    }
+
+    /** The daemon version reported by the current connection, if any. */
+    get daemonVer(): string | null {
+        return this.active?.snapshot.daemonVer ?? null;
+    }
+
+    /**
+     * Open a route and return its connection-bound immutable handle. One
+     * attempt under one bounded deadline; retry policy belongs to owners
+     * above (managed `call()` owns its own allowlisted retry loop).
+     */
+    async routeOpen(target: RouteTarget, identity: BindIdentity): Promise<RouteHandle> {
+        const deadline = Deadline.start(this.routeOpenDeadlineMs, this.clock);
+        const active = await this.ensureConnection(deadline);
+        return this.controlRouteOpen(
+            active,
+            target,
+            identity,
+            this.envConsumerIdentity(),
+            deadline,
+        );
+    }
+
+    /**
+     * Send one routed request on exactly the supplied route generation and
+     * return the JSON-parsed response body. Never replays the body.
+     */
+    async request(
+        handle: RouteHandle,
+        body: unknown,
+        options: RequestOptions = {},
+    ): Promise<unknown> {
+        const active = this.requireLiveHandle(handle);
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const terminal = await this.awaitRequest(active.generation, {
+            channel: handle.channel,
+            epoch: handle.epoch,
+            body: encodeBody(body),
+            deadline,
+            options,
+        });
+        return parseResponseJson(terminal);
+    }
+
+    /**
+     * Managed route + request convenience: opens and caches a route keyed by
+     * (target kind, module id, identity, consumer identity), reconnecting
+     * and reopening after retirement. Sends `{method, params}` and returns
+     * the JSON-parsed response. Owns exactly one body-replay token.
+     */
+    async call<Response = unknown>(
+        moduleId: string,
+        method: string,
+        params?: unknown,
+        options: ManagedCallOptions = {},
+    ): Promise<Response> {
+        const deadline = Deadline.start(options.timeoutMs ?? this.requestTimeoutMs, this.clock);
+        const body = Buffer.from(
+            JSON.stringify(params === undefined ? { method } : { method, params }),
+            "utf8",
+        );
+        let replaySpent = false;
+        for (;;) {
+            const handle = await this.managedRouteHandle(moduleId, options, deadline);
+            try {
+                const active = this.requireLiveHandle(handle);
+                const terminal = await this.awaitRequest(active.generation, {
+                    channel: handle.channel,
+                    epoch: handle.epoch,
+                    body,
+                    deadline,
+                    options,
+                });
+                return parseResponseJson(terminal) as Response;
+            } catch (error) {
+                const err = toManagedCallError(error);
+                const callerActive = !this.closeStarted && options.signal?.aborted !== true;
+                const mayReplay = !replaySpent && callerActive && !deadline.isExpired();
+                if (err.kind === "terminal" && err.code === "unknown_channel" && mayReplay) {
+                    // The host proved no dispatch; evict the dead route and
+                    // spend the one token on a fresh-route retry (KTD8).
+                    replaySpent = true;
+                    this.evictHandle(handle);
+                    continue;
+                }
+                if (err.kind === "not_sent" && mayReplay) {
+                    replaySpent = true;
+                    continue;
+                }
+                throw err;
+            }
+        }
+    }
+
+    /** List catalog entries through a validated tagged `catalog.list`. */
+    async catalogList(): Promise<CatalogEntry[]> {
+        const deadline = Deadline.start(this.requestTimeoutMs, this.clock);
+        const active = await this.ensureConnection(deadline);
+        const bodyText = JSON.stringify({ op: "catalog.list" });
+        const parsed = await this.controlRequest(active, bodyText, "catalog.list", deadline);
+        const modules = parsed.modules ?? [];
+        if (!Array.isArray(modules)) {
+            throw new SubcCallError(
+                "terminal",
+                "catalog.list response carried a non-array modules field",
+                "malformed_control_response",
+            );
+        }
+        return modules as CatalogEntry[];
+    }
+
+    /**
+     * Tear down exactly the supplied route generation: evict caches, send
+     * route Goodbye, and await the write bounded by the shutdown deadline.
+     */
+    async closeRoute(handle: RouteHandle): Promise<void> {
+        const active = this.requireLiveHandle(handle);
+        this.liveRoutes.delete(handle.channel);
+        for (const [key, cached] of this.routes) {
+            if (cached.handle === handle) {
+                cached.closed = true;
+                cached.handle = null;
+                this.routes.delete(key);
+            }
+        }
+        active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
+        await active.generation.flushWrites(Deadline.start(this.shutdownDeadlineMs, this.clock));
+    }
+
+    /**
+     * Synchronous close for existing callers: fires the bounded async
+     * teardown and returns immediately. New code should prefer
+     * `closeAsync()`.
+     */
+    close(): void {
+        void this.closeAsync();
+    }
+
+    /**
+     * Awaitable owner close under one bounded shutdown deadline: drain
+     * in-flight route.open attempts (so a late success becomes route
+     * Goodbye instead of a cached route), send connection Goodbye
+     * best-effort, flush, then retire the generation. Idempotent.
+     */
+    closeAsync(): Promise<void> {
+        if (this.closePromise) return this.closePromise;
+        this.closeStarted = true;
+        this.closePromise = this.runClose();
+        return this.closePromise;
+    }
+
+    // ------------------------------------------------------------------
+    // Connection ownership: single-flight connect and retirement reaction.
+    // ------------------------------------------------------------------
+
+    private async ensureConnection(deadline: Deadline): Promise<ActiveConnection> {
+        if (this.closeStarted) throw new SubcError("client closed", "client_closed");
+        const active = this.active;
+        if (active && !active.generation.isRetired()) return active;
+        if (!this.connecting) {
+            const connecting = this.openConnection(deadline).finally(() => {
+                if (this.connecting === connecting) this.connecting = null;
+            });
+            connecting.catch(() => {});
+            this.connecting = connecting;
+        }
+        return this.connecting;
+    }
+
+    private async openConnection(deadline: Deadline): Promise<ActiveConnection> {
+        const stage = deadline.stage(this.handshakeTimeoutMs);
+        // Reconnect rereads the file and reauthenticates from scratch (wire
+        // doc Section 12); credentials are never cached across generations.
+        const snapshot = await readConnectionFile(this.connectionFile, {
+            deadline: stage,
+            trustedSymlink: this.trustedSymlink,
+        });
+        let conn: ActiveConnection | null = null;
+        const generation = new ConnectionGeneration({
+            host: snapshot.endpoint.host,
+            port: snapshot.endpoint.port,
+            credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
+            onRetired: (info) => {
+                if (conn) this.onGenerationRetired(conn, info);
+            },
+            onRouteGoodbye: (channel, epoch) => {
+                if (conn) this.onRouteGoodbye(conn, channel, epoch);
+            },
+            // Skip per-frame event allocation entirely when no observer is
+            // configured; the generation's hook check short-circuits on
+            // undefined.
+            onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
+            ...this.generationOptions,
+        });
+        conn = { generation, token: newConnectionToken(), snapshot };
+        await generation.start(stage);
+        if (this.closeStarted) {
+            generation.retire("owner_close");
+            throw new SubcError("client closed", "client_closed");
+        }
+        this.active = conn;
+        this.liveRoutes.clear();
+        this.emitDiagnostics({
+            type: "connected",
+            daemonVer: snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
+            pid: snapshot.pid,
+        });
+        return conn;
+    }
+
+    private onGenerationRetired(conn: ActiveConnection, info: RetirementInfo): void {
+        if (this.active === conn) {
+            this.active = null;
+            this.liveRoutes.clear();
+            for (const cached of this.routes.values()) {
+                cached.handle = null;
+            }
+        }
+        this.emitDiagnostics({ type: "retired", reason: info.reason });
+    }
+
+    private onRouteGoodbye(conn: ActiveConnection, channel: number, epoch: number): void {
+        if (this.active !== conn) return;
+        const handle = this.liveRoutes.get(channel);
+        if (!handle || handle.epoch !== epoch) return;
+        this.liveRoutes.delete(channel);
+        for (const cached of this.routes.values()) {
+            if (cached.handle === handle) cached.handle = null;
+        }
+    }
+
+    private isLiveHandle(handle: RouteHandle): boolean {
+        const active = this.active;
+        return (
+            active !== null &&
+            !active.generation.isRetired() &&
+            belongsToConnection(handle, active.token) &&
+            this.liveRoutes.get(handle.channel) === handle
+        );
+    }
+
+    private requireLiveHandle(handle: RouteHandle): ActiveConnection {
+        if (!this.isLiveHandle(handle)) throw new StaleRouteHandleError(handle);
+        return this.active as ActiveConnection;
+    }
+
+    private evictHandle(handle: RouteHandle): void {
+        if (this.liveRoutes.get(handle.channel) === handle) {
+            this.liveRoutes.delete(handle.channel);
+        }
+        for (const cached of this.routes.values()) {
+            if (cached.handle === handle) cached.handle = null;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Requests: one pending entry, caller abort, terminal classification.
+    // ------------------------------------------------------------------
+
+    /**
+     * Run one request to its terminal. A wire Error terminal becomes a
+     * `terminal` SubcCallError with the canonical body's stable code. On a
+     * caller abort, the rejection carries the cleanup ticket, and a
+     * post-write routed abort enqueues a correlation-scoped Cancel; channel
+     * 0 never sees Cancel (KTD9 handles it by retirement in the caller).
+     */
+    private async awaitRequest(
+        generation: ConnectionGeneration,
+        params: RequestParams,
+    ): Promise<RequestTerminal> {
+        const signal = params.options.signal;
+        const pending: PendingRequest = generation.request({
+            channel: params.channel,
+            epoch: params.epoch,
+            body: params.body,
+            deadline: params.deadline,
+            mode: "unary",
+            priority: params.options.priority,
+            admissionClass: params.options.admissionClass,
+        });
+        let cleanup: Promise<void> | null = null;
+        const onAbort = (): void => {
+            cleanup = pending.abort().cleanup;
+        };
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener("abort", onAbort, { once: true });
+        try {
+            const terminal = await pending.result;
+            if (terminal.kind === "error") throw terminalFromErrorBody(terminal.body);
+            return terminal;
+        } catch (error) {
+            if (cleanup !== null && error instanceof SubcCallError) {
+                if (error.kind === "outcome_unknown" && params.channel !== 0) {
+                    generation.enqueueCancel(params.channel, params.epoch, pending.correlation);
+                }
+                error.cleanup = cleanup;
+            }
+            throw error;
+        } finally {
+            signal?.removeEventListener("abort", onAbort);
+        }
+    }
+
+    /** Send one channel-0 control request and validate the tagged response. */
+    private async controlRequest(
+        active: ActiveConnection,
+        bodyText: string,
+        expectedOp: string,
+        deadline: Deadline,
+    ): Promise<Record<string, unknown>> {
+        const body = Buffer.from(bodyText, "utf8");
+        if (body.length > MAX_CONTROL_BODY_LEN) {
+            throw new SubcCallError(
+                "not_sent",
+                `channel-0 control body of ${body.length} bytes exceeds the ${MAX_CONTROL_BODY_LEN}-byte cap`,
+                "control_body_too_large",
+            );
+        }
+        const terminal = await this.awaitRequest(active.generation, {
+            channel: 0,
+            epoch: 0,
+            body,
+            deadline,
+            options: {},
+        });
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(Buffer.from(terminal.body).toString("utf8"));
+        } catch {
+            parsed = undefined;
+        }
+        if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            Array.isArray(parsed) ||
+            (parsed as { op?: unknown }).op !== expectedOp
+        ) {
+            throw new SubcCallError(
+                "terminal",
+                `control response was not a tagged ${expectedOp} object`,
+                "malformed_control_response",
+            );
+        }
+        this.emitDiagnostics({ type: "parse", channel: 0, epoch: 0, len: terminal.body.length });
+        return parsed as Record<string, unknown>;
+    }
+
+    // ------------------------------------------------------------------
+    // Route opening: validation, close races, and ambiguous-open handling.
+    // ------------------------------------------------------------------
+
+    private controlRouteOpen(
+        active: ActiveConnection,
+        target: RouteTarget,
+        identity: BindIdentity,
+        consumerIdentity: ConsumerIdentity | undefined,
+        deadline: Deadline,
+    ): Promise<RouteHandle> {
+        const run = this.runRouteOpen(active, target, identity, consumerIdentity, deadline);
+        const tracked = run.then(
+            () => undefined,
+            () => undefined,
+        );
+        this.pendingRouteOpens.add(tracked);
+        void tracked.finally(() => this.pendingRouteOpens.delete(tracked));
+        return run;
+    }
+
+    private async runRouteOpen(
+        active: ActiveConnection,
+        target: RouteTarget,
+        identity: BindIdentity,
+        consumerIdentity: ConsumerIdentity | undefined,
+        deadline: Deadline,
+    ): Promise<RouteHandle> {
+        const bodyText = routeOpenBody(target, identity, consumerIdentity);
+        let parsed: Record<string, unknown>;
+        try {
+            parsed = await this.controlRequest(active, bodyText, "route.open", deadline);
+        } catch (error) {
+            // KTD9: an ambiguous channel-0 route.open (possible send, no
+            // terminal) has no handle and Cancel is illegal on channel 0,
+            // so retire the generation before any recovery.
+            if (error instanceof SubcCallError && error.kind === "outcome_unknown") {
+                active.generation.retire("ambiguous_route_open", error);
+            }
+            throw error;
+        }
+        const channel = parsed.route_channel;
+        const epoch = parsed.route_epoch;
+        let handle: RouteHandle;
+        try {
+            if (typeof channel !== "number" || typeof epoch !== "number") {
+                throw new RangeError("route.open response carried no numeric route handle");
+            }
+            handle = createRouteHandle(channel, epoch, active.token);
+        } catch (error) {
+            throw new SubcCallError(
+                "terminal",
+                `route.open returned a malformed route handle${causeMessage(error)}`,
+                "malformed_control_response",
+                error,
+            );
+        }
+        if (this.closeStarted) {
+            // KTD9 owner-close race: never cache the late route; best-effort
+            // Goodbye (a failed enqueue retires the generation internally).
+            active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
+            throw new SubcCallError(
+                "not_sent",
+                "route was closed before route.open completed",
+                "route_closed",
+            );
+        }
+        this.liveRoutes.set(handle.channel, handle);
+        return handle;
+    }
+
+    // ------------------------------------------------------------------
+    // Managed route cache and its bounded allowlisted retry loop.
+    // ------------------------------------------------------------------
+
+    private async managedRouteHandle(
+        moduleId: string,
+        options: ManagedCallOptions,
+        deadline: Deadline,
+    ): Promise<RouteHandle> {
+        const identity = options.identity ?? this.defaultIdentity;
+        if (!identity) {
+            throw new SubcCallError(
+                "terminal",
+                "managed call requires a BindIdentity in SubcClient.connect({ identity }) or call(..., { identity })",
+                "missing_identity",
+            );
+        }
+        const kind = options.targetKind ?? this.defaultTargetKind;
+        const target = { kind, module_id: moduleId } as Extract<
+            RouteTarget,
+            { kind: ManagedRouteKind }
+        >;
+        const consumerIdentity = this.envConsumerIdentity();
+        const key = routeCacheKey(target, identity, consumerIdentity);
+        let cached = this.routes.get(key);
+        if (!cached) {
+            cached = {
+                key,
+                target,
+                identity,
+                consumerIdentity,
+                handle: null,
+                opening: null,
+                closed: false,
+            };
+            this.routes.set(key, cached);
+        }
+        if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
+        if (!cached.opening) {
+            const opening = this.openCachedRoute(
+                cached,
+                deadline.stage(this.routeOpenDeadlineMs),
+            ).finally(() => {
+                if (cached.opening === opening) cached.opening = null;
+            });
+            opening.catch(() => {});
+            cached.opening = opening;
+        }
+        return cached.opening;
+    }
+
+    /**
+     * Open one cached managed route under one bounded route-open deadline.
+     * Only the allowlisted momentary route.open rejections retry (with
+     * bounded backoff); transient connection failures reconnect; the
+     * application body is never sent before route success.
+     */
+    private async openCachedRoute(
+        cached: CachedManagedRoute,
+        deadline: Deadline,
+    ): Promise<RouteHandle> {
+        let delayMs = ROUTE_RETRY_BASE_MS;
+        const backoff = async (): Promise<boolean> => {
+            await this.sleep(deadline.stageBudgetMs(delayMs));
+            delayMs = Math.min(delayMs * 2, ROUTE_RETRY_CAP_MS);
+            return !deadline.isExpired();
+        };
+        for (;;) {
+            if (cached.closed || this.closeStarted) {
+                throw new SubcCallError(
+                    "not_sent",
+                    "route was closed before route.open completed",
+                    "route_closed",
+                );
+            }
+            if (deadline.isExpired()) {
+                throw new SubcCallError(
+                    "not_sent",
+                    "route.open deadline expired before a route was opened",
+                    "deadline_expired",
+                );
+            }
+            let active: ActiveConnection;
+            try {
+                active = await this.ensureConnection(deadline);
+            } catch (error) {
+                if (error instanceof SubcCallError) throw error;
+                if (
+                    isConsumerReconnectTransient(error) &&
+                    !this.closeStarted &&
+                    (await backoff())
+                ) {
+                    continue;
+                }
+                throw new SubcCallError(
+                    isConsumerReconnectTransient(error) ? "not_sent" : "terminal",
+                    `route.open could not run because connect failed${causeMessage(error)}`,
+                    errorCode(error),
+                    error,
+                );
+            }
+            if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
+            try {
+                const handle = await this.controlRouteOpen(
+                    active,
+                    cached.target,
+                    cached.identity,
+                    cached.consumerIdentity,
+                    deadline,
+                );
+                if (cached.closed) {
+                    this.liveRoutes.delete(handle.channel);
+                    active.generation.enqueueRouteGoodbye(handle.channel, handle.epoch);
+                    throw new SubcCallError(
+                        "not_sent",
+                        "route was closed before route.open completed",
+                        "route_closed",
+                    );
+                }
+                cached.handle = handle;
+                return handle;
+            } catch (error) {
+                if (!isSubcCallError(error)) {
+                    throw new SubcCallError(
+                        "terminal",
+                        `route.open failed for module ${cached.target.module_id}${causeMessage(error)}`,
+                        errorCode(error),
+                        error,
+                    );
+                }
+                if (error.code === "route_closed" || this.closeStarted) throw error;
+                if (error.kind === "terminal" && isRetryableRouteOpenCode(error.code)) {
+                    if (await backoff()) continue;
+                    throw new SubcCallError(
+                        "not_sent",
+                        `route.open failed for module ${cached.target.module_id}: ${error.code} (route-open retry budget exhausted)`,
+                        error.code,
+                        error,
+                    );
+                }
+                if (error.kind === "not_sent" || error.kind === "outcome_unknown") {
+                    // An ambiguous open already retired its generation; the
+                    // next loop iteration reconnects under the same deadline.
+                    if (await backoff()) continue;
+                    throw error;
+                }
+                throw error;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Bounded owner close.
+    // ------------------------------------------------------------------
+
+    private async runClose(): Promise<void> {
+        const deadline = Deadline.start(this.shutdownDeadlineMs, this.clock);
+        if (this.connecting) {
+            try {
+                await this.connecting;
+            } catch {
+                // A failed connect has nothing to tear down.
+            }
+        }
+        if (this.pendingRouteOpens.size > 0) {
+            let cancelWait: (() => void) | undefined;
+            const wait = new Promise<void>((resolve) => {
+                const timer = setTimeout(resolve, Math.max(0, deadline.remainingMs()));
+                cancelWait = () => {
+                    clearTimeout(timer);
+                    resolve();
+                };
+            });
+            try {
+                await Promise.race([Promise.all([...this.pendingRouteOpens]), wait]);
+            } finally {
+                cancelWait?.();
+            }
+        }
+        const active = this.active;
+        if (active && !active.generation.isRetired()) {
+            active.generation.enqueueConnectionGoodbye();
+            await active.generation.flushWrites(deadline);
+            active.generation.retire("owner_close");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Bounded, redacted diagnostics.
+    // ------------------------------------------------------------------
+
+    private emitDiagnostics(event: Omit<SubcDiagnosticsEvent, "atMs">): void {
+        const observer = this.diagnostics;
+        if (!observer) return;
+        const now = Date.now();
+        if (now - this.diagWindowStartMs >= 1_000) {
+            this.diagWindowStartMs = now;
+            this.diagWindowCount = 0;
+        }
+        this.diagWindowCount += 1;
+        if (this.diagWindowCount > this.maxDiagnosticEventsPerSecond) return;
+        try {
+            observer(Object.freeze({ ...event, atMs: now }));
+        } catch {
+            // Observer exceptions must never affect protocol work (KTD12).
+        }
+    }
+
+    private envConsumerIdentity(): ConsumerIdentity | undefined {
+        const moduleId = process.env[SUBC_MODULE_ID_ENV];
+        const launchNonce = process.env[SUBC_LAUNCH_NONCE_ENV];
+        if (!moduleId || !launchNonce) return undefined;
+        return { module_id: moduleId, launch_nonce: launchNonce };
+    }
+}
+
+// ----------------------------------------------------------------------
+// Body encoding and terminal classification helpers.
+// ----------------------------------------------------------------------
+
+function encodeBody(body: unknown): Uint8Array {
+    return body instanceof Uint8Array ? body : Buffer.from(JSON.stringify(body), "utf8");
+}
+
+/** Canonical compact `route.open` request body (wire doc 7.2). */
+function routeOpenBody(
+    target: RouteTarget,
+    identity: BindIdentity,
+    consumerIdentity: ConsumerIdentity | undefined,
+): string {
+    const canonicalTarget =
+        target.kind === "internal_service"
+            ? { kind: target.kind, module_id: target.module_id, service_id: target.service_id }
+            : { kind: target.kind, module_id: target.module_id };
+    const canonicalIdentity = {
+        project_root: identity.project_root,
+        harness: identity.harness,
+        session: identity.session,
+    };
+    return JSON.stringify(
+        consumerIdentity
+            ? {
+                  op: "route.open",
+                  target: canonicalTarget,
+                  identity: canonicalIdentity,
+                  consumer_identity: {
+                      module_id: consumerIdentity.module_id,
+                      launch_nonce: consumerIdentity.launch_nonce,
+                  },
+              }
+            : { op: "route.open", target: canonicalTarget, identity: canonicalIdentity },
+    );
+}
+
+/** Canonical `ErrorBody {code, message}` into a `terminal` SubcCallError. */
+function terminalFromErrorBody(body: Uint8Array): SubcCallError {
+    const text = Buffer.from(body).toString("utf8");
+    try {
+        const parsed = JSON.parse(text) as { code?: unknown; message?: unknown };
+        if (typeof parsed === "object" && parsed !== null) {
+            const code = typeof parsed.code === "string" ? parsed.code : undefined;
+            const message = typeof parsed.message === "string" ? parsed.message : undefined;
+            return new SubcCallError("terminal", message ?? "subc error", code);
+        }
+    } catch {
+        // Fall through to the opaque-body form.
+    }
+    return new SubcCallError("terminal", text || "subc error");
+}
+
+function parseResponseJson(terminal: RequestTerminal): unknown {
+    try {
+        return JSON.parse(Buffer.from(terminal.body).toString("utf8"));
+    } catch (error) {
+        throw new SubcCallError(
+            "terminal",
+            "response body was not valid JSON",
+            "invalid_response_body",
+            error,
+        );
+    }
+}
+
+function toManagedCallError(error: unknown): SubcCallError {
+    if (error instanceof SubcCallError) return error;
+    if (error instanceof StaleRouteHandleError) {
+        return new SubcCallError(
+            "not_sent",
+            `managed request used a stale route handle${causeMessage(error)}`,
+            error.code,
+            error,
+        );
+    }
+    return new SubcCallError(
+        "terminal",
+        `managed call failed${causeMessage(error)}`,
+        errorCode(error),
+        error,
+    );
+}
+
+function routeCacheKey(
+    target: Extract<RouteTarget, { kind: ManagedRouteKind }>,
+    identity: BindIdentity,
+    consumerIdentity: ConsumerIdentity | undefined,
+): string {
+    const consumerPart = consumerIdentity
+        ? `${consumerIdentity.module_id}\0${consumerIdentity.launch_nonce}`
+        : "";
+    return `${target.kind}\0${target.module_id}\0${identity.project_root}\0${identity.harness}\0${identity.session}\0${consumerPart}`;
+}

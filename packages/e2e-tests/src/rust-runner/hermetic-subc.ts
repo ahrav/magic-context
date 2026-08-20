@@ -39,7 +39,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { SubcClient, type BindIdentity } from "@cortexkit/subc-client";
+import { SubcClient, type BindIdentity } from "@magic-context/core/shared/mc-host-client";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const MODULE_ID = "magic-context";
@@ -694,13 +694,12 @@ export class HermeticSubcStack {
             route = await client.routeOpen(
                 { kind: "tool_provider", module_id: MODULE_ID },
                 identity,
-                { consumerIdentity: null },
             );
             const response = await client.request(route, { method, v: 1, session_id: sessionId });
             return (response && typeof response === "object" ? response : {}) as Record<string, unknown>;
         } catch (error) {
-            client.close();
             if (this.statusClient === client) this.statusClient = null;
+            await client.closeAsync().catch(() => undefined);
             throw error;
         } finally {
             if (route) await client.closeRoute(route).catch(() => undefined);
@@ -734,7 +733,14 @@ export class HermeticSubcStack {
      */
     assertModuleNotSupervised(): void {
         const configPath = join(this.daemonConfigDir, "cortexkit", "subc.jsonc");
-        const config = JSON.parse(readFileSync(configPath, "utf8")) as { modules?: unknown };
+        let config: { modules?: unknown };
+        try {
+            config = JSON.parse(readFileSync(configPath, "utf8")) as { modules?: unknown };
+        } catch (error) {
+            throw new Error(
+                `Rust outage drill precondition failed: unreadable daemon config ${configPath}: ${error}`,
+            );
+        }
         if (
             config.modules === null ||
             typeof config.modules !== "object" ||
@@ -816,8 +822,9 @@ export class HermeticSubcStack {
 
     /** Hard teardown. Safe to call more than once; never throws. */
     async stop(): Promise<void> {
-        this.statusClient?.close();
+        const statusClient = this.statusClient;
         this.statusClient = null;
+        if (statusClient) await statusClient.closeAsync().catch(() => undefined);
         try {
             await this.killModuleAndWait();
         } catch {
