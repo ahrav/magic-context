@@ -163,6 +163,17 @@ describe("seedFixture on the reviewed v1 release", () => {
         expect(firstRanked).toContain("message:msg-fixture-0001");
     });
 
+    it("binds the deterministic vector-recipe id into the fixture identity", () => {
+        const result = seedV1();
+        expect(result.manifest.embeddingModelId).toBe(BENCHMARK_EMBEDDING_MODEL_ID);
+        // Changing embeddingModelId changes manifestFingerprint.
+        const staleRecipe = canonicalFingerprint({
+            ...result.manifest,
+            embeddingModelId: "benchmark:deterministic/v1",
+        });
+        expect(staleRecipe).not.toBe(result.manifestFingerprint);
+    });
+
     it("executes candidate K=100 and both selectivity endpoints through production seams", async () => {
         const result = seedV1();
         const deep = await searchSnapshot(

@@ -1,0 +1,90 @@
+{
+  "unit": "u30-query-purpose-default",
+  "tracking": "beads:magic-context-3q5.6 (U30); https://github.com/ahrav/magic-context/pull/13",
+  "profile": "ci",
+  "release": "packages/plugin/scripts/fixtures/retrieval-benchmark/v1",
+  "claim": "regression",
+  "policyFingerprint": "4241bd583739e3096f03eb5a6a166bec37c00aa356d658990dd0e23b98b43271",
+  "qualityKey": {
+    "releaseFingerprints": {
+      "corpus": "9f388d7ac837d6f277c60da7e4fae011765982b6f2e5880ca1f92f516f874b35",
+      "judgments": "f6d8ec1de0f224c6b9ab32b771a6c0695fb1b95a9b0b6bb33712994503338639",
+      "syntheticProfiles": "69e9f35251115c3ba25dc337b8416f380098f00b8642128da2d6ca4fa414cec2",
+      "manifest": "c1eb223e7a4c34f317b3d19c6c8358466cee195e678ee6ce30f128ac3a32ffbe"
+    },
+    "metricPolicyVersion": "retrieval-metric-policy/v1",
+    "timingPolicyVersion": "retrieval-timing-policy/v1",
+    "profileFingerprint": "67778282cc28d905020b905e6cdeb8f033447039b2ee7be8765ac68ca7282486",
+    "behaviorFingerprint": "747359550f87973fba08ec1c7ab801489145fcccddd9e2553f016f63ed09450a"
+  },
+  "qualityKeyFingerprint": "beab230d31c88a2b24c26452f766f095bc52e289f88f21c2c6c16bffb6fb26ac",
+  "baseline": {
+    "path": "packages/plugin/scripts/fixtures/retrieval-benchmark/baselines/v1/quality.json",
+    "builtFrom": "pre-passage reports below",
+    "runEvidenceDigests": [
+      "e9551d385a41559f1a91bfdc715268da887a0d3477446b26bf8a775669e8008c",
+      "6a4121e64ac73219d2f7976f74a62e0ecdf3aeb002f22b9e2ef89729e504203f",
+      "dfba60e647c727b4e9f17a36f0b71bbe3f6408ff45158d78f63ae3a5b3849231"
+    ]
+  },
+  "preChange": {
+    "sourceCommit": "59ba2a78396f30730d56ff03d9a2fdc747738d3b",
+    "runs": [
+      {
+        "file": "pre-passage-run-1.json",
+        "evidenceDigest": "e9551d385a41559f1a91bfdc715268da887a0d3477446b26bf8a775669e8008c",
+        "semanticFingerprint": "2084bd935e8701472e1b3c2f64c335020102856edccfafe20d38396933a3c0a1",
+        "observedEmbedPurpose": "passage",
+        "scenarioCount": 141
+      },
+      {
+        "file": "pre-passage-run-2.json",
+        "evidenceDigest": "6a4121e64ac73219d2f7976f74a62e0ecdf3aeb002f22b9e2ef89729e504203f",
+        "semanticFingerprint": "2084bd935e8701472e1b3c2f64c335020102856edccfafe20d38396933a3c0a1",
+        "observedEmbedPurpose": "passage",
+        "scenarioCount": 141
+      },
+      {
+        "file": "pre-passage-run-3.json",
+        "evidenceDigest": "dfba60e647c727b4e9f17a36f0b71bbe3f6408ff45158d78f63ae3a5b3849231",
+        "semanticFingerprint": "2084bd935e8701472e1b3c2f64c335020102856edccfafe20d38396933a3c0a1",
+        "observedEmbedPurpose": "passage",
+        "scenarioCount": 141
+      }
+    ]
+  },
+  "postChange": {
+    "sourceCommit": "47de3663ec53aad0f26151775e1aca0d5c4d8a01",
+    "runs": [
+      {
+        "file": "post-query-run-1.json",
+        "evidenceDigest": "0ad79e25b7392aa168240770b40c557f4dd61ac2a1401168b098f901425418f2",
+        "semanticFingerprint": "2084bd935e8701472e1b3c2f64c335020102856edccfafe20d38396933a3c0a1",
+        "observedEmbedPurpose": "query",
+        "scenarioCount": 141
+      },
+      {
+        "file": "post-query-run-2.json",
+        "evidenceDigest": "b9c99aa873f13157bdcac5a9cd1dfde216e98c08fc21c1b2b6dd24753208ee3d",
+        "semanticFingerprint": "2084bd935e8701472e1b3c2f64c335020102856edccfafe20d38396933a3c0a1",
+        "observedEmbedPurpose": "query",
+        "scenarioCount": 141
+      },
+      {
+        "file": "post-query-run-3.json",
+        "evidenceDigest": "6a6a2cb78cc20ee927b511cdcaf03d2640bfac0ff288342d014f89ab29b0d043",
+        "semanticFingerprint": "2084bd935e8701472e1b3c2f64c335020102856edccfafe20d38396933a3c0a1",
+        "observedEmbedPurpose": "query",
+        "scenarioCount": 141
+      }
+    ]
+  },
+  "regression": {
+    "file": "regression.json",
+    "verdict": "quality-only",
+    "latencyRequired": false,
+    "unblocked": true,
+    "qualityFindingsPass": true,
+    "qualityEvidenceScope": "The harness embedQuery is purpose-invariant (the purpose argument never changes the returned vector), so pre/post metrics are identical by construction. This gate proves the dispatch flip introduces no harness-level regression; the quality effect of query-vs-passage embedding at an asymmetric provider boundary (input_type/query_input_type) is unmeasured here and is validated only by the provider-boundary unit tests (AE1-AE4)."
+  }
+}

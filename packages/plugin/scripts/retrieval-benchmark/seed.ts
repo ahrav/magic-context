@@ -52,7 +52,7 @@ export const SEED_MANIFEST_VERSION = "retrieval-benchmark-seed/v1";
 /** Model id recorded for every deterministic fixture vector. Runners must
  *  return this id from their `embedQuery` contract so production lanes match
  *  the seeded BLOBs. */
-export const BENCHMARK_EMBEDDING_MODEL_ID = "benchmark:deterministic/v1";
+export const BENCHMARK_EMBEDDING_MODEL_ID = "benchmark:deterministic/v2";
 
 /** Fixed epoch for every seeded wall-clock column, so fixture bytes never
  *  depend on the time the seeder ran. */

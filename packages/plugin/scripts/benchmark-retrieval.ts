@@ -36,6 +36,7 @@ import {
     RegressionError,
     type RegressionVerdict,
     REQUIRED_RUN_COUNT,
+    vacuousBaselineModes,
 } from "./retrieval-benchmark/regression";
 import { type BenchmarkReport, parseReport } from "./retrieval-benchmark/report";
 import { RunnerError, runBenchmark } from "./retrieval-benchmark/runner";
@@ -266,18 +267,14 @@ async function runBaselineCreate(rest: string[]): Promise<void> {
         // A mode whose metrics are zero across every run publishes a vacuous
         // gate: loss is bounded below by zero, so no regression in that mode
         // can ever fail. Refuse to publish it; fix the lane first.
-        for (const mode of artifact.runs[0]?.modes ?? []) {
-            const allZero = artifact.runs.every((run) =>
-                run.modes.some(
-                    (entry) =>
-                        entry.mode === mode.mode && entry.ndcgAt10 === 0 && entry.recallAt50 === 0,
+        const vacuousModes = vacuousBaselineModes(artifact);
+        if (vacuousModes.length > 0) {
+            throw new RunnerError(
+                vacuousModes.map(
+                    (mode) =>
+                        `usage: refusing to publish a zero-valued ${mode} baseline (the gate would be vacuous)`,
                 ),
             );
-            if (allZero) {
-                throw new RunnerError([
-                    `usage: refusing to publish a zero-valued ${mode.mode} baseline (the gate would be vacuous)`,
-                ]);
-            }
         }
         const { path } = publishBaseline(artifact, outPath);
         console.error(`[benchmark-retrieval] published quality baseline ${path}`);

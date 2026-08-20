@@ -6,7 +6,7 @@ import { cosineSimilarity } from "./cosine-similarity";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { LocalEmbeddingProvider } from "./embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./embedding-openai";
-import type { EmbeddingProvider } from "./embedding-provider";
+import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 import { SynapseEmbeddingProvider } from "./embedding-synapse";
 
 export type {
@@ -189,6 +189,14 @@ export function isEmbeddingEnabled(): boolean {
     return embeddingConfig.provider !== "off";
 }
 
+/** Restores the module-default embedding config. Tests that call
+ *  `initializeEmbedding` share this module's global state with every other
+ *  test file in the process; resetting to a non-default config (e.g.
+ *  `"off"`) would silently disable semantic lanes for later files. */
+export function _resetEmbeddingConfigForTests(): void {
+    initializeEmbedding(DEFAULT_EMBEDDING_CONFIG);
+}
+
 export async function ensureEmbeddingModel(): Promise<boolean> {
     const currentProvider = getOrCreateProvider();
     if (!currentProvider) {
@@ -198,7 +206,11 @@ export async function ensureEmbeddingModel(): Promise<boolean> {
     return currentProvider.initialize();
 }
 
-export async function embedText(text: string, signal?: AbortSignal): Promise<Float32Array | null> {
+export async function embedText(
+    text: string,
+    signal?: AbortSignal,
+    purpose?: EmbeddingPurpose,
+): Promise<Float32Array | null> {
     const currentProvider = getOrCreateProvider();
     if (!currentProvider) {
         return null;
@@ -208,7 +220,7 @@ export async function embedText(text: string, signal?: AbortSignal): Promise<Flo
         return null;
     }
 
-    return currentProvider.embed(text, signal);
+    return currentProvider.embed(text, signal, purpose);
 }
 
 export function getEmbeddingModelId(): string {
