@@ -17,11 +17,11 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
-import { resolve as pathResolve, join } from "node:path";
-import { TestHarness } from "../src/harness";
+import { join, resolve as pathResolve } from "node:path";
+import { insertMemory } from "../../plugin/src/features/magic-context/memory";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
-import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
-import { openTestDb } from "../src/test-db";
+import { Database } from "../../plugin/src/shared/sqlite";
+import { TestHarness } from "../src/harness";
 
 let h: TestHarness;
 
@@ -49,19 +49,14 @@ function computeDirIdentity(directory: string): string {
 
 function seedMemory(h: TestHarness, projectIdentity: string, content: string): void {
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = openTestDb(dbPath);
+    const db = new Database(dbPath);
     try {
-        const now = Date.now();
-        const normalizedHash = computeNormalizedHash(content);
-        db.prepare(
-            `INSERT INTO memories (
-                project_path, category, content, normalized_hash,
-                source_session_id, source_type,
-                seen_count, retrieval_count,
-                first_seen_at, created_at, updated_at, last_seen_at,
-                status
-             ) VALUES (?, 'USER_DIRECTIVES', ?, ?, NULL, 'historian', 5, 0, ?, ?, ?, ?, 'active')`,
-        ).run(projectIdentity, content, normalizedHash, now, now, now, now);
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "PROJECT_RULES",
+            content,
+            sourceType: "historian",
+        });
     } finally {
         db.close();
     }

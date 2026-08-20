@@ -83,6 +83,10 @@ function hitMemoryClaimFailpoint(id: MemoryClaimFailpointId): void {
     activeFailpoints.get(id)?.();
 }
 
+export function acknowledgeMemoryClaimResult(): void {
+    hitMemoryClaimFailpoint("memory-claim.070.ack.after");
+}
+
 // ---------------------------------------------------------------------------
 // Schema probe, capability, and transaction adapters
 // ---------------------------------------------------------------------------

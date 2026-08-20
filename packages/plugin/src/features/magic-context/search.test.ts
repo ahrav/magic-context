@@ -17,9 +17,18 @@ import {
 } from "./compartment-chunk-embedding";
 import { appendCompartments, getCompartments, replaceSessionFacts } from "./compartment-storage";
 import { upsertCommits } from "./git-commits";
-import { getMemoryById, insertMemory, resetEmbeddingCacheForTests, saveEmbedding } from "./memory";
+import {
+    getMemoryById,
+    insertMemory,
+    insertMemoryIdempotent,
+    resetEmbeddingCacheForTests,
+    saveEmbedding,
+} from "./memory";
 import { _resetEmbeddingConfigForTests, initializeEmbedding } from "./memory/embedding";
-import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
+import {
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+} from "./memory/storage-memory-claims";
 import { ensureMessagesIndexed } from "./message-index";
 import { runMigrations } from "./migrations";
 import {
@@ -160,6 +169,62 @@ describe("unifiedSearch", () => {
             expect(results[0].question).toBe("How does the cache system work?");
             expect(results[0].support).toBe(2);
         }
+    });
+
+    it("keeps exact-hash claim-backed facts on the legacy memory reader once", async () => {
+        const project = "git:u6-search-reader";
+        const content = "u6 exact hash fact preserves UTF-8 bytes: café";
+        const first = insertMemory(db, {
+            projectPath: project,
+            category: "CONSTRAINTS",
+            content,
+        });
+        const duplicate = insertMemoryIdempotent(db, {
+            projectPath: project,
+            category: "CONSTRAINTS",
+            content,
+        });
+        expect(duplicate.inserted).toBeFalse();
+        expect(duplicate.memory.id).toBe(first.id);
+        expect(getCurrentMemoryClaimByLegacyMemoryId(db, first.id)?.content).toBe(content);
+
+        const statements: string[] = [];
+        const originalPrepare = db.prepare.bind(db);
+        db.prepare = ((sql: string) => {
+            statements.push(sql);
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+        let results: UnifiedSearchResult[];
+        try {
+            results = await unifiedSearch(db, "ses-u6-search", project, "u6 exact hash fact", {
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                sources: ["memory"],
+            });
+        } finally {
+            db.prepare = originalPrepare;
+        }
+
+        const memories = results.filter(
+            (result): result is Extract<UnifiedSearchResult, { source: "memory" }> =>
+                result.source === "memory",
+        );
+        expect(memories).toHaveLength(1);
+        expect(Buffer.from(memories[0].content)).toEqual(Buffer.from(content));
+        expect(Object.keys(memories[0]).sort()).toEqual([
+            "category",
+            "content",
+            "matchType",
+            "memoryId",
+            "score",
+            "source",
+            "sourceName",
+        ]);
+        expect(statements.some((sql) => /\bmemories(?:_fts)?\b/i.test(sql))).toBeTrue();
+        expect(
+            statements.some((sql) => /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql)),
+        ).toBeFalse();
     });
 
     it("returns ranked results across memories and messages (no facts)", async () => {

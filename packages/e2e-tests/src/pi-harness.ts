@@ -1,8 +1,10 @@
 /** PiTestHarness — facade for Pi Magic Context e2e tests. */
 
-import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
+import { initializeDatabase } from "../../plugin/src/features/magic-context/storage-db";
+import { Database } from "../../plugin/src/shared/sqlite";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
 import {
@@ -35,6 +37,19 @@ const DEFAULT_MOCK_RESPONSE: MockResponse = {
   },
 };
 
+function initializeIsolatedContextDb(dataDir: string): void {
+  const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+  if (existsSync(path)) return;
+  mkdirSync(dirname(path), { recursive: true });
+  const db = new Database(path);
+  try {
+    initializeDatabase(db);
+    runMigrations(db);
+  } finally {
+    db.close();
+  }
+}
+
 export class PiTestHarness {
   readonly mock: MockProvider;
   readonly env: PiIsolatedEnv;
@@ -55,6 +70,7 @@ export class PiTestHarness {
     mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
     const env = createPiIsolatedEnv(options.sharedDataDir);
     if (options.workdir) env.workdir = options.workdir;
+    initializeIsolatedContextDb(env.dataDir);
     const rpc = new PiRpcClient({
       env,
       mockProviderURL: PiTestHarness.mockBaseURL(mock),
@@ -283,5 +299,6 @@ export class PiTestHarness {
     }
     await this.rpc.shutdown();
     await this.mock.stop();
+    rmSync(this.env.baseDir, { recursive: true, force: true });
   }
 }

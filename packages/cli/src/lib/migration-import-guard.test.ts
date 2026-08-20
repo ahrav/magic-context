@@ -11,6 +11,7 @@ const SOURCE_ROOTS = ["packages/cli/src", "packages/plugin/src", "packages/pi-pl
 const ALLOWED_RUN_MIGRATIONS_IMPORTS = new Set([
     "packages/cli/src/commands/doctor-repair-db.ts",
     "packages/plugin/src/features/magic-context/storage-db.ts",
+    "packages/plugin/src/features/magic-context/memory/fixtures/claims-crash-worker.ts",
 ]);
 
 function sourceFiles(directory: string): string[] {

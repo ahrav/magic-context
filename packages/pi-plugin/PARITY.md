@@ -155,6 +155,8 @@ shared resolver's log-only dubious-ownership warning while still using the same
   **stdin** (Pi concatenates stdin + positional) to avoid Linux `MAX_ARG_STRLEN`
   / E2BIG; the positional is omitted when piping.
 - `--no-session` keeps subagent JSONL out of the user's session picker.
+- v83 memory writes are intentionally not divergent. OpenCode and Pi wrappers keep harness-specific authorization, formatting, and post-commit embedding/module dispatch, but both call same transaction-local claim compatibility kernel. Same operation commits crosswalk, immutable revision metadata, `memories` projection, outbox, and generation; existing readers stay on `memories`. Public-tool e2e covers OpenCode→Pi and Pi→OpenCode writes against shared DB.
+- Ship Pi, OpenCode, CLI, and `ck-mc` from same revision before v83 migration. Held-open legacy writers are rejected by shared guard; pending v22 work and lazy backfill use shared startup/doctor recovery (`magic-context doctor --check-claims-backfill`, then `--retry-claims-backfill`, then restart both harnesses). Archive/delete retire projection state and retain claim history; no Pi or OpenCode response promises erasure.
 
 ---
 

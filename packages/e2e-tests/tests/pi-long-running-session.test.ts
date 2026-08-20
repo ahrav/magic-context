@@ -1,16 +1,15 @@
 /// <reference types="bun-types" />
 
-import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
-import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
+import { insertMemory } from "../../plugin/src/features/magic-context/memory";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
+import { Database } from "../../plugin/src/shared/sqlite";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { PiTestHarness } from "../src/pi-harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
-import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -157,7 +156,7 @@ function readMeta<T>(h: PiTestHarness, sessionId: string, columns: string): T | 
 }
 
 function writeDb(h: PiTestHarness, fn: (db: Database) => void): void {
-    const db = openTestDb(h.contextDbPath(), { readwrite: true });
+    const db = new Database(h.contextDbPath());
     try {
         fn(db);
     } finally {
@@ -168,14 +167,12 @@ function writeDb(h: PiTestHarness, fn: (db: Database) => void): void {
 function seedMemory(h: PiTestHarness, content: string): void {
     const projectIdentity = resolveProjectIdentity(realpathSync(pathResolve(h.env.workdir)));
     writeDb(h, (db) => {
-        const now = Date.now();
-        db.prepare(
-            `INSERT INTO memories (
-                project_path, category, content, normalized_hash,
-                source_session_id, source_type, seen_count, retrieval_count,
-                first_seen_at, created_at, updated_at, last_seen_at, status
-            ) VALUES (?, 'WORKFLOW_RULES', ?, ?, NULL, 'historian', 5, 0, ?, ?, ?, ?, 'active')`,
-        ).run(projectIdentity, content, computeNormalizedHash(content), now, now, now, now);
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "PROJECT_RULES",
+            content,
+            sourceType: "historian",
+        });
     });
 }
 
