@@ -64,8 +64,10 @@ Validation rules (`crates/mc-host/src/synapse/bundle.rs` is authoritative):
 - Hashes are 64 lowercase hex and may not be placeholders (a repeated
   single character, e.g. all zeros, is refused).
 - `max_tokens` must equal the tokenizer_config's `model_max_length`, so the
-  truncation boundary has one owner.
-- The corpus must parse, match `dims`, and carry a positive tolerance.
+  truncation boundary has one owner, and `tokenizer_config` must declare a
+  string `pad_token`.
+- The corpus must parse, match `dims`, and carry a finite tolerance in
+  `(0, 0.1]`.
 
 `fingerprint` covers the complete embedding-space contract: artifact
 identity, dimensions, pooling, quantization, output selection, truncation
@@ -95,10 +97,11 @@ refused by design.
 
 ## 4. Startup, readiness, and degraded mode
 
-Initialization order: verify the ORT identity, hash and confine every
-artifact, construct the FastEmbed user-defined model (one intra-op thread,
-CPU execution provider only), run a structural probe (dimension count,
-finite components, unit L2 norm), then certify semantics against the corpus.
+Initialization order: hash and confine every bundle artifact, verify and
+commit the ORT identity, construct the FastEmbed user-defined model (one
+intra-op thread, CPU execution provider only), run a structural probe
+(dimension count, finite components, unit L2 norm), then certify semantics
+against the corpus.
 The corpus is chosen to be sensitive to output selection, pooling, and the
 truncation boundary, so a structurally healthy but semantically wrong model
 never reports ready.

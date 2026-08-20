@@ -1097,6 +1097,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         });
     }
 
+    /** Legacy lenient polling for `embedItems`/`embedBatch` callers only: it
+     *  tolerates pre-canonical hosts (`complete`, `cursor` aliases) and treats
+     *  a missing cursor as termination. The canonical R13 rule — done:false
+     *  without a cursor is explicit pending, never termination — lives in
+     *  `collectJobPages`, which every detailed/ledger path uses. */
     private async pollBatch(
         jobId: string,
         requestKey: string,

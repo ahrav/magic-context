@@ -735,10 +735,13 @@ describe("embedItemsDetailed", () => {
 
             expect(result.failures).toEqual([]);
             expect(result.receipts).toHaveLength(1);
-            expect(stateAtFirstPoll?.state).toBe("polling");
-            expect(stateAtFirstPoll?.job_id).toBe("job-1");
-            expect(typeof stateAtFirstPoll?.attempt_id).toBe("string");
-            expect(stateAtFirstPoll?.deadline_at as number).toBeGreaterThan(Date.now());
+            // Widened read: TS narrows the closure-assigned variable to its
+            // initializer type at this point.
+            const firstPoll = stateAtFirstPoll as Record<string, unknown> | null;
+            expect(firstPoll?.state).toBe("polling");
+            expect(firstPoll?.job_id).toBe("job-1");
+            expect(typeof firstPoll?.attempt_id).toBe("string");
+            expect(firstPoll?.deadline_at as number).toBeGreaterThan(Date.now());
 
             const row = ledgerRows(db)[0];
             expect(row.state).toBe("ready");
@@ -1088,5 +1091,35 @@ describe("embedItemsDetailed", () => {
         } finally {
             closeQuietly(db);
         }
+    });
+});
+
+describe("canonical request-key golden vectors", () => {
+    // These exact keys are committed in docs/mc-host-wire-protocol.md §7.5.7
+    // and asserted by the Rust unit tests in
+    // crates/mc-host/src/synapse/protocol.rs; both languages must produce
+    // identical bytes or batch idempotency breaks cross-language.
+    const sha256Hex = (text: string) => createHash("sha256").update(text).digest("hex");
+    const keyFor = (epoch: number, items: { id: string; text: string }[]) =>
+        getSynapseBatchRequestKey({
+            model: "tiny-test-model",
+            fingerprint: "fp-1",
+            tableEpoch: epoch,
+            items: items.map((item) => ({ id: item.id, contentSha256: sha256Hex(item.text) })),
+        });
+
+    it("matches the committed golden vectors", () => {
+        expect(keyFor(1, [])).toBe(
+            "581e663acbdeee7021b440822f8f054afa1089ca89f3be3585bf0e8032502186",
+        );
+        expect(
+            keyFor(1, [
+                { id: "item:0", text: "hello world" },
+                { id: "item:1", text: "second text" },
+            ]),
+        ).toBe("ce9a0b29a7c3339ba91851d71b1164f93a35ea6053629f1e9a97ac26c2c02ece");
+        expect(keyFor(7, [{ id: 'id "q"\\ü\n', text: 'café \u2028 "quoted\\" \n tab\t' }])).toBe(
+            "abdb2e55e593fb0f05dfd9f01e3bbaba88f88452daa01cf19bb1ba43da933979",
+        );
     });
 });

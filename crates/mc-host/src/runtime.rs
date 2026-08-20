@@ -332,31 +332,19 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
     }
 }
 
-/// Runs one host incarnation to completion.
-///
-/// Startup follows the protocol order (§8.1): lock and credentials, handler
-/// initialization, listener bind, publication, then admission. The function
-/// returns after shutdown has drained (or fatally failed); the instance lock
-/// releases when the guard drops at the end — after the handler.
-pub async fn run<H: McHostHandler>(
-    handler: H,
-    mut config: HostConfig,
-    shutdown: CancellationToken,
-) -> Result<(), HostError> {
-    crate::panic_boundary::install();
-    config.validate().map_err(HostError::Config)?;
-    let mut guard =
-        InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
-
-    let handler = Arc::new(handler);
-    let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
+/// Validates the startup manifest set and derives the routable
+/// `(module, kind)` pairs, so the published catalog and route admission can
+/// never contradict each other.
+fn build_target_index(
+    manifests: &[crate::handler::ManifestSnapshot],
+) -> Result<crate::control::TargetIndex, HostError> {
     if manifests.is_empty() || manifests.len() > 2 {
         return Err(HostError::InitFailed(
             "the static profile requires one or two module manifests".to_owned(),
         ));
     }
     let mut target_entries: Vec<(Box<str>, Vec<TargetKind>)> = Vec::with_capacity(manifests.len());
-    for manifest in &manifests {
+    for manifest in manifests {
         if let Err(err) = crate::control::validate_manifest_module_id(&manifest.module_id) {
             return Err(HostError::InitFailed(err));
         }
@@ -395,7 +383,28 @@ pub async fn run<H: McHostHandler>(
         }
         target_entries.push((manifest.module_id.clone().into_boxed_str(), kinds));
     }
-    let targets = crate::control::TargetIndex::new(target_entries);
+    Ok(crate::control::TargetIndex::new(target_entries))
+}
+
+/// Runs one host incarnation to completion.
+///
+/// Startup follows the protocol order (§8.1): lock and credentials, handler
+/// initialization, listener bind, publication, then admission. The function
+/// returns after shutdown has drained (or fatally failed); the instance lock
+/// releases when the guard drops at the end — after the handler.
+pub async fn run<H: McHostHandler>(
+    handler: H,
+    mut config: HostConfig,
+    shutdown: CancellationToken,
+) -> Result<(), HostError> {
+    crate::panic_boundary::install();
+    config.validate().map_err(HostError::Config)?;
+    let mut guard =
+        InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
+
+    let handler = Arc::new(handler);
+    let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
+    let targets = build_target_index(&manifests)?;
     // Bounded during serialization, not after: an over-limit manifest must be
     // refused without ever materializing a full copy of its catalog.
     let Ok(catalog) =

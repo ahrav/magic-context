@@ -373,21 +373,23 @@ Routed requests on the `synapse/management_surface` route are UTF-8 JSON objects
 
 #### 7.5.1 Validation, bounds, and error codes
 
-Every request body is parsed strictly: duplicate object keys, non-object roots, invalid UTF-8, unknown `method` values, wrong field types, and out-of-bound sizes are rejected before hashing or inference. Whole-body nesting is bounded (8 levels); no valid request needs more than 3. The application error vocabulary is closed:
+Every request body is parsed strictly: duplicate object keys, non-object roots, invalid UTF-8, unknown `method` values, wrong field types, and out-of-bound sizes are rejected before hashing or inference. Whole-body nesting is bounded (8 levels); no valid request needs more than 5. The application error vocabulary is closed:
 
 | Code | Meaning | Retry disposition |
 | --- | --- | --- |
-| `queue_full` | admission capacity (job count, queued bytes, or CPU backlog) exhausted before admission | retry after the bounded `retry_after_ms` carried in the message envelope policy; no state was created |
-| `model_loading` | backend is initializing | bounded retry |
+| `queue_full` | admission capacity (job count or aggregate queued request bytes) exhausted before admission | bounded client-side retry; the error body carries no `retry_after_ms` and no state was created |
+| `model_loading` | reserved; not emitted by the current host — initialization completes before publication, so loading faults surface as bind-time `artifact_invalid` | bounded retry |
 | `timeout` | request-scoped deadline expired host-side | caller policy |
 | `artifact_invalid` | bundle missing/invalid (bind rejection) or response identity guard failed | permanent; no retry |
 | `substitution_rejected` | request named a model/fingerprint/epoch the lane does not serve, or `allow_equivalent`/`accept_declared` was not `false` | permanent |
-| `not_certified` | model failed semantic certification | permanent |
-| `probe_required` | structural startup probe has not passed | permanent for this incarnation |
+| `not_certified` | reserved; not emitted by the current host — certification faults surface as bind-time `artifact_invalid` | permanent |
+| `probe_required` | reserved; not emitted by the current host — probe faults surface as bind-time `artifact_invalid` | permanent for this incarnation |
 | `idempotency_conflict` | retained `request_key` reused with a conflicting payload | permanent |
 | `schema_violation` | malformed request, hash/key mismatch, bad cursor, bound violation | permanent |
 | `module_restarted` | job unknown to this host incarnation (restart, expiry, or eviction) | resubmit the same page once from cursor `null` |
-| `cancelled` | host cancellation won (Section 9.2) | no generic retry |
+| `cancelled` | client `Cancel` (Section 9.2) or host shutdown cancellation won | no generic retry |
+
+The host-generic `internal_error` (Section 7.4) additionally covers response construction or task failure on a routed synapse correlation.
 
 Every capacity is finite and host-owned; request fields can never select capacities, models, or filesystem paths. Defaults: 1 concurrent CPU inference, 64 admitted jobs, 64 MiB aggregate queued request text, 64 retained completed jobs, 64 MiB retained vector bytes, 64 items and 8 MiB total text per batch, 1 MiB text per item or query, 16 vectors or 2 MiB encoded output per result page, 15-minute completed-job retention.
 
@@ -429,7 +431,7 @@ A wrong model, fingerprint, or epoch, or either flag not literally `false`, is t
 {"result":{"job_id":"<opaque>","request_key":"<echoed>","done":false,"status":"queued","retry_after_ms":50}}
 ```
 
-Reusing a retained `request_key` with the byte-identical canonical payload returns the same `job_id` and runs inference at most once. Reusing it with any differing payload (order, IDs, texts, hashes, or lane constraints) is terminal `idempotency_conflict`; the original job is never replaced or rerun. Jobs are process-local and host-incarnation-fenced: they do not survive restart, and the durable recovery authority is the TypeScript ledger.
+Reusing a retained `request_key` with the byte-identical canonical payload returns the same `job_id` and runs inference at most once. Reusing it with any differing payload (order, IDs, texts, or hashes) is terminal `idempotency_conflict`; the original job is never replaced or rerun. Jobs are process-local and host-incarnation-fenced: they do not survive restart, and the durable recovery authority is the TypeScript ledger.
 
 #### 7.5.6 `embed.result`
 
@@ -445,7 +447,7 @@ Ready results are returned as ordered bounded pages preserving input order. Ever
 {"result":{"model":"tiny-test-model","fingerprint":"<hex>","table_epoch":1,"dims":8,"done":false,"next_cursor":"<opaque>","vectors":[{"id":"item:0","content_sha256":"<hex>","vector":[0.1]}]}}
 ```
 
-Cursors are opaque, forward-only, and bound to their job. A malformed, cross-job, backward, or past-end cursor is `schema_violation`. A `job_id` from another incarnation, or one that is unknown, expired, or evicted, is `module_restarted` — the client's single resubmission rule. A failed job reports its terminal error code on `embed.result`.
+Cursors are opaque and bound to their job. A malformed, cross-job, or never-issued cursor is `schema_violation`. Any previously issued cursor (including `null`) MAY be replayed and re-serves the same page, so a lost response is retried with the same cursor. A `job_id` from another incarnation, or one that is unknown, expired, or evicted, is `module_restarted` — the client's single resubmission rule. A failed job reports its terminal error code on `embed.result`.
 
 #### 7.5.7 Canonical request key
 
@@ -473,7 +475,7 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | bundle identity, offline CPU inference, degraded isolation | `crates/mc-host/tests/synapse_bundle.rs` |
 | request validation, bounds, idempotency, cursors, restart fencing | `crates/mc-host/tests/synapse_protocol.rs`, `crates/mc-host/tests/synapse_jobs.rs` |
 | four operations over a real authenticated route, shutdown cleanup | `crates/mc-host/tests/synapse_roundtrip.rs` |
-| request-key golden vectors in both languages | `crates/mc-host/tests/synapse_protocol.rs`, `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` |
+| request-key golden vectors | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` (matching TypeScript golden test) |
 | durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v82.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |
 
 ## 8. Host and handler lifecycle
@@ -668,9 +670,9 @@ Graceful host shutdown order:
 3. drain or cancel work within finite shutdown deadline, emitting terminal `Response`, `StreamEnd`, or `Error{code:"cancelled"}` frames while generations are still live;
 4. send best-effort connection Goodbye; receiving it retires the generation client-side (Section 6.2), so it MUST follow the drain, or drain-phase terminals would arrive on a retired generation and be dropped;
 5. invoke route-gone exactly once for every handler-visible route;
-6. invoke the handler shutdown callback exactly once, after route cleanup and health-probe quiescence; the callback must not be aborted — a deadline overrun or panic marks the shutdown non-graceful, but the handler, host state, and instance lock remain owned until every native call and lifecycle callback has actually stopped;
+6. invoke the handler shutdown callback exactly once, after route cleanup and health-probe quiescence; the callback must not be aborted — a deadline overrun or panic marks the shutdown non-graceful, but the handler, host state, and instance lock remain owned until every native call and lifecycle callback has actually stopped. On the forced path (the drain deadline already expired) the callback still runs exactly once, but residual route-gone callbacks that themselves overran their deadline may still be in flight beside it; that incarnation is already fatal;
 7. drop handler only after all route-gone callbacks and the shutdown callback complete;
-8. close sockets/listener;
+8. sockets and the listener close as their owning tasks exit (no later than this step);
 9. release instance lock.
 
 Work without an observed terminal remains `outcome_unknown`. Forced shutdown may skip wire Goodbyes but MUST preserve local exactly-once route-gone and handler-drop ordering.

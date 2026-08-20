@@ -247,14 +247,36 @@ fn embed_via(
     lane: &ReadyLane,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>, InferenceError> {
-    match lane.backend.embed(texts) {
-        Ok(vectors) => Ok(vectors),
-        Err(InferenceError::Invariant(reason)) => {
+    settle_inference(inner, Ok(lane.backend.embed(texts)))
+}
+
+/// One owner for the inference-disposition policy: an `Invariant` failure or
+/// a panicked blocking task marks the lane failing BEFORE the error reaches
+/// any sink, so no suspect vector can be served by a later caller.
+fn settle_inference(
+    inner: &SynapseInner,
+    joined: Result<Result<Vec<Vec<f32>>, InferenceError>, tokio::task::JoinError>,
+) -> Result<Vec<Vec<f32>>, InferenceError> {
+    match joined {
+        Ok(Ok(vectors)) => Ok(vectors),
+        Ok(Err(InferenceError::Invariant(reason))) => {
             mark_failing(inner, reason.clone());
             Err(InferenceError::Invariant(reason))
         }
-        Err(other) => Err(other),
+        Ok(Err(other)) => Err(other),
+        Err(_join) => {
+            let reason = "inference task panicked".to_owned();
+            mark_failing(inner, reason.clone());
+            Err(InferenceError::Invariant(reason))
+        }
     }
+}
+
+/// Why a query produced no vectors: host shutdown is distinct from every
+/// engine-reported error so an engine can never spoof a cancellation.
+enum QueryFault {
+    Cancelled,
+    Engine(InferenceError),
 }
 
 fn request_error(error: RequestError) -> RequestOutcome {
@@ -296,7 +318,7 @@ impl SynapseComponent {
             return app_error("cancelled", "the host is shutting down");
         }
         let content_sha256 = protocol::sha256_hex(text.as_bytes());
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<Vec<f32>>, QueryFault>>();
         let inner = Arc::clone(&self.inner);
         let lane_task = Arc::clone(&lane);
         // The tracked task owns the native call; this handler future is only
@@ -307,7 +329,7 @@ impl SynapseComponent {
             let permit = tokio::select! {
                 biased;
                 () = inner.closing.cancelled() => {
-                    let _ = tx.send(Err(InferenceError::Input("cancelled".to_owned())));
+                    let _ = tx.send(Err(QueryFault::Cancelled));
                     return;
                 }
                 // A waiter that is already gone (route loss, deadline) can
@@ -318,28 +340,16 @@ impl SynapseComponent {
                 permit = Arc::clone(&inner.cpu).acquire_owned() => permit,
             };
             let Ok(_permit) = permit else {
-                let _ = tx.send(Err(InferenceError::Invariant(
+                let _ = tx.send(Err(QueryFault::Engine(InferenceError::Invariant(
                     "cpu semaphore closed".to_owned(),
-                )));
+                ))));
                 return;
             };
             let lane_blocking = Arc::clone(&lane_task);
             let joined =
                 tokio::task::spawn_blocking(move || lane_blocking.backend.embed(&[text.as_str()]))
                     .await;
-            let result = match joined {
-                Ok(Ok(vectors)) => Ok(vectors),
-                Ok(Err(InferenceError::Invariant(reason))) => {
-                    mark_failing(&inner, reason.clone());
-                    Err(InferenceError::Invariant(reason))
-                }
-                Ok(Err(other)) => Err(other),
-                Err(_join) => {
-                    let reason = "inference task panicked".to_owned();
-                    mark_failing(&inner, reason.clone());
-                    Err(InferenceError::Invariant(reason))
-                }
-            };
+            let result = settle_inference(&inner, joined).map_err(QueryFault::Engine);
             let _ = tx.send(result);
         });
 
@@ -351,22 +361,30 @@ impl SynapseComponent {
             Ok(Ok(result)) => result,
         };
         match result {
-            Ok(vectors) => {
-                respond(
-                    ctx,
-                    protocol::query_body(&lane.lane, &content_sha256, &vectors[0]),
-                )
-                .await
-            }
-            Err(InferenceError::Input(reason)) => {
-                if reason == "cancelled" {
-                    app_error("cancelled", "the host is shutting down")
-                } else {
-                    app_error("schema_violation", &reason)
+            Ok(vectors) => match vectors.first() {
+                Some(vector) => {
+                    respond(
+                        ctx,
+                        protocol::query_body(&lane.lane, &content_sha256, vector),
+                    )
+                    .await
                 }
+                None => {
+                    mark_failing(
+                        &self.inner,
+                        "inference returned no vector for one query".to_owned(),
+                    );
+                    app_error("artifact_invalid", "inference returned no vector")
+                }
+            },
+            Err(QueryFault::Cancelled) => app_error("cancelled", "the host is shutting down"),
+            Err(QueryFault::Engine(InferenceError::Input(reason))) => {
+                app_error("schema_violation", &reason)
             }
-            Err(InferenceError::Artifact(reason)) => app_error("artifact_invalid", &reason),
-            Err(InferenceError::Invariant(reason)) => app_error("artifact_invalid", &reason),
+            Err(QueryFault::Engine(InferenceError::Artifact(reason)))
+            | Err(QueryFault::Engine(InferenceError::Invariant(reason))) => {
+                app_error("artifact_invalid", &reason)
+            }
         }
     }
 
@@ -444,27 +462,14 @@ impl SynapseComponent {
                 lane_blocking.backend.embed(&texts)
             })
             .await;
-            match joined {
-                Ok(Ok(vectors)) => inner.jobs.publish_ready(seq, vectors),
-                Ok(Err(InferenceError::Input(reason))) => {
+            match settle_inference(&inner, joined) {
+                Ok(vectors) => inner.jobs.publish_ready(seq, vectors),
+                Err(InferenceError::Input(reason)) => {
                     inner
                         .jobs
                         .publish_failed(seq, "schema_violation".to_owned(), reason);
                 }
-                Ok(Err(InferenceError::Artifact(reason))) => {
-                    inner
-                        .jobs
-                        .publish_failed(seq, "artifact_invalid".to_owned(), reason);
-                }
-                Ok(Err(InferenceError::Invariant(reason))) => {
-                    mark_failing(&inner, reason.clone());
-                    inner
-                        .jobs
-                        .publish_failed(seq, "artifact_invalid".to_owned(), reason);
-                }
-                Err(_join) => {
-                    let reason = "inference task panicked".to_owned();
-                    mark_failing(&inner, reason.clone());
+                Err(InferenceError::Artifact(reason)) | Err(InferenceError::Invariant(reason)) => {
                     inner
                         .jobs
                         .publish_failed(seq, "artifact_invalid".to_owned(), reason);

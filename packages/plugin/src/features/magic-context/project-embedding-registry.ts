@@ -1580,8 +1580,16 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
                 context,
                 spec.signal,
             );
+            // A retried group's first-round results are entirely superseded:
+            // keeping its earlier receipts beside the rerun's would present
+            // duplicate rows for one item set and fail the group preflight.
             result = {
-                receipts: [...result.receipts, ...retried.receipts],
+                receipts: [
+                    ...result.receipts.filter(
+                        (receipt) => !retryGroups.has(receipt.applicationGroup),
+                    ),
+                    ...retried.receipts,
+                ],
                 failures: [
                     ...result.failures.filter(
                         (failure) => !retryGroups.has(failure.applicationGroup),
@@ -1884,17 +1892,23 @@ async function applyCompartmentWindowsDetailed(
             });
             replaceCompartmentChunkEmbeddings(db, rowsToWrite);
         },
-        destinationState: (item) => {
-            const existing = getExistingChunkHashes(
-                db,
-                args.compartmentId,
-                lane.chunkModelId,
-                projectIdentity,
-            );
-            if (existing.size === 0) return "absent";
-            const hash = existing.get(windowIndexFromItemId(item.id));
-            return hash === item.contentSha256 ? "current" : "stale";
-        },
+        destinationState: (() => {
+            // One snapshot per proof transaction: the proof calls this once
+            // per manifest item, and re-reading the whole hash map each time
+            // is O(items x windows) for the identical in-transaction answer.
+            let existing: ReadonlyMap<number, string> | null = null;
+            return (item: { id: string; contentSha256: string }) => {
+                existing ??= getExistingChunkHashes(
+                    db,
+                    args.compartmentId,
+                    lane.chunkModelId,
+                    projectIdentity,
+                );
+                if (existing.size === 0) return "absent";
+                const hash = existing.get(windowIndexFromItemId(item.id));
+                return hash === item.contentSha256 ? "current" : "stale";
+            };
+        })(),
         invalidateDestination: () =>
             deleteCompartmentChunkEmbeddingsForModel(db, args.compartmentId, lane.chunkModelId),
     });

@@ -4,6 +4,8 @@ mod support;
 
 use std::time::Duration;
 
+use mc_host::HostError;
+
 use support::raw_client::{
     self, FLAGS_INTERACTIVE, FLAGS_PURE_HEADER, TY_GOODBYE, TY_PING, TY_PONG, TY_REQUEST,
     TY_RESPONSE,
@@ -866,4 +868,41 @@ async fn a_successor_starts_only_after_the_predecessor_releases_its_lock() {
     );
 
     second.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn shutdown_callback_deadline_expiry_retains_the_handler_until_it_stops() {
+    let host = TestHost::start().await;
+    host.handler.block_shutdown();
+    let handler = host.handler.clone();
+
+    let result = host.shutdown().await;
+    assert!(
+        matches!(result, Err(HostError::LifecycleFatal(ref message))
+            if message.contains("shutdown callback")),
+        "an overrunning shutdown callback must be reported as lifecycle-fatal, got {result:?}"
+    );
+    // The callback is still executing: the handler must stay owned.
+    assert!(
+        !handler.handler_dropped(),
+        "the handler must not drop while its shutdown callback runs"
+    );
+    assert!(
+        handler
+            .events()
+            .iter()
+            .all(|event| *event != Event::Shutdown),
+        "the blocked callback has not completed yet"
+    );
+
+    handler.release_shutdown();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !handler.handler_dropped() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the handler must drop once the shutdown callback stops"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(handler.events().contains(&Event::Shutdown));
 }

@@ -1,6 +1,6 @@
 //! Bounded process-local batch jobs: deterministic idempotency, ephemeral
-//! retention, opaque incarnation-fenced identifiers, and forward-only
-//! result cursors.
+//! retention, opaque incarnation-fenced identifiers, and replayable
+//! boundary-checked result cursors.
 //!
 //! Nothing here is durable. The TypeScript ledger owns crash recovery; a
 //! host restart maps every old job to `module_restarted`, which is the
@@ -163,6 +163,14 @@ impl JobTable {
         if incarnation != self.incarnation {
             return None;
         }
+        // Canonical digits only: `+1`, `007`, and similar aliases of a live
+        // sequence number must not resolve, or job IDs stop being opaque.
+        if seq.is_empty() || seq.len() > 20 || !seq.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if seq.len() > 1 && seq.starts_with('0') {
+            return None;
+        }
         seq.parse().ok()
     }
 
@@ -262,7 +270,7 @@ impl JobTable {
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
 
-        let boundaries = self.page_boundaries(&vectors);
+        let boundaries = self.page_boundaries(&job.item_meta, &vectors);
         job.state = JobState::Ready {
             vectors,
             boundaries,
@@ -352,12 +360,30 @@ impl JobTable {
         boundaries.contains(&offset).then_some(offset)
     }
 
-    fn page_boundaries(&self, vectors: &[Vec<f32>]) -> Vec<usize> {
+    /// Worst-case JSON text bytes for one f32 component (sign, up to nine
+    /// significant digits, exponent, separator).
+    const ENCODED_BYTES_PER_COMPONENT: usize = 16;
+    /// Fixed JSON envelope around one vector item (braces, field names,
+    /// quotes, separators).
+    const ENCODED_ITEM_OVERHEAD: usize = 64;
+
+    /// Estimated encoded page cost of one result item. Deliberately
+    /// conservative: undercounting could split a ready job into a page whose
+    /// JSON body exceeds the frame limit, which no cursor could ever serve.
+    fn encoded_item_cost(vector_len: usize, id: &str, hash: &str) -> usize {
+        vector_len * Self::ENCODED_BYTES_PER_COMPONENT
+            + id.len()
+            + hash.len()
+            + Self::ENCODED_ITEM_OVERHEAD
+    }
+
+    fn page_boundaries(&self, item_meta: &[(String, String)], vectors: &[Vec<f32>]) -> Vec<usize> {
         let mut boundaries = Vec::new();
         let mut count_in_page = 0usize;
         let mut bytes_in_page = 0usize;
         for (index, vector) in vectors.iter().enumerate() {
-            let encoded = vector.len() * 4;
+            let (id, hash) = &item_meta[index];
+            let encoded = Self::encoded_item_cost(vector.len(), id, hash);
             if count_in_page > 0
                 && (count_in_page >= self.limits.max_page_vectors
                     || bytes_in_page + encoded > self.limits.max_page_encoded_bytes)
