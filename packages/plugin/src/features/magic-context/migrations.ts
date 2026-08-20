@@ -3193,27 +3193,19 @@ export const MIGRATIONS: Migration[] = [
  * - Rows under any non-Synapse `model_id` (local/openai lanes) are never
  *   touched (R25).
  */
-export function invalidateUnprovenSynapseDestinationRowsV82(db: Database): {
-    memory: number;
-    commit: number;
-    chunk: number;
-} {
+function invalidateUnprovenSynapseDestinationRowsV82(db: Database): void {
     const laneLike = "synapse:v1:%";
-    const memory = tableExists(db, "memory_embeddings")
-        ? db.prepare("DELETE FROM memory_embeddings WHERE model_id LIKE ?").run(laneLike).changes
-        : 0;
-    const commit = tableExists(db, "git_commit_embeddings")
-        ? db.prepare("DELETE FROM git_commit_embeddings WHERE model_id LIKE ?").run(laneLike)
-              .changes
-        : 0;
-    const chunk = tableExists(db, "compartment_chunk_embeddings")
-        ? db
-              .prepare(
-                  "DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ? AND (chunk_hash IS NULL OR chunk_hash = '')",
-              )
-              .run(laneLike).changes
-        : 0;
-    return { memory, commit, chunk };
+    if (tableExists(db, "memory_embeddings")) {
+        db.prepare("DELETE FROM memory_embeddings WHERE model_id LIKE ?").run(laneLike);
+    }
+    if (tableExists(db, "git_commit_embeddings")) {
+        db.prepare("DELETE FROM git_commit_embeddings WHERE model_id LIKE ?").run(laneLike);
+    }
+    if (tableExists(db, "compartment_chunk_embeddings")) {
+        db.prepare(
+            "DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ? AND (chunk_hash IS NULL OR chunk_hash = '')",
+        ).run(laneLike);
+    }
 }
 
 /**

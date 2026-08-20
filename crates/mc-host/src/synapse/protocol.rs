@@ -476,7 +476,6 @@ mod tests {
             fingerprint: "fp-1".to_owned(),
             table_epoch: 1,
             dims: 8,
-            max_tokens: 8,
             provenance: serde_json::Value::Null,
             recommended_rows: 16,
             recommended_token_budget: 8192,

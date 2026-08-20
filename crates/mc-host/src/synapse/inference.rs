@@ -106,7 +106,7 @@ fn verify_ort_library(identity: &OrtIdentity) -> Result<(), InferenceError> {
     }
     let bytes = std::fs::read(&identity.library)
         .map_err(|_| InferenceError::Artifact("ONNX Runtime library read failed".to_owned()))?;
-    if super::bundle::hex_digest(&bytes) != identity.sha256 {
+    if super::protocol::sha256_hex(&bytes) != identity.sha256 {
         return Err(InferenceError::Artifact(
             "ONNX Runtime library hash mismatch".to_owned(),
         ));
@@ -190,10 +190,6 @@ impl Backend {
         Ok(backend)
     }
 
-    pub fn dims(&self) -> usize {
-        self.dims
-    }
-
     /// Blocking native inference over one ordered page of texts. Every
     /// returned vector is validated: exact count, exact dimensions, finite
     /// components, and a unit L2 norm.
@@ -234,19 +230,6 @@ impl Backend {
             self.validate_vector(vector)?;
         }
         Ok(vectors)
-    }
-
-    /// Tokenized length of one text under the model's own tokenizer.
-    pub fn count_tokens(&self, text: &str) -> Result<usize, InferenceError> {
-        let model = self
-            .model
-            .lock()
-            .map_err(|_| InferenceError::Invariant("inference state is poisoned".to_owned()))?;
-        let encoding = model
-            .tokenizer
-            .encode(text, true)
-            .map_err(|_| InferenceError::Input("text failed to tokenize".to_owned()))?;
-        Ok(encoding.get_ids().len())
     }
 
     fn validate_vector(&self, vector: &[f32]) -> Result<(), InferenceError> {

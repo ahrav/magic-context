@@ -458,7 +458,7 @@ impl JobTable {
     /// Shutdown: closes admission and drops every queued (not yet started)
     /// job. Running jobs finish under the incarnation tracker; completed
     /// retention is released by [`JobTable::clear`] afterwards.
-    pub fn close_admission(&self) -> Vec<u64> {
+    pub fn close_admission(&self) {
         let mut jobs = self.inner.lock().expect("job table lock");
         jobs.closed = true;
         let queued: Vec<u64> = jobs
@@ -467,10 +467,9 @@ impl JobTable {
             .filter(|job| matches!(job.state, JobState::Queued { .. }))
             .map(|job| job.seq)
             .collect();
-        for seq in &queued {
-            Self::remove(&mut jobs, *seq);
+        for seq in queued {
+            Self::remove(&mut jobs, seq);
         }
-        queued
     }
 
     pub fn clear(&self) {

@@ -330,7 +330,6 @@ async fn certified_bundle_loads_and_serves_expected_vectors() {
     assert_eq!(lane.model, "tiny-test-model");
     assert_eq!(lane.dims, 8);
     assert_eq!(lane.table_epoch, 1);
-    assert_eq!(lane.max_tokens, 8);
     assert_eq!(lane.recommended_rows, 16);
 
     let corpus = corpus();

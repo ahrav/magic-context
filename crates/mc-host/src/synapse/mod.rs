@@ -87,7 +87,6 @@ pub struct LaneInfo {
     pub fingerprint: String,
     pub table_epoch: u64,
     pub dims: usize,
-    pub max_tokens: u64,
     pub provenance: serde_json::Value,
     pub recommended_rows: u32,
     pub recommended_token_budget: u32,
@@ -100,7 +99,6 @@ impl LaneInfo {
             fingerprint: manifest.fingerprint.clone(),
             table_epoch: manifest.table_epoch,
             dims: manifest.dims as usize,
-            max_tokens: manifest.max_tokens,
             provenance: manifest.provenance.clone(),
             recommended_rows: manifest.recommended_batch.rows,
             recommended_token_budget: manifest.recommended_batch.token_budget,
@@ -593,7 +591,7 @@ impl CompositeComponent for SynapseComponent {
     /// native call.
     async fn shutdown(&self) {
         self.inner.closing.cancel();
-        let _ = self.inner.jobs.close_admission();
+        self.inner.jobs.close_admission();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
         self.inner.jobs.clear();

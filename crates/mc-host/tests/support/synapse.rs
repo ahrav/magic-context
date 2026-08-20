@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::raw_client::{self, Discovered, RawFrame};
 use mc_host::synapse::inference::InferenceError;
 use mc_host::synapse::{
     EmbeddingEngine, LaneInfo, SynapseComponent, SynapseLimits, SYNAPSE_MODULE_ID,
@@ -17,9 +18,6 @@ use mc_host::{
     HostInit, HostLimits, InitError, ManifestSnapshot, PrimaryComponent, RequestCtx,
     RequestOutcome, RouteHandle, RouteIdentity, StaticComposite,
 };
-use sha2::{Digest, Sha256};
-
-use super::raw_client::{self, Discovered, RawFrame};
 
 pub const ROOT: &str = "/workspace/project";
 pub const BUDGET: Duration = Duration::from_secs(5);
@@ -30,7 +28,6 @@ pub fn test_lane() -> LaneInfo {
         fingerprint: "a2b4c6d8e0f01234a2b4c6d8e0f01234a2b4c6d8e0f01234a2b4c6d8e0f01234".to_owned(),
         table_epoch: 1,
         dims: 8,
-        max_tokens: 8,
         provenance: serde_json::json!({"source": "deterministic test engine"}),
         recommended_rows: 16,
         recommended_token_budget: 8192,
@@ -67,7 +64,8 @@ impl DeterministicEngine {
     }
 
     pub fn vector_for(&self, text: &str) -> Vec<f32> {
-        let digest = Sha256::digest(text.as_bytes());
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(text.as_bytes());
         let mut vector: Vec<f32> = digest
             .iter()
             .take(self.dims)
@@ -263,38 +261,21 @@ pub async fn call(
 }
 
 pub fn sha256_hex(text: &str) -> String {
-    Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    mc_host::synapse::protocol::sha256_hex(text.as_bytes())
 }
 
-/// Mirrors the TypeScript `getSynapseBatchRequestKey` canonical object.
+/// Delegates to the production canonical-key algorithm, which is itself
+/// anchored by the committed JavaScript golden vectors.
 pub fn request_key(lane: &LaneInfo, items: &[(String, String)]) -> String {
-    fn js(value: &str) -> String {
-        serde_json::to_string(value).expect("string serializes")
-    }
-    let hashes: Vec<String> = items.iter().map(|(_, text)| sha256_hex(text)).collect();
-    let mut canonical = String::new();
-    canonical
-        .push_str("{\"accept_declared\":false,\"allow_equivalent\":false,\"content_sha256\":[");
-    canonical.push_str(&hashes.iter().map(|h| js(h)).collect::<Vec<_>>().join(","));
-    canonical.push_str("],\"ids\":[");
-    canonical.push_str(
-        &items
-            .iter()
-            .map(|(id, _)| js(id))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
-    canonical.push_str("],\"model\":");
-    canonical.push_str(&js(&lane.model));
-    canonical.push_str(",\"op\":\"embed.batch\",\"required_epoch\":");
-    canonical.push_str(&lane.table_epoch.to_string());
-    canonical.push_str(",\"required_fingerprint\":");
-    canonical.push_str(&js(&lane.fingerprint));
-    canonical.push('}');
-    sha256_hex(&canonical)
+    let batch_items: Vec<mc_host::synapse::jobs::BatchItem> = items
+        .iter()
+        .map(|(id, text)| mc_host::synapse::jobs::BatchItem {
+            id: id.clone(),
+            content_sha256: sha256_hex(text),
+            text: text.clone(),
+        })
+        .collect();
+    mc_host::synapse::protocol::canonical_request_key(lane, &batch_items)
 }
 
 pub fn constraints(lane: &LaneInfo) -> serde_json::Value {

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use super::protocol::sha256_hex;
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_MODEL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -190,7 +190,7 @@ pub fn load_bundle(dir: &Path) -> Result<VerifiedBundle, BundleError> {
 
     let read_verified = |artifact: &ArtifactRef, cap: u64| -> Result<Vec<u8>, BundleError> {
         let bytes = read_artifact(dir, &artifact.name, cap)?;
-        let digest = hex_digest(&bytes);
+        let digest = sha256_hex(&bytes);
         if digest != artifact.sha256 {
             return Err(err(format!("artifact hash mismatch: {}", artifact.name)));
         }
@@ -397,16 +397,4 @@ fn parse_corpus(bytes: &[u8], dims: usize) -> Result<Corpus, BundleError> {
         tolerance: raw.tolerance,
         items,
     })
-}
-
-pub(crate) fn hex_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }

@@ -189,7 +189,6 @@ async fn all_four_operations_serve_certified_vectors_over_the_wire() {
         fingerprint: manifest["fingerprint"].as_str().expect("fp").to_owned(),
         table_epoch: manifest["table_epoch"].as_u64().expect("epoch"),
         dims: manifest["dims"].as_u64().expect("dims") as usize,
-        max_tokens: manifest["max_tokens"].as_u64().expect("max"),
         provenance: serde_json::Value::Null,
         recommended_rows: 16,
         recommended_token_budget: 8192,
