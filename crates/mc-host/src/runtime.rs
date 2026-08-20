@@ -286,15 +286,70 @@ pub struct LifecycleFailure {
     pub stopped: bool,
 }
 
-/// Runs the handler shutdown callback so handler-owned work stops before the
-/// caller drops the instance guard. Startup failure paths use this directly:
-/// they run after `initialize` but before `HostShared` and `AbandonGuard`
-/// exist, so no other owner can drain the handler for them. The await is
-/// unbounded for the same reason the lock-retention waits are — returning
-/// early would release the fence while handler code still runs.
-async fn drain_handler<H: McHostHandler>(handler: &Arc<H>) {
-    let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
-    crate::panic_boundary::redact(callback).await;
+fn spawn_handler_shutdown<H: McHostHandler>(handler: Arc<H>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
+        crate::panic_boundary::redact(callback).await;
+    })
+}
+
+/// Owns handler shutdown and the instance guard before `HostShared` exists.
+/// Shutdown runs in its own task so cancelling the waiter transfers that same
+/// task and the guard to a reaper instead of cancelling cleanup or invoking
+/// the callback twice. Successful publication disarms the owner without
+/// spawning cleanup.
+struct PrePublicationCleanup<H: McHostHandler> {
+    guard: Option<InstanceGuard>,
+    handler: Option<Arc<H>>,
+    shutdown: Option<JoinHandle<()>>,
+}
+
+impl<H: McHostHandler> PrePublicationCleanup<H> {
+    fn new(guard: InstanceGuard, handler: Arc<H>) -> Self {
+        Self {
+            guard: Some(guard),
+            handler: Some(handler),
+            shutdown: None,
+        }
+    }
+
+    fn guard_mut(&mut self) -> &mut InstanceGuard {
+        self.guard.as_mut().expect("armed startup cleanup")
+    }
+
+    async fn finish(mut self) {
+        self.shutdown = Some(spawn_handler_shutdown(
+            self.handler.take().expect("armed startup cleanup"),
+        ));
+        let shutdown = self.shutdown.as_mut().expect("started startup cleanup");
+        let _ = shutdown.await;
+        drop(self.shutdown.take());
+        drop(self.guard.take());
+    }
+
+    fn disarm(mut self) -> (InstanceGuard, Arc<H>) {
+        (
+            self.guard.take().expect("armed startup cleanup"),
+            self.handler.take().expect("armed startup cleanup"),
+        )
+    }
+}
+
+impl<H: McHostHandler> Drop for PrePublicationCleanup<H> {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let shutdown = self.shutdown.take().unwrap_or_else(|| {
+                spawn_handler_shutdown(self.handler.take().expect("armed startup cleanup"))
+            });
+            runtime.spawn(async move {
+                let _ = shutdown.await;
+                drop(guard);
+            });
+        }
+    }
 }
 
 /// Cancels host work if the `run` future is dropped instead of completing:
@@ -445,8 +500,7 @@ pub async fn run<H: McHostHandler>(
 ) -> Result<(), HostError> {
     crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
-    let mut guard =
-        InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
+    let guard = InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
     let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
@@ -520,7 +574,7 @@ pub async fn run<H: McHostHandler>(
                 // shutdown callback stops it. Awaiting it here keeps the
                 // single-instance fence — `guard` drops when this returns —
                 // held until the handler is actually idle.
-                drain_handler(&handler).await;
+                PrePublicationCleanup::new(guard, handler).finish().await;
 
                 // The handler-authored message can carry data derived from
                 // the opaque storage descriptor (credentials, endpoints);
@@ -534,7 +588,7 @@ pub async fn run<H: McHostHandler>(
                 // A panic can happen after initialization starts handler-owned
                 // work, so it has the same cleanup obligation as a returned
                 // initialization error.
-                drain_handler(&handler).await;
+                PrePublicationCleanup::new(guard, handler).finish().await;
                 let kind = if join_err.is_panic() {
                     "panic"
                 } else {
@@ -557,6 +611,7 @@ pub async fn run<H: McHostHandler>(
     // stores or started handler-owned work, and only the shutdown callback
     // stops it. `AbandonGuard` takes that duty over once it exists, which is
     // why these steps are grouped instead of each returning through `?`.
+    let mut cleanup = PrePublicationCleanup::new(guard, handler);
     let setup = async {
         // Shutdown between initialization and publication: nothing was
         // published and no route work exists, so this is the graceful
@@ -568,7 +623,8 @@ pub async fn run<H: McHostHandler>(
             .await
             .map_err(HostError::Io)?;
         let port = listener.local_addr().map_err(HostError::Io)?.port();
-        guard
+        cleanup
+            .guard_mut()
             .publish(port, &config.daemon_ver)
             .map_err(HostError::Instance)?;
         Ok(Some(listener))
@@ -577,14 +633,16 @@ pub async fn run<H: McHostHandler>(
     let listener = match setup {
         Ok(Some(listener)) => listener,
         Ok(None) => {
-            drain_handler(&handler).await;
+            cleanup.finish().await;
             return Ok(());
         }
         Err(err) => {
-            drain_handler(&handler).await;
+            cleanup.finish().await;
             return Err(err);
         }
     };
+
+    let (guard, handler) = cleanup.disarm();
 
     let auth_key = ConnectionKey(*guard.key().bytes());
     let daemon_id = *guard.daemon_id();

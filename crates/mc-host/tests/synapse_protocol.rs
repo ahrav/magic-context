@@ -8,7 +8,7 @@ use support::synapse::{
     sha256_hex, test_lane, DeterministicEngine, SynapseHost, BUDGET,
 };
 
-use mc_host::synapse::SynapseLimits;
+use mc_host::synapse::{protocol, SynapseLimits};
 
 const TY_ERROR: u8 = 5;
 
@@ -525,6 +525,81 @@ async fn result_pages_preserve_order_and_cursor_discipline() {
     .await;
     let body = frame.json();
     assert_eq!(body["result"]["vectors"][0]["id"], "i2");
+
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn maximum_page_with_escaped_ids_fits_its_output_reservation() {
+    let engine = DeterministicEngine::new();
+    let lane = test_lane();
+    let page: Vec<(String, String)> = (0..16)
+        .map(|index| {
+            let id = format!("{}{index:04x}", "\"\\\n\u{0001}".repeat(63));
+            assert_eq!(id.len(), 256);
+            (id, format!("text {index}"))
+        })
+        .collect();
+    let vectors: Vec<Vec<f32>> = page
+        .iter()
+        .map(|(_, text)| engine.vector_for(text))
+        .collect();
+    let hashes: Vec<String> = page.iter().map(|(_, text)| sha256_hex(text)).collect();
+    let views: Vec<protocol::VectorItemView<'_>> = page
+        .iter()
+        .zip(&hashes)
+        .zip(&vectors)
+        .map(|(((id, _), hash), vector)| protocol::VectorItemView {
+            id,
+            content_sha256: hash,
+            vector,
+        })
+        .collect();
+    let reservation = protocol::vector_body_reservation(&lane, &views, None);
+    let mut encoded = Vec::new();
+    protocol::write_vector_body(&mut encoded, &lane, &views, true, None)
+        .expect("vector body serializes");
+    assert!(
+        encoded.len() <= reservation,
+        "encoded body {} exceeds reservation {reservation}",
+        encoded.len()
+    );
+
+    let host = SynapseHost::start(ready_component(engine, SynapseLimits::default())).await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let frame = call(
+        &mut client,
+        channel,
+        epoch,
+        "embed.batch",
+        batch_params(&lane, &page),
+    )
+    .await;
+    let job_id = frame.json()["result"]["job_id"]
+        .as_str()
+        .expect("job")
+        .to_owned();
+    let key = request_key(&lane, &page);
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let mut params = constraints(&lane);
+        params["job_id"] = job_id.clone().into();
+        params["request_key"] = key.clone().into();
+        params["cursor"] = serde_json::Value::Null;
+        let frame = call(&mut client, channel, epoch, "embed.result", params).await;
+        assert_ne!(frame.ty, TY_ERROR, "escaped IDs must not exhaust output");
+        let body = frame.json();
+        if let Some(vectors) = body["result"]["vectors"].as_array() {
+            assert_eq!(vectors.len(), page.len());
+            for (actual, (expected, _)) in vectors.iter().zip(&page) {
+                assert_eq!(actual["id"], expected.as_str());
+            }
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "job never ready");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     host.shutdown().await.expect("graceful shutdown");
 }

@@ -186,7 +186,7 @@ describe("migration v83: context-complete synapse batch ledger", () => {
         }
     });
 
-    test("invalidates unproven synapse destination rows in the migration transaction, keeps proven and non-synapse rows", () => {
+    test("invalidates unproven synapse destination rows in the migration transaction, keeps provable commits and non-synapse rows", () => {
         const dbPath = fileDbPath("migrations-v83-invalidate-");
         const db = v81Database(dbPath);
         try {
@@ -197,9 +197,17 @@ describe("migration v83: context-complete synapse batch ledger", () => {
             // source text and model_id pins the lane, so both survive.
             insertCommitEmbedding(db, "a".repeat(40), synapseModel);
             insertCommitEmbedding(db, "b".repeat(40), "local-model");
-            // chunk rows carry their source hash; a non-empty hash is the
-            // compatibility proof, an empty one is unprovable.
-            insertChunkEmbedding(db, synapseModel, "chunk-hash-proven");
+            // Every Synapse chunk row is invalidated: the read path never
+            // re-verifies even a non-empty stored hash against current text.
+            insertChunkEmbedding(db, synapseModel, "hash-for-current-content");
+            const staleChunkId = insertChunkEmbedding(
+                db,
+                synapseModel,
+                "hash-for-original-content",
+            );
+            db.prepare("UPDATE compartments SET content = 'changed source' WHERE id = ?").run(
+                staleChunkId,
+            );
             insertChunkEmbedding(db, synapseModel, "");
             insertChunkEmbedding(db, "local-model", "");
 
@@ -224,10 +232,7 @@ describe("migration v83: context-complete synapse batch ledger", () => {
                     "SELECT model_id, chunk_hash FROM compartment_chunk_embeddings ORDER BY model_id, chunk_hash",
                 )
                 .all() as Array<{ model_id: string; chunk_hash: string }>;
-            expect(chunkRows).toEqual([
-                { model_id: "local-model", chunk_hash: "" },
-                { model_id: synapseModel, chunk_hash: "chunk-hash-proven" },
-            ]);
+            expect(chunkRows).toEqual([{ model_id: "local-model", chunk_hash: "" }]);
         } finally {
             closeQuietly(db);
         }

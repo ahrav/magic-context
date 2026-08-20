@@ -7,6 +7,7 @@
 //! client's single resubmission rule.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
@@ -56,7 +57,9 @@ pub enum PollOutcome {
 }
 
 pub struct ResultPage {
-    pub vectors: Vec<(String, String, Vec<f32>)>,
+    /// Shared backing keeps concurrent polls from copying retained vectors
+    /// before their output reservations are acquired.
+    pub vectors: Vec<(String, String, Arc<[f32]>)>,
     pub done: bool,
     pub next_cursor: Option<String>,
 }
@@ -67,7 +70,7 @@ enum JobState {
     },
     Running,
     Ready {
-        vectors: Vec<Vec<f32>>,
+        vectors: Vec<Arc<[f32]>>,
         boundaries: Vec<usize>,
     },
     Failed {
@@ -257,6 +260,10 @@ impl JobTable {
 
     pub fn publish_ready(&self, seq: u64, vectors: Vec<Vec<f32>>) {
         let result_bytes: u64 = vectors.iter().map(|v| (v.len() * 4) as u64).sum();
+        // Converting Vec to Arc<[T]> copies the allocation. Keep that work
+        // outside the global job-table lock so large inference results do not
+        // block admission, polling, or shutdown bookkeeping.
+        let vectors: Vec<Arc<[f32]>> = vectors.into_iter().map(Arc::from).collect();
         let mut jobs = self.inner.lock().expect("job table lock");
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
@@ -351,10 +358,10 @@ impl JobTable {
                     .copied()
                     .find(|b| *b > offset)
                     .unwrap_or(vectors.len());
-                let page: Vec<(String, String, Vec<f32>)> = (offset..next_boundary)
+                let page = (offset..next_boundary)
                     .map(|index| {
                         let (id, hash) = &job.item_meta[index];
-                        (id.clone(), hash.clone(), vectors[index].clone())
+                        (id.clone(), hash.clone(), Arc::clone(&vectors[index]))
                     })
                     .collect();
                 let done = next_boundary >= vectors.len();
@@ -387,19 +394,36 @@ impl JobTable {
     /// quotes, separators).
     const ENCODED_ITEM_OVERHEAD: usize = 64;
 
-    /// Estimated encoded page cost of one result item. Deliberately
+    /// Estimated encoded page cost of one result item. `hash` is the
+    /// server-computed lowercase hexadecimal content digest and therefore
+    /// needs no JSON escaping. Deliberately
     /// conservative: undercounting could split a ready job into a page whose
     /// JSON body exceeds the frame limit, which no cursor could ever serve.
     /// The response encoder reserves output from the same estimate, so it is
     /// also the upper bound on one item's serialized bytes.
     pub(crate) fn encoded_item_cost(vector_len: usize, id: &str, hash: &str) -> usize {
-        vector_len * Self::ENCODED_BYTES_PER_COMPONENT
-            + id.len()
-            + hash.len()
-            + Self::ENCODED_ITEM_OVERHEAD
+        debug_assert!(
+            hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "content hash must be hexadecimal"
+        );
+        let escaped_id_bytes = serde_json::to_string(id)
+            .expect("string serialization cannot fail")
+            .len()
+            .checked_sub(2)
+            .expect("serialized JSON string includes quotes");
+        vector_len
+            .checked_mul(Self::ENCODED_BYTES_PER_COMPONENT)
+            .and_then(|bytes| bytes.checked_add(escaped_id_bytes))
+            .and_then(|bytes| bytes.checked_add(hash.len()))
+            .and_then(|bytes| bytes.checked_add(Self::ENCODED_ITEM_OVERHEAD))
+            .unwrap_or(usize::MAX)
     }
 
-    fn page_boundaries(&self, item_meta: &[(String, String)], vectors: &[Vec<f32>]) -> Vec<usize> {
+    fn page_boundaries(
+        &self,
+        item_meta: &[(String, String)],
+        vectors: &[Arc<[f32]>],
+    ) -> Vec<usize> {
         let mut boundaries = Vec::new();
         let mut count_in_page = 0usize;
         let mut bytes_in_page = 0usize;
@@ -408,14 +432,16 @@ impl JobTable {
             let encoded = Self::encoded_item_cost(vector.len(), id, hash);
             if count_in_page > 0
                 && (count_in_page >= self.limits.max_page_vectors
-                    || bytes_in_page + encoded > self.limits.max_page_encoded_bytes)
+                    || bytes_in_page
+                        .checked_add(encoded)
+                        .is_none_or(|bytes| bytes > self.limits.max_page_encoded_bytes))
             {
                 boundaries.push(index);
                 count_in_page = 0;
                 bytes_in_page = 0;
             }
             count_in_page += 1;
-            bytes_in_page += encoded;
+            bytes_in_page = bytes_in_page.saturating_add(encoded);
         }
         boundaries
     }
@@ -500,5 +526,41 @@ impl JobTable {
         jobs.by_key.clear();
         jobs.queued_text_bytes = 0;
         jobs.retained_result_bytes = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_polls_share_the_retained_vector_allocation() {
+        let jobs = JobTable::new(SynapseLimits::default());
+        let batch = vec![BatchItem {
+            id: "large-vector".to_owned(),
+            content_sha256: "0".repeat(64),
+            text: "alpha".to_owned(),
+        }];
+        let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key".to_owned(), batch) else {
+            panic!("job is admitted");
+        };
+        jobs.start(seq).expect("job starts");
+        jobs.publish_ready(seq, vec![vec![0.5; 256 * 1024]]);
+
+        let PollOutcome::Page(first) = jobs.poll(&job_id, "key", None) else {
+            panic!("first poll returns a page");
+        };
+        let second = jobs.poll(&job_id, "key", None);
+        let PollOutcome::Page(second) = second else {
+            panic!("second poll returns a page");
+        };
+        assert!(
+            Arc::ptr_eq(&first.vectors[0].2, &second.vectors[0].2),
+            "ready polls must not allocate or clone vector elements"
+        );
+
+        jobs.clear();
+        assert_eq!(first.vectors[0].2.len(), 256 * 1024);
+        assert_eq!(second.vectors[0].2[0], 0.5);
     }
 }

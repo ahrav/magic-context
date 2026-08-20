@@ -33,6 +33,7 @@ import {
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
+    enqueueShadowEmbeddingItems,
     flushShadowEmbeddingBacklog,
     getProjectEmbeddingSnapshot,
     getShadowBackfillStopReason,
@@ -1713,6 +1714,52 @@ describe("project embedding registry", () => {
         expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
         expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(3);
     });
+
+    it("drains every ID from a shadow queue item larger than one worker pass", async () => {
+        const batchSizes: number[] = [];
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        batchSizes.push(texts.length);
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "shadow"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-large-queue-item";
+        const shadow = registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            {
+                provider: "synapse",
+                model: "synapse-model",
+                synapse_fingerprint: "fp-large-queue-item",
+            } as unknown as EmbeddingConfig,
+            "/tmp/shadow-large-queue-item",
+        );
+        if (!shadow) throw new Error("failed to register shadow provider");
+        const ids = Array.from({ length: 70 }, (_, index) =>
+            String(
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "CONSTRAINTS",
+                    content: `queued shadow memory ${index}`,
+                }).id,
+            ),
+        );
+
+        let passes = 0;
+        enqueueShadowEmbeddingItems(projectIdentity, "memory", ids);
+        await flushShadowEmbeddingBacklog(projectIdentity, () => {
+            passes += 1;
+        });
+
+        expect(batchSizes).toEqual([64, 6]);
+        expect(passes).toBeGreaterThanOrEqual(2);
+        const embeddings = loadAllEmbeddings(db, projectIdentity, shadow.modelId);
+        expect([...embeddings.keys()].sort((a, b) => a - b)).toEqual(ids.map(Number));
+    });
 });
 
 describe("detailed synapse writers apply complete receipt groups atomically", () => {
@@ -1804,7 +1851,8 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         // Throw at the receipt-complete CAS: the destination write already ran
         // inside the same transaction, so SQLite rolls it back with the ledger.
         const crashed = crashingDatabase(db, {
-            matcher: /SET state = \?, failure_disposition = \?/,
+            matcher:
+                /UPDATE synapse_batch_ledger\s+SET state = \?, failure_disposition = \?, state_version = state_version \+ 1, updated_at = \?\s+WHERE id = \? AND state_version = \? AND state IN \(\?\)\s*$/,
             times: 1,
         });
 
@@ -1814,7 +1862,9 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
 
         expect(written?.size).toBe(0);
         expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
-        expect(ledgerRows(db).every((row) => row.state !== "complete")).toBe(true);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.state !== "complete")).toBe(true);
     });
 
     it("one drifted memory in the group writes nothing and retires the receipt", async () => {

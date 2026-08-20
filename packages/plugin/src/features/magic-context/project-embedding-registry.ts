@@ -2013,17 +2013,19 @@ async function embedShadowItems(
 async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
     const registration = shadowRegistrations.get(item.projectIdentity);
     if (!registration) return;
-    const boundedIds = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
+    if (item.ids.length > SHADOW_MAX_ITEMS_PER_TICK) {
+        throw new Error("shadow worker must split oversized queue items");
+    }
     if (item.scope === "memory") {
         const db = dbForShadowQueue.get(item.projectIdentity);
         if (!db) return;
-        const placeholders = boundedIds.map(() => "?").join(",");
+        const placeholders = item.ids.map(() => "?").join(",");
         const rows = db
             .prepare(
                 `SELECT id, content, normalized_hash FROM memories
                  WHERE project_path = ? AND id IN (${placeholders}) AND status = 'active'`,
             )
-            .all(item.projectIdentity, ...boundedIds.map((id) => Number(id))) as Array<{
+            .all(item.projectIdentity, ...item.ids.map((id) => Number(id))) as Array<{
             id: number;
             content: string;
             normalized_hash: string;
@@ -2064,12 +2066,12 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
     if (item.scope === "commit") {
         const db = dbForShadowQueue.get(item.projectIdentity);
         if (!db) return;
-        const placeholders = boundedIds.map(() => "?").join(",");
+        const placeholders = item.ids.map(() => "?").join(",");
         const rows = db
             .prepare(
                 `SELECT sha, message FROM git_commits WHERE project_path = ? AND sha IN (${placeholders})`,
             )
-            .all(item.projectIdentity, ...boundedIds) as Array<{ sha: string; message: string }>;
+            .all(item.projectIdentity, ...item.ids) as Array<{ sha: string; message: string }>;
         const shadowLane = getDetailedLane(item.projectIdentity, "shadow");
         if (shadowLane) {
             await embedCommitRowsDetailed(db, item.projectIdentity, shadowLane, rows);
@@ -2094,13 +2096,13 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
 
     const db = dbForShadowQueue.get(item.projectIdentity);
     if (!db) return;
-    const placeholders = boundedIds.map(() => "?").join(",");
+    const placeholders = item.ids.map(() => "?").join(",");
     const candidates = db
         .prepare(
             `SELECT id, session_id, start_message, end_message
          FROM compartments WHERE id IN (${placeholders})`,
         )
-        .all(...boundedIds.map((id) => Number(id))) as Array<{
+        .all(...item.ids.map((id) => Number(id))) as Array<{
         id: number;
         session_id: string;
         start_message: number;
@@ -2198,6 +2200,13 @@ async function runShadowWorker(): Promise<void> {
         }
         const item = shadowQueue.shift();
         if (!item) break;
+        if (item.ids.length > SHADOW_MAX_ITEMS_PER_TICK) {
+            shadowQueue.unshift({
+                ...item,
+                ids: item.ids.slice(SHADOW_MAX_ITEMS_PER_TICK),
+            });
+            item.ids = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
+        }
         const itemBytes = item.ids.reduce((total, id) => total + id.length, 0);
         if (processed > 0 && processedBytes + itemBytes > SHADOW_MAX_BYTES_PER_TICK) {
             shadowQueue.unshift(item);

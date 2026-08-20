@@ -3233,11 +3233,11 @@ export const MIGRATIONS: Migration[] = [
  *   cascade-delete with `git_commits`) and `model_id` pins the lane
  *   (model+fingerprint), so source and lane compatibility are provable from
  *   durable state -- retained.
- * - `compartment_chunk_embeddings`: each row carries its source hash
- *   (`chunk_hash`, re-verified against recomputed windows by the read path
- *   before any use) and its lane identity (`model_id` pins model+fingerprint),
- *   so a row with a non-empty `chunk_hash` is provably source- and
- *   lane-compatible and is retained; Synapse rows without one are deleted.
+ * - `compartment_chunk_embeddings`: compartment text is mutable, and the
+ *   search read path serves stored vectors without reconstructing source
+ *   windows. A stored `chunk_hash` therefore cannot prove source compatibility
+ *   during migration. All Synapse rows are deleted and normal selectors
+ *   rebuild them from current source text.
  * - Rows under any non-Synapse `model_id` (local/openai lanes) are never
  *   touched (R25).
  */
@@ -3253,9 +3253,7 @@ function invalidateUnprovenSynapseDestinationRowsV83(db: Database): void {
     }
     if (tableExists(db, "compartment_chunk_embeddings")) {
         const deleted = db
-            .prepare(
-                "DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ? AND (chunk_hash IS NULL OR chunk_hash = '')",
-            )
+            .prepare("DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ?")
             .run(laneLike).changes;
         if (deleted > 0) {
             log(`[migrations] v83: invalidated ${deleted} unproven synapse chunk embedding(s)`);

@@ -1134,6 +1134,46 @@ async fn a_failed_initialization_runs_the_shutdown_callback_before_lock_release(
     successor.shutdown_gracefully().await;
 }
 
+#[tokio::test]
+async fn aborting_failed_initialization_cleanup_retains_lock_until_shutdown_stops() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.fail_init("secondary component failed to initialize");
+    handler.block_shutdown();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let mut task = tokio::spawn(async move {
+        mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
+    });
+
+    // Initialization returns immediately, so a pending startup is waiting for
+    // the blocked shutdown callback before returning its original error.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut task)
+            .await
+            .is_err(),
+        "startup must wait for the shutdown callback"
+    );
+    task.abort();
+    assert!(task.await.is_err(), "the run task was aborted");
+
+    let successor =
+        assert_lock_released_only_after_shutdown_callback(&handler, data_root.path()).await;
+    assert_eq!(
+        handler
+            .events()
+            .iter()
+            .filter(|event| **event == Event::Shutdown)
+            .count(),
+        1,
+        "aborting cleanup must not invoke shutdown twice"
+    );
+    successor.shutdown_gracefully().await;
+}
+
 /// A setup failure *after* a successful initialize drains the handler too:
 /// publication is the last step before the host owns cleanup, and an
 /// initialized handler can already hold stores or background work that only
