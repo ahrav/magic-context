@@ -314,6 +314,29 @@ describe("project identity merge", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("refuses to merge a registered historical alias away from its project", () => {
+        const database = makeDb();
+        database.exec(`
+            INSERT INTO projects (canonical_identity, created_at) VALUES ('git:target', 1);
+            INSERT INTO project_aliases (alias_identity, project_id, created_at)
+            SELECT 'git:target', id, 1 FROM projects;
+            INSERT INTO project_aliases (alias_identity, project_id, created_at)
+            SELECT 'dir:old', id, 1 FROM projects;
+        `);
+
+        expect(() => mergeProjectIdentities(database, "dir:old", "git:elsewhere")).toThrow(
+            /historical alias of git:target/,
+        );
+
+        // The rolled-back merge leaves both registries untouched.
+        expect(
+            database.prepare("SELECT COUNT(*) AS count FROM v22_identity_rekey_map").get(),
+        ).toEqual({ count: 0 });
+        expect(
+            database.prepare("SELECT canonical_identity AS canonical FROM projects").get(),
+        ).toEqual({ canonical: "git:target" });
+    });
+
     test("rolls back the whole merge when the source project owns authoritative children", () => {
         const database = makeDb();
         database.exec(`

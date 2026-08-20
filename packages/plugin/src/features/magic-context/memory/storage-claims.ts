@@ -39,7 +39,13 @@ export function sha256Utf8Hex(text: string): string {
     return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-function withImmediateTransaction<T>(db: Database, fn: () => T): T {
+/**
+ * Run `fn` inside BEGIN IMMEDIATE. The caller must not hold an open
+ * transaction: the immediate lock is acquired up front so writers serialize
+ * at entry, and a nested call fails loudly instead of degrading to a
+ * savepoint without the reserved lock.
+ */
+export function withImmediateTransaction<T>(db: Database, fn: () => T): T {
     db.exec("BEGIN IMMEDIATE");
     try {
         const result = fn();
@@ -639,13 +645,23 @@ function assertRevisionsHaveEvidence(
     db: Database,
     revisions: readonly ClaimRevisionRecord[],
 ): void {
-    const hasEvidence = db.prepare("SELECT 1 FROM claim_evidence WHERE revision_id = ? LIMIT 1");
-    for (const revision of revisions) {
-        if (!hasEvidence.get(revision.id)) {
-            throw new ClaimGraphCorruptionError(
-                `claim revision ${revision.id} has no evidence rows; direct-SQL corruption`,
-            );
-        }
+    if (revisions.length === 0) return;
+    const ids = revisions.map((revision) => revision.id);
+    const placeholders = ids.map(() => "?").join(", ");
+    const missing = db
+        .prepare(
+            `SELECT id FROM claim_revisions
+              WHERE id IN (${placeholders})
+                AND NOT EXISTS (
+                    SELECT 1 FROM claim_evidence WHERE claim_evidence.revision_id = claim_revisions.id
+                )
+              LIMIT 1`,
+        )
+        .get(...ids) as { id: number } | undefined;
+    if (missing) {
+        throw new ClaimGraphCorruptionError(
+            `claim revision ${missing.id} has no evidence rows; direct-SQL corruption`,
+        );
     }
 }
 
@@ -661,8 +677,28 @@ export function listClaimRevisions(db: Database, claimId: number): ClaimRevision
                FROM claim_revisions WHERE claim_id = ? ORDER BY revision`,
         )
         .all(claimId) as ClaimRevisionRecord[];
+    assertCurrentPointerIsMaxRevision(claim, revisions);
     assertRevisionsHaveEvidence(db, revisions);
     return revisions;
+}
+
+/**
+ * A pointer at anything but the newest revision is a direct-SQL rollback of
+ * published history (the clear guard and composite FK both permit it), so
+ * readers refuse to serve the claim rather than presenting stale history as
+ * current.
+ */
+function assertCurrentPointerIsMaxRevision(
+    claim: ClaimRecord,
+    revisions: readonly ClaimRevisionRecord[],
+): void {
+    const pointed = revisions.find((revision) => revision.id === claim.currentRevisionId);
+    const maxRevision = revisions.at(-1)?.revision;
+    if (!pointed || pointed.revision !== maxRevision) {
+        throw new ClaimGraphCorruptionError(
+            `claim ${claim.id} pointer targets revision ${pointed?.revision ?? "none"} but history reaches ${String(maxRevision)}; direct-SQL corruption`,
+        );
+    }
 }
 
 export function getCurrentClaimRevision(db: Database, claimId: number): ClaimRevisionRecord | null {
@@ -678,6 +714,14 @@ export function getCurrentClaimRevision(db: Database, claimId: number): ClaimRev
     if (!revision) {
         throw new ClaimGraphCorruptionError(
             `claim ${claimId} points at missing revision ${claim.currentRevisionId}`,
+        );
+    }
+    const maxRevision = db
+        .prepare("SELECT MAX(revision) AS max FROM claim_revisions WHERE claim_id = ?")
+        .get(claimId) as { max: number | null };
+    if (revision.revision !== maxRevision.max) {
+        throw new ClaimGraphCorruptionError(
+            `claim ${claimId} pointer targets revision ${revision.revision} but history reaches ${String(maxRevision.max)}; direct-SQL corruption`,
         );
     }
     assertRevisionsHaveEvidence(db, [revision]);

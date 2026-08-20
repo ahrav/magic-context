@@ -361,6 +361,19 @@ export function applyIdentityMergeToProjectRegistry(
     }
     if (sourceId === targetId) return;
 
+    // A registered historical alias may not be merged away from its project:
+    // repointing it would rename or absorb the whole project while sibling
+    // rekey-map rows keep resolving to the old terminal, splitting one
+    // registered history into two on any later re-seed.
+    const sourceCanonical = db
+        .prepare("SELECT canonical_identity AS canonical FROM projects WHERE id = ?")
+        .get(sourceId) as { canonical: string };
+    if (sourceCanonical.canonical !== fromIdentity) {
+        throw new Error(
+            `Refusing identity merge: source ${boundedIdentityList([fromIdentity])} is a historical alias of ${boundedIdentityList([sourceCanonical.canonical])}; merge the canonical identity instead.`,
+        );
+    }
+
     if (targetId === null) {
         // In-place adoption renames the source project's canonical identity on
         // the same numeric row; owned episodes/claims keep their project_id,

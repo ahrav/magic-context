@@ -640,6 +640,14 @@ describe("storage-claims: fail-closed reads and lifecycle", () => {
                     evidence: [{ observationId: chain.observationId }],
                 }),
             ).toThrow(ClaimGraphCorruptionError);
+            // Ordinary readers refuse to serve the rolled-back revision as
+            // current instead of silently presenting stale history.
+            expect(() => getCurrentClaimRevision(db, created.claimId)).toThrow(
+                ClaimGraphCorruptionError,
+            );
+            expect(() => listClaimRevisions(db, created.claimId)).toThrow(
+                ClaimGraphCorruptionError,
+            );
         } finally {
             closeQuietly(db);
         }
