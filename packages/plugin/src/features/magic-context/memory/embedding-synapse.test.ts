@@ -385,6 +385,54 @@ describe("recommended batch policy", () => {
         expect(acceptedPageBytes).toEqual([itemBytes, itemBytes]);
     });
 
+    it("floors a fractional token budget rather than dropping the field", async () => {
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "/tmp/unused",
+            projectRoot: "/tmp/p",
+            session: "s",
+            clientFactory: async () =>
+                ({
+                    async call(_m: string, method: string) {
+                        if (method !== "models.list") throw new Error(`unexpected ${method}`);
+                        return {
+                            result: {
+                                table_epoch: 0,
+                                models: [
+                                    {
+                                        model_id: "gte-modernbert-base-f16",
+                                        fingerprints: ["fp1"],
+                                        state: "ready",
+                                        recommended_batch: { rows: 3.7, token_budget: 1024.5 },
+                                    },
+                                ],
+                            },
+                        };
+                    },
+                    close() {},
+                }) as SynapseClientLike,
+        });
+
+        expect(await provider.initialize()).toBe(true);
+        // Both halves of the measured policy floor, so a fractional budget
+        // still bounds a page instead of leaving the lane unbounded.
+        expect(provider.metadata?.recommended_batch).toBe(3);
+        expect(provider.metadata?.recommended_token_budget).toBe(1024);
+
+        // A pinned reconstruction floors the same way.
+        const pinned = new SynapseEmbeddingProvider({
+            connectionFile: "/tmp/unused",
+            projectRoot: "/tmp/p",
+            session: "s",
+            model: "gte-modernbert-base-f16",
+            fingerprint: "fp1",
+            tableEpoch: 0,
+            dims: 3,
+            recommendedBatch: 2,
+            recommendedTokenBudget: 1024.5,
+        });
+        expect(pinned.metadata?.recommended_token_budget).toBe(1024);
+    });
+
     it("bare-number recommended_batch still sets the row limit (legacy wire shape)", async () => {
         const calls: number[] = [];
         const provider = new SynapseEmbeddingProvider({
@@ -806,6 +854,14 @@ describe("embedItemsDetailed", () => {
         return error;
     }
 
+    /** The host's answer for a request whose own content it refuses, such as a
+     *  text over the per-input byte cap. */
+    function schemaViolationError(): Error {
+        const error = new Error("text exceeds the host per-input cap") as Error & { code: string };
+        error.code = "schema_violation";
+        return error;
+    }
+
     function ledgerDb(): Database {
         const db = new Database(":memory:");
         db.exec("PRAGMA foreign_keys=ON");
@@ -1156,7 +1212,7 @@ describe("embedItemsDetailed", () => {
         }
     });
 
-    it("records a retained ready-job failure and lets the next call retry", async () => {
+    it("reports a retained ready-job failure and lets the next call retry", async () => {
         const db = ledgerDb();
         try {
             const host = new DetailedHost();
@@ -1217,16 +1273,96 @@ describe("embedItemsDetailed", () => {
             expect(failed.receipts).toEqual([]);
             expect(failed.failures).toHaveLength(1);
             expect(failed.failures[0].disposition).toBe("retryable");
-            const failedRows = ledgerRows(db);
-            expect(failedRows.map((row) => row.state)).toEqual(["obsolete", "failed"]);
-            expect(failedRows[1].failure_disposition).toBe("retryable");
+            // The retained job's reply is the only thing that failed, so the
+            // ready row retires and no row records a disposition for a page
+            // that was never submitted.
+            expect(ledgerRows(db).map((row) => row.state)).toEqual(["obsolete"]);
 
             const retried = await provider.embedItemsDetailed(items, detailedContext(db));
             expect(retried.failures).toEqual([]);
             expect(retried.receipts).toHaveLength(1);
-            expect(retried.receipts[0].rowId).toBe(failedRows[1].id);
             expect(ledgerRows(db).map((row) => row.state)).toEqual(["obsolete", "ready"]);
+            expect(retried.receipts[0].rowId).toBe(ledgerRows(db)[1].id);
             expect(host.batchCalls()).toHaveLength(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("retires a ready row whose retained job fails without failing a page it never submitted", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([{ id: "memory:1", group: "g1" }]);
+            const created = createSynapseLedgerPage(db, {
+                projectPath: "/repo",
+                sessionId: "ses-1",
+                scope: "memory",
+                laneRole: "primary",
+                destinationModel: getSynapseLaneIdentity(MODEL, FP),
+                applicationGroup: "g1",
+                requestKey: getSynapseBatchRequestKey({
+                    model: MODEL,
+                    fingerprint: FP,
+                    tableEpoch: 0,
+                    items,
+                }),
+                manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                deadlineAt: Date.now() + 60_000,
+            });
+            let seeded = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-crashed",
+                jobId: "job-retained",
+            });
+            seeded = markSynapseLedgerReady(db, {
+                rowId: seeded.rowId,
+                expectedStateVersion: seeded.stateVersion,
+                jobId: "job-retained",
+            });
+            // The retained job answers with a hash that does not match the
+            // page's content: permanent evidence about that reply, and the page
+            // itself has not been submitted since its vectors were lost.
+            host.resultPages = (jobId, jobItems) => ({
+                result: {
+                    ...ENVELOPE,
+                    done: true,
+                    vectors:
+                        jobId === "job-retained"
+                            ? [
+                                  {
+                                      id: items[0].id,
+                                      content_sha256: "0".repeat(64),
+                                      vector: [1, 2, 3],
+                                  },
+                              ]
+                            : jobItems.map((item) => ({
+                                  id: item.id,
+                                  content_sha256: item.content_sha256,
+                                  vector: [1, 2, 3],
+                              })),
+                },
+            });
+
+            const failed = await provider.embedItemsDetailed(items, detailedContext(db));
+            expect(failed.receipts).toEqual([]);
+            expect(failed.failures.map((failure) => failure.code)).toEqual(["artifact_invalid"]);
+            // Only the ready row is retired. No second row records a
+            // disposition for a page that never reached the daemon.
+            expect(ledgerRows(db).map((row) => row.state)).toEqual(["obsolete"]);
+            expect(host.batchCalls()).toEqual([]);
+
+            // The next run opens a fresh page for the same identity and
+            // submits it, so the content is embedded rather than foreclosed.
+            const next = detailedProvider(host);
+            const retried = await next.embedItemsDetailed(items, detailedContext(db));
+            expect(retried.failures).toEqual([]);
+            expect(retried.receipts).toHaveLength(1);
+            expect(retried.receipts[0].vectors.size).toBe(1);
+            expect(host.batchCalls()).toHaveLength(1);
+            expect(ledgerRows(db).map((row) => row.state)).toEqual(["obsolete", "ready"]);
         } finally {
             closeQuietly(db);
         }
@@ -1472,6 +1608,45 @@ describe("embedItemsDetailed", () => {
             expect(rows[0].state).toBe("failed");
             expect(rows[0].failure_disposition).toBe("permanent");
             expect(rows[0].restart_count).toBe(1);
+            expect(rows[1].state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("scopes a request-local schema violation to its page and leaves the lane live", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            // Only the first group's page carries content the host refuses, so
+            // the second group's page must still reach the daemon.
+            host.batchError = (index) => (index === 0 ? schemaViolationError() : null);
+            const provider = detailedProvider(host);
+            const result = await provider.embedItemsDetailed(
+                detailedItems([
+                    { id: "memory:1", group: "g1" },
+                    { id: "memory:2", group: "g2" },
+                ]),
+                detailedContext(db),
+            );
+
+            expect(result.failures).toHaveLength(1);
+            expect(result.failures[0].applicationGroup).toBe("g1");
+            expect(result.failures[0].code).toBe("schema_violation");
+            expect(result.failures[0].disposition).toBe("permanent");
+            // A condemned lane answers `artifact_invalid` for every later page
+            // without submitting it, so a served receipt proves the lane lives.
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].applicationGroup).toBe("g2");
+            expect(result.receipts[0].vectors.size).toBe(1);
+            expect(host.batchCalls()).toHaveLength(2);
+            // The lane also stays usable for this project's other scopes.
+            expect(provider.isLoaded()).toBe(true);
+            expect(await provider.initialize()).toBe(true);
+            const rows = ledgerRows(db);
+            expect(rows.map((row) => row.application_group)).toEqual(["g1", "g2"]);
+            expect(rows[0].state).toBe("failed");
+            expect(rows[0].failure_disposition).toBe("permanent");
             expect(rows[1].state).toBe("ready");
         } finally {
             closeQuietly(db);

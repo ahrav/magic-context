@@ -696,6 +696,37 @@ async fn maximum_page_with_escaped_ids_fits_its_output_reservation() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
+/// The manifest bounds the model name at 128 bytes and constrains no
+/// character within them, so a name of control characters serializes to six
+/// bytes each. The reservation holds the serialized body, so it charges the
+/// escaped length; charging the source bytes undercounts by 640 and the
+/// buffer runs out mid-serialization.
+#[test]
+fn a_model_name_needing_escapes_fits_its_output_reservation() {
+    let engine = DeterministicEngine::new();
+    let mut lane = test_lane();
+    lane.model = "\u{0001}".repeat(128);
+    assert_eq!(lane.model.len(), 128, "the manifest model-name maximum");
+
+    let hash = sha256_hex("text");
+    let vector = engine.vector_for("text");
+    let views = [protocol::VectorItemView {
+        id: "i0",
+        content_sha256: &hash,
+        vector: &vector,
+    }];
+
+    let reservation = protocol::vector_body_reservation(&lane, &views, None);
+    let mut encoded = Vec::new();
+    protocol::write_vector_body(&mut encoded, &lane, &views, true, None)
+        .expect("vector body serializes");
+    assert!(
+        encoded.len() <= reservation,
+        "encoded body {} exceeds reservation {reservation}",
+        encoded.len()
+    );
+}
+
 #[tokio::test]
 async fn unknown_and_foreign_jobs_are_module_restarted() {
     let engine = DeterministicEngine::new();

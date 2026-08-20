@@ -139,10 +139,42 @@ function isPermanentSynapseCode(code: string): boolean {
     );
 }
 
-/** Ledger-state codes describe one page row's disposition, not a daemon fault:
- *  they never condemn the lane. */
-function isLedgerStateSynapseCode(code: string): boolean {
-    return code === "idempotency_conflict" || code === "page_terminal";
+/**
+ * Permanent codes divide by what they are evidence about, and only lane-wide
+ * evidence may condemn the lane.
+ *
+ * Page-scoped: `idempotency_conflict` and `page_terminal` describe one ledger
+ * row's disposition, and `schema_violation` describes one request — its own
+ * items' content, or the shape of the reply to that request. A text over the
+ * host's per-input cap is a property of that row, so every other page of the
+ * lane remains embeddable.
+ *
+ * Lane-wide: `artifact_invalid`, `substitution_rejected`, `not_certified`, and
+ * `probe_required` describe the model the lane serves. They hold for every page
+ * the lane would submit, so they disable it until the lane is rediscovered.
+ */
+function isPageScopedSynapseCode(code: string): boolean {
+    return (
+        code === "idempotency_conflict" || code === "page_terminal" || code === "schema_violation"
+    );
+}
+
+/**
+ * Normalize an advertised per-call token budget to a positive safe integer,
+ * flooring a fractional advertisement the way `recommended_batch` floors its row
+ * count. Flooring keeps the served budget as a ceiling the client never exceeds.
+ * A value that is not a finite positive number, or whose floor falls to zero or
+ * leaves the safe-integer range, carries no usable budget and is dropped so the
+ * lane keeps the client default.
+ *
+ * Every guard that admits this field shares this function so the catalog parser,
+ * the provider constructor, the registry, and routing cannot disagree about
+ * which advertisements survive.
+ */
+export function normalizeSynapseTokenBudget(value: unknown): number | undefined {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+    const floored = Math.floor(value);
+    return floored > 0 && Number.isSafeInteger(floored) ? floored : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -315,7 +347,9 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
         const batchRecord = asRecord(rawBatch);
         const recommendedBatch =
             typeof rawBatch === "number" ? rawBatch : batchRecord ? batchRecord.rows : undefined;
-        const recommendedTokenBudget = batchRecord ? batchRecord.token_budget : undefined;
+        const recommendedTokenBudget = batchRecord
+            ? normalizeSynapseTokenBudget(batchRecord.token_budget)
+            : undefined;
         const maxInputTokens = record.max_input_tokens ?? record.maxInputTokens;
         const state = typeof record.state === "string" ? record.state : undefined;
         return [
@@ -327,9 +361,7 @@ function extractCatalogEntries(value: unknown): SynapseCatalogEntry[] {
                 ...(typeof recommendedBatch === "number" && recommendedBatch > 0
                     ? { recommended_batch: Math.floor(recommendedBatch) }
                     : {}),
-                ...(typeof recommendedTokenBudget === "number" &&
-                Number.isSafeInteger(recommendedTokenBudget) &&
-                recommendedTokenBudget > 0
+                ...(recommendedTokenBudget !== undefined
                     ? { recommended_token_budget: recommendedTokenBudget }
                     : {}),
                 ...(typeof maxInputTokens === "number" &&
@@ -469,12 +501,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             options.maxInputTokens > 0
                 ? options.maxInputTokens
                 : undefined;
-        const recommendedTokenBudget =
-            typeof options.recommendedTokenBudget === "number" &&
-            Number.isSafeInteger(options.recommendedTokenBudget) &&
-            options.recommendedTokenBudget > 0
-                ? options.recommendedTokenBudget
-                : undefined;
+        const recommendedTokenBudget = normalizeSynapseTokenBudget(options.recommendedTokenBudget);
         this.metadata =
             fingerprint &&
             Number.isInteger(options.tableEpoch) &&
@@ -732,7 +759,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 const classified = classifyError(error);
                 this.logCallFailure(classified, "embed.batch");
                 if (classified.code === "idempotency_conflict") throw classified;
-                if (classified.permanent) {
+                // A page-scoped code answers for this page only, so the
+                // remaining pages keep their turn on a live lane.
+                if (classified.permanent && !isPageScopedSynapseCode(classified.code)) {
                     this.permanentFailure = true;
                     this.initialized = false;
                     break;
@@ -795,16 +824,10 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     );
                 } catch (error) {
                     const classified = classifyError(error);
-                    if (
-                        isLedgerStateSynapseCode(classified.code) &&
-                        classified.ledgerRowId !== undefined
-                    ) {
-                        log(
-                            `[magic-context] Synapse embed.batch ${classified.code}: ${classified.message}`,
-                        );
-                    } else {
-                        this.logCallFailure(classified, "embed.batch");
-                    }
+                    // `logCallFailure` owns the lane verdict: it condemns the
+                    // lane only for lane-wide evidence, so a page-scoped code
+                    // reported here leaves the remaining groups embeddable.
+                    this.logCallFailure(classified, "embed.batch");
                     result.failures.push({
                         applicationGroup,
                         items: manifest,
@@ -927,20 +950,18 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 } catch (error) {
                     const classified = classifyError(error);
                     if (classified.code !== "module_restarted") {
+                        // The failure is evidence about the retained job's
+                        // reply. This page has not been submitted since its
+                        // vectors were lost, so it carries no disposition of its
+                        // own: recording one would answer for work never
+                        // attempted, and a permanent answer would foreclose the
+                        // content forever. Retiring the ready row leaves no live
+                        // row for this identity, so the next pass opens a fresh
+                        // pending page and submits it.
                         markSynapseLedgerObsolete(db, {
                             rowId: row.rowId,
                             expectedStateVersion: row.stateVersion,
                         });
-                        row = freshPage();
-                        try {
-                            row = markSynapseLedgerOutcome(db, {
-                                rowId: row.rowId,
-                                expectedStateVersion: row.stateVersion,
-                                disposition: classified.permanent ? "permanent" : "retryable",
-                            });
-                        } catch (casError) {
-                            if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
-                        }
                         classified.ledgerRowId = row.rowId;
                         throw classified;
                     }
@@ -952,7 +973,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     // `restart_count` at 0, so an unchecked rebuild here hands
                     // the page a fresh budget on every pass and a restarting
                     // daemon resubmits it without bound. `page_terminal` is the
-                    // ledger-state code for a spent budget: it belongs to this
+                    // page-scoped code for a spent budget: it belongs to this
                     // row alone and leaves the lane's other pages runnable.
                     if (row.restartCount !== 0 || (row.deadlineAt ?? 0) <= Date.now()) {
                         const terminal = new SynapseEmbeddingError(
@@ -1463,7 +1484,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     private logCallFailure(error: unknown, operation: string): void {
         const classified = classifyError(error);
-        if (classified.permanent) this.permanentFailure = true;
+        if (classified.permanent && !isPageScopedSynapseCode(classified.code)) {
+            this.permanentFailure = true;
+        }
         const suffix =
             classified.retryAfterMs === undefined
                 ? ""

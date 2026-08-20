@@ -369,6 +369,22 @@ let startupQueue: Promise<void> = Promise.resolve();
 let startupQueueDepth = 0;
 let startupChunkDeadlineAt = 0;
 
+/**
+ * True while `reg` is still the live registration for its directory. A
+ * registration stops being live when its directory unregisters (the instance is
+ * disposed) or re-registers with a fresh config, and a stale one carries a
+ * disposed instance's `client`, progress sink, and module client.
+ *
+ * Both ends of the startup queue consult this, because the queue is serialized:
+ * an entry waits out every earlier project's drains — one shared
+ * chunk-backfill budget plus each project's git backlog and smart-note drains
+ * and its due dreamer tasks — so a wave can hold an entry far past the point
+ * where its registration was replaced or removed.
+ */
+function isLiveRegistration(reg: ProjectRegistration): boolean {
+    return registeredProjects.get(reg.directory) === reg;
+}
+
 function enqueueStartupProjectRun(reg: ProjectRegistration, db: Database): void {
     if (startupQueueDepth === 0) {
         startupChunkDeadlineAt = Date.now() + CHUNK_BACKFILL_TICK_BUDGET_MS;
@@ -376,7 +392,15 @@ function enqueueStartupProjectRun(reg: ProjectRegistration, db: Database): void 
     startupQueueDepth += 1;
     const chunkDeadlineAt = startupChunkDeadlineAt;
     startupQueue = startupQueue
-        .then(() => runProjectMaintenance(reg, "startup", db, chunkDeadlineAt))
+        .then(() => {
+            if (!isLiveRegistration(reg)) {
+                log(
+                    `[dreamer] startup maintenance skipped for ${reg.projectIdentity} — no longer the registered project`,
+                );
+                return;
+            }
+            return runProjectMaintenance(reg, "startup", db, chunkDeadlineAt);
+        })
         .catch((error) => {
             log(
                 `[dreamer] startup maintenance failed for ${reg.projectIdentity}: ${getErrorMessage(error)}`,
@@ -391,7 +415,7 @@ function scheduleInitialProjectRun(reg: ProjectRegistration, db: Database): void
     if (startupTimers.has(reg.directory)) return;
     const timer = scheduleAfterBootQuiet(() => {
         startupTimers.delete(reg.directory);
-        if (registeredProjects.get(reg.directory) !== reg) return;
+        if (!isLiveRegistration(reg)) return;
         enqueueStartupProjectRun(reg, db);
     }, startupJitterMs(reg.directory));
     startupTimers.set(reg.directory, timer);

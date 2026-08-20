@@ -6,6 +6,7 @@ import type {
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../config/schema/magic-context";
 import {
     getSynapseLaneIdentity,
+    normalizeSynapseTokenBudget,
     SYNAPSE_DEFAULT_MODEL,
     SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
@@ -101,7 +102,9 @@ function synapseOptions(
                   tableEpoch: metadata.table_epoch,
                   dims: metadata.dims,
                   recommendedBatch: metadata.recommended_batch,
-                  recommendedTokenBudget: metadata.recommended_token_budget,
+                  recommendedTokenBudget: normalizeSynapseTokenBudget(
+                      metadata.recommended_token_budget,
+                  ),
                   maxInputTokens: metadata.max_input_tokens,
                   provenance: metadata.provenance,
               }
@@ -140,6 +143,7 @@ function resolvedSynapseConfig(
 ): ResolvedSynapseEmbeddingConfig {
     void projectRoot;
     void session;
+    const tokenBudget = normalizeSynapseTokenBudget(metadata.recommended_token_budget);
     return {
         provider: "synapse",
         model: metadata.model,
@@ -151,9 +155,7 @@ function resolvedSynapseConfig(
         ...(metadata.recommended_batch
             ? { synapse_recommended_batch: metadata.recommended_batch }
             : {}),
-        ...(metadata.recommended_token_budget
-            ? { synapse_recommended_token_budget: metadata.recommended_token_budget }
-            : {}),
+        ...(tokenBudget !== undefined ? { synapse_recommended_token_budget: tokenBudget } : {}),
         ...(metadata.provenance !== undefined ? { synapse_provenance: metadata.provenance } : {}),
     };
 }

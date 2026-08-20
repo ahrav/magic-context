@@ -527,6 +527,11 @@ const VECTOR_BODY_ENVELOPE: usize = 256;
 /// Upper bound on the serialized length of a vector-bearing body, built from
 /// the same per-item accounting the job table splits pages with — so a page
 /// that fit the page cap also fits the reservation taken from this estimate.
+/// The model name is charged at its escaped length, the form the body holds:
+/// the manifest bounds it at 128 bytes and constrains no character within
+/// them, so it can expand sixfold. The fingerprint is hexadecimal and the
+/// cursor is server-built from hexadecimal and digits, so both serialize
+/// unchanged.
 pub fn vector_body_reservation(
     lane: &LaneInfo,
     items: &[VectorItemView<'_>],
@@ -543,7 +548,7 @@ pub fn vector_body_reservation(
         })
         .sum();
     items
-        + lane.model.len()
+        + super::jobs::escaped_string_bytes(&lane.model)
         + lane.fingerprint.len()
         + next_cursor.map_or(0, str::len)
         + VECTOR_BODY_ENVELOPE

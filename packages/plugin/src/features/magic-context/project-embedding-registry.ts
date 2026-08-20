@@ -45,6 +45,7 @@ import type {
     EmbeddingPurpose,
 } from "./memory/embedding-provider";
 import {
+    normalizeSynapseTokenBudget,
     SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
     SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
@@ -448,6 +449,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             synapse_recommended_token_budget?: number;
             synapse_provenance?: unknown;
         };
+        const tokenBudget = normalizeSynapseTokenBudget(synapse.synapse_recommended_token_budget);
         return {
             provider: "synapse",
             model: synapse.model?.trim() || "gte-modernbert-base-f16",
@@ -472,11 +474,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             ...(typeof synapse.synapse_recommended_batch === "number"
                 ? { synapse_recommended_batch: synapse.synapse_recommended_batch }
                 : {}),
-            ...(typeof synapse.synapse_recommended_token_budget === "number" &&
-            Number.isSafeInteger(synapse.synapse_recommended_token_budget) &&
-            synapse.synapse_recommended_token_budget > 0
-                ? { synapse_recommended_token_budget: synapse.synapse_recommended_token_budget }
-                : {}),
+            ...(tokenBudget !== undefined ? { synapse_recommended_token_budget: tokenBudget } : {}),
             ...(synapse.synapse_provenance !== undefined
                 ? { synapse_provenance: synapse.synapse_provenance }
                 : {}),
@@ -539,7 +537,9 @@ function createProvider(
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
-            recommendedTokenBudget: synapse.synapse_recommended_token_budget,
+            recommendedTokenBudget: normalizeSynapseTokenBudget(
+                synapse.synapse_recommended_token_budget,
+            ),
             maxInputTokens: synapse.max_input_tokens,
             provenance: synapse.synapse_provenance,
         });

@@ -122,6 +122,19 @@ pub struct JobTable {
     inner: std::sync::Mutex<Jobs>,
 }
 
+/// Bytes `s` occupies inside a JSON string, excluding the delimiting quotes:
+/// its escaped form, which is what a serialized body holds. Quotes,
+/// backslashes, and control characters expand — a control character costs six
+/// bytes as `\u00XX` — so a byte-length charge undercounts the body an output
+/// reservation must fit.
+pub(crate) fn escaped_string_bytes(s: &str) -> usize {
+    serde_json::to_string(s)
+        .expect("string serialization cannot fail")
+        .len()
+        .checked_sub(2)
+        .expect("serialized JSON string includes quotes")
+}
+
 fn digest_payload(key: &str, items: &[BatchItem]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     let mut update = |bytes: &[u8]| {
@@ -406,14 +419,9 @@ impl JobTable {
             hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "content hash must be hexadecimal"
         );
-        let escaped_id_bytes = serde_json::to_string(id)
-            .expect("string serialization cannot fail")
-            .len()
-            .checked_sub(2)
-            .expect("serialized JSON string includes quotes");
         vector_len
             .checked_mul(Self::ENCODED_BYTES_PER_COMPONENT)
-            .and_then(|bytes| bytes.checked_add(escaped_id_bytes))
+            .and_then(|bytes| bytes.checked_add(escaped_string_bytes(id)))
             .and_then(|bytes| bytes.checked_add(hash.len()))
             .and_then(|bytes| bytes.checked_add(Self::ENCODED_ITEM_OVERHEAD))
             .unwrap_or(usize::MAX)
