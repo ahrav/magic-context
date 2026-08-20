@@ -1,6 +1,6 @@
 {
   "unit": "u30-query-purpose-default",
-  "plan": "docs/plans/2026-08-19-1526-fix-query-purpose-default-plan.md",
+  "tracking": "beads:magic-context-3q5.6 (U30); https://github.com/ahrav/magic-context/pull/13",
   "profile": "ci",
   "release": "packages/plugin/scripts/fixtures/retrieval-benchmark/v1",
   "claim": "regression",
@@ -84,6 +84,7 @@
     "verdict": "quality-only",
     "latencyRequired": false,
     "unblocked": true,
-    "qualityFindingsPass": true
+    "qualityFindingsPass": true,
+    "qualityEvidenceScope": "The harness embedQuery is purpose-invariant (the purpose argument never changes the returned vector), so pre/post metrics are identical by construction. This gate proves the dispatch flip introduces no harness-level regression; the quality effect of query-vs-passage embedding at an asymmetric provider boundary (input_type/query_input_type) is unmeasured here and is validated only by the provider-boundary unit tests (AE1-AE4)."
   }
 }
