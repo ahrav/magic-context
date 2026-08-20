@@ -445,6 +445,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     maxInputTokens: number;
     metadata: SynapseLaneMetadata | null;
 
+    /// Deadline basis for every ledger page this provider opens. Resolved once
+    /// so the provider's own page deadlines and any external reopen of the same
+    /// row share one basis instead of each falling back independently.
+    readonly pageTimeoutMs: number;
+
     private readonly options: SynapseEmbeddingProviderOptions;
     private client: SynapseClientLike | null = null;
     private initialized = false;
@@ -455,6 +460,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
 
     constructor(options: SynapseEmbeddingProviderOptions) {
         this.options = options;
+        this.pageTimeoutMs = options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
         const model = options.model || SYNAPSE_DEFAULT_MODEL;
         const fingerprint = options.fingerprint ?? "";
         const maxInputTokens =
@@ -678,7 +684,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         body = await this.callWithRetry(
                             "embed.batch",
                             this.batchRequest(page, requestKey),
-                            this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
+                            this.pageTimeoutMs,
                             true,
                             signal,
                         );
@@ -834,7 +840,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             applicationGroup,
             requestKey,
         };
-        const timeoutMs = this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
+        const timeoutMs = this.pageTimeoutMs;
         const freshPage = () =>
             createSynapseLedgerPage(db, {
                 ...identity,
@@ -938,6 +944,24 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         classified.ledgerRowId = row.rowId;
                         throw classified;
                     }
+                    // A restart forces this page back through submission, which
+                    // is the same resubmission the polling path buys with the
+                    // page's single durable restart, so the ready path spends
+                    // that budget under the same evidence: an unspent restart
+                    // inside the original deadline. The rebuilt row seeds
+                    // `restart_count` at 0, so an unchecked rebuild here hands
+                    // the page a fresh budget on every pass and a restarting
+                    // daemon resubmits it without bound. `page_terminal` is the
+                    // ledger-state code for a spent budget: it belongs to this
+                    // row alone and leaves the lane's other pages runnable.
+                    if (row.restartCount !== 0 || (row.deadlineAt ?? 0) <= Date.now()) {
+                        const terminal = new SynapseEmbeddingError(
+                            "page_terminal",
+                            "restart budget or page deadline exhausted",
+                        );
+                        terminal.ledgerRowId = row.rowId;
+                        throw terminal;
+                    }
                 }
             }
             markSynapseLedgerObsolete(db, {
@@ -987,11 +1011,39 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                             });
                         },
                     );
-                    row = markSynapseLedgerReady(db, {
-                        rowId: row.rowId,
-                        expectedStateVersion: row.stateVersion,
-                        jobId,
-                    });
+                    try {
+                        row = markSynapseLedgerReady(db, {
+                            rowId: row.rowId,
+                            expectedStateVersion: row.stateVersion,
+                            jobId,
+                        });
+                    } catch (casError) {
+                        if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
+                        // A sibling attempt validated this page and advanced the
+                        // row first. Its receipt covers the identical work: the
+                        // request key pins the item set, hashes, fingerprint, and
+                        // epoch, and `jobId` pins the daemon job those vectors
+                        // came from, so the winner's row and the vectors in hand
+                        // describe one validated result. Attach to the winner's
+                        // version rather than discard the collected vectors. A
+                        // winner holding a different job is different work whose
+                        // items are unproven here, so it is not a success.
+                        const winner = findSynapseLedgerPage(db, identity);
+                        if (
+                            !winner ||
+                            winner.jobId !== jobId ||
+                            (winner.state !== "ready" && winner.state !== "complete")
+                        ) {
+                            throw casError;
+                        }
+                        return {
+                            rowId: winner.rowId,
+                            stateVersion: winner.stateVersion,
+                            applicationGroup,
+                            items: manifest,
+                            vectors,
+                        };
+                    }
                     return {
                         rowId: row.rowId,
                         stateVersion: row.stateVersion,
@@ -1249,8 +1301,7 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         // One absolute deadline spans the whole poll sequence, so a job that
         // never leaves the queue cannot poll without bound; each call is
         // bounded by the remaining budget.
-        const deadlineAt =
-            Date.now() + (this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS);
+        const deadlineAt = Date.now() + this.pageTimeoutMs;
         for (;;) {
             if (signal?.aborted) return {};
             const remainingMs = deadlineAt - Date.now();

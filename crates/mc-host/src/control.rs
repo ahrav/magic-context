@@ -299,7 +299,10 @@ pub(crate) fn validate_manifest_module_id(module_id: &str) -> Result<(), String>
     check_string("manifest module_id", module_id, MAX_MODULE_ID_LEN, true)
 }
 
-fn check_string(
+/// Applies the host's shared bounds to one client-supplied string: nonempty
+/// (when required), a byte ceiling, and no interior NUL. Callers outside the
+/// control plane map the returned message onto their own error code.
+pub(crate) fn check_string(
     field: &str,
     value: &str,
     max_bytes: usize,

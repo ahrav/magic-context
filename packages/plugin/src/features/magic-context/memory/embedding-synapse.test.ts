@@ -10,10 +10,13 @@ import { initializeDatabase } from "../storage-db";
 import {
     createSynapseLedgerPage,
     getSynapseLedgerPage,
+    markSynapseLedgerObsolete,
     markSynapseLedgerOutcome,
     markSynapseLedgerPolling,
     markSynapseLedgerReady,
     recordSynapseLedgerCursor,
+    recordSynapseLedgerJob,
+    recordSynapseLedgerRestart,
 } from "../storage-embedding-measurements";
 import type { DetailedEmbedContext, DetailedEmbedItem } from "./embedding-provider";
 import {
@@ -1298,6 +1301,106 @@ describe("embedItemsDetailed", () => {
         }
     });
 
+    it("keeps a ready-path module_restarted terminal once the page's restart budget is spent", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([
+                { id: "memory:1", group: "g1" },
+                { id: "memory:2", group: "g2" },
+            ]);
+            const spentPage = [items[0]];
+            const created = createSynapseLedgerPage(db, {
+                projectPath: "/repo",
+                sessionId: "ses-1",
+                scope: "memory",
+                laneRole: "primary",
+                destinationModel: getSynapseLaneIdentity(MODEL, FP),
+                applicationGroup: "g1",
+                requestKey: getSynapseBatchRequestKey({
+                    model: MODEL,
+                    fingerprint: FP,
+                    tableEpoch: 0,
+                    items: spentPage,
+                }),
+                manifest: spentPage.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                deadlineAt: Date.now() + 60_000,
+            });
+            // The page's history: it spent its single durable restart, reached
+            // ready under the replacement job, then lost its vectors with the
+            // process. A second restart leaves it no budget to resubmit under.
+            let seeded = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-1",
+                jobId: "job-first",
+            });
+            seeded = recordSynapseLedgerRestart(db, {
+                rowId: seeded.rowId,
+                expectedStateVersion: seeded.stateVersion,
+                jobId: "job-first",
+            });
+            seeded = recordSynapseLedgerJob(db, {
+                rowId: seeded.rowId,
+                expectedStateVersion: seeded.stateVersion,
+                attemptId: "attempt-2",
+                jobId: "job-retained",
+            });
+            seeded = markSynapseLedgerReady(db, {
+                rowId: seeded.rowId,
+                expectedStateVersion: seeded.stateVersion,
+                jobId: "job-retained",
+            });
+            host.resultPages = (jobId, jobItems) => {
+                if (jobId === "job-retained") return moduleRestartedError();
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: jobItems.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+
+            const result = await provider.embedItemsDetailed(items, detailedContext(db));
+
+            expect(result.failures).toHaveLength(1);
+            expect(result.failures[0].applicationGroup).toBe("g1");
+            expect(result.failures[0].code).toBe("page_terminal");
+            expect(result.failures[0].disposition).toBe("permanent");
+            expect(result.failures[0].rowId).toBe(seeded.rowId);
+            // The exhausted page is never rebuilt and never resubmitted.
+            expect(
+                host
+                    .batchCalls()
+                    .filter((call) =>
+                        (call.params.items as Array<{ id: string }>).some(
+                            (item) => item.id === "memory:1",
+                        ),
+                    ),
+            ).toEqual([]);
+            // The lane stays live: a disabled lane reports `artifact_invalid`
+            // for every later page instead of embedding it.
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].applicationGroup).toBe("g2");
+            expect(result.receipts[0].vectors.size).toBe(1);
+            const rows = ledgerRows(db);
+            expect(rows).toHaveLength(2);
+            expect(rows[0].id).toBe(seeded.rowId);
+            expect(rows[0].state).toBe("ready");
+            expect(rows[0].restart_count).toBe(1);
+            expect(rows[1].application_group).toBe("g2");
+            expect(rows[1].state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     it("keeps a module_restarted retryable while the page still has restart budget", async () => {
         const db = ledgerDb();
         try {
@@ -1460,6 +1563,135 @@ describe("embedItemsDetailed", () => {
             expect(rows).toHaveLength(1);
             expect(rows[0].id).toBe(competitorRowId);
             expect(rows[0].state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("returns the collected vectors by attaching to the winner when the ready CAS loses", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([{ id: "memory:1", group: "g1" }]);
+            let winner: Record<string, unknown> | null = null;
+            host.resultPages = (jobId, jobItems, index) => {
+                if (index === 0) {
+                    // A sibling process validated the same job and advanced the
+                    // row to ready first, leaving this attempt's version stale.
+                    const live = ledgerRows(db)[0];
+                    markSynapseLedgerReady(db, {
+                        rowId: live.id as number,
+                        expectedStateVersion: live.state_version as number,
+                        jobId,
+                    });
+                    winner = ledgerRows(db)[0];
+                }
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: jobItems.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+
+            const result = await provider.embedItemsDetailed(items, detailedContext(db));
+
+            // Widened read: TS narrows the closure-assigned variable to its
+            // initializer type at this point.
+            const winnerRow = winner as Record<string, unknown> | null;
+            expect(winnerRow?.state).toBe("ready");
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].rowId).toBe(winnerRow?.id);
+            expect(result.receipts[0].stateVersion).toBe(winnerRow?.state_version);
+            expect(result.receipts[0].vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
+            expect(host.batchCalls()).toHaveLength(1);
+            const rows = ledgerRows(db);
+            expect(rows).toHaveLength(1);
+            expect(rows[0].state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("refuses to attach to a winner running a different job", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([{ id: "memory:1", group: "g1" }]);
+            const identity = {
+                projectPath: "/repo",
+                sessionId: "ses-1",
+                scope: "memory" as const,
+                laneRole: "primary" as const,
+                destinationModel: getSynapseLaneIdentity(MODEL, FP),
+                applicationGroup: "g1",
+                requestKey: getSynapseBatchRequestKey({
+                    model: MODEL,
+                    fingerprint: FP,
+                    tableEpoch: 0,
+                    items,
+                }),
+            };
+            let rivalRowId = 0;
+            host.resultPages = (_jobId, jobItems, index) => {
+                if (index === 0) {
+                    // The live row for this identity is replaced by one running
+                    // a different job, so the vectors in hand prove nothing
+                    // about the row that now owns the page.
+                    const live = ledgerRows(db)[0];
+                    markSynapseLedgerObsolete(db, {
+                        rowId: live.id as number,
+                        expectedStateVersion: live.state_version as number,
+                    });
+                    const rival = createSynapseLedgerPage(db, {
+                        ...identity,
+                        manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                        deadlineAt: Date.now() + 60_000,
+                    });
+                    const polling = markSynapseLedgerPolling(db, {
+                        rowId: rival.rowId,
+                        expectedStateVersion: rival.stateVersion,
+                        attemptId: "attempt-rival",
+                        jobId: "job-other",
+                    });
+                    rivalRowId = markSynapseLedgerReady(db, {
+                        rowId: polling.rowId,
+                        expectedStateVersion: polling.stateVersion,
+                        jobId: "job-other",
+                    }).rowId;
+                }
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: jobItems.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+
+            const result = await provider.embedItemsDetailed(items, detailedContext(db));
+
+            expect(rivalRowId).toBeGreaterThan(0);
+            expect(result.receipts).toEqual([]);
+            expect(result.failures).toHaveLength(1);
+            expect(result.failures[0].code).toBe("transport");
+            expect(result.failures[0].disposition).toBe("retryable");
+            // The rival's row keeps its own version: no receipt claims it.
+            const rival = getSynapseLedgerPage(db, rivalRowId);
+            expect(rival?.state).toBe("ready");
+            expect(rival?.jobId).toBe("job-other");
         } finally {
             closeQuietly(db);
         }

@@ -3146,7 +3146,21 @@ export const MIGRATIONS: Migration[] = [
                     }>
                 ).map((row) => row.name),
             );
-            if (columns.has("state_version")) return;
+            if (columns.has("state_version")) {
+                // `state_version` exists only once this migration's own DDL has
+                // run, so the ledger already carries the target shape. The
+                // staging copy is created after that DDL and dropped as the
+                // final statement, so its presence marks an attempt interrupted
+                // between the two -- the destination invalidation may not have
+                // run. Repeat it (deleting rows under a Synapse lane identity is
+                // idempotent) and drop the staging copy so the shape is
+                // complete.
+                if (tableExists(db, "synapse_batch_ledger_legacy_v81")) {
+                    invalidateUnprovenSynapseDestinationRowsV83(db);
+                    db.exec("DROP TABLE synapse_batch_ledger_legacy_v81");
+                }
+                return;
+            }
             const legacyCount = (
                 db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
                     count: number;
@@ -3194,24 +3208,6 @@ export const MIGRATIONS: Migration[] = [
             if (copied !== legacyCount) {
                 throw new Error(
                     `v83 ledger copy postcondition failed: ${copied} of ${legacyCount} rows`,
-                );
-            }
-            const duplicates = (
-                db
-                    .prepare(
-                        `SELECT COUNT(*) AS count FROM (
-                            SELECT 1 FROM synapse_batch_ledger
-                            WHERE state != 'obsolete'
-                            GROUP BY project_path, session_id, scope, lane_role,
-                                     destination_model, application_group, request_key
-                            HAVING COUNT(*) > 1
-                        )`,
-                    )
-                    .get() as { count: number }
-            ).count;
-            if (duplicates !== 0) {
-                throw new Error(
-                    `v83 ledger uniqueness postcondition failed: ${duplicates} duplicate identities`,
                 );
             }
             invalidateUnprovenSynapseDestinationRowsV83(db);

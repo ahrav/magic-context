@@ -176,6 +176,9 @@ describe("dream-timer normal chunk recovery trigger (static)", () => {
  * concurrency probe: two projects' passes must never be inside it together.
  */
 describe("dream-timer startup maintenance", () => {
+    /** Mirrors DREAM_TIMER_INTERVAL_MS, the delay the timer's interval tick is
+     *  registered under. */
+    const TIMER_INTERVAL_MS = 15 * 60 * 1000;
     const dirs: string[] = [];
     const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
@@ -246,6 +249,94 @@ describe("dream-timer startup maintenance", () => {
             expect(entered.sort()).toEqual(["dir:startup-a", "dir:startup-b"]);
             expect(maxConcurrent).toBe(1);
         } finally {
+            for (const stop of stops) stop?.();
+        }
+    }, 30_000);
+
+    /**
+     * A startup wave's passes run on `startupQueue`, outside the tick that
+     * scheduled them, and one wave can outlast the timer's interval: it spends a
+     * whole shared chunk-backfill budget plus its memory and git drains. An
+     * interval pass drives the same provider and database, so it yields while
+     * the wave is draining and runs once the wave is done. `ensureRegistered` is
+     * the first await of every pass, so its call count reports which passes ran.
+     */
+    test("an interval tick yields to a draining startup wave and runs after it", async () => {
+        const dataHome = mkdtempSync(join(tmpdir(), "mc-interval-home-"));
+        const project = mkdtempSync(join(tmpdir(), "mc-interval-a-"));
+        dirs.push(dataHome, project);
+        process.env.XDG_DATA_HOME = dataHome;
+        // Boot quiet already elapsed, so only slot 0's sub-second jitter delays
+        // the startup pass.
+        setBootQuietPeriodForTests(Date.now() - BOOT_QUIET_MS);
+
+        // Interval ticks are fire-and-forget on a 15-minute setInterval;
+        // capturing the callback makes one invocable at a chosen moment. A
+        // mismatch on the delay leaves the handle undefined, which the
+        // assertion below reports.
+        const originalSetInterval = globalThis.setInterval;
+        let fireIntervalTick: (() => void) | undefined;
+        globalThis.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+            if (typeof handler === "function" && timeout === TIMER_INTERVAL_MS) {
+                fireIntervalTick = handler as () => void;
+                // A parked real timer keeps unref()/clearInterval() working on
+                // the handle the timer stores.
+                return originalSetInterval(() => {}, 2 ** 30);
+            }
+            return originalSetInterval(handler, timeout, ...args);
+        }) as unknown as typeof setInterval;
+
+        let calls = 0;
+        let releaseStartupPass: () => void = () => {};
+        const startupPassGate = new Promise<void>((resolve) => {
+            releaseStartupPass = resolve;
+        });
+        // The wave's pass parks inside its first await, holding the startup
+        // queue open; every later call returns at once.
+        const ensureRegistered = async () => {
+            calls += 1;
+            if (calls === 1) await startupPassGate;
+        };
+
+        const stops: Array<(() => void) | undefined> = [];
+        try {
+            stops.push(
+                await startDreamScheduleTimer({
+                    directory: project,
+                    projectIdentity: "dir:interval-a",
+                    client: {} as never,
+                    memoryEnabled: true,
+                    ensureRegistered,
+                }),
+            );
+
+            const deadline = Date.now() + 15_000;
+            while (calls === 0 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            expect(calls).toBe(1);
+            expect(fireIntervalTick).toBeDefined();
+
+            // An interval tick landing mid-wave must not open a second pass.
+            fireIntervalTick?.();
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            expect(calls).toBe(1);
+
+            releaseStartupPass();
+            while (calls < 2 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            expect(calls).toBe(2);
+
+            // Once the queue drains, an interval tick runs its pass.
+            while (calls < 3 && Date.now() < deadline) {
+                fireIntervalTick?.();
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            expect(calls).toBeGreaterThanOrEqual(3);
+        } finally {
+            globalThis.setInterval = originalSetInterval;
+            releaseStartupPass();
             for (const stop of stops) stop?.();
         }
     }, 30_000);

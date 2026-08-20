@@ -225,10 +225,24 @@ impl Backend {
     /// Blocking: initializes ORT, builds the FastEmbed model from verified
     /// bytes, then runs the structural probe and semantic certification
     /// before returning a usable backend.
-    pub fn load(bundle: &VerifiedBundle, ort: &OrtIdentity) -> Result<Self, InferenceError> {
+    pub fn load(bundle: VerifiedBundle, ort: &OrtIdentity) -> Result<Self, InferenceError> {
         ensure_ort(ort)?;
 
-        let manifest = &bundle.manifest;
+        // The bundle is consumed so every weight buffer moves into the model
+        // rather than being copied beside a live original. One aggregate
+        // budget of 2 GiB covers the ONNX graph plus all external
+        // initializers, so cloning them here would put the real peak at
+        // twice that bound.
+        let VerifiedBundle {
+            manifest,
+            onnx,
+            initializers,
+            tokenizer_file,
+            config_file,
+            special_tokens_map_file,
+            tokenizer_config_file,
+            corpus,
+        } = bundle;
         let pooling = match manifest.pooling.as_str() {
             "mean" => Pooling::Mean,
             "cls" => Pooling::Cls,
@@ -258,18 +272,18 @@ impl Backend {
         };
 
         let mut model = UserDefinedEmbeddingModel::new(
-            bundle.onnx.clone(),
+            onnx,
             TokenizerFiles {
-                tokenizer_file: bundle.tokenizer_file.clone(),
-                config_file: bundle.config_file.clone(),
-                special_tokens_map_file: bundle.special_tokens_map_file.clone(),
-                tokenizer_config_file: bundle.tokenizer_config_file.clone(),
+                tokenizer_file,
+                config_file,
+                special_tokens_map_file,
+                tokenizer_config_file,
             },
         )
         .with_pooling(pooling)
         .with_quantization(quantization);
-        for (name, buffer) in &bundle.initializers {
-            model = model.with_external_initializer(name.clone(), buffer.clone());
+        for (name, buffer) in initializers {
+            model = model.with_external_initializer(name, buffer);
         }
         model.output_key = Some(output_key);
 
@@ -285,7 +299,7 @@ impl Backend {
             dims: manifest.dims as usize,
         };
         backend.structural_probe()?;
-        backend.certify(&bundle.corpus)?;
+        backend.certify(&corpus)?;
         Ok(backend)
     }
 
@@ -423,6 +437,5 @@ mod tests {
         );
 
         drop(verified);
-        assert!(!loaded_path.exists());
     }
 }

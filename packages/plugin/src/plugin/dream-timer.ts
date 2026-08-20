@@ -287,6 +287,17 @@ function runTick(origin: "startup" | "interval"): void {
         log(`[dreamer] timer tick (${origin}) skipped — previous tick still running`);
         return;
     }
+    // A startup wave's passes run on `startupQueue`, outside the tick that
+    // scheduled them, so `tickInProgress` is already clear while the wave
+    // drains — and one wave can outlast DREAM_TIMER_INTERVAL_MS, because it
+    // spends a whole CHUNK_BACKFILL_TICK_BUDGET_MS plus its memory and git
+    // drains. An interval pass drives the same provider and database, so it
+    // yields to the wave; periodic maintenance it skips is picked up by the
+    // next interval, whereas queueing it behind the wave builds a backlog.
+    if (origin === "interval" && startupQueueDepth > 0) {
+        log(`[dreamer] timer tick (${origin}) skipped — startup wave still draining`);
+        return;
+    }
     log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
     tickInProgress = true;
     void (async () => {

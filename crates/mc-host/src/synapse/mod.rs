@@ -741,10 +741,14 @@ impl SecondaryComponent for SynapseComponent {
                 library: config.ort_library.clone(),
                 sha256: config.ort_library_sha256.clone(),
             };
+            // The advertised lane summary is derived from the manifest before
+            // the bundle moves into the backend, which consumes it so the
+            // weight buffers are never duplicated.
+            let lane = LaneInfo::from_manifest(&bundle.manifest);
             let backend =
-                Backend::load(&bundle, &ort).map_err(|e| bundle::BundleError(e.to_string()))?;
+                Backend::load(bundle, &ort).map_err(|e| bundle::BundleError(e.to_string()))?;
             Ok::<_, bundle::BundleError>(ReadyLane {
-                lane: LaneInfo::from_manifest(&bundle.manifest),
+                lane,
                 backend: Arc::new(backend),
             })
         });

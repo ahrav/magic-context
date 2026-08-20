@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use super::jobs::BatchItem;
 use super::LaneInfo;
 use super::SynapseLimits;
+use crate::control::check_string;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 256;
@@ -289,9 +290,7 @@ fn parse_query(
         params.accept_declared,
         lane,
     )?;
-    if params.text.is_empty() || params.text.len() > limits.max_text_bytes {
-        return Err(schema("text length out of bounds"));
-    }
+    check_string("text", &params.text, limits.max_text_bytes, true).map_err(schema)?;
     if let Some(ms) = params.deadline_ms {
         if ms == 0 || ms > MAX_DEADLINE_MS {
             return Err(schema("deadline_ms out of bounds"));
@@ -325,12 +324,8 @@ fn parse_batch(
     let mut items = Vec::with_capacity(params.items.len());
     let mut total_text_bytes = 0usize;
     for raw in &params.items {
-        if raw.0.id.is_empty() || raw.0.id.len() > MAX_ID_BYTES {
-            return Err(schema("item id length out of bounds"));
-        }
-        if raw.0.text.is_empty() || raw.0.text.len() > limits.max_text_bytes {
-            return Err(schema("item text length out of bounds"));
-        }
+        check_string("item id", &raw.0.id, MAX_ID_BYTES, true).map_err(schema)?;
+        check_string("item text", &raw.0.text, limits.max_text_bytes, true).map_err(schema)?;
         total_text_bytes += raw.0.text.len();
         // Recomputed, never trusted: a wrong supplied hash would poison the
         // durable ledger's content identity.
@@ -373,18 +368,14 @@ fn parse_result(params: ResultParams<'_>, lane: &LaneInfo) -> Result<Request, Re
         params.accept_declared,
         lane,
     )?;
-    if params.job_id.is_empty() || params.job_id.len() > MAX_JOB_ID_BYTES {
-        return Err(schema("job_id length out of bounds"));
-    }
+    check_string("job_id", &params.job_id, MAX_JOB_ID_BYTES, true).map_err(schema)?;
     if !is_lower_hex_64(&params.request_key) {
         return Err(schema("request_key must be 64 lowercase hex characters"));
     }
     let cursor = match params.cursor {
         None => None,
         Some(cursor) => {
-            if cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES {
-                return Err(schema("cursor length out of bounds"));
-            }
+            check_string("cursor", &cursor, MAX_CURSOR_BYTES, true).map_err(schema)?;
             Some(cursor.into_owned())
         }
     };

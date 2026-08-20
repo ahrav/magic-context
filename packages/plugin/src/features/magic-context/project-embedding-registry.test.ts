@@ -2062,6 +2062,47 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
     });
 
+    it("reopens a conflicted page on the provider's configured batch timeout", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-reopen-deadline";
+        const host = new DetailedSynapseTestHost();
+        // detailedSynapseTestProvider configures batchTimeoutMs, so the lane's
+        // page deadlines sit far below the provider's own default.
+        const configuredTimeoutMs = 5_000;
+        const memories = ["d1", "d2"].map((content) => {
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content,
+            });
+            return { id: memory.id, content: memory.content };
+        });
+        registerDetailed(db, projectIdentity, host);
+
+        const first = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+        expect(first?.size).toBe(2);
+        db.prepare("DELETE FROM memory_embeddings WHERE model_id = ?").run(
+            SYNAPSE_TEST_LANE_IDENTITY,
+        );
+
+        const before = Date.now();
+        const second = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+        const after = Date.now();
+
+        expect(second?.size).toBe(2);
+        const deadlines = (
+            db.prepare("SELECT deadline_at FROM synapse_batch_ledger ORDER BY id").all() as Array<{
+                deadline_at: number | null;
+            }>
+        ).map((row) => row.deadline_at);
+        expect(deadlines.length).toBe(1);
+        for (const deadline of deadlines) {
+            expect(deadline).not.toBeNull();
+            expect(deadline as number).toBeGreaterThanOrEqual(before + configuredTimeoutMs);
+            expect(deadline as number).toBeLessThanOrEqual(after + configuredTimeoutMs);
+        }
+    });
+
     it("commit drain routes through receipts and completes only with the vector write", async () => {
         const db = useTempDb();
         const projectIdentity = "git:detailed-commit";

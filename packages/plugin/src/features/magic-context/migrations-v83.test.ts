@@ -326,6 +326,55 @@ describe("migration v83: context-complete synapse batch ledger", () => {
         }
     });
 
+    test("a rerun that finds the staging copy beside the new shape completes the invalidation", () => {
+        const dbPath = fileDbPath("migrations-v83-interrupted-");
+        const db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA foreign_keys=ON");
+            initializeDatabase(db);
+            runMigrations(db);
+            // An attempt interrupted between the destination invalidation and
+            // the staging drop: the ledger already carries the v83 shape, the
+            // staging copy is still present, and the version row is absent, so
+            // the next open replays v83 and must finish the invalidation.
+            db.exec("DELETE FROM schema_migrations WHERE version >= 83");
+            db.exec(
+                "CREATE TABLE synapse_batch_ledger_legacy_v81 AS SELECT * FROM synapse_batch_ledger",
+            );
+            insertMemoryEmbedding(db, "synapse:v1:abc123");
+            insertMemoryEmbedding(db, "local-model");
+            insertChunkEmbedding(db, "synapse:v1:abc123", "");
+            insertChunkEmbedding(db, "local-model", "");
+
+            runMigrations(db);
+
+            const memoryModels = (
+                db
+                    .prepare("SELECT model_id FROM memory_embeddings ORDER BY model_id")
+                    .all() as Array<{ model_id: string }>
+            ).map((row) => row.model_id);
+            expect(memoryModels).toEqual(["local-model"]);
+            const chunkModels = (
+                db
+                    .prepare("SELECT model_id FROM compartment_chunk_embeddings ORDER BY model_id")
+                    .all() as Array<{ model_id: string }>
+            ).map((row) => row.model_id);
+            expect(chunkModels).toEqual(["local-model"]);
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE name = 'synapse_batch_ledger_legacy_v81'",
+                    )
+                    .get(),
+            ).toBeNull();
+            expect(
+                db.prepare("SELECT 1 FROM schema_migrations WHERE version = 83").get(),
+            ).not.toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("fresh database gets the v83 shape and live-identity uniqueness", () => {
         const db = new Database(":memory:");
         try {

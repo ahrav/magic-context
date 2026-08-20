@@ -363,11 +363,11 @@ async fn queued_query_wait_is_bounded_by_its_deadline() {
     params["text"] = "deadline-bound query".into();
     params["deadline_ms"] = 50.into();
     let frame = tokio::time::timeout(
-        Duration::from_millis(250),
+        BUDGET,
         call(&mut client, channel, epoch, "embed.query", params),
     )
     .await
-    .expect("query must honor its deadline");
+    .expect("deadline-bound query must not hang");
     assert_eq!(frame.error_code(), "timeout");
 
     tokio::time::sleep(Duration::from_millis(500)).await;

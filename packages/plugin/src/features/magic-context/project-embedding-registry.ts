@@ -1487,8 +1487,25 @@ interface DetailedLane {
     modelId: string;
     /** Storage model id for chunk destination rows. */
     chunkModelId: string;
+    /** Page timeout this lane's provider applies to the deadlines it writes.
+     *  A reopen rewrites the deadline of the very row the provider created, so
+     *  both deadlines must come from one basis: a provider running a non-default
+     *  timeout would otherwise poll a page against its own budget while the row
+     *  advertises a lease from an unrelated one. */
+    batchTimeoutMs: number;
     /** True while the registration that produced this lane is still current. */
     stillCurrent: () => boolean;
+}
+
+/** Page timeout the provider itself resolves for its ledger deadlines. Reading
+ *  it keeps a reopened row on the same deadline basis the provider used to open
+ *  it; a provider that does not publish one is a non-journaling lane, which
+ *  falls back to the same default the ledger helpers assume. */
+function providerBatchTimeoutMs(provider: EmbeddingProvider): number {
+    const published = (provider as unknown as { pageTimeoutMs?: unknown }).pageTimeoutMs;
+    return typeof published === "number" && Number.isFinite(published) && published > 0
+        ? published
+        : SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
 }
 
 /** Resolve the lane's provider only when it can journal versioned receipts.
@@ -1508,6 +1525,7 @@ function getDetailedLane(
             sessionId: `shadow:${projectIdentity}`,
             modelId: registration.modelId,
             chunkModelId: registration.chunkModelId,
+            batchTimeoutMs: providerBatchTimeoutMs(provider),
             stillCurrent: () => shadowRegistrations.get(projectIdentity) === registration,
         };
     }
@@ -1523,6 +1541,7 @@ function getDetailedLane(
         sessionId: projectIdentity,
         modelId: registration.modelId,
         chunkModelId: registration.chunkModelId,
+        batchTimeoutMs: providerBatchTimeoutMs(provider),
         stillCurrent: () => {
             const current = projectRegistrations.get(projectIdentity);
             return (
@@ -1601,7 +1620,7 @@ async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<strin
             const probe = spec.makeDestinationProbe();
             const reopened = reopenCompleteSynapseLedgerGroupWithProof(db, {
                 rowIds,
-                deadlineAt: Date.now() + SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
+                deadlineAt: Date.now() + lane.batchTimeoutMs,
                 destinationState: probe.state,
                 invalidateDestination: probe.invalidate,
             });
