@@ -772,74 +772,76 @@ export function createCtxMemoryTool(
 					: "active";
 
 				let canonicalMemory!: Memory;
-				deps.db.transaction(() => {
-					let canonicalContentChanged = false;
-					if (canonicalExisting) {
-						// One of the source memories already has the merged content.
-						// Update it in place to absorb stats from the others.
-						canonicalMemory = canonicalExisting;
-						canonicalContentChanged =
-							canonicalMemory.content !== content ||
-							canonicalMemory.normalizedHash !== normalizedHash;
-						if (canonicalContentChanged) {
-							updateMemoryContent(
-								deps.db,
-								canonicalMemory.id,
+				deps.db
+					.transaction(() => {
+						let canonicalContentChanged = false;
+						if (canonicalExisting) {
+							// One of the source memories already has the merged content.
+							// Update it in place to absorb stats from the others.
+							canonicalMemory = canonicalExisting;
+							canonicalContentChanged =
+								canonicalMemory.content !== content ||
+								canonicalMemory.normalizedHash !== normalizedHash;
+							if (canonicalContentChanged) {
+								updateMemoryContent(
+									deps.db,
+									canonicalMemory.id,
+									content,
+									normalizedHash,
+								);
+							}
+						} else {
+							// Insert a fresh canonical memory with the merged content.
+							canonicalMemory = insertMemory(deps.db, {
+								projectPath: projectIdentity,
+								category,
 								content,
-								normalizedHash,
-							);
+								sourceSessionId: sessionId,
+								sourceType: dreamerAllowed ? "dreamer" : "agent",
+							});
 						}
-					} else {
-						// Insert a fresh canonical memory with the merged content.
-						canonicalMemory = insertMemory(deps.db, {
-							projectPath: projectIdentity,
-							category,
-							content,
-							sourceSessionId: sessionId,
-							sourceType: dreamerAllowed ? "dreamer" : "agent",
-						});
-					}
 
-					mergeMemoryStats(
-						deps.db,
-						canonicalMemory.id,
-						mergedSeenCount,
-						mergedRetrievalCount,
-						mergedFrom,
-						mergedStatus,
-					);
+						mergeMemoryStats(
+							deps.db,
+							canonicalMemory.id,
+							mergedSeenCount,
+							mergedRetrievalCount,
+							mergedFrom,
+							mergedStatus,
+						);
 
-					for (const memory of sourceMemories) {
-						if (memory.id === canonicalMemory.id) {
-							continue;
+						for (const memory of sourceMemories) {
+							if (memory.id === canonicalMemory.id) {
+								continue;
+							}
+							supersededMemory(deps.db, memory.id, canonicalMemory.id);
+							queueMemoryMutation(deps.db, {
+								// Normalize the stored path to the resolved identity
+								// before queueing — the render-side mutation-log reader
+								// matches exact project_path, and OpenCode + dashboard
+								// both normalize first. A legacy raw filesystem path here
+								// would write a row that normalized git:/dir: sessions
+								// never read (the supersede delta would silently vanish).
+								projectPath: normalizeStoredProjectPath(memory.projectPath),
+								mutationType: "superseded",
+								targetMemoryId: memory.id,
+								supersededById: canonicalMemory.id,
+							});
 						}
-						supersededMemory(deps.db, memory.id, canonicalMemory.id);
-						queueMemoryMutation(deps.db, {
-							// Normalize the stored path to the resolved identity
-							// before queueing — the render-side mutation-log reader
-							// matches exact project_path, and OpenCode + dashboard
-							// both normalize first. A legacy raw filesystem path here
-							// would write a row that normalized git:/dir: sessions
-							// never read (the supersede delta would silently vanish).
-							projectPath: normalizeStoredProjectPath(memory.projectPath),
-							mutationType: "superseded",
-							targetMemoryId: memory.id,
-							supersededById: canonicalMemory.id,
-						});
-					}
 
-					if (canonicalExisting && canonicalContentChanged) {
-						queueMemoryMutation(deps.db, {
-							projectPath: normalizeStoredProjectPath(
-								canonicalMemory.projectPath,
-							),
-							mutationType: "update",
-							targetMemoryId: canonicalMemory.id,
-							category,
-							newContent: content,
-						});
-					}
-				})();
+						if (canonicalExisting && canonicalContentChanged) {
+							queueMemoryMutation(deps.db, {
+								projectPath: normalizeStoredProjectPath(
+									canonicalMemory.projectPath,
+								),
+								mutationType: "update",
+								targetMemoryId: canonicalMemory.id,
+								category,
+								newContent: content,
+							});
+						}
+					})
+					.immediate();
 
 				queueEmbedding({
 					deps,

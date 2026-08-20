@@ -11,6 +11,7 @@ import {
     ensureContextStoreUuid,
     ensureLiveMemoryResnapshot,
     getAuthorityManagedMarker,
+    getMirrorCursor,
     getModuleNoteEvaluationBridge,
     installAuthorityManagedMarker,
     prepareAuthority,
@@ -19,7 +20,11 @@ import {
     registerModuleNoteEvaluationBridge,
 } from "./context-authority";
 import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/storage-memory";
-import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
+import {
+    clearMemoryClaimFailpoints,
+    runInMemoryClaimsWriteTransaction,
+    setMemoryClaimFailpoint,
+} from "./memory/storage-memory-claims";
 import { getMemoryVerifications } from "./memory/storage-memory-verifications";
 import { runMigrations } from "./migrations";
 import { resolveMemoriesByIdsForSearch, unifiedSearch } from "./search";
@@ -1182,6 +1187,20 @@ describe("memory authority protocol", () => {
                     .all(),
                 cursor: database
                     .prepare("SELECT domain, cursor FROM mirror_cursors ORDER BY domain")
+                    .all(),
+                claimOperations: database
+                    .prepare("SELECT producer, operation_key FROM claim_operations ORDER BY id")
+                    .all(),
+                claimOutbox: database
+                    .prepare("SELECT effect_key, effect_type FROM claim_change_outbox ORDER BY id")
+                    .all(),
+                claimGenerations: database
+                    .prepare(
+                        "SELECT project_id, generation FROM claim_project_generations ORDER BY project_id",
+                    )
+                    .all(),
+                crosswalk: database
+                    .prepare("SELECT * FROM legacy_memory_claims ORDER BY memory_id")
                     .all(),
             });
         const before = snapshotTables();
@@ -2843,5 +2862,387 @@ describe("memory authority protocol", () => {
                 },
             }),
         ).toThrow(/memory_stats row missing for memory 8/);
+    });
+});
+
+describe("module mirror claims (v83)", () => {
+    const MODULE_PROJECT = "git:mirror-module";
+
+    function moduleSnapshot(
+        id: number,
+        content: string,
+        hash: string,
+        extra: Record<string, unknown> = {},
+    ): Record<string, unknown> {
+        return {
+            id,
+            project_path: MODULE_PROJECT,
+            category: "CONSTRAINTS",
+            content,
+            normalized_hash: hash,
+            importance: 50,
+            scope: "project",
+            shareable: 0,
+            source_session_id: null,
+            source_type: "agent",
+            seen_count: 1,
+            retrieval_count: 0,
+            first_seen_at: 0,
+            created_at: 0,
+            updated_at: 1,
+            last_seen_at: 1,
+            last_retrieved_at: null,
+            status: "active",
+            expires_at: null,
+            verification_status: "unverified",
+            verified_at: null,
+            classified_at: null,
+            superseded_by_memory_id: null,
+            merged_from: null,
+            metadata_json: null,
+            context_store_uuid: null,
+            context_row_id: null,
+            mural_cue: null,
+            mural_cue_hash: null,
+            mural_cue_at: null,
+            mural_cue_rejection_count: 0,
+            ...extra,
+        };
+    }
+
+    function page(
+        cursor: number,
+        rows: Array<{
+            feedSeq: number;
+            op: "insert" | "update" | "tombstone";
+            moduleRowId: number;
+            snapshot: Record<string, unknown>;
+        }>,
+    ): ChangefeedPage {
+        return {
+            domain: "memories",
+            cursor,
+            next_cursor: rows.at(-1)?.feedSeq ?? cursor,
+            has_more: false,
+            rows: rows.map((row) => ({
+                feed_seq: row.feedSeq,
+                domain: "memories" as const,
+                op: row.op,
+                module_row_id: row.moduleRowId,
+                full_row_snapshot: row.snapshot,
+                content_hash: String(row.snapshot.normalized_hash ?? ""),
+            })),
+        };
+    }
+
+    function claimState(database: Database) {
+        return {
+            revisions: (
+                database.prepare("SELECT COUNT(*) AS c FROM claim_revisions").get() as {
+                    c: number;
+                }
+            ).c,
+            crosswalk: database
+                .prepare(
+                    "SELECT memory_id, canonical_memory_id, claim_id FROM legacy_memory_claims ORDER BY memory_id",
+                )
+                .all() as Array<{ memory_id: number; canonical_memory_id: number }>,
+            outbox: database
+                .prepare(
+                    "SELECT effect_key, effect_type, generation FROM claim_change_outbox ORDER BY id",
+                )
+                .all() as Array<{ effect_key: string; effect_type: string; generation: number }>,
+            generations: database
+                .prepare(
+                    "SELECT project_id, generation FROM claim_project_generations ORDER BY project_id",
+                )
+                .all() as Array<{ project_id: number; generation: number }>,
+            conflicts: (
+                database.prepare("SELECT COUNT(*) AS c FROM claim_conflicts").get() as {
+                    c: number;
+                }
+            ).c,
+        };
+    }
+
+    function resetCursorForReplay(database: Database): void {
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare("UPDATE mirror_cursors SET cursor = 0 WHERE domain = 'memories'")
+                .run();
+        });
+    }
+
+    test("a module insert commits claim, projection, outbox, generation, and feed cursor in one transaction", () => {
+        const database = db();
+        applyMirrorPage({
+            db: database,
+            page: page(0, [
+                {
+                    feedSeq: 1,
+                    op: "insert",
+                    moduleRowId: 11,
+                    snapshot: moduleSnapshot(11, "module fact", "mm-h1"),
+                },
+            ]),
+        });
+
+        const memory = database
+            .prepare(
+                "SELECT id, content, project_path FROM memories WHERE normalized_hash = 'mm-h1'",
+            )
+            .get() as { id: number; content: string; project_path: string };
+        expect(memory.content).toBe("module fact");
+        expect(memory.project_path).toBe(MODULE_PROJECT);
+
+        const state = claimState(database);
+        expect(state.revisions).toBe(1);
+        expect(state.crosswalk).toEqual([
+            expect.objectContaining({ memory_id: memory.id, canonical_memory_id: memory.id }),
+        ]);
+        expect(state.outbox).toEqual([
+            { effect_key: `memory:${memory.id}:upsert`, effect_type: "upsert", generation: 1 },
+        ]);
+        expect(state.generations).toEqual([expect.objectContaining({ generation: 1 })]);
+        expect(
+            database
+                .prepare("SELECT producer, operation_key FROM claim_operations ORDER BY id")
+                .all(),
+        ).toEqual([
+            { producer: "module-mirror", operation_key: `memories:${MODULE_PROJECT}:11:1` },
+        ]);
+        const metadata = database
+            .prepare(
+                `SELECT meta.category, meta.normalized_hash FROM claim_revision_memory_metadata meta`,
+            )
+            .get();
+        expect(metadata).toEqual({ category: "CONSTRAINTS", normalized_hash: "mm-h1" });
+        expect(getMirrorCursor(database, "memories")).toBe(1);
+    });
+
+    test("a content-changing snapshot appends one revision; telemetry-only and exact replay append none", () => {
+        const database = db();
+        const insertPage = page(0, [
+            {
+                feedSeq: 1,
+                op: "insert",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "v1", "mm-h1"),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: insertPage });
+
+        const contentPage = page(1, [
+            {
+                feedSeq: 2,
+                op: "update",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "v2", "mm-h2"),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: contentPage });
+        const afterContent = claimState(database);
+        expect(afterContent.revisions).toBe(2);
+        expect(afterContent.outbox).toHaveLength(2);
+        expect(afterContent.generations).toEqual([expect.objectContaining({ generation: 2 })]);
+
+        // Telemetry-only: new feed sequence, unchanged semantic state.
+        const telemetryPage = page(2, [
+            {
+                feedSeq: 3,
+                op: "update",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "v2", "mm-h2", {
+                    seen_count: 7,
+                    last_seen_at: 900,
+                    updated_at: 900,
+                }),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: telemetryPage });
+        const afterTelemetry = claimState(database);
+        expect(afterTelemetry.revisions).toBe(2);
+        expect(afterTelemetry.outbox).toHaveLength(2);
+        expect(afterTelemetry.generations).toEqual([expect.objectContaining({ generation: 2 })]);
+        expect(database.prepare("SELECT seen_count FROM memory_stats").get()).toEqual({
+            seen_count: 7,
+        });
+
+        // Exact replay of every applied page from cursor zero.
+        const before = JSON.stringify(claimState(database));
+        resetCursorForReplay(database);
+        applyMirrorPage({ db: database, page: insertPage });
+        applyMirrorPage({ db: database, page: contentPage });
+        applyMirrorPage({ db: database, page: telemetryPage });
+        expect(JSON.stringify(claimState(database))).toBe(before);
+        expect(getMirrorCursor(database, "memories")).toBe(3);
+    });
+
+    test("a module tombstone adopts an unlinked preimage, retires the claim, removes the projection, and commits the cursor", () => {
+        const database = db();
+        const memoryId = runInMemoryClaimsWriteTransaction(database, () => {
+            const result = database
+                .prepare(
+                    `INSERT INTO memories (project_path, category, content, normalized_hash,
+                        first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (?, 'CONSTRAINTS', 'preimage fact', 'mm-pre', 1, 1, 1, 1)`,
+                )
+                .run(MODULE_PROJECT) as { lastInsertRowid: number | bigint };
+            return Number(result.lastInsertRowid);
+        });
+        expect(database.prepare("SELECT COUNT(*) AS c FROM legacy_memory_claims").get()).toEqual({
+            c: 0,
+        });
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 31, ?)",
+                )
+                .run(MODULE_PROJECT, memoryId);
+        });
+
+        applyMirrorPage({
+            db: database,
+            page: page(0, [
+                {
+                    feedSeq: 1,
+                    op: "tombstone",
+                    moduleRowId: 31,
+                    snapshot: moduleSnapshot(31, "preimage fact", "mm-pre"),
+                },
+            ]),
+        });
+
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM memories WHERE id = ?").get(memoryId),
+        ).toEqual({ c: 0 });
+        const link = database
+            .prepare("SELECT memory_id, claim_id FROM legacy_memory_claims WHERE memory_id = ?")
+            .get(memoryId) as { claim_id: number };
+        expect(link).toBeDefined();
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(link.claim_id),
+        ).toEqual({ state: "archived" });
+        expect(
+            database
+                .prepare("SELECT content FROM claim_revisions WHERE claim_id = ?")
+                .all(link.claim_id),
+        ).toEqual([{ content: "preimage fact" }]);
+        expect(claimState(database).outbox).toEqual([
+            { effect_key: `memory:${memoryId}:lifecycle`, effect_type: "lifecycle", generation: 1 },
+        ]);
+        expect(getMirrorCursor(database, "memories")).toBe(1);
+    });
+
+    test("store.db may already be committed while context.db is pending: a mid-page failure rolls back the whole page and the replayed page converges", () => {
+        const database = db();
+        // The module committed this page to store.db before mirroring; the
+        // context.db application is the only side under test here — the two
+        // databases share no transaction.
+        const twoRowPage = page(0, [
+            {
+                feedSeq: 1,
+                op: "insert",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "first", "mm-h1"),
+            },
+            {
+                feedSeq: 2,
+                op: "insert",
+                moduleRowId: 12,
+                snapshot: moduleSnapshot(12, "second", "mm-h2"),
+            },
+        ]);
+        let claimHits = 0;
+        setMemoryClaimFailpoint("memory-claim.010.claim.after", () => {
+            claimHits += 1;
+            if (claimHits === 2) throw new Error("injected mid-page failure");
+        });
+        try {
+            expect(() => applyMirrorPage({ db: database, page: twoRowPage })).toThrow(
+                /injected mid-page failure/,
+            );
+        } finally {
+            clearMemoryClaimFailpoints();
+        }
+
+        // Complete pre-page state: nothing from either row survived.
+        expect(database.prepare("SELECT COUNT(*) AS c FROM memories").get()).toEqual({ c: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS c FROM claims").get()).toEqual({ c: 0 });
+        expect(database.prepare("SELECT COUNT(*) AS c FROM claim_operations").get()).toEqual({
+            c: 0,
+        });
+        expect(database.prepare("SELECT COUNT(*) AS c FROM claim_change_outbox").get()).toEqual({
+            c: 0,
+        });
+        expect(getMirrorCursor(database, "memories")).toBe(0);
+
+        // The module replays the same committed page; context.db converges.
+        applyMirrorPage({ db: database, page: twoRowPage });
+        expect(database.prepare("SELECT COUNT(*) AS c FROM memories").get()).toEqual({ c: 2 });
+        const state = claimState(database);
+        expect(state.revisions).toBe(2);
+        expect(state.outbox).toHaveLength(2);
+        expect(getMirrorCursor(database, "memories")).toBe(2);
+    });
+
+    test("a pending supersession resolves when its target arrives without duplicate lineage on replay", () => {
+        const database = db();
+        const sourcePage = page(0, [
+            {
+                feedSeq: 1,
+                op: "insert",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "old fact", "mm-h1", {
+                    superseded_by_memory_id: 12,
+                    status: "archived",
+                }),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: sourcePage });
+        expect(claimState(database).conflicts).toBe(0);
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 1 });
+
+        const targetPage = page(1, [
+            {
+                feedSeq: 2,
+                op: "insert",
+                moduleRowId: 12,
+                snapshot: moduleSnapshot(12, "new fact", "mm-h2"),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: targetPage });
+        const sourceId = (
+            database.prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-h1'").get() as {
+                id: number;
+            }
+        ).id;
+        const targetId = (
+            database.prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-h2'").get() as {
+                id: number;
+            }
+        ).id;
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ s: targetId });
+        expect(claimState(database).conflicts).toBe(1);
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key = ?")
+                .get(`memories:supersede:${sourceId}:${targetId}`),
+        ).toEqual({ c: 1 });
+
+        // Page replay re-creates and re-resolves the pending reference.
+        resetCursorForReplay(database);
+        applyMirrorPage({ db: database, page: sourcePage });
+        applyMirrorPage({ db: database, page: targetPage });
+        expect(claimState(database).conflicts).toBe(1);
+        expect(database.prepare("SELECT COUNT(*) AS c FROM claim_merge_lineage").get()).toEqual({
+            c: 0,
+        });
     });
 });

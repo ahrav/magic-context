@@ -1,9 +1,19 @@
+import { randomUUID } from "node:crypto";
 import type { Database } from "../../shared/sqlite";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 import {
+    computeClaimRequestDigest,
+    ensureMemoryClaimLinkInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
+    type MemoryClaimEffect,
+    readMemoryClaimLink,
+    recordMemoryClaimSupersessionInCurrentTransaction,
+    resolveMemoryClaimProjectInCurrentTransaction,
+    retireMemoryClaimInCurrentTransaction,
+    runMemoryClaimOperationInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
 } from "./memory/storage-memory-claims";
+import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
 import {
     applyIdentityMergeToProjectRegistry,
     discoverIdentityTables,
@@ -137,6 +147,86 @@ function logRow(
     ).run(fromIdentity, toIdentity, tableName, rowId, action, targetRowId, mergedAt);
 }
 
+function adoptIdentityMergeRowClaims(
+    db: Database,
+    sourceId: number,
+    collisionTargetId: number | null,
+    toIdentity: string,
+): void {
+    const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
+    if (projectId === null) return;
+    const sourceRow = readMemoryProjectionRow(db, sourceId);
+    if (!sourceRow || sourceRow.content.length === 0) return;
+    runMemoryClaimOperationInCurrentTransaction(
+        db,
+        {
+            producer: "identity-merge",
+            operationKey: `merge-row:${randomUUID()}`,
+            requestDigest: computeClaimRequestDigest({ sourceId, collisionTargetId, toIdentity }),
+        },
+        () => {
+            const effects: MemoryClaimEffect[] = [];
+            if (collisionTargetId === null) {
+                // Adoption must precede the caller's project_path UPDATE: an
+                // unlinked boundary row would trip the v83 identity-move guard.
+                const wasLinked = readMemoryClaimLink(db, sourceId) !== null;
+                const link = ensureMemoryClaimLinkInCurrentTransaction(db, sourceRow, projectId, {
+                    kind: "migration",
+                });
+                if (!wasLinked) {
+                    effects.push({
+                        effectKey: `memory:${sourceId}:upsert`,
+                        projectId,
+                        claimId: link.claimId,
+                        effectType: "upsert" as const,
+                    });
+                }
+                return { result: link.claimId, effects };
+            }
+            const targetRow = readMemoryProjectionRow(db, collisionTargetId);
+            if (!targetRow || targetRow.content.length === 0) {
+                return { result: null, effects };
+            }
+            const targetWasLinked = readMemoryClaimLink(db, collisionTargetId) !== null;
+            const targetLink = ensureMemoryClaimLinkInCurrentTransaction(db, targetRow, projectId, {
+                kind: "migration",
+            });
+            if (!targetWasLinked) {
+                effects.push({
+                    effectKey: `memory:${collisionTargetId}:upsert`,
+                    projectId,
+                    claimId: targetLink.claimId,
+                    effectType: "upsert" as const,
+                });
+            }
+            let sourceLink = readMemoryClaimLink(db, sourceId);
+            if (!sourceLink) {
+                sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
+                    db,
+                    sourceRow,
+                    projectId,
+                    { kind: "migration" },
+                    { adoptDivergentContent: false },
+                );
+            }
+            if (sourceLink.claimId !== targetLink.claimId) {
+                // A colliding source with its own claim retires it with
+                // supersession lineage; two active claims must not survive for
+                // one surviving fact.
+                retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, "identity-merge");
+                recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink);
+                effects.push({
+                    effectKey: `memory:${sourceId}:lifecycle`,
+                    projectId: sourceLink.projectId,
+                    claimId: sourceLink.claimId,
+                    effectType: "lifecycle" as const,
+                });
+            }
+            return { result: targetLink.claimId, effects };
+        },
+    );
+}
+
 function mergeMemoryRow(
     db: Database,
     row: SqliteRow,
@@ -167,6 +257,9 @@ function mergeMemoryRow(
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
+        if (hasMemoryClaimsCompatSchema(db)) {
+            adoptIdentityMergeRowClaims(db, sourceId, targetId, toIdentity);
+        }
         const mergedSeen = Math.max(
             effectiveSeenCount(targetId, collision.seen_count),
             effectiveSeenCount(sourceId, row.seen_count),
@@ -251,6 +344,9 @@ function mergeMemoryRow(
         return true;
     }
 
+    if (hasMemoryClaimsCompatSchema(db)) {
+        adoptIdentityMergeRowClaims(db, sourceId, null, toIdentity);
+    }
     const result = db
         .prepare("UPDATE memories SET project_path = ? WHERE id = ? AND project_path = ?")
         .run(toIdentity, sourceId, fromIdentity) as { changes?: number };

@@ -3184,11 +3184,11 @@ export const MIGRATIONS: Migration[] = [
                 .prepare(
                     "SELECT value FROM schema_migrations_meta WHERE key = 'v22_legacy_memory_backfill'",
                 )
-                .get() as { value: string } | undefined;
-            writeMeta.run(
-                CLAIMS_BACKFILL_META_KEYS.v22Takeover,
-                v22Status && v22Status.value !== "complete" ? "pending" : "none",
-            );
+                .get() as { value: string } | null | undefined;
+            const v22Pending =
+                v22Status != null &&
+                (v22Status.value === "pending" || v22Status.value === "completed_with_failures");
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.v22Takeover, v22Pending ? "pending" : "none");
             if (corpus.count === 0) {
                 // An empty corpus completes synchronously in the migration
                 // (R7): there is nothing to convert, so the completion

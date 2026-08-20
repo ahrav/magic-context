@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
 import {
     effectiveSeenCountSql,
@@ -5,9 +6,20 @@ import {
     requireEffectiveSeenCount,
 } from "./storage-memory";
 import {
+    computeClaimRequestDigest,
+    ensureMemoryClaimLinkInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
+    type MemoryClaimEffect,
+    type MemoryClaimLink,
+    type MemoryClaimOperationEnvelope,
+    readMemoryClaimLink,
+    recordMemoryClaimSupersessionInCurrentTransaction,
+    resolveMemoryClaimProjectInCurrentTransaction,
+    retireMemoryClaimInCurrentTransaction,
+    runMemoryClaimOperationInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
 } from "./storage-memory-claims";
+import { readMemoryProjectionRow } from "./storage-memory-projection";
 import type { MemoryStatus } from "./types";
 
 /**
@@ -76,6 +88,204 @@ export function rekeyMemoryRowWithCollisionMerge(
     return rekeyMemoryRowWithCollisionMergeInner(db, rowId, fromProjectPath, toIdentity);
 }
 
+const RELOCATION_PRODUCER = "memory-relocation";
+
+function relocationEnvelope(operation: string, request: unknown): MemoryClaimOperationEnvelope {
+    return {
+        producer: RELOCATION_PRODUCER,
+        operationKey: `${operation}:${randomUUID()}`,
+        requestDigest: computeClaimRequestDigest(request),
+    };
+}
+
+/**
+ * Claim adoption for a plain rekey. An unlinked row adopts its preimage
+ * under the TARGET numeric project — the raw source path is what made it
+ * unlinkable — which also satisfies the v83 boundary identity guard before
+ * the project_path UPDATE runs. A row already linked to the target project
+ * (the routine dir: → git: adoption) needs nothing: the numeric project and
+ * claims are retained.
+ */
+function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId: number): void {
+    const row = readMemoryProjectionRow(db, rowId);
+    if (!row || row.content.length === 0) return;
+    runMemoryClaimOperationInCurrentTransaction(
+        db,
+        relocationEnvelope("rekey", { rowId, targetProjectId }),
+        () => {
+            const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, targetProjectId, {
+                kind: "migration",
+            });
+            return {
+                result: link.claimId,
+                effects: [
+                    {
+                        effectKey: `memory:${rowId}:upsert`,
+                        projectId: targetProjectId,
+                        claimId: link.claimId,
+                        effectType: "upsert" as const,
+                    },
+                ],
+            };
+        },
+    );
+}
+
+/**
+ * Claim canonicalization for a collision merge: the surviving target row
+ * owns (or adopts) the canonical claim, the deleted source row records its
+ * link to that canonical claim (duplicate crosswalk link), and a source that
+ * carried its OWN claim retires it with supersession lineage. The source
+ * bytes stay retained on the duplicate link's root observation, so the
+ * canonical claim keeps reflecting the surviving projection row.
+ */
+function adoptRelocationMergeClaims(
+    db: Database,
+    sourceId: number,
+    targetId: number,
+    toIdentity: string,
+): void {
+    const targetProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
+    if (targetProjectId === null) return;
+    const targetRow = readMemoryProjectionRow(db, targetId);
+    if (!targetRow || targetRow.content.length === 0) return;
+    const sourceRow = readMemoryProjectionRow(db, sourceId);
+    runMemoryClaimOperationInCurrentTransaction(
+        db,
+        relocationEnvelope("merge", { sourceId, targetId, toIdentity }),
+        () => {
+            const effects: MemoryClaimEffect[] = [];
+            const targetWasLinked = readMemoryClaimLink(db, targetId) !== null;
+            const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
+                db,
+                targetRow,
+                targetProjectId,
+                { kind: "migration" },
+            );
+            if (!targetWasLinked) {
+                effects.push({
+                    effectKey: `memory:${targetId}:upsert`,
+                    projectId: targetProjectId,
+                    claimId: targetLink.claimId,
+                    effectType: "upsert" as const,
+                });
+            }
+            let sourceLink = readMemoryClaimLink(db, sourceId);
+            if (!sourceLink && sourceRow && sourceRow.content.length > 0) {
+                sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
+                    db,
+                    sourceRow,
+                    targetProjectId,
+                    { kind: "migration" },
+                    { adoptDivergentContent: false },
+                );
+            }
+            if (sourceLink && sourceLink.claimId !== targetLink.claimId) {
+                retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
+                recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink);
+                effects.push({
+                    effectKey: `memory:${sourceId}:lifecycle`,
+                    projectId: sourceLink.projectId,
+                    claimId: sourceLink.claimId,
+                    effectType: "lifecycle" as const,
+                });
+            }
+            return { result: targetLink.claimId, effects };
+        },
+    );
+}
+
+/**
+ * Authorized cross-project MOVE of a claim-linked row. The crosswalk is
+ * append-only and keyed by memory id, so a linked row can never re-link to a
+ * second numeric project in place. The move therefore inserts a fresh
+ * projection row at the target (carrying stats, embedding, and verification
+ * mappings), creates the target claim for it, retires the source claim with
+ * cross-project lineage, repoints sibling supersession references, and
+ * deletes the source row — whose durable link survives the delete.
+ */
+function moveLinkedMemoryAcrossProjects(
+    db: Database,
+    rowId: number,
+    fromProjectPath: string,
+    toIdentity: string,
+    targetProjectId: number,
+    sourceLink: MemoryClaimLink,
+): boolean {
+    const current = db.prepare("SELECT project_path FROM memories WHERE id = ?").get(rowId) as
+        | { project_path: string }
+        | undefined;
+    if (current?.project_path !== fromProjectPath) return false;
+
+    const columns = getMemoryCopyColumns(db);
+    const selectExprs = columns.map((c) => (c === "project_path" ? "? AS project_path" : c));
+    const inserted = db
+        .prepare(
+            `INSERT INTO memories (${columns.join(", ")})
+             SELECT ${selectExprs.join(", ")} FROM memories WHERE id = ?`,
+        )
+        .run(toIdentity, rowId) as { lastInsertRowid?: number | bigint };
+    const newId = Number(inserted.lastInsertRowid);
+    if (!Number.isSafeInteger(newId) || newId <= 0) {
+        throw new Error(`cross-project memory move produced no target row for memory ${rowId}`);
+    }
+    db.prepare(
+        `INSERT OR IGNORE INTO memory_embeddings (memory_id, embedding, model_id)
+         SELECT ?, embedding, model_id FROM memory_embeddings WHERE memory_id = ?`,
+    ).run(newId, rowId);
+    if (hasMemoryStatsTable(db)) {
+        db.prepare(
+            `UPDATE memory_stats
+                SET (seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at) =
+                    (SELECT seen_count, retrieval_count, last_seen_at, last_retrieved_at, updated_at
+                       FROM memory_stats WHERE memory_id = ?)
+              WHERE memory_id = ?`,
+        ).run(rowId, newId);
+    }
+    db.prepare(
+        `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+         SELECT ?, file_path, verified_at, mapped_at FROM memory_verifications WHERE memory_id = ?`,
+    ).run(newId, rowId);
+    db.prepare(
+        "UPDATE memories SET superseded_by_memory_id = ? WHERE superseded_by_memory_id = ?",
+    ).run(newId, rowId);
+
+    runMemoryClaimOperationInCurrentTransaction(
+        db,
+        relocationEnvelope("move", { rowId, newId, toIdentity }),
+        () => {
+            const newRow = readMemoryProjectionRow(db, newId);
+            if (!newRow) throw new Error(`moved memory row ${newId} vanished inside its move`);
+            const newLink = ensureMemoryClaimLinkInCurrentTransaction(db, newRow, targetProjectId, {
+                kind: "migration",
+            });
+            retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
+            recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, newLink);
+            return {
+                result: newLink.claimId,
+                effects: [
+                    {
+                        effectKey: `memory:${newId}:upsert`,
+                        projectId: targetProjectId,
+                        claimId: newLink.claimId,
+                        effectType: "upsert" as const,
+                    },
+                    {
+                        effectKey: `memory:${rowId}:lifecycle`,
+                        projectId: sourceLink.projectId,
+                        claimId: sourceLink.claimId,
+                        effectType: "lifecycle" as const,
+                    },
+                ],
+            };
+        },
+    );
+
+    db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(rowId);
+    db.prepare("DELETE FROM memories WHERE id = ?").run(rowId);
+    return true;
+}
+
 function rekeyMemoryRowWithCollisionMergeInner(
     db: Database,
     rowId: number,
@@ -90,6 +300,7 @@ function rekeyMemoryRowWithCollisionMergeInner(
         | { category: string; normalized_hash: string; seen_count: number | null }
         | undefined;
     if (!row) return false;
+    const claimsActive = hasMemoryClaimsCompatSchema(db);
 
     const collision = db
         .prepare(
@@ -123,6 +334,10 @@ function rekeyMemoryRowWithCollisionMergeInner(
                 );
             }
         }
+        // The canonical claim and both crosswalk links must exist BEFORE the
+        // source row deletes: the v83 boundary guard refuses to delete an
+        // unlinked boundary row.
+        if (claimsActive) adoptRelocationMergeClaims(db, rowId, collision.id, toIdentity);
         // Preserve an embedding on the surviving target BEFORE the source row's
         // embedding FK-cascades away on DELETE (memory_embeddings.memory_id
         // REFERENCES memories(id) ON DELETE CASCADE). INSERT OR IGNORE keeps the
@@ -135,6 +350,24 @@ function rekeyMemoryRowWithCollisionMergeInner(
         ).run(collision.id, rowId);
         db.prepare("DELETE FROM memories WHERE id = ?").run(rowId);
         return true;
+    }
+
+    if (claimsActive) {
+        const targetProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
+        if (targetProjectId !== null) {
+            const link = readMemoryClaimLink(db, rowId);
+            if (link && link.projectId !== targetProjectId) {
+                return moveLinkedMemoryAcrossProjects(
+                    db,
+                    rowId,
+                    fromProjectPath,
+                    toIdentity,
+                    targetProjectId,
+                    link,
+                );
+            }
+            if (!link) adoptRelocationRekeyClaim(db, rowId, targetProjectId);
+        }
     }
 
     const result = db
@@ -243,6 +476,10 @@ function copyMemoriesToProjectInner(
                 WHERE memory_id = ?`,
           )
         : null;
+    const claimsActive = hasMemoryClaimsCompatSchema(db);
+    const targetProjectId = claimsActive
+        ? resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity)
+        : null;
     let relocated = 0;
     let skipped = 0;
     for (const id of ids) {
@@ -252,8 +489,14 @@ function copyMemoriesToProjectInner(
         };
         if ((result.changes ?? 0) > 0) {
             relocated += 1;
-            copyEmbeddingStmt.run(Number(result.lastInsertRowid), id);
-            copyStatsStmt?.run(id, Number(result.lastInsertRowid));
+            const newId = Number(result.lastInsertRowid);
+            copyEmbeddingStmt.run(newId, id);
+            copyStatsStmt?.run(id, newId);
+            // The copy is an authorized operation that creates a target
+            // claim; the source row and its claim stay intact.
+            if (targetProjectId !== null) {
+                adoptRelocationRekeyClaim(db, newId, targetProjectId);
+            }
         } else {
             skipped += 1;
         }

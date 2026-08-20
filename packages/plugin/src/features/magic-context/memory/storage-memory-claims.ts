@@ -41,7 +41,6 @@ import {
     readMemoryProjectionRow,
     replaceMemoryProjectionVerificationFiles,
     setMemoryProjectionSuperseded,
-    toSafeChangeCount,
     updateMemoryProjectionClassification,
     updateMemoryProjectionContent,
     updateMemoryProjectionMerge,
@@ -270,11 +269,13 @@ export function runMemoryClaimOperationInCurrentTransaction<T>(
     );
 
     const generationByProject = new Map<number, number>();
+    const projectHasGenerationRow = new Map<number, boolean>();
     for (const effect of effects) {
         if (generationByProject.has(effect.projectId)) continue;
         const row = db
             .prepare("SELECT generation FROM claim_project_generations WHERE project_id = ?")
-            .get(effect.projectId) as { generation: number } | undefined;
+            .get(effect.projectId) as { generation: number } | null | undefined;
+        projectHasGenerationRow.set(effect.projectId, row != null);
         generationByProject.set(effect.projectId, (row?.generation ?? 0) + 1);
     }
     const insertOutbox = db.prepare(
@@ -298,14 +299,13 @@ export function runMemoryClaimOperationInCurrentTransaction<T>(
     for (const [projectId, generation] of generationByProject) {
         // UPDATE-then-INSERT instead of an upsert: the append-only collision
         // trigger fires on every INSERT, including ON CONFLICT resolution.
-        const changes = toSafeChangeCount(
-            db
-                .prepare(
-                    "UPDATE claim_project_generations SET generation = ?, updated_at = ? WHERE project_id = ?",
-                )
-                .run(generation, now, projectId),
-        );
-        if (changes === 0) {
+        // The branch uses the transaction-local read above, not the reported
+        // change count, which bun:sqlite may widen to a total-changes delta.
+        if (projectHasGenerationRow.get(projectId)) {
+            db.prepare(
+                "UPDATE claim_project_generations SET generation = ?, updated_at = ? WHERE project_id = ?",
+            ).run(generation, now, projectId);
+        } else {
             db.prepare(
                 "INSERT INTO claim_project_generations (project_id, generation, updated_at) VALUES (?, ?, ?)",
             ).run(projectId, generation, now);
@@ -569,6 +569,16 @@ function appendMemoryClaimRevision(
     return outcome.revisionId;
 }
 
+export interface EnsureMemoryClaimLinkOptions {
+    /**
+     * When false, a hash-equal preimage whose bytes differ from the canonical
+     * content links WITHOUT appending a revision (the source bytes stay
+     * retained on the root observation). Merge-delete relocations use this so
+     * the canonical claim keeps reflecting the surviving projection row (R6).
+     */
+    adoptDivergentContent?: boolean;
+}
+
 /**
  * Ensure the memory row has its durable claim link, adopting the preimage as
  * revision 1 when unlinked (R10). Exact-hash dedup selects the existing
@@ -581,6 +591,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
     row: MemoryProjectionRow,
     projectId: number,
     provenance: MemoryClaimProvenance,
+    options: EnsureMemoryClaimLinkOptions = {},
 ): MemoryClaimLink {
     const existing = readMemoryClaimLink(db, row.id);
     if (existing) return existing;
@@ -594,7 +605,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
             content: row.content,
             provenance,
         });
-        if (canonical.currentContent !== row.content) {
+        if ((options.adoptDivergentContent ?? true) && canonical.currentContent !== row.content) {
             appendMemoryClaimRevision(db, {
                 claimId: canonical.claimId,
                 content: row.content,
@@ -660,18 +671,80 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
     };
 }
 
+/**
+ * Record one supersession edge between two linked memories' current
+ * revisions: same-project pairs use `claim_conflicts` (supersedes), distinct
+ * projects use the audit-only `claim_merge_lineage` relation (KTD8). Both
+ * paths are idempotent, so page replay or a doctor retry cannot duplicate
+ * lineage. Returns true only when a new edge was recorded.
+ */
+export function recordMemoryClaimSupersessionInCurrentTransaction(
+    db: Database,
+    source: MemoryClaimLink,
+    target: MemoryClaimLink,
+): boolean {
+    // A duplicate link shares its canonical claim; a claim cannot supersede
+    // itself.
+    if (source.claimId === target.claimId) return false;
+    const sourceRevisionId = readClaimCurrentRevisionId(db, source.claimId);
+    const targetRevisionId = readClaimCurrentRevisionId(db, target.claimId);
+    if (source.projectId === target.projectId) {
+        const existing = db
+            .prepare(
+                "SELECT 1 FROM claim_conflicts WHERE relation = 'supersedes' AND left_revision_id = ? AND right_revision_id = ?",
+            )
+            .get(targetRevisionId, sourceRevisionId);
+        if (existing) return false;
+        addClaimConflictInCurrentTransaction(db, {
+            relation: "supersedes",
+            leftRevisionId: targetRevisionId,
+            rightRevisionId: sourceRevisionId,
+        });
+        return true;
+    }
+    const existing = db
+        .prepare(
+            "SELECT 1 FROM claim_merge_lineage WHERE source_revision_id = ? AND target_revision_id = ?",
+        )
+        .get(sourceRevisionId, targetRevisionId);
+    if (existing) return false;
+    db.prepare(
+        `INSERT INTO claim_merge_lineage
+            (source_revision_id, source_project_id, target_revision_id, target_project_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+    ).run(sourceRevisionId, source.projectId, targetRevisionId, target.projectId, Date.now());
+    return true;
+}
+
 /** Claim lifecycle state change (active | permanent | archived). */
 export function setClaimLifecycleStateInCurrentTransaction(
     db: Database,
     claimId: number,
     state: ClaimState,
 ): void {
-    const changes = toSafeChangeCount(
-        db.prepare("UPDATE claims SET state = ? WHERE id = ?").run(state, claimId),
-    );
-    if (changes !== 1) {
-        throw new Error(`claim ${claimId} lifecycle update changed ${changes} rows; expected 1`);
+    db.prepare("UPDATE claims SET state = ? WHERE id = ?").run(state, claimId);
+    // Read-back instead of a change count: bun:sqlite can report a
+    // transaction-wide total-changes delta rather than the UPDATE's own row
+    // count, so the count is not a reliable single-row oracle.
+    const row = db.prepare("SELECT state FROM claims WHERE id = ?").get(claimId) as
+        | { state: string }
+        | undefined;
+    if (row?.state !== state) {
+        throw new Error(`claim ${claimId} lifecycle update did not persist state ${state}`);
     }
+}
+
+export function retireMemoryClaimInCurrentTransaction(
+    db: Database,
+    claimId: number,
+    verifier: string,
+): void {
+    setClaimLifecycleStateInCurrentTransaction(db, claimId, "archived");
+    addVerificationEvent(db, {
+        revisionId: readClaimCurrentRevisionId(db, claimId),
+        outcome: "archive",
+        verifier,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1464,266 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
                         effectType: "evidence" as const,
                     },
                 ],
+            };
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Module mirror deltas (R15, R19; U4)
+// ---------------------------------------------------------------------------
+
+export interface ModuleMemoryDeltaResult {
+    memoryId: number;
+    claimId: number | null;
+    /** Newly appended revision id, when the delta changed semantic state. */
+    revisionId: number | null;
+    /** True when the projection row is gone after the delta (tombstone). */
+    removed: boolean;
+}
+
+interface CurrentClaimSemanticState {
+    content: string;
+    state: ClaimState;
+    category: string | null;
+    normalizedHash: string | null;
+    importance: number | null;
+    memoryScope: string | null;
+    shareable: number | null;
+    sourceType: string | null;
+    expiresAt: number | null;
+    metadataJson: string | null;
+}
+
+function readCurrentClaimSemanticState(db: Database, claimId: number): CurrentClaimSemanticState {
+    const row = db
+        .prepare(
+            `SELECT rev.content AS content, claims.state AS state,
+                    meta.category AS category, meta.normalized_hash AS normalizedHash,
+                    meta.importance AS importance, meta.memory_scope AS memoryScope,
+                    meta.shareable AS shareable, meta.source_type AS sourceType,
+                    meta.expires_at AS expiresAt, meta.metadata_json AS metadataJson
+               FROM claims
+               JOIN claim_revisions rev ON rev.id = claims.current_revision_id
+               LEFT JOIN claim_revision_memory_metadata meta ON meta.revision_id = rev.id
+              WHERE claims.id = ?`,
+        )
+        .get(claimId) as CurrentClaimSemanticState | undefined;
+    if (!row) {
+        throw new ClaimGraphCorruptionError(
+            `claim ${claimId} has no current revision for a module delta compare`,
+        );
+    }
+    return row;
+}
+
+function claimSemanticStateDiffers(
+    current: CurrentClaimSemanticState,
+    content: string,
+    desired: RevisionMemoryMetadataInput,
+): boolean {
+    return (
+        current.content !== content ||
+        current.category !== desired.category ||
+        current.normalizedHash !== desired.normalizedHash ||
+        current.importance !== desired.importance ||
+        current.memoryScope !== desired.memoryScope ||
+        current.shareable !== desired.shareable ||
+        current.sourceType !== desired.sourceType ||
+        (current.expiresAt ?? null) !== (desired.expiresAt ?? null) ||
+        (current.metadataJson ?? null) !== (desired.metadataJson ?? null)
+    );
+}
+
+/**
+ * Apply one module changefeed memory delta with its claim-side effects in the
+ * caller's privileged mirror-page transaction (R15). The envelope key is the
+ * durable feed identity (module project + row id + feed sequence), so an
+ * exact page replay returns the committed result and appends no revision,
+ * outbox effect, or generation (AE7). The projection application itself runs
+ * on every call — it is idempotent and must re-establish mirror identity on
+ * replay-from-zero — while every claim mutation stays inside the envelope.
+ *
+ * Effective semantic state is compared, not feed ops: a telemetry-only
+ * snapshot appends nothing (Mutation Transition Matrix last row), a
+ * content/metadata change appends one revision, a status change moves claim
+ * lifecycle, and a tombstone that actually removes the projection row retires
+ * the claim after the unlinked preimage was adopted (R10).
+ */
+export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+    db: Database,
+    envelope: MemoryClaimOperationEnvelope,
+    input: { memoryId: number; applyProjection: () => void },
+): MemoryClaimOperationOutcome<ModuleMemoryDeltaResult> {
+    // Preimage adoption runs BEFORE the projection delta (R10) so a boundary
+    // row acquires its non-cascading link before a tombstone deletes it or an
+    // update rewrites it. Idempotent on replay: an existing link short-circuits.
+    const pre = readMemoryProjectionRow(db, input.memoryId);
+    let preLink: MemoryClaimLink | null = null;
+    if (pre && pre.content.length > 0) {
+        const preProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, pre.project_path);
+        if (preProjectId !== null) {
+            preLink = ensureMemoryClaimLinkInCurrentTransaction(db, pre, preProjectId, {
+                kind: "migration",
+            });
+        }
+    }
+
+    input.applyProjection();
+    hitMemoryClaimFailpoint("memory-claim.020.projection.after");
+
+    return runMemoryClaimOperationInCurrentTransaction<ModuleMemoryDeltaResult>(
+        db,
+        envelope,
+        () => {
+            const post = readMemoryProjectionRow(db, input.memoryId);
+            const effects: MemoryClaimEffect[] = [];
+            if (!post) {
+                // Tombstone removed the projection row: retire the claim, keep
+                // the crosswalk (retention, not erasure).
+                if (preLink) {
+                    setClaimLifecycleStateInCurrentTransaction(db, preLink.claimId, "archived");
+                    addVerificationEvent(db, {
+                        revisionId: readClaimCurrentRevisionId(db, preLink.claimId),
+                        outcome: "archive",
+                        verifier: envelope.producer,
+                    });
+                    effects.push({
+                        effectKey: `memory:${input.memoryId}:lifecycle`,
+                        projectId: preLink.projectId,
+                        claimId: preLink.claimId,
+                        effectType: "lifecycle" as const,
+                    });
+                }
+                hitMemoryClaimFailpoint("memory-claim.010.claim.after");
+                return {
+                    result: {
+                        memoryId: input.memoryId,
+                        claimId: preLink?.claimId ?? null,
+                        revisionId: null,
+                        removed: true,
+                    },
+                    effects,
+                };
+            }
+
+            const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, post.project_path);
+            if (projectId === null || post.content.length === 0) {
+                recordMemoryClaimLinkFailure(
+                    db,
+                    post.id,
+                    post.project_path,
+                    projectId === null ? "unresolved-project-identity" : "empty-content",
+                );
+                hitMemoryClaimFailpoint("memory-claim.010.claim.after");
+                return {
+                    result: { memoryId: post.id, claimId: null, revisionId: null, removed: false },
+                    effects: [],
+                };
+            }
+
+            const previouslyLinked = readMemoryClaimLink(db, post.id) !== null;
+            const link = ensureMemoryClaimLinkInCurrentTransaction(db, post, projectId, {
+                kind: "live",
+                producer: envelope.producer,
+                operationKey: envelope.operationKey,
+                sourceSessionId: post.source_session_id,
+            });
+
+            const current = readCurrentClaimSemanticState(db, link.claimId);
+            const desiredMeta = metadataFromProjectionRow(post);
+            let revisionId: number | null = null;
+            if (claimSemanticStateDiffers(current, post.content, desiredMeta)) {
+                const observationId = createMemoryObservation(db, {
+                    projectId,
+                    memoryId: post.id,
+                    content: post.content,
+                    provenance: liveProvenance(envelope, post.source_session_id),
+                });
+                revisionId = appendMemoryClaimRevision(db, {
+                    claimId: link.claimId,
+                    content: post.content,
+                    observationId,
+                    metadata: desiredMeta,
+                    sourceSessionId: post.source_session_id,
+                });
+                effects.push({
+                    effectKey: `memory:${post.id}:upsert`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "upsert" as const,
+                });
+            } else if (!previouslyLinked) {
+                // A fresh module insert: adoption above created revision 1.
+                effects.push({
+                    effectKey: `memory:${post.id}:upsert`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "upsert" as const,
+                });
+            }
+
+            const desiredState = claimStateFromMemoryStatus(post.status);
+            if (current.state !== desiredState) {
+                setClaimLifecycleStateInCurrentTransaction(db, link.claimId, desiredState);
+                if (desiredState === "archived") {
+                    addVerificationEvent(db, {
+                        revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                        outcome: "archive",
+                        verifier: envelope.producer,
+                    });
+                }
+                effects.push({
+                    effectKey: `memory:${post.id}:lifecycle`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "lifecycle" as const,
+                });
+            }
+
+            const outcome = VERIFICATION_EVENT_OUTCOMES[post.verification_status];
+            if (outcome && post.verification_status !== (pre?.verification_status ?? null)) {
+                addVerificationEvent(db, {
+                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                    outcome,
+                    verifier: envelope.producer,
+                });
+                effects.push({
+                    effectKey: `memory:${post.id}:evidence`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "evidence" as const,
+                });
+            }
+
+            const supersededBy = post.superseded_by_memory_id;
+            if (supersededBy !== null && supersededBy !== (pre?.superseded_by_memory_id ?? null)) {
+                const target = readMemoryProjectionRow(db, supersededBy);
+                const targetProjectId = target
+                    ? resolveMemoryClaimProjectInCurrentTransaction(db, target.project_path)
+                    : null;
+                if (target && targetProjectId !== null && target.content.length > 0) {
+                    const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
+                        db,
+                        target,
+                        targetProjectId,
+                        { kind: "migration" },
+                    );
+                    if (recordMemoryClaimSupersessionInCurrentTransaction(db, link, targetLink)) {
+                        effects.push({
+                            effectKey: `memory:${target.id}:supersede`,
+                            projectId: targetProjectId,
+                            claimId: targetLink.claimId,
+                            effectType: "evidence" as const,
+                        });
+                    }
+                }
+            }
+
+            hitMemoryClaimFailpoint("memory-claim.010.claim.after");
+            return {
+                result: { memoryId: post.id, claimId: link.claimId, revisionId, removed: false },
+                effects,
             };
         },
     );

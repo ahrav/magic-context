@@ -2,7 +2,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { partitionVerifyScope } from "./dreamer/verify-gate";
-import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
+import { insertMemory as insertMemoryThroughKernel } from "./memory/storage-memory";
+import {
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+} from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { auditIdentityMerge, mergeProjectIdentities } from "./storage-identity-merge";
@@ -379,6 +383,133 @@ describe("project identity merge", () => {
             database.prepare("SELECT COUNT(*) AS count FROM v22_identity_rekey_map").get(),
         ).toEqual({ count: 0 });
         expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
+            count: 0,
+        });
+    });
+});
+
+describe("project identity merge claims (v83)", () => {
+    test("a true two-project merge with claims fails before changing aliases, rows, or generations", () => {
+        const database = makeDb();
+        insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "source claimed fact",
+        });
+        insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "target claimed fact",
+        });
+        const snapshot = () =>
+            JSON.stringify({
+                aliases: database
+                    .prepare(
+                        "SELECT alias_identity, project_id FROM project_aliases ORDER BY alias_identity",
+                    )
+                    .all(),
+                projects: database
+                    .prepare("SELECT id, canonical_identity FROM projects ORDER BY id")
+                    .all(),
+                memories: database
+                    .prepare("SELECT id, project_path, status FROM memories ORDER BY id")
+                    .all(),
+                generations: database
+                    .prepare(
+                        "SELECT project_id, generation FROM claim_project_generations ORDER BY project_id",
+                    )
+                    .all(),
+                claims: database
+                    .prepare("SELECT id, project_id, state FROM claims ORDER BY id")
+                    .all(),
+            });
+        const before = snapshot();
+
+        expect(() => mergeProjectIdentities(database, "git:source", "git:target")).toThrow(
+            /authoritative episodes or claims/,
+        );
+
+        expect(snapshot()).toBe(before);
+        expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
+            count: 0,
+        });
+        expect(
+            database.prepare("SELECT COUNT(*) AS count FROM v22_identity_rekey_map").get(),
+        ).toEqual({ count: 0 });
+    });
+
+    test("in-place dir: to git: adoption retains the numeric project and claims", () => {
+        const database = makeDb();
+        const memory = insertMemoryThroughKernel(database, {
+            projectPath: "dir:old-checkout",
+            category: "CONSTRAINTS",
+            content: "durable fact",
+        });
+        const projectId = (
+            database
+                .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
+                .get("dir:old-checkout") as { id: number }
+        ).id;
+        const linkBefore = database
+            .prepare("SELECT * FROM legacy_memory_claims WHERE memory_id = ?")
+            .get(memory.id);
+
+        mergeProjectIdentities(database, "dir:old-checkout", "git:new-identity", { now: 50 });
+
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(memory.id),
+        ).toEqual({ project_path: "git:new-identity" });
+        expect(database.prepare("SELECT id, canonical_identity FROM projects").all()).toEqual([
+            { id: projectId, canonical_identity: "git:new-identity" },
+        ]);
+        expect(
+            database
+                .prepare("SELECT * FROM legacy_memory_claims WHERE memory_id = ?")
+                .get(memory.id),
+        ).toEqual(linkBefore);
+        const current = getCurrentMemoryClaimByLegacyMemoryId(database, memory.id);
+        expect(current?.projectId).toBe(projectId);
+        expect(current?.state).toBe("active");
+        expect(current?.content).toBe("durable fact");
+    });
+
+    test("an in-place adoption collision links the archived source to the canonical claim once", () => {
+        const database = makeDb();
+        const source = insertMemoryThroughKernel(database, {
+            projectPath: "dir:old-checkout",
+            category: "CONSTRAINTS",
+            content: "same fact",
+        });
+        const sourceHash = (
+            database
+                .prepare("SELECT normalized_hash AS hash FROM memories WHERE id = ?")
+                .get(source.id) as { hash: string }
+        ).hash;
+        const targetId = insertMemory(database, "git:new-identity", "same fact", sourceHash);
+
+        mergeProjectIdentities(database, "dir:old-checkout", "git:new-identity", { now: 99 });
+
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(source.id),
+        ).toEqual({ status: "archived", by: targetId });
+        const links = database
+            .prepare(
+                "SELECT memory_id, canonical_memory_id, claim_id FROM legacy_memory_claims ORDER BY memory_id",
+            )
+            .all() as Array<{ memory_id: number; canonical_memory_id: number; claim_id: number }>;
+        expect(links).toEqual([
+            { memory_id: source.id, canonical_memory_id: source.id, claim_id: links[0].claim_id },
+            { memory_id: targetId, canonical_memory_id: source.id, claim_id: links[0].claim_id },
+        ]);
+        expect(database.prepare("SELECT COUNT(*) AS count FROM claims").get()).toEqual({
+            count: 1,
+        });
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(links[0].claim_id),
+        ).toEqual({ state: "active" });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM claim_conflicts").get()).toEqual({
             count: 0,
         });
     });

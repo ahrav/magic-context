@@ -9,12 +9,9 @@ import {
     resolveProjectIdentityStrict,
 } from "./memory/project-identity";
 import { rekeyMemoryRowWithCollisionMerge } from "./memory/relocate-memory";
-import {
-    effectiveSeenCountSql,
-    hasMemoryStatsTable,
-    requireEffectiveSeenCount,
-} from "./memory/storage-memory";
+import { effectiveSeenCountSql } from "./memory/storage-memory";
 import { withClaimsWriteCapabilityInCurrentTransaction } from "./memory/storage-memory-claims";
+import { CLAIMS_BACKFILL_META_KEYS } from "./storage-memory-claims-schema";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 
 export const BATCH_SIZE = 25;
@@ -196,7 +193,16 @@ function bumpProjectMemoryEpochInTransaction(db: Database, identity: string, now
 function updateFinalBackfillStatus(db: Database): V22BackfillStatus {
     const failureCount = countFailures(db);
     const status: V22BackfillStatus = failureCount > 0 ? "completed_with_failures" : "completed";
-    writeMeta(db, BACKFILL_META_KEY, status);
+    db.transaction(() => {
+        writeMeta(db, BACKFILL_META_KEY, status);
+        if (claimsGuarded(db)) {
+            writeMeta(
+                db,
+                CLAIMS_BACKFILL_META_KEYS.v22Takeover,
+                status === "completed" ? "none" : "pending",
+            );
+        }
+    }).immediate();
     return status;
 }
 
@@ -259,7 +265,6 @@ export async function runDeferredV22Backfill(
 
     await yieldToEventLoop();
 
-    const statsBacked = hasMemoryStatsTable(db);
     const seenCountSql = effectiveSeenCountSql(db);
 
     while (true) {
@@ -302,80 +307,18 @@ export async function runDeferredV22Backfill(
         db.transaction(() => {
             const applyBatch = (): void => {
                 const now = Date.now();
-                const updateMemory = db.prepare(
-                    "UPDATE memories SET project_path = ? WHERE id = ? AND project_path = ?",
-                );
                 const verifyMemory = db.prepare(
                     "SELECT project_path FROM memories WHERE id = ? AND project_path = ?",
                 );
-                // Detect a row that already lives under the target identity with the
-                // same (category, normalized_hash). Rekeying onto it would violate
-                // UNIQUE(project_path, category, normalized_hash) and abort the whole
-                // batch transaction. This is reachable when one project's memories were
-                // written under multiple raw legacy paths (e.g. symlinked / pre-identity
-                // paths) that all resolve to the same git:/dir: identity.
-                const findCollision = db.prepare(
-                    `SELECT id, ${seenCountSql} FROM memories
-                 WHERE project_path = ? AND category = ? AND normalized_hash = ?
-                 LIMIT 1`,
-                );
-                const bumpSeenCount = statsBacked
-                    ? db.prepare("UPDATE memory_stats SET seen_count = ? WHERE memory_id = ?")
-                    : db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?");
-                // Preserve an embedding on the surviving target BEFORE the source row's
-                // embedding FK-cascades away on DELETE. Same fix as the live
-                // collision-merge path (rekeyMemoryRowWithCollisionMerge): the two rows
-                // are content-equivalent (same category + normalized_hash), so either
-                // vector is valid; INSERT OR IGNORE keeps the target's if it has one,
-                // adopts the source's otherwise — so a merged row never loses its vector.
-                const preserveEmbedding = db.prepare(
-                    `INSERT OR IGNORE INTO memory_embeddings (memory_id, embedding, model_id)
-                 SELECT ?, embedding, model_id FROM memory_embeddings WHERE memory_id = ?`,
-                );
-                const deleteMemoryRow = db.prepare("DELETE FROM memories WHERE id = ?");
 
                 for (const row of resolvedRows) {
-                    const collision = findCollision.get(
+                    const changed = rekeyMemoryRowWithCollisionMerge(
+                        db,
+                        row.id,
+                        row.project_path,
                         row.identity,
-                        row.category,
-                        row.normalized_hash,
-                    ) as { id: number; seen_count: number | null } | undefined;
-                    if (collision && collision.id !== row.id) {
-                        // Merge into the surviving target: keep the larger seen_count,
-                        // delete the source legacy row. The embedding row FK-cascades on
-                        // delete. The mutation log is unaffected (no render-visible
-                        // change — both rows held identical content).
-                        // requireEffectiveSeenCount aborts the batch transaction when a
-                        // v80 stats read is NULL (a missing stats row is corruption),
-                        // before the merge substitutes a default count and deletes the
-                        // source row. The check lives inside the merge branch so rows
-                        // that only need a project_path rekey do not stall the cursor.
-                        const sourceSeen = requireEffectiveSeenCount(db, row.id, row.seen_count);
-                        const targetSeen = requireEffectiveSeenCount(
-                            db,
-                            collision.id,
-                            collision.seen_count,
-                        );
-                        const mergedSeen = Math.max(targetSeen, sourceSeen);
-                        if (mergedSeen !== targetSeen) {
-                            bumpSeenCount.run(mergedSeen, collision.id);
-                        }
-                        preserveEmbedding.run(collision.id, row.id);
-                        deleteMemoryRow.run(row.id);
-                        changedRows += 1;
-                        changedIdentities.add(row.identity);
-                        upsertRekeyMap(db, row.project_path, row.identity, now);
-                        const legacyRustIdentity = computeLegacyRustDirIdentity(row.project_path);
-                        if (legacyRustIdentity !== row.identity) {
-                            upsertRekeyMap(db, legacyRustIdentity, row.identity, now);
-                        }
-                        deleteFailure(db, row.id);
-                        continue;
-                    }
-                    const result = updateMemory.run(row.identity, row.id, row.project_path) as {
-                        changes?: number;
-                    };
-                    if ((result.changes ?? 0) > 0) {
+                    );
+                    if (changed) {
                         changedRows += 1;
                         changedIdentities.add(row.identity);
                         upsertRekeyMap(db, row.project_path, row.identity, now);
