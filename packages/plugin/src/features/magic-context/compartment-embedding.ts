@@ -11,6 +11,7 @@ import {
 } from "./compartment-chunk-embedding";
 import {
     contentSha256,
+    embedCompartmentWindowsDetailedForProject,
     embedItemsForProject,
     enqueueShadowEmbeddingItems,
     getProjectChunkEmbeddingModelId,
@@ -97,6 +98,13 @@ export async function embedAndStoreCompartmentChunks(
                 continue;
             }
 
+            const detailed = await embedCompartmentWindowsDetailedForProject(db, projectPath, {
+                compartmentId: compartment.id,
+                sessionId,
+                windows,
+            });
+            if (detailed !== null) continue;
+
             const result = await embedItemsForProject(
                 projectPath,
                 windows.map((window) => ({
@@ -104,9 +112,6 @@ export async function embedAndStoreCompartmentChunks(
                     text: window.text,
                     contentSha256: contentSha256(window.text),
                 })),
-                undefined,
-                db,
-                sessionId,
             );
             if (!result) continue;
             if (

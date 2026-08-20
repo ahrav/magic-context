@@ -350,6 +350,32 @@ describe("SubcClient facade", () => {
         expectCallError(await rejection(requestPromise), "terminal", "store_unavailable");
     });
 
+    test("artifact_invalid bind rejection is permanent: one route.open, no retry", async () => {
+        const sleeps: number[] = [];
+        const { client, conn } = await connected({
+            identity: IDENTITY,
+            sleep: async (ms) => {
+                sleeps.push(ms);
+            },
+        });
+        const cursor = frameCursor(conn);
+        const callPromise = client.call("synapse", "models.list", undefined, {
+            targetKind: "management_surface",
+        });
+
+        const open1 = await cursor.next(isRouteOpen);
+        await sendErrorBody(conn, open1.corr, "artifact_invalid");
+
+        const error = (await callPromise.catch((e) => e)) as SubcCallError;
+        expect(error).toBeInstanceOf(SubcCallError);
+        expect(error.kind).toBe("terminal");
+        expect(error.code).toBe("artifact_invalid");
+        // artifact_invalid must not enter the momentary-rejection retry loop.
+        expect(sleeps).toEqual([]);
+        const opens = conn.frames.filter(isRouteOpen);
+        expect(opens.length).toBe(1);
+    });
+
     test("managed call retries allowlisted route-open terminals and never sends the body early", async () => {
         const sleeps: number[] = [];
         const { client, conn } = await connected({

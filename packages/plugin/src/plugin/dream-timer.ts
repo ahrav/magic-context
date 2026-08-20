@@ -41,6 +41,7 @@ import {
     renewGitSweepLease,
 } from "../features/magic-context/git-commits";
 import {
+    embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
@@ -349,8 +350,21 @@ async function runProjectMaintenance(
                 `[magic-context] proactively embedded ${embeddedCount} ${embeddedCount === 1 ? "memory" : "memories"} for project ${reg.projectIdentity}`,
             );
         }
-        // Compartment-chunk backfill remains demand-driven to avoid bursty
-        // requests to local embedding endpoints.
+        try {
+            const chunkCount = await embedUnembeddedCompartmentChunksForProject(
+                db,
+                reg.projectIdentity,
+            );
+            if (chunkCount > 0) {
+                log(
+                    `[magic-context] recovered ${chunkCount} missing compartment chunk embedding(s) for project ${reg.projectIdentity}`,
+                );
+            }
+        } catch (error) {
+            log(
+                `[magic-context] chunk backfill failed for ${reg.projectIdentity}: ${getErrorMessage(error)}`,
+            );
+        }
     }
     await sweepProject(reg, origin, db);
 }

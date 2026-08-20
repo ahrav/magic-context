@@ -6,6 +6,7 @@ import {
     _resetCompartmentChunkSearchCacheForTests,
     buildCanonicalChunkTextFromFts,
     CHUNK_WINDOW_SAFETY_RATIO,
+    type CompartmentChunkWindow,
     canonicalizeInMemoryChunkTextForEmbedding,
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
@@ -19,11 +20,18 @@ import { runMigrations } from "./migrations";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
+    contentSha256,
+    embedCompartmentWindowsDetailedForProject,
     getProjectEmbeddingSnapshot,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
 import { initializeDatabase } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
+import {
+    DetailedSynapseTestHost,
+    detailedSynapseTestProvider,
+    synapseTestConfig,
+} from "./synapse-detailed-test-support";
 
 function referenceRecursiveSplit(text: string, chunkSize: number): string[] {
     const lengthFunction = estimateTokens;
@@ -536,6 +544,162 @@ describe("compartment chunk embedding core", () => {
             ).toHaveLength(1);
         } finally {
             _resetProjectEmbeddingRegistryForTests();
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("all-window replacement through versioned synapse receipts", () => {
+    function seedCompartment(db: Database, sessionId: string): number {
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 5,
+                startMessageId: "u1",
+                endMessageId: "a5",
+                title: "Receipt span",
+                content: "P1 content",
+                p1: "P1 content",
+            },
+        ]);
+        return getCompartments(db, sessionId)[0].id;
+    }
+
+    function testWindows(count: number): CompartmentChunkWindow[] {
+        return Array.from({ length: count }, (_, index) => {
+            const text = `window text ${index + 1}`;
+            return {
+                windowIndex: index + 1,
+                startOrdinal: index + 1,
+                endOrdinal: index + 1,
+                text,
+                chunkHash: contentSha256(text),
+            };
+        });
+    }
+
+    function chunkRowCount(db: Database, compartmentId: number, modelId: string): number {
+        return (
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM compartment_chunk_embeddings WHERE compartment_id = ? AND model_id = ?",
+                )
+                .get(compartmentId, modelId) as { count: number }
+        ).count;
+    }
+
+    function ledgerRows(db: Database): Array<{ application_group: string; state: string }> {
+        return db
+            .prepare("SELECT application_group, state FROM synapse_batch_ledger ORDER BY id")
+            .all() as Array<{ application_group: string; state: string }>;
+    }
+
+    function registerDetailedChunkProject(
+        db: Database,
+        projectIdentity: string,
+        host: DetailedSynapseTestHost,
+    ): string {
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "synapse" ? detailedSynapseTestProvider(host) : null,
+        );
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            synapseTestConfig(),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/chunk-detailed",
+        );
+        return getProjectEmbeddingSnapshot(projectIdentity)?.chunkModelId ?? "off";
+    }
+
+    test("a compartment spanning three provider pages replaces all windows and completes all receipts once", async () => {
+        const db = createDb();
+        try {
+            const host = new DetailedSynapseTestHost();
+            const chunkModelId = registerDetailedChunkProject(db, "git:chunk-span", host);
+            const compartmentId = seedCompartment(db, "ses-span");
+
+            const applied = await embedCompartmentWindowsDetailedForProject(db, "git:chunk-span", {
+                compartmentId,
+                sessionId: "ses-span",
+                windows: testWindows(5),
+            });
+
+            expect(applied).toBe(true);
+            expect(chunkRowCount(db, compartmentId, chunkModelId)).toBe(5);
+            const rows = ledgerRows(db);
+            expect(rows).toHaveLength(3);
+            expect(
+                rows.every((row) => row.application_group === `compartment:${compartmentId}`),
+            ).toBe(true);
+            expect(rows.every((row) => row.state === "complete")).toBe(true);
+        } finally {
+            _resetProjectEmbeddingRegistryForTests();
+            _resetCompartmentChunkSearchCacheForTests();
+            closeQuietly(db);
+        }
+    });
+
+    test("one missing window preserves prior rows and leaves every receipt non-complete", async () => {
+        const db = createDb();
+        try {
+            const host = new DetailedSynapseTestHost();
+            const chunkModelId = registerDetailedChunkProject(db, "git:chunk-miss", host);
+            const compartmentId = seedCompartment(db, "ses-miss");
+
+            const priorWindow = testWindows(1)[0];
+            replaceCompartmentChunkEmbeddings(db, [
+                {
+                    compartmentId,
+                    sessionId: "ses-miss",
+                    projectPath: "git:chunk-miss",
+                    window: { ...priorWindow, text: "prior text", chunkHash: "prior-hash" },
+                    modelId: chunkModelId,
+                    vector: new Float32Array([9, 9, 9]),
+                },
+            ]);
+            expect(chunkRowCount(db, compartmentId, chunkModelId)).toBe(1);
+
+            host.resultPages = (jobId, items) => {
+                if (jobId === "job-2") {
+                    const error = new Error("malformed page") as Error & { code: string };
+                    error.code = "schema_violation";
+                    return error;
+                }
+                return {
+                    result: {
+                        ...host.envelope(),
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+
+            const applied = await embedCompartmentWindowsDetailedForProject(db, "git:chunk-miss", {
+                compartmentId,
+                sessionId: "ses-miss",
+                windows: testWindows(5),
+            });
+
+            expect(applied).toBe(false);
+            expect(chunkRowCount(db, compartmentId, chunkModelId)).toBe(1);
+            const prior = db
+                .prepare(
+                    "SELECT chunk_hash AS chunkHash FROM compartment_chunk_embeddings WHERE compartment_id = ?",
+                )
+                .get(compartmentId) as { chunkHash: string };
+            expect(prior.chunkHash).toBe("prior-hash");
+            const rows = ledgerRows(db);
+            expect(rows.length).toBeGreaterThan(0);
+            expect(rows.every((row) => row.state !== "complete")).toBe(true);
+        } finally {
+            _resetProjectEmbeddingRegistryForTests();
+            _resetCompartmentChunkSearchCacheForTests();
             closeQuietly(db);
         }
     });

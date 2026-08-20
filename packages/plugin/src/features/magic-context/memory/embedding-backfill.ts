@@ -1,6 +1,10 @@
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
-import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./embedding";
+import {
+    embedBatchForProject,
+    embedMemoriesDetailedForProject,
+    getProjectEmbeddingSnapshot,
+} from "./embedding";
 import {
     type StoredMemoryEmbedding,
     saveEmbeddingIfHashMatches,
@@ -26,6 +30,18 @@ export async function ensureMemoryEmbeddings(args: {
     }
 
     try {
+        const detailed = await embedMemoriesDetailedForProject(
+            args.db,
+            args.projectIdentity,
+            missingMemories.map((memory) => ({ id: memory.id, content: memory.content })),
+        );
+        if (detailed) {
+            for (const [id, stored] of detailed) {
+                args.existingEmbeddings.set(id, stored);
+            }
+            return args.existingEmbeddings;
+        }
+
         const result = await embedBatchForProject(
             args.projectIdentity,
             missingMemories.map((memory) => memory.content),

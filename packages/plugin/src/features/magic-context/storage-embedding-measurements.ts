@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import type { EmbeddingPageReceipt } from "./memory/embedding-provider";
 import { normalizedQueryHash } from "./query-normalization";
 
 export { normalizedQueryHash, normalizeQueryText } from "./query-normalization";
@@ -612,72 +613,154 @@ export function markSynapseLedgerObsolete(
     );
 }
 
-export interface SynapseBatchLedgerInput {
-    sessionId: string;
-    projectPath: string;
+export interface SynapseReceiptGroupExpectation {
     scope: "memory" | "commit" | "chunk";
-    manifest: readonly { id: string; contentSha256: string }[];
-    requestKey: string;
+    laneRole: "primary" | "shadow";
+    /** Ledger destination model (the provider lane identity), not the storage model id. */
+    destinationModel: string;
 }
 
-function legacyLaneRole(sessionId: string): "primary" | "shadow" {
-    return sessionId.startsWith("shadow:") ? "shadow" : "primary";
-}
-
-/** Legacy compat shim over the v82 table for pre-detailed callers (removed
- *  when U6 rewires them onto versioned receipts). Writes a context-incomplete
- *  identity (empty destination model / application group) without CAS. */
-export function beginSynapseBatchLedger(db: Database, input: SynapseBatchLedgerInput): void {
-    const now = Date.now();
-    const laneRole = legacyLaneRole(input.sessionId);
-    const changes = db
-        .prepare(
-            `UPDATE synapse_batch_ledger
-                SET manifest_json = ?, state_version = state_version + 1, updated_at = ?
-              WHERE project_path = ? AND session_id = ? AND scope = ? AND lane_role = ?
-                AND destination_model = '' AND application_group = '' AND request_key = ?
-                AND state != 'obsolete'`,
-        )
-        .run(
-            JSON.stringify(input.manifest),
-            now,
-            input.projectPath,
-            input.sessionId,
-            input.scope,
-            laneRole,
-            input.requestKey,
-        ).changes;
-    if (changes > 0) return;
-    db.prepare(
-        `INSERT INTO synapse_batch_ledger
-            (project_path, session_id, scope, lane_role, destination_model, application_group,
-             request_key, manifest_json, state, state_version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, '', '', ?, ?, 'pending', 0, ?, ?)`,
-    ).run(
-        input.projectPath,
-        input.sessionId,
-        input.scope,
-        laneRole,
-        input.requestKey,
-        JSON.stringify(input.manifest),
-        now,
-        now,
-    );
-}
-
-/** Legacy compat shim paired with beginSynapseBatchLedger (removed in U6). */
-export function finishSynapseBatchLedger(
+/**
+ * Apply one application group's receipts atomically (R23, KTD13).
+ *
+ * Runs inside ONE SQLite transaction (a savepoint when the caller already
+ * holds one — it never commits independently). Preflights the complete
+ * receipt set, exact item coverage, per-item vectors, current source hashes,
+ * and each ledger row's state/version/lane/model; then writes every
+ * destination item via `writeDestination` and advances every contributing
+ * receipt ready->complete. ANY failed guard, missing vector, or zero-row CAS
+ * throws SynapseLedgerConflictError and rolls back destination and ledger
+ * together. Proven source drift additionally retires the drifted rows to
+ * 'obsolete' after the rollback (KTD12).
+ */
+export function applySynapseReceiptGroup(
     db: Database,
-    sessionId: string,
-    requestKey: string,
-    status: "complete" | "partial" | "failed",
+    args: {
+        receipts: readonly EmbeddingPageReceipt[];
+        expectation: SynapseReceiptGroupExpectation;
+        /** Recompute the CURRENT source hash per item id, inside the transaction.
+         *  A missing id means the source row is gone (drift). */
+        readCurrentHashes: (ids: readonly string[]) => ReadonlyMap<string, string>;
+        /** Write every destination item. Runs inside the same transaction. */
+        writeDestination: () => void;
+    },
 ): void {
-    const disposition = status === "complete" ? null : "retryable";
-    db.prepare(
-        `UPDATE synapse_batch_ledger
-            SET state = ?, failure_disposition = ?, state_version = state_version + 1, updated_at = ?
-          WHERE session_id = ? AND request_key = ? AND state NOT IN ('obsolete', 'complete')`,
-    ).run(status, disposition, Date.now(), sessionId, requestKey);
+    const { receipts, expectation } = args;
+    if (receipts.length === 0) {
+        throw new SynapseLedgerConflictError("cannot apply an empty receipt group");
+    }
+    const group = receipts[0].applicationGroup;
+    const driftedRowIds = new Set<number>();
+    try {
+        db.transaction(() => {
+            const manifestHashes = new Map<string, string>();
+            const rowIdByItem = new Map<string, number>();
+            for (const receipt of receipts) {
+                if (receipt.applicationGroup !== group) {
+                    throw new SynapseLedgerConflictError(
+                        "receipts span more than one application group",
+                    );
+                }
+                for (const item of receipt.items) {
+                    if (manifestHashes.has(item.id)) {
+                        throw new SynapseLedgerConflictError(
+                            `item ${item.id} appears in two receipts of one group`,
+                        );
+                    }
+                    manifestHashes.set(item.id, item.contentSha256);
+                    rowIdByItem.set(item.id, receipt.rowId);
+                    if (!receipt.vectors.has(item.id)) {
+                        throw new SynapseLedgerConflictError(
+                            `receipt ${receipt.rowId} is missing a vector for item ${item.id}`,
+                        );
+                    }
+                }
+            }
+            for (const receipt of receipts) {
+                const row = getSynapseLedgerPage(db, receipt.rowId);
+                if (row?.state !== "ready" || row.stateVersion !== receipt.stateVersion) {
+                    throw new SynapseLedgerConflictError(
+                        `receipt ${receipt.rowId} is not ready at version ${receipt.stateVersion}`,
+                    );
+                }
+                if (
+                    row.scope !== expectation.scope ||
+                    row.laneRole !== expectation.laneRole ||
+                    row.destinationModel !== expectation.destinationModel ||
+                    row.applicationGroup !== group
+                ) {
+                    throw new SynapseLedgerConflictError(
+                        `receipt ${receipt.rowId} identity does not match the destination context`,
+                    );
+                }
+            }
+            const ids = [...manifestHashes.keys()];
+            const current = args.readCurrentHashes(ids);
+            for (const [id, hash] of manifestHashes) {
+                if (current.get(id) !== hash) {
+                    const rowId = rowIdByItem.get(id);
+                    if (rowId !== undefined) driftedRowIds.add(rowId);
+                    throw new SynapseLedgerConflictError(`source drifted for item ${id}`);
+                }
+            }
+            args.writeDestination();
+            for (const receipt of receipts) {
+                completeSynapseLedgerReceipt(db, {
+                    rowId: receipt.rowId,
+                    expectedStateVersion: receipt.stateVersion,
+                });
+            }
+        })();
+    } catch (error) {
+        for (const rowId of driftedRowIds) {
+            const row = getSynapseLedgerPage(db, rowId);
+            if (!row || row.state === "complete" || row.state === "obsolete") continue;
+            try {
+                markSynapseLedgerObsolete(db, { rowId, expectedStateVersion: row.stateVersion });
+            } catch {
+                // Best effort: a concurrent transition already moved the row.
+            }
+        }
+        throw error;
+    }
+}
+
+/**
+ * Reopen a 'complete' receipt ONLY with destination proof (R24). Inside one
+ * transaction the selector proves every manifest item's exact destination row
+ * absent or stale, invalidates the stale rows, and CASes complete->pending.
+ * Returns false (and changes nothing) when the destination is truthfully
+ * complete — 'complete' stays absorbing.
+ */
+export function reopenCompleteSynapseLedgerPageWithProof(
+    db: Database,
+    args: {
+        rowId: number;
+        deadlineAt: number;
+        destinationState: (item: SynapseLedgerManifestItem) => "absent" | "stale" | "current";
+        invalidateDestination: (item: SynapseLedgerManifestItem) => void;
+    },
+): boolean {
+    let reopened = false;
+    db.transaction(() => {
+        const row = getSynapseLedgerPage(db, args.rowId);
+        if (row?.state !== "complete") return;
+        let proven = false;
+        for (const item of row.manifest) {
+            const state = args.destinationState(item);
+            if (state === "current") continue;
+            proven = true;
+            if (state === "stale") args.invalidateDestination(item);
+        }
+        if (!proven) return;
+        reopenCompleteSynapseLedgerPage(db, {
+            rowId: row.rowId,
+            expectedStateVersion: row.stateVersion,
+            deadlineAt: args.deadlineAt,
+        });
+        reopened = true;
+    })();
+    return reopened;
 }
 
 /** Retention for synapse_batch_ledger rows keyed by a project's synthetic

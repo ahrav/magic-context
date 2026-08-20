@@ -44,7 +44,13 @@ import {
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
-import { beginSynapseBatchLedger } from "./storage-embedding-measurements";
+import { createSynapseLedgerPage } from "./storage-embedding-measurements";
+import {
+    DetailedSynapseTestHost,
+    detailedSynapseTestProvider,
+    SYNAPSE_TEST_LANE_IDENTITY,
+    synapseTestConfig,
+} from "./synapse-detailed-test-support";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
     readonly modelId: string;
@@ -626,20 +632,20 @@ describe("project embedding registry", () => {
         // keys its ledger by the project identity, the shadow lane by
         // `shadow:<projectIdentity>`. Neither is ever session-deleted.
         for (const sessionId of [projectIdentity, `shadow:${projectIdentity}`]) {
-            beginSynapseBatchLedger(db, {
-                sessionId,
-                projectPath: projectIdentity,
-                scope: "memory",
-                manifest: [],
-                requestKey: `${sessionId}:old`,
-            });
-            beginSynapseBatchLedger(db, {
-                sessionId,
-                projectPath: projectIdentity,
-                scope: "memory",
-                manifest: [],
-                requestKey: `${sessionId}:fresh`,
-            });
+            const laneRole = sessionId.startsWith("shadow:") ? "shadow" : "primary";
+            for (const age of ["old", "fresh"] as const) {
+                createSynapseLedgerPage(db, {
+                    projectPath: projectIdentity,
+                    sessionId,
+                    scope: "memory",
+                    laneRole,
+                    destinationModel: "model-x",
+                    applicationGroup: `group-${age}`,
+                    requestKey: `${sessionId}:${age}`,
+                    manifest: [],
+                    deadlineAt: Date.now() + 60_000,
+                });
+            }
             db.prepare(
                 "UPDATE synapse_batch_ledger SET updated_at = ? WHERE session_id = ? AND request_key = ?",
             ).run(Date.now() - fifteenDaysMs, sessionId, `${sessionId}:old`);
@@ -1638,5 +1644,204 @@ describe("project embedding registry", () => {
 
         expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
         expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(3);
+    });
+});
+
+describe("detailed synapse writers apply complete receipt groups atomically", () => {
+    const tempDirs: string[] = [];
+    const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+    function useTempDb() {
+        const dir = mkdtempSync(join(tmpdir(), "registry-detailed-"));
+        tempDirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
+    }
+
+    afterEach(() => {
+        _resetProjectEmbeddingRegistryForTests();
+        closeDatabase();
+        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        for (const dir of tempDirs.splice(0)) {
+            try {
+                rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            } catch {
+                /* Ignore EBUSY on Windows */
+            }
+        }
+    });
+
+    function ledgerRows(db: NonNullable<ReturnType<typeof openDatabase>>) {
+        return db
+            .prepare(
+                "SELECT scope, lane_role, application_group, state FROM synapse_batch_ledger ORDER BY id",
+            )
+            .all() as Array<{
+            scope: string;
+            lane_role: string;
+            application_group: string;
+            state: string;
+        }>;
+    }
+
+    function registerDetailed(
+        db: NonNullable<ReturnType<typeof openDatabase>>,
+        projectIdentity: string,
+        host: DetailedSynapseTestHost,
+    ): void {
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "synapse"
+                ? detailedSynapseTestProvider(host)
+                : new FakeEmbeddingProvider("off"),
+        );
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            synapseTestConfig(),
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/tmp/registry-detailed",
+        );
+    }
+
+    it("memory drain writes every item in the group and completes all receipts together", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory";
+        const host = new DetailedSynapseTestHost();
+        insertMemory(db, { projectPath: projectIdentity, category: "CONSTRAINTS", content: "m1" });
+        insertMemory(db, { projectPath: projectIdentity, category: "CONSTRAINTS", content: "m2" });
+        registerDetailed(db, projectIdentity, host);
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+
+        expect(embedded).toBe(2);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(2);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.state === "complete")).toBe(true);
+        expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
+    });
+
+    it("one drifted memory in the group writes nothing and retires the receipt", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-drift";
+        const host = new DetailedSynapseTestHost();
+        const first = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "stable memory",
+        });
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "another memory",
+        });
+        registerDetailed(db, projectIdentity, host);
+        host.resultPages = (_jobId, items) => {
+            db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(
+                "edited mid-flight",
+                first.id,
+            );
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+
+        expect(embedded).toBe(0);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
+        const rows = ledgerRows(db);
+        expect(rows.some((row) => row.state === "obsolete")).toBe(true);
+        expect(rows.every((row) => row.state !== "complete")).toBe(true);
+    });
+
+    it("a registration change between inference and apply writes no vectors and leaves receipts recoverable", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-generation";
+        const host = new DetailedSynapseTestHost();
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "generation guard memory",
+        });
+        registerDetailed(db, projectIdentity, host);
+        host.resultPages = (_jobId, items) => {
+            registerProjectEmbedding(
+                db,
+                projectIdentity,
+                localConfig("model-b"),
+                { memoryEnabled: true, gitCommitEnabled: false },
+                "/tmp/registry-detailed",
+            );
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+
+        expect(embedded).toBe(0);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
+        expect(ledgerRows(db).every((row) => row.state === "ready")).toBe(true);
+    });
+
+    it("commit drain routes through receipts and completes only with the vector write", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-commit";
+        const host = new DetailedSynapseTestHost();
+        upsertCommits(db, projectIdentity, [makeGitCommit("d1", 1000), makeGitCommit("d2", 2000)]);
+        registerDetailed(db, projectIdentity, host);
+
+        const drained = await drainCommitBacklogForProject(db, projectIdentity, Date.now() + 5000);
+
+        expect(drained).toBe(2);
+        expect(countEmbeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(2);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.scope === "commit" && row.state === "complete")).toBe(true);
+    });
+
+    it("chunk drain applies each compartment group atomically through its receipts", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-chunk";
+        const host = new DetailedSynapseTestHost();
+        seedCompartmentWithFts(db, "ses-detailed-chunk");
+        recordSessionProjectIdentity(db, "ses-detailed-chunk", projectIdentity);
+        registerDetailed(db, projectIdentity, host);
+
+        const embedded = await embedUnembeddedCompartmentChunksForProject(db, projectIdentity);
+
+        expect(embedded).toBe(1);
+        const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+        expect(
+            loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-detailed-chunk",
+                projectIdentity,
+                snapshot?.chunkModelId ?? "off",
+            ).length,
+        ).toBeGreaterThan(0);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.scope === "chunk" && row.state === "complete")).toBe(true);
+        expect(rows.every((row) => row.application_group.startsWith("compartment:"))).toBe(true);
     });
 });

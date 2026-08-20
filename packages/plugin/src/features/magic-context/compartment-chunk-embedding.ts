@@ -809,6 +809,16 @@ export function replaceCompartmentChunkEmbeddings(
     );
 }
 
+/** Remove one compartment's rows under one model, invalidating decoded pools. */
+export function deleteCompartmentChunkEmbeddingsForModel(
+    db: Database,
+    compartmentId: number,
+    modelId: string,
+): void {
+    getDeleteByCompartmentStatement(db).run(compartmentId, modelId);
+    invalidateDecodedSearchPools(db, ([, , cachedModelId]) => cachedModelId === modelId);
+}
+
 function searchPoolVectorBytes(rows: readonly StoredCompartmentChunkEmbedding[]): number {
     let bytes = 0;
     for (const row of rows) {

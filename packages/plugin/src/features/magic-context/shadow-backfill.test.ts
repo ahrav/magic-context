@@ -26,6 +26,12 @@ import {
     sweepStaleEmbeddingIdentitiesForProject,
 } from "./project-embedding-registry";
 import { closeDatabase, openDatabase } from "./storage";
+import {
+    DetailedSynapseTestHost,
+    detailedSynapseTestProvider,
+    SYNAPSE_TEST_LANE_IDENTITY,
+    synapseTestConfig,
+} from "./synapse-detailed-test-support";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
     readonly modelId: string;
@@ -112,7 +118,9 @@ describe("shadow embedding historical backfill", () => {
         const dir = mkdtempSync(join(tmpdir(), "shadow-backfill-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
     }
 
     afterEach(() => {
@@ -137,7 +145,7 @@ describe("shadow embedding historical backfill", () => {
     }
 
     function seedPrimaryMemories(
-        db: ReturnType<typeof openDatabase>,
+        db: NonNullable<ReturnType<typeof openDatabase>>,
         projectIdentity: string,
         count: number,
     ): void {
@@ -452,5 +460,142 @@ describe("shadow embedding historical backfill", () => {
         // Old identity aged out; new identity (current shadow) is protected.
         expect(countShadowMemoryRows(db, projectIdentity, shadowA)).toBe(0);
         expect(countShadowMemoryRows(db, projectIdentity, shadowB)).toBe(3);
+    });
+});
+
+describe("shadow lane writes through versioned synapse receipts", () => {
+    const tempDirs: string[] = [];
+    const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+    function useTempDb() {
+        const dir = mkdtempSync(join(tmpdir(), "shadow-detailed-"));
+        tempDirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
+    }
+
+    afterEach(() => {
+        _resetProjectEmbeddingRegistryForTests();
+        closeDatabase();
+        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        for (const dir of tempDirs.splice(0)) {
+            try {
+                rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            } catch {
+                /* Ignore EBUSY on Windows */
+            }
+        }
+    });
+
+    it("shadow memory backfill applies groups atomically under the shadow lane identity", async () => {
+        const host = new DetailedSynapseTestHost();
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "synapse"
+                ? detailedSynapseTestProvider(host)
+                : new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-detailed";
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "Mirror me into the shadow lane.",
+        });
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-detailed",
+        );
+        saveEmbedding(db, memory.id, new Float32Array([1, 1]), primaryModelId(projectIdentity));
+
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseTestConfig(),
+            "/tmp/shadow-detailed",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(shadowModelId(projectIdentity)).toBe(SYNAPSE_TEST_LANE_IDENTITY);
+        expect(countShadowMemoryRows(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(1);
+        const ledger = db
+            .prepare(
+                "SELECT session_id, lane_role, scope, state FROM synapse_batch_ledger ORDER BY id",
+            )
+            .all() as Array<{
+            session_id: string;
+            lane_role: string;
+            scope: string;
+            state: string;
+        }>;
+        expect(ledger.length).toBeGreaterThan(0);
+        expect(
+            ledger.every(
+                (row) =>
+                    row.lane_role === "shadow" &&
+                    row.session_id === `shadow:${projectIdentity}` &&
+                    row.scope === "memory" &&
+                    row.state === "complete",
+            ),
+        ).toBe(true);
+    });
+
+    it("a shadow group failure writes nothing and completes no receipt", async () => {
+        const host = new DetailedSynapseTestHost();
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "synapse"
+                ? detailedSynapseTestProvider(host)
+                : new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-detailed-fail";
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "Shadow mirror candidate.",
+        });
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-detailed-fail",
+        );
+        saveEmbedding(db, memory.id, new Float32Array([1, 1]), primaryModelId(projectIdentity));
+
+        host.resultPages = (_jobId, items) => {
+            db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(
+                "edited before shadow apply",
+                memory.id,
+            );
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            synapseTestConfig(),
+            "/tmp/shadow-detailed-fail",
+        );
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        expect(countShadowMemoryRows(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(0);
+        const ledger = db
+            .prepare("SELECT state FROM synapse_batch_ledger ORDER BY id")
+            .all() as Array<{ state: string }>;
+        expect(ledger.every((row) => row.state !== "complete")).toBe(true);
     });
 });

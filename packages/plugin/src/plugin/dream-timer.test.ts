@@ -146,3 +146,22 @@ describe("dream-timer dead-directory guard (static)", () => {
         expect(gcIdx).toBeGreaterThan(guardIdx);
     });
 });
+
+describe("dream-timer normal chunk recovery trigger (static)", () => {
+    const source = readFileSync(join(import.meta.dir, "dream-timer.ts"), "utf8");
+
+    test("runProjectMaintenance drains missing compartment chunks under the existing selector", () => {
+        const maintenance = source.slice(
+            source.indexOf("async function runProjectMaintenance("),
+            source.indexOf("async function sweepProject("),
+        );
+        expect(maintenance).toContain("embedUnembeddedMemoriesForProject(db, reg.projectIdentity)");
+        expect(maintenance).toContain("embedUnembeddedCompartmentChunksForProject");
+    });
+
+    test("no ledger scan, ledger lease, or recovery queue is introduced", () => {
+        expect(source).not.toContain("synapse_batch_ledger");
+        expect(source).not.toContain("SynapseLedger");
+        expect(source).not.toContain("recoveryQueue");
+    });
+});

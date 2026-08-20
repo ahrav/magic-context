@@ -102,6 +102,21 @@ export function saveCommitEmbedding(
     getSaveStatement(db).run(sha, bytes, modelId, Date.now());
 }
 
+export function hasCommitEmbedding(db: Database, sha: string, modelId: string): boolean {
+    return Boolean(
+        db
+            .prepare("SELECT 1 FROM git_commit_embeddings WHERE sha = ? AND model_id = ? LIMIT 1")
+            .get(sha, modelId),
+    );
+}
+
+export function deleteCommitEmbedding(db: Database, sha: string, modelId: string): void {
+    db.prepare("DELETE FROM git_commit_embeddings WHERE sha = ? AND model_id = ?").run(
+        sha,
+        modelId,
+    );
+}
+
 /** The join to `git_commits` drops embeddings whose commit row is gone, so an
  *  orphan vector can never reach ranking. */
 export function loadProjectCommitEmbeddings(

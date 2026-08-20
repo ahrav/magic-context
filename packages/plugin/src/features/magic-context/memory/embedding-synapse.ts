@@ -709,7 +709,16 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     );
                 } catch (error) {
                     const classified = classifyError(error);
-                    this.logCallFailure(classified, "embed.batch");
+                    if (
+                        classified.code === "idempotency_conflict" &&
+                        classified.ledgerRowId !== undefined
+                    ) {
+                        log(
+                            `[magic-context] Synapse embed.batch receipt conflict: ${classified.message}`,
+                        );
+                    } else {
+                        this.logCallFailure(classified, "embed.batch");
+                    }
                     result.failures.push({
                         applicationGroup,
                         items: manifest,
