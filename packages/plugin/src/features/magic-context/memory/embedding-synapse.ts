@@ -1,8 +1,29 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
 import { isSubcCallError, SubcClient } from "../../../shared/mc-host-client";
-import type { EmbeddingProvider } from "./embedding-provider";
+import {
+    createSynapseLedgerPage,
+    findSynapseLedgerPage,
+    markSynapseLedgerObsolete,
+    markSynapseLedgerOutcome,
+    markSynapseLedgerPolling,
+    markSynapseLedgerReady,
+    recordSynapseLedgerCursor,
+    recordSynapseLedgerJob,
+    recordSynapseLedgerRestart,
+    retrySynapseLedgerPage,
+    SynapseLedgerConflictError,
+    type SynapseLedgerManifestItem,
+    type SynapseLedgerPageIdentity,
+} from "../storage-embedding-measurements";
+import type {
+    DetailedEmbedContext,
+    DetailedEmbedItem,
+    DetailedEmbedResult,
+    EmbeddingPageReceipt,
+    EmbeddingProvider,
+} from "./embedding-provider";
 
 export const SYNAPSE_DEFAULT_MODEL = "gte-modernbert-base-f16";
 export const SYNAPSE_MAX_INPUT_TOKENS = 8192;
@@ -85,6 +106,8 @@ export class SynapseEmbeddingError extends Error {
     readonly code: SynapseErrorCode;
     readonly retryAfterMs?: number;
     readonly permanent: boolean;
+    /** Ledger receipt this failure was recorded against, when one exists. */
+    ledgerRowId?: number;
 
     constructor(
         code: SynapseErrorCode,
@@ -633,6 +656,389 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         return output;
     }
 
+    async embedItemsDetailed(
+        items: readonly DetailedEmbedItem[],
+        context: DetailedEmbedContext,
+        signal?: AbortSignal,
+    ): Promise<DetailedEmbedResult> {
+        const result: DetailedEmbedResult = { receipts: [], failures: [] };
+        if (items.length === 0) return result;
+        const groups = new Map<string, DetailedEmbedItem[]>();
+        for (const item of items) {
+            const group = groups.get(item.applicationGroup);
+            if (group) group.push(item);
+            else groups.set(item.applicationGroup, [item]);
+        }
+        const ready = await this.initialize();
+        if (!ready || !this.metadata) {
+            for (const [applicationGroup, groupItems] of groups) {
+                result.failures.push({
+                    applicationGroup,
+                    items: groupItems.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                    rowId: null,
+                    code: this.permanentFailure ? "artifact_invalid" : "transport",
+                    message: "Synapse lane is unavailable",
+                    disposition: this.permanentFailure ? "permanent" : "retryable",
+                });
+            }
+            return result;
+        }
+        for (const [applicationGroup, groupItems] of groups) {
+            // Pages are cut inside one group only, so a provider page can
+            // never span two application transaction groups (R18).
+            for (let start = 0; start < groupItems.length; ) {
+                const page = this.nextPage(groupItems, start) as readonly DetailedEmbedItem[];
+                start += page.length;
+                const manifest = page.map(({ id, contentSha256 }) => ({ id, contentSha256 }));
+                if (signal?.aborted || this.permanentFailure) {
+                    result.failures.push({
+                        applicationGroup,
+                        items: manifest,
+                        rowId: null,
+                        code: this.permanentFailure ? "artifact_invalid" : "cancelled",
+                        message: this.permanentFailure
+                            ? "Synapse lane disabled after a permanent failure"
+                            : "Synapse request aborted",
+                        disposition: this.permanentFailure ? "permanent" : "retryable",
+                    });
+                    continue;
+                }
+                try {
+                    result.receipts.push(
+                        await this.runDetailedPage(page, applicationGroup, context, signal),
+                    );
+                } catch (error) {
+                    const classified = classifyError(error);
+                    this.logCallFailure(classified, "embed.batch");
+                    result.failures.push({
+                        applicationGroup,
+                        items: manifest,
+                        rowId: classified.ledgerRowId ?? null,
+                        code: classified.code,
+                        message: classified.message,
+                        disposition: classified.permanent ? "permanent" : "retryable",
+                    });
+                }
+            }
+        }
+        return result;
+    }
+
+    private async runDetailedPage(
+        page: readonly DetailedEmbedItem[],
+        applicationGroup: string,
+        context: DetailedEmbedContext,
+        signal?: AbortSignal,
+    ): Promise<EmbeddingPageReceipt> {
+        const db = context.db;
+        const requestKey = this.requestKey(page);
+        const manifest: SynapseLedgerManifestItem[] = page.map(({ id, contentSha256 }) => ({
+            id,
+            contentSha256,
+        }));
+        const identity: SynapseLedgerPageIdentity = {
+            projectPath: context.projectPath,
+            sessionId: context.sessionId,
+            scope: context.scope,
+            laneRole: context.laneRole,
+            destinationModel: this.modelId,
+            applicationGroup,
+            requestKey,
+        };
+        const timeoutMs = this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
+        const freshPage = () =>
+            createSynapseLedgerPage(db, {
+                ...identity,
+                manifest,
+                deadlineAt: Date.now() + timeoutMs,
+            });
+        let row = findSynapseLedgerPage(db, identity) ?? freshPage();
+
+        if (row.state === "complete") {
+            const error = new SynapseEmbeddingError(
+                "idempotency_conflict",
+                "receipt is already complete; reopening requires destination proof (R24)",
+                { permanent: true },
+            );
+            error.ledgerRowId = row.rowId;
+            throw error;
+        }
+        if (row.state === "partial" || row.state === "failed") {
+            if (row.failureDisposition === "retryable" && (row.deadlineAt ?? 0) > Date.now()) {
+                row = retrySynapseLedgerPage(db, {
+                    rowId: row.rowId,
+                    expectedStateVersion: row.stateVersion,
+                });
+            } else {
+                markSynapseLedgerObsolete(db, {
+                    rowId: row.rowId,
+                    expectedStateVersion: row.stateVersion,
+                });
+                row = freshPage();
+            }
+        }
+        if (row.state === "ready") {
+            // A ready row without applied destinations means the vectors were
+            // lost with the process; re-derive them from the retained job (R20).
+            if (row.jobId) {
+                try {
+                    const vectors = await this.collectJobPages(
+                        row.jobId,
+                        requestKey,
+                        page,
+                        row.deadlineAt ?? Date.now() + timeoutMs,
+                        signal,
+                    );
+                    return {
+                        rowId: row.rowId,
+                        stateVersion: row.stateVersion,
+                        applicationGroup,
+                        items: manifest,
+                        vectors,
+                    };
+                } catch (error) {
+                    const classified = classifyError(error);
+                    if (classified.code !== "module_restarted") {
+                        classified.ledgerRowId = row.rowId;
+                        throw classified;
+                    }
+                }
+            }
+            markSynapseLedgerObsolete(db, {
+                rowId: row.rowId,
+                expectedStateVersion: row.stateVersion,
+            });
+            row = freshPage();
+        }
+
+        const deadlineAt = row.deadlineAt ?? Date.now() + timeoutMs;
+        try {
+            if (row.state === "pending") {
+                const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                row = markSynapseLedgerPolling(db, {
+                    rowId: row.rowId,
+                    expectedStateVersion: row.stateVersion,
+                    attemptId: randomUUID(),
+                    jobId,
+                });
+            }
+            for (;;) {
+                if (!row.jobId) {
+                    // A crash between the restart CAS and resubmission leaves a
+                    // polling row without a job; resubmit the same page key.
+                    const jobId = await this.submitBatchPage(page, requestKey, deadlineAt, signal);
+                    row = recordSynapseLedgerJob(db, {
+                        rowId: row.rowId,
+                        expectedStateVersion: row.stateVersion,
+                        attemptId: randomUUID(),
+                        jobId,
+                    });
+                }
+                const jobId = row.jobId as string;
+                try {
+                    const vectors = await this.collectJobPages(
+                        jobId,
+                        requestKey,
+                        page,
+                        deadlineAt,
+                        signal,
+                        (cursor) => {
+                            row = recordSynapseLedgerCursor(db, {
+                                rowId: row.rowId,
+                                expectedStateVersion: row.stateVersion,
+                                jobId,
+                                cursor,
+                            });
+                        },
+                    );
+                    row = markSynapseLedgerReady(db, {
+                        rowId: row.rowId,
+                        expectedStateVersion: row.stateVersion,
+                        jobId,
+                    });
+                    return {
+                        rowId: row.rowId,
+                        stateVersion: row.stateVersion,
+                        applicationGroup,
+                        items: manifest,
+                        vectors,
+                    };
+                } catch (error) {
+                    const classified = classifyError(error);
+                    if (classified.code !== "module_restarted") throw classified;
+                    try {
+                        row = recordSynapseLedgerRestart(db, {
+                            rowId: row.rowId,
+                            expectedStateVersion: row.stateVersion,
+                            jobId,
+                        });
+                    } catch (casError) {
+                        if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
+                        // The single durable restart is already spent or the
+                        // deadline passed: this page cannot resubmit (R21).
+                        throw new SynapseEmbeddingError(
+                            "module_restarted",
+                            "restart budget or page deadline exhausted",
+                        );
+                    }
+                }
+            }
+        } catch (error) {
+            const classified = classifyError(error);
+            try {
+                row = markSynapseLedgerOutcome(db, {
+                    rowId: row.rowId,
+                    expectedStateVersion: row.stateVersion,
+                    state: "failed",
+                    disposition: classified.permanent ? "permanent" : "retryable",
+                });
+            } catch (casError) {
+                if (!(casError instanceof SynapseLedgerConflictError)) throw casError;
+            }
+            classified.ledgerRowId = row.rowId;
+            throw classified;
+        }
+    }
+
+    private async submitBatchPage(
+        page: readonly { id: string; text: string; contentSha256: string }[],
+        requestKey: string,
+        deadlineAt: number,
+        signal?: AbortSignal,
+    ): Promise<string> {
+        const remainingMs = deadlineAt - Date.now();
+        if (remainingMs <= 0) {
+            throw new SynapseEmbeddingError("timeout", "Synapse page deadline exhausted");
+        }
+        const body = await this.callWithRetry(
+            "embed.batch",
+            this.batchRequest(page, requestKey),
+            remainingMs,
+            true,
+            signal,
+        );
+        const parsed = responseBody(body);
+        const jobId =
+            typeof parsed.job_id === "string" && parsed.job_id.length > 0 ? parsed.job_id : null;
+        if (!jobId) {
+            throw new SynapseEmbeddingError(
+                "schema_violation",
+                "embed.batch returned no job descriptor",
+            );
+        }
+        return jobId;
+    }
+
+    private async collectJobPages(
+        jobId: string,
+        requestKey: string,
+        page: readonly { id: string; contentSha256: string }[],
+        deadlineAt: number,
+        signal?: AbortSignal,
+        onCursor?: (cursor: string) => void,
+    ): Promise<Map<string, Float32Array>> {
+        const metadata = this.metadata;
+        if (!metadata) {
+            throw new SynapseEmbeddingError("transport", "Synapse metadata is unavailable");
+        }
+        const expected = new Map(page.map((item) => [item.id, item.contentSha256]));
+        const collected = new Map<string, Float32Array>();
+        let cursor: string | null = null;
+        for (;;) {
+            if (signal?.aborted) {
+                throw new SynapseEmbeddingError("transport", "Synapse request aborted");
+            }
+            const remainingMs = deadlineAt - Date.now();
+            if (remainingMs <= 0) {
+                throw new SynapseEmbeddingError("timeout", "Synapse page deadline exhausted");
+            }
+            const body = await this.callWithRetry(
+                "embed.result",
+                this.requestConstraints({ job_id: jobId, request_key: requestKey, cursor }),
+                remainingMs,
+                true,
+                signal,
+            );
+            const parsed = responseBody(body);
+            const hasVectors = Array.isArray(parsed.vectors);
+            if (parsed.done !== true && (!hasVectors || parsed.next_cursor == null)) {
+                // done:false without a next cursor is explicit pending, never
+                // termination (R13): wait the bounded delay and poll again.
+                const delay = Math.min(
+                    readRetryAfter(parsed) ?? 50,
+                    Math.max(0, deadlineAt - Date.now()),
+                );
+                await wait(delay);
+                continue;
+            }
+            if (!hasVectors) {
+                throw new SynapseEmbeddingError(
+                    "schema_violation",
+                    "Synapse result page carries done:true without vectors",
+                );
+            }
+            if (typeof parsed.model === "string" && parsed.model !== metadata.model) {
+                throw new SynapseEmbeddingError(
+                    "substitution_rejected",
+                    `Synapse served model ${parsed.model}, expected ${metadata.model}`,
+                );
+            }
+            for (const item of extractBatchItems(body)) {
+                const id = typeof item.id === "string" ? item.id : "";
+                if (!id || !expected.has(id)) {
+                    throw new SynapseEmbeddingError(
+                        "schema_violation",
+                        `Synapse returned unknown item ${id || "<missing id>"}`,
+                    );
+                }
+                if (collected.has(id)) {
+                    throw new SynapseEmbeddingError(
+                        "schema_violation",
+                        `Synapse returned duplicate item ${id}`,
+                    );
+                }
+                const hash = item.content_sha256;
+                if (typeof hash !== "string" || hash !== expected.get(id)) {
+                    throw new SynapseEmbeddingError(
+                        "artifact_invalid",
+                        `Synapse content hash mismatch for item ${id}`,
+                    );
+                }
+                const raw = item.vector ?? item.embedding;
+                if (
+                    !Array.isArray(raw) ||
+                    raw.length === 0 ||
+                    raw.some((value) => typeof value !== "number" || !Number.isFinite(value))
+                ) {
+                    throw new SynapseEmbeddingError(
+                        "schema_violation",
+                        `Synapse vector for item ${id} is malformed or non-finite`,
+                    );
+                }
+                const vector = Float32Array.from(raw as number[]);
+                this.validateResponse({ ...parsed, ...item }, vector.length);
+                collected.set(id, vector);
+            }
+            if (parsed.done === true) break;
+            const nextCursor = parsed.next_cursor;
+            if (typeof nextCursor !== "string") {
+                throw new SynapseEmbeddingError(
+                    "schema_violation",
+                    "Synapse non-final result page has no next_cursor",
+                );
+            }
+            cursor = nextCursor;
+            onCursor?.(nextCursor);
+        }
+        if (collected.size !== page.length) {
+            throw new SynapseEmbeddingError(
+                "schema_violation",
+                `Synapse returned ${collected.size} of ${page.length} requested items`,
+            );
+        }
+        return collected;
+    }
+
     async dispose(): Promise<void> {
         this.initialized = false;
         this.client = null;
@@ -759,6 +1165,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             } catch (error) {
                 const classified = classifyError(error);
                 if (classified.code === "idempotency_conflict") throw classified;
+                // R21: module_restarted bypasses generic retry entirely; the
+                // caller owns the single durable restart resubmission.
+                if (classified.code === "module_restarted") throw classified;
                 const outcomeUnknown = isSubcCallError(error) && error.kind === "outcome_unknown";
                 const retryable = !classified.permanent && (retryEmbeddings || !outcomeUnknown);
                 if (!retryable || attempt >= 3) throw classified;

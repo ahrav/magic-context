@@ -37,6 +37,7 @@ import {
     ensureColumn,
     healAllNullColumns,
     MEMORIES_AU_TRIGGER_BODY,
+    synapseBatchLedgerIndexDdl,
 } from "./storage-schema-helpers";
 import {
     loadToolDefinitionMeasurements,
@@ -97,7 +98,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastMigrationOnOpenRefusal = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 81;
+export const LATEST_SUPPORTED_VERSION = 82;
 
 // chmod is meaningless on Windows (POSIX modes are not honored), so all
 // permission tightening is skipped there. mkdir's `mode` is likewise ignored.
@@ -1062,20 +1063,25 @@ export function initializeDatabase(db: Database): void {
 
     CREATE TABLE IF NOT EXISTS synapse_batch_ledger (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
       project_path TEXT NOT NULL DEFAULT '',
+      session_id TEXT NOT NULL,
       scope TEXT NOT NULL DEFAULT '',
-      manifest_json TEXT NOT NULL DEFAULT '{}',
+      lane_role TEXT NOT NULL DEFAULT 'primary' CHECK(lane_role IN ('primary', 'shadow')),
+      destination_model TEXT NOT NULL DEFAULT '',
+      application_group TEXT NOT NULL DEFAULT '',
       request_key TEXT NOT NULL DEFAULT '',
+      manifest_json TEXT NOT NULL DEFAULT '[]',
+      state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'polling', 'ready', 'complete', 'partial', 'failed', 'obsolete')),
+      state_version INTEGER NOT NULL DEFAULT 0,
+      attempt_id TEXT,
       job_id TEXT,
       cursor TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
+      deadline_at INTEGER,
+      restart_count INTEGER NOT NULL DEFAULT 0,
+      failure_disposition TEXT CHECK(failure_disposition IS NULL OR failure_disposition IN ('retryable', 'permanent')),
       created_at INTEGER NOT NULL DEFAULT 0,
-      updated_at INTEGER NOT NULL DEFAULT 0,
-      UNIQUE(session_id, request_key)
+      updated_at INTEGER NOT NULL DEFAULT 0
     );
-    CREATE INDEX IF NOT EXISTS idx_synapse_batch_ledger_session
-      ON synapse_batch_ledger(session_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS shadow_embedding_registrations (
       project_path TEXT NOT NULL,
@@ -1638,6 +1644,18 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         VALUES (new.id, new.question, new.answer, new.project_path);
       END;
     `);
+
+    // The ledger's live-identity indexes reference v82 columns; on a
+    // pre-migration database the legacy-shape table exists without them, so
+    // index creation must wait for migration v82's table replacement.
+    const ledgerColumns = new Set(
+        (
+            db.prepare("PRAGMA table_info(synapse_batch_ledger)").all() as Array<{ name: string }>
+        ).map((row) => row.name),
+    );
+    if (ledgerColumns.has("state_version")) {
+        db.exec(synapseBatchLedgerIndexDdl(true));
+    }
 
     ensureColumn(db, "session_meta", "last_nudge_band", "TEXT DEFAULT ''");
     ensureColumn(db, "session_meta", "last_nudge_undropped", "INTEGER DEFAULT 0");

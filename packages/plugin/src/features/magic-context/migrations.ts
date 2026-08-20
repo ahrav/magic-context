@@ -5,6 +5,8 @@ import {
     ensureColumn,
     healAllNullColumns,
     MEMORIES_AU_TRIGGER_BODY,
+    synapseBatchLedgerDdl,
+    synapseBatchLedgerIndexDdl,
 } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -3089,7 +3091,130 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "notes", "state_version", "INTEGER NOT NULL DEFAULT 0");
         },
     },
+    {
+        version: 82,
+        description: "context-complete synapse batch ledger with versioned CAS state",
+        up(db: Database): void {
+            if (!tableExists(db, "synapse_batch_ledger")) {
+                db.exec(synapseBatchLedgerDdl("synapse_batch_ledger"));
+                db.exec(synapseBatchLedgerIndexDdl(false));
+                return;
+            }
+            const columns = new Set(
+                (
+                    db.prepare("PRAGMA table_info(synapse_batch_ledger)").all() as Array<{
+                        name: string;
+                    }>
+                ).map((row) => row.name),
+            );
+            if (columns.has("state_version")) return;
+            const legacyCount = (
+                db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
+                    count: number;
+                }
+            ).count;
+            // Stage the legacy rows in a plain copy instead of ALTER RENAME:
+            // a rename forces SQLite to re-resolve every trigger in the schema,
+            // which fails closed on databases whose memories_au trigger dangles
+            // (minimal fixtures without memories_fts).
+            db.exec(
+                "CREATE TABLE synapse_batch_ledger_legacy_v81 AS SELECT * FROM synapse_batch_ledger",
+            );
+            db.exec("DROP TABLE synapse_batch_ledger");
+            db.exec(synapseBatchLedgerDdl("synapse_batch_ledger"));
+            db.exec(synapseBatchLedgerIndexDdl(false));
+            // Quarantine every legacy row: the v81 schema stored no lane role,
+            // destination model, or application group, so no legacy receipt can
+            // prove full context (including rows that claimed 'complete' before
+            // destination persistence). Each is retained as a terminal
+            // 'obsolete' receipt -- durable and queryable -- and normal domain
+            // selectors rebuild the work under fresh context-complete rows.
+            db.exec(`
+                INSERT INTO synapse_batch_ledger
+                    (project_path, session_id, scope, lane_role, destination_model,
+                     application_group, request_key, manifest_json, state, state_version,
+                     job_id, cursor, deadline_at, restart_count, failure_disposition,
+                     created_at, updated_at)
+                SELECT project_path, session_id, scope,
+                       CASE WHEN session_id LIKE 'shadow:%' THEN 'shadow' ELSE 'primary' END,
+                       '', '', request_key, manifest_json, 'obsolete', 0,
+                       job_id, cursor, NULL, 0, NULL,
+                       created_at, updated_at
+                FROM synapse_batch_ledger_legacy_v81
+            `);
+            const copied = (
+                db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
+                    count: number;
+                }
+            ).count;
+            if (copied !== legacyCount) {
+                throw new Error(
+                    `v82 ledger copy postcondition failed: ${copied} of ${legacyCount} rows`,
+                );
+            }
+            const duplicates = (
+                db
+                    .prepare(
+                        `SELECT COUNT(*) AS count FROM (
+                            SELECT 1 FROM synapse_batch_ledger
+                            WHERE state != 'obsolete'
+                            GROUP BY project_path, session_id, scope, lane_role,
+                                     destination_model, application_group, request_key
+                            HAVING COUNT(*) > 1
+                        )`,
+                    )
+                    .get() as { count: number }
+            ).count;
+            if (duplicates !== 0) {
+                throw new Error(
+                    `v82 ledger uniqueness postcondition failed: ${duplicates} duplicate identities`,
+                );
+            }
+            invalidateUnprovenSynapseDestinationRowsV82(db);
+            db.exec("DROP TABLE synapse_batch_ledger_legacy_v81");
+        },
+    },
 ];
+
+/**
+ * Invalidate Synapse-lane destination vectors whose exact source and lane
+ * compatibility cannot be proven from durable state, inside the v82 migration
+ * transaction (R24). Coverage, precisely:
+ *
+ * - `memory_embeddings` and `git_commit_embeddings`: rows under a Synapse lane
+ *   identity (`model_id LIKE 'synapse:v1:%'`) carry no per-row source hash, so
+ *   exact source compatibility is unprovable -- deleted. Normal memory/commit
+ *   selectors rebuild them on demand.
+ * - `compartment_chunk_embeddings`: each row carries its source hash
+ *   (`chunk_hash`, re-verified against recomputed windows by the read path
+ *   before any use) and its lane identity (`model_id` pins model+fingerprint),
+ *   so a row with a non-empty `chunk_hash` is provably source- and
+ *   lane-compatible and is retained; Synapse rows without one are deleted.
+ * - Rows under any non-Synapse `model_id` (local/openai lanes) are never
+ *   touched (R25).
+ */
+export function invalidateUnprovenSynapseDestinationRowsV82(db: Database): {
+    memory: number;
+    commit: number;
+    chunk: number;
+} {
+    const laneLike = "synapse:v1:%";
+    const memory = tableExists(db, "memory_embeddings")
+        ? db.prepare("DELETE FROM memory_embeddings WHERE model_id LIKE ?").run(laneLike).changes
+        : 0;
+    const commit = tableExists(db, "git_commit_embeddings")
+        ? db.prepare("DELETE FROM git_commit_embeddings WHERE model_id LIKE ?").run(laneLike)
+              .changes
+        : 0;
+    const chunk = tableExists(db, "compartment_chunk_embeddings")
+        ? db
+              .prepare(
+                  "DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ? AND (chunk_hash IS NULL OR chunk_hash = '')",
+              )
+              .run(laneLike).changes
+        : 0;
+    return { memory, commit, chunk };
+}
 
 /**
  * Highest version in the MIGRATIONS array. `LATEST_SUPPORTED_VERSION` in

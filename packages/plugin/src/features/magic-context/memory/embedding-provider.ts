@@ -1,4 +1,47 @@
+import type { Database } from "../../../shared/sqlite";
+
 export type EmbeddingPurpose = "query" | "passage";
+
+export interface DetailedEmbedItem {
+    id: string;
+    text: string;
+    contentSha256: string;
+    /** Destination application-transaction group. A provider page never
+     *  crosses groups (R18); one group may span several pages. */
+    applicationGroup: string;
+}
+
+export interface DetailedEmbedContext {
+    db: Database;
+    projectPath: string;
+    sessionId: string;
+    scope: "memory" | "commit" | "chunk";
+    laneRole: "primary" | "shadow";
+}
+
+/** One validated provider page: the durable versioned receipt (row id +
+ *  state version) plus its immutable item set and in-memory vectors (R23). */
+export interface EmbeddingPageReceipt {
+    rowId: number;
+    stateVersion: number;
+    applicationGroup: string;
+    items: readonly { id: string; contentSha256: string }[];
+    vectors: Map<string, Float32Array>;
+}
+
+export interface EmbeddingPageFailure {
+    applicationGroup: string;
+    items: readonly { id: string; contentSha256: string }[];
+    rowId: number | null;
+    code: string;
+    message: string;
+    disposition: "retryable" | "permanent";
+}
+
+export interface DetailedEmbedResult {
+    receipts: EmbeddingPageReceipt[];
+    failures: EmbeddingPageFailure[];
+}
 
 export interface EmbeddingProvider {
     readonly modelId: string;
@@ -29,6 +72,15 @@ export interface EmbeddingProvider {
         items: readonly { id: string; text: string; contentSha256: string }[],
         signal?: AbortSignal,
     ): Promise<Map<string, Float32Array>>;
+    /** Detailed batch capability: pages the items without crossing application
+     *  groups, journals each page in the durable ledger, and returns versioned
+     *  receipts for destination transactions. Only providers with a durable
+     *  page journal (Synapse) implement this. */
+    embedItemsDetailed?(
+        items: readonly DetailedEmbedItem[],
+        context: DetailedEmbedContext,
+        signal?: AbortSignal,
+    ): Promise<DetailedEmbedResult>;
     dispose(): Promise<void>;
     isLoaded(): boolean;
 }

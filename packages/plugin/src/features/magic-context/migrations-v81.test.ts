@@ -19,7 +19,7 @@ function v80Database(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
-    db.exec("DELETE FROM schema_migrations WHERE version = 81");
+    db.exec("DELETE FROM schema_migrations WHERE version >= 81");
     db.exec(`
         ALTER TABLE notes DROP COLUMN source_revision;
         ALTER TABLE notes DROP COLUMN state_version;

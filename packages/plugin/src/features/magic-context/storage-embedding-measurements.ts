@@ -191,6 +191,427 @@ export function listMeasurementRowsWithOwnership(
     }));
 }
 
+export type SynapseLedgerState =
+    | "pending"
+    | "polling"
+    | "ready"
+    | "complete"
+    | "partial"
+    | "failed"
+    | "obsolete";
+
+export type SynapseFailureDisposition = "retryable" | "permanent";
+
+export interface SynapseLedgerManifestItem {
+    id: string;
+    contentSha256: string;
+}
+
+/** Context-complete identity of one provider page (R18). One live (non-obsolete)
+ *  ledger row exists per identity tuple; the row id is the receipt identity. */
+export interface SynapseLedgerPageIdentity {
+    projectPath: string;
+    sessionId: string;
+    scope: "memory" | "commit" | "chunk";
+    laneRole: "primary" | "shadow";
+    destinationModel: string;
+    applicationGroup: string;
+    requestKey: string;
+}
+
+export interface SynapseLedgerPageInput extends SynapseLedgerPageIdentity {
+    manifest: readonly SynapseLedgerManifestItem[];
+    /** Absolute wall-clock deadline for every attempt at this page (R19/R21). */
+    deadlineAt: number;
+}
+
+export interface SynapseLedgerPage extends SynapseLedgerPageIdentity {
+    rowId: number;
+    manifest: SynapseLedgerManifestItem[];
+    state: SynapseLedgerState;
+    stateVersion: number;
+    attemptId: string | null;
+    jobId: string | null;
+    cursor: string | null;
+    deadlineAt: number | null;
+    restartCount: number;
+    failureDisposition: SynapseFailureDisposition | null;
+}
+
+/** A CAS transition matched zero rows: the caller's snapshot is stale (or the
+ *  transition's evidence — state, version, job, restart budget, deadline — no
+ *  longer holds). Never a success; destination transactions must abort on it. */
+export class SynapseLedgerConflictError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "SynapseLedgerConflictError";
+    }
+}
+
+interface RawLedgerRow {
+    id: number;
+    project_path: string;
+    session_id: string;
+    scope: string;
+    lane_role: string;
+    destination_model: string;
+    application_group: string;
+    request_key: string;
+    manifest_json: string;
+    state: string;
+    state_version: number;
+    attempt_id: string | null;
+    job_id: string | null;
+    cursor: string | null;
+    deadline_at: number | null;
+    restart_count: number;
+    failure_disposition: string | null;
+}
+
+function toLedgerPage(row: RawLedgerRow): SynapseLedgerPage {
+    let manifest: SynapseLedgerManifestItem[] = [];
+    try {
+        const parsed = JSON.parse(row.manifest_json);
+        if (Array.isArray(parsed)) {
+            manifest = parsed.filter(
+                (entry): entry is SynapseLedgerManifestItem =>
+                    entry !== null &&
+                    typeof entry === "object" &&
+                    typeof entry.id === "string" &&
+                    typeof entry.contentSha256 === "string",
+            );
+        }
+    } catch {
+        manifest = [];
+    }
+    return {
+        rowId: row.id,
+        projectPath: row.project_path,
+        sessionId: row.session_id,
+        scope: row.scope as SynapseLedgerPageIdentity["scope"],
+        laneRole: row.lane_role as SynapseLedgerPageIdentity["laneRole"],
+        destinationModel: row.destination_model,
+        applicationGroup: row.application_group,
+        requestKey: row.request_key,
+        manifest,
+        state: row.state as SynapseLedgerState,
+        stateVersion: row.state_version,
+        attemptId: row.attempt_id,
+        jobId: row.job_id,
+        cursor: row.cursor,
+        deadlineAt: row.deadline_at,
+        restartCount: row.restart_count,
+        failureDisposition: row.failure_disposition as SynapseFailureDisposition | null,
+    };
+}
+
+export function getSynapseLedgerPage(db: Database, rowId: number): SynapseLedgerPage | null {
+    const row = db
+        .prepare("SELECT * FROM synapse_batch_ledger WHERE id = ?")
+        .get(rowId) as RawLedgerRow | null;
+    return row ? toLedgerPage(row) : null;
+}
+
+/** Exact-identity lookup of the one live row for a page. Never a scan: the
+ *  ledger is not a work queue (R20); callers always know their page identity. */
+export function findSynapseLedgerPage(
+    db: Database,
+    identity: SynapseLedgerPageIdentity,
+): SynapseLedgerPage | null {
+    const row = db
+        .prepare(
+            `SELECT * FROM synapse_batch_ledger
+              WHERE project_path = ? AND session_id = ? AND scope = ? AND lane_role = ?
+                AND destination_model = ? AND application_group = ? AND request_key = ?
+                AND state != 'obsolete'`,
+        )
+        .get(
+            identity.projectPath,
+            identity.sessionId,
+            identity.scope,
+            identity.laneRole,
+            identity.destinationModel,
+            identity.applicationGroup,
+            identity.requestKey,
+        ) as RawLedgerRow | null;
+    return row ? toLedgerPage(row) : null;
+}
+
+/** Create the page's ledger row in 'pending' with its absolute deadline
+ *  persisted before any submission (R18/R19). Throws on a live duplicate. */
+export function createSynapseLedgerPage(
+    db: Database,
+    input: SynapseLedgerPageInput,
+): SynapseLedgerPage {
+    const now = Date.now();
+    let result: { lastInsertRowid: number | bigint };
+    try {
+        result = db
+            .prepare(
+                `INSERT INTO synapse_batch_ledger
+                    (project_path, session_id, scope, lane_role, destination_model,
+                     application_group, request_key, manifest_json, state, state_version,
+                     deadline_at, restart_count, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, 0, ?, ?)`,
+            )
+            .run(
+                input.projectPath,
+                input.sessionId,
+                input.scope,
+                input.laneRole,
+                input.destinationModel,
+                input.applicationGroup,
+                input.requestKey,
+                JSON.stringify(input.manifest),
+                input.deadlineAt,
+                now,
+                now,
+            );
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/UNIQUE constraint failed/i.test(message)) {
+            throw new SynapseLedgerConflictError(
+                `synapse ledger page already live for request_key ${input.requestKey}`,
+            );
+        }
+        throw error;
+    }
+    const page = getSynapseLedgerPage(db, Number(result.lastInsertRowid));
+    if (!page) throw new SynapseLedgerConflictError("synapse ledger insert vanished");
+    return page;
+}
+
+interface CasExpectation {
+    rowId: number;
+    stateVersion: number;
+    states: readonly SynapseLedgerState[];
+    jobId?: string;
+    extraWhere?: string;
+    extraParams?: readonly unknown[];
+}
+
+/** Core versioned CAS: match row id + expected state version + allowed prior
+ *  states (+ optional job identity), bump state_version. Zero rows changed is
+ *  a hard SynapseLedgerConflictError, never success (KTD12). */
+function casLedgerUpdate(
+    db: Database,
+    expectation: CasExpectation,
+    sets: Record<string, unknown>,
+): SynapseLedgerPage {
+    const setEntries = Object.entries(sets);
+    const setSql = setEntries.map(([column]) => `${column} = ?`).join(", ");
+    const statePlaceholders = expectation.states.map(() => "?").join(", ");
+    const jobClause = expectation.jobId === undefined ? "" : " AND job_id = ?";
+    const extraClause = expectation.extraWhere ? ` AND ${expectation.extraWhere}` : "";
+    const params: unknown[] = [
+        ...setEntries.map(([, value]) => value),
+        Date.now(),
+        expectation.rowId,
+        expectation.stateVersion,
+        ...expectation.states,
+    ];
+    if (expectation.jobId !== undefined) params.push(expectation.jobId);
+    params.push(...(expectation.extraParams ?? []));
+    const changes = db
+        .prepare(
+            `UPDATE synapse_batch_ledger
+                SET ${setSql}, state_version = state_version + 1, updated_at = ?
+              WHERE id = ? AND state_version = ? AND state IN (${statePlaceholders})${jobClause}${extraClause}`,
+        )
+        .run(...params).changes;
+    if (changes !== 1) {
+        throw new SynapseLedgerConflictError(
+            `synapse ledger CAS matched ${changes} rows for row ${expectation.rowId} at version ${expectation.stateVersion}`,
+        );
+    }
+    const page = getSynapseLedgerPage(db, expectation.rowId);
+    if (!page) throw new SynapseLedgerConflictError("synapse ledger row vanished after CAS");
+    return page;
+}
+
+/** pending -> polling: persist attempt identity and the admitted job_id
+ *  immediately after embed.batch admission (R19; KTD12 row 1). */
+export function markSynapseLedgerPolling(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number; attemptId: string; jobId: string },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        { rowId: args.rowId, stateVersion: args.expectedStateVersion, states: ["pending"] },
+        { state: "polling", attempt_id: args.attemptId, job_id: args.jobId, cursor: null },
+    );
+}
+
+/** polling -> polling: record the replacement job after a restart resubmission. */
+export function recordSynapseLedgerJob(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number; attemptId: string; jobId: string },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        { rowId: args.rowId, stateVersion: args.expectedStateVersion, states: ["polling"] },
+        { attempt_id: args.attemptId, job_id: args.jobId, cursor: null },
+    );
+}
+
+/** polling -> polling: diagnostic cursor checkpoint after a validated result
+ *  page. Recovery never resumes from it — polling restarts at cursor null. */
+export function recordSynapseLedgerCursor(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number; jobId: string; cursor: string },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        {
+            rowId: args.rowId,
+            stateVersion: args.expectedStateVersion,
+            states: ["polling"],
+            jobId: args.jobId,
+        },
+        { cursor: args.cursor },
+    );
+}
+
+/** polling -> polling on module_restarted: clear job/cursor and durably spend
+ *  the single permitted restart, only inside the original deadline (R21). */
+export function recordSynapseLedgerRestart(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number; jobId: string; now?: number },
+): SynapseLedgerPage {
+    const now = args.now ?? Date.now();
+    return casLedgerUpdate(
+        db,
+        {
+            rowId: args.rowId,
+            stateVersion: args.expectedStateVersion,
+            states: ["polling"],
+            jobId: args.jobId,
+            extraWhere: "restart_count = 0 AND deadline_at IS NOT NULL AND deadline_at > ?",
+            extraParams: [now],
+        },
+        { job_id: null, cursor: null, restart_count: 1 },
+    );
+}
+
+/** polling -> ready after the exact requested item set validated (R22). */
+export function markSynapseLedgerReady(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number; jobId: string },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        {
+            rowId: args.rowId,
+            stateVersion: args.expectedStateVersion,
+            states: ["polling"],
+            jobId: args.jobId,
+        },
+        { state: "ready" },
+    );
+}
+
+/** pending|polling -> partial|failed with an explicit retry disposition. */
+export function markSynapseLedgerOutcome(
+    db: Database,
+    args: {
+        rowId: number;
+        expectedStateVersion: number;
+        state: "partial" | "failed";
+        disposition: SynapseFailureDisposition;
+    },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        {
+            rowId: args.rowId,
+            stateVersion: args.expectedStateVersion,
+            states: ["pending", "polling"],
+        },
+        { state: args.state, failure_disposition: args.disposition },
+    );
+}
+
+/** partial|failed -> pending for a new attempt: requires a retryable
+ *  disposition and remaining time inside the original deadline (KTD12). */
+export function retrySynapseLedgerPage(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number; now?: number },
+): SynapseLedgerPage {
+    const now = args.now ?? Date.now();
+    return casLedgerUpdate(
+        db,
+        {
+            rowId: args.rowId,
+            stateVersion: args.expectedStateVersion,
+            states: ["partial", "failed"],
+            extraWhere:
+                "failure_disposition = 'retryable' AND deadline_at IS NOT NULL AND deadline_at > ?",
+            extraParams: [now],
+        },
+        {
+            state: "pending",
+            attempt_id: null,
+            job_id: null,
+            cursor: null,
+            failure_disposition: null,
+        },
+    );
+}
+
+/** ready -> complete. Call ONLY inside the destination transaction that
+ *  writes the receipt's complete item set (R23): the thrown conflict on a
+ *  stale version must abort that whole transaction. */
+export function completeSynapseLedgerReceipt(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        { rowId: args.rowId, stateVersion: args.expectedStateVersion, states: ["ready"] },
+        { state: "complete", failure_disposition: null },
+    );
+}
+
+/** complete -> pending. 'complete' is absorbing (R24): call ONLY from a
+ *  destination-owning selector that, in this same transaction, proved the
+ *  receipt's exact destination rows absent or source/lane-stale and
+ *  invalidated any stale rows before retrying. */
+export function reopenCompleteSynapseLedgerPage(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number; deadlineAt: number },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        { rowId: args.rowId, stateVersion: args.expectedStateVersion, states: ["complete"] },
+        {
+            state: "pending",
+            attempt_id: null,
+            job_id: null,
+            cursor: null,
+            deadline_at: args.deadlineAt,
+            restart_count: 0,
+            failure_disposition: null,
+        },
+    );
+}
+
+/** Any non-absorbing state -> obsolete (terminal). 'complete' is excluded:
+ *  it can only leave through the destination-proof reopen (KTD12). */
+export function markSynapseLedgerObsolete(
+    db: Database,
+    args: { rowId: number; expectedStateVersion: number },
+): SynapseLedgerPage {
+    return casLedgerUpdate(
+        db,
+        {
+            rowId: args.rowId,
+            stateVersion: args.expectedStateVersion,
+            states: ["pending", "polling", "ready", "partial", "failed"],
+        },
+        { state: "obsolete" },
+    );
+}
+
 export interface SynapseBatchLedgerInput {
     sessionId: string;
     projectPath: string;
@@ -199,35 +620,64 @@ export interface SynapseBatchLedgerInput {
     requestKey: string;
 }
 
+function legacyLaneRole(sessionId: string): "primary" | "shadow" {
+    return sessionId.startsWith("shadow:") ? "shadow" : "primary";
+}
+
+/** Legacy compat shim over the v82 table for pre-detailed callers (removed
+ *  when U6 rewires them onto versioned receipts). Writes a context-incomplete
+ *  identity (empty destination model / application group) without CAS. */
 export function beginSynapseBatchLedger(db: Database, input: SynapseBatchLedgerInput): void {
     const now = Date.now();
+    const laneRole = legacyLaneRole(input.sessionId);
+    const changes = db
+        .prepare(
+            `UPDATE synapse_batch_ledger
+                SET manifest_json = ?, state_version = state_version + 1, updated_at = ?
+              WHERE project_path = ? AND session_id = ? AND scope = ? AND lane_role = ?
+                AND destination_model = '' AND application_group = '' AND request_key = ?
+                AND state != 'obsolete'`,
+        )
+        .run(
+            JSON.stringify(input.manifest),
+            now,
+            input.projectPath,
+            input.sessionId,
+            input.scope,
+            laneRole,
+            input.requestKey,
+        ).changes;
+    if (changes > 0) return;
     db.prepare(
         `INSERT INTO synapse_batch_ledger
-            (session_id, project_path, scope, manifest_json, request_key, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-         ON CONFLICT(session_id, request_key) DO UPDATE SET
-            manifest_json = excluded.manifest_json,
-            updated_at = excluded.updated_at`,
+            (project_path, session_id, scope, lane_role, destination_model, application_group,
+             request_key, manifest_json, state, state_version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, '', '', ?, ?, 'pending', 0, ?, ?)`,
     ).run(
-        input.sessionId,
         input.projectPath,
+        input.sessionId,
         input.scope,
-        JSON.stringify(input.manifest),
+        laneRole,
         input.requestKey,
+        JSON.stringify(input.manifest),
         now,
         now,
     );
 }
 
+/** Legacy compat shim paired with beginSynapseBatchLedger (removed in U6). */
 export function finishSynapseBatchLedger(
     db: Database,
     sessionId: string,
     requestKey: string,
     status: "complete" | "partial" | "failed",
 ): void {
+    const disposition = status === "complete" ? null : "retryable";
     db.prepare(
-        "UPDATE synapse_batch_ledger SET status = ?, updated_at = ? WHERE session_id = ? AND request_key = ?",
-    ).run(status, Date.now(), sessionId, requestKey);
+        `UPDATE synapse_batch_ledger
+            SET state = ?, failure_disposition = ?, state_version = state_version + 1, updated_at = ?
+          WHERE session_id = ? AND request_key = ? AND state NOT IN ('obsolete', 'complete')`,
+    ).run(status, disposition, Date.now(), sessionId, requestKey);
 }
 
 /** Retention for synapse_batch_ledger rows keyed by a project's synthetic
