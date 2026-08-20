@@ -10,6 +10,8 @@ export type WakePlaneStatus = "present" | "absent" | "unknown";
 
 const WAKE_PLANE_STATUS_TTL_MS = 5 * 60 * 1_000;
 const WAKE_PLANE_HANDSHAKE_TIMEOUT_MS = 2_000;
+/** Bounds the catalog request directly; the client default is 30 seconds. */
+const WAKE_PLANE_CATALOG_TIMEOUT_MS = 2_000;
 
 type CatalogEntry = { control_ops?: unknown };
 type CatalogProbe = () => Promise<readonly CatalogEntry[]>;
@@ -32,6 +34,7 @@ async function probeWakePlaneCatalog(): Promise<readonly CatalogEntry[]> {
     const client = await SubcClient.connect({
         connectionFile: connectionFile(),
         handshakeTimeoutMs: WAKE_PLANE_HANDSHAKE_TIMEOUT_MS,
+        requestTimeoutMs: WAKE_PLANE_CATALOG_TIMEOUT_MS,
     });
     try {
         return await client.catalogList();

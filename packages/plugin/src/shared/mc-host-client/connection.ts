@@ -43,6 +43,12 @@ const DEFAULT_MAX_QUEUED_FRAMES = 256;
 const DEFAULT_CONTROL_RESERVE_FRAMES = 32;
 const DEFAULT_CLEANUP_TICKET_MS = 5_000;
 /**
+ * Hard cap on pre-handshake buffering. Auth messages are a `u32` length plus
+ * at most 4,096 bytes each, so a legal exchange never approaches this; the
+ * aggregate memory cap only covers frame bodies and cannot bound this phase.
+ */
+const MAX_AUTH_BUFFERED_BYTES = 65_536;
+/**
  * Fixed header/control overhead admitted above one maximum body (KTD7): the
  * aggregate cap must still accept one exact 64 MiB frame plus headers,
  * reserved control frames, and small control-plane bodies.
@@ -820,6 +826,16 @@ export class ConnectionGeneration {
         if (this.phase === "setup") {
             this.authChunks.push(chunk);
             this.authBuffered += chunk.length;
+            if (this.authBuffered > MAX_AUTH_BUFFERED_BYTES) {
+                this.retire(
+                    "protocol_violation",
+                    new AuthError(
+                        "peer streamed more pre-handshake bytes than any legal auth exchange",
+                        "message_too_large",
+                    ),
+                );
+                return;
+            }
             this.serveAuthWaiter();
             return;
         }

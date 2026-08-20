@@ -360,7 +360,13 @@ options:
   --fifo-concurrency <n>         concurrent module-transport calls, max 16 (default: 8)
   --real-response-kib <n>        real transform response target KiB (default: 2048)
   --real-response-messages <n>   real transform response message count (default: 310)`);
-    process.exit(0);
+// Let buffered stdout drain before terminating: process.exit() truncates a
+// large report when stdout is a pipe or file. The empty write's callback
+// fires only after everything queued before it has been flushed.
+await new Promise<void>((resolveFlush) => {
+    process.stdout.write("", () => resolveFlush());
+});
+process.exit(0);
 }
 
 const connectionFile = resolve(

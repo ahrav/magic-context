@@ -35,8 +35,15 @@ function buildPerfHost(repoRoot: string, binary: string): Promise<void> {
         });
         build.on("error", rejectPromise);
         build.on("exit", (code) => {
-            if (code === 0 && existsSync(binary)) resolvePromise();
-            else rejectPromise(new Error(`cargo build exited with code ${code}`));
+            if (code !== 0) {
+                rejectPromise(new Error(`cargo build exited with code ${code}`));
+                return;
+            }
+            if (!existsSync(binary)) {
+                rejectPromise(new Error(`cargo build succeeded but ${binary} is missing`));
+                return;
+            }
+            resolvePromise();
         });
     });
 }
@@ -56,7 +63,10 @@ function waitForReady(child: ChildProcess, deadlineMs: number): Promise<string> 
         }, deadlineMs);
         child.stdout?.on("data", (chunk: Buffer) => {
             stdout += chunk.toString("utf8");
-            const match = /^READY (.+)$/m.exec(stdout);
+            // Require the line terminator: a chunk boundary can split the
+            // READY line, and a bare `$` anchor would accept the truncated
+            // prefix as the whole connection-file path.
+            const match = /^READY ([^\r\n]+)\r?\n/m.exec(stdout);
             if (match?.[1]) {
                 const path = match[1];
                 finish(() => resolvePromise(path));

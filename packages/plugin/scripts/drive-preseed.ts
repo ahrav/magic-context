@@ -29,6 +29,9 @@ const payloadPath = join(dirname(new URL(import.meta.url).pathname), "drive-pres
 let payload: { compartments: unknown[] };
 try {
     payload = JSON.parse(readFileSync(payloadPath, "utf8")) as { compartments: unknown[] };
+    if (!Array.isArray(payload.compartments)) {
+        throw new Error("preseed payload must contain a `compartments` array");
+    }
 } catch (error) {
     console.error(`failed to read preseed payload ${payloadPath}:`, error);
     process.exit(1);

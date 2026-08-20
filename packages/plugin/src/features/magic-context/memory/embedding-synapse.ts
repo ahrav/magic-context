@@ -349,11 +349,19 @@ async function getSharedClient(
     if (sharedClient && sharedClientFile === options.connectionFile) return sharedClient;
     if (sharedClientPromise && sharedClientFile === options.connectionFile)
         return sharedClientPromise;
+    const file = options.connectionFile;
     const promise = SubcClient.connect({
-        connectionFile: options.connectionFile,
+        connectionFile: file,
         handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
     }).then((client) => {
-        sharedClient = client;
+        if (sharedClientPromise === promise && sharedClientFile === file) {
+            sharedClient = client;
+        } else {
+            // A connect for a different connection file superseded this one
+            // while it was in flight; close the orphan instead of leaking it
+            // or publishing it under the newer file's cache slot.
+            client.close();
+        }
         return client;
     });
     promise.catch(() => {
@@ -364,7 +372,7 @@ async function getSharedClient(
             sharedClientFile = null;
         }
     });
-    sharedClientFile = options.connectionFile;
+    sharedClientFile = file;
     sharedClientPromise = promise;
     return promise;
 }

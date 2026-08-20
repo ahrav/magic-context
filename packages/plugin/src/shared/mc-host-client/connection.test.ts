@@ -910,6 +910,6 @@ describe("setup failures", () => {
     test("start is single-flight per generation", async () => {
         const peer = await h.startPeer();
         const generation = await h.dial(peer);
-        expect(generation.start(Deadline.start(100))).rejects.toThrow(/single-flight/);
+        await expect(generation.start(Deadline.start(100))).rejects.toThrow(/single-flight/);
     });
 });
