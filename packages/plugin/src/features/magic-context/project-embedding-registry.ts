@@ -2604,13 +2604,27 @@ export async function drainCommitBacklogForProject(
     return total;
 }
 
+interface CompartmentChunkBatchResult {
+    /** Candidates the query returned; 0 means the backlog is drained (or chunk
+     *  embedding is off), which is the drain loop's only "stop, nothing left"
+     *  signal — an all-no-work batch still selected rows and must not stop it. */
+    selected: number;
+    embedded: number;
+    noWork: number[];
+    failed: number[];
+    nextCursor?: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id">;
+}
+
 async function embedCompartmentChunkBatch(
     db: Database,
     projectIdentity: string,
     batchSize: number,
-): Promise<number> {
+    before?: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id">,
+): Promise<CompartmentChunkBatchResult> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled || snapshot.chunkModelId === "off") return 0;
+    if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
+        return { selected: 0, embedded: 0, noWork: [], failed: [] };
+    }
 
     repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
     const candidates = loadUnembeddedCompartmentChunkCandidates(
@@ -2618,17 +2632,23 @@ async function embedCompartmentChunkBatch(
         projectIdentity,
         snapshot.chunkModelId,
         batchSize,
+        before,
     );
-    if (candidates.length === 0) return 0;
-    // Passive sweep ignores `failed`/`noWork` — it's bounded per tick and re-runs
-    // on the next sweep; the session drain is the path that tracks them.
-    const { embedded } = await embedCandidateChunkBatch(
+    if (candidates.length === 0) return { selected: 0, embedded: 0, noWork: [], failed: [] };
+    const { embedded, noWork, failed } = await embedCandidateChunkBatch(
         db,
         projectIdentity,
         snapshot.chunkModelId,
         candidates,
     );
-    return embedded;
+    const tail = candidates[candidates.length - 1];
+    return {
+        selected: candidates.length,
+        embedded,
+        noWork,
+        failed,
+        nextCursor: { createdAt: tail.createdAt, id: tail.id },
+    };
 }
 
 interface CandidateChunkBatchResult {
@@ -2882,6 +2902,11 @@ async function drainCompartmentChunkBacklogForProject(
 
     let total = 0;
     let leaseLost = false;
+    // Every selected batch advances the run-local keyset cursor, including
+    // no-work and failed rows. The cursor is not persisted, so provider
+    // failures remain eligible for the next maintenance pass.
+    let cursor: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id"> | undefined;
+    let consecutiveFailedBatches = 0;
     const renewal = setInterval(() => {
         try {
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
@@ -2892,15 +2917,32 @@ async function drainCompartmentChunkBacklogForProject(
     (renewal as { unref?: () => void }).unref?.();
     try {
         while (!leaseLost && Date.now() < deadline && total < CHUNK_DRAIN_MAX_PER_SWEEP) {
-            const embedded = await embedCompartmentChunkBatch(
+            const { selected, embedded, failed, nextCursor } = await embedCompartmentChunkBatch(
                 db,
                 projectIdentity,
                 CHUNK_DRAIN_BATCH_SIZE,
+                cursor,
             );
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
-            if (leaseLost || embedded === 0) break;
+            if (leaseLost) break;
             total += embedded;
-            if (embedded < CHUNK_DRAIN_BATCH_SIZE) break;
+            if (selected === 0) break; // nothing left to select = drained
+            cursor = nextCursor;
+
+            // No-work rows do not reset provider health. Mixed no-work/failed
+            // batches still prove the provider made no progress on attempted
+            // inputs; successful persistence resets the failure streak.
+            if (embedded === 0 && failed.length > 0) {
+                consecutiveFailedBatches += 1;
+                if (consecutiveFailedBatches >= MAX_CONSECUTIVE_FAILED_BATCHES) break;
+            } else if (embedded > 0) {
+                consecutiveFailedBatches = 0;
+            }
+
+            // An all-no-work batch performs no provider await. Yield explicitly
+            // so timers, lease cancellation, and request handling stay live while
+            // the cursor walks a long no-work prefix.
+            await new Promise((resolve) => setTimeout(resolve, 0));
         }
     } finally {
         clearInterval(renewal);

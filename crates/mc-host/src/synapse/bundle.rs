@@ -18,6 +18,12 @@ const MAX_ARTIFACT_NAME_BYTES: usize = 255;
 const MAX_PROVENANCE_BYTES: usize = 8 * 1024;
 const MAX_DIMS: u64 = 16_384;
 const MAX_MAX_TOKENS: u64 = 1_048_576;
+/// The epoch crosses the wire as a JSON number and the TypeScript client holds
+/// it in a double, which rounds above this value while the host keeps the
+/// exact integer. A rounded epoch reaches the host as a different
+/// `required_epoch` and a different canonical request key, so every embedding
+/// request would be rejected for a constraint mismatch the owner cannot see.
+const MAX_TABLE_EPOCH: u64 = 9_007_199_254_740_991;
 const MAX_CORPUS_ITEMS: usize = 256;
 const MAX_CORPUS_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -278,6 +284,9 @@ fn validate_manifest(manifest: &BundleManifest) -> Result<(), BundleError> {
     }
     if manifest.max_tokens == 0 || manifest.max_tokens > MAX_MAX_TOKENS {
         return Err(err("max_tokens out of bounds"));
+    }
+    if manifest.table_epoch > MAX_TABLE_EPOCH {
+        return Err(err("table_epoch out of bounds"));
     }
     if !matches!(manifest.pooling.as_str(), "mean" | "cls") {
         return Err(err("unsupported pooling"));

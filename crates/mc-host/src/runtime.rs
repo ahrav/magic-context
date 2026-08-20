@@ -286,6 +286,17 @@ pub struct LifecycleFailure {
     pub stopped: bool,
 }
 
+/// Runs the handler shutdown callback so handler-owned work stops before the
+/// caller drops the instance guard. Startup failure paths use this directly:
+/// they run after `initialize` but before `HostShared` and `AbandonGuard`
+/// exist, so no other owner can drain the handler for them. The await is
+/// unbounded for the same reason the lock-retention waits are — returning
+/// early would release the fence while handler code still runs.
+async fn drain_handler<H: McHostHandler>(handler: &Arc<H>) {
+    let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
+    crate::panic_boundary::redact(callback).await;
+}
+
 /// Cancels host work if the `run` future is dropped instead of completing:
 /// `TaskTracker` does not abort tracked tasks on drop, so a supervisor that
 /// aborts `run` would otherwise leave the health loop and authenticated
@@ -506,11 +517,11 @@ pub async fn run<H: McHostHandler>(
                 // A failed initialization can still have left handler-owned
                 // work running: a composite's primary may have initialized
                 // successfully before its secondary failed, and only the
-                // shutdown callback stops and drains that. Awaiting it here
-                // keeps the single-instance fence — `guard` drops when this
-                // returns — held until the handler is actually idle.
-                let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
-                crate::panic_boundary::redact(callback).await;
+                // shutdown callback stops it. Awaiting it here keeps the
+                // single-instance fence — `guard` drops when this returns —
+                // held until the handler is actually idle.
+                drain_handler(&handler).await;
+
                 // The handler-authored message can carry data derived from
                 // the opaque storage descriptor (credentials, endpoints);
                 // startup diagnostics get bounded structure only (V24).
@@ -520,6 +531,10 @@ pub async fn run<H: McHostHandler>(
                 )));
             }
             Ok(Err(join_err)) => {
+                // A panic can happen after initialization starts handler-owned
+                // work, so it has the same cleanup obligation as a returned
+                // initialization error.
+                drain_handler(&handler).await;
                 let kind = if join_err.is_panic() {
                     "panic"
                 } else {
@@ -537,23 +552,42 @@ pub async fn run<H: McHostHandler>(
         }
     }
 
-    // Shutdown between initialization and publication: nothing was published
-    // and no work exists to drain, so completing without binding is the
-    // graceful outcome.
-    if shutdown.is_cancelled() {
-        return Ok(());
+    // Initialization has run, so every early return from here must drain the
+    // handler before `guard` drops: a completed initialize can have opened
+    // stores or started handler-owned work, and only the shutdown callback
+    // stops it. `AbandonGuard` takes that duty over once it exists, which is
+    // why these steps are grouped instead of each returning through `?`.
+    let setup = async {
+        // Shutdown between initialization and publication: nothing was
+        // published and no route work exists, so this is the graceful
+        // outcome — the initialized handler still has to be drained.
+        if shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(HostError::Io)?;
+        let port = listener.local_addr().map_err(HostError::Io)?.port();
+        guard
+            .publish(port, &config.daemon_ver)
+            .map_err(HostError::Instance)?;
+        Ok(Some(listener))
     }
-
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(HostError::Io)?;
-    let port = listener.local_addr().map_err(HostError::Io)?.port();
+    .await;
+    let listener = match setup {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            drain_handler(&handler).await;
+            return Ok(());
+        }
+        Err(err) => {
+            drain_handler(&handler).await;
+            return Err(err);
+        }
+    };
 
     let auth_key = ConnectionKey(*guard.key().bytes());
     let daemon_id = *guard.daemon_id();
-    guard
-        .publish(port, &config.daemon_ver)
-        .map_err(HostError::Instance)?;
 
     drop(manifests);
 

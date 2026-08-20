@@ -287,6 +287,18 @@ async fn manifest_field_bounds_disable_the_lane() {
         "schema version",
     )
     .await;
+    // The epoch crosses the wire as a JSON number, so a value the client
+    // cannot hold exactly is refused rather than silently rounded into a
+    // constraint mismatch.
+    expect_disabled_with(
+        |dir| {
+            edit_manifest(dir, |m| {
+                m["table_epoch"] = serde_json::Value::from(9_007_199_254_740_992u64)
+            })
+        },
+        "table_epoch out of bounds",
+    )
+    .await;
     expect_disabled_with(
         |dir| edit_manifest(dir, |m| m["model_file"]["name"] = "/etc/passwd".into()),
         "path separator",

@@ -1133,3 +1133,44 @@ async fn a_failed_initialization_runs_the_shutdown_callback_before_lock_release(
     .expect("the lock releases once startup returns");
     successor.shutdown_gracefully().await;
 }
+
+/// A setup failure *after* a successful initialize drains the handler too:
+/// publication is the last step before the host owns cleanup, and an
+/// initialized handler can already hold stores or background work that only
+/// the shutdown callback stops.
+#[tokio::test]
+async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    // Initialize blocks so the runtime directory can be removed after the
+    // instance lock exists but before publication writes the connection file.
+    handler.block_init();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let task = tokio::spawn(async move {
+        mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let host_dir = data_root.path().join("cortexkit").join("run");
+    std::fs::remove_dir(&host_dir).expect("remove empty runtime directory");
+    handler.release_init();
+
+    let result = task.await.expect("run task joins");
+
+    assert!(
+        matches!(result, Err(HostError::Instance(_))),
+        "a removed runtime directory fails publication, got {result:?}"
+    );
+    assert!(
+        handler.events().contains(&Event::Initialized),
+        "initialization completed before publication was attempted"
+    );
+    assert!(
+        handler.events().contains(&Event::Shutdown),
+        "the shutdown callback drains the handler on a post-initialize setup failure"
+    );
+}

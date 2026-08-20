@@ -181,6 +181,34 @@ function seedManyCompartmentsWithFts(
 }
 
 /**
+ * Seed compartments that can never yield an embeddable window: no FTS rows in
+ * their span and no title/p1/content to fall back to, so canonical text is
+ * empty and every one lands in the drain's `noWork` set.
+ */
+function seedNoWorkCompartmentsWithoutFts(
+    db: NonNullable<ReturnType<typeof openDatabase>>,
+    sessionId: string,
+    count: number,
+    startOrdinal: number,
+): void {
+    for (let i = 0; i < count; i++) {
+        const start = startOrdinal + i * 2;
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1000 + i,
+                startMessage: start,
+                endMessage: start + 1,
+                startMessageId: `u${start}`,
+                endMessageId: `a${start + 1}`,
+                title: "",
+                content: "",
+                p1: "",
+            },
+        ]);
+    }
+}
+
+/**
  * Seed one compartment whose single assistant message is huge, so its canonical
  * chunk text is one oversized line that chunkCanonicalText splits into many
  * windows — the #207 batching case.
@@ -1167,6 +1195,44 @@ describe("project embedding registry", () => {
                 currentChunkModelId("git:project-a"),
             ),
         ).toHaveLength(0);
+    });
+
+    it("advances the passive chunk drain past a full batch of no-work candidates", async () => {
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        // Real work first (lower ids), then a whole batch of un-embeddable
+        // compartments. The candidate query is newest-first, so the no-work rows
+        // fill the first batch and the drain must skip past them within the same
+        // pass to reach the older compartments that do have work.
+        seedManyCompartmentsWithFts(db, "ses-nowork", 3);
+        const workIds = getCompartments(db, "ses-nowork").map((compartment) => compartment.id);
+        seedNoWorkCompartmentsWithoutFts(db, "ses-nowork", 8, 101);
+        recordSessionProjectIdentity(db, "ses-nowork", "git:nowork");
+        registerProjectEmbedding(
+            db,
+            "git:nowork",
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/nowork",
+        );
+
+        const embedded = await embedUnembeddedCompartmentChunksForProject(db, "git:nowork");
+
+        expect(embedded).toBe(3);
+        const rows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            "ses-nowork",
+            "git:nowork",
+            currentChunkModelId("git:nowork"),
+        );
+        expect(new Set(rows.map((row) => row.compartmentId))).toEqual(new Set(workIds));
+
+        // One pass was enough: the follow-up finds nothing embeddable left.
+        const second = await embedUnembeddedCompartmentChunksForProject(db, "git:nowork");
+        expect(second).toBe(0);
     });
 
     it("repairs chunk rows stamped with a different project than their session owner", async () => {
