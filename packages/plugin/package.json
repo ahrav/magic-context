@@ -43,6 +43,8 @@
     "test:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts adversarial",
     "smoke:mc-host-client:bun": "bun scripts/smoke-mc-host-client.ts",
     "smoke:mc-host-client:node": "bun scripts/run-mc-host-client-node.ts smoke",
+    "smoke:mc-host-synapse:bun": "bun scripts/smoke-mc-host-synapse.ts",
+    "smoke:mc-host-synapse:node": "bun scripts/run-mc-host-client-node.ts synapse",
     "lint": "biome check .",
     "bench:retrieval": "bun scripts/benchmark-retrieval.ts",
     "bench:retrieval:check": "bun scripts/benchmark-retrieval.ts check --profile ci",
