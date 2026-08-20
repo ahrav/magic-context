@@ -64,6 +64,11 @@ function printUsage(): void {
     console.log("    doctor --check-v22-backfill       Show v22 memory backfill status");
     console.log("    doctor --retry-v22-backfill       Retry failed v22 memory backfill rows");
     console.log("    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows");
+    console.log("    doctor --check-claims-backfill    Show v83 claims backfill status");
+    console.log("    doctor --retry-claims-backfill    Repair and resume the v83 claims backfill");
+    console.log(
+        '    doctor --waive-claims-backfill-failure <id> --rationale "<why>"  Waive a reviewed lineage failure',
+    );
     console.log(
         "    doctor drain-authority <project>  Drain module memory/note authority back to TypeScript",
     );
@@ -148,6 +153,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
             }
             const { runDoctor } = await import("./commands/doctor");
             const rekeyV22DirIdentity = valueAfter(rest, "--rekey-v22-dir-identity");
+            const waiveClaimsBackfillFailure = valueAfter(rest, "--waive-claims-backfill-failure");
+            const waiveRationale = valueAfter(rest, "--rationale");
             return runDoctor({
                 force: rest.includes("--force"),
                 issue: rest.includes("--issue"),
@@ -155,6 +162,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
                 checkV22Backfill: rest.includes("--check-v22-backfill"),
                 retryV22Backfill: rest.includes("--retry-v22-backfill"),
                 ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
+                checkClaimsBackfill: rest.includes("--check-claims-backfill"),
+                retryClaimsBackfill: rest.includes("--retry-claims-backfill"),
+                ...(waiveClaimsBackfillFailure !== null ? { waiveClaimsBackfillFailure } : {}),
+                ...(waiveRationale !== null ? { waiveRationale } : {}),
                 argv: rest,
             });
         }

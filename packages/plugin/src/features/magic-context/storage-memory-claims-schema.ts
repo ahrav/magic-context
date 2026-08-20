@@ -55,6 +55,8 @@ export const APPEND_ONLY_MEMORY_CLAIMS_TABLES = [
 export const CLAIMS_BACKFILL_META_KEYS = {
     /** `empty` | `lazy` | `eager` — how the v83 corpus converts. */
     mode: "claims_backfill_mode",
+    /** Calibration digest for the selected backfill mode. */
+    calibrationDigest: "claims_backfill_calibration_digest",
     /** High-water `memories.id` at the v83 migration boundary (R1). */
     boundaryMemoryId: "claims_backfill_boundary_memory_id",
     /** Expected crosswalk link count for the boundary corpus (R11). */

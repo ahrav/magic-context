@@ -1,8 +1,13 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import {
+    clearClaimsBackfillFailpoints,
+    setClaimsBackfillCalibrationForTests,
+    setClaimsBackfillFailpoint,
+} from "./claims-backfill";
 import {
     createMemoryWithClaimsInCurrentTransaction,
     ensureMemoryClaimLinkInCurrentTransaction,
@@ -65,6 +70,10 @@ function v83ObjectRows(db: Database): Array<Record<string, unknown>> {
 }
 
 describe("migration v83: memories-to-claims compatibility contract", () => {
+    afterEach(() => {
+        clearClaimsBackfillFailpoints();
+        setClaimsBackfillCalibrationForTests(null);
+    });
     test("a fresh database and a v82-upgraded database publish identical v83 objects and one version row", () => {
         const fresh = migratedDb();
         const upgraded = v82DatabaseWithRows(["carried row"]);
@@ -112,6 +121,62 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
         } finally {
             closeQuietly(fresh);
             closeQuietly(upgraded);
+        }
+    });
+
+    test("forced eager conversion and reconciliation stay in the migration transaction", () => {
+        const db = new Database(":memory:");
+        db.exec("PRAGMA foreign_keys=ON");
+        initializeDatabase(db);
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS schema_migrations_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT OR REPLACE INTO schema_migrations_meta (key, value)
+            VALUES ('v22_legacy_memory_backfill', 'completed');
+        `);
+        db.prepare(
+            `INSERT INTO memories (project_path, category, content, normalized_hash,
+                first_seen_at, created_at, updated_at, last_seen_at)
+             VALUES ('git:eager-rollback', 'CONSTRAINTS', 'eager row', 'eager-hash', 1, 1, 1, 1)`,
+        ).run();
+        setClaimsBackfillCalibrationForTests({
+            cutoffRows: 1,
+            evidenceDigest: "e".repeat(64),
+        });
+        setClaimsBackfillFailpoint("claims-migration.020.rows.after", () => {
+            throw new Error("eager migration cut");
+        });
+        try {
+            expect(() => runMigrations(db)).toThrow(/eager migration cut/);
+            expect(
+                db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'legacy_memory_claims'").get(),
+            ).toBeNull();
+            expect(
+                db.prepare("SELECT 1 FROM schema_migrations WHERE version = 83").get(),
+            ).toBeNull();
+
+            clearClaimsBackfillFailpoints();
+            runMigrations(db);
+            expect(metaValue(db, CLAIMS_BACKFILL_META_KEYS.mode)).toBe("eager");
+            expect(metaValue(db, CLAIMS_BACKFILL_META_KEYS.phase)).toBe("complete");
+            expect(db.prepare("SELECT COUNT(*) AS count FROM legacy_memory_claims").get()).toEqual({
+                count: 1,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("v83 takes over v22 pending state even when the claims corpus is already complete", () => {
+        const db = migratedDb();
+        try {
+            expect(metaValue(db, CLAIMS_BACKFILL_META_KEYS.mode)).toBe("empty");
+            expect(metaValue(db, CLAIMS_BACKFILL_META_KEYS.phase)).toBe("complete");
+            expect(metaValue(db, CLAIMS_BACKFILL_META_KEYS.v22Takeover)).toBe("pending");
+        } finally {
+            closeQuietly(db);
         }
     });
 

@@ -201,18 +201,28 @@ afterEach(() => {
 });
 
 describe("Pi doctor", () => {
-    it("parses v22 backfill flags", () => {
+    it("parses v22 and claims backfill flags", () => {
         expect(
             parseDoctorArgs([
                 "--check-v22-backfill",
                 "--retry-v22-backfill",
                 "--rekey-v22-dir-identity",
                 "/tmp/project",
+                "--check-claims-backfill",
+                "--retry-claims-backfill",
+                "--waive-claims-backfill-failure",
+                "7",
+                "--rationale",
+                "reviewed source",
             ]),
         ).toMatchObject({
             checkV22Backfill: true,
             retryV22Backfill: true,
             rekeyV22DirIdentity: "/tmp/project",
+            checkClaimsBackfill: true,
+            retryClaimsBackfill: true,
+            waiveClaimsBackfillFailure: "7",
+            waiveRationale: "reviewed source",
         });
     });
 

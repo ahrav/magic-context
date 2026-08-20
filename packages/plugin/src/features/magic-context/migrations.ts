@@ -2,6 +2,11 @@ import { extractTiersFromInner } from "../../hooks/magic-context/compartment-par
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
+    decideClaimsBackfillMode,
+    hitClaimsMigrationFailpoint,
+    runEagerClaimsBackfillInMigrationTransaction,
+} from "./claims-backfill";
+import {
     assertClaimsSchemaForeignKeys,
     CLAIMS_AND_EVIDENCE_TABLES,
     createClaimsAndEvidenceSchema,
@@ -3154,6 +3159,7 @@ export const MIGRATIONS: Migration[] = [
                 return;
             }
             createMemoryClaimsCompatSchema(db);
+            hitClaimsMigrationFailpoint("claims-migration.010.ddl.after");
 
             // Sparse legacy databases that never ran v22 lack the meta table.
             db.exec(`
@@ -3189,23 +3195,24 @@ export const MIGRATIONS: Migration[] = [
                 v22Status != null &&
                 (v22Status.value === "pending" || v22Status.value === "completed_with_failures");
             writeMeta.run(CLAIMS_BACKFILL_META_KEYS.v22Takeover, v22Pending ? "pending" : "none");
-            if (corpus.count === 0) {
+            const decision = decideClaimsBackfillMode(db, corpus.count, v22Pending);
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.mode, decision.mode);
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.calibrationDigest, decision.calibrationDigest);
+            if (decision.mode === "empty") {
                 // An empty corpus completes synchronously in the migration
                 // (R7): there is nothing to convert, so the completion
                 // checkpoint and U8 watermark publish here.
-                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.mode, "empty");
                 writeMeta.run(CLAIMS_BACKFILL_META_KEYS.phase, "complete");
                 writeMeta.run(CLAIMS_BACKFILL_META_KEYS.reconciliationVersion, "1");
                 writeMeta.run(CLAIMS_BACKFILL_META_KEYS.finalOutboxWatermark, "0");
             } else {
-                // Without checked-in calibration evidence every nonempty
-                // corpus uses lazy mode (R7). The bounded runner is U5; v83
-                // only records the pending state.
-                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.mode, "lazy");
                 writeMeta.run(CLAIMS_BACKFILL_META_KEYS.phase, "rows");
             }
 
             if (hasMemories) installMemoryClaimsWriteGuards(db);
+            if (decision.mode === "eager") {
+                runEagerClaimsBackfillInMigrationTransaction(db);
+            }
             assertMemoryClaimsSchemaForeignKeys(db);
         },
     },
@@ -3338,11 +3345,17 @@ export function runMigrations(db: Database): void {
                     db.prepare(
                         "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                     ).run(migration.version, migration.description, Date.now());
+                    if (migration.version === 83) {
+                        hitClaimsMigrationFailpoint("claims-migration.040.version.after");
+                    }
                     return true;
                 })
                 .immediate();
 
             if (!applied || !migration) break;
+            if (migration.version === 83) {
+                hitClaimsMigrationFailpoint("claims-migration.050.commit.after");
+            }
             if (migration.version <= 61) touchedLegacyAuthorityBatch = true;
             log(`[migrations] applied v${migration.version}: ${migration.description}`);
         } catch (error) {

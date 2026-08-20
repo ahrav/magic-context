@@ -23,6 +23,10 @@ import {
     matchesPluginEntry,
 } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
+import {
+    type ClaimsBackfillCommandArgs,
+    runClaimsBackfillCommands,
+} from "../lib/claims-backfill-commands";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
 import {
     openExistingContextDatabase,
@@ -609,7 +613,8 @@ function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[
 }
 
 export async function runDoctor(
-    options: { force?: boolean; issue?: boolean } & V22BackfillCommandArgs = {},
+    options: { force?: boolean; issue?: boolean } & V22BackfillCommandArgs &
+        ClaimsBackfillCommandArgs = {},
 ): Promise<number> {
     migrateConfigLocationsForCli(process.cwd(), log);
 
@@ -638,6 +643,29 @@ export async function runDoctor(
     );
     if (v22Result.handled) {
         return v22Result.exitCode;
+    }
+
+    let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
+    const claimsResult = await runClaimsBackfillCommands(
+        {
+            name: "OpenCode",
+            openDatabase: (readonly = true) => {
+                const dbPath = join(getMagicContextStorageDir(), "context.db");
+                claimsDb = readonly
+                    ? openExistingContextDatabase(dbPath, { readonly: true })
+                    : openExistingContextDatabaseForMutation(dbPath);
+                return claimsDb;
+            },
+            closeDatabase: () => {
+                claimsDb?.close();
+                claimsDb = null;
+            },
+            log,
+        },
+        options,
+    );
+    if (claimsResult.handled) {
+        return claimsResult.exitCode;
     }
 
     intro("Magic Context Doctor");

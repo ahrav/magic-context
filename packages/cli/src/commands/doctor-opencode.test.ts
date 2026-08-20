@@ -10,6 +10,7 @@ import {
 import { computeLegacyRustDirIdentity } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { runClaimsBackfillCommands } from "../lib/claims-backfill-commands";
 import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME,
@@ -421,6 +422,98 @@ describe("doctor OpenCode helper logic", () => {
 
         expect(getUserNpmrcPath()).toBe(customNpmrc);
         expect(collectNpmReleaseAgeWarnings()).toEqual([`${customNpmrc} has 'before=2026-01-01'`]);
+    });
+});
+
+describe("doctor claims backfill commands", () => {
+    it("status is read-only and reports blocked state with exact repair command", async () => {
+        const database = makeDb();
+        const messages: string[] = [];
+        const readonlyFlags: boolean[] = [];
+        const versionBefore = database
+            .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+            .get() as { version: number };
+
+        const result = await runClaimsBackfillCommands(
+            {
+                ...makeHarness(database, messages),
+                openDatabase: (readonly = false) => {
+                    readonlyFlags.push(readonly);
+                    return database;
+                },
+            },
+            { checkClaimsBackfill: true },
+        );
+
+        expect(result).toEqual({ handled: true, exitCode: 0 });
+        expect(readonlyFlags).toEqual([true]);
+        expect(messages.join("\n")).toContain("claims backfill status: blocked");
+        expect(messages.join("\n")).toContain(
+            "Repair with: magic-context doctor --retry-claims-backfill",
+        );
+        expect(
+            database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),
+        ).toEqual(versionBefore);
+    });
+
+    it("retry resolves v22 takeover once, reports before/after counts, preserves schema version, and gives restart guidance", async () => {
+        const database = makeDb();
+        const messages: string[] = [];
+        const versionBefore = database
+            .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+            .get();
+
+        const result = await runClaimsBackfillCommands(makeHarness(database, messages), {
+            retryClaimsBackfill: true,
+        });
+
+        expect(result).toEqual({ handled: true, exitCode: 0 });
+        const output = messages.join("\n");
+        expect(output).toContain("before: phase=complete; linked=0/0");
+        expect(output).toContain("after:  phase=complete; linked=0/0");
+        expect(output).toContain("claims backfill complete");
+        expect(output).toContain("schema: v83 → v83");
+        expect(output).toContain("restart it before creating new sessions");
+        expect(
+            database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),
+        ).toEqual(versionBefore);
+    });
+
+    it("status distinguishes pending, completed, and completed-with-warnings", async () => {
+        const database = makeDb();
+        database
+            .prepare(
+                "UPDATE schema_migrations_meta SET value = 'none' WHERE key = 'claims_backfill_v22_takeover'",
+            )
+            .run();
+        const cases = [
+            { phase: "rows", expected: "pending" },
+            { phase: "complete", expected: "complete" },
+        ] as const;
+        for (const item of cases) {
+            database
+                .prepare(
+                    "UPDATE schema_migrations_meta SET value = ? WHERE key = 'claims_backfill_phase'",
+                )
+                .run(item.phase);
+            const messages: string[] = [];
+            await runClaimsBackfillCommands(makeHarness(database, messages), {
+                checkClaimsBackfill: true,
+            });
+            expect(messages.join("\n")).toContain(`claims backfill status: ${item.expected}`);
+        }
+        database
+            .prepare(
+                `INSERT INTO claim_backfill_failures
+                (phase, item_kind, item_key, reason_code, detail, disposition, rationale, created_at, updated_at)
+             VALUES ('relationships', 'lineage', 'test-warning', 'operator-warning', '', 'warning', 'reviewed', 1, 1)`,
+            )
+            .run();
+        const messages: string[] = [];
+        await runClaimsBackfillCommands(makeHarness(database, messages), {
+            checkClaimsBackfill: true,
+        });
+        expect(messages.join("\n")).toContain("claims backfill status: complete-with-warnings");
     });
 });
 

@@ -10,6 +10,7 @@ import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
+import { runClaimsBackfillStartup } from "./features/magic-context/claims-backfill-startup";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -31,7 +32,6 @@ import {
     setSqlitePragmaConfig,
 } from "./features/magic-context/storage-db";
 import { recordToolDefinition } from "./features/magic-context/tool-definition-tokens";
-import { runDeferredV22Backfill } from "./features/magic-context/v22-deferred-backfill";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker";
 import {
     COMPARTMENT_AGENT_SYSTEM_PROMPT,
@@ -267,22 +267,22 @@ const server: Plugin = async (ctx) => {
         registrationPromptSurface: loadedPluginConfig.registrationPromptSurface,
     });
 
-    // v22 deferred legacy-memory identity backfill. createSessionHooks() opens
-    // the shared DB and runs migrations before returning a non-null hook, so
-    // this fire-and-forget runner starts only after the schema is ready. Its
-    // batch transactions serialize naturally with concurrent ctx_memory writes.
+    // createSessionHooks() opens the shared DB and runs migrations before
+    // returning a non-null hook, so this fire-and-forget runner starts only
+    // after the schema is ready. Batch transactions serialize with concurrent
+    // ctx_memory writes.
     if (pluginConfig.enabled && magicContextRuntime.magicContext) {
         try {
             const db = openDatabase();
             if (db && isDatabasePersisted(db)) {
                 scheduleAfterBootQuiet(() => {
-                    runDeferredV22Backfill(db).catch((err) => {
-                        log(`[v22-backfill] background runner failed: ${err}`);
+                    runClaimsBackfillStartup(db).catch((err) => {
+                        log(`[claims-backfill] background runner failed: ${err}`);
                     });
                 });
             }
         } catch (err) {
-            log(`[v22-backfill] failed to start background runner: ${err}`);
+            log(`[claims-backfill] failed to start background runner: ${err}`);
         }
     }
 

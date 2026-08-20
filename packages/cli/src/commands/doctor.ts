@@ -15,6 +15,11 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter } from "../adapters/types";
 import {
+    type ClaimsBackfillCommandArgs,
+    hasClaimsBackfillCommand,
+    runClaimsBackfillCommands,
+} from "../lib/claims-backfill-commands";
+import {
     openExistingContextDatabase,
     openExistingContextDatabaseForMutation,
 } from "../lib/database-access";
@@ -29,7 +34,7 @@ import { runDoctor as runOmpDoctor } from "./doctor-omp";
 import { runDoctor as runOpenCodeDoctor } from "./doctor-opencode";
 import { doctor as runPiDoctor } from "./doctor-pi";
 
-export interface RunDoctorOptions extends V22BackfillCommandArgs {
+export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfillCommandArgs {
     force?: boolean;
     issue?: boolean;
     clear?: boolean;
@@ -71,6 +76,29 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
                 closeDatabase: () => {
                     v22Db?.close();
                     v22Db = null;
+                },
+                log,
+            },
+            options,
+        );
+        if (result.handled) return result.exitCode;
+    }
+
+    if (hasClaimsBackfillCommand(options)) {
+        let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
+        const result = await runClaimsBackfillCommands(
+            {
+                name: "Magic Context",
+                openDatabase: (readonly = true) => {
+                    const dbPath = join(getMagicContextStorageDir(), "context.db");
+                    claimsDb = readonly
+                        ? openExistingContextDatabase(dbPath, { readonly: true })
+                        : openExistingContextDatabaseForMutation(dbPath);
+                    return claimsDb;
+                },
+                closeDatabase: () => {
+                    claimsDb?.close();
+                    claimsDb = null;
                 },
                 log,
             },
