@@ -20,7 +20,7 @@ use crate::connection::{run_connection, GenerationCore};
 use crate::dispatch::{
     finish_route_close, force_close_all_routes, send_connection_goodbye, settle_route,
 };
-use crate::handler::McHostHandler;
+use crate::handler::{McHostHandler, TargetKind};
 use crate::instance::{ConnectionKey, InstanceError, InstanceGuard};
 use crate::routing::RouteRegistry;
 use crate::wire::ByteBudget;
@@ -93,11 +93,7 @@ pub struct HostShared<H> {
     pub limits: HostLimits,
     pub timing: HostTiming,
     pub liveness: Option<LivenessPolicy>,
-    /// The linked module's identity, the only manifest datum the runtime
-    /// reads after startup. The full `ManifestSnapshot` is dropped once the
-    /// catalog cache is built: a large `provides` tree would otherwise stay
-    /// resident for the incarnation outside every byte budget.
-    pub module_id: Arc<str>,
+    pub targets: crate::control::TargetIndex,
     pub catalog: crate::control::CatalogCache,
     pub registry: RouteRegistry,
     pub ingress_budget: ByteBudget,
@@ -353,14 +349,60 @@ pub async fn run<H: McHostHandler>(
         InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
-    let manifest = crate::panic_boundary::redact_sync(|| handler.manifest());
+    let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
+    if manifests.is_empty() || manifests.len() > 2 {
+        return Err(HostError::InitFailed(
+            "the static profile requires one or two module manifests".to_owned(),
+        ));
+    }
+    let mut target_entries: Vec<(Box<str>, Vec<TargetKind>)> = Vec::with_capacity(manifests.len());
+    for manifest in &manifests {
+        if let Err(err) = crate::control::validate_manifest_module_id(&manifest.module_id) {
+            return Err(HostError::InitFailed(err));
+        }
+        if target_entries
+            .iter()
+            .any(|(id, _)| id.as_ref() == manifest.module_id)
+        {
+            return Err(HostError::InitFailed(
+                "duplicate module ID across startup manifests".to_owned(),
+            ));
+        }
+        let mut kinds = Vec::new();
+        for entry in &manifest.provides {
+            // A published catalog entry whose role can never route would
+            // contradict route admission, so startup refuses it.
+            let Some(kind) = entry
+                .get("role")
+                .and_then(|role| role.as_str())
+                .and_then(TargetKind::parse)
+            else {
+                return Err(HostError::InitFailed(
+                    "manifest advertises an unsupported role".to_owned(),
+                ));
+            };
+            if kinds.contains(&kind) {
+                return Err(HostError::InitFailed(
+                    "manifest advertises a duplicate target pair".to_owned(),
+                ));
+            }
+            kinds.push(kind);
+        }
+        if kinds.is_empty() {
+            return Err(HostError::InitFailed(
+                "manifest advertises no routable role".to_owned(),
+            ));
+        }
+        target_entries.push((manifest.module_id.clone().into_boxed_str(), kinds));
+    }
+    let targets = crate::control::TargetIndex::new(target_entries);
     // Bounded during serialization, not after: an over-limit manifest must be
     // refused without ever materializing a full copy of its catalog.
     let Ok(catalog) =
-        crate::control::CatalogCache::new_bounded(&manifest, crate::wire::MAX_BODY_LEN as usize)
+        crate::control::CatalogCache::new_bounded(&manifests, crate::wire::MAX_BODY_LEN as usize)
     else {
         return Err(HostError::InitFailed(
-            "linked manifest exceeds the frame limit".to_owned(),
+            "linked manifest catalog exceeds the frame limit".to_owned(),
         ));
     };
     // The cached catalog stays resident for the whole incarnation outside
@@ -374,23 +416,6 @@ pub async fn run<H: McHostHandler>(
         return Err(HostError::InitFailed(
             "linked manifest catalog leaves no resident-byte headroom".to_owned(),
         ));
-    }
-    // `route.open` admits only manifest-supported roles (protocol §7.2); a
-    // manifest without the tool_provider role would publish a catalog that
-    // says the role is unavailable while route admission still accepted it.
-    if !manifest.provides.iter().any(|entry| {
-        entry.get("role").and_then(|role| role.as_str())
-            == Some(crate::control::TARGET_KIND_TOOL_PROVIDER)
-    }) {
-        return Err(HostError::InitFailed(
-            "linked manifest does not advertise a tool_provider role".to_owned(),
-        ));
-    }
-    // The module ID must satisfy the same bounds route.open enforces on the
-    // client-supplied target, or the catalog advertises a module no request
-    // can name.
-    if let Err(err) = crate::control::validate_manifest_module_id(&manifest.module_id) {
-        return Err(HostError::InitFailed(err));
     }
 
     // Initialization runs exactly once, before bind; failure or deadline
@@ -476,18 +501,14 @@ pub async fn run<H: McHostHandler>(
         .publish(port, &config.daemon_ver)
         .map_err(HostError::Instance)?;
 
-    // Only the module ID outlives startup; the snapshot's provides tree can
-    // approach the frame limit and must not stay resident beside budgets
-    // that only subtract the serialized catalog.
-    let module_id: Arc<str> = Arc::from(manifest.module_id.as_str());
-    drop(manifest);
+    drop(manifests);
 
     let shared = Arc::new(HostShared {
         handler,
         limits: config.limits.clone(),
         timing: config.timing.clone(),
         liveness: config.liveness.clone(),
-        module_id,
+        targets,
         catalog,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
@@ -715,7 +736,41 @@ async fn shutdown_sequence<H: McHostHandler>(
         // against the predecessor's in-flight cleanup.
         let lifecycle_chain = shared.timing.lifecycle_callback_deadline.saturating_mul(2);
         let _ = timeout(lifecycle_chain, shared.tracker.wait()).await;
+        run_handler_shutdown(shared).await;
         return false;
     }
-    drained_in_time
+    run_handler_shutdown(shared).await && drained_in_time
+}
+
+/// Runs the handler shutdown callback exactly once, after route cleanup.
+/// The callback is never aborted: a deadline overrun trips the fatal latch
+/// and returns non-graceful while the still-tracked task keeps running, so
+/// the handler stays owned until it actually stops.
+async fn run_handler_shutdown<H: McHostHandler>(shared: &Arc<HostShared<H>>) -> bool {
+    let handler = Arc::clone(&shared.handler);
+    let mut task = shared.spawn_lifecycle(async move {
+        let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
+        crate::panic_boundary::redact(callback).await;
+    });
+    match timeout(shared.timing.lifecycle_callback_deadline, &mut task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(join_err)) => {
+            let kind = if join_err.is_panic() {
+                "panicked"
+            } else {
+                "was aborted"
+            };
+            shared
+                .fatal
+                .trip(&shared.shutdown, format!("shutdown callback {kind}"));
+            false
+        }
+        Err(_) => {
+            shared.fatal.trip(
+                &shared.shutdown,
+                "shutdown callback deadline expired".to_owned(),
+            );
+            false
+        }
+    }
 }

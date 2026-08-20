@@ -13,7 +13,7 @@ use std::time::Duration;
 use mc_host::{
     BindOutcome, CancellationToken, HealthReport, HealthStatus, HostConfig, HostError, HostLimits,
     InitError, ManifestSnapshot, McHostHandler, RequestCtx, RequestOutcome, RouteHandle,
-    RouteIdentity,
+    RouteIdentity, RouteTarget,
 };
 
 use raw_client::Discovered;
@@ -80,6 +80,7 @@ pub enum Event {
     Request(RouteHandle),
     RouteGone(RouteHandle),
     Health,
+    Shutdown,
     HandlerDropped,
 }
 
@@ -306,8 +307,8 @@ impl Drop for TestHandler {
 }
 
 impl McHostHandler for TestHandler {
-    fn manifest(&self) -> ManifestSnapshot {
-        ManifestSnapshot {
+    fn manifests(&self) -> Vec<ManifestSnapshot> {
+        vec![ManifestSnapshot {
             module_id: LINKED_MODULE_ID.to_owned(),
             module_version: MODULE_VERSION.to_owned(),
             provides: vec![serde_json::json!({
@@ -324,7 +325,7 @@ impl McHostHandler for TestHandler {
                 "forward_compatible_extra": {"nested": true}
             })],
             control_ops: vec!["health.check".to_owned()],
-        }
+        }]
     }
 
     async fn initialize(&self, _init: mc_host::HostInit) -> Result<(), InitError> {
@@ -346,7 +347,12 @@ impl McHostHandler for TestHandler {
         }
     }
 
-    async fn bind(&self, route: RouteHandle, identity: RouteIdentity) -> BindOutcome {
+    async fn bind(
+        &self,
+        route: RouteHandle,
+        _target: RouteTarget,
+        identity: RouteIdentity,
+    ) -> BindOutcome {
         self.inner
             .identities
             .lock()
@@ -511,6 +517,10 @@ impl McHostHandler for TestHandler {
     async fn health(&self) -> HealthReport {
         self.push(Event::Health);
         self.inner.health.lock().expect("health lock").clone()
+    }
+
+    async fn shutdown(&self) {
+        self.push(Event::Shutdown);
     }
 }
 

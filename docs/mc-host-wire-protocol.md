@@ -1,9 +1,9 @@
 # `mc-host` Wire Protocol and Handshake
 
-Status: normative direct-linked single-module profile
+Status: normative direct-linked static two-target profile
 Wire version: 2
 Connection-file schema: 1
-Task: `magic-context-c50.2`
+Task: `magic-context-c50.2`; two-target revision and Synapse application protocol: `magic-context-c50.6`
 
 ## 1. Conformance and authority
 
@@ -23,15 +23,15 @@ This document is sufficient to implement a compatible host and client without pr
 
 ## 2. Profile, actors, and trust boundary
 
-`mc-host` directly links one `McHandler` and serves one module, `magic-context`. It is not a general module supervisor or remote transport.
+`mc-host` directly links one static composite handler and serves exactly two immutable modules: `magic-context` (role `tool_provider`) and `synapse` (role `management_surface`). The composition is fixed at startup: there is no dynamic registration, catalog mutation, plugin loading, or module supervision, and `mc-host` is not a remote transport.
 
 Actors:
 
 - **Host:** `mc-host`; owns credentials, connection generations, channels, epochs, correlations accepted from each peer, and handler lifecycle.
-- **TypeScript clients:** `SubcModuleTransport`, Synapse, and the wake-plane catalog probe.
+- **TypeScript clients:** `SubcModuleTransport`, the Synapse embedding provider, and the wake-plane catalog probe.
 - **Raw Rust client:** `HistorianProducer`; authenticates directly, opens command and subscription routes, sends unary and streaming requests, reads errors, and sends route `Goodbye`.
 - **Managed Rust client:** published `SubcConsumer`; owns bounded reconnect and route-open policy around fresh control RPCs.
-- **Handler:** linked `McHandler`; receives synthetic initialization, bind, request, route-gone, and internal health callbacks.
+- **Handler:** the linked static composite; receives synthetic initialization, target-aware bind, request, route-gone, internal health, and shutdown callbacks, and dispatches each to the owning component (`magic-context` or `synapse`).
 
 The 32-byte connection key is a bearer capability. Possession grants every direct-profile operation and permits any `BindIdentity`. Client `role`, `consumer_identity`, `project_root`, `harness`, and `session` are claims or scoping metadata; none grants authority. A key reader MUST therefore be trusted as the same local security principal as the host.
 
@@ -314,11 +314,20 @@ Successful response MUST retain the tag:
 {"op":"route.open","route_channel":7,"route_epoch":77}
 ```
 
-The only current successful target is linked module ID `magic-context` with a role supported by its manifest. Other module IDs receive terminal `unknown_module`; unsupported target kinds receive terminal `target_unavailable`. Dynamic routing, provider discovery, `internal_service`, and model-runner routing are outside this single-module document; `magic-context-c50.11` owns model-runner route integration required by the Rust historian.
+The direct profile routes exactly two static target pairs. Classification runs only after every structural bound in Section 7.1 held, and each rejection is one stable terminal code:
 
-This exclusion has one known in-repo casualty: `RealSessionResolver` (`crates/mc-module/src/session_resolver.rs`), constructed whenever `McHandler` receives a connection file, unconditionally opens a `management_surface` route to module `thalamus`, and the linked manifest consumes that service. Against a conforming direct host that `route.open` receives a terminal error (`target_unavailable` for the unsupported `management_surface` kind), so stateful facade calls that resolve sessions fail at route-open. This contract deliberately does not add a thalamus-compatible route; `magic-context-c50.4` owns replacing or disabling that resolver path (for example, a host-served session-resolve equivalent or the existing `MissingSessionResolver` fallback) before mc-module runs against this profile.
+| `target.kind` | `target.module_id` | Result |
+| --- | --- | --- |
+| `tool_provider` | `magic-context` | handler bind for the Magic Context component |
+| `management_surface` | `synapse` | handler bind for the Synapse component |
+| `tool_provider` | `synapse` | terminal `target_unavailable` (known module, unsupported role); zero bind calls |
+| `management_surface` | `magic-context` | terminal `target_unavailable` (known module, unsupported role); zero bind calls |
+| any recognized kind above | any other module | terminal `unknown_module`; zero bind calls |
+| any other kind (`internal_service`, model-runner kinds, unknown strings) | any module | terminal `target_unavailable`; zero bind calls |
 
-The Synapse embedding lane has the same shape: when `embedding.provider` is `synapse`, `embedding-synapse.ts` opens a `management_surface` route to module `synapse` for every operation. Against this profile that route receives terminal `target_unavailable`, so the discovery probe fails over to the configured fallback embedding provider. That fail-over is the intended interim behavior, not silent breakage: `magic-context-c50.6` owns porting the synapse embedding service — all four operations the client calls: `embed.batch`, `embed.query` (single-vector requests), `embed.result` (asynchronous-job polling), and `models.list` — to the Rust host, and until it lands the configured Synapse lane is unavailable against this host by design.
+A successful classification carries the validated typed target into the handler bind, so the composite dispatches on host-validated data and never re-parses the client body. The Synapse target stays in this matrix even when its model bundle is missing or invalid: classification still succeeds, the bind is invoked, and the component rejects it with terminal `artifact_invalid` (Section 7.5.1). Dynamic routing, provider discovery, `internal_service`, and model-runner routing remain outside this document; `magic-context-c50.11` owns model-runner route integration required by the Rust historian.
+
+This exclusion has one known in-repo casualty: `RealSessionResolver` (`crates/mc-module/src/session_resolver.rs`), constructed whenever `McHandler` receives a connection file, unconditionally opens a `management_surface` route to module `thalamus`, and the linked manifest consumes that service. Against a conforming direct host that `route.open` receives terminal `unknown_module` (the kind is recognized but no static module named `thalamus` exists), so stateful facade calls that resolve sessions fail at route-open. This contract deliberately does not add a thalamus-compatible route; `magic-context-c50.4` owns replacing or disabling that resolver path (for example, a host-served session-resolve equivalent or the existing `MissingSessionResolver` fallback) before mc-module runs against this profile.
 
 ### 7.3 `catalog.list`
 
@@ -332,19 +341,19 @@ Requests MAY omit `module_id` to list all entries or supply a filter. Unknown fi
 {"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list"]}
 ```
 
-An unfiltered request and a `magic-context` filter MUST return exactly one entry derived without lossy rewriting from the linked manifest:
+An unfiltered request MUST return exactly two entries — `magic-context` then `synapse`, in that deterministic order — and an exact-module filter MUST return that one entry, each derived without lossy rewriting from its startup manifest:
 
 | Response field | Required value |
 | --- | --- |
 | `op` | `catalog.list` |
 | `generation` | current catalog-state generation |
-| `modules[0].module_id` | `magic-context` |
-| `modules[0].module_version` | linked manifest's exact build version |
-| `modules[0].roles` | linked manifest's complete `provides` array, including tool schemas |
-| `modules[0].control_ops` | implemented module control operations only; currently no `wake.create` |
+| `modules[i].module_id` | `magic-context` or `synapse` |
+| `modules[i].module_version` | that manifest's exact build version |
+| `modules[i].roles` | that manifest's complete `provides` array, including tool schemas |
+| `modules[i].control_ops` | implemented module control operations only; currently no `wake.create` |
 | `subc_ops` | `route.open`, `catalog.list` |
 
-Current direct host does not implement `wake.create`, so wake-plane probing remains fail-open. `generation` changes only when catalog content changes and is unrelated to connection generation.
+The Synapse entry is immutable identity, not readiness: it stays in the catalog even when the model bundle is missing or invalid (Section 7.5.1). Current direct host does not implement `wake.create`, so wake-plane probing remains fail-open. `generation` changes only when catalog content changes and is unrelated to connection generation.
 
 ### 7.4 Operation classification
 
@@ -357,6 +366,115 @@ Canonical error body:
 ```
 
 `Error` terminates only its matching correlation. It does not itself close a route or connection unless the error table below says so.
+
+### 7.5 Synapse application protocol
+
+Routed requests on the `synapse/management_surface` route are UTF-8 JSON objects (`binary = 0`) of the shape `{"method": string, "params": object}`. Successful responses are JSON objects whose operation payload lives under a `result` object. Failures are transport `Error` terminals with the canonical `{code, message}` body. The service implements exactly four methods — `models.list`, `embed.query`, `embed.batch`, and `embed.result` — and MUST NOT add job-management, health, cancellation, or model-management methods. Legacy field aliases (`entries`, `items`, `results`, `embedding`, `complete`, `cursor` as a response field) are TypeScript read compatibility only; the Rust host MUST NOT emit them.
+
+#### 7.5.1 Validation, bounds, and error codes
+
+Every request body is parsed strictly: duplicate object keys, non-object roots, invalid UTF-8, unknown `method` values, wrong field types, and out-of-bound sizes are rejected before hashing or inference. Whole-body nesting is bounded (8 levels); no valid request needs more than 3. The application error vocabulary is closed:
+
+| Code | Meaning | Retry disposition |
+| --- | --- | --- |
+| `queue_full` | admission capacity (job count, queued bytes, or CPU backlog) exhausted before admission | retry after the bounded `retry_after_ms` carried in the message envelope policy; no state was created |
+| `model_loading` | backend is initializing | bounded retry |
+| `timeout` | request-scoped deadline expired host-side | caller policy |
+| `artifact_invalid` | bundle missing/invalid (bind rejection) or response identity guard failed | permanent; no retry |
+| `substitution_rejected` | request named a model/fingerprint/epoch the lane does not serve, or `allow_equivalent`/`accept_declared` was not `false` | permanent |
+| `not_certified` | model failed semantic certification | permanent |
+| `probe_required` | structural startup probe has not passed | permanent for this incarnation |
+| `idempotency_conflict` | retained `request_key` reused with a conflicting payload | permanent |
+| `schema_violation` | malformed request, hash/key mismatch, bad cursor, bound violation | permanent |
+| `module_restarted` | job unknown to this host incarnation (restart, expiry, or eviction) | resubmit the same page once from cursor `null` |
+| `cancelled` | host cancellation won (Section 9.2) | no generic retry |
+
+Every capacity is finite and host-owned; request fields can never select capacities, models, or filesystem paths. Defaults: 1 concurrent CPU inference, 64 admitted jobs, 64 MiB aggregate queued request text, 64 retained completed jobs, 64 MiB retained vector bytes, 64 items and 8 MiB total text per batch, 1 MiB text per item or query, 16 vectors or 2 MiB encoded output per result page, 15-minute completed-job retention.
+
+#### 7.5.2 `models.list`
+
+Request `params` MUST be an empty object (or absent). Result:
+
+```json
+{"result":{"models":[{"model":"tiny-test-model","fingerprint":"<hex>","table_epoch":1,"dims":8,"certified":true,"status":"ready","provenance":{"source":"owner-provisioned"},"recommended_batch":{"rows":16,"token_budget":8192}}]}}
+```
+
+Exactly one model is served — the certified bundle pinned at startup. `fingerprint` covers the complete embedding-space contract (artifact hashes, dimensions, pooling, output selection, truncation, quantization, and fixed L2 post-processing). `table_epoch` is the manifest's destination-table epoch.
+
+#### 7.5.3 Fixed lane constraints
+
+Every `embed.*` request MUST carry the fixed constraints and the host MUST validate each one exactly:
+
+```json
+{"model":"tiny-test-model","required_fingerprint":"<hex>","required_epoch":1,"allow_equivalent":false,"accept_declared":false}
+```
+
+A wrong model, fingerprint, or epoch, or either flag not literally `false`, is terminal `substitution_rejected`. The service never adapts a response to a different model or embedding space.
+
+#### 7.5.4 `embed.query`
+
+`params` adds `text` (bounded string) and optional `deadline_ms` (bounded positive integer). The response is synchronous and carries complete lane metadata:
+
+```json
+{"result":{"model":"tiny-test-model","fingerprint":"<hex>","table_epoch":1,"dims":8,"done":true,"vectors":[{"id":"query","content_sha256":"<hex of text>","vector":[0.1,0.2]}]}}
+```
+
+`embed.query` is a pure computation: it creates no job, no ledger state, and no retained result, which is what permits the TypeScript client's `outcome_unknown` retry without an idempotency token. Route loss cancels only the response wait; a started native inference call is joined by the Synapse incarnation tracker, never orphaned.
+
+#### 7.5.5 `embed.batch`
+
+`params` adds `request_key` (64 lowercase hex chars) and `items`, a bounded ordered array of `{"id": string, "text": string, "content_sha256": string}`. The host recomputes each item's UTF-8 SHA-256 and the canonical request key (Section 7.5.7); any mismatch, duplicate ID, or bound violation is `schema_violation` with zero job creation. A valid batch always returns an ephemeral job descriptor — never inline vectors, even when inference completes immediately:
+
+```json
+{"result":{"job_id":"<opaque>","request_key":"<echoed>","done":false,"status":"queued","retry_after_ms":50}}
+```
+
+Reusing a retained `request_key` with the byte-identical canonical payload returns the same `job_id` and runs inference at most once. Reusing it with any differing payload (order, IDs, texts, hashes, or lane constraints) is terminal `idempotency_conflict`; the original job is never replaced or rerun. Jobs are process-local and host-incarnation-fenced: they do not survive restart, and the durable recovery authority is the TypeScript ledger.
+
+#### 7.5.6 `embed.result`
+
+`params` adds `job_id`, the echoed `request_key`, and `cursor` — JSON `null` for the first page, else the opaque `next_cursor` from the previous page. While work is pending the response is explicit and cannot be mistaken for an empty result:
+
+```json
+{"result":{"job_id":"<opaque>","done":false,"status":"running","retry_after_ms":50}}
+```
+
+Ready results are returned as ordered bounded pages preserving input order. Every non-final page carries `done:false` and a non-null `next_cursor`; the final page carries `done:true` and no `next_cursor`:
+
+```json
+{"result":{"model":"tiny-test-model","fingerprint":"<hex>","table_epoch":1,"dims":8,"done":false,"next_cursor":"<opaque>","vectors":[{"id":"item:0","content_sha256":"<hex>","vector":[0.1]}]}}
+```
+
+Cursors are opaque, forward-only, and bound to their job. A malformed, cross-job, backward, or past-end cursor is `schema_violation`. A `job_id` from another incarnation, or one that is unknown, expired, or evicted, is `module_restarted` — the client's single resubmission rule. A failed job reports its terminal error code on `embed.result`.
+
+#### 7.5.7 Canonical request key
+
+The request key is the lowercase-hex SHA-256 of a canonical JSON object with keys in this exact order and JavaScript `JSON.stringify` string escaping:
+
+```text
+{"accept_declared":false,"allow_equivalent":false,"content_sha256":[...ordered recomputed hashes...],"ids":[...ordered ids...],"model":"<model>","op":"embed.batch","required_epoch":<int>,"required_fingerprint":"<fingerprint>"}
+```
+
+Golden vectors (model `tiny-test-model`, fingerprint `fp-1`):
+
+| Case | Inputs | Key |
+| --- | --- | --- |
+| empty items, epoch 1 | `ids:[] content_sha256:[]` | `581e663acbdeee7021b440822f8f054afa1089ca89f3be3585bf0e8032502186` |
+| two ASCII items, epoch 1 | ids `item:0`,`item:1`; texts `hello world`, `second text` | `ce9a0b29a7c3339ba91851d71b1164f93a35ea6053629f1e9a97ac26c2c02ece` |
+| escaped + non-ASCII, epoch 7 | id `id "q"\ü\n` (literal quote, backslash, u-umlaut, newline); text `café \u2028 "quoted\" \n tab\t` | `abdb2e55e593fb0f05dfd9f01e3bbaba88f88452daa01cf19bb1ba43da933979` |
+
+Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, two-byte short escapes for `"` `\` and control characters `\b \t \n \f \r`, six-byte `\u00XX` for remaining control characters, and no escaping of U+2028/U+2029. The host additionally stores a server-side payload digest that includes the item texts, so a repeated key is classified as same-payload (job reuse) or conflict.
+
+#### 7.5.8 Traceability
+
+| Rule | Verified by |
+| --- | --- |
+| target matrix and catalog (Section 7.2, 7.3) | `crates/mc-host/tests/composite_routing.rs` |
+| bundle identity, offline CPU inference, degraded isolation | `crates/mc-host/tests/synapse_bundle.rs` |
+| request validation, bounds, idempotency, cursors, restart fencing | `crates/mc-host/tests/synapse_protocol.rs`, `crates/mc-host/tests/synapse_jobs.rs` |
+| four operations over a real authenticated route, shutdown cleanup | `crates/mc-host/tests/synapse_roundtrip.rs` |
+| request-key golden vectors in both languages | `crates/mc-host/tests/synapse_protocol.rs`, `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` |
+| durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v82.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |
 
 ## 8. Host and handler lifecycle
 
@@ -398,7 +516,7 @@ For every valid `route.open`, host MUST:
 1. allocate a nonzero channel unused across all live consumer connections;
 2. choose a nonzero epoch strictly greater than every prior epoch used for that channel in this host incarnation;
 3. create handler-visible route handle and identity;
-4. call handler bind before publishing the route to client;
+4. call handler bind with the validated typed target (module and role from the Section 7.2 matrix) before publishing the route to client;
 5. on acceptance, install route then return tagged `route.open` response;
 6. on rejection, call route-gone exactly once because handler observed the handle, release it after callback completes, then return terminal bind error.
 
@@ -550,9 +668,10 @@ Graceful host shutdown order:
 3. drain or cancel work within finite shutdown deadline, emitting terminal `Response`, `StreamEnd`, or `Error{code:"cancelled"}` frames while generations are still live;
 4. send best-effort connection Goodbye; receiving it retires the generation client-side (Section 6.2), so it MUST follow the drain, or drain-phase terminals would arrive on a retired generation and be dropped;
 5. invoke route-gone exactly once for every handler-visible route;
-6. drop handler only after all route-gone callbacks complete;
-7. close sockets/listener;
-8. release instance lock.
+6. invoke the handler shutdown callback exactly once, after route cleanup and health-probe quiescence; the callback must not be aborted — a deadline overrun or panic marks the shutdown non-graceful, but the handler, host state, and instance lock remain owned until every native call and lifecycle callback has actually stopped;
+7. drop handler only after all route-gone callbacks and the shutdown callback complete;
+8. close sockets/listener;
+9. release instance lock.
 
 Work without an observed terminal remains `outcome_unknown`. Forced shutdown may skip wire Goodbyes but MUST preserve local exactly-once route-gone and handler-drop ordering.
 
@@ -662,7 +781,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | Consumer | Required contract | Verification owner |
 | --- | --- | --- |
 | `packages/plugin/src/hooks/magic-context/module-transport.ts` | v2 auth/frame, route cache by generation, opaque bodies, close race, outcome-safe retry | `magic-context-c50.5` |
-| `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts` | managed call and `not_sent` / `outcome_unknown` / `terminal` distinction; its synapse `management_surface` route is unavailable under this profile until the Rust port lands (Section 7.2) | `magic-context-c50.5`, synapse route in `magic-context-c50.6` |
+| `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts` | managed call and `not_sent` / `outcome_unknown` / `terminal` distinction; its synapse `management_surface` route binds under the Section 7.2 matrix and speaks the Section 7.5 application protocol | `magic-context-c50.5`, synapse protocol in `magic-context-c50.6` |
 | `packages/plugin/src/features/magic-context/smart-notes/wake-plane.ts` | tagged truthful catalog; absent `wake.create` fails open | `magic-context-c50.5` |
 | `crates/mc-module/src/historian_producer.rs` | raw auth, first endpoint, route open, monotonic correlation, streaming, Error, Goodbye; Ping/Pong echo required (Section 9.3, currently missing) | `magic-context-c50.4`, route target in `magic-context-c50.11` |
 | `crates/mc-module/src/session_resolver.rs` | managed Rust route-open deadline and terminal module errors; its thalamus `management_surface` target is unsupported by this profile and MUST be replaced or disabled (Section 7.2) | `magic-context-c50.4` |
@@ -693,7 +812,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 
 ## 17. Scope boundaries
 
-In scope: discovery and secure publication, pre-envelope authentication, v2 framing, `route.open`, `catalog.list`, one linked module, routing/correlation/streaming/cancel/close, internal health, send outcomes, and generation recovery.
+In scope: discovery and secure publication, pre-envelope authentication, v2 framing, `route.open`, `catalog.list`, the fixed two-module static composition, the Synapse application protocol (Section 7.5), routing/correlation/streaming/cancel/close, internal health, send outcomes, and generation recovery.
 
 Deferred: executable cross-language golden fixtures; host, shim, and client code; private dependency compiler closure; model-runner routing; test-only TypeScript provider API; deployment-specific numeric quotas beyond required finite bounds.
 

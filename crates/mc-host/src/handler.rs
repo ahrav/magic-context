@@ -37,6 +37,35 @@ pub struct RouteHandle {
     pub epoch: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TargetKind {
+    ToolProvider,
+    ManagementSurface,
+}
+
+impl TargetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolProvider => "tool_provider",
+            Self::ManagementSurface => "management_surface",
+        }
+    }
+
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "tool_provider" => Some(Self::ToolProvider),
+            "management_surface" => Some(Self::ManagementSurface),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTarget {
+    pub module_id: String,
+    pub kind: TargetKind,
+}
+
 /// Caller-supplied route scope. Every field is an unverified claim: it scopes
 /// handler state and never grants authority (protocol §2, §7.1).
 #[derive(Clone, PartialEq, Eq)]
@@ -389,13 +418,14 @@ impl std::error::Error for InitError {}
 /// to one `internal_error` terminal for that correlation only (when the
 /// runtime unwinds; under `panic=abort` any panic kills the process).
 pub trait McHostHandler: Send + Sync + 'static {
-    fn manifest(&self) -> ManifestSnapshot;
+    fn manifests(&self) -> Vec<ManifestSnapshot>;
 
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
 
     fn bind(
         &self,
         route: RouteHandle,
+        target: RouteTarget,
         identity: RouteIdentity,
     ) -> impl Future<Output = BindOutcome> + Send;
 
@@ -404,4 +434,6 @@ pub trait McHostHandler: Send + Sync + 'static {
     fn route_gone(&self, route: RouteHandle) -> impl Future<Output = ()> + Send;
 
     fn health(&self) -> impl Future<Output = HealthReport> + Send;
+
+    fn shutdown(&self) -> impl Future<Output = ()> + Send;
 }
