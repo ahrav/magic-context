@@ -19,7 +19,9 @@ function v80Database(): Database {
     const db = new Database(":memory:");
     initializeDatabase(db);
     runMigrations(db);
-    db.exec("DELETE FROM schema_migrations WHERE version = 81");
+    // Deleting only row 81 would leave the current version at 82 and never
+    // re-select the pending 81; the replayed 82 no-ops over its existing tables.
+    db.exec("DELETE FROM schema_migrations WHERE version >= 81");
     db.exec(`
         ALTER TABLE notes DROP COLUMN source_revision;
         ALTER TABLE notes DROP COLUMN state_version;

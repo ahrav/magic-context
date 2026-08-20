@@ -43,6 +43,28 @@ describe("workspace identity helpers", () => {
         }
     });
 
+    test("expands multi-hop rekey chains and numeric-registry aliases to workspace members", () => {
+        const db = openDb();
+        try {
+            db.exec(`
+                INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at)
+                VALUES ('git:hop-1', 'git:hop-2', 2), ('git:hop-2', 'git:member', 2);
+                INSERT INTO projects (canonical_identity, created_at) VALUES ('git:member', 1);
+                INSERT INTO project_aliases (alias_identity, project_id, created_at)
+                VALUES ('git:member', 1, 1), ('git:registry-alias', 1, 1);
+            `);
+
+            expect(expandWorkspaceIdentitySet(db, ["git:member"]).sort()).toEqual([
+                "git:hop-1",
+                "git:hop-2",
+                "git:member",
+                "git:registry-alias",
+            ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("workspace fingerprint is stable over sorted identity/epoch pairs", () => {
         const db = openDb();
         try {

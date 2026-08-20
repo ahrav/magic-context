@@ -4,6 +4,7 @@ import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { resolveProjectIdentity } from "./memory/project-identity";
+import { withImmediateTransaction } from "./memory/storage-claims";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
@@ -73,22 +74,6 @@ function ensureBackfillStateTable(db: Database): void {
         } catch (error) {
             if (!/duplicate column name/i.test(String(error))) throw error;
         }
-    }
-}
-
-function withImmediateTransaction<T>(db: Database, fn: () => T): T {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-        const result = fn();
-        db.exec("COMMIT");
-        return result;
-    } catch (error) {
-        try {
-            db.exec("ROLLBACK");
-        } catch {
-            // Ignore rollback failures: the original error is the actionable one.
-        }
-        throw error;
     }
 }
 

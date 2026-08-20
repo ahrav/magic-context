@@ -2,6 +2,17 @@ import { extractTiersFromInner } from "../../hooks/magic-context/compartment-par
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
+    assertClaimsSchemaForeignKeys,
+    CLAIMS_AND_EVIDENCE_TABLES,
+    createClaimsAndEvidenceSchema,
+} from "./storage-claims-schema";
+import {
+    assertProjectRegistrySeed,
+    resolveProjectIdentitySeed,
+    seedProjectRegistry,
+    tableExists,
+} from "./storage-project-identities";
+import {
     ensureColumn,
     healAllNullColumns,
     MEMORIES_AU_TRIGGER_BODY,
@@ -47,12 +58,6 @@ function isSqliteLockError(error: unknown): boolean {
     return (
         typeof candidate.message === "string" &&
         /database is locked|sqlite_(busy|locked)/i.test(candidate.message)
-    );
-}
-
-function tableExists(db: Database, name: string): boolean {
-    return Boolean(
-        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name),
     );
 }
 
@@ -3087,6 +3092,40 @@ export const MIGRATIONS: Migration[] = [
             if (!tableExists(db, "notes")) return;
             ensureColumn(db, "notes", "source_revision", "INTEGER NOT NULL DEFAULT 0");
             ensureColumn(db, "notes", "state_version", "INTEGER NOT NULL DEFAULT 0");
+        },
+    },
+    {
+        version: 82,
+        description:
+            "authoritative claims and evidence schema with the numeric project identity registry",
+        up(db: Database): void {
+            // A replayed v82 must no-op over its own published schema, but a
+            // partial or foreign `projects` table is corruption, not a replay.
+            if (tableExists(db, "projects")) {
+                const missing = CLAIMS_AND_EVIDENCE_TABLES.filter(
+                    (table) => !tableExists(db, table),
+                );
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v82 replay guard: projects exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                return;
+            }
+            const seed = resolveProjectIdentitySeed(db);
+            if (seed.skippedCycles.length > 0) {
+                // Legacy merge flows could store old→new rows with no
+                // acyclicity check; a cyclic chain must not permanently fail
+                // the migration (and disable the plugin), so those identities
+                // stay unregistered until touched by a supported writer.
+                log(
+                    `[migrations] v82: skipped ${seed.skippedCycles.length} identity chain(s) with rekey cycles: ${seed.skippedCycles.join(", ")}`,
+                );
+            }
+            createClaimsAndEvidenceSchema(db);
+            seedProjectRegistry(db, seed, Date.now());
+            assertProjectRegistrySeed(db, seed);
+            assertClaimsSchemaForeignKeys(db);
         },
     },
 ];

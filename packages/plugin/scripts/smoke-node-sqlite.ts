@@ -11,6 +11,15 @@ import { join } from "node:path";
 // `bun test` cannot reach. Node's ESM type-stripping resolver requires the
 // extension. The file is excluded from tsconfig.scripts.json for the same
 // reason (running it IS the validation).
+import {
+    appendClaimRevision,
+    createClaim,
+    createEpisode,
+    createObservation,
+    createSourceSpan,
+    ensureProject,
+} from "../src/features/magic-context/memory/storage-claims.ts";
+import { createClaimsAndEvidenceSchema } from "../src/features/magic-context/storage-claims-schema.ts";
 import { Database } from "../src/shared/sqlite.ts";
 
 let failures = 0;
@@ -117,6 +126,68 @@ try {
     }
     check("readonly open blocks writes", blocked);
     ro.close();
+
+    const claimsDb = new Database(join(dir, "claims.db"));
+    claimsDb.exec("PRAGMA foreign_keys=ON");
+    const engine = claimsDb.prepare("SELECT sqlite_version() AS version").get() as {
+        version: string;
+    };
+    console.log(`  sqlite_version() = ${engine.version}`);
+    createClaimsAndEvidenceSchema(claimsDb);
+    const projectId = ensureProject(claimsDb, "git:node-smoke");
+    const episodeId = createEpisode(claimsDb, { projectId, sourceSessionId: "ses_smoke" });
+    const spanId = createSourceSpan(claimsDb, {
+        episodeId,
+        sourceLocator: "transcript://smoke",
+        content: "smoke span content",
+        startOffset: 0,
+        endOffset: 18,
+    });
+    const observationId = createObservation(claimsDb, {
+        sourceSpanId: spanId,
+        extractedText: "smoke observation",
+        extractor: "smoke",
+        extractorVersion: "1",
+        extractorRunId: "run",
+        independenceKey: "ik",
+    });
+    const created = createClaim(claimsDb, {
+        projectId,
+        subject: "s",
+        predicate: "p",
+        content: "claim v1",
+        evidence: [{ observationId }],
+    });
+    check("v82 createClaim applies revision 1", created.status === "applied", JSON.stringify(created));
+    if (created.status === "applied") {
+        const appended = appendClaimRevision(claimsDb, {
+            claimId: created.claimId,
+            expectedCurrentRevisionId: created.revisionId,
+            content: "claim v2",
+            evidence: [{ observationId }],
+        });
+        check(
+            "v82 append advances to revision 2",
+            appended.status === "applied" && appended.revision === 2,
+            JSON.stringify(appended),
+        );
+        const stale = appendClaimRevision(claimsDb, {
+            claimId: created.claimId,
+            expectedCurrentRevisionId: created.revisionId,
+            content: "stale append",
+            evidence: [{ observationId }],
+        });
+        check("v82 stale CAS reports stale", stale.status === "stale", JSON.stringify(stale));
+        const revisionCount = claimsDb
+            .prepare("SELECT COUNT(*) AS count FROM claim_revisions")
+            .get() as { count: number };
+        check(
+            "v82 stale append leaves no revision residue",
+            revisionCount.count === 2,
+            String(revisionCount.count),
+        );
+    }
+    claimsDb.close();
 } finally {
     rmSync(dir, { recursive: true, force: true });
 }
