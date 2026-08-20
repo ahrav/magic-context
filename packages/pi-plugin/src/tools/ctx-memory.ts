@@ -75,7 +75,6 @@ import {
 } from "@magic-context/core/features/magic-context/workspaces";
 import { log } from "@magic-context/core/shared/logger";
 import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
-import { runImmediateTransaction } from "@magic-context/core/tools/ctx-memory/verification-recording";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -583,21 +582,23 @@ export function createCtxMemoryTool(
 					);
 				}
 
-				runImmediateTransaction(deps.db, () => {
-					updateMemoryContentInCurrentTransaction(
-						deps.db,
-						memory,
-						content,
-						normalizedHash,
-					);
-					queueMemoryMutation(deps.db, {
-						projectPath: targetIdentity,
-						mutationType: "update",
-						targetMemoryId: memory.id,
-						category: memory.category,
-						newContent: content,
-					});
-				});
+				deps.db
+					.transaction(() => {
+						updateMemoryContentInCurrentTransaction(
+							deps.db,
+							memory,
+							content,
+							normalizedHash,
+						);
+						queueMemoryMutation(deps.db, {
+							projectPath: targetIdentity,
+							mutationType: "update",
+							targetMemoryId: memory.id,
+							category: memory.category,
+							newContent: content,
+						});
+					})
+					.immediate();
 				queueEmbedding({
 					deps,
 					projectIdentity: targetIdentity,
@@ -872,16 +873,18 @@ export function createCtxMemoryTool(
 						projectIdentity: targetIdentityForStoredPath(memory.projectPath),
 					};
 				});
-				runImmediateTransaction(deps.db, () => {
-					for (const target of targets) {
-						archiveMemory(deps.db, target.memoryId, params.reason);
-						queueMemoryMutation(deps.db, {
-							projectPath: target.projectIdentity,
-							mutationType: "archive",
-							targetMemoryId: target.memoryId,
-						});
-					}
-				});
+				deps.db
+					.transaction(() => {
+						for (const target of targets) {
+							archiveMemory(deps.db, target.memoryId, params.reason);
+							queueMemoryMutation(deps.db, {
+								projectPath: target.projectIdentity,
+								mutationType: "archive",
+								targetMemoryId: target.memoryId,
+							});
+						}
+					})
+					.immediate();
 				const reasonSuffix = params.reason ? ` (${params.reason})` : "";
 				const idList = archiveIds.join(", ");
 				const plural = archiveIds.length > 1 ? "memories" : "memory";

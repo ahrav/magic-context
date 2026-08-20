@@ -55,7 +55,6 @@ import {
     type CtxMemoryArgs,
     type CtxMemoryToolDeps,
 } from "./types";
-import { runImmediateTransaction } from "./verification-recording";
 
 export { CTX_MEMORY_LIGHT_DESCRIPTION } from "../light-descriptions";
 
@@ -662,21 +661,23 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 }
 
                 const projectIdentity = targetIdentityForStoredPath(rawProjectPath);
-                runImmediateTransaction(deps.db, () => {
-                    updateMemoryContentInCurrentTransaction(
-                        deps.db,
-                        memory,
-                        content,
-                        normalizedHash,
-                    );
-                    queueMemoryMutation(deps.db, {
-                        projectPath: projectIdentity,
-                        mutationType: "update",
-                        targetMemoryId: memory.id,
-                        category: memory.category,
-                        newContent: content,
-                    });
-                });
+                deps.db
+                    .transaction(() => {
+                        updateMemoryContentInCurrentTransaction(
+                            deps.db,
+                            memory,
+                            content,
+                            normalizedHash,
+                        );
+                        queueMemoryMutation(deps.db, {
+                            projectPath: projectIdentity,
+                            mutationType: "update",
+                            targetMemoryId: memory.id,
+                            category: memory.category,
+                            newContent: content,
+                        });
+                    })
+                    .immediate();
                 queueMemoryEmbedding({
                     deps,
                     sessionId: toolContext.sessionID,
@@ -797,82 +798,86 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     : "active";
 
                 let mergeConflict: string | null = null;
-                const canonicalMemory = runImmediateTransaction(deps.db, () => {
-                    const lockedDuplicate = getMemoryByHash(
-                        deps.db,
-                        projectPath,
-                        category,
-                        normalizedHash,
-                    );
-                    const canonicalExisting =
-                        lockedDuplicate && ids.includes(lockedDuplicate.id)
-                            ? lockedDuplicate
-                            : null;
-                    if (lockedDuplicate && !canonicalExisting) {
-                        mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
-                        return null;
-                    }
-
-                    const nextCanonical =
-                        canonicalExisting?.id != null
-                            ? canonicalExisting
-                            : insertMemoryIdempotent(deps.db, {
-                                  projectPath: projectPath,
-                                  category,
-                                  content,
-                                  sourceSessionId: toolContext.sessionID,
-                                  sourceType:
-                                      toolContext.agent === DREAMER_AGENT
-                                          ? "dreamer"
-                                          : getSourceType(deps),
-                              }).memory;
-                    const canonicalContentChanged =
-                        nextCanonical.content !== content ||
-                        nextCanonical.normalizedHash !== normalizedHash;
-
-                    if (canonicalContentChanged) {
-                        updateMemoryContentInCurrentTransaction(
+                const canonicalMemory = deps.db
+                    .transaction(() => {
+                        const lockedDuplicate = getMemoryByHash(
                             deps.db,
-                            nextCanonical,
-                            content,
+                            projectPath,
+                            category,
                             normalizedHash,
                         );
-                    }
-
-                    mergeMemoryStats(
-                        deps.db,
-                        nextCanonical.id,
-                        mergedSeenCount,
-                        mergedRetrievalCount,
-                        mergedFrom,
-                        mergedStatus,
-                    );
-
-                    for (const memory of sourceMemories) {
-                        if (memory.id === nextCanonical.id) {
-                            continue;
+                        const canonicalExisting =
+                            lockedDuplicate && ids.includes(lockedDuplicate.id)
+                                ? lockedDuplicate
+                                : null;
+                        if (lockedDuplicate && !canonicalExisting) {
+                            mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+                            return null;
                         }
-                        supersededMemory(deps.db, memory.id, nextCanonical.id);
-                        queueMemoryMutation(deps.db, {
-                            projectPath: projectIdentityForStoredPath(memory.projectPath),
-                            mutationType: "superseded",
-                            targetMemoryId: memory.id,
-                            supersededById: nextCanonical.id,
-                        });
-                    }
 
-                    if (canonicalExisting && canonicalContentChanged) {
-                        queueMemoryMutation(deps.db, {
-                            projectPath: projectIdentityForStoredPath(nextCanonical.projectPath),
-                            mutationType: "update",
-                            targetMemoryId: nextCanonical.id,
-                            category,
-                            newContent: content,
-                        });
-                    }
+                        const nextCanonical =
+                            canonicalExisting?.id != null
+                                ? canonicalExisting
+                                : insertMemoryIdempotent(deps.db, {
+                                      projectPath: projectPath,
+                                      category,
+                                      content,
+                                      sourceSessionId: toolContext.sessionID,
+                                      sourceType:
+                                          toolContext.agent === DREAMER_AGENT
+                                              ? "dreamer"
+                                              : getSourceType(deps),
+                                  }).memory;
+                        const canonicalContentChanged =
+                            nextCanonical.content !== content ||
+                            nextCanonical.normalizedHash !== normalizedHash;
 
-                    return nextCanonical;
-                });
+                        if (canonicalContentChanged) {
+                            updateMemoryContentInCurrentTransaction(
+                                deps.db,
+                                nextCanonical,
+                                content,
+                                normalizedHash,
+                            );
+                        }
+
+                        mergeMemoryStats(
+                            deps.db,
+                            nextCanonical.id,
+                            mergedSeenCount,
+                            mergedRetrievalCount,
+                            mergedFrom,
+                            mergedStatus,
+                        );
+
+                        for (const memory of sourceMemories) {
+                            if (memory.id === nextCanonical.id) {
+                                continue;
+                            }
+                            supersededMemory(deps.db, memory.id, nextCanonical.id);
+                            queueMemoryMutation(deps.db, {
+                                projectPath: projectIdentityForStoredPath(memory.projectPath),
+                                mutationType: "superseded",
+                                targetMemoryId: memory.id,
+                                supersededById: nextCanonical.id,
+                            });
+                        }
+
+                        if (canonicalExisting && canonicalContentChanged) {
+                            queueMemoryMutation(deps.db, {
+                                projectPath: projectIdentityForStoredPath(
+                                    nextCanonical.projectPath,
+                                ),
+                                mutationType: "update",
+                                targetMemoryId: nextCanonical.id,
+                                category,
+                                newContent: content,
+                            });
+                        }
+
+                        return nextCanonical;
+                    })
+                    .immediate();
                 if (mergeConflict || !canonicalMemory) {
                     return mergeConflict ?? "Error: Failed to merge memories.";
                 }
@@ -932,16 +937,18 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     });
                 }
 
-                runImmediateTransaction(deps.db, () => {
-                    for (const target of targets) {
-                        archiveMemory(deps.db, target.memoryId, args.reason);
-                        queueMemoryMutation(deps.db, {
-                            projectPath: target.projectIdentity,
-                            mutationType: "archive",
-                            targetMemoryId: target.memoryId,
-                        });
-                    }
-                });
+                deps.db
+                    .transaction(() => {
+                        for (const target of targets) {
+                            archiveMemory(deps.db, target.memoryId, args.reason);
+                            queueMemoryMutation(deps.db, {
+                                projectPath: target.projectIdentity,
+                                mutationType: "archive",
+                                targetMemoryId: target.memoryId,
+                            });
+                        }
+                    })
+                    .immediate();
                 requestRustMemorySync(deps, toolContext.sessionID);
                 const idList = targets.map((t) => t.memoryId).join(", ");
                 const plural = targets.length > 1 ? "memories" : "memory";

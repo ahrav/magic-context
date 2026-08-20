@@ -1120,6 +1120,100 @@ describe("memory authority protocol", () => {
         });
     });
 
+    test("replaying an already-applied module feed page leaves rows and cursor byte-identical", () => {
+        const database = db();
+        const storeUuid = ensureContextStoreUuid(database);
+        const insertRow = {
+            feed_seq: 1,
+            domain: "memories" as const,
+            op: "insert" as const,
+            module_row_id: 7,
+            full_row_snapshot: {
+                id: 7,
+                project_path: "/repo",
+                category: "CONSTRAINTS",
+                content: "module replay fact",
+                normalized_hash: "replay-h1",
+                importance: 50,
+                scope: "project",
+                shareable: 0,
+                source_session_id: null,
+                source_type: "agent",
+                seen_count: 1,
+                retrieval_count: 0,
+                first_seen_at: 0,
+                created_at: 0,
+                updated_at: 1,
+                last_seen_at: 1,
+                last_retrieved_at: null,
+                status: "active",
+                expires_at: null,
+                verification_status: "unverified",
+                verified_at: null,
+                classified_at: null,
+                superseded_by_memory_id: null,
+                merged_from: null,
+                metadata_json: null,
+                context_store_uuid: storeUuid,
+                context_row_id: 7,
+            },
+            content_hash: "replay-h1",
+        };
+        const applied = applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 0,
+                next_cursor: 1,
+                has_more: false,
+                rows: [insertRow],
+            },
+        });
+        expect(applied).toBe(1);
+        const snapshotTables = () =>
+            JSON.stringify({
+                memories: database.prepare("SELECT * FROM memories ORDER BY id").all(),
+                stats: database.prepare("SELECT * FROM memory_stats ORDER BY memory_id").all(),
+                identity: database
+                    .prepare("SELECT * FROM mirror_identity ORDER BY domain, module_row_id")
+                    .all(),
+                cursor: database
+                    .prepare("SELECT domain, cursor FROM mirror_cursors ORDER BY domain")
+                    .all(),
+            });
+        const before = snapshotTables();
+
+        // Replay: the module re-sends the applied row from the durable cursor.
+        const replayed = applyMirrorPage({
+            db: database,
+            page: {
+                domain: "memories",
+                cursor: 1,
+                next_cursor: 1,
+                has_more: false,
+                rows: [insertRow],
+            },
+        });
+        expect(replayed).toBe(1);
+        expect(snapshotTables()).toBe(before);
+
+        // A page at a cursor other than the durable one is rejected instead
+        // of being applied twice.
+        expect(() =>
+            applyMirrorPage({
+                db: database,
+                page: {
+                    domain: "memories",
+                    cursor: 0,
+                    next_cursor: 1,
+                    has_more: false,
+                    rows: [insertRow],
+                },
+            }),
+        ).toThrow(/mirror cursor mismatch/);
+        expect(snapshotTables()).toBe(before);
+    });
+
     test("mirror-back keeps same content in separate project rows", () => {
         const database = db();
         withPrivilegedWriter(database, () => {

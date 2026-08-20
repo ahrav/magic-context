@@ -12,14 +12,18 @@ import { clearSession } from "../storage-meta-session";
 import { isCanonicalProjectIdentity } from "../storage-project-identities";
 import {
     addClaimConflict,
+    addClaimConflictInCurrentTransaction,
     addVerificationEvent,
     appendClaimRevision,
+    appendClaimRevisionInCurrentTransaction,
     ClaimGraphCorruptionError,
     createClaim,
+    createClaimInCurrentTransaction,
     createEpisode,
     createObservation,
     createSourceSpan,
     ensureProject,
+    ensureProjectInCurrentTransaction,
     findClaimGraphCorruption,
     getClaimById,
     getCurrentClaimRevision,
@@ -731,6 +735,236 @@ describe("storage-claims: fail-closed reads and lifecycle", () => {
             expect(rowCount(db, "claim_evidence")).toBe(1);
             expect(rowCount(db, "verification_events")).toBe(1);
             expect(getCurrentClaimRevision(db, created.claimId)?.sourceSessionId).toBe(sessionId);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("storage-claims: transaction composition", () => {
+    test("a claim append inside a caller-held BEGIN IMMEDIATE composes via savepoint and an outer rollback removes it", () => {
+        const db = migratedDb();
+        try {
+            const chain = seedEvidenceChain(db);
+            const created = createClaim(db, {
+                projectId: chain.projectId,
+                subject: "s",
+                predicate: "p",
+                content: "revision one",
+                evidence: [{ observationId: chain.observationId }],
+            });
+            if (created.status !== "applied") throw new Error("create failed");
+
+            db.exec("BEGIN IMMEDIATE");
+            // No nested BEGIN: a plain BEGIN here would throw "cannot start a
+            // transaction within a transaction".
+            const nested = appendClaimRevision(db, {
+                claimId: created.claimId,
+                expectedCurrentRevisionId: created.revisionId,
+                content: "nested revision",
+                evidence: [{ observationId: chain.observationId }],
+            });
+            expect(nested.status).toBe("applied");
+            const registered = ensureProject(db, "git:nested-project");
+            expect(registered).toBeGreaterThan(0);
+            db.exec("ROLLBACK");
+
+            expect(rowCount(db, "claim_revisions")).toBe(1);
+            expect(rowCount(db, "claim_evidence")).toBe(1);
+            expect(getClaimById(db, created.claimId)?.currentRevisionId).toBe(created.revisionId);
+            expect(resolveProjectId(db, "git:nested-project")).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("an inner failure rolls back only its savepoint when the caller handles the error", () => {
+        const db = migratedDb();
+        try {
+            const chain = seedEvidenceChain(db);
+
+            db.exec("BEGIN IMMEDIATE");
+            const outerEpisodeId = createEpisode(db, { projectId: chain.projectId });
+            try {
+                db.transaction(() => {
+                    const outcome = createClaim(db, {
+                        projectId: chain.projectId,
+                        subject: "doomed",
+                        predicate: "p",
+                        content: "doomed content",
+                        evidence: [{ observationId: chain.observationId }],
+                    });
+                    expect(outcome.status).toBe("applied");
+                    throw new Error("inner boom");
+                }).immediate();
+            } catch (error) {
+                expect((error as Error).message).toBe("inner boom");
+            }
+            // An invalid outcome is returned, not thrown, and leaves no rows.
+            const invalid = createClaim(db, {
+                projectId: chain.projectId,
+                subject: "invalid",
+                predicate: "p",
+                content: "c",
+                evidence: [],
+            });
+            expect(invalid.status).toBe("invalid");
+            db.exec("COMMIT");
+
+            expect(rowCount(db, "claims")).toBe(0);
+            expect(rowCount(db, "claim_revisions")).toBe(0);
+            expect(rowCount(db, "claim_evidence")).toBe(0);
+            expect(db.prepare("SELECT id FROM episodes WHERE id = ?").get(outerEpisodeId)).toEqual({
+                id: outerEpisodeId,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("Node-shaped bigint run() metadata produces the same safe row ids and CAS outcomes as Bun numbers", () => {
+        const db = migratedDb();
+        const bigintDb = new Proxy(db, {
+            get(target, prop) {
+                if (prop === "prepare") {
+                    return (sql: string) => {
+                        const stmt = target.prepare(sql);
+                        return new Proxy(stmt, {
+                            get(stmtTarget, stmtProp) {
+                                const value = (
+                                    stmtTarget as unknown as Record<string | symbol, unknown>
+                                )[stmtProp];
+                                if (stmtProp !== "run") {
+                                    return typeof value === "function"
+                                        ? (value as (...a: unknown[]) => unknown).bind(stmtTarget)
+                                        : value;
+                                }
+                                return (...args: unknown[]) => {
+                                    const result = stmtTarget.run(...args) as {
+                                        changes: number | bigint;
+                                        lastInsertRowid: number | bigint;
+                                    };
+                                    return {
+                                        changes: BigInt(result.changes),
+                                        lastInsertRowid: BigInt(result.lastInsertRowid),
+                                    };
+                                };
+                            },
+                        });
+                    };
+                }
+                const value = (target as unknown as Record<string | symbol, unknown>)[prop];
+                return typeof value === "function"
+                    ? (value as (...a: unknown[]) => unknown).bind(target)
+                    : value;
+            },
+        }) as Database;
+        try {
+            const chain = seedEvidenceChain(bigintDb);
+            const created = createClaim(bigintDb, {
+                projectId: chain.projectId,
+                subject: "s",
+                predicate: "p",
+                content: "bigint revision one",
+                evidence: [{ observationId: chain.observationId }],
+            });
+            expect(created.status).toBe("applied");
+            if (created.status !== "applied") throw new Error("unreachable");
+            expect(Number.isSafeInteger(created.claimId)).toBeTrue();
+            expect(Number.isSafeInteger(created.revisionId)).toBeTrue();
+
+            const appended = appendClaimRevision(bigintDb, {
+                claimId: created.claimId,
+                expectedCurrentRevisionId: created.revisionId,
+                content: "bigint revision two",
+                evidence: [{ observationId: chain.observationId }],
+            });
+            expect(appended.status).toBe("applied");
+            if (appended.status !== "applied") throw new Error("unreachable");
+            expect(appended.revision).toBe(2);
+
+            const stale = appendClaimRevision(bigintDb, {
+                claimId: created.claimId,
+                expectedCurrentRevisionId: created.revisionId,
+                content: "stale append",
+                evidence: [{ observationId: chain.observationId }],
+            });
+            expect(stale).toEqual({ status: "stale" });
+            // The plain-number connection reads the identical graph.
+            expect(listClaimRevisions(db, created.claimId).map((r) => r.revision)).toEqual([1, 2]);
+            expect(getClaimById(db, created.claimId)?.currentRevisionId).toBe(appended.revisionId);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("storage-claims: transaction-local primitives", () => {
+    test("the InCurrentTransaction primitives compose inside one caller-owned transaction", () => {
+        const db = migratedDb();
+        try {
+            const outcomes = db
+                .transaction(() => {
+                    const projectId = ensureProjectInCurrentTransaction(db, "git:kernel-project");
+                    const episodeId = createEpisode(db, { projectId });
+                    const spanId = createSourceSpan(db, {
+                        episodeId,
+                        sourceLocator: "transcript://kernel",
+                        content: "kernel span",
+                        startOffset: 0,
+                        endOffset: 11,
+                    });
+                    const observationId = createObservation(db, {
+                        sourceSpanId: spanId,
+                        extractedText: "kernel observation",
+                        extractor: "historian",
+                        extractorVersion: "1",
+                        extractorRunId: "run-k",
+                        independenceKey: "ik-k",
+                    });
+                    const left = createClaimInCurrentTransaction(db, {
+                        projectId,
+                        subject: "left",
+                        predicate: "p",
+                        content: "left v1",
+                        evidence: [{ observationId }],
+                    });
+                    const right = createClaimInCurrentTransaction(db, {
+                        projectId,
+                        subject: "right",
+                        predicate: "p",
+                        content: "right v1",
+                        evidence: [{ observationId }],
+                    });
+                    if (left.status !== "applied" || right.status !== "applied") {
+                        throw new Error("create failed");
+                    }
+                    const appended = appendClaimRevisionInCurrentTransaction(db, {
+                        claimId: left.claimId,
+                        expectedCurrentRevisionId: left.revisionId,
+                        content: "left v2",
+                        evidence: [{ observationId }],
+                    });
+                    if (appended.status !== "applied") throw new Error("append failed");
+                    const conflictId = addClaimConflictInCurrentTransaction(db, {
+                        relation: "supersedes",
+                        leftRevisionId: appended.revisionId,
+                        rightRevisionId: right.revisionId,
+                    });
+                    return { left, appended, conflictId };
+                })
+                .immediate();
+
+            expect(outcomes.appended.revision).toBe(2);
+            expect(getClaimById(db, outcomes.left.claimId)?.currentRevisionId).toBe(
+                outcomes.appended.revisionId,
+            );
+            expect(rowCount(db, "claim_conflicts")).toBe(1);
+            expect(findClaimGraphCorruption(db)).toEqual({
+                nullPointerClaimIds: [],
+                evidencelessRevisionIds: [],
+                stalePointerClaimIds: [],
+            });
         } finally {
             closeQuietly(db);
         }
