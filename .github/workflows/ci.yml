@@ -121,6 +121,31 @@ jobs:
       - name: Test
         run: bun run --cwd packages/pi-plugin test
 
+  mc-host-client-interop:
+    name: mc-host client interop (Bun + Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Adversarial scenarios (Bun)
+        working-directory: packages/plugin
+        run: bun scripts/run-mc-host-client-adversarial.ts
+
+      - name: Adversarial scenarios (Node 24)
+        run: bun run --cwd packages/plugin test:mc-host-client:node
+
   check-dashboard:
     name: Check (dashboard)
     runs-on: ubuntu-latest
