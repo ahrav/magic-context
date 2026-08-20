@@ -28,6 +28,7 @@ import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
+    embedMemoriesDetailedForProject,
     embedSessionCompartmentChunks,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
@@ -46,6 +47,7 @@ import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
 import { createSynapseLedgerPage } from "./storage-embedding-measurements";
 import {
+    crashingDatabase,
     DetailedSynapseTestHost,
     detailedSynapseTestProvider,
     SYNAPSE_TEST_LANE_IDENTITY,
@@ -1721,6 +1723,32 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         expect(rows.length).toBeGreaterThan(0);
         expect(rows.every((row) => row.state === "complete")).toBe(true);
         expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
+    });
+
+    it("a rolled-back receipt group returns no vectors to the read path", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-rollback";
+        const host = new DetailedSynapseTestHost();
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "rolled back memory",
+        });
+        registerDetailed(db, projectIdentity, host);
+        // Throw at the receipt-complete CAS: the destination write already ran
+        // inside the same transaction, so SQLite rolls it back with the ledger.
+        const crashed = crashingDatabase(db, {
+            matcher: /SET state = \?, failure_disposition = \?/,
+            times: 1,
+        });
+
+        const written = await embedMemoriesDetailedForProject(crashed, projectIdentity, [
+            { id: 1, content: "rolled back memory" },
+        ]);
+
+        expect(written?.size).toBe(0);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
+        expect(ledgerRows(db).every((row) => row.state !== "complete")).toBe(true);
     });
 
     it("one drifted memory in the group writes nothing and retires the receipt", async () => {

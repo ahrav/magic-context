@@ -338,12 +338,39 @@ function startupJitterMs(directory: string): number {
     return jitter;
 }
 
+/** Startup passes arrive on jittered per-project timers, so unlike the
+ *  interval loop they do not run back to back on their own. Chaining them
+ *  keeps one project's expensive drains off the shared provider and DB while
+ *  another project is still draining, and lets every pass of one startup wave
+ *  share a single chunk-backfill budget exactly as one interval tick does. */
+let startupQueue: Promise<void> = Promise.resolve();
+let startupQueueDepth = 0;
+let startupChunkDeadlineAt = 0;
+
+function enqueueStartupProjectRun(reg: ProjectRegistration, db: Database): void {
+    if (startupQueueDepth === 0) {
+        startupChunkDeadlineAt = Date.now() + CHUNK_BACKFILL_TICK_BUDGET_MS;
+    }
+    startupQueueDepth += 1;
+    const chunkDeadlineAt = startupChunkDeadlineAt;
+    startupQueue = startupQueue
+        .then(() => runProjectMaintenance(reg, "startup", db, chunkDeadlineAt))
+        .catch((error) => {
+            log(
+                `[dreamer] startup maintenance failed for ${reg.projectIdentity}: ${getErrorMessage(error)}`,
+            );
+        })
+        .finally(() => {
+            startupQueueDepth -= 1;
+        });
+}
+
 function scheduleInitialProjectRun(reg: ProjectRegistration, db: Database): void {
     if (startupTimers.has(reg.directory)) return;
     const timer = scheduleAfterBootQuiet(() => {
         startupTimers.delete(reg.directory);
         if (registeredProjects.get(reg.directory) !== reg) return;
-        void runProjectMaintenance(reg, "startup", db);
+        enqueueStartupProjectRun(reg, db);
     }, startupJitterMs(reg.directory));
     startupTimers.set(reg.directory, timer);
 }
@@ -352,10 +379,10 @@ async function runProjectMaintenance(
     reg: ProjectRegistration,
     origin: "startup" | "interval",
     db: Database,
-    /** Shared chunk-backfill deadline for the whole maintenance pass; a
-     *  per-project fallback applies on the jittered startup path, where
-     *  projects do not run back to back. */
-    chunkDeadlineAt?: number,
+    /** Shared chunk-backfill deadline for every project in one maintenance
+     *  wave: the interval loop runs them back to back, the startup queue
+     *  chains them, and both spend one budget. */
+    chunkDeadlineAt: number,
 ): Promise<void> {
     const projectMaintenanceEnabled =
         Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||

@@ -49,6 +49,7 @@ export type SynapseErrorCode =
     | "not_certified"
     | "probe_required"
     | "idempotency_conflict"
+    | "page_terminal"
     | "schema_violation"
     | "module_restarted";
 
@@ -132,8 +133,15 @@ function isPermanentSynapseCode(code: string): boolean {
         code === "not_certified" ||
         code === "probe_required" ||
         code === "idempotency_conflict" ||
+        code === "page_terminal" ||
         code === "schema_violation"
     );
+}
+
+/** Ledger-state codes describe one page row's disposition, not a daemon fault:
+ *  they never condemn the lane. */
+function isLedgerStateSynapseCode(code: string): boolean {
+    return code === "idempotency_conflict" || code === "page_terminal";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -728,11 +736,11 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 } catch (error) {
                     const classified = classifyError(error);
                     if (
-                        classified.code === "idempotency_conflict" &&
+                        isLedgerStateSynapseCode(classified.code) &&
                         classified.ledgerRowId !== undefined
                     ) {
                         log(
-                            `[magic-context] Synapse embed.batch receipt conflict: ${classified.message}`,
+                            `[magic-context] Synapse embed.batch ${classified.code}: ${classified.message}`,
                         );
                     } else {
                         this.logCallFailure(classified, "embed.batch");
@@ -779,7 +787,23 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                 manifest,
                 deadlineAt: Date.now() + timeoutMs,
             });
-        let row = findSynapseLedgerPage(db, identity) ?? freshPage();
+        const openPage = () => {
+            const existing = findSynapseLedgerPage(db, identity);
+            if (existing) return existing;
+            try {
+                return freshPage();
+            } catch (error) {
+                // A sibling process took this page identity between the read
+                // and the create, and the partial unique index rejected the
+                // loser. The winner's row IS this page, so attach to it instead
+                // of failing a request whose job is already running.
+                if (!(error instanceof SynapseLedgerConflictError)) throw error;
+                const winner = findSynapseLedgerPage(db, identity);
+                if (!winner) throw error;
+                return winner;
+            }
+        };
+        let row = openPage();
 
         if (row.state === "complete") {
             const error = new SynapseEmbeddingError(
@@ -791,6 +815,19 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             throw error;
         }
         if (row.state === "failed") {
+            if (row.failureDisposition === "permanent") {
+                // A permanent disposition is this page identity's answer:
+                // obsoleting the row and rebuilding it would resubmit the same
+                // rejected request on every pass. A changed request identity
+                // (content hashes, table epoch, or fingerprint) hashes to a
+                // different request key and gets its own row.
+                const error = new SynapseEmbeddingError(
+                    "page_terminal",
+                    "page failed permanently; the same request identity is not resubmitted",
+                );
+                error.ledgerRowId = row.rowId;
+                throw error;
+            }
             if (row.failureDisposition === "retryable" && (row.deadlineAt ?? 0) > Date.now()) {
                 row = retrySynapseLedgerPage(db, {
                     rowId: row.rowId,

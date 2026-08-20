@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../features/magic-context/storage";
+import { BOOT_QUIET_MS, setBootQuietPeriodForTests } from "./boot-quiet";
+import { startDreamScheduleTimer } from "./dream-timer";
 
 /**
  * Regression coverage for the schema-fence / null-DB crash:
@@ -164,4 +166,80 @@ describe("dream-timer normal chunk recovery trigger (static)", () => {
         expect(source).not.toContain("SynapseLedger");
         expect(source).not.toContain("recoveryQueue");
     });
+});
+
+/**
+ * Startup project passes are scheduled as jittered timers, one per project.
+ * Each pass can drain that project's chunk backlog for minutes, so unless the
+ * passes are chained they overlap and load the shared provider and DB at once.
+ * `ensureRegistered` is the first await of every pass, which makes it the
+ * concurrency probe: two projects' passes must never be inside it together.
+ */
+describe("dream-timer startup maintenance", () => {
+    const dirs: string[] = [];
+    const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+    afterEach(() => {
+        setBootQuietPeriodForTests(null);
+        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        for (const dir of dirs.splice(0)) {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("a second project's pass waits for the first instead of draining concurrently", async () => {
+        const dataHome = mkdtempSync(join(tmpdir(), "mc-startup-home-"));
+        const first = mkdtempSync(join(tmpdir(), "mc-startup-a-"));
+        const second = mkdtempSync(join(tmpdir(), "mc-startup-b-"));
+        dirs.push(dataHome, first, second);
+        process.env.XDG_DATA_HOME = dataHome;
+        // Boot quiet already elapsed, so only the per-project jitter delays the
+        // passes: slot 0 fires within 1s and slot 1 within 2s of the tick.
+        setBootQuietPeriodForTests(Date.now() - BOOT_QUIET_MS);
+
+        const inPass = new Set<string>();
+        let maxConcurrent = 0;
+        const entered: string[] = [];
+        // Longer than the whole jitter span, so an unchained second pass is
+        // guaranteed to start while the first is still inside this await.
+        const passWorkMs = 2_200;
+        const probe = (identity: string) => async () => {
+            if (!entered.includes(identity)) entered.push(identity);
+            inPass.add(identity);
+            maxConcurrent = Math.max(maxConcurrent, inPass.size);
+            await new Promise((resolve) => setTimeout(resolve, passWorkMs));
+            inPass.delete(identity);
+        };
+
+        const stops: Array<(() => void) | undefined> = [];
+        try {
+            for (const [directory, identity] of [
+                [first, "dir:startup-a"],
+                [second, "dir:startup-b"],
+            ] as const) {
+                stops.push(
+                    await startDreamScheduleTimer({
+                        directory,
+                        projectIdentity: identity,
+                        client: {} as never,
+                        memoryEnabled: true,
+                        ensureRegistered: probe(identity),
+                    }),
+                );
+            }
+
+            const deadline = Date.now() + 15_000;
+            while (entered.length < 2 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            while (inPass.size > 0 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+
+            expect(entered.sort()).toEqual(["dir:startup-a", "dir:startup-b"]);
+            expect(maxConcurrent).toBe(1);
+        } finally {
+            for (const stop of stops) stop?.();
+        }
+    }, 30_000);
 });

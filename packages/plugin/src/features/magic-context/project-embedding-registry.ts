@@ -1694,8 +1694,8 @@ async function embedMemoryRowsDetailed(
         )}`;
         for (const spec of chunk) items.push({ ...spec, applicationGroup: group });
     }
-    const written = new Map<number, Float32Array>();
-    await embedAndApplyDetailed({
+    const inferred = new Map<string, Float32Array>();
+    const applied = await embedAndApplyDetailed({
         db,
         projectIdentity,
         scope: "memory",
@@ -1725,7 +1725,7 @@ async function embedMemoryRowsDetailed(
         writeGroup: (_group, vectors) => {
             for (const [id, vector] of vectors) {
                 saveEmbedding(db, memoryIdFromItemId(id), vector, lane.modelId);
-                written.set(memoryIdFromItemId(id), vector);
+                inferred.set(id, vector);
             }
         },
         // Memory staleness is unprovable from the destination row (no per-row
@@ -1738,6 +1738,16 @@ async function embedMemoryRowsDetailed(
                     : "absent",
         }),
     });
+    // writeGroup runs inside the apply transaction, so `inferred` also holds
+    // vectors whose destination write was rolled back with a failed receipt
+    // CAS. The applied ids are the committed set; nothing else may be returned.
+    const written = new Map<number, Float32Array>();
+    for (const ids of applied.values()) {
+        for (const id of ids) {
+            const vector = inferred.get(id);
+            if (vector) written.set(memoryIdFromItemId(id), vector);
+        }
+    }
     return written;
 }
 

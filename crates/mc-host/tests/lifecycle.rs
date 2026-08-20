@@ -1070,3 +1070,66 @@ async fn initialization_deadline_expiry_runs_the_shutdown_callback_before_lock_r
     );
     successor.shutdown_gracefully().await;
 }
+
+/// An initialization that *returns* a failure still drains the handler: a
+/// composite's primary can have initialized before its secondary failed, and
+/// only the shutdown callback stops that work. The callback is awaited inside
+/// `run`, so the instance lock — released when `run` returns — cannot free
+/// while handler-owned work is still live.
+#[tokio::test]
+async fn a_failed_initialization_runs_the_shutdown_callback_before_lock_release() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.fail_init("secondary component failed to initialize");
+    handler.block_shutdown();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let mut task = tokio::spawn(async move {
+        mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
+    });
+
+    // While the shutdown callback is blocked, startup has not returned and the
+    // lock is still held against a successor.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_err(),
+        "startup must not return while the shutdown callback runs"
+    );
+    let blocked = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await;
+    assert!(
+        matches!(blocked, Err(HostError::Instance(_))),
+        "the lock must stay held while the shutdown callback runs"
+    );
+
+    handler.release_shutdown();
+    let result = task.await.expect("run task joins");
+    assert!(
+        matches!(result, Err(HostError::InitFailed(_))),
+        "a failed initialize fails startup, got {result:?}"
+    );
+    assert!(
+        handler.events().contains(&Event::Shutdown),
+        "the shutdown callback drains the handler on the init-failure path"
+    );
+    assert!(
+        !handler.events().contains(&Event::Initialized),
+        "the failing initialize never reports success"
+    );
+
+    let successor = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("the lock releases once startup returns");
+    successor.shutdown_gracefully().await;
+}

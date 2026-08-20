@@ -503,6 +503,14 @@ pub async fn run<H: McHostHandler>(
         match joined {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => {
+                // A failed initialization can still have left handler-owned
+                // work running: a composite's primary may have initialized
+                // successfully before its secondary failed, and only the
+                // shutdown callback stops and drains that. Awaiting it here
+                // keeps the single-instance fence — `guard` drops when this
+                // returns — held until the handler is actually idle.
+                let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
+                crate::panic_boundary::redact(callback).await;
                 // The handler-authored message can carry data derived from
                 // the opaque storage descriptor (credentials, endpoints);
                 // startup diagnostics get bounded structure only (V24).

@@ -10,6 +10,7 @@ import { initializeDatabase } from "../storage-db";
 import {
     createSynapseLedgerPage,
     getSynapseLedgerPage,
+    markSynapseLedgerOutcome,
     markSynapseLedgerPolling,
     markSynapseLedgerReady,
     recordSynapseLedgerCursor,
@@ -692,6 +693,49 @@ describe("embedItemsDetailed", () => {
             .all() as Array<Record<string, unknown>>;
     }
 
+    /** Wrap a Database so `insertCompetitor` runs the instant the exact-identity
+     *  page read misses, placing a rival process's row between this attempt's
+     *  read and its create so the partial unique index rejects the insert. */
+    function raceLedgerCreate(db: Database, insertCompetitor: () => void): Database {
+        let raced = false;
+        const wrapper = {
+            prepare(sql: string) {
+                const statement = db.prepare(sql);
+                if (raced || !/FROM synapse_batch_ledger[\s\S]*request_key = \?/.test(sql)) {
+                    return statement;
+                }
+                return new Proxy(statement, {
+                    get(target, property, receiver) {
+                        if (property !== "get") {
+                            const value = Reflect.get(target, property, receiver);
+                            return typeof value === "function"
+                                ? (value as (...a: unknown[]) => unknown).bind(target)
+                                : value;
+                        }
+                        return (...args: unknown[]) => {
+                            const row = target.get(...(args as never[]));
+                            if (!raced && (row === null || row === undefined)) {
+                                raced = true;
+                                insertCompetitor();
+                            }
+                            return row;
+                        };
+                    },
+                });
+            },
+            exec(sql: string) {
+                return db.exec(sql);
+            },
+            transaction<F extends (...args: never[]) => unknown>(fn: F) {
+                return db.transaction(fn);
+            },
+            close() {
+                db.close();
+            },
+        };
+        return wrapper as unknown as Database;
+    }
+
     it("splits pages inside one application group and never lets a page cross groups", async () => {
         const db = ledgerDb();
         try {
@@ -1008,6 +1052,96 @@ describe("embedItemsDetailed", () => {
             expect(row.state).toBe("failed");
             expect(row.failure_disposition).toBe("retryable");
             expect(row.restart_count).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("keeps a permanently failed page terminal instead of rebuilding and resubmitting it", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([{ id: "memory:1", group: "g1" }]);
+            const created = createSynapseLedgerPage(db, {
+                projectPath: "/repo",
+                sessionId: "ses-1",
+                scope: "memory",
+                laneRole: "primary",
+                destinationModel: getSynapseLaneIdentity(MODEL, FP),
+                applicationGroup: "g1",
+                requestKey: getSynapseBatchRequestKey({
+                    model: MODEL,
+                    fingerprint: FP,
+                    tableEpoch: 0,
+                    items,
+                }),
+                manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                deadlineAt: Date.now() + 60_000,
+            });
+            const failed = markSynapseLedgerOutcome(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                disposition: "permanent",
+            });
+
+            const result = await provider.embedItemsDetailed(items, detailedContext(db));
+
+            // The recorded permanent disposition is the page's answer: no new
+            // ledger row, no new daemon job, and the failure stays permanent.
+            expect(result.receipts).toEqual([]);
+            expect(result.failures).toHaveLength(1);
+            expect(result.failures[0].disposition).toBe("permanent");
+            expect(result.failures[0].rowId).toBe(failed.rowId);
+            expect(host.batchCalls()).toEqual([]);
+            const rows = ledgerRows(db);
+            expect(rows).toHaveLength(1);
+            expect(rows[0].id).toBe(failed.rowId);
+            expect(rows[0].state).toBe("failed");
+            expect(rows[0].failure_disposition).toBe("permanent");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("attaches to the winning row when a concurrent insert takes the page identity", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            const provider = detailedProvider(host);
+            const items = detailedItems([{ id: "memory:1", group: "g1" }]);
+            let competitorRowId = 0;
+            const racing = raceLedgerCreate(db, () => {
+                competitorRowId = createSynapseLedgerPage(db, {
+                    projectPath: "/repo",
+                    sessionId: "ses-1",
+                    scope: "memory",
+                    laneRole: "primary",
+                    destinationModel: getSynapseLaneIdentity(MODEL, FP),
+                    applicationGroup: "g1",
+                    requestKey: getSynapseBatchRequestKey({
+                        model: MODEL,
+                        fingerprint: FP,
+                        tableEpoch: 0,
+                        items,
+                    }),
+                    manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
+                    deadlineAt: Date.now() + 60_000,
+                }).rowId;
+            });
+
+            const result = await provider.embedItemsDetailed(items, detailedContext(racing));
+
+            // The loser of the create race drives the winner's row instead of
+            // reporting a transport failure for a page that already exists.
+            expect(competitorRowId).toBeGreaterThan(0);
+            expect(result.failures).toEqual([]);
+            expect(result.receipts).toHaveLength(1);
+            expect(result.receipts[0].rowId).toBe(competitorRowId);
+            const rows = ledgerRows(db);
+            expect(rows).toHaveLength(1);
+            expect(rows[0].id).toBe(competitorRowId);
+            expect(rows[0].state).toBe("ready");
         } finally {
             closeQuietly(db);
         }
