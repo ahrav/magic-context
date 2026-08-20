@@ -572,6 +572,12 @@ export class SubcModuleTransport {
                         if (ensuredRoute) {
                             this.dropRoute(ensuredRoute.routeKey, ensuredRoute.route);
                         }
+                        // Recovery rebinds a new route, and the facade may already have
+                        // reconnected underneath without moving connectionGeneration. The
+                        // cached snapshot was probed through the evicted route, so it is
+                        // not proven to describe the module the next route reaches; the
+                        // generation counter alone cannot expire it here.
+                        this.invalidateStateSyncCapabilities();
                     } else if (cleanupTicket === null && isConnectionFailure(error)) {
                         // Same invalidation as before, but never a body resend
                         // after a possible send. A post-write abort relies on

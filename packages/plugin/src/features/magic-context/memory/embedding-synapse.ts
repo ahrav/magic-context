@@ -8,6 +8,15 @@ export const SYNAPSE_DEFAULT_MODEL = "gte-modernbert-base-f16";
 export const SYNAPSE_MAX_INPUT_TOKENS = 8192;
 export const SYNAPSE_DEFAULT_QUERY_TIMEOUT_MS = 3_000;
 export const SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS = 120_000;
+/**
+ * Connect budget for the shared provider client. The client-wide default is
+ * sized for the hook transport, which reconnects on a per-pass deadline; this
+ * lane instead memoizes one long-lived client, and the budget must cover the
+ * connection-file read plus dial and auth. Failing it leaves the provider
+ * uninitialized, which silently degrades embeddings to no-ops rather than
+ * surfacing an error, so the wait is deliberately generous.
+ */
+export const SYNAPSE_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export type SynapseErrorCode =
     | "queue_full"
@@ -340,12 +349,13 @@ async function getSharedClient(
     if (sharedClient && sharedClientFile === options.connectionFile) return sharedClient;
     if (sharedClientPromise && sharedClientFile === options.connectionFile)
         return sharedClientPromise;
-    const promise = SubcClient.connect({ connectionFile: options.connectionFile }).then(
-        (client) => {
-            sharedClient = client;
-            return client;
-        },
-    );
+    const promise = SubcClient.connect({
+        connectionFile: options.connectionFile,
+        handshakeTimeoutMs: SYNAPSE_HANDSHAKE_TIMEOUT_MS,
+    }).then((client) => {
+        sharedClient = client;
+        return client;
+    });
     promise.catch(() => {
         // Evict only our own rejected promise so a later call can
         // reconnect instead of reusing the poisoned one.
