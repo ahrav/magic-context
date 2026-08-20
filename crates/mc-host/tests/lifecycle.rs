@@ -2,7 +2,11 @@
 
 mod support;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+use mc_host::{HostError, McHostHandler};
 
 use support::raw_client::{
     self, FLAGS_INTERACTIVE, FLAGS_PURE_HEADER, TY_GOODBYE, TY_PING, TY_PONG, TY_REQUEST,
@@ -12,6 +16,59 @@ use support::{mode_body, BindPolicy, Event, TestHandler, TestHost, LINKED_MODULE
 
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
+
+/// Blocks inside one `route_gone` poll, so task abort cannot take effect until
+/// the test releases it.
+struct DelayedRouteGoneHandler {
+    inner: TestHandler,
+    route_gone_started: Arc<AtomicBool>,
+    route_gone_release: Arc<(Mutex<bool>, Condvar)>,
+    shutdown_calls: Arc<AtomicUsize>,
+}
+
+impl McHostHandler for DelayedRouteGoneHandler {
+    fn manifests(&self) -> Vec<mc_host::ManifestSnapshot> {
+        self.inner.manifests()
+    }
+
+    async fn initialize(&self, init: mc_host::HostInit) -> Result<(), mc_host::InitError> {
+        self.inner.initialize(init).await
+    }
+
+    async fn bind(
+        &self,
+        route: mc_host::RouteHandle,
+        target: mc_host::RouteTarget,
+        identity: mc_host::RouteIdentity,
+    ) -> mc_host::BindOutcome {
+        self.inner.bind(route, target, identity).await
+    }
+
+    async fn handle(&self, ctx: mc_host::RequestCtx) -> mc_host::RequestOutcome {
+        self.inner.handle(ctx).await
+    }
+
+    async fn route_gone(&self, route: mc_host::RouteHandle) {
+        self.route_gone_started.store(true, Ordering::SeqCst);
+        {
+            let (lock, ready) = &*self.route_gone_release;
+            let mut released = lock.lock().expect("route-gone release lock");
+            while !*released {
+                released = ready.wait(released).expect("route-gone release wait");
+            }
+        }
+        self.inner.route_gone(route).await;
+    }
+
+    async fn health(&self) -> mc_host::HealthReport {
+        self.inner.health().await
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.shutdown().await;
+    }
+}
 
 #[tokio::test]
 async fn publication_follows_initialization() {
@@ -866,4 +923,471 @@ async fn a_successor_starts_only_after_the_predecessor_releases_its_lock() {
     );
 
     second.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn shutdown_callback_deadline_expiry_retains_the_handler_until_it_stops() {
+    let host = TestHost::start().await;
+    host.handler.block_shutdown();
+    let handler = host.handler.clone();
+
+    let result = host.shutdown().await;
+    assert!(
+        matches!(result, Err(HostError::LifecycleFatal(ref message))
+            if message.contains("shutdown callback")),
+        "an overrunning shutdown callback must be reported as lifecycle-fatal, got {result:?}"
+    );
+    // The callback is still executing: the handler must stay owned.
+    assert!(
+        !handler.handler_dropped(),
+        "the handler must not drop while its shutdown callback runs"
+    );
+    assert!(
+        handler
+            .events()
+            .iter()
+            .all(|event| *event != Event::Shutdown),
+        "the blocked callback has not completed yet"
+    );
+
+    handler.release_shutdown();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !handler.handler_dropped() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the handler must drop once the shutdown callback stops"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(handler.events().contains(&Event::Shutdown));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delayed_lifecycle_callback_runs_shutdown_once_before_successor_starts() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.block_shutdown();
+    let route_gone_started = Arc::new(AtomicBool::new(false));
+    let route_gone_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let shutdown_calls = Arc::new(AtomicUsize::new(0));
+    let runtime_handler = DelayedRouteGoneHandler {
+        inner: handler.clone(),
+        route_gone_started: Arc::clone(&route_gone_started),
+        route_gone_release: Arc::clone(&route_gone_release),
+        shutdown_calls: Arc::clone(&shutdown_calls),
+    };
+    let shutdown = mc_host::CancellationToken::new();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        timing: mc_host::HostTiming {
+            shutdown_deadline: Duration::from_millis(100),
+            lifecycle_callback_deadline: Duration::from_millis(50),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let run_shutdown = shutdown.clone();
+    let task =
+        tokio::spawn(async move { mc_host::run(runtime_handler, config, run_shutdown).await });
+    let publication = support::connection_file(data_root.path());
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while !publication.exists() {
+        assert!(!task.is_finished(), "host exited before publishing");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "host did not publish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let info = raw_client::discover(&publication).expect("publication validates");
+    let mut client = raw_client::RawClient::connect(&info)
+        .await
+        .expect("client authenticates");
+    client
+        .route_open(LINKED_MODULE_ID, ROOT, "opencode", "delayed-route-gone")
+        .await
+        .expect("route");
+
+    shutdown.cancel();
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while !route_gone_started.load(Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "route-gone callback did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let result = tokio::time::timeout(BUDGET, task)
+        .await
+        .expect("run returns after the lifecycle-chain wait")
+        .expect("run task joins");
+    assert!(
+        matches!(result, Err(HostError::LifecycleFatal(ref message))
+            if message.contains("route_gone")),
+        "the delayed callback must fail shutdown, got {result:?}"
+    );
+    assert!(
+        handler.route_gones().is_empty(),
+        "the callback must still be blocked after both lifecycle waits"
+    );
+    assert_eq!(
+        shutdown_calls.load(Ordering::SeqCst),
+        0,
+        "handler shutdown must not overlap the lifecycle callback"
+    );
+
+    let blocked = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await;
+    assert!(
+        matches!(blocked, Err(HostError::Instance(_))),
+        "the reaper must retain the lock after run returns"
+    );
+
+    {
+        let (lock, ready) = &*route_gone_release;
+        *lock.lock().expect("route-gone release lock") = true;
+        ready.notify_all();
+    }
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while shutdown_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "handler shutdown did not start after route-gone drained"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        shutdown_calls.load(Ordering::SeqCst),
+        1,
+        "handler shutdown must start exactly once"
+    );
+
+    let successor =
+        assert_lock_released_only_after_shutdown_callback(&handler, data_root.path()).await;
+    assert_eq!(
+        shutdown_calls.load(Ordering::SeqCst),
+        1,
+        "handler shutdown must run exactly once"
+    );
+    assert_eq!(
+        handler
+            .events()
+            .iter()
+            .filter(|event| **event == Event::Shutdown)
+            .count(),
+        1,
+        "handler shutdown must complete exactly once"
+    );
+    successor.shutdown_gracefully().await;
+}
+
+/// Asserts the guard ordering shared by every interrupted-incarnation path:
+/// the instance lock refuses a successor while the blocked shutdown callback
+/// runs, and releases only after that callback completes. Returns the
+/// successor host that finally acquired the lock.
+async fn assert_lock_released_only_after_shutdown_callback(
+    handler: &TestHandler,
+    data_root: &std::path::Path,
+) -> TestHost {
+    // Let the detached cleanup progress to the shutdown callback before
+    // observing the held lock.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !handler.events().contains(&Event::Shutdown),
+        "the blocked shutdown callback has not completed"
+    );
+    let blocked = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await;
+    assert!(
+        matches!(blocked, Err(HostError::Instance(_))),
+        "the lock must stay held while the shutdown callback runs"
+    );
+
+    handler.release_shutdown();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let attempt = TestHost::try_start_with(TestHandler::new(), {
+            let path = data_root.to_path_buf();
+            move |config| config.data_dir = Some(path)
+        })
+        .await;
+        if let Ok(successor) = attempt {
+            assert!(
+                handler.events().contains(&Event::Shutdown),
+                "the shutdown callback completes before the lock releases"
+            );
+            return successor;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the lock must release once the shutdown callback stops"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An abandoned `run` future (supervisor abort, not a shutdown signal) must
+/// still run the handler shutdown callback: component-owned work is only
+/// stopped and drained by `shutdown`, and the instance lock must not release
+/// beside it.
+#[tokio::test]
+async fn an_abandoned_run_future_runs_the_shutdown_callback_before_lock_release() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.block_shutdown();
+    let shutdown = mc_host::CancellationToken::new();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let run_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { mc_host::run(run_handler, config, run_shutdown).await });
+    let publication = support::connection_file(data_root.path());
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while !publication.exists() {
+        assert!(!task.is_finished(), "host exited before publishing");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "host did not publish"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Abandon the run future outright; the forced cleanup owns the instance
+    // guard from here.
+    task.abort();
+    assert!(
+        task.await.is_err(),
+        "the aborted run future cannot complete"
+    );
+
+    let successor =
+        assert_lock_released_only_after_shutdown_callback(&handler, data_root.path()).await;
+    assert_eq!(
+        handler
+            .events()
+            .iter()
+            .filter(|event| **event == Event::Shutdown)
+            .count(),
+        1,
+        "the abandoned incarnation runs its shutdown callback exactly once"
+    );
+    successor.shutdown_gracefully().await;
+}
+
+/// A shutdown request during initialization aborts the callback, and the
+/// detached reaper then runs the handler shutdown callback before releasing
+/// the lock: an interrupted initialize can already have handed work to
+/// component-owned trackers that only `shutdown` drains.
+#[tokio::test]
+async fn shutdown_during_initialization_runs_the_shutdown_callback_before_lock_release() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.block_init();
+    handler.block_shutdown();
+    let shutdown = mc_host::CancellationToken::new();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let run_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { mc_host::run(run_handler, config, run_shutdown).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shutdown.cancel();
+    let result = task.await.expect("run task joins");
+    assert!(
+        matches!(result, Err(HostError::InitFailed(_))),
+        "shutdown during initialization fails startup, got {result:?}"
+    );
+
+    let successor =
+        assert_lock_released_only_after_shutdown_callback(&handler, data_root.path()).await;
+    assert!(
+        !handler.events().contains(&Event::Initialized),
+        "the aborted initialize must not complete detached"
+    );
+    successor.shutdown_gracefully().await;
+}
+
+/// The initialize-deadline path takes the same reaper as shutdown-during-init:
+/// the shutdown callback runs and the lock outlives it.
+#[tokio::test]
+async fn initialization_deadline_expiry_runs_the_shutdown_callback_before_lock_release() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.block_init();
+    handler.block_shutdown();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        timing: mc_host::HostTiming {
+            lifecycle_callback_deadline: Duration::from_millis(50),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let result = mc_host::run(handler.clone(), config, mc_host::CancellationToken::new()).await;
+    assert!(
+        matches!(result, Err(HostError::InitFailed(_))),
+        "an initialize deadline expiry fails startup, got {result:?}"
+    );
+
+    let successor =
+        assert_lock_released_only_after_shutdown_callback(&handler, data_root.path()).await;
+    assert!(
+        !handler.events().contains(&Event::Initialized),
+        "the aborted initialize must not complete detached"
+    );
+    successor.shutdown_gracefully().await;
+}
+
+/// An initialization that *returns* a failure still drains the handler: a
+/// composite's primary can have initialized before its secondary failed, and
+/// only the shutdown callback stops that work. The callback is awaited inside
+/// `run`, so the instance lock — released when `run` returns — cannot free
+/// while handler-owned work is still live.
+#[tokio::test]
+async fn a_failed_initialization_runs_the_shutdown_callback_before_lock_release() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.fail_init("secondary component failed to initialize");
+    handler.block_shutdown();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let mut task = tokio::spawn(async move {
+        mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
+    });
+
+    // While the shutdown callback is blocked, startup has not returned and the
+    // lock is still held against a successor.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut task)
+            .await
+            .is_err(),
+        "startup must not return while the shutdown callback runs"
+    );
+    let blocked = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await;
+    assert!(
+        matches!(blocked, Err(HostError::Instance(_))),
+        "the lock must stay held while the shutdown callback runs"
+    );
+
+    handler.release_shutdown();
+    let result = task.await.expect("run task joins");
+    assert!(
+        matches!(result, Err(HostError::InitFailed(_))),
+        "a failed initialize fails startup, got {result:?}"
+    );
+    assert!(
+        handler.events().contains(&Event::Shutdown),
+        "the shutdown callback drains the handler on the init-failure path"
+    );
+    assert!(
+        !handler.events().contains(&Event::Initialized),
+        "the failing initialize never reports success"
+    );
+
+    let successor = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("the lock releases once startup returns");
+    successor.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn aborting_failed_initialization_cleanup_retains_lock_until_shutdown_stops() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    handler.fail_init("secondary component failed to initialize");
+    handler.block_shutdown();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let mut task = tokio::spawn(async move {
+        mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
+    });
+
+    // Initialization returns immediately, so a pending startup is waiting for
+    // the blocked shutdown callback before returning its original error.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut task)
+            .await
+            .is_err(),
+        "startup must wait for the shutdown callback"
+    );
+    task.abort();
+    assert!(task.await.is_err(), "the run task was aborted");
+
+    let successor =
+        assert_lock_released_only_after_shutdown_callback(&handler, data_root.path()).await;
+    assert_eq!(
+        handler
+            .events()
+            .iter()
+            .filter(|event| **event == Event::Shutdown)
+            .count(),
+        1,
+        "aborting cleanup must not invoke shutdown twice"
+    );
+    successor.shutdown_gracefully().await;
+}
+
+/// A setup failure *after* a successful initialize drains the handler too:
+/// publication is the last step before the host owns cleanup, and an
+/// initialized handler can already hold stores or background work that only
+/// the shutdown callback stops.
+#[tokio::test]
+async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() {
+    let data_root = tempfile::tempdir().expect("temp root");
+    let handler = TestHandler::new();
+    // Initialize blocks so the runtime directory can be removed after the
+    // instance lock exists but before publication writes the connection file.
+    handler.block_init();
+    let config = mc_host::HostConfig {
+        data_dir: Some(data_root.path().to_path_buf()),
+        ..Default::default()
+    };
+    let run_handler = handler.clone();
+    let task = tokio::spawn(async move {
+        mc_host::run(run_handler, config, mc_host::CancellationToken::new()).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let host_dir = data_root.path().join("cortexkit").join("run");
+    std::fs::remove_dir(&host_dir).expect("remove empty runtime directory");
+    handler.release_init();
+
+    let result = task.await.expect("run task joins");
+
+    assert!(
+        matches!(result, Err(HostError::Instance(_))),
+        "a removed runtime directory fails publication, got {result:?}"
+    );
+    assert!(
+        handler.events().contains(&Event::Initialized),
+        "initialization completed before publication was attempted"
+    );
+    assert!(
+        handler.events().contains(&Event::Shutdown),
+        "the shutdown callback drains the handler on a post-initialize setup failure"
+    );
 }

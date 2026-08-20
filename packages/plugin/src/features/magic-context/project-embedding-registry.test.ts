@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import {
+    buildCanonicalChunkTextFromFts,
     chunkCanonicalText,
     loadCompartmentChunkEmbeddingsForSearch,
     replaceCompartmentChunkEmbeddings,
@@ -18,6 +19,7 @@ import {
 import { upsertCommits } from "./git-commits/storage-git-commits";
 import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-coordinator";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import { SynapseEmbeddingError } from "./memory/embedding-synapse";
 import { insertMemory } from "./memory/storage-memory";
 import {
     getStoredModelId,
@@ -28,11 +30,15 @@ import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
     drainCommitBacklogForProject,
+    embedCompartmentWindowsDetailedForProject,
+    embedMemoriesDetailedForProject,
     embedSessionCompartmentChunks,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
+    enqueueShadowEmbeddingItems,
     flushShadowEmbeddingBacklog,
+    getProjectEmbeddingMaxInputTokens,
     getProjectEmbeddingSnapshot,
     getShadowBackfillStopReason,
     markProjectLoadUntrusted,
@@ -44,7 +50,14 @@ import {
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
-import { beginSynapseBatchLedger } from "./storage-embedding-measurements";
+import { createSynapseLedgerPage, getSynapseLedgerPage } from "./storage-embedding-measurements";
+import {
+    crashingDatabase,
+    DetailedSynapseTestHost,
+    detailedSynapseTestProvider,
+    SYNAPSE_TEST_LANE_IDENTITY,
+    synapseTestConfig,
+} from "./synapse-detailed-test-support";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
     readonly modelId: string;
@@ -169,6 +182,34 @@ function seedManyCompartmentsWithFts(
         db.prepare(
             "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
         ).run(sessionId, end, `${sessionId}-a${end}`, "assistant", `Answer ${i}.`);
+    }
+}
+
+/**
+ * Seed compartments that can never yield an embeddable window: no FTS rows in
+ * their span and no title/p1/content to fall back to, so canonical text is
+ * empty and every one lands in the drain's `noWork` set.
+ */
+function seedNoWorkCompartmentsWithoutFts(
+    db: NonNullable<ReturnType<typeof openDatabase>>,
+    sessionId: string,
+    count: number,
+    startOrdinal: number,
+): void {
+    for (let i = 0; i < count; i++) {
+        const start = startOrdinal + i * 2;
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 1000 + i,
+                startMessage: start,
+                endMessage: start + 1,
+                startMessageId: `u${start}`,
+                endMessageId: `a${start + 1}`,
+                title: "",
+                content: "",
+                p1: "",
+            },
+        ]);
     }
 }
 
@@ -626,20 +667,20 @@ describe("project embedding registry", () => {
         // keys its ledger by the project identity, the shadow lane by
         // `shadow:<projectIdentity>`. Neither is ever session-deleted.
         for (const sessionId of [projectIdentity, `shadow:${projectIdentity}`]) {
-            beginSynapseBatchLedger(db, {
-                sessionId,
-                projectPath: projectIdentity,
-                scope: "memory",
-                manifest: [],
-                requestKey: `${sessionId}:old`,
-            });
-            beginSynapseBatchLedger(db, {
-                sessionId,
-                projectPath: projectIdentity,
-                scope: "memory",
-                manifest: [],
-                requestKey: `${sessionId}:fresh`,
-            });
+            const laneRole = sessionId.startsWith("shadow:") ? "shadow" : "primary";
+            for (const age of ["old", "fresh"] as const) {
+                createSynapseLedgerPage(db, {
+                    projectPath: projectIdentity,
+                    sessionId,
+                    scope: "memory",
+                    laneRole,
+                    destinationModel: "model-x",
+                    applicationGroup: `group-${age}`,
+                    requestKey: `${sessionId}:${age}`,
+                    manifest: [],
+                    deadlineAt: Date.now() + 60_000,
+                });
+            }
             db.prepare(
                 "UPDATE synapse_batch_ledger SET updated_at = ? WHERE session_id = ? AND request_key = ?",
             ).run(Date.now() - fifteenDaysMs, sessionId, `${sessionId}:old`);
@@ -1161,6 +1202,44 @@ describe("project embedding registry", () => {
         ).toHaveLength(0);
     });
 
+    it("advances the passive chunk drain past a full batch of no-work candidates", async () => {
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new FakeEmbeddingProvider(config.provider === "local" ? config.model : "off"),
+        );
+        const db = useTempDb();
+        // Real work first (lower ids), then a whole batch of un-embeddable
+        // compartments. The candidate query is newest-first, so the no-work rows
+        // fill the first batch and the drain must skip past them within the same
+        // pass to reach the older compartments that do have work.
+        seedManyCompartmentsWithFts(db, "ses-nowork", 3);
+        const workIds = getCompartments(db, "ses-nowork").map((compartment) => compartment.id);
+        seedNoWorkCompartmentsWithoutFts(db, "ses-nowork", 8, 101);
+        recordSessionProjectIdentity(db, "ses-nowork", "git:nowork");
+        registerProjectEmbedding(
+            db,
+            "git:nowork",
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/nowork",
+        );
+
+        const embedded = await embedUnembeddedCompartmentChunksForProject(db, "git:nowork");
+
+        expect(embedded).toBe(3);
+        const rows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            "ses-nowork",
+            "git:nowork",
+            currentChunkModelId("git:nowork"),
+        );
+        expect(new Set(rows.map((row) => row.compartmentId))).toEqual(new Set(workIds));
+
+        // One pass was enough: the follow-up finds nothing embeddable left.
+        const second = await embedUnembeddedCompartmentChunksForProject(db, "git:nowork");
+        expect(second).toBe(0);
+    });
+
     it("repairs chunk rows stamped with a different project than their session owner", async () => {
         const db = useTempDb();
         const compartmentId = seedCompartmentWithFts(db, "ses-repair");
@@ -1638,5 +1717,605 @@ describe("project embedding registry", () => {
 
         expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
         expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(3);
+    });
+
+    it("drains every ID from a shadow queue item larger than one worker pass", async () => {
+        const batchSizes: number[] = [];
+        _setTestProviderFactoryForProject(
+            (config) =>
+                new (class extends FakeEmbeddingProvider {
+                    override async embedBatch(texts: string[]): Promise<Float32Array[]> {
+                        batchSizes.push(texts.length);
+                        return super.embedBatch(texts);
+                    }
+                })(config.provider === "local" ? config.model : "shadow"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-large-queue-item";
+        const shadow = registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            {
+                provider: "synapse",
+                model: "synapse-model",
+                synapse_fingerprint: "fp-large-queue-item",
+            } as unknown as EmbeddingConfig,
+            "/tmp/shadow-large-queue-item",
+        );
+        if (!shadow) throw new Error("failed to register shadow provider");
+        const ids = Array.from({ length: 70 }, (_, index) =>
+            String(
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "CONSTRAINTS",
+                    content: `queued shadow memory ${index}`,
+                }).id,
+            ),
+        );
+
+        let passes = 0;
+        enqueueShadowEmbeddingItems(projectIdentity, "memory", ids);
+        await flushShadowEmbeddingBacklog(projectIdentity, () => {
+            passes += 1;
+        });
+
+        expect(batchSizes).toEqual([64, 6]);
+        expect(passes).toBeGreaterThanOrEqual(2);
+        const embeddings = loadAllEmbeddings(db, projectIdentity, shadow.modelId);
+        expect([...embeddings.keys()].sort((a, b) => a - b)).toEqual(ids.map(Number));
+    });
+
+    it("windows shadow chunks against the shadow provider's advertised token window", async () => {
+        // The shadow provider advertises a far smaller window than the config
+        // default, so honoring it produces strictly more windows than the
+        // primary lane's default-window split.
+        const shadowWindowTokens = 96;
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "local"
+                ? new FakeEmbeddingProvider(config.model)
+                : new (class extends FakeEmbeddingProvider {
+                      readonly maxInputTokens = shadowWindowTokens;
+                  })("shadow"),
+        );
+        const db = useTempDb();
+        const projectIdentity = "git:shadow-chunk-window";
+        const sessionId = "ses-shadow-chunk-window";
+        const compartmentId = seedOversizedCompartmentWithFts(db, sessionId);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            localConfig("model-a"),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shadow-chunk-window",
+        );
+        await embedUnembeddedCompartmentChunksForProject(db, projectIdentity);
+        const primaryWindows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            sessionId,
+            projectIdentity,
+            currentChunkModelId(projectIdentity),
+        ).length;
+        expect(primaryWindows).toBeGreaterThan(0);
+
+        const shadow = registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            {
+                provider: "synapse",
+                model: "synapse-model",
+                synapse_fingerprint: "fp-chunk-window",
+            } as unknown as EmbeddingConfig,
+            "/tmp/shadow-chunk-window",
+        );
+        if (!shadow) throw new Error("failed to register shadow provider");
+        enqueueShadowEmbeddingItems(projectIdentity, "chunk", [String(compartmentId)]);
+        await flushShadowEmbeddingBacklog(projectIdentity);
+
+        const shadowRows = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            sessionId,
+            projectIdentity,
+            shadow.chunkModelId,
+        );
+        expect(shadowRows.length).toBeGreaterThan(primaryWindows);
+        expect(new Set(shadowRows.map((row) => row.compartmentId))).toEqual(
+            new Set([compartmentId]),
+        );
+    });
+});
+
+describe("detailed synapse writers apply complete receipt groups atomically", () => {
+    const tempDirs: string[] = [];
+    const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+    function useTempDb() {
+        const dir = mkdtempSync(join(tmpdir(), "registry-detailed-"));
+        tempDirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
+    }
+
+    afterEach(() => {
+        _resetProjectEmbeddingRegistryForTests();
+        closeDatabase();
+        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        for (const dir of tempDirs.splice(0)) {
+            try {
+                rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            } catch {
+                /* Ignore EBUSY on Windows */
+            }
+        }
+    });
+
+    function ledgerRows(db: NonNullable<ReturnType<typeof openDatabase>>) {
+        return db
+            .prepare(
+                "SELECT scope, lane_role, application_group, state FROM synapse_batch_ledger ORDER BY id",
+            )
+            .all() as Array<{
+            scope: string;
+            lane_role: string;
+            application_group: string;
+            state: string;
+        }>;
+    }
+
+    function registerDetailed(
+        db: NonNullable<ReturnType<typeof openDatabase>>,
+        projectIdentity: string,
+        host: DetailedSynapseTestHost,
+    ): void {
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "synapse"
+                ? detailedSynapseTestProvider(host)
+                : new FakeEmbeddingProvider("off"),
+        );
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            synapseTestConfig(),
+            { memoryEnabled: true, gitCommitEnabled: true },
+            "/tmp/registry-detailed",
+        );
+    }
+
+    it("memory drain writes every item in the group and completes all receipts together", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory";
+        const host = new DetailedSynapseTestHost();
+        insertMemory(db, { projectPath: projectIdentity, category: "CONSTRAINTS", content: "m1" });
+        insertMemory(db, { projectPath: projectIdentity, category: "CONSTRAINTS", content: "m2" });
+        registerDetailed(db, projectIdentity, host);
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+
+        expect(embedded).toBe(2);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(2);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.state === "complete")).toBe(true);
+        expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
+    });
+
+    it("a rolled-back receipt group returns no vectors to the read path", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-rollback";
+        const host = new DetailedSynapseTestHost();
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "rolled back memory",
+        });
+        registerDetailed(db, projectIdentity, host);
+        // Throw at the receipt-complete CAS: the destination write already ran
+        // inside the same transaction, so SQLite rolls it back with the ledger.
+        const crashed = crashingDatabase(db, {
+            matcher:
+                /UPDATE synapse_batch_ledger\s+SET state = \?, failure_disposition = \?, state_version = state_version \+ 1, updated_at = \?\s+WHERE id = \? AND state_version = \? AND state IN \(\?\)\s*$/,
+            times: 1,
+        });
+
+        const written = await embedMemoriesDetailedForProject(crashed, projectIdentity, [
+            { id: 1, content: "rolled back memory" },
+        ]);
+
+        expect(written?.size).toBe(0);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.state !== "complete")).toBe(true);
+    });
+
+    it("one drifted memory in the group writes nothing and retires the receipt", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-drift";
+        const host = new DetailedSynapseTestHost();
+        const first = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "stable memory",
+        });
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "another memory",
+        });
+        registerDetailed(db, projectIdentity, host);
+        host.resultPages = (_jobId, items) => {
+            db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(
+                "edited mid-flight",
+                first.id,
+            );
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+
+        expect(embedded).toBe(0);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
+        const rows = ledgerRows(db);
+        expect(rows.some((row) => row.state === "obsolete")).toBe(true);
+        expect(rows.every((row) => row.state !== "complete")).toBe(true);
+    });
+
+    it("a registration change between inference and apply writes no vectors and leaves receipts recoverable", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-generation";
+        const host = new DetailedSynapseTestHost();
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "generation guard memory",
+        });
+        registerDetailed(db, projectIdentity, host);
+        host.resultPages = (_jobId, items) => {
+            registerProjectEmbedding(
+                db,
+                projectIdentity,
+                localConfig("model-b"),
+                { memoryEnabled: true, gitCommitEnabled: false },
+                "/tmp/registry-detailed",
+            );
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
+
+        expect(embedded).toBe(0);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.state === "ready")).toBe(true);
+    });
+
+    it("retries a whole conflicted group when only one of its pages lost its destination", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-group-reopen";
+        const host = new DetailedSynapseTestHost();
+        // The test provider pages two items at a time, so four memories in one
+        // application group span two pages.
+        const memories = ["g1", "g2", "g3", "g4"].map((content) => {
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content,
+            });
+            return { id: memory.id, content: memory.content };
+        });
+        registerDetailed(db, projectIdentity, host);
+
+        const first = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+        expect(first?.size).toBe(4);
+        const pageRowIds = (
+            db.prepare("SELECT id FROM synapse_batch_ledger ORDER BY id").all() as Array<{
+                id: number;
+            }>
+        ).map((row) => row.id);
+        expect(pageRowIds.length).toBe(2);
+        expect(ledgerRows(db).every((row) => row.state === "complete")).toBe(true);
+
+        // Drop the destination rows of the FIRST page only: that page is
+        // provably unapplied while its sibling stays complete and current.
+        const lostPage = getSynapseLedgerPage(db, pageRowIds[0]);
+        if (!lostPage) throw new Error("expected the first page's ledger row");
+        const lostIds = lostPage.manifest.map((item) => Number(item.id.slice("memory:".length)));
+        expect(lostIds.length).toBe(2);
+        for (const memoryId of lostIds) {
+            db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ? AND model_id = ?").run(
+                memoryId,
+                SYNAPSE_TEST_LANE_IDENTITY,
+            );
+        }
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(2);
+
+        const second = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+
+        // Both pages reopened against the one proof, so the retry covers the
+        // whole group and the group applies.
+        expect([...(second?.keys() ?? [])].sort((a, b) => a - b)).toEqual(
+            memories.map((memory) => memory.id),
+        );
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(4);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBe(2);
+        expect(rows.every((row) => row.state === "complete")).toBe(true);
+        expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
+    });
+
+    it("reopens a conflicted page on the provider's configured batch timeout", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-memory-reopen-deadline";
+        const host = new DetailedSynapseTestHost();
+        // detailedSynapseTestProvider configures batchTimeoutMs, so the lane's
+        // page deadlines sit far below the provider's own default.
+        const configuredTimeoutMs = 5_000;
+        const memories = ["d1", "d2"].map((content) => {
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content,
+            });
+            return { id: memory.id, content: memory.content };
+        });
+        registerDetailed(db, projectIdentity, host);
+
+        const first = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+        expect(first?.size).toBe(2);
+        db.prepare("DELETE FROM memory_embeddings WHERE model_id = ?").run(
+            SYNAPSE_TEST_LANE_IDENTITY,
+        );
+
+        const before = Date.now();
+        const second = await embedMemoriesDetailedForProject(db, projectIdentity, memories);
+        const after = Date.now();
+
+        expect(second?.size).toBe(2);
+        const deadlines = (
+            db.prepare("SELECT deadline_at FROM synapse_batch_ledger ORDER BY id").all() as Array<{
+                deadline_at: number | null;
+            }>
+        ).map((row) => row.deadline_at);
+        expect(deadlines.length).toBe(1);
+        for (const deadline of deadlines) {
+            expect(deadline).not.toBeNull();
+            expect(deadline as number).toBeGreaterThanOrEqual(before + configuredTimeoutMs);
+            expect(deadline as number).toBeLessThanOrEqual(after + configuredTimeoutMs);
+        }
+    });
+
+    it("does not publish chunk receipts after the compartment source changes", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-chunk-publish-race";
+        const sessionId = "ses-detailed-chunk-publish-race";
+        const host = new DetailedSynapseTestHost();
+        const compartmentId = seedCompartmentWithFts(db, sessionId);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        registerDetailed(db, projectIdentity, host);
+        const compartment = getCompartments(db, sessionId)[0];
+        const windows = chunkCanonicalText(
+            buildCanonicalChunkTextFromFts(
+                db,
+                sessionId,
+                compartment.startMessage,
+                compartment.endMessage,
+            ),
+            compartment.startMessage,
+            compartment.endMessage,
+            getProjectEmbeddingMaxInputTokens(projectIdentity),
+        );
+        host.resultPages = (_jobId, items) => {
+            db.prepare(
+                "UPDATE message_history_fts SET content = ? WHERE session_id = ? AND message_ordinal = ?",
+            ).run("The queue source changed during inference.", sessionId, 1);
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const applied = await embedCompartmentWindowsDetailedForProject(db, projectIdentity, {
+            compartmentId,
+            sessionId,
+            windows,
+        });
+
+        expect(applied).toBe(false);
+        expect(
+            loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                sessionId,
+                projectIdentity,
+                currentChunkModelId(projectIdentity),
+            ),
+        ).toEqual([]);
+        expect(ledgerRows(db).some((row) => row.state === "obsolete")).toBe(true);
+    });
+
+    it("replaces a multi-page chunk group when one page changes", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-chunk-group-reopen";
+        const sessionId = "ses-detailed-chunk-group-reopen";
+        const host = new DetailedSynapseTestHost();
+        const compartmentId = seedCompartmentWithFts(db, sessionId);
+        const original = "a ".repeat(40_000);
+        db.prepare(
+            "UPDATE message_history_fts SET content = ? WHERE session_id = ? AND message_ordinal = ?",
+        ).run(original, sessionId, 1);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        registerDetailed(db, projectIdentity, host);
+        const compartment = getCompartments(db, sessionId)[0];
+        const buildWindows = () =>
+            chunkCanonicalText(
+                buildCanonicalChunkTextFromFts(
+                    db,
+                    sessionId,
+                    compartment.startMessage,
+                    compartment.endMessage,
+                ),
+                compartment.startMessage,
+                compartment.endMessage,
+                getProjectEmbeddingMaxInputTokens(projectIdentity),
+            );
+        const originalWindows = buildWindows();
+        expect(originalWindows.length).toBeGreaterThan(2);
+        expect(
+            await embedCompartmentWindowsDetailedForProject(db, projectIdentity, {
+                compartmentId,
+                sessionId,
+                windows: originalWindows,
+            }),
+        ).toBe(true);
+
+        db.prepare(
+            "UPDATE message_history_fts SET content = ? WHERE session_id = ? AND message_ordinal = ?",
+        ).run(`b${original.slice(1)}`, sessionId, 1);
+        const changedWindows = buildWindows();
+        expect(changedWindows).toHaveLength(originalWindows.length);
+        expect(
+            changedWindows.filter(
+                (window, index) => window.chunkHash !== originalWindows[index]?.chunkHash,
+            ),
+        ).toHaveLength(1);
+        host.vectorFor = () => [4, 5, 6];
+
+        expect(
+            await embedCompartmentWindowsDetailedForProject(db, projectIdentity, {
+                compartmentId,
+                sessionId,
+                windows: changedWindows,
+            }),
+        ).toBe(true);
+        const stored = loadCompartmentChunkEmbeddingsForSearch(
+            db,
+            sessionId,
+            projectIdentity,
+            currentChunkModelId(projectIdentity),
+        );
+        expect(stored).toHaveLength(changedWindows.length);
+        expect(stored.every((row) => Array.from(row.vector).join(",") === "4,5,6")).toBe(true);
+    });
+
+    it("commit drain routes through receipts and completes only with the vector write", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-commit";
+        const host = new DetailedSynapseTestHost();
+        upsertCommits(db, projectIdentity, [makeGitCommit("d1", 1000), makeGitCommit("d2", 2000)]);
+        registerDetailed(db, projectIdentity, host);
+
+        const drained = await drainCommitBacklogForProject(db, projectIdentity, Date.now() + 5000);
+
+        expect(drained).toBe(2);
+        expect(countEmbeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(2);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.scope === "commit" && row.state === "complete")).toBe(true);
+    });
+
+    it("skips an oversized newest commit and embeds the older valid commit", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-commit-oversized";
+        const host = new DetailedSynapseTestHost();
+        const oversized = {
+            ...makeGitCommit("oversized", 2000),
+            message: "x".repeat(1024 * 1024 + 1),
+        };
+        const valid = makeGitCommit("valid", 1000);
+        upsertCommits(db, projectIdentity, [oversized, valid]);
+        registerDetailed(db, projectIdentity, host);
+        host.resultPages = (_jobId, items) => {
+            const batchItems = host.batchCalls().at(-1)?.params.items as
+                | { text: string }[]
+                | undefined;
+            if (batchItems?.some((item) => Buffer.byteLength(item.text, "utf8") > 1024 * 1024)) {
+                return new SynapseEmbeddingError(
+                    "schema_violation",
+                    "item text exceeds the served per-text byte cap",
+                );
+            }
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const drained = await drainCommitBacklogForProject(db, projectIdentity, Date.now() + 5000);
+
+        expect(drained).toBe(1);
+        expect(countEmbeddedCommits(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY)).toBe(1);
+        expect(
+            countRows(
+                db,
+                `SELECT COUNT(*) AS count
+                 FROM git_commit_embeddings
+                 WHERE sha = ? AND model_id = ?`,
+                valid.sha,
+                SYNAPSE_TEST_LANE_IDENTITY,
+            ),
+        ).toBe(1);
+        expect(host.batchCalls()).toHaveLength(1);
+    });
+
+    it("chunk drain applies each compartment group atomically through its receipts", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-chunk";
+        const host = new DetailedSynapseTestHost();
+        seedCompartmentWithFts(db, "ses-detailed-chunk");
+        recordSessionProjectIdentity(db, "ses-detailed-chunk", projectIdentity);
+        registerDetailed(db, projectIdentity, host);
+
+        const embedded = await embedUnembeddedCompartmentChunksForProject(db, projectIdentity);
+
+        expect(embedded).toBe(1);
+        const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+        expect(
+            loadCompartmentChunkEmbeddingsForSearch(
+                db,
+                "ses-detailed-chunk",
+                projectIdentity,
+                snapshot?.chunkModelId ?? "off",
+            ).length,
+        ).toBeGreaterThan(0);
+        const rows = ledgerRows(db);
+        expect(rows.length).toBeGreaterThan(0);
+        expect(rows.every((row) => row.scope === "chunk" && row.state === "complete")).toBe(true);
+        expect(rows.every((row) => row.application_group.startsWith("compartment:"))).toBe(true);
     });
 });

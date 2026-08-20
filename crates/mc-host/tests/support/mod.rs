@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod raw_client;
+pub mod synapse;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -13,7 +14,7 @@ use std::time::Duration;
 use mc_host::{
     BindOutcome, CancellationToken, HealthReport, HealthStatus, HostConfig, HostError, HostLimits,
     InitError, ManifestSnapshot, McHostHandler, RequestCtx, RequestOutcome, RouteHandle,
-    RouteIdentity,
+    RouteIdentity, RouteTarget,
 };
 
 use raw_client::Discovered;
@@ -80,6 +81,7 @@ pub enum Event {
     Request(RouteHandle),
     RouteGone(RouteHandle),
     Health,
+    Shutdown,
     HandlerDropped,
 }
 
@@ -115,6 +117,8 @@ struct Inner {
     block_route_gone: Mutex<bool>,
     route_gone_gate: tokio::sync::Semaphore,
     panic_route_gone: Mutex<bool>,
+    block_shutdown: Mutex<bool>,
+    shutdown_gate: tokio::sync::Semaphore,
     block_runtime_drop: AtomicBool,
     runtime_drop_started: AtomicBool,
     runtime_drop_gate: (Mutex<bool>, Condvar),
@@ -155,6 +159,8 @@ impl TestHandler {
                 block_route_gone: Mutex::new(false),
                 route_gone_gate: tokio::sync::Semaphore::new(0),
                 panic_route_gone: Mutex::new(false),
+                block_shutdown: Mutex::new(false),
+                shutdown_gate: tokio::sync::Semaphore::new(0),
                 block_runtime_drop: AtomicBool::new(false),
                 runtime_drop_started: AtomicBool::new(false),
                 runtime_drop_gate: (Mutex::new(false), Condvar::new()),
@@ -276,6 +282,18 @@ impl TestHandler {
         *self.inner.panic_route_gone.lock().expect("panic lock") = true;
     }
 
+    pub fn block_shutdown(&self) {
+        *self
+            .inner
+            .block_shutdown
+            .lock()
+            .expect("shutdown block lock") = true;
+    }
+
+    pub fn release_shutdown(&self) {
+        self.inner.shutdown_gate.add_permits(1);
+    }
+
     fn push(&self, event: Event) {
         self.inner.events.lock().expect("events lock").push(event);
     }
@@ -306,8 +324,8 @@ impl Drop for TestHandler {
 }
 
 impl McHostHandler for TestHandler {
-    fn manifest(&self) -> ManifestSnapshot {
-        ManifestSnapshot {
+    fn manifests(&self) -> Vec<ManifestSnapshot> {
+        vec![ManifestSnapshot {
             module_id: LINKED_MODULE_ID.to_owned(),
             module_version: MODULE_VERSION.to_owned(),
             provides: vec![serde_json::json!({
@@ -324,7 +342,7 @@ impl McHostHandler for TestHandler {
                 "forward_compatible_extra": {"nested": true}
             })],
             control_ops: vec!["health.check".to_owned()],
-        }
+        }]
     }
 
     async fn initialize(&self, _init: mc_host::HostInit) -> Result<(), InitError> {
@@ -346,7 +364,12 @@ impl McHostHandler for TestHandler {
         }
     }
 
-    async fn bind(&self, route: RouteHandle, identity: RouteIdentity) -> BindOutcome {
+    async fn bind(
+        &self,
+        route: RouteHandle,
+        _target: RouteTarget,
+        identity: RouteIdentity,
+    ) -> BindOutcome {
         self.inner
             .identities
             .lock()
@@ -511,6 +534,23 @@ impl McHostHandler for TestHandler {
     async fn health(&self) -> HealthReport {
         self.push(Event::Health);
         self.inner.health.lock().expect("health lock").clone()
+    }
+
+    async fn shutdown(&self) {
+        if *self
+            .inner
+            .block_shutdown
+            .lock()
+            .expect("shutdown block lock")
+        {
+            let _permit = self
+                .inner
+                .shutdown_gate
+                .acquire()
+                .await
+                .expect("shutdown gate remains open");
+        }
+        self.push(Event::Shutdown);
     }
 }
 

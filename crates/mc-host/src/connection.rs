@@ -472,11 +472,7 @@ async fn handle_control<H: McHostHandler>(
     frame: crate::wire::InboundFrame,
 ) {
     let corr = frame.header.corr;
-    let action = parse_control(
-        &frame.body,
-        frame.header.flags.is_binary(),
-        &shared.module_id,
-    );
+    let action = parse_control(&frame.body, frame.header.flags.is_binary(), &shared.targets);
     // The body and its charge are done: validation is complete.
     drop(frame);
 
@@ -537,7 +533,7 @@ async fn handle_control<H: McHostHandler>(
                 }
             }));
         }
-        ControlAction::RouteOpen { identity } => {
+        ControlAction::RouteOpen { target, identity } => {
             // Bind callbacks may be slow; never stall the read loop on them.
             // Abort-exempt: this wrapper owns its route's cleanup (rejected
             // or close-raced binds still get exactly-once route-gone), so the
@@ -547,7 +543,7 @@ async fn handle_control<H: McHostHandler>(
             let gen_task = Arc::clone(gen);
             shared.spawn_lifecycle(gen.read_tasks.track_future(async move {
                 let _pending_permit = pending_permit;
-                open_route(shared_task, gen_task, corr, identity).await;
+                open_route(shared_task, gen_task, corr, target, identity).await;
             }));
         }
     }

@@ -6,7 +6,10 @@ import type {
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../config/schema/magic-context";
 import {
     getSynapseLaneIdentity,
+    normalizeSynapseTokenBudget,
     SYNAPSE_DEFAULT_MODEL,
+    SYNAPSE_MAX_INPUT_BYTES,
+    SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
     type SynapseLaneMetadata,
 } from "../features/magic-context/memory/embedding-synapse";
@@ -15,7 +18,11 @@ import { log } from "../shared/logger";
 export interface ResolvedSynapseEmbeddingConfig {
     provider: "synapse";
     model: string;
-    max_input_tokens: 8192;
+    /** Advertised per-input token window; SYNAPSE_MAX_INPUT_TOKENS when the
+     *  catalog omits it. */
+    max_input_tokens: number;
+    /** Advertised UTF-8 byte ceiling for one input. */
+    synapse_max_input_bytes: number;
     synapse_connection_file: string;
     synapse_fingerprint: string;
     synapse_table_epoch: number;
@@ -23,6 +30,7 @@ export interface ResolvedSynapseEmbeddingConfig {
     // treats a missing value as adopt-on-first-write.
     synapse_dims?: number;
     synapse_recommended_batch?: number;
+    synapse_recommended_token_budget?: number;
     synapse_provenance?: unknown;
 }
 
@@ -97,6 +105,11 @@ function synapseOptions(
                   tableEpoch: metadata.table_epoch,
                   dims: metadata.dims,
                   recommendedBatch: metadata.recommended_batch,
+                  recommendedTokenBudget: normalizeSynapseTokenBudget(
+                      metadata.recommended_token_budget,
+                  ),
+                  maxInputTokens: metadata.max_input_tokens,
+                  maxInputBytes: metadata.max_input_bytes,
                   provenance: metadata.provenance,
               }
             : {}),
@@ -134,10 +147,12 @@ function resolvedSynapseConfig(
 ): ResolvedSynapseEmbeddingConfig {
     void projectRoot;
     void session;
+    const tokenBudget = normalizeSynapseTokenBudget(metadata.recommended_token_budget);
     return {
         provider: "synapse",
         model: metadata.model,
-        max_input_tokens: 8192,
+        max_input_tokens: metadata.max_input_tokens ?? SYNAPSE_MAX_INPUT_TOKENS,
+        synapse_max_input_bytes: metadata.max_input_bytes ?? SYNAPSE_MAX_INPUT_BYTES,
         synapse_connection_file: subc.connection_file,
         synapse_fingerprint: metadata.fingerprint,
         synapse_table_epoch: metadata.table_epoch,
@@ -145,6 +160,7 @@ function resolvedSynapseConfig(
         ...(metadata.recommended_batch
             ? { synapse_recommended_batch: metadata.recommended_batch }
             : {}),
+        ...(tokenBudget !== undefined ? { synapse_recommended_token_budget: tokenBudget } : {}),
         ...(metadata.provenance !== undefined ? { synapse_provenance: metadata.provenance } : {}),
     };
 }

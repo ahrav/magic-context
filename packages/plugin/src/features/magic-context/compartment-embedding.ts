@@ -11,9 +11,11 @@ import {
 } from "./compartment-chunk-embedding";
 import {
     contentSha256,
+    embedCompartmentWindowsDetailedForProject,
     embedItemsForProject,
     enqueueShadowEmbeddingItems,
     getProjectChunkEmbeddingModelId,
+    getProjectEmbeddingMaxInputBytes,
     getProjectEmbeddingMaxInputTokens,
 } from "./project-embedding-registry";
 
@@ -54,6 +56,7 @@ export async function embedAndStoreCompartmentChunks(
 ): Promise<void> {
     if (compartments.length === 0) return;
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectPath);
+    const maxInputBytes = getProjectEmbeddingMaxInputBytes(projectPath);
 
     for (const compartment of compartments) {
         try {
@@ -80,6 +83,7 @@ export async function embedAndStoreCompartmentChunks(
                 compartment.startMessage,
                 compartment.endMessage,
                 maxInputTokens,
+                maxInputBytes,
             );
             if (windows.length === 0) continue;
 
@@ -97,6 +101,44 @@ export async function embedAndStoreCompartmentChunks(
                 continue;
             }
 
+            const detailed = await embedCompartmentWindowsDetailedForProject(db, projectPath, {
+                compartmentId: compartment.id,
+                sessionId,
+                windows,
+                ...(fromMemory
+                    ? {
+                          currentWindows: () =>
+                              chunkCanonicalText(
+                                  canonicalText,
+                                  compartment.startMessage,
+                                  compartment.endMessage,
+                                  maxInputTokens,
+                                  maxInputBytes,
+                              ),
+                      }
+                    : {}),
+            });
+            // `null` means no journaling lane owns this project, so the legacy
+            // path below embeds the windows. A boolean means the journaling lane
+            // owns this compartment: `true` applied its windows, `false` applied
+            // none of them and left the outcome in the page ledger — a failed
+            // page with its retry disposition, or receipts still awaiting
+            // application. Either way the compartment keeps its existing
+            // destination rows and no ledger page reaches 'complete', so the next
+            // publish re-derives the windows. Embedding them through the legacy
+            // path instead would write destination rows with no receipt behind
+            // them, which is the split state the ledger exists to prevent: a
+            // later reopen proof reads those rows as current, declines to reopen,
+            // and strands the group on idempotency_conflict.
+            if (detailed === false) {
+                sessionLog(
+                    sessionId,
+                    `compartment chunk embedding not applied by the synapse lane for compartment ${compartment.id}: no receipt group covered its windows`,
+                );
+                continue;
+            }
+            if (detailed === true) continue;
+
             const result = await embedItemsForProject(
                 projectPath,
                 windows.map((window) => ({
@@ -104,9 +146,6 @@ export async function embedAndStoreCompartmentChunks(
                     text: window.text,
                     contentSha256: contentSha256(window.text),
                 })),
-                undefined,
-                db,
-                sessionId,
             );
             if (!result) continue;
             if (

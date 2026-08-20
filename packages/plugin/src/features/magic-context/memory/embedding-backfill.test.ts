@@ -12,6 +12,12 @@ import {
     registerProjectEmbedding,
 } from "../project-embedding-registry";
 import { closeDatabase, openDatabase } from "../storage";
+import {
+    DetailedSynapseTestHost,
+    detailedSynapseTestProvider,
+    SYNAPSE_TEST_LANE_IDENTITY,
+    synapseTestConfig,
+} from "../synapse-detailed-test-support";
 import { ensureMemoryEmbeddings } from "./embedding-backfill";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 import { insertMemory } from "./storage-memory";
@@ -67,7 +73,9 @@ describe("ensureMemoryEmbeddings (read-path backfill)", () => {
         const dir = mkdtempSync(join(tmpdir(), "embedding-backfill-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
-        return openDatabase();
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
     }
 
     afterEach(() => {
@@ -188,5 +196,121 @@ describe("ensureMemoryEmbeddings (read-path backfill)", () => {
         // the stored vector must be the NEW content's (24 chars), not the stale
         // old one (15 chars).
         expect(stored.get(memory.id)?.embedding[0]).toBe("New memory body (edited)".length);
+    });
+});
+
+describe("ensureMemoryEmbeddings through versioned synapse receipts", () => {
+    const tempDirs: string[] = [];
+    const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+    function useTempDb() {
+        const dir = mkdtempSync(join(tmpdir(), "embedding-backfill-detailed-"));
+        tempDirs.push(dir);
+        process.env.XDG_DATA_HOME = dir;
+        const db = openDatabase();
+        if (!db) throw new Error("failed to open test database");
+        return db;
+    }
+
+    afterEach(() => {
+        _resetProjectEmbeddingRegistryForTests();
+        closeDatabase();
+        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        for (const dir of tempDirs.splice(0)) {
+            try {
+                rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+            } catch {
+                /* Ignore EBUSY on Windows */
+            }
+        }
+    });
+
+    it("writes vectors, completes receipts, and merges the cache only for committed rows", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:backfill-detailed";
+        const host = new DetailedSynapseTestHost();
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "synapse" ? detailedSynapseTestProvider(host) : null,
+        );
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "Backfill me through receipts.",
+        });
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            synapseTestConfig(),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/backfill-detailed",
+        );
+
+        const cache = await ensureMemoryEmbeddings({
+            db,
+            projectIdentity,
+            memories: [memory],
+            existingEmbeddings: new Map(),
+        });
+
+        expect(cache.get(memory.id)?.modelId).toBe(SYNAPSE_TEST_LANE_IDENTITY);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(1);
+        const ledger = db
+            .prepare("SELECT state, scope FROM synapse_batch_ledger ORDER BY id")
+            .all() as Array<{ state: string; scope: string }>;
+        expect(ledger.length).toBeGreaterThan(0);
+        expect(ledger.every((row) => row.state === "complete" && row.scope === "memory")).toBe(
+            true,
+        );
+    });
+
+    it("merges no cache entry and writes nothing when the memory drifts before the transaction", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:backfill-detailed-drift";
+        const host = new DetailedSynapseTestHost();
+        _setTestProviderFactoryForProject((config) =>
+            config.provider === "synapse" ? detailedSynapseTestProvider(host) : null,
+        );
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "Original body",
+        });
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            synapseTestConfig(),
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/backfill-detailed-drift",
+        );
+        host.resultPages = (_jobId, items) => {
+            db.prepare(
+                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+            ).run("Edited mid-flight", "edited-hash", Date.now(), memory.id);
+            return {
+                result: {
+                    ...host.envelope(),
+                    done: true,
+                    vectors: items.map((item) => ({
+                        id: item.id,
+                        content_sha256: item.content_sha256,
+                        vector: [1, 2, 3],
+                    })),
+                },
+            };
+        };
+
+        const cache = await ensureMemoryEmbeddings({
+            db,
+            projectIdentity,
+            memories: [memory],
+            existingEmbeddings: new Map(),
+        });
+
+        expect(cache.has(memory.id)).toBe(false);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(0);
+        const ledger = db
+            .prepare("SELECT state FROM synapse_batch_ledger ORDER BY id")
+            .all() as Array<{ state: string }>;
+        expect(ledger.every((row) => row.state !== "complete")).toBe(true);
     });
 });

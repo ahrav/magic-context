@@ -336,10 +336,22 @@ impl RawClient {
         harness: &str,
         session: &str,
     ) -> Result<(u16, u32), String> {
+        self.route_open_target("tool_provider", module_id, project_root, harness, session)
+            .await
+    }
+
+    pub async fn route_open_target(
+        &mut self,
+        kind: &str,
+        module_id: &str,
+        project_root: &str,
+        harness: &str,
+        session: &str,
+    ) -> Result<(u16, u32), String> {
         let corr = self
             .control(&serde_json::json!({
                 "op": "route.open",
-                "target": {"kind": "tool_provider", "module_id": module_id},
+                "target": {"kind": kind, "module_id": module_id},
                 "identity": {
                     "project_root": project_root,
                     "harness": harness,

@@ -159,15 +159,38 @@ export function normalizeCandidateDepth(depth?: number): number | null {
  *  never splitting a surrogate pair. */
 export function truncateUtf8Bytes(text: string, maxBytes: number): string {
     if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+    return text.slice(0, utf8PrefixEnd(text, maxBytes));
+}
+
+function utf8PrefixEnd(text: string, maxBytes: number, start = 0): number {
     let bytes = 0;
-    let end = 0;
-    for (const char of text) {
+    let end = start;
+    for (const char of text.slice(start)) {
         const charBytes = Buffer.byteLength(char, "utf8");
         if (bytes + charBytes > maxBytes) break;
         bytes += charBytes;
         end += char.length;
     }
-    return text.slice(0, end);
+    return end;
+}
+
+/** Split `text` into UTF-8 byte-bounded slices without splitting surrogate pairs. */
+export function splitUtf8Bytes(text: string, maxBytes: number): string[] {
+    if (!Number.isInteger(maxBytes) || maxBytes < 1) {
+        throw new RangeError("maxBytes must be a positive integer");
+    }
+    if (Buffer.byteLength(text, "utf8") <= maxBytes) return [text];
+    const slices: string[] = [];
+    let start = 0;
+    while (start < text.length) {
+        const end = utf8PrefixEnd(text, maxBytes, start);
+        if (end === start) {
+            throw new RangeError("maxBytes cannot hold one Unicode code point");
+        }
+        slices.push(text.slice(start, end));
+        start = end;
+    }
+    return slices;
 }
 
 /** End offsets (exclusive) of each whitespace-delimited atom in `text`. */

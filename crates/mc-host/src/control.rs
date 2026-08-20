@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::handler::{ManifestSnapshot, RouteIdentity};
+use crate::handler::{ManifestSnapshot, RouteIdentity, RouteTarget, TargetKind};
 
 pub const CODE_INVALID_CONTROL_REQUEST: &str = "invalid_control_request";
 pub const CODE_UNSUPPORTED_OPERATION: &str = "unsupported_operation";
@@ -21,11 +21,24 @@ pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 pub const OP_ROUTE_OPEN: &str = subc_control::ops::ROUTE_OPEN;
 pub const OP_CATALOG_LIST: &str = subc_control::ops::CATALOG_LIST;
 
-/// The only routable target kind in the direct profile. `route.open` succeeds
-/// only for a role the linked manifest actually advertises, so startup
-/// rejects a manifest without it rather than publishing a catalog that
-/// contradicts route admission (protocol §7.2).
-pub const TARGET_KIND_TOOL_PROVIDER: &str = "tool_provider";
+/// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
+/// pairs.
+pub struct TargetIndex {
+    entries: Vec<(Box<str>, Vec<TargetKind>)>,
+}
+
+impl TargetIndex {
+    pub(crate) fn new(entries: Vec<(Box<str>, Vec<TargetKind>)>) -> Self {
+        Self { entries }
+    }
+
+    fn kinds_of(&self, module_id: &str) -> Option<&[TargetKind]> {
+        self.entries
+            .iter()
+            .find(|(id, _)| id.as_ref() == module_id)
+            .map(|(_, kinds)| kinds.as_slice())
+    }
+}
 
 const MAX_OP_LEN: usize = 64;
 const MAX_MODULE_ID_LEN: usize = 128;
@@ -54,6 +67,7 @@ pub enum ControlAction {
         module_id_filter: Option<String>,
     },
     RouteOpen {
+        target: RouteTarget,
         identity: RouteIdentity,
     },
     /// Semantic rejection with a trustworthy correlation; one terminal.
@@ -73,8 +87,7 @@ fn invalid(message: &str) -> ControlAction {
 /// Validates and classifies one complete channel-0 `Request` body.
 ///
 /// `binary` is the frame's encoding bit: channel 0 accepts JSON only.
-/// `linked_module_id` is the only routable module.
-pub fn parse_control(body: &[u8], binary: bool, linked_module_id: &str) -> ControlAction {
+pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> ControlAction {
     if binary {
         return invalid("control channel accepts JSON only");
     }
@@ -108,7 +121,7 @@ pub fn parse_control(body: &[u8], binary: bool, linked_module_id: &str) -> Contr
 
     match op {
         OP_CATALOG_LIST => parse_catalog_list(&fields),
-        OP_ROUTE_OPEN => parse_route_open(&fields, linked_module_id),
+        OP_ROUTE_OPEN => parse_route_open(&fields, targets),
         _ => ControlAction::Reject {
             code: CODE_UNSUPPORTED_OPERATION,
             message: "operation is not supported by this host".to_owned(),
@@ -134,7 +147,7 @@ fn parse_catalog_list(fields: &serde_json::Map<String, serde_json::Value>) -> Co
 
 fn parse_route_open(
     fields: &serde_json::Map<String, serde_json::Value>,
-    linked_module_id: &str,
+    targets: &TargetIndex,
 ) -> ControlAction {
     let Some(serde_json::Value::Object(target)) = fields.get("target") else {
         return invalid("target must be an object");
@@ -243,20 +256,30 @@ fn parse_route_open(
 
     // Classification runs only after every bound held, so a hostile body
     // cannot pick its rejection code to probe the catalog cheaply.
-    if kind != TARGET_KIND_TOOL_PROVIDER {
+    let Some(parsed_kind) = TargetKind::parse(kind) else {
         return ControlAction::Reject {
             code: CODE_TARGET_UNAVAILABLE,
             message: "target kind is not routable on this host".to_owned(),
         };
-    }
-    if module_id != linked_module_id {
+    };
+    let Some(kinds) = targets.kinds_of(module_id) else {
         return ControlAction::Reject {
             code: CODE_UNKNOWN_MODULE,
             message: format!("module {module_id} is unavailable"),
         };
+    };
+    if !kinds.contains(&parsed_kind) {
+        return ControlAction::Reject {
+            code: CODE_TARGET_UNAVAILABLE,
+            message: format!("module {module_id} does not serve this target kind"),
+        };
     }
 
     ControlAction::RouteOpen {
+        target: RouteTarget {
+            module_id: module_id.clone(),
+            kind: parsed_kind,
+        },
         identity: RouteIdentity {
             project_root: PathBuf::from(project_root),
             harness: harness.clone(),
@@ -269,14 +292,17 @@ fn parse_route_open(
     }
 }
 
-/// Validates the linked manifest's module ID against the same constraints
+/// Validates a startup manifest's module ID against the same constraints
 /// `route.open` applies to the client-supplied target, so startup rejects a
 /// manifest advertising a module that no conforming request could ever bind.
 pub(crate) fn validate_manifest_module_id(module_id: &str) -> Result<(), String> {
     check_string("manifest module_id", module_id, MAX_MODULE_ID_LEN, true)
 }
 
-fn check_string(
+/// Applies the host's shared bounds to one client-supplied string: nonempty
+/// (when required), a byte ceiling, and no interior NUL. Callers outside the
+/// control plane map the returned message onto their own error code.
+pub(crate) fn check_string(
     field: &str,
     value: &str,
     max_bytes: usize,
@@ -306,43 +332,59 @@ fn value_depth(value: &serde_json::Value) -> usize {
 
 /// Immutable `catalog.list` bodies serialized before the host is published.
 ///
-/// The direct-linked profile has one static module, so every valid filter
-/// resolves to either the complete catalog or one canonical empty catalog.
+/// Every valid filter resolves to a startup-serialized body: the complete
+/// catalog, one exact per-module entry, or one canonical empty catalog.
 pub struct CatalogCache {
-    module_id: Box<str>,
     full: Box<[u8]>,
+    per_module: Vec<(Box<str>, Box<[u8]>)>,
     empty: Box<[u8]>,
 }
 
 impl CatalogCache {
-    /// Serializes both cached bodies through a capped writer, so a manifest
-    /// whose catalog exceeds `limit` is rejected while it is being written
-    /// rather than after a full copy exists. Materializing first and checking
-    /// afterwards could OOM the host on the very input startup means to
-    /// refuse.
-    pub fn new_bounded(manifest: &ManifestSnapshot, limit: usize) -> Result<Self, ()> {
+    /// Serializes every cached body through a capped writer, so a manifest
+    /// set whose catalog exceeds `limit` is rejected while it is being
+    /// written rather than after a full copy exists. Materializing first and
+    /// checking afterwards could OOM the host on the very input startup
+    /// means to refuse.
+    pub fn new_bounded(manifests: &[ManifestSnapshot], limit: usize) -> Result<Self, ()> {
+        let mut per_module = Vec::with_capacity(manifests.len());
+        for manifest in manifests {
+            per_module.push((
+                manifest.module_id.clone().into_boxed_str(),
+                serialize_catalog_response(std::slice::from_ref(manifest), limit)?,
+            ));
+        }
         Ok(Self {
-            module_id: manifest.module_id.clone().into_boxed_str(),
-            full: serialize_catalog_response(manifest, true, limit)?,
-            empty: serialize_catalog_response(manifest, false, limit)?,
+            full: serialize_catalog_response(manifests, limit)?,
+            per_module,
+            empty: serialize_catalog_response(&[], limit)?,
         })
     }
 
     /// Selects cached bytes without allocating. Unknown filters yield an empty
     /// list, not an error (protocol §7.3).
     pub fn body(&self, module_id_filter: Option<&str>) -> &[u8] {
-        match module_id_filter {
-            None => &self.full,
-            Some(filter) if filter == self.module_id.as_ref() => &self.full,
-            Some(_) => &self.empty,
-        }
+        let Some(filter) = module_id_filter else {
+            return &self.full;
+        };
+        self.per_module
+            .iter()
+            .find(|(id, _)| id.as_ref() == filter)
+            .map(|(_, body)| body.as_ref())
+            .unwrap_or(&self.empty)
     }
 
     /// Bytes this cache permanently keeps resident for the incarnation; the
     /// runtime subtracts them from the byte budgets so the configured
     /// `max_resident_bytes` bound stays truthful.
     pub fn resident_len(&self) -> usize {
-        self.full.len() + self.empty.len()
+        self.full.len()
+            + self.empty.len()
+            + self
+                .per_module
+                .iter()
+                .map(|(id, body)| id.len() + body.len())
+                .sum::<usize>()
     }
 }
 
@@ -371,14 +413,11 @@ impl std::io::Write for CappedWriter {
 }
 
 fn serialize_catalog_response(
-    manifest: &ManifestSnapshot,
-    include: bool,
+    manifests: &[ManifestSnapshot],
     limit: usize,
 ) -> Result<Box<[u8]>, ()> {
-    // Borrowed throughout: building a `serde_json::Value` here would clone the
-    // manifest's whole `provides` tree before the capped writer saw a byte, so
-    // an over-limit manifest could exhaust memory during the very check meant
-    // to refuse it. Field order matches the published shape.
+    // Borrowing `ManifestSnapshot` fields avoids cloning `provides` before
+    // the capped writer can reject an oversized manifest.
     #[derive(serde::Serialize)]
     struct CatalogModule<'a> {
         module_id: &'a str,
@@ -395,16 +434,15 @@ fn serialize_catalog_response(
         subc_ops: [&'static str; 2],
     }
 
-    let modules = if include {
-        vec![CatalogModule {
+    let modules: Vec<CatalogModule<'_>> = manifests
+        .iter()
+        .map(|manifest| CatalogModule {
             module_id: &manifest.module_id,
             module_version: &manifest.module_version,
             roles: &manifest.provides,
             control_ops: &manifest.control_ops,
-        }]
-    } else {
-        Vec::new()
-    };
+        })
+        .collect();
     let mut writer = CappedWriter {
         buf: Vec::new(),
         limit,
@@ -436,7 +474,7 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
 /// object keys outright. A conforming client never sends duplicates, and
 /// accepting repeated fields would make handling depend on decoder or field
 /// order (protocol §7.1).
-mod strict_json {
+pub(crate) mod strict_json {
     use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
     use serde_json::Value;
     use std::fmt;
@@ -540,6 +578,14 @@ mod tests {
     use super::*;
 
     const LINKED: &str = "magic-context";
+    const SYNAPSE: &str = "synapse";
+
+    fn two_target_index() -> TargetIndex {
+        TargetIndex::new(vec![
+            (LINKED.into(), vec![TargetKind::ToolProvider]),
+            (SYNAPSE.into(), vec![TargetKind::ManagementSurface]),
+        ])
+    }
 
     fn reject_code(action: ControlAction) -> &'static str {
         match action {
@@ -561,14 +607,20 @@ mod tests {
     }
 
     fn parse(value: &serde_json::Value) -> ControlAction {
-        parse_control(&serde_json::to_vec(value).unwrap(), false, LINKED)
+        parse_control(
+            &serde_json::to_vec(value).unwrap(),
+            false,
+            &two_target_index(),
+        )
     }
 
     #[test]
     fn canonical_route_open_parses() {
-        let ControlAction::RouteOpen { identity } = parse(&minimal_route_open()) else {
+        let ControlAction::RouteOpen { target, identity } = parse(&minimal_route_open()) else {
             panic!("expected route open");
         };
+        assert_eq!(target.module_id, LINKED);
+        assert_eq!(target.kind, TargetKind::ToolProvider);
         assert_eq!(identity.project_root, PathBuf::from("/workspace/project"));
         assert_eq!(identity.harness, "opencode");
         assert_eq!(identity.session, "session-1");
@@ -577,15 +629,27 @@ mod tests {
     }
 
     #[test]
+    fn synapse_management_surface_parses() {
+        let mut request = minimal_route_open();
+        request["target"]["kind"] = serde_json::Value::String("management_surface".to_owned());
+        request["target"]["module_id"] = serde_json::Value::String(SYNAPSE.to_owned());
+        let ControlAction::RouteOpen { target, .. } = parse(&request) else {
+            panic!("expected route open");
+        };
+        assert_eq!(target.module_id, SYNAPSE);
+        assert_eq!(target.kind, TargetKind::ManagementSurface);
+    }
+
+    #[test]
     fn binary_flag_on_control_is_semantic_rejection() {
-        let action = parse_control(b"{}", true, LINKED);
+        let action = parse_control(b"{}", true, &two_target_index());
         assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
     }
 
     #[test]
     fn malformed_json_and_non_object_roots_are_rejected() {
         for body in [&b"{"[..], b"[1,2]", b"\xff\xfe", b"null", b"{} trailing"] {
-            let action = parse_control(body, false, LINKED);
+            let action = parse_control(body, false, &two_target_index());
             assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
         }
     }
@@ -593,7 +657,7 @@ mod tests {
     #[test]
     fn duplicate_recognized_field_is_rejected_before_classification() {
         let body = br#"{"op":"route.open","op":"catalog.list","target":{},"identity":{}}"#;
-        let action = parse_control(body, false, LINKED);
+        let action = parse_control(body, false, &two_target_index());
         assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
     }
 
@@ -713,8 +777,18 @@ mod tests {
     }
 
     #[test]
+    fn wrong_role_for_known_module_is_target_unavailable() {
+        for (module, kind) in [(LINKED, "management_surface"), (SYNAPSE, "tool_provider")] {
+            let mut request = minimal_route_open();
+            request["target"]["module_id"] = serde_json::Value::String(module.to_owned());
+            request["target"]["kind"] = serde_json::Value::String(kind.to_owned());
+            assert_eq!(reject_code(parse(&request)), CODE_TARGET_UNAVAILABLE);
+        }
+    }
+
+    #[test]
     fn unsupported_target_kind_is_target_unavailable() {
-        for kind in ["management_surface", "internal_service", "mystery_kind"] {
+        for kind in ["internal_service", "mystery_kind"] {
             let mut request = minimal_route_open();
             request["target"]["kind"] = serde_json::Value::String(kind.to_owned());
             if kind == "internal_service" {
@@ -726,9 +800,12 @@ mod tests {
 
     #[test]
     fn unknown_module_id_is_unknown_module() {
-        let mut request = minimal_route_open();
-        request["target"]["module_id"] = serde_json::Value::String("thalamus".to_owned());
-        assert_eq!(reject_code(parse(&request)), CODE_UNKNOWN_MODULE);
+        for kind in ["tool_provider", "management_surface"] {
+            let mut request = minimal_route_open();
+            request["target"]["kind"] = serde_json::Value::String(kind.to_owned());
+            request["target"]["module_id"] = serde_json::Value::String("thalamus".to_owned());
+            assert_eq!(reject_code(parse(&request)), CODE_UNKNOWN_MODULE);
+        }
     }
 
     #[test]
@@ -771,33 +848,43 @@ mod tests {
             "role": "tool_provider",
             "tools": [{"name": "ctx_reduce", "schema": {"type": "object"}}]
         });
-        let manifest = ManifestSnapshot {
-            module_id: LINKED.to_owned(),
-            module_version: "9.9.9".to_owned(),
-            provides: vec![role.clone()],
-            control_ops: vec!["mc.reload".to_owned()],
-        };
-        let catalog = CatalogCache::new_bounded(&manifest, crate::wire::MAX_BODY_LEN as usize)
-            .expect("test manifest fits the frame limit");
+        let synapse_role = serde_json::json!({"role": "management_surface"});
+        let manifests = [
+            ManifestSnapshot {
+                module_id: LINKED.to_owned(),
+                module_version: "9.9.9".to_owned(),
+                provides: vec![role.clone()],
+                control_ops: vec!["mc.reload".to_owned()],
+            },
+            ManifestSnapshot {
+                module_id: SYNAPSE.to_owned(),
+                module_version: "0.1.0".to_owned(),
+                provides: vec![synapse_role.clone()],
+                control_ops: Vec::new(),
+            },
+        ];
+        let catalog = CatalogCache::new_bounded(&manifests, crate::wire::MAX_BODY_LEN as usize)
+            .expect("test manifests fit the frame limit");
         let unfiltered_body = catalog.body(None);
         assert!(
             std::ptr::eq(unfiltered_body, catalog.body(None)),
             "repeated catalog requests must reuse startup serialization"
         );
-        assert!(
-            std::ptr::eq(unfiltered_body, catalog.body(Some(LINKED))),
-            "an exact filter must reuse the full catalog serialization"
-        );
         let unfiltered: serde_json::Value = serde_json::from_slice(unfiltered_body).unwrap();
         assert_eq!(unfiltered["op"], "catalog.list");
         assert_eq!(unfiltered["generation"], CATALOG_GENERATION);
-        assert_eq!(unfiltered["modules"].as_array().unwrap().len(), 1);
+        assert_eq!(unfiltered["modules"].as_array().unwrap().len(), 2);
         assert_eq!(unfiltered["modules"][0]["module_id"], LINKED);
         assert_eq!(unfiltered["modules"][0]["module_version"], "9.9.9");
         assert_eq!(unfiltered["modules"][0]["roles"], serde_json::json!([role]));
         assert_eq!(
             unfiltered["modules"][0]["control_ops"],
             serde_json::json!(["mc.reload"])
+        );
+        assert_eq!(unfiltered["modules"][1]["module_id"], SYNAPSE);
+        assert_eq!(
+            unfiltered["modules"][1]["roles"],
+            serde_json::json!([synapse_role])
         );
         assert_eq!(
             unfiltered["subc_ops"],
@@ -806,9 +893,14 @@ mod tests {
         // wake.create must stay absent until implemented (protocol AE10).
         assert!(!unfiltered.to_string().contains("wake.create"));
 
-        let filtered: serde_json::Value =
-            serde_json::from_slice(catalog.body(Some(LINKED))).unwrap();
-        assert_eq!(filtered["modules"].as_array().unwrap().len(), 1);
+        for (module, version) in [(LINKED, "9.9.9"), (SYNAPSE, "0.1.0")] {
+            let filtered: serde_json::Value =
+                serde_json::from_slice(catalog.body(Some(module))).unwrap();
+            let modules = filtered["modules"].as_array().unwrap();
+            assert_eq!(modules.len(), 1);
+            assert_eq!(modules[0]["module_id"], module);
+            assert_eq!(modules[0]["module_version"], version);
+        }
 
         let unknown_body = catalog.body(Some("nope"));
         assert!(

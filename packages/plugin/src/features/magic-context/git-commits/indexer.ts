@@ -13,17 +13,12 @@
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import {
-    contentSha256,
-    embedItemsForProject,
-    enqueueShadowEmbeddingItems,
+    embedCommitRowsForProject,
+    getProjectEmbeddingMaxInputBytes,
     getProjectEmbeddingSnapshot,
 } from "../memory/embedding";
 import { readGitCommitsResult } from "./git-log-reader";
-import {
-    countEmbeddedCommits,
-    loadUnembeddedCommits,
-    saveCommitEmbedding,
-} from "./storage-git-commit-embeddings";
+import { countEmbeddedCommits, loadUnembeddedCommits } from "./storage-git-commit-embeddings";
 import {
     enforceProjectCap,
     getLatestIndexedCommitTimeMs,
@@ -166,43 +161,23 @@ export async function embedUnembeddedCommits(db: Database, projectPath: string):
     embedInProgress.add(projectPath);
     const startedAt = Date.now();
     const deadline = startedAt + EMBED_SWEEP_MAX_WALL_CLOCK_MS;
+    const maxInputBytes = getProjectEmbeddingMaxInputBytes(projectPath) ?? Number.MAX_SAFE_INTEGER;
     let total = 0;
 
     try {
         while (Date.now() < deadline && total < EMBED_MAX_PER_SWEEP) {
-            const rows = loadUnembeddedCommits(db, projectPath, snapshot.modelId, EMBED_BATCH_SIZE);
+            const rows = loadUnembeddedCommits(
+                db,
+                projectPath,
+                snapshot.modelId,
+                EMBED_BATCH_SIZE,
+                maxInputBytes,
+            );
             if (rows.length === 0) break;
 
             let embeddedThisBatch = 0;
             try {
-                const result = await embedItemsForProject(
-                    projectPath,
-                    rows.map((row) => ({
-                        id: `commit:${row.sha}`,
-                        text: row.message,
-                        contentSha256: contentSha256(row.message),
-                    })),
-                    undefined,
-                    db,
-                    projectPath,
-                );
-                if (!result) break;
-
-                db.transaction(() => {
-                    for (const row of rows) {
-                        const embedding = result.vectors.get(`commit:${row.sha}`);
-                        if (!embedding) continue;
-                        saveCommitEmbedding(db, row.sha, embedding, result.modelId);
-                        embeddedThisBatch += 1;
-                    }
-                })();
-                enqueueShadowEmbeddingItems(
-                    projectPath,
-                    "commit",
-                    rows
-                        .filter((row) => result.vectors.has(`commit:${row.sha}`))
-                        .map((row) => row.sha),
-                );
+                embeddedThisBatch = await embedCommitRowsForProject(db, projectPath, rows);
             } catch (error) {
                 log(
                     `[git-commits] embed batch failed for ${projectPath}: ${error instanceof Error ? error.message : String(error)}`,

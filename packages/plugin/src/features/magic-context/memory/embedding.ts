@@ -18,7 +18,10 @@ export {
     _setTestProviderFactoryForProject,
     contentSha256,
     embedBatchForProject,
+    embedCommitRowsForProject,
+    embedCompartmentWindowsDetailedForProject,
     embedItemsForProject,
+    embedMemoriesDetailedForProject,
     embedShadowTextForProject,
     embedTextForProject,
     embedUnembeddedCompartmentChunksForProject,
@@ -26,6 +29,7 @@ export {
     enqueueShadowEmbeddingItems,
     flushShadowEmbeddingBacklog,
     getPrimaryEmbeddingMeasurementCohort,
+    getProjectEmbeddingMaxInputBytes,
     getProjectEmbeddingSnapshot,
     getShadowBackfillRemaining,
     getShadowBackfillStopReason,
@@ -131,11 +135,14 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
     if (config.provider === "synapse") {
         const synapse = config as EmbeddingConfig & {
             model?: string;
+            max_input_tokens?: number;
+            synapse_max_input_bytes?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
             synapse_provenance?: unknown;
         };
         return new SynapseEmbeddingProvider({
@@ -147,6 +154,9 @@ function createProvider(config: EmbeddingConfig): EmbeddingProvider | null {
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
+            recommendedTokenBudget: synapse.synapse_recommended_token_budget,
+            maxInputTokens: synapse.max_input_tokens,
+            maxInputBytes: synapse.synapse_max_input_bytes,
             provenance: synapse.synapse_provenance,
         });
     }

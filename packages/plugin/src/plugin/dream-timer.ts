@@ -41,6 +41,7 @@ import {
     renewGitSweepLease,
 } from "../features/magic-context/git-commits";
 import {
+    embedUnembeddedCompartmentChunksForProject,
     embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
@@ -130,6 +131,17 @@ let activeTimer: ReturnType<typeof setInterval> | null = null;
 const startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const startupJitters = new Map<string, number>();
 let nextStartupJitterSlot = 0;
+
+/**
+ * Clear the module-scope startup jitter slots. Slots are handed out for the
+ * lifetime of the module and are otherwise released only when the last project
+ * unregisters, so a test whose timing depends on which slots its projects
+ * receive must clear them before registering.
+ */
+export function resetStartupJitterSlotsForTests(): void {
+    startupJitters.clear();
+    nextStartupJitterSlot = 0;
+}
 
 /** True when `directory` exists and is a directory. Any stat error (gone,
  *  permission, ENOENT) → false: a directory we can't read is treated as gone for
@@ -256,12 +268,38 @@ export async function startDreamScheduleTimer(
     };
 }
 
+/** Shared chunk-backfill budget for ONE tick across every registered project.
+ *  Kept under DREAM_TIMER_INTERVAL_MS so a multi-project backlog drain can
+ *  never outrun the interval that scheduled it. */
+const CHUNK_BACKFILL_TICK_BUDGET_MS = 10 * 60 * 1000;
+
+/** One tick runs at a time: interval ticks are fire-and-forget, so without
+ *  this guard a backlogged tick would overlap its successor and stack
+ *  maintenance passes over the same projects. */
+let tickInProgress = false;
+
 /**
  * Single tick body. Runs global message-history maintenance once, then
  * iterates every registered project for its per-directory work.
  */
 function runTick(origin: "startup" | "interval"): void {
+    if (tickInProgress) {
+        log(`[dreamer] timer tick (${origin}) skipped — previous tick still running`);
+        return;
+    }
+    // A startup wave's passes run on `startupQueue`, outside the tick that
+    // scheduled them, so `tickInProgress` is already clear while the wave
+    // drains — and one wave can outlast DREAM_TIMER_INTERVAL_MS, because it
+    // spends a whole CHUNK_BACKFILL_TICK_BUDGET_MS plus its memory and git
+    // drains. An interval pass drives the same provider and database, so it
+    // yields to the wave; periodic maintenance it skips is picked up by the
+    // next interval, whereas queueing it behind the wave builds a backlog.
+    if (origin === "interval" && startupQueueDepth > 0) {
+        log(`[dreamer] timer tick (${origin}) skipped — startup wave still draining`);
+        return;
+    }
     log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
+    tickInProgress = true;
     void (async () => {
         try {
             const db = openTimerDatabaseOrNull("maintenance tick");
@@ -271,11 +309,12 @@ function runTick(origin: "startup" | "interval"): void {
             // dream queue processing. We iterate all registered projects so
             // Desktop's "open all projects at once" workflow indexes every one,
             // not just whichever project happened to register the timer first.
+            const chunkDeadlineAt = Date.now() + CHUNK_BACKFILL_TICK_BUDGET_MS;
             for (const reg of registeredProjects.values()) {
                 if (origin === "startup") {
                     scheduleInitialProjectRun(reg, db);
                 } else {
-                    await runProjectMaintenance(reg, origin, db);
+                    await runProjectMaintenance(reg, origin, db, chunkDeadlineAt);
                 }
             }
             if (origin === "startup") return;
@@ -285,6 +324,8 @@ function runTick(origin: "startup" | "interval"): void {
             runSqliteOptimize(db);
         } catch (error) {
             log("[magic-context] timer-triggered maintenance check failed:", error);
+        } finally {
+            tickInProgress = false;
         }
     })();
 }
@@ -319,12 +360,63 @@ function startupJitterMs(directory: string): number {
     return jitter;
 }
 
+/** Startup passes arrive on jittered per-project timers, so unlike the
+ *  interval loop they do not run back to back on their own. Chaining them
+ *  keeps one project's expensive drains off the shared provider and DB while
+ *  another project is still draining, and lets every pass of one startup wave
+ *  share a single chunk-backfill budget exactly as one interval tick does. */
+let startupQueue: Promise<void> = Promise.resolve();
+let startupQueueDepth = 0;
+let startupChunkDeadlineAt = 0;
+
+/**
+ * True while `reg` is still the live registration for its directory. A
+ * registration stops being live when its directory unregisters (the instance is
+ * disposed) or re-registers with a fresh config, and a stale one carries a
+ * disposed instance's `client`, progress sink, and module client.
+ *
+ * Both ends of the startup queue consult this, because the queue is serialized:
+ * an entry waits out every earlier project's drains — one shared
+ * chunk-backfill budget plus each project's git backlog and smart-note drains
+ * and its due dreamer tasks — so a wave can hold an entry far past the point
+ * where its registration was replaced or removed.
+ */
+function isLiveRegistration(reg: ProjectRegistration): boolean {
+    return registeredProjects.get(reg.directory) === reg;
+}
+
+function enqueueStartupProjectRun(reg: ProjectRegistration, db: Database): void {
+    if (startupQueueDepth === 0) {
+        startupChunkDeadlineAt = Date.now() + CHUNK_BACKFILL_TICK_BUDGET_MS;
+    }
+    startupQueueDepth += 1;
+    const chunkDeadlineAt = startupChunkDeadlineAt;
+    startupQueue = startupQueue
+        .then(() => {
+            if (!isLiveRegistration(reg)) {
+                log(
+                    `[dreamer] startup maintenance skipped for ${reg.projectIdentity} — no longer the registered project`,
+                );
+                return;
+            }
+            return runProjectMaintenance(reg, "startup", db, chunkDeadlineAt);
+        })
+        .catch((error) => {
+            log(
+                `[dreamer] startup maintenance failed for ${reg.projectIdentity}: ${getErrorMessage(error)}`,
+            );
+        })
+        .finally(() => {
+            startupQueueDepth -= 1;
+        });
+}
+
 function scheduleInitialProjectRun(reg: ProjectRegistration, db: Database): void {
     if (startupTimers.has(reg.directory)) return;
     const timer = scheduleAfterBootQuiet(() => {
         startupTimers.delete(reg.directory);
-        if (registeredProjects.get(reg.directory) !== reg) return;
-        void runProjectMaintenance(reg, "startup", db);
+        if (!isLiveRegistration(reg)) return;
+        enqueueStartupProjectRun(reg, db);
     }, startupJitterMs(reg.directory));
     startupTimers.set(reg.directory, timer);
 }
@@ -333,6 +425,10 @@ async function runProjectMaintenance(
     reg: ProjectRegistration,
     origin: "startup" | "interval",
     db: Database,
+    /** Shared chunk-backfill deadline for every project in one maintenance
+     *  wave: the interval loop runs them back to back, the startup queue
+     *  chains them, and both spend one budget. */
+    chunkDeadlineAt: number,
 ): Promise<void> {
     const projectMaintenanceEnabled =
         Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
@@ -349,8 +445,22 @@ async function runProjectMaintenance(
                 `[magic-context] proactively embedded ${embeddedCount} ${embeddedCount === 1 ? "memory" : "memories"} for project ${reg.projectIdentity}`,
             );
         }
-        // Compartment-chunk backfill remains demand-driven to avoid bursty
-        // requests to local embedding endpoints.
+        try {
+            const chunkCount = await embedUnembeddedCompartmentChunksForProject(
+                db,
+                reg.projectIdentity,
+                chunkDeadlineAt,
+            );
+            if (chunkCount > 0) {
+                log(
+                    `[magic-context] recovered ${chunkCount} missing compartment chunk embedding(s) for project ${reg.projectIdentity}`,
+                );
+            }
+        } catch (error) {
+            log(
+                `[magic-context] chunk backfill failed for ${reg.projectIdentity}: ${getErrorMessage(error)}`,
+            );
+        }
     }
     await sweepProject(reg, origin, db);
 }

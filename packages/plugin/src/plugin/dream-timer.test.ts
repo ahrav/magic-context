@@ -1,8 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../features/magic-context/storage";
+import { BOOT_QUIET_MS, setBootQuietPeriodForTests } from "./boot-quiet";
+import { resetStartupJitterSlotsForTests, startDreamScheduleTimer } from "./dream-timer";
 
 /**
  * Regression coverage for the schema-fence / null-DB crash:
@@ -145,4 +147,284 @@ describe("dream-timer dead-directory guard (static)", () => {
         expect(guardIdx).toBeGreaterThan(0);
         expect(gcIdx).toBeGreaterThan(guardIdx);
     });
+});
+
+describe("dream-timer normal chunk recovery trigger (static)", () => {
+    const source = readFileSync(join(import.meta.dir, "dream-timer.ts"), "utf8");
+
+    test("runProjectMaintenance drains missing compartment chunks under the existing selector", () => {
+        const maintenance = source.slice(
+            source.indexOf("async function runProjectMaintenance("),
+            source.indexOf("async function sweepProject("),
+        );
+        expect(maintenance).toContain("embedUnembeddedMemoriesForProject(db, reg.projectIdentity)");
+        expect(maintenance).toContain("embedUnembeddedCompartmentChunksForProject");
+    });
+
+    test("no ledger scan, ledger lease, or recovery queue is introduced", () => {
+        expect(source).not.toContain("synapse_batch_ledger");
+        expect(source).not.toContain("SynapseLedger");
+        expect(source).not.toContain("recoveryQueue");
+    });
+});
+
+/**
+ * Startup project passes are scheduled as jittered timers, one per project.
+ * Each pass can drain that project's chunk backlog for minutes, so unless the
+ * passes are chained they overlap and load the shared provider and DB at once.
+ * `ensureRegistered` is the first await of every pass, which makes it the
+ * concurrency probe: two projects' passes must never be inside it together.
+ */
+describe("dream-timer startup maintenance", () => {
+    /** Mirrors DREAM_TIMER_INTERVAL_MS, the delay the timer's interval tick is
+     *  registered under. */
+    const TIMER_INTERVAL_MS = 15 * 60 * 1000;
+    const dirs: string[] = [];
+    const originalXdgDataHome = process.env.XDG_DATA_HOME;
+
+    // Jitter slots live at module scope and are shared by every test in this
+    // file, so the slot pair this test's projects receive — and therefore the
+    // delay between their two passes — is only known once the slots are cleared.
+    beforeEach(() => {
+        resetStartupJitterSlotsForTests();
+    });
+
+    afterEach(() => {
+        setBootQuietPeriodForTests(null);
+        process.env.XDG_DATA_HOME = originalXdgDataHome;
+        for (const dir of dirs.splice(0)) {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("a second project's pass waits for the first instead of draining concurrently", async () => {
+        const dataHome = mkdtempSync(join(tmpdir(), "mc-startup-home-"));
+        const first = mkdtempSync(join(tmpdir(), "mc-startup-a-"));
+        const second = mkdtempSync(join(tmpdir(), "mc-startup-b-"));
+        dirs.push(dataHome, first, second);
+        process.env.XDG_DATA_HOME = dataHome;
+        // Boot quiet already elapsed, so only the per-project jitter delays the
+        // passes: slot 0 fires within 1s and slot 1 within 2s of the tick.
+        setBootQuietPeriodForTests(Date.now() - BOOT_QUIET_MS);
+
+        const inPass = new Set<string>();
+        let maxConcurrent = 0;
+        const entered: string[] = [];
+        // Longer than the whole jitter span, so an unchained second pass is
+        // guaranteed to start while the first is still inside this await.
+        const passWorkMs = 2_200;
+        const probe = (identity: string) => async () => {
+            if (!entered.includes(identity)) entered.push(identity);
+            inPass.add(identity);
+            maxConcurrent = Math.max(maxConcurrent, inPass.size);
+            await new Promise((resolve) => setTimeout(resolve, passWorkMs));
+            inPass.delete(identity);
+        };
+
+        const stops: Array<(() => void) | undefined> = [];
+        try {
+            for (const [directory, identity] of [
+                [first, "dir:startup-a"],
+                [second, "dir:startup-b"],
+            ] as const) {
+                stops.push(
+                    await startDreamScheduleTimer({
+                        directory,
+                        projectIdentity: identity,
+                        client: {} as never,
+                        memoryEnabled: true,
+                        ensureRegistered: probe(identity),
+                    }),
+                );
+            }
+
+            const deadline = Date.now() + 15_000;
+            while (entered.length < 2 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            while (inPass.size > 0 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+
+            expect(entered.sort()).toEqual(["dir:startup-a", "dir:startup-b"]);
+            expect(maxConcurrent).toBe(1);
+        } finally {
+            for (const stop of stops) stop?.();
+        }
+    }, 30_000);
+
+    /**
+     * The queue is serialized, so an entry waits out every earlier project's
+     * drains — a shared chunk-backfill budget plus per-project git and
+     * smart-note drains and due dreamer tasks. That window is long enough for a
+     * directory to be unregistered (instance disposed) or re-registered with a
+     * fresh config after its entry was queued, so the registration each entry
+     * carries is re-checked when the entry reaches the front of the queue.
+     * `ensureRegistered` is the first await of every pass, so the identities it
+     * records report exactly which passes ran.
+     */
+    test("a project unregistered while queued is skipped and the rest of the wave still runs", async () => {
+        const dataHome = mkdtempSync(join(tmpdir(), "mc-stale-home-"));
+        // Registration order fixes the jitter slots, and therefore the queue
+        // order: the first registration starts the timer and is scheduled last
+        // (by the startup tick), so the second gets slot 0 and dequeues first.
+        const survivor = mkdtempSync(join(tmpdir(), "mc-stale-survivor-"));
+        const gate = mkdtempSync(join(tmpdir(), "mc-stale-gate-"));
+        const victim = mkdtempSync(join(tmpdir(), "mc-stale-victim-"));
+        dirs.push(dataHome, survivor, gate, victim);
+        process.env.XDG_DATA_HOME = dataHome;
+        // Boot quiet already elapsed, so only the per-project jitter delays the
+        // passes: slots 0..2 all fire within 3s of the startup tick.
+        setBootQuietPeriodForTests(Date.now() - BOOT_QUIET_MS);
+
+        const entered: string[] = [];
+        let releaseGatePass: () => void = () => {};
+        const gatePassGate = new Promise<void>((resolve) => {
+            releaseGatePass = resolve;
+        });
+        const probe = (identity: string) => async () => {
+            if (!entered.includes(identity)) entered.push(identity);
+            // The head-of-queue pass parks here, holding the queue open long
+            // enough for the two later entries to be queued and for one of them
+            // to be unregistered before its turn.
+            if (identity === "dir:stale-gate") await gatePassGate;
+        };
+
+        const stops = new Map<string, (() => void) | undefined>();
+        try {
+            for (const [directory, identity] of [
+                [survivor, "dir:stale-survivor"],
+                [gate, "dir:stale-gate"],
+                [victim, "dir:stale-victim"],
+            ] as const) {
+                stops.set(
+                    identity,
+                    await startDreamScheduleTimer({
+                        directory,
+                        projectIdentity: identity,
+                        client: {} as never,
+                        memoryEnabled: true,
+                        ensureRegistered: probe(identity),
+                    }),
+                );
+            }
+
+            const deadline = Date.now() + 20_000;
+            while (entered.length === 0 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            expect(entered).toEqual(["dir:stale-gate"]);
+
+            // Past the last jitter slot (2 * 1s slot + sub-slot hash), so both
+            // remaining projects are queued behind the parked pass.
+            await new Promise((resolve) => setTimeout(resolve, 3_300));
+            expect(entered).toEqual(["dir:stale-gate"]);
+
+            // Unregistering now leaves a queued entry whose registration is no
+            // longer live.
+            stops.get("dir:stale-victim")?.();
+            stops.delete("dir:stale-victim");
+
+            releaseGatePass();
+            while (!entered.includes("dir:stale-survivor") && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            // Settle time for a victim pass that should never open.
+            await new Promise((resolve) => setTimeout(resolve, 300));
+
+            expect(entered).not.toContain("dir:stale-victim");
+            expect(entered.sort()).toEqual(["dir:stale-gate", "dir:stale-survivor"]);
+        } finally {
+            releaseGatePass();
+            for (const stop of stops.values()) stop?.();
+        }
+    }, 40_000);
+
+    /**
+     * A startup wave's passes run on `startupQueue`, outside the tick that
+     * scheduled them, and one wave can outlast the timer's interval: it spends a
+     * whole shared chunk-backfill budget plus its memory and git drains. An
+     * interval pass drives the same provider and database, so it yields while
+     * the wave is draining and runs once the wave is done. `ensureRegistered` is
+     * the first await of every pass, so its call count reports which passes ran.
+     */
+    test("an interval tick yields to a draining startup wave and runs after it", async () => {
+        const dataHome = mkdtempSync(join(tmpdir(), "mc-interval-home-"));
+        const project = mkdtempSync(join(tmpdir(), "mc-interval-a-"));
+        dirs.push(dataHome, project);
+        process.env.XDG_DATA_HOME = dataHome;
+        // Boot quiet already elapsed, so only slot 0's sub-second jitter delays
+        // the startup pass.
+        setBootQuietPeriodForTests(Date.now() - BOOT_QUIET_MS);
+
+        // Interval ticks are fire-and-forget on a 15-minute setInterval;
+        // capturing the callback makes one invocable at a chosen moment. A
+        // mismatch on the delay leaves the handle undefined, which the
+        // assertion below reports.
+        const originalSetInterval = globalThis.setInterval;
+        let fireIntervalTick: (() => void) | undefined;
+        globalThis.setInterval = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+            if (typeof handler === "function" && timeout === TIMER_INTERVAL_MS) {
+                fireIntervalTick = handler as () => void;
+                // A parked real timer keeps unref()/clearInterval() working on
+                // the handle the timer stores.
+                return originalSetInterval(() => {}, 2 ** 30);
+            }
+            return originalSetInterval(handler, timeout, ...args);
+        }) as unknown as typeof setInterval;
+
+        let calls = 0;
+        let releaseStartupPass: () => void = () => {};
+        const startupPassGate = new Promise<void>((resolve) => {
+            releaseStartupPass = resolve;
+        });
+        // The wave's pass parks inside its first await, holding the startup
+        // queue open; every later call returns at once.
+        const ensureRegistered = async () => {
+            calls += 1;
+            if (calls === 1) await startupPassGate;
+        };
+
+        const stops: Array<(() => void) | undefined> = [];
+        try {
+            stops.push(
+                await startDreamScheduleTimer({
+                    directory: project,
+                    projectIdentity: "dir:interval-a",
+                    client: {} as never,
+                    memoryEnabled: true,
+                    ensureRegistered,
+                }),
+            );
+
+            const deadline = Date.now() + 15_000;
+            while (calls === 0 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            expect(calls).toBe(1);
+            expect(fireIntervalTick).toBeDefined();
+
+            // An interval tick landing mid-wave must not open a second pass.
+            fireIntervalTick?.();
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            expect(calls).toBe(1);
+
+            releaseStartupPass();
+            while (calls < 2 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            expect(calls).toBe(2);
+
+            // Once the queue drains, an interval tick runs its pass.
+            while (calls < 3 && Date.now() < deadline) {
+                fireIntervalTick?.();
+                await new Promise((resolve) => setTimeout(resolve, 25));
+            }
+            expect(calls).toBeGreaterThanOrEqual(3);
+        } finally {
+            globalThis.setInterval = originalSetInterval;
+            releaseStartupPass();
+            for (const stop of stops) stop?.();
+        }
+    }, 30_000);
 });

@@ -71,7 +71,8 @@ function getLoadUnembeddedStatement(db: Database): PreparedStatement {
             `SELECT c.sha AS sha, c.message AS message
              FROM git_commits c
              LEFT JOIN git_commit_embeddings e ON c.sha = e.sha AND e.model_id = ?
-             WHERE c.project_path = ? AND e.sha IS NULL
+             WHERE c.project_path = ? AND e.sha IS NULL AND c.message != ''
+               AND length(CAST(c.message AS BLOB)) <= ?
              ORDER BY c.committed_at DESC
              LIMIT ?`,
         );
@@ -102,6 +103,14 @@ export function saveCommitEmbedding(
     getSaveStatement(db).run(sha, bytes, modelId, Date.now());
 }
 
+export function hasCommitEmbedding(db: Database, sha: string, modelId: string): boolean {
+    return Boolean(
+        db
+            .prepare("SELECT 1 FROM git_commit_embeddings WHERE sha = ? AND model_id = ? LIMIT 1")
+            .get(sha, modelId),
+    );
+}
+
 /** The join to `git_commits` drops embeddings whose commit row is gone, so an
  *  orphan vector can never reach ranking. */
 export function loadProjectCommitEmbeddings(
@@ -128,13 +137,31 @@ export function loadProjectCommitEmbeddings(
     return map;
 }
 
+/**
+ * Commits with no embedding row for `modelId`, newest first.
+ *
+ * A commit created with an empty message carries no embeddable text: the host
+ * rejects an empty item, and one rejected item fails every page of the batch's
+ * application group. Because such a row is never embeddable, selecting it makes
+ * the newest batch fail forever and the drain — which stops as soon as a batch
+ * embeds nothing — never reaches the commits behind it. Excluding it in the
+ * selection is what retires it: it is permanently not work, so it never enters
+ * a batch and never blocks one. The same applies to text above a provider's
+ * per-item byte cap.
+ */
 export function loadUnembeddedCommits(
     db: Database,
     projectPath: string,
     modelId: string,
     limit: number,
+    maxInputBytes = Number.MAX_SAFE_INTEGER,
 ): Array<{ sha: string; message: string }> {
-    return getLoadUnembeddedStatement(db).all(modelId, projectPath, limit) as UnembeddedRow[];
+    return getLoadUnembeddedStatement(db).all(
+        modelId,
+        projectPath,
+        maxInputBytes,
+        limit,
+    ) as UnembeddedRow[];
 }
 
 export function countEmbeddedCommits(db: Database, projectPath: string, modelId: string): number {

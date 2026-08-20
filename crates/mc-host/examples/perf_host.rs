@@ -35,8 +35,8 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 struct EchoHandler;
 
 impl McHostHandler for EchoHandler {
-    fn manifest(&self) -> ManifestSnapshot {
-        ManifestSnapshot {
+    fn manifests(&self) -> Vec<ManifestSnapshot> {
+        vec![ManifestSnapshot {
             module_id: "perf-echo".to_owned(),
             module_version: "0.0.0".to_owned(),
             provides: vec![serde_json::json!({
@@ -52,14 +52,19 @@ impl McHostHandler for EchoHandler {
                 "sub_supervises": false
             })],
             control_ops: Vec::new(),
-        }
+        }]
     }
 
     async fn initialize(&self, _init: HostInit) -> Result<(), InitError> {
         Ok(())
     }
 
-    async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
+    async fn bind(
+        &self,
+        _route: RouteHandle,
+        _target: mc_host::RouteTarget,
+        _identity: RouteIdentity,
+    ) -> BindOutcome {
         BindOutcome::Accept
     }
 
@@ -87,6 +92,8 @@ impl McHostHandler for EchoHandler {
     async fn health(&self) -> HealthReport {
         HealthReport::ok()
     }
+
+    async fn shutdown(&self) {}
 }
 
 #[tokio::main]

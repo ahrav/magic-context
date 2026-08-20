@@ -8,10 +8,13 @@ import {
     buildCanonicalChunkTextFromFts,
     buildCompartmentSummaryFallbackText,
     type CompartmentChunkBackfillCandidate,
+    type CompartmentChunkWindow,
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
     countSessionCompartmentEmbedCoverage,
     countUnembeddedSessionCompartments,
+    deleteCompartmentChunkEmbeddingsForModel,
+    getExistingChunkHashes,
     loadUnembeddedCompartmentChunkCandidates,
     loadUnembeddedSessionChunkCandidates,
     normalizeCompartmentChunkMaxInputTokens,
@@ -20,6 +23,7 @@ import {
 } from "./compartment-chunk-embedding";
 import {
     countEmbeddedCommits,
+    hasCommitEmbedding,
     loadUnembeddedCommits,
     saveCommitEmbedding,
 } from "./git-commits/storage-git-commit-embeddings";
@@ -33,15 +37,24 @@ import { invalidateProject } from "./memory/embedding-cache";
 import { getEmbeddingProviderIdentity } from "./memory/embedding-identity";
 import { LocalEmbeddingProvider } from "./memory/embedding-local";
 import { OpenAICompatibleEmbeddingProvider } from "./memory/embedding-openai";
-import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
+import type {
+    DetailedEmbedContext,
+    DetailedEmbedItem,
+    EmbeddingPageReceipt,
+    EmbeddingProvider,
+    EmbeddingPurpose,
+} from "./memory/embedding-provider";
 import {
-    getSynapseBatchRequestKey,
-    SYNAPSE_DEFAULT_MODEL,
+    normalizeSynapseTokenBudget,
+    SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
+    SYNAPSE_MAX_INPUT_BYTES,
     SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
 } from "./memory/embedding-synapse";
 import {
     getMemoryEmbedCoverage,
+    hasMemoryEmbedding,
+    saveEmbedding,
     saveEmbeddingIfHashMatches,
 } from "./memory/storage-memory-embeddings";
 import {
@@ -49,9 +62,9 @@ import {
     repairMisScopedCompartmentChunkEmbeddingsForProject,
 } from "./session-project-storage";
 import {
-    beginSynapseBatchLedger,
-    finishSynapseBatchLedger,
+    applySynapseReceiptGroup,
     pruneSynapseBatchLedgerForProject,
+    reopenCompleteSynapseLedgerGroupWithProof,
 } from "./storage-embedding-measurements";
 
 const OFF_PROVIDER_IDENTITY = "embedding-provider:off";
@@ -428,17 +441,32 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
     if (config.provider === "synapse") {
         const synapse = config as EmbeddingConfig & {
             model?: string;
+            max_input_tokens?: number;
+            synapse_max_input_bytes?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
             synapse_provenance?: unknown;
         };
+        const tokenBudget = normalizeSynapseTokenBudget(synapse.synapse_recommended_token_budget);
         return {
             provider: "synapse",
             model: synapse.model?.trim() || "gte-modernbert-base-f16",
-            max_input_tokens: SYNAPSE_MAX_INPUT_TOKENS,
+            max_input_tokens:
+                typeof synapse.max_input_tokens === "number" &&
+                Number.isInteger(synapse.max_input_tokens) &&
+                synapse.max_input_tokens > 0
+                    ? synapse.max_input_tokens
+                    : SYNAPSE_MAX_INPUT_TOKENS,
+            synapse_max_input_bytes:
+                typeof synapse.synapse_max_input_bytes === "number" &&
+                Number.isInteger(synapse.synapse_max_input_bytes) &&
+                synapse.synapse_max_input_bytes >= 4
+                    ? synapse.synapse_max_input_bytes
+                    : SYNAPSE_MAX_INPUT_BYTES,
             ...(synapse.synapse_connection_file
                 ? { synapse_connection_file: synapse.synapse_connection_file }
                 : {}),
@@ -454,6 +482,7 @@ function resolveEmbeddingConfig(config?: EmbeddingConfig): EmbeddingConfig {
             ...(typeof synapse.synapse_recommended_batch === "number"
                 ? { synapse_recommended_batch: synapse.synapse_recommended_batch }
                 : {}),
+            ...(tokenBudget !== undefined ? { synapse_recommended_token_budget: tokenBudget } : {}),
             ...(synapse.synapse_provenance !== undefined
                 ? { synapse_provenance: synapse.synapse_provenance }
                 : {}),
@@ -498,11 +527,14 @@ function createProvider(
     if (config.provider === "synapse") {
         const synapse = config as EmbeddingConfig & {
             model?: string;
+            max_input_tokens?: number;
+            synapse_max_input_bytes?: number;
             synapse_connection_file?: string;
             synapse_fingerprint?: string;
             synapse_table_epoch?: number;
             synapse_dims?: number;
             synapse_recommended_batch?: number;
+            synapse_recommended_token_budget?: number;
             synapse_provenance?: unknown;
         };
         return new SynapseEmbeddingProvider({
@@ -514,6 +546,11 @@ function createProvider(
             tableEpoch: synapse.synapse_table_epoch,
             dims: synapse.synapse_dims,
             recommendedBatch: synapse.synapse_recommended_batch,
+            recommendedTokenBudget: normalizeSynapseTokenBudget(
+                synapse.synapse_recommended_token_budget,
+            ),
+            maxInputTokens: synapse.max_input_tokens,
+            maxInputBytes: synapse.synapse_max_input_bytes,
             provenance: synapse.synapse_provenance,
         });
     }
@@ -558,12 +595,16 @@ function getChunkEmbeddingModelId(config: EmbeddingConfig, providerIdentity: str
     // only providerIdentity so a chunk-window change does not wipe unrelated stores.
     const chunkIdentity = {
         providerIdentity,
-        // v2: windowing targets CHUNK_WINDOW_SAFETY_RATIO * max_input_tokens
-        // instead of the raw ceiling, so boundaries shifted — bump to re-embed.
-        chunkerVersion: 2,
+        // v3 adds Synapse's advertised UTF-8 byte ceiling. Other providers have
+        // no byte cap, so they retain v2 identity and avoid a no-op re-embed.
+        chunkerVersion: config.provider === "synapse" ? 3 : 2,
         maxInputTokens: normalizeCompartmentChunkMaxInputTokens(
             "max_input_tokens" in config ? config.max_input_tokens : undefined,
         ),
+        maxInputBytes:
+            config.provider === "synapse" && "synapse_max_input_bytes" in config
+                ? config.synapse_max_input_bytes
+                : undefined,
         truncate: config.provider === "openai-compatible" ? (config.truncate ?? "") : "",
     };
     return `${providerIdentity}:chunk:${sha256Prefix(stableStringify(chunkIdentity))}`;
@@ -1448,82 +1489,679 @@ export async function flushShadowEmbeddingBacklog(
     }
 }
 
+type DetailedCapableProvider = EmbeddingProvider & {
+    embedItemsDetailed: NonNullable<EmbeddingProvider["embedItemsDetailed"]>;
+};
+
+interface DetailedLane {
+    provider: DetailedCapableProvider;
+    laneRole: "primary" | "shadow";
+    sessionId: string;
+    /** Storage model id for memory/commit destination rows. */
+    modelId: string;
+    /** Storage model id for chunk destination rows. */
+    chunkModelId: string;
+    /** Page timeout this lane's provider applies to the deadlines it writes.
+     *  A reopen rewrites the deadline of the very row the provider created, so
+     *  both deadlines must come from one basis: a provider running a non-default
+     *  timeout would otherwise poll a page against its own budget while the row
+     *  advertises a lease from an unrelated one. */
+    batchTimeoutMs: number;
+    /** True while the registration that produced this lane is still current. */
+    stillCurrent: () => boolean;
+}
+
+/** Page timeout the provider itself resolves for its ledger deadlines. Reading
+ *  it keeps a reopened row on the same deadline basis the provider used to open
+ *  it; a provider that does not publish one is a non-journaling lane, which
+ *  falls back to the same default the ledger helpers assume. */
+function providerBatchTimeoutMs(provider: EmbeddingProvider): number {
+    const published = (provider as unknown as { pageTimeoutMs?: unknown }).pageTimeoutMs;
+    return typeof published === "number" && Number.isFinite(published) && published > 0
+        ? published
+        : SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS;
+}
+
+/** Resolve the lane's provider only when it can journal versioned receipts.
+ *  Providers without embedItemsDetailed (local, openai-compatible, test fakes)
+ *  return null and keep their existing non-ledger paths. */
+function getDetailedLane(
+    projectIdentity: string,
+    laneRole: "primary" | "shadow",
+): DetailedLane | null {
+    if (laneRole === "shadow") {
+        const registration = shadowRegistrations.get(projectIdentity);
+        const provider = registration?.provider;
+        if (!registration || !provider?.embedItemsDetailed) return null;
+        return {
+            provider: provider as DetailedCapableProvider,
+            laneRole,
+            sessionId: `shadow:${projectIdentity}`,
+            modelId: registration.modelId,
+            chunkModelId: registration.chunkModelId,
+            batchTimeoutMs: providerBatchTimeoutMs(provider),
+            stillCurrent: () => shadowRegistrations.get(projectIdentity) === registration,
+        };
+    }
+    const registration = projectRegistrations.get(projectIdentity);
+    if (!registration || registration.observationMode) return null;
+    const provider = getOrCreateProjectProvider(registration);
+    if (!provider?.embedItemsDetailed) return null;
+    const generation = registration.generation;
+    const runtimeFingerprint = registration.runtimeFingerprint;
+    return {
+        provider: provider as DetailedCapableProvider,
+        laneRole,
+        sessionId: projectIdentity,
+        modelId: registration.modelId,
+        chunkModelId: registration.chunkModelId,
+        batchTimeoutMs: providerBatchTimeoutMs(provider),
+        stillCurrent: () => {
+            const current = projectRegistrations.get(projectIdentity);
+            return (
+                current !== undefined &&
+                current.generation === generation &&
+                current.runtimeFingerprint === runtimeFingerprint
+            );
+        },
+    };
+}
+
+/** Destination-row classification for one reopen-proof transaction. */
+interface DetailedDestinationProbe {
+    /** Classify one manifest item's exact destination row. */
+    state: (item: { id: string; contentSha256: string }) => "absent" | "stale" | "current";
+    /** Remove one manifest item's destination row. A group reopen invalidates
+     *  every item of every page it reopens, so this runs for lanes that cannot
+     *  prove staleness too. */
+    invalidate: (item: { id: string; contentSha256: string }) => void;
+}
+
+interface DetailedApplySpec {
+    db: Database;
+    projectIdentity: string;
+    scope: "memory" | "commit" | "chunk";
+    lane: DetailedLane;
+    items: DetailedEmbedItem[];
+    /** Recompute current source hashes inside the destination transaction. */
+    readCurrentHashes: (ids: readonly string[]) => ReadonlyMap<string, string>;
+    /** Write one application group's destination rows inside that transaction. */
+    writeGroup: (group: string, vectors: ReadonlyMap<string, Float32Array>) => void;
+    /** Build a fresh probe for ONE reopen-proof transaction. Any snapshot the
+     *  probe caches must not outlive that transaction: an earlier proof's
+     *  invalidation changes the destination the next proof must observe. */
+    makeDestinationProbe: () => DetailedDestinationProbe;
+    signal?: AbortSignal;
+}
+
+/**
+ * Embed items through the provider's durable page journal and apply every
+ * fully-covered application group atomically: destination writes and every
+ * contributing receipt's ready->complete CAS share one transaction; a group
+ * with any failed page, missing vector, drifted source, or stale receipt
+ * version applies nothing. When a group's pages report idempotency_conflict,
+ * the group's complete pages are reopened together against one destination
+ * proof and retried once.
+ * Returns the applied item ids per application group.
+ */
+async function embedAndApplyDetailed(spec: DetailedApplySpec): Promise<Map<string, Set<string>>> {
+    const { db, lane, items } = spec;
+    if (items.length === 0) return new Map();
+    const context: DetailedEmbedContext = {
+        db,
+        projectPath: spec.projectIdentity,
+        sessionId: lane.sessionId,
+        scope: spec.scope,
+        laneRole: lane.laneRole,
+    };
+    let result = await lane.provider.embedItemsDetailed(items, context, spec.signal);
+
+    const conflicted = result.failures.filter(
+        (failure) => failure.code === "idempotency_conflict" && failure.rowId !== null,
+    );
+    if (conflicted.length > 0) {
+        const conflictedGroups = new Set(conflicted.map((failure) => failure.applicationGroup));
+        const retryGroups = new Set<string>();
+        for (const group of conflictedGroups) {
+            const reopened = db.transaction(() => {
+                // A changed page has a fresh receipt rather than a conflict.
+                // Its destination evidence still proves every complete sibling
+                // in the atomic group must reopen.
+                const rowIds = (
+                    db
+                        .prepare(
+                            `SELECT id FROM synapse_batch_ledger
+                             WHERE project_path = ? AND session_id = ? AND scope = ?
+                               AND lane_role = ? AND destination_model = ?
+                               AND application_group = ? AND state = 'complete'`,
+                        )
+                        .all(
+                            spec.projectIdentity,
+                            lane.sessionId,
+                            spec.scope,
+                            lane.laneRole,
+                            lane.provider.modelId,
+                            group,
+                        ) as Array<{ id: number }>
+                ).map((row) => row.id);
+                const evidence = items.filter((item) => item.applicationGroup === group);
+                const probe = spec.makeDestinationProbe();
+                let destinationNeedsRepair: boolean | undefined;
+                return reopenCompleteSynapseLedgerGroupWithProof(db, {
+                    rowIds,
+                    deadlineAt: Date.now() + lane.batchTimeoutMs,
+                    destinationState: (item) => {
+                        destinationNeedsRepair ??= evidence.some(
+                            (candidate) => probe.state(candidate) !== "current",
+                        );
+                        return destinationNeedsRepair ? "stale" : probe.state(item);
+                    },
+                    invalidateDestination: probe.invalidate,
+                });
+            })();
+            if (reopened > 0) retryGroups.add(group);
+        }
+        if (retryGroups.size > 0) {
+            const retryItems = items.filter((item) => retryGroups.has(item.applicationGroup));
+            const retried = await lane.provider.embedItemsDetailed(
+                retryItems,
+                context,
+                spec.signal,
+            );
+            // A retried group's first-round results are entirely superseded:
+            // keeping its earlier receipts beside the rerun's would present
+            // duplicate rows for one item set and fail the group preflight.
+            result = {
+                receipts: [
+                    ...result.receipts.filter(
+                        (receipt) => !retryGroups.has(receipt.applicationGroup),
+                    ),
+                    ...retried.receipts,
+                ],
+                failures: [
+                    ...result.failures.filter(
+                        (failure) => !retryGroups.has(failure.applicationGroup),
+                    ),
+                    ...retried.failures,
+                ],
+            };
+        }
+    }
+
+    if (!lane.stillCurrent()) return new Map();
+
+    const expectedByGroup = new Map<string, number>();
+    for (const item of items) {
+        expectedByGroup.set(
+            item.applicationGroup,
+            (expectedByGroup.get(item.applicationGroup) ?? 0) + 1,
+        );
+    }
+    const receiptsByGroup = new Map<string, EmbeddingPageReceipt[]>();
+    for (const receipt of result.receipts) {
+        const list = receiptsByGroup.get(receipt.applicationGroup);
+        if (list) list.push(receipt);
+        else receiptsByGroup.set(receipt.applicationGroup, [receipt]);
+    }
+    const applied = new Map<string, Set<string>>();
+    for (const [group, receipts] of receiptsByGroup) {
+        const covered = receipts.reduce((total, receipt) => total + receipt.items.length, 0);
+        if (covered !== expectedByGroup.get(group)) continue;
+        const vectors = new Map<string, Float32Array>();
+        for (const receipt of receipts) {
+            for (const [id, vector] of receipt.vectors) vectors.set(id, vector);
+        }
+        try {
+            applySynapseReceiptGroup(db, {
+                receipts,
+                expectation: {
+                    scope: spec.scope,
+                    laneRole: lane.laneRole,
+                    destinationModel: lane.provider.modelId,
+                },
+                readCurrentHashes: spec.readCurrentHashes,
+                writeDestination: () => spec.writeGroup(group, vectors),
+            });
+        } catch (error) {
+            log(`[magic-context] synapse receipt group ${group} not applied:`, error);
+            continue;
+        }
+        applied.set(
+            group,
+            new Set(receipts.flatMap((receipt) => receipt.items.map((item) => item.id))),
+        );
+    }
+    return applied;
+}
+
+function memoryIdFromItemId(itemId: string): number {
+    return Number(itemId.slice("memory:".length));
+}
+
+/** Memory application-group size. Memory vectors are independent rows with no
+ *  cross-row atomicity requirement, so the group only bounds how much
+ *  completed inference one failed page can discard. Chunking id-sorted
+ *  memories keeps group identity stable when the caller's candidate set
+ *  shifts: new (higher-id) memories perturb only the tail group. */
+const MEMORY_APPLICATION_GROUP_SIZE = 32;
+
+async function embedMemoryRowsDetailed(
+    db: Database,
+    projectIdentity: string,
+    lane: DetailedLane,
+    memories: readonly { id: number; content: string }[],
+    signal?: AbortSignal,
+): Promise<Map<number, Float32Array>> {
+    const specs = [...memories]
+        .sort((a, b) => a.id - b.id)
+        .map((memory) => ({
+            id: `memory:${memory.id}`,
+            text: memory.content,
+            contentSha256: contentSha256(memory.content),
+        }));
+    const items: DetailedEmbedItem[] = [];
+    for (let start = 0; start < specs.length; start += MEMORY_APPLICATION_GROUP_SIZE) {
+        const chunk = specs.slice(start, start + MEMORY_APPLICATION_GROUP_SIZE);
+        const group = `memory:${sha256Prefix(
+            stableStringify(chunk.map(({ id, contentSha256: hash }) => [id, hash])),
+        )}`;
+        for (const spec of chunk) items.push({ ...spec, applicationGroup: group });
+    }
+    const inferred = new Map<string, Float32Array>();
+    const applied = await embedAndApplyDetailed({
+        db,
+        projectIdentity,
+        scope: "memory",
+        lane,
+        items,
+        signal,
+        readCurrentHashes: (ids) => {
+            const map = new Map<string, string>();
+            if (ids.length === 0) return map;
+            const placeholders = ids.map(() => "?").join(",");
+            const rows = db
+                .prepare(
+                    `SELECT id, content FROM memories
+                     WHERE project_path = ? AND status = 'active' AND id IN (${placeholders})`,
+                )
+                .all(projectIdentity, ...ids.map(memoryIdFromItemId)) as Array<{
+                id: number;
+                content: unknown;
+            }>;
+            for (const row of rows) {
+                if (typeof row.content === "string") {
+                    map.set(`memory:${row.id}`, contentSha256(row.content));
+                }
+            }
+            return map;
+        },
+        writeGroup: (_group, vectors) => {
+            for (const [id, vector] of vectors) {
+                saveEmbedding(db, memoryIdFromItemId(id), vector, lane.modelId);
+                inferred.set(id, vector);
+            }
+        },
+        // Memory staleness is unprovable from the destination row (no per-row
+        // source hash), so the probe never reports "stale"; content edits
+        // delete the row, which reads as "absent".
+        makeDestinationProbe: () => ({
+            state: (item) =>
+                hasMemoryEmbedding(db, memoryIdFromItemId(item.id), lane.modelId)
+                    ? "current"
+                    : "absent",
+            invalidate: (item) => {
+                db.prepare(
+                    "DELETE FROM memory_embeddings WHERE memory_id = ? AND model_id = ?",
+                ).run(memoryIdFromItemId(item.id), lane.modelId);
+            },
+        }),
+    });
+    // writeGroup runs inside the apply transaction, so `inferred` also holds
+    // vectors whose destination write was rolled back with a failed receipt
+    // CAS. The applied ids are the committed set; nothing else may be returned.
+    const written = new Map<number, Float32Array>();
+    for (const ids of applied.values()) {
+        for (const id of ids) {
+            const vector = inferred.get(id);
+            if (vector) written.set(memoryIdFromItemId(id), vector);
+        }
+    }
+    return written;
+}
+
+/** Read-path and drain entry: memory batch through versioned receipts. Returns
+ *  the committed vectors (merge caches only from this), or null when the lane
+ *  has no durable page journal and the caller must use its legacy path. */
+export async function embedMemoriesDetailedForProject(
+    db: Database,
+    projectIdentity: string,
+    memories: readonly { id: number; content: string }[],
+): Promise<Map<number, { embedding: Float32Array; modelId: string }> | null> {
+    const lane = getDetailedLane(projectIdentity, "primary");
+    if (!lane) return null;
+    const written = await embedMemoryRowsDetailed(db, projectIdentity, lane, memories);
+    const out = new Map<number, { embedding: Float32Array; modelId: string }>();
+    for (const [id, embedding] of written) out.set(id, { embedding, modelId: lane.modelId });
+    if (out.size > 0) {
+        enqueueShadowEmbeddingItems(projectIdentity, "memory", [...out.keys()].map(String));
+    }
+    return out;
+}
+
+async function embedCommitRowsDetailed(
+    db: Database,
+    projectIdentity: string,
+    lane: DetailedLane,
+    rows: readonly { sha: string; message: string }[],
+): Promise<Set<string>> {
+    // Empty and over-limit messages fail the host's item schema. Dropping them
+    // before the group is formed keeps one invalid commit from discarding its
+    // otherwise valid siblings.
+    const specs = rows
+        .filter(
+            (row) =>
+                row.message.length > 0 &&
+                Buffer.byteLength(row.message, "utf8") <=
+                    (lane.provider.maxInputBytes ?? SYNAPSE_MAX_INPUT_BYTES),
+        )
+        .map((row) => ({
+            id: `commit:${row.sha}`,
+            text: row.message,
+            contentSha256: contentSha256(row.message),
+        }));
+    const group = `commit:${sha256Prefix(
+        stableStringify(specs.map(({ id, contentSha256: hash }) => [id, hash])),
+    )}`;
+    const items: DetailedEmbedItem[] = specs.map((spec) => ({
+        ...spec,
+        applicationGroup: group,
+    }));
+    const shaFromItemId = (itemId: string): string => itemId.slice("commit:".length);
+    const applied = await embedAndApplyDetailed({
+        db,
+        projectIdentity,
+        scope: "commit",
+        lane,
+        items,
+        readCurrentHashes: (ids) => {
+            const map = new Map<string, string>();
+            if (ids.length === 0) return map;
+            const placeholders = ids.map(() => "?").join(",");
+            const rows = db
+                .prepare(
+                    `SELECT sha, message FROM git_commits
+                     WHERE project_path = ? AND sha IN (${placeholders})`,
+                )
+                .all(projectIdentity, ...ids.map(shaFromItemId)) as Array<{
+                sha: string;
+                message: unknown;
+            }>;
+            for (const row of rows) {
+                if (typeof row.message === "string") {
+                    map.set(`commit:${row.sha}`, contentSha256(row.message));
+                }
+            }
+            return map;
+        },
+        writeGroup: (_group, vectors) => {
+            for (const [id, vector] of vectors) {
+                saveCommitEmbedding(db, shaFromItemId(id), vector, lane.modelId);
+            }
+        },
+        // A commit's source text is fixed by its SHA, so an existing row can
+        // never be source-stale; the probe reports only current or absent.
+        makeDestinationProbe: () => ({
+            state: (item) =>
+                hasCommitEmbedding(db, shaFromItemId(item.id), lane.modelId) ? "current" : "absent",
+            invalidate: (item) => {
+                db.prepare("DELETE FROM git_commit_embeddings WHERE sha = ? AND model_id = ?").run(
+                    shaFromItemId(item.id),
+                    lane.modelId,
+                );
+            },
+        }),
+    });
+    const shas = new Set<string>();
+    for (const ids of applied.values()) {
+        for (const id of ids) shas.add(shaFromItemId(id));
+    }
+    return shas;
+}
+
+/** Embed and persist one batch of commit rows for the primary lane, through
+ *  versioned receipts when the provider journals pages and through the
+ *  existing guarded transaction otherwise. Returns how many commits landed. */
+export async function embedCommitRowsForProject(
+    db: Database,
+    projectIdentity: string,
+    rows: readonly { sha: string; message: string }[],
+): Promise<number> {
+    if (rows.length === 0) return 0;
+    const lane = getDetailedLane(projectIdentity, "primary");
+    if (lane) {
+        const applied = await embedCommitRowsDetailed(db, projectIdentity, lane, rows);
+        if (applied.size > 0) {
+            enqueueShadowEmbeddingItems(projectIdentity, "commit", [...applied]);
+        }
+        return applied.size;
+    }
+    const result = await embedItemsForProject(
+        projectIdentity,
+        rows.map((row) => ({
+            id: `commit:${row.sha}`,
+            text: row.message,
+            contentSha256: contentSha256(row.message),
+        })),
+    );
+    if (!result) return 0;
+    let embeddedCount = 0;
+    db.transaction(() => {
+        for (const row of rows) {
+            const embedding = result.vectors.get(`commit:${row.sha}`);
+            if (!embedding) continue;
+            saveCommitEmbedding(db, row.sha, embedding, result.modelId);
+            embeddedCount += 1;
+        }
+    })();
+    enqueueShadowEmbeddingItems(
+        projectIdentity,
+        "commit",
+        rows.filter((row) => result.vectors.has(`commit:${row.sha}`)).map((row) => row.sha),
+    );
+    return embeddedCount;
+}
+
+interface CompartmentWindowsApplication {
+    compartmentId: number;
+    sessionId: string;
+    windows: readonly CompartmentChunkWindow[];
+    /** Recompute the compartment's current windows inside the transaction;
+     *  defaults to reloading its stored source. */
+    currentWindows?: () => readonly CompartmentChunkWindow[];
+}
+
+/** One application group per compartment: the all-window replacement and every
+ *  contributing page receipt commit together or not at all. */
+async function applyCompartmentWindowsDetailed(
+    db: Database,
+    projectIdentity: string,
+    lane: DetailedLane,
+    args: CompartmentWindowsApplication,
+    signal?: AbortSignal,
+): Promise<boolean> {
+    const group = `compartment:${args.compartmentId}`;
+    const items: DetailedEmbedItem[] = args.windows.map((window) => ({
+        id: `chunk:${args.compartmentId}:${window.windowIndex}`,
+        text: window.text,
+        contentSha256: window.chunkHash,
+        applicationGroup: group,
+    }));
+    const windowIndexFromItemId = (itemId: string): number =>
+        Number(itemId.split(":")[2] ?? Number.NaN);
+    const currentWindows =
+        args.currentWindows ??
+        (() => {
+            const source = db
+                .prepare(
+                    `SELECT start_message, end_message FROM compartments
+                     WHERE id = ? AND session_id = ?`,
+                )
+                .get(args.compartmentId, args.sessionId) as {
+                start_message: number;
+                end_message: number;
+            } | null;
+            if (!source) return [];
+            const text =
+                buildCanonicalChunkTextFromFts(
+                    db,
+                    args.sessionId,
+                    source.start_message,
+                    source.end_message,
+                ) || buildCompartmentSummaryFallbackText(db, args.compartmentId);
+            return chunkCanonicalText(
+                text,
+                source.start_message,
+                source.end_message,
+                getProjectEmbeddingMaxInputTokens(projectIdentity),
+                getProjectEmbeddingMaxInputBytes(projectIdentity),
+            );
+        });
+    const applied = await embedAndApplyDetailed({
+        db,
+        projectIdentity,
+        scope: "chunk",
+        lane,
+        items,
+        signal,
+        readCurrentHashes: (ids) => {
+            const current = currentWindows();
+            if (current.length !== ids.length) return new Map();
+            const byIndex = new Map(current.map((window) => [window.windowIndex, window]));
+            const map = new Map<string, string>();
+            for (const id of ids) {
+                const window = byIndex.get(windowIndexFromItemId(id));
+                if (window) map.set(id, window.chunkHash);
+            }
+            return map;
+        },
+        writeGroup: (_group, vectors) => {
+            const rowsToWrite: SaveCompartmentChunkEmbeddingInput[] = args.windows.map((window) => {
+                const vector = vectors.get(`chunk:${args.compartmentId}:${window.windowIndex}`);
+                if (!vector) {
+                    throw new Error(
+                        `missing chunk vector for window ${window.windowIndex} of compartment ${args.compartmentId}`,
+                    );
+                }
+                return {
+                    compartmentId: args.compartmentId,
+                    sessionId: args.sessionId,
+                    projectPath: projectIdentity,
+                    window,
+                    modelId: lane.chunkModelId,
+                    vector,
+                };
+            });
+            replaceCompartmentChunkEmbeddings(db, rowsToWrite);
+        },
+        makeDestinationProbe: () => {
+            // One snapshot per proof transaction: the proof calls state() once
+            // per manifest item, and re-reading the whole hash map each time
+            // is O(items x windows) for the identical in-transaction answer.
+            // The snapshot must not outlive the proof: an earlier proof's
+            // invalidation deletes the rows the next proof must re-observe.
+            let existing: ReadonlyMap<number, string> | null = null;
+            // Invalidation is compartment-wide, so one call per proof
+            // transaction covers every window in its manifest.
+            let invalidated = false;
+            return {
+                state: (item: { id: string; contentSha256: string }) => {
+                    existing ??= getExistingChunkHashes(
+                        db,
+                        args.compartmentId,
+                        lane.chunkModelId,
+                        projectIdentity,
+                    );
+                    if (existing.size === 0) return "absent";
+                    const hash = existing.get(windowIndexFromItemId(item.id));
+                    return hash === item.contentSha256 ? "current" : "stale";
+                },
+                invalidate: () => {
+                    if (invalidated) return;
+                    invalidated = true;
+                    deleteCompartmentChunkEmbeddingsForModel(
+                        db,
+                        args.compartmentId,
+                        lane.chunkModelId,
+                    );
+                },
+            };
+        },
+    });
+    return applied.has(group);
+}
+
+/** Publish-path entry for one compartment's windows. Returns null when the
+ *  primary lane has no durable page journal (caller uses its legacy path). */
+export async function embedCompartmentWindowsDetailedForProject(
+    db: Database,
+    projectIdentity: string,
+    args: CompartmentWindowsApplication,
+): Promise<boolean | null> {
+    const lane = getDetailedLane(projectIdentity, "primary");
+    if (!lane) return null;
+    const applied = await applyCompartmentWindowsDetailed(db, projectIdentity, lane, args);
+    if (applied) {
+        enqueueShadowEmbeddingItems(projectIdentity, "chunk", [String(args.compartmentId)]);
+    }
+    return applied;
+}
+
 async function embedShadowItems(
     registration: ShadowEmbeddingRegistration,
     items: readonly { id: string; text: string; contentSha256: string }[],
-    db: Database,
-    scope: ShadowScope,
 ): Promise<Map<string, Float32Array>> {
-    const raw = registration.config as unknown as Record<string, unknown>;
-    const fingerprint = typeof raw.synapse_fingerprint === "string" ? raw.synapse_fingerprint : "";
-    const tableEpoch = typeof raw.synapse_table_epoch === "number" ? raw.synapse_table_epoch : 0;
-    const requestKey = getSynapseBatchRequestKey({
-        model: typeof raw.model === "string" ? raw.model : SYNAPSE_DEFAULT_MODEL,
-        fingerprint,
-        tableEpoch,
-        items,
-    });
-    beginSynapseBatchLedger(db, {
-        sessionId: `shadow:${registration.projectIdentity}`,
-        projectPath: registration.projectIdentity,
-        scope,
-        manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
-        requestKey,
-    });
-    try {
-        if (registration.provider.embedItems) {
-            const vectors = await registration.provider.embedItems(items);
-            finishSynapseBatchLedger(
-                db,
-                `shadow:${registration.projectIdentity}`,
-                requestKey,
-                vectors.size === items.length ? "complete" : "partial",
-            );
-            return vectors;
-        }
-        const positional = await registration.provider.embedBatch(items.map((item) => item.text));
-        const vectors = new Map(
-            items.flatMap((item, index) => {
-                const vector = positional[index];
-                return vector ? [[item.id, vector] as const] : [];
-            }),
-        );
-        finishSynapseBatchLedger(
-            db,
-            `shadow:${registration.projectIdentity}`,
-            requestKey,
-            vectors.size === items.length ? "complete" : "partial",
-        );
-        return vectors;
-    } catch (error) {
-        finishSynapseBatchLedger(
-            db,
-            `shadow:${registration.projectIdentity}`,
-            requestKey,
-            "failed",
-        );
-        throw error;
+    if (registration.provider.embedItems) {
+        return registration.provider.embedItems(items);
     }
+    const positional = await registration.provider.embedBatch(items.map((item) => item.text));
+    return new Map(
+        items.flatMap((item, index) => {
+            const vector = positional[index];
+            return vector ? [[item.id, vector] as const] : [];
+        }),
+    );
 }
 
 async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
     const registration = shadowRegistrations.get(item.projectIdentity);
     if (!registration) return;
-    const boundedIds = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
+    if (item.ids.length > SHADOW_MAX_ITEMS_PER_TICK) {
+        throw new Error("shadow worker must split oversized queue items");
+    }
     if (item.scope === "memory") {
         const db = dbForShadowQueue.get(item.projectIdentity);
         if (!db) return;
-        const placeholders = boundedIds.map(() => "?").join(",");
+        const placeholders = item.ids.map(() => "?").join(",");
         const rows = db
             .prepare(
                 `SELECT id, content, normalized_hash FROM memories
                  WHERE project_path = ? AND id IN (${placeholders}) AND status = 'active'`,
             )
-            .all(item.projectIdentity, ...boundedIds.map((id) => Number(id))) as Array<{
+            .all(item.projectIdentity, ...item.ids.map((id) => Number(id))) as Array<{
             id: number;
             content: string;
             normalized_hash: string;
         }>;
+        const shadowLane = getDetailedLane(item.projectIdentity, "shadow");
+        if (shadowLane) {
+            await embedMemoryRowsDetailed(
+                db,
+                item.projectIdentity,
+                shadowLane,
+                rows.map((row) => ({ id: row.id, content: row.content })),
+            );
+            return;
+        }
         const vectors = await embedShadowItems(
             registration,
             rows.map((row) => ({
@@ -1531,8 +2169,6 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
                 text: row.content,
                 contentSha256: contentSha256(row.content),
             })),
-            db,
-            "memory",
         );
         db.transaction(() => {
             for (const row of rows) {
@@ -1552,12 +2188,17 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
     if (item.scope === "commit") {
         const db = dbForShadowQueue.get(item.projectIdentity);
         if (!db) return;
-        const placeholders = boundedIds.map(() => "?").join(",");
+        const placeholders = item.ids.map(() => "?").join(",");
         const rows = db
             .prepare(
                 `SELECT sha, message FROM git_commits WHERE project_path = ? AND sha IN (${placeholders})`,
             )
-            .all(item.projectIdentity, ...boundedIds) as Array<{ sha: string; message: string }>;
+            .all(item.projectIdentity, ...item.ids) as Array<{ sha: string; message: string }>;
+        const shadowLane = getDetailedLane(item.projectIdentity, "shadow");
+        if (shadowLane) {
+            await embedCommitRowsDetailed(db, item.projectIdentity, shadowLane, rows);
+            return;
+        }
         const vectors = await embedShadowItems(
             registration,
             rows.map((row) => ({
@@ -1565,8 +2206,6 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
                 text: row.message,
                 contentSha256: contentSha256(row.message),
             })),
-            db,
-            "commit",
         );
         db.transaction(() => {
             for (const row of rows) {
@@ -1579,18 +2218,23 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
 
     const db = dbForShadowQueue.get(item.projectIdentity);
     if (!db) return;
-    const placeholders = boundedIds.map(() => "?").join(",");
+    const placeholders = item.ids.map(() => "?").join(",");
     const candidates = db
         .prepare(
             `SELECT id, session_id, start_message, end_message
          FROM compartments WHERE id IN (${placeholders})`,
         )
-        .all(...boundedIds.map((id) => Number(id))) as Array<{
+        .all(...item.ids.map((id) => Number(id))) as Array<{
         id: number;
         session_id: string;
         start_message: number;
         end_message: number;
     }>;
+    // One window ceiling for the whole item: the initial windows and the
+    // in-transaction recomputation must window identically, or every hash
+    // comparison against the recomputed set fails.
+    const maxInputTokens = laneMaxInputTokens(registration);
+    const maxInputBytes = laneMaxInputBytes(registration);
     const prepared = candidates.flatMap((candidate) => {
         const text =
             buildCanonicalChunkTextFromFts(
@@ -1604,10 +2248,38 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             text,
             candidate.start_message,
             candidate.end_message,
-            SYNAPSE_MAX_INPUT_TOKENS,
+            maxInputTokens,
+            maxInputBytes,
         );
         return windows.length > 0 ? [{ candidate, windows }] : [];
     });
+    const shadowChunkLane = getDetailedLane(item.projectIdentity, "shadow");
+    if (shadowChunkLane) {
+        for (const preparedItem of prepared) {
+            await applyCompartmentWindowsDetailed(db, item.projectIdentity, shadowChunkLane, {
+                compartmentId: preparedItem.candidate.id,
+                sessionId: preparedItem.candidate.session_id,
+                windows: preparedItem.windows,
+                currentWindows: () => {
+                    const text =
+                        buildCanonicalChunkTextFromFts(
+                            db,
+                            preparedItem.candidate.session_id,
+                            preparedItem.candidate.start_message,
+                            preparedItem.candidate.end_message,
+                        ) || buildCompartmentSummaryFallbackText(db, preparedItem.candidate.id);
+                    return chunkCanonicalText(
+                        text,
+                        preparedItem.candidate.start_message,
+                        preparedItem.candidate.end_message,
+                        maxInputTokens,
+                        maxInputBytes,
+                    );
+                },
+            });
+        }
+        return;
+    }
     const items = prepared.flatMap((item) =>
         item.windows.map((window) => ({
             id: `chunk:${item.candidate.id}:${window.windowIndex}`,
@@ -1615,7 +2287,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             contentSha256: contentSha256(window.text),
         })),
     );
-    const vectors = await embedShadowItems(registration, items, db, "chunk");
+    const vectors = await embedShadowItems(registration, items);
     for (const item of prepared) {
         const rows: SaveCompartmentChunkEmbeddingInput[] = item.windows.flatMap((window) => {
             const vector = vectors.get(`chunk:${item.candidate.id}:${window.windowIndex}`);
@@ -1657,6 +2329,13 @@ async function runShadowWorker(): Promise<void> {
         }
         const item = shadowQueue.shift();
         if (!item) break;
+        if (item.ids.length > SHADOW_MAX_ITEMS_PER_TICK) {
+            shadowQueue.unshift({
+                ...item,
+                ids: item.ids.slice(SHADOW_MAX_ITEMS_PER_TICK),
+            });
+            item.ids = item.ids.slice(0, SHADOW_MAX_ITEMS_PER_TICK);
+        }
         const itemBytes = item.ids.reduce((total, id) => total + id.length, 0);
         if (processed > 0 && processedBytes + itemBytes > SHADOW_MAX_BYTES_PER_TICK) {
             shadowQueue.unshift(item);
@@ -1731,8 +2410,12 @@ export function getProjectChunkEmbeddingModelId(projectIdentity: string): string
     return registration && !registration.observationMode ? registration.chunkModelId : "off";
 }
 
-export function getProjectEmbeddingMaxInputTokens(projectIdentity: string): number {
-    const registration = projectRegistrations.get(projectIdentity);
+/** Chunk window ceiling for one lane: the provider's advertised window when it
+ *  reports one (the host can advertise a different window than the config's
+ *  default), else the lane's configured cap. */
+function laneMaxInputTokens(
+    registration: { config: EmbeddingConfig; provider: EmbeddingProvider | null } | undefined,
+): number {
     const configMax =
         registration?.config && "max_input_tokens" in registration.config
             ? registration.config.max_input_tokens
@@ -1740,6 +2423,30 @@ export function getProjectEmbeddingMaxInputTokens(projectIdentity: string): numb
     return normalizeCompartmentChunkMaxInputTokens(
         registration?.provider?.maxInputTokens ?? configMax,
     );
+}
+
+function laneMaxInputBytes(
+    registration: { config: EmbeddingConfig; provider: EmbeddingProvider | null } | undefined,
+): number | undefined {
+    const configMax =
+        registration?.config.provider === "synapse" &&
+        "synapse_max_input_bytes" in registration.config
+            ? registration.config.synapse_max_input_bytes
+            : undefined;
+    const maxInputBytes = registration?.provider?.maxInputBytes ?? configMax;
+    return typeof maxInputBytes === "number" &&
+        Number.isInteger(maxInputBytes) &&
+        maxInputBytes >= 4
+        ? maxInputBytes
+        : undefined;
+}
+
+export function getProjectEmbeddingMaxInputTokens(projectIdentity: string): number {
+    return laneMaxInputTokens(projectRegistrations.get(projectIdentity));
+}
+
+export function getProjectEmbeddingMaxInputBytes(projectIdentity: string): number | undefined {
+    return laneMaxInputBytes(projectRegistrations.get(projectIdentity));
 }
 
 function getOrCreateProjectProvider(
@@ -1829,8 +2536,6 @@ export async function embedItemsForProject(
     projectIdentity: string,
     items: readonly { id: string; text: string; contentSha256: string }[],
     signal?: AbortSignal,
-    db?: Database,
-    sessionId = projectIdentity,
 ): Promise<{ vectors: Map<string, Float32Array>; modelId: string; generation: number } | null> {
     const registration = projectRegistrations.get(projectIdentity);
     if (!registration || registration.observationMode || items.length === 0) return null;
@@ -1840,63 +2545,20 @@ export async function embedItemsForProject(
     const provider = getOrCreateProjectProvider(registration);
     if (!provider) return null;
 
-    const rawConfig = registration.config as unknown as Record<string, unknown>;
-    const fingerprint =
-        typeof rawConfig.synapse_fingerprint === "string" ? rawConfig.synapse_fingerprint : "";
-    const tableEpoch =
-        typeof rawConfig.synapse_table_epoch === "number"
-            ? rawConfig.synapse_table_epoch
-            : undefined;
-    const isSynapse =
-        registration.providerIdentity.startsWith("synapse:v1:") &&
-        fingerprint &&
-        tableEpoch !== undefined;
-    const ledgerKey = isSynapse
-        ? getSynapseBatchRequestKey({
-              model: typeof rawConfig.model === "string" ? rawConfig.model : registration.modelId,
-              fingerprint,
-              tableEpoch,
-              items,
-          })
-        : null;
-    if (db && ledgerKey) {
-        beginSynapseBatchLedger(db, {
-            sessionId,
-            projectPath: projectIdentity,
-            scope: items[0].id.split(":", 1)[0] as "memory" | "commit" | "chunk",
-            manifest: items.map(({ id, contentSha256 }) => ({ id, contentSha256 })),
-            requestKey: ledgerKey,
-        });
-    }
-
     let vectors: Map<string, Float32Array>;
-    try {
-        if (provider.embedItems) {
-            vectors = await provider.embedItems(items, signal);
-        } else {
-            const positional = await provider.embedBatch(
-                items.map((item) => item.text),
-                signal,
-                "passage",
-            );
-            vectors = new Map(
-                items.flatMap((item, index) => {
-                    const vector = positional[index];
-                    return vector ? [[item.id, vector] as const] : [];
-                }),
-            );
-        }
-    } catch (error) {
-        if (db && ledgerKey) finishSynapseBatchLedger(db, sessionId, ledgerKey, "failed");
-        throw error;
-    }
-
-    if (db && ledgerKey) {
-        finishSynapseBatchLedger(
-            db,
-            sessionId,
-            ledgerKey,
-            vectors.size === items.length ? "complete" : "partial",
+    if (provider.embedItems) {
+        vectors = await provider.embedItems(items, signal);
+    } else {
+        const positional = await provider.embedBatch(
+            items.map((item) => item.text),
+            signal,
+            "passage",
+        );
+        vectors = new Map(
+            items.flatMap((item, index) => {
+                const vector = positional[index];
+                return vector ? [[item.id, vector] as const] : [];
+            }),
         );
     }
 
@@ -1916,10 +2578,9 @@ async function embedItemsWindowBounded(
     projectIdentity: string,
     items: readonly { id: string; text: string; contentSha256: string }[],
     signal?: AbortSignal,
-    db?: Database,
 ): Promise<Awaited<ReturnType<typeof embedItemsForProject>>> {
     if (items.length <= MAX_WINDOWS_PER_EMBED_CALL) {
-        return embedItemsForProject(projectIdentity, items, signal, db, projectIdentity);
+        return embedItemsForProject(projectIdentity, items, signal);
     }
     const vectors = new Map<string, Float32Array>();
     let modelId: string | null = null;
@@ -1929,8 +2590,6 @@ async function embedItemsWindowBounded(
             projectIdentity,
             items.slice(start, start + MAX_WINDOWS_PER_EMBED_CALL),
             signal,
-            db,
-            projectIdentity,
         );
         if (!result) return null;
         if (modelId === null) {
@@ -1980,6 +2639,23 @@ export async function embedUnembeddedMemoriesForProject(
     if (memories.length === 0) return 0;
 
     try {
+        const lane = getDetailedLane(projectIdentity, "primary");
+        if (lane) {
+            const written = await embedMemoryRowsDetailed(
+                db,
+                projectIdentity,
+                lane,
+                memories.map((memory) => ({ id: memory.id, content: memory.content })),
+            );
+            if (written.size > 0) {
+                enqueueShadowEmbeddingItems(
+                    projectIdentity,
+                    "memory",
+                    [...written.keys()].map(String),
+                );
+            }
+            return written.size;
+        }
         const result = await embedItemsForProject(
             projectIdentity,
             memories.map((memory) => ({
@@ -1987,9 +2663,6 @@ export async function embedUnembeddedMemoriesForProject(
                 text: memory.content,
                 contentSha256: contentSha256(memory.content),
             })),
-            undefined,
-            db,
-            projectIdentity,
         );
         if (!result) return 0;
 
@@ -2025,52 +2698,37 @@ export async function embedUnembeddedMemoriesForProject(
     }
 }
 
-/** Drain a single batch of unembedded commits. Returns how many embedded. */
+interface CommitBatchResult {
+    selected: number;
+    embedded: number;
+}
+
+/** Drain a single batch of unembedded commits. */
 async function embedCommitBatch(
     db: Database,
     projectIdentity: string,
     batchSize: number,
-): Promise<number> {
+): Promise<CommitBatchResult> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.gitCommitEnabled) return 0;
+    if (!snapshot?.gitCommitEnabled) return { selected: 0, embedded: 0 };
+    const limit = Math.max(1, Math.floor(batchSize));
+    const registration = projectRegistrations.get(projectIdentity);
+    const detailed = getDetailedLane(projectIdentity, "primary") !== null;
+    const maxInputBytes = detailed
+        ? (laneMaxInputBytes(registration) ?? SYNAPSE_MAX_INPUT_BYTES)
+        : Number.MAX_SAFE_INTEGER;
     const commits = loadUnembeddedCommits(
         db,
         projectIdentity,
         snapshot.modelId,
-        Math.max(1, Math.floor(batchSize)),
+        limit,
+        maxInputBytes,
     );
-    if (commits.length === 0) return 0;
-
-    const result = await embedItemsForProject(
-        projectIdentity,
-        commits.map((commit) => ({
-            id: `commit:${commit.sha}`,
-            text: commit.message,
-            contentSha256: contentSha256(commit.message),
-        })),
-        undefined,
-        db,
-        projectIdentity,
-    );
-    if (!result) return 0;
-
-    let embeddedCount = 0;
-    db.transaction(() => {
-        for (const commit of commits) {
-            const embedding = result.vectors.get(`commit:${commit.sha}`);
-            if (!embedding) continue;
-            saveCommitEmbedding(db, commit.sha, embedding, result.modelId);
-            embeddedCount += 1;
-        }
-    })();
-    enqueueShadowEmbeddingItems(
-        projectIdentity,
-        "commit",
-        commits
-            .filter((commit) => result.vectors.has(`commit:${commit.sha}`))
-            .map((commit) => commit.sha),
-    );
-    return embeddedCount;
+    if (commits.length === 0) return { selected: 0, embedded: 0 };
+    return {
+        selected: commits.length,
+        embedded: await embedCommitRowsForProject(db, projectIdentity, commits),
+    };
 }
 
 /**
@@ -2103,6 +2761,7 @@ export async function drainCommitBacklogForProject(
     }
 
     let total = 0;
+    let processed = 0;
     let leaseLost = false;
     const renewal = setInterval(() => {
         try {
@@ -2113,12 +2772,17 @@ export async function drainCommitBacklogForProject(
     }, SESSION_EMBED_LEASE_RENEWAL_MS);
     (renewal as { unref?: () => void }).unref?.();
     try {
-        while (!leaseLost && Date.now() < deadline && total < COMMIT_DRAIN_MAX_PER_SWEEP) {
-            const embedded = await embedCommitBatch(db, projectIdentity, COMMIT_DRAIN_BATCH_SIZE);
+        while (!leaseLost && Date.now() < deadline && processed < COMMIT_DRAIN_MAX_PER_SWEEP) {
+            const batchSize = Math.min(
+                COMMIT_DRAIN_BATCH_SIZE,
+                COMMIT_DRAIN_MAX_PER_SWEEP - processed,
+            );
+            const batch = await embedCommitBatch(db, projectIdentity, batchSize);
+            processed += batch.selected;
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
-            if (leaseLost || embedded === 0) break;
-            total += embedded;
-            if (embedded < COMMIT_DRAIN_BATCH_SIZE) break; // partial batch = drained
+            if (leaseLost || batch.selected === 0) break;
+            total += batch.embedded;
+            if (batch.embedded < batch.selected || batch.selected < batchSize) break;
         }
     } finally {
         clearInterval(renewal);
@@ -2127,13 +2791,27 @@ export async function drainCommitBacklogForProject(
     return total;
 }
 
+interface CompartmentChunkBatchResult {
+    /** Candidates the query returned; 0 means the backlog is drained (or chunk
+     *  embedding is off), which is the drain loop's only "stop, nothing left"
+     *  signal — an all-no-work batch still selected rows and must not stop it. */
+    selected: number;
+    embedded: number;
+    noWork: number[];
+    failed: number[];
+    nextCursor?: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id">;
+}
+
 async function embedCompartmentChunkBatch(
     db: Database,
     projectIdentity: string,
     batchSize: number,
-): Promise<number> {
+    before?: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id">,
+): Promise<CompartmentChunkBatchResult> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled || snapshot.chunkModelId === "off") return 0;
+    if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
+        return { selected: 0, embedded: 0, noWork: [], failed: [] };
+    }
 
     repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
     const candidates = loadUnembeddedCompartmentChunkCandidates(
@@ -2141,17 +2819,23 @@ async function embedCompartmentChunkBatch(
         projectIdentity,
         snapshot.chunkModelId,
         batchSize,
+        before,
     );
-    if (candidates.length === 0) return 0;
-    // Passive sweep ignores `failed`/`noWork` — it's bounded per tick and re-runs
-    // on the next sweep; the session drain is the path that tracks them.
-    const { embedded } = await embedCandidateChunkBatch(
+    if (candidates.length === 0) return { selected: 0, embedded: 0, noWork: [], failed: [] };
+    const { embedded, noWork, failed } = await embedCandidateChunkBatch(
         db,
         projectIdentity,
         snapshot.chunkModelId,
         candidates,
     );
-    return embedded;
+    const tail = candidates[candidates.length - 1];
+    return {
+        selected: candidates.length,
+        embedded,
+        noWork,
+        failed,
+        nextCursor: { createdAt: tail.createdAt, id: tail.id },
+    };
 }
 
 interface CandidateChunkBatchResult {
@@ -2184,6 +2868,7 @@ async function embedCandidateChunkBatch(
     const failed: number[] = [];
     if (candidates.length === 0) return { embedded: 0, noWork, failed };
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
+    const maxInputBytes = getProjectEmbeddingMaxInputBytes(projectIdentity);
 
     type Prepared = {
         candidate: CompartmentChunkBackfillCandidate;
@@ -2211,6 +2896,7 @@ async function embedCandidateChunkBatch(
             candidate.startMessage,
             candidate.endMessage,
             maxInputTokens,
+            maxInputBytes,
         );
         if (
             windows.length === 0 ||
@@ -2223,6 +2909,53 @@ async function embedCandidateChunkBatch(
     }
 
     if (prepared.length === 0) return { embedded: 0, noWork, failed };
+
+    const lane = getDetailedLane(projectIdentity, "primary");
+    if (lane) {
+        let embeddedDetailed = 0;
+        for (const { candidate, windows } of prepared) {
+            if (signal?.aborted) break;
+            let applied = false;
+            try {
+                applied = await applyCompartmentWindowsDetailed(
+                    db,
+                    projectIdentity,
+                    lane,
+                    {
+                        compartmentId: candidate.id,
+                        sessionId: candidate.sessionId,
+                        windows,
+                        currentWindows: () => {
+                            const text =
+                                buildCanonicalChunkTextFromFts(
+                                    db,
+                                    candidate.sessionId,
+                                    candidate.startMessage,
+                                    candidate.endMessage,
+                                ) || buildCompartmentSummaryFallbackText(db, candidate.id);
+                            return chunkCanonicalText(
+                                text,
+                                candidate.startMessage,
+                                candidate.endMessage,
+                                maxInputTokens,
+                                maxInputBytes,
+                            );
+                        },
+                    },
+                    signal,
+                );
+            } catch (error) {
+                log("[magic-context] failed to embed compartment chunks (detailed):", error);
+            }
+            if (applied) {
+                embeddedDetailed += 1;
+                enqueueShadowEmbeddingItems(projectIdentity, "chunk", [String(candidate.id)]);
+            } else if (!signal?.aborted) {
+                failed.push(candidate.id);
+            }
+        }
+        return { embedded: embeddedDetailed, noWork, failed };
+    }
 
     // Embed the prepared compartments in sub-batches bounded by window count so
     // the per-call payload (and the provider's padded tensor / JSON body) stays
@@ -2284,7 +3017,7 @@ async function embedCandidateChunkBatch(
                 // compartment" rule could hand the provider one enormous text array
                 // in a single HTTP call, defeating the payload bound and risking
                 // provider timeouts/rejections (PR #207 review).
-                result = await embedItemsWindowBounded(projectIdentity, items, signal, db);
+                result = await embedItemsWindowBounded(projectIdentity, items, signal);
             } catch (error) {
                 log("[magic-context] failed to proactively embed compartment chunks:", error);
             }
@@ -2359,6 +3092,11 @@ async function drainCompartmentChunkBacklogForProject(
 
     let total = 0;
     let leaseLost = false;
+    // Every selected batch advances the run-local keyset cursor, including
+    // no-work and failed rows. The cursor is not persisted, so provider
+    // failures remain eligible for the next maintenance pass.
+    let cursor: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id"> | undefined;
+    let consecutiveFailedBatches = 0;
     const renewal = setInterval(() => {
         try {
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
@@ -2369,15 +3107,32 @@ async function drainCompartmentChunkBacklogForProject(
     (renewal as { unref?: () => void }).unref?.();
     try {
         while (!leaseLost && Date.now() < deadline && total < CHUNK_DRAIN_MAX_PER_SWEEP) {
-            const embedded = await embedCompartmentChunkBatch(
+            const { selected, embedded, failed, nextCursor } = await embedCompartmentChunkBatch(
                 db,
                 projectIdentity,
                 CHUNK_DRAIN_BATCH_SIZE,
+                cursor,
             );
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
-            if (leaseLost || embedded === 0) break;
+            if (leaseLost) break;
             total += embedded;
-            if (embedded < CHUNK_DRAIN_BATCH_SIZE) break;
+            if (selected === 0) break; // nothing left to select = drained
+            cursor = nextCursor;
+
+            // No-work rows do not reset provider health. Mixed no-work/failed
+            // batches still prove the provider made no progress on attempted
+            // inputs; successful persistence resets the failure streak.
+            if (embedded === 0 && failed.length > 0) {
+                consecutiveFailedBatches += 1;
+                if (consecutiveFailedBatches >= MAX_CONSECUTIVE_FAILED_BATCHES) break;
+            } else if (embedded > 0) {
+                consecutiveFailedBatches = 0;
+            }
+
+            // An all-no-work batch performs no provider await. Yield explicitly
+            // so timers, lease cancellation, and request handling stay live while
+            // the cursor walks a long no-work prefix.
+            await new Promise((resolve) => setTimeout(resolve, 0));
         }
     } finally {
         clearInterval(renewal);
@@ -2386,15 +3141,16 @@ async function drainCompartmentChunkBacklogForProject(
     return total;
 }
 
+/** Passive missing-chunk drain for one project. `deadlineAt` is the shared
+ *  wall-clock budget of the maintenance pass that invoked it — callers that
+ *  iterate several projects must pass ONE deadline across all of them so a
+ *  multi-project pass cannot outrun the caller's own schedule. */
 export async function embedUnembeddedCompartmentChunksForProject(
     db: Database,
     projectIdentity: string,
+    deadlineAt: number = Date.now() + SWEEP_MAX_WALL_CLOCK_MS,
 ): Promise<number> {
-    return drainCompartmentChunkBacklogForProject(
-        db,
-        projectIdentity,
-        Date.now() + SWEEP_MAX_WALL_CLOCK_MS,
-    );
+    return drainCompartmentChunkBacklogForProject(db, projectIdentity, deadlineAt);
 }
 
 export interface SessionChunkBackfillProgress {
