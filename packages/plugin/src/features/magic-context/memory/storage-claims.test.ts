@@ -9,6 +9,7 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { clearSession } from "../storage-meta-session";
+import { isCanonicalProjectIdentity } from "../storage-project-identities";
 import {
     addClaimConflict,
     addVerificationEvent,
@@ -545,11 +546,137 @@ describe("storage-claims: fail-closed reads and lifecycle", () => {
             expect(findClaimGraphCorruption(db)).toEqual({
                 nullPointerClaimIds: [corruptClaimId],
                 evidencelessRevisionIds: [orphanRevisionId],
+                stalePointerClaimIds: [],
             });
             expect(() => getClaimById(db, corruptClaimId)).toThrow(ClaimGraphCorruptionError);
             expect(() => listClaimRevisions(db, corruptClaimId)).toThrow(ClaimGraphCorruptionError);
+            expect(() => getRevisionEvidence(db, orphanRevisionId)).toThrow(
+                ClaimGraphCorruptionError,
+            );
+            expect(getRevisionEvidence(db, 999_999)).toEqual([]);
         } finally {
             closeQuietly(db);
+        }
+    });
+
+    test("a null pointer fails listClaimRevisions closed even when every revision is evidenced", () => {
+        const db = migratedDb();
+        try {
+            const chain = seedEvidenceChain(db);
+            const now = Date.now();
+            const claimId = Number(
+                (
+                    db
+                        .prepare(
+                            "INSERT INTO claims (project_id, subject, predicate, scope, state, created_at) VALUES (?, 'null-ptr', 'p', '', 'active', ?)",
+                        )
+                        .run(chain.projectId, now) as { lastInsertRowid: number | bigint }
+                ).lastInsertRowid,
+            );
+            const revisionId = Number(
+                (
+                    db
+                        .prepare(
+                            "INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at) VALUES (?, 1, 'evidenced', ?, ?)",
+                        )
+                        .run(claimId, sha256Utf8Hex("evidenced"), now) as {
+                        lastInsertRowid: number | bigint;
+                    }
+                ).lastInsertRowid,
+            );
+            db.prepare(
+                "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', ?)",
+            ).run(revisionId, chain.observationId, now);
+
+            expect(() => listClaimRevisions(db, claimId)).toThrow(ClaimGraphCorruptionError);
+            expect(listClaimRevisions(db, 999_999)).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a backward-repointed claim reads as stale-pointer corruption and appends fail typed", () => {
+        const db = migratedDb();
+        try {
+            const chain = seedEvidenceChain(db);
+            const created = createClaim(db, {
+                projectId: chain.projectId,
+                subject: "pointer",
+                predicate: "p",
+                content: "v1",
+                evidence: [{ observationId: chain.observationId }],
+            });
+            if (created.status !== "applied") throw new Error("createClaim failed");
+            const appended = appendClaimRevision(db, {
+                claimId: created.claimId,
+                expectedCurrentRevisionId: created.revisionId,
+                content: "v2",
+                evidence: [{ observationId: chain.observationId }],
+            });
+            if (appended.status !== "applied") throw new Error("appendClaimRevision failed");
+
+            // Direct SQL can move the pointer back to an older same-claim
+            // revision; the clear guard and composite FK both permit it.
+            db.prepare("UPDATE claims SET current_revision_id = ? WHERE id = ?").run(
+                created.revisionId,
+                created.claimId,
+            );
+
+            expect(findClaimGraphCorruption(db).stalePointerClaimIds).toEqual([created.claimId]);
+            expect(() =>
+                appendClaimRevision(db, {
+                    claimId: created.claimId,
+                    expectedCurrentRevisionId: created.revisionId,
+                    content: "v3",
+                    evidence: [{ observationId: chain.observationId }],
+                }),
+            ).toThrow(ClaimGraphCorruptionError);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("the canonical-identity predicate agrees across the writer, the shared helper, and the DDL CHECK", () => {
+        const writerDb = migratedDb();
+        const ddlDb = migratedDb();
+        try {
+            const fixtures = [
+                "git:abc123",
+                "dir:deadbeef",
+                "git:a",
+                "dir:a b",
+                "git:",
+                "dir:",
+                "git",
+                "",
+                "/home/user/project",
+                "GIT:abc",
+                "gitx:abc",
+            ];
+            for (const identity of fixtures) {
+                const shared = isCanonicalProjectIdentity(identity);
+                let writerAccepts = true;
+                try {
+                    ensureProject(writerDb, identity);
+                } catch {
+                    writerAccepts = false;
+                }
+                let ddlAccepts = true;
+                try {
+                    ddlDb
+                        .prepare(
+                            "INSERT INTO projects (canonical_identity, created_at) VALUES (?, 1)",
+                        )
+                        .run(identity);
+                } catch {
+                    ddlAccepts = false;
+                }
+                expect(`${identity}:${writerAccepts}`).toBe(`${identity}:${shared}`);
+                expect(`${identity}:${ddlAccepts}`).toBe(`${identity}:${shared}`);
+            }
+        } finally {
+            closeQuietly(writerDb);
+            closeQuietly(ddlDb);
         }
     });
 

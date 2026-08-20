@@ -108,6 +108,40 @@ describe("seed resolution", () => {
             ["git:live", "git:live"],
             ["git:old", "git:live"],
         ]);
+        expect(seed.skippedCycles).toEqual([]);
+    });
+
+    test("cyclic rekey chains are skipped with diagnostics instead of failing the seed", () => {
+        const database = rawDb();
+        database.exec(`
+            CREATE TABLE memories (id INTEGER PRIMARY KEY, project_path TEXT);
+            CREATE TABLE v22_identity_rekey_map (
+                old_project_path TEXT PRIMARY KEY,
+                new_project_path TEXT NOT NULL,
+                rekeyed_at INTEGER NOT NULL
+            );
+            INSERT INTO memories (project_path) VALUES ('git:live'), ('git:loop-a');
+            INSERT INTO v22_identity_rekey_map VALUES ('git:loop-a', 'git:loop-b', 1);
+            INSERT INTO v22_identity_rekey_map VALUES ('git:loop-b', 'git:loop-a', 1);
+        `);
+        const seed = resolveProjectIdentitySeed(database);
+        expect(seed.terminals).toEqual(["git:live"]);
+        expect([...seed.skippedCycles].sort()).toEqual(["git:loop-a", "git:loop-b"]);
+        expect(seed.aliasTargets.has("git:loop-a")).toBe(false);
+        expect(seed.aliasTargets.has("git:loop-b")).toBe(false);
+    });
+
+    test("append-only audit tables are alias sources only, never grounds for a project row", () => {
+        const database = rawDb();
+        database.exec(`
+            CREATE TABLE memories (id INTEGER PRIMARY KEY, project_path TEXT);
+            CREATE TABLE memory_mutation_log (id INTEGER PRIMARY KEY, project_path TEXT);
+            INSERT INTO memories (project_path) VALUES ('git:live');
+            INSERT INTO memory_mutation_log (project_path) VALUES ('git:live'), ('git:dead-history');
+        `);
+        const seed = resolveProjectIdentitySeed(database);
+        expect(seed.terminals).toEqual(["git:live"]);
+        expect(seed.aliasTargets.has("git:dead-history")).toBe(false);
     });
 
     test("seedProjectRegistry publishes one project per terminal with every alias", () => {
@@ -248,6 +282,30 @@ describe("applyIdentityMergeToProjectRegistry", () => {
                 .prepare("SELECT canonical_identity AS c FROM projects WHERE id = ?")
                 .get(sourceId),
         ).toEqual({ c: "git:brand-new" });
+    });
+
+    test("in-place adoption stays legal when the source owns authoritative children", () => {
+        const database = seededRegistry();
+        const sourceId = projectIdFor(database, "git:source") as number;
+        database
+            .prepare("INSERT INTO episodes (project_id, created_at) VALUES (?, 1)")
+            .run(sourceId);
+
+        // The routine dir:/git: rekey renames the same numeric row; children
+        // keep their project_id, so owned history must not block it.
+        applyIdentityMergeToProjectRegistry(database, "git:source", "git:brand-new", 2_000);
+
+        expect(projectIdFor(database, "git:brand-new")).toBe(sourceId);
+        expect(
+            database
+                .prepare("SELECT canonical_identity AS c FROM projects WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ c: "git:brand-new" });
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS count FROM episodes WHERE project_id = ?")
+                .get(sourceId),
+        ).toEqual({ count: 1 });
     });
 
     test("refuses adopting a non-canonical target for a registered source", () => {

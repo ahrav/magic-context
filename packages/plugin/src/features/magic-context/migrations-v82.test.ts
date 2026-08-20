@@ -238,7 +238,7 @@ describe("migration v82: claims and evidence schema", () => {
         }
     });
 
-    test("a rekey cycle aborts v82, leaves no v82 objects, and a corrected retry publishes once", () => {
+    test("a rekey cycle is skipped: v82 publishes, live identities seed, cyclic ones stay unregistered", () => {
         const db = v81Database();
         try {
             db.prepare(
@@ -247,28 +247,20 @@ describe("migration v82: claims and evidence schema", () => {
             db.prepare(
                 "INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at) VALUES (?, ?, 1)",
             ).run("git:cycle-b", "git:cycle-a");
+            db.prepare("INSERT INTO project_state (project_path) VALUES (?)").run("git:live");
 
-            expect(() => runMigrations(db)).toThrow(/rekey cycle/);
-            const tables = objectNames(db, "table");
-            for (const table of CLAIMS_AND_EVIDENCE_TABLES) {
-                expect(tables).not.toContain(table);
-            }
-            expect(
-                db
-                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 82")
-                    .get(),
-            ).toEqual({ count: 0 });
-
-            db.prepare("DELETE FROM v22_identity_rekey_map WHERE old_project_path = ?").run(
-                "git:cycle-b",
-            );
+            // Legacy merge flows could write cyclic old→new rows; the cycle
+            // must not permanently fail the migration and disable the plugin.
             runMigrations(db);
+
             expect(
                 db
                     .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 82")
                     .get(),
             ).toEqual({ count: 1 });
-            expect(projectIdFor(db, "git:cycle-a")).toBe(projectIdFor(db, "git:cycle-b") as number);
+            expect(projectIdFor(db, "git:live")).toBeDefined();
+            expect(projectIdFor(db, "git:cycle-a")).toBeUndefined();
+            expect(projectIdFor(db, "git:cycle-b")).toBeUndefined();
         } finally {
             closeQuietly(db);
         }
@@ -553,6 +545,39 @@ describe("migration v82: claims and evidence schema", () => {
                     )
                     .run(graph.claimId, "b".repeat(64)),
             ).toThrow(/append-only/);
+
+            // claim_evidence is WITHOUT ROWID: a rowid-addressed REPLACE with a
+            // fresh (revision_id, observation_id) pair would otherwise replace
+            // an existing evidence row without firing the pair-keyed collision
+            // trigger or, with recursive triggers off, the delete guard.
+            const freshObservationId = Number(
+                (
+                    db
+                        .prepare(
+                            `INSERT INTO observations
+                                (source_span_id, extracted_text, content_sha256, extractor, extractor_version, extractor_run_id, independence_key, created_at)
+                             VALUES (?, 'fresh', ?, 'e', '1', 'r2', 'ik2', 99)`,
+                        )
+                        .run(graph.spanId, "c".repeat(64)) as {
+                        lastInsertRowid: number | bigint;
+                    }
+                ).lastInsertRowid,
+            );
+            const evidenceBefore = db
+                .prepare("SELECT * FROM claim_evidence ORDER BY revision_id, observation_id")
+                .all();
+            expect(() =>
+                db
+                    .prepare(
+                        "INSERT OR REPLACE INTO claim_evidence (rowid, revision_id, observation_id, relation, created_at) VALUES (1, ?, ?, 'supports', 99)",
+                    )
+                    .run(graph.revisionId, freshObservationId),
+            ).toThrow(/rowid/i);
+            expect(
+                db
+                    .prepare("SELECT * FROM claim_evidence ORDER BY revision_id, observation_id")
+                    .all(),
+            ).toEqual(evidenceBefore);
 
             expect(() =>
                 db

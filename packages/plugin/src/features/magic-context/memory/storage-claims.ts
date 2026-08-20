@@ -424,6 +424,19 @@ export function appendClaimRevision(
             );
         }
 
+        // A pointer repointed backward by direct SQL still passes the CAS
+        // (the caller read the corrupted pointer), but the next revision
+        // number would collide with existing history. Surface that as
+        // corruption instead of a raw append-only trigger error.
+        const maxRevision = db
+            .prepare("SELECT MAX(revision) AS max FROM claim_revisions WHERE claim_id = ?")
+            .get(input.claimId) as { max: number | null };
+        if (maxRevision.max !== expected.revision) {
+            throw new ClaimGraphCorruptionError(
+                `claim ${input.claimId} pointer targets revision ${expected.revision} but history reaches ${String(maxRevision.max)}; direct-SQL corruption`,
+            );
+        }
+
         const revision = expected.revision + 1;
         const revisionId = insertRevisionWithEvidence(db, {
             claimId: input.claimId,
@@ -547,11 +560,14 @@ export interface ClaimEvidenceRecord {
 
 /**
  * Supported writers never commit these shapes; only direct SQL can. Readers
- * treat both as corruption rather than serving unauditable claims.
+ * treat all of them as corruption rather than serving unauditable claims.
  */
 export interface ClaimGraphCorruptionReport {
     nullPointerClaimIds: number[];
     evidencelessRevisionIds: number[];
+    /** Claims whose pointer targets a revision below the claim's max: a
+     * direct-SQL rollback of published history the clear-guard cannot see. */
+    stalePointerClaimIds: number[];
 }
 
 export function findClaimGraphCorruption(db: Database): ClaimGraphCorruptionReport {
@@ -567,9 +583,20 @@ export function findClaimGraphCorruption(db: Database): ClaimGraphCorruptionRepo
               ORDER BY claim_revisions.id`,
         )
         .all() as Array<{ id: number }>;
+    const stalePointer = db
+        .prepare(
+            `SELECT claims.id AS id FROM claims
+               JOIN claim_revisions AS current ON current.id = claims.current_revision_id
+              WHERE current.revision <> (
+                  SELECT MAX(revision) FROM claim_revisions WHERE claim_id = claims.id
+              )
+              ORDER BY claims.id`,
+        )
+        .all() as Array<{ id: number }>;
     return {
         nullPointerClaimIds: nullPointer.map((row) => row.id),
         evidencelessRevisionIds: evidenceless.map((row) => row.id),
+        stalePointerClaimIds: stalePointer.map((row) => row.id),
     };
 }
 
@@ -609,6 +636,10 @@ function assertRevisionsHaveEvidence(
 }
 
 export function listClaimRevisions(db: Database, claimId: number): ClaimRevisionRecord[] {
+    // Resolving through getClaimById fails closed on a null current-revision
+    // pointer even when every revision row is properly evidenced.
+    const claim = getClaimById(db, claimId);
+    if (!claim) return [];
     const revisions = db
         .prepare(
             `SELECT id, claim_id AS claimId, revision, content, content_sha256 AS contentSha256,
@@ -640,11 +671,24 @@ export function getCurrentClaimRevision(db: Database, claimId: number): ClaimRev
 }
 
 export function getRevisionEvidence(db: Database, revisionId: number): ClaimEvidenceRecord[] {
-    return db
+    const rows = db
         .prepare(
             `SELECT revision_id AS revisionId, observation_id AS observationId, relation,
                     created_at AS createdAt
                FROM claim_evidence WHERE revision_id = ? ORDER BY observation_id`,
         )
         .all(revisionId) as ClaimEvidenceRecord[];
+    if (rows.length === 0) {
+        // An existing revision with zero evidence is the corruption shape this
+        // module fails closed on; only a nonexistent revision reads as empty.
+        const revisionExists = db
+            .prepare("SELECT 1 FROM claim_revisions WHERE id = ? LIMIT 1")
+            .get(revisionId);
+        if (revisionExists) {
+            throw new ClaimGraphCorruptionError(
+                `claim revision ${revisionId} has no evidence rows; direct-SQL corruption`,
+            );
+        }
+    }
+    return rows;
 }

@@ -127,13 +127,18 @@ export function createClaimsAndEvidenceSchema(db: Database): void {
         UNIQUE (claim_id, id)
     );
 
+    -- WITHOUT ROWID is load-bearing for the append-only contract: on a rowid
+    -- table an INSERT OR REPLACE addressed at an existing rowid with a fresh
+    -- (revision_id, observation_id) pair would slip past the collision trigger
+    -- and, with recursive triggers off, REPLACE's implicit delete would skip
+    -- the delete guard — silently destroying an evidence row.
     CREATE TABLE claim_evidence (
         revision_id INTEGER NOT NULL REFERENCES claim_revisions(id) ON DELETE RESTRICT,
         observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE RESTRICT,
         relation TEXT NOT NULL CHECK (relation IN ('supports', 'merged_from')),
         created_at INTEGER NOT NULL,
         PRIMARY KEY (revision_id, observation_id)
-    );
+    ) WITHOUT ROWID;
     CREATE INDEX idx_claim_evidence_observation ON claim_evidence(observation_id);
 
     CREATE TABLE claim_conflicts (

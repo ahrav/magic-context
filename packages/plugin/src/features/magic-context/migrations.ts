@@ -3118,6 +3118,15 @@ export const MIGRATIONS: Migration[] = [
                 return;
             }
             const seed = resolveProjectIdentitySeed(db);
+            if (seed.skippedCycles.length > 0) {
+                // Legacy merge flows could store old→new rows with no
+                // acyclicity check; a cyclic chain must not permanently fail
+                // the migration (and disable the plugin), so those identities
+                // stay unregistered until touched by a supported writer.
+                log(
+                    `[migrations] v82: skipped ${seed.skippedCycles.length} identity chain(s) with rekey cycles: ${seed.skippedCycles.join(", ")}`,
+                );
+            }
             createClaimsAndEvidenceSchema(db);
             seedProjectRegistry(db, seed, Date.now());
             assertProjectRegistrySeed(db, seed);
