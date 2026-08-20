@@ -204,6 +204,70 @@ describe("SynapseEmbeddingProvider", () => {
         expect(await provider.embed("hello")).toBeNull();
         expect(await provider.embed("again")).toBeNull();
     });
+
+    it("refuses rediscovery that rotates the pinned lane fingerprint", async () => {
+        const client = new MockSynapseClient();
+        client.call = async <Response = unknown>(
+            _module: string,
+            method: string,
+            params?: unknown,
+        ) => {
+            client.requests.push({ method, params });
+            if (method === "models.list") {
+                return {
+                    models: [
+                        {
+                            model: "gte-modernbert-base-f16",
+                            fingerprint: "fp-rotated",
+                            table_epoch: 1,
+                        },
+                    ],
+                } as Response;
+            }
+            return { vector: [1, 2, 3], fingerprint: "fp-rotated", table_epoch: 1 } as Response;
+        };
+        // The routing probe pins model, fingerprint, and epoch but not dims —
+        // the live catalog omits them — so this provider must rediscover before
+        // its first call while its registration's destination rows are already
+        // keyed to the pinned lane identity.
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            model: "gte-modernbert-base-f16",
+            fingerprint: "fp-pinned",
+            tableEpoch: 0,
+            clientFactory: async () => client,
+        });
+
+        expect(await provider.initialize()).toBe(false);
+        expect(provider.modelId).not.toBe(
+            getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-rotated"),
+        );
+        expect(await provider.embed("hello")).toBeNull();
+        const vectors = await provider.embedItems([
+            { id: "memory:1", text: "one", contentSha256: "a" },
+        ]);
+        expect(vectors.size).toBe(0);
+        expect(client.requests.some((entry) => entry.method === "embed.batch")).toBe(false);
+    });
+
+    it("adopts rediscovered dims when the pinned lane identity still matches", async () => {
+        const client = new MockSynapseClient();
+        const provider = new SynapseEmbeddingProvider({
+            connectionFile: "fixture",
+            projectRoot: "/repo",
+            session: "ses-1",
+            model: "gte-modernbert-base-f16",
+            fingerprint: "fp-live",
+            tableEpoch: 0,
+            clientFactory: async () => client,
+        });
+
+        expect(await provider.initialize()).toBe(true);
+        expect(provider.modelId).toBe(getSynapseLaneIdentity("gte-modernbert-base-f16", "fp-live"));
+        expect(await provider.embed("hello")).toEqual(new Float32Array([1, 2, 3]));
+    });
 });
 
 describe("recommended batch policy", () => {
@@ -1311,6 +1375,38 @@ describe("embedItemsDetailed", () => {
                 { id: "memory:1", text: "one", contentSha256: "a" },
             ]);
             expect(vectors.size).toBe(1);
+            expect(ledgerRows(db)).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("keeps polling the canonical pending reply on the legacy embedItems path", async () => {
+        const db = ledgerDb();
+        try {
+            const host = new DetailedHost();
+            host.resultPages = (_jobId, items, index) => {
+                if (index === 0) {
+                    return { result: { done: false, status: "queued", retry_after_ms: 0 } };
+                }
+                return {
+                    result: {
+                        ...ENVELOPE,
+                        done: true,
+                        vectors: items.map((item) => ({
+                            id: item.id,
+                            content_sha256: item.content_sha256,
+                            vector: [1, 2, 3],
+                        })),
+                    },
+                };
+            };
+            const provider = detailedProvider(host);
+            const vectors = await provider.embedItems([
+                { id: "memory:1", text: "one", contentSha256: "a" },
+            ]);
+            expect(vectors.get("memory:1")).toEqual(new Float32Array([1, 2, 3]));
+            expect(host.resultCalls()).toHaveLength(2);
             expect(ledgerRows(db)).toEqual([]);
         } finally {
             closeQuietly(db);

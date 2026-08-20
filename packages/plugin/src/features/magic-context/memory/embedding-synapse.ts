@@ -198,6 +198,26 @@ function wait(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * The canonical R13 pending rule for one `embed.result` reply: a reply that
+ * neither reports `done:true` nor carries a cursored vector page is queue
+ * state, never termination, so the only correct response is to wait and poll
+ * again. Returns the bounded wait, or null when the reply is a page the caller
+ * must consume. The 10ms floor keeps a served `retry_after_ms` of 0 from
+ * busy-looping the event loop with full-rate `embed.result` calls.
+ */
+function pendingPollDelay(
+    parsed: Record<string, unknown>,
+    hasVectors: boolean,
+    deadlineAt: number,
+): number | null {
+    if (parsed.done === true || (hasVectors && parsed.next_cursor != null)) return null;
+    return Math.min(
+        Math.max(readRetryAfter(parsed) ?? 50, 10),
+        Math.max(0, deadlineAt - Date.now()),
+    );
+}
+
 function sha256(value: string): string {
     return createHash("sha256").update(value).digest("hex");
 }
@@ -526,6 +546,28 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                         throw new SynapseEmbeddingError(
                             "not_certified",
                             `Synapse model ${entry.model} is not certified`,
+                        );
+                    }
+                    // Rediscovery matches by model name only, so a daemon that
+                    // rotated the artifact between routing and this call answers
+                    // with a different lane. A registration that pinned an
+                    // identity already keyed its destination rows to it, and
+                    // those keys do not follow this metadata, so adopting the
+                    // rotated lane would store its vectors under the pinned
+                    // lane's key. Refuse; routing rediscovers and rebuilds the
+                    // registration under the new identity.
+                    const pinnedFingerprint = this.options.fingerprint;
+                    if (pinnedFingerprint && entry.fingerprint !== pinnedFingerprint) {
+                        throw new SynapseEmbeddingError(
+                            "substitution_rejected",
+                            `Synapse model ${entry.model} now serves fingerprint ${entry.fingerprint}, but this lane is registered under ${pinnedFingerprint}`,
+                        );
+                    }
+                    const pinnedEpoch = this.options.tableEpoch;
+                    if (Number.isInteger(pinnedEpoch) && entry.table_epoch !== pinnedEpoch) {
+                        throw new SynapseEmbeddingError(
+                            "substitution_rejected",
+                            `Synapse model ${entry.model} now serves table epoch ${entry.table_epoch}, but this lane is registered under ${pinnedEpoch}`,
                         );
                     }
                     const metadata: SynapseLaneMetadata = {
@@ -1028,16 +1070,9 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
             );
             const parsed = responseBody(body);
             const hasVectors = Array.isArray(parsed.vectors);
-            if (parsed.done !== true && (!hasVectors || parsed.next_cursor == null)) {
-                // done:false without a next cursor is explicit pending, never
-                // termination (R13): wait the bounded delay and poll again.
-                // The 10ms floor keeps a served retry_after_ms of 0 from
-                // busy-looping the event loop with full-rate embed.result calls.
-                const delay = Math.min(
-                    Math.max(readRetryAfter(parsed) ?? 50, 10),
-                    Math.max(0, deadlineAt - Date.now()),
-                );
-                await wait(delay);
+            const pendingDelay = pendingPollDelay(parsed, hasVectors, deadlineAt);
+            if (pendingDelay !== null) {
+                await wait(pendingDelay);
                 continue;
             }
             if (!hasVectors) {
@@ -1157,11 +1192,13 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
         });
     }
 
-    /** Legacy lenient polling for `embedItems`/`embedBatch` callers only: it
-     *  tolerates pre-canonical hosts (`complete`, `cursor` aliases) and treats
-     *  a missing cursor as termination. The canonical R13 rule — done:false
-     *  without a cursor is explicit pending, never termination — lives in
-     *  `collectJobPages`, which every detailed/ledger path uses. */
+    /** Lenient polling for `embedItems`/`embedBatch` callers only: it tolerates
+     *  pre-canonical hosts (`complete`, `cursor` aliases) and treats a missing
+     *  cursor on a reply that carried items as termination. A reply carrying no
+     *  items at all is the canonical pending shape, so it defers to the shared
+     *  R13 rule in `pendingPollDelay` rather than reading the absent cursor as
+     *  completion; the detailed/ledger paths apply that rule in
+     *  `collectJobPages` for every reply. */
     private async pollBatch(
         jobId: string,
         requestKey: string,
@@ -1169,8 +1206,17 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
     ): Promise<unknown> {
         let cursor: unknown = null;
         const allItems: Array<Record<string, unknown>> = [];
+        // One absolute deadline spans the whole poll sequence, so a job that
+        // never leaves the queue cannot poll without bound; each call is
+        // bounded by the remaining budget.
+        const deadlineAt =
+            Date.now() + (this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS);
         for (;;) {
             if (signal?.aborted) return {};
+            const remainingMs = deadlineAt - Date.now();
+            if (remainingMs <= 0) {
+                throw new SynapseEmbeddingError("timeout", "Synapse job poll deadline exhausted");
+            }
             const body = await this.callWithRetry(
                 "embed.result",
                 this.requestConstraints({
@@ -1178,12 +1224,19 @@ export class SynapseEmbeddingProvider implements EmbeddingProvider {
                     cursor,
                     request_key: requestKey,
                 }),
-                this.options.batchTimeoutMs ?? SYNAPSE_DEFAULT_BATCH_TIMEOUT_MS,
+                remainingMs,
                 true,
                 signal,
             );
             const parsed = responseBody(body);
             const items = extractBatchItems(body);
+            if (parsed.complete !== true && items.length === 0 && allItems.length === 0) {
+                const pendingDelay = pendingPollDelay(parsed, false, deadlineAt);
+                if (pendingDelay !== null) {
+                    await wait(pendingDelay);
+                    continue;
+                }
+            }
             allItems.push(...items);
             const nextCursor = parsed.next_cursor ?? parsed.cursor;
             const done =

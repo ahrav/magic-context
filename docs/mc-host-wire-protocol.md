@@ -398,7 +398,7 @@ Every capacity is finite and host-owned; request fields can never select capacit
 Request `params` MUST be an empty object (or absent). Result:
 
 ```json
-{"result":{"models":[{"model":"tiny-test-model","fingerprint":"<hex>","table_epoch":1,"dims":8,"max_input_tokens":512,"certified":true,"status":"ready","provenance":{"source":"owner-provisioned"},"recommended_batch":{"rows":16,"token_budget":8192}}]}}
+{"result":{"models":[{"model":"tiny-test-model","fingerprint":"<hex>","table_epoch":1,"dims":8,"max_input_tokens":8,"certified":true,"status":"ready","provenance":{"source":"owner-provisioned"},"recommended_batch":{"rows":16,"token_budget":8192}}]}}
 ```
 
 Exactly one model is served — the certified bundle pinned at startup. `fingerprint` covers the complete embedding-space contract (artifact hashes, dimensions, pooling, output selection, truncation, quantization, and fixed L2 post-processing). `table_epoch` is the manifest's destination-table epoch. `max_input_tokens` is the bundle's own truncation window: text longer than this window is silently truncated by the tokenizer while the item's `content_sha256` still covers the whole text, so clients MUST size chunks against this value rather than assume a default.
