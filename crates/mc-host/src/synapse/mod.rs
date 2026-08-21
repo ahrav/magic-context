@@ -648,6 +648,21 @@ impl SynapseComponent {
         request_key: String,
         cursor: Option<String>,
     ) -> RequestOutcome {
+        // The ready-page branch clones every page item's id and hash out of
+        // the job table, and those copies live until the response encoder
+        // finishes. Their worst case is reserved before polling and shrunk
+        // to the real page after, mirroring the parse-reservation pattern.
+        let page_meta_bound = self
+            .inner
+            .limits
+            .max_page_vectors
+            .saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
+        let Some(mut meta_charge) = ctx.try_reserve_resident(page_meta_bound) else {
+            return app_error(
+                "queue_full",
+                "resident capacity for the result page is exhausted",
+            );
+        };
         match self
             .inner
             .jobs
@@ -672,6 +687,16 @@ impl SynapseComponent {
                 .await
             }
             PollOutcome::Page(page) => {
+                // Ids are validated to MAX_ITEM_ID_BYTES, hashes are fixed
+                // 64-hex, and a page holds at most max_page_vectors items,
+                // so the bound covers the clones by construction.
+                let meta_bytes: usize = page
+                    .vectors
+                    .iter()
+                    .map(|(id, hash, _)| id.len() + hash.len())
+                    .sum();
+                debug_assert!(meta_bytes <= page_meta_bound);
+                meta_charge.shrink_to(meta_bytes);
                 let items: Vec<protocol::VectorItemView<'_>> = page
                     .vectors
                     .iter()
@@ -681,14 +706,16 @@ impl SynapseComponent {
                         vector,
                     })
                     .collect();
-                respond_vectors(
+                let outcome = respond_vectors(
                     ctx,
                     &lane.lane,
                     &items,
                     page.done,
                     page.next_cursor.as_deref(),
                 )
-                .await
+                .await;
+                drop(meta_charge);
+                outcome
             }
         }
     }

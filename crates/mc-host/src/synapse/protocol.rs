@@ -626,13 +626,28 @@ const RESERVE_ENVELOPE_BYTES: usize = 4096;
 /// the body length and be live together.
 const RESERVE_BODY_FACTOR: usize = 3;
 
+/// Conservative floor on the serialized size of one decodable batch item.
+/// The accepted shape carries a 64-hex `content_sha256` plus the quoted
+/// field skeleton (over 100 bytes together), so a body of `n` bytes can
+/// never decode into more than `n / 64 + 1` items. Understating the floor
+/// only overstates the item bound, which keeps the reservation an upper
+/// bound.
+const RESERVE_MIN_ITEM_BODY_BYTES: usize = 64;
+
 /// Conservative upper bound on every parse-phase heap allocation for one
 /// request body — the allocation phase ledger's maximum covered phase.
 /// `None` on arithmetic overflow, which callers treat as unsatisfiable.
+/// The per-item term is capped by the number of items the body could
+/// physically contain, so a large configured `max_batch_items` cannot
+/// inflate the method-independent reservation for small (or non-batch)
+/// bodies past the ingress pool and wedge every request into `queue_full`.
 pub(crate) fn parse_reservation_bytes(body_len: usize, limits: &SynapseLimits) -> Option<usize> {
+    let item_bound = limits
+        .max_batch_items
+        .min(body_len / RESERVE_MIN_ITEM_BODY_BYTES + 1);
     body_len
         .checked_mul(RESERVE_BODY_FACTOR)?
-        .checked_add(limits.max_batch_items.checked_mul(RESERVE_PER_ITEM_BYTES)?)?
+        .checked_add(item_bound.checked_mul(RESERVE_PER_ITEM_BYTES)?)?
         .checked_add(RESERVE_ENVELOPE_BYTES)
 }
 
@@ -1317,11 +1332,20 @@ mod tests {
     fn reservation_arithmetic_is_checked() {
         let limits = SynapseLimits::default();
         assert!(parse_reservation_bytes(usize::MAX, &limits).is_none());
+        // A huge configured max_batch_items cannot inflate the reservation
+        // for a small body past what the body could physically contain:
+        // the bound stays satisfiable, so the configuration cannot wedge
+        // every request (including non-batch methods) into queue_full.
         let absurd = SynapseLimits {
             max_batch_items: usize::MAX,
             ..SynapseLimits::default()
         };
-        assert!(parse_reservation_bytes(1024, &absurd).is_none());
+        let bounded = parse_reservation_bytes(1024, &absurd).expect("bounded by the body");
+        assert_eq!(
+            bounded,
+            parse_reservation_bytes(1024, &limits).expect("default"),
+            "for a small body the item term is body-derived, not config-derived"
+        );
         // The bound is monotone in the body length.
         let small = parse_reservation_bytes(1024, &limits).expect("small");
         let large = parse_reservation_bytes(2048, &limits).expect("large");

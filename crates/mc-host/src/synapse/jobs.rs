@@ -16,7 +16,7 @@ use super::SynapseLimits;
 use crate::wire::ByteCharge;
 
 pub(crate) const MAX_ITEM_ID_BYTES: usize = 256;
-const CONTENT_SHA256_BYTES: usize = 64;
+pub(crate) const CONTENT_SHA256_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchItem {
