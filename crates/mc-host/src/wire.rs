@@ -53,8 +53,25 @@ impl ByteBudget {
             .await
             .expect("byte budget semaphore is never closed");
         ByteCharge {
-            _permit: Some(permit),
+            permit: Some(permit),
         }
+    }
+
+    /// Atomically reserves `bytes` without waiting. `None` means the budget
+    /// cannot cover the request right now (or the count does not fit a
+    /// permit count); nothing is acquired partially.
+    pub fn try_charge(&self, bytes: usize) -> Option<ByteCharge> {
+        let bytes = u32::try_from(bytes).ok()?;
+        if bytes == 0 {
+            return Some(ByteCharge::none());
+        }
+        self.semaphore
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .ok()
+            .map(|permit| ByteCharge {
+                permit: Some(permit),
+            })
     }
 
     #[cfg(test)]
@@ -66,15 +83,51 @@ impl ByteBudget {
 /// One held byte charge; releases its bytes on drop.
 #[derive(Debug)]
 pub struct ByteCharge {
-    // Held only for its Drop: releasing the permit returns the bytes to the
+    // Held for its Drop: releasing the permit returns the bytes to the
     // budget at exactly the point the accounted buffer dies.
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ByteCharge {
     /// A zero-byte charge for header-only frames.
     pub fn none() -> Self {
-        Self { _permit: None }
+        Self { permit: None }
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.permit
+            .as_ref()
+            .map_or(0, OwnedSemaphorePermit::num_permits)
+    }
+
+    /// Splits `bytes` off into an independently owned charge. `None` when
+    /// this charge holds fewer than `bytes`; the original is unchanged then,
+    /// so a failed split can never create or destroy permits.
+    pub(crate) fn split(&mut self, bytes: usize) -> Option<ByteCharge> {
+        if bytes == 0 {
+            return Some(ByteCharge::none());
+        }
+        let permit = self.permit.as_mut()?.split(bytes)?;
+        Some(ByteCharge {
+            permit: Some(permit),
+        })
+    }
+
+    pub(crate) fn split_or_take(&mut self, bytes: usize) -> ByteCharge {
+        match self.split(bytes) {
+            Some(charge) => charge,
+            None => std::mem::replace(self, ByteCharge::none()),
+        }
+    }
+
+    /// Monotonic shrink: releases everything above `bytes` back to the
+    /// budget immediately. A request to grow (bytes above the held count)
+    /// is a no-op — a charge can never be inflated after acquisition.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) {
+        let excess = self.bytes().saturating_sub(bytes);
+        if excess > 0 {
+            drop(self.split(excess));
+        }
     }
 }
 
@@ -815,6 +868,92 @@ mod tests {
             next,
             ReadEvent::Frame(InboundFrame { header, .. }) if header.ty == FrameType::Goodbye
         ));
+    }
+
+    #[test]
+    fn try_charge_is_exact_and_all_or_none() {
+        let budget = ByteBudget::new(100);
+        let charge = budget.try_charge(60).expect("fits");
+        assert_eq!(budget.available(), 40);
+        assert!(
+            budget.try_charge(41).is_none(),
+            "over-capacity acquisition must not partially reduce the budget"
+        );
+        assert_eq!(budget.available(), 40);
+        drop(charge);
+        assert_eq!(budget.available(), 100);
+        // Zero-byte and unconvertible requests never create a backed charge.
+        assert_eq!(budget.try_charge(0).expect("zero charge").bytes(), 0);
+        assert!(budget.try_charge(u32::MAX as usize + 1).is_none());
+        assert_eq!(budget.available(), 100);
+    }
+
+    #[test]
+    fn split_preserves_total_and_shrink_releases_only_the_delta() {
+        let budget = ByteBudget::new(100);
+        let mut charge = budget.try_charge(80).expect("fits");
+        let mut portion = charge.split(30).expect("within the charge");
+        assert_eq!(charge.bytes(), 50);
+        assert_eq!(portion.bytes(), 30);
+        assert_eq!(
+            budget.available(),
+            20,
+            "a split moves permits, never frees them"
+        );
+
+        portion.shrink_to(10);
+        assert_eq!(portion.bytes(), 10);
+        assert_eq!(budget.available(), 40);
+        // Growing is refused: shrink is monotonic.
+        portion.shrink_to(usize::MAX);
+        assert_eq!(portion.bytes(), 10);
+        assert_eq!(budget.available(), 40);
+
+        assert!(
+            charge.split(51).is_none(),
+            "an over-split must not change the charge"
+        );
+        assert_eq!(charge.bytes(), 50);
+
+        drop(portion);
+        drop(charge);
+        assert_eq!(budget.available(), 100);
+    }
+
+    #[test]
+    fn split_or_take_falls_back_to_the_whole_charge() {
+        let budget = ByteBudget::new(100);
+        let mut charge = budget.try_charge(30).expect("fits");
+        let taken = charge.split_or_take(50);
+        assert_eq!(
+            taken.bytes(),
+            30,
+            "an oversized request takes everything remaining"
+        );
+        assert_eq!(charge.bytes(), 0);
+        drop(taken);
+        drop(charge);
+        assert_eq!(budget.available(), 100);
+    }
+
+    #[tokio::test]
+    async fn body_charge_and_reservation_share_one_ingress_pool() {
+        let budget = ByteBudget::new(100);
+        let body_charge = budget.charge(60).await;
+        assert!(
+            budget.try_charge(50).is_none(),
+            "a reservation must see the body's pressure"
+        );
+        let reservation = budget.try_charge(40).expect("remaining capacity");
+        assert_eq!(budget.available(), 0);
+        drop(reservation);
+        assert_eq!(
+            budget.available(),
+            40,
+            "an untransferred reservation restores its exact permits"
+        );
+        drop(body_charge);
+        assert_eq!(budget.available(), 100);
     }
 
     #[tokio::test]

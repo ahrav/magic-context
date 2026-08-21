@@ -13,6 +13,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use super::SynapseLimits;
+use crate::wire::ByteCharge;
 
 pub(crate) const MAX_ITEM_ID_BYTES: usize = 256;
 const CONTENT_SHA256_BYTES: usize = 64;
@@ -97,9 +98,26 @@ struct Job {
     result_bytes: u64,
     state: JobState,
     completed_at: Option<Instant>,
+    /// Resident-byte charge for this job's request inputs. Sized by
+    /// [`job_input_bytes`] at admission, shrunk to [`Job::retained_input_bytes`]
+    /// when the texts die, and released by dropping the job on removal,
+    /// eviction, expiry, or clear.
+    charge: ByteCharge,
 }
 
 impl Job {
+    /// Logical request-input bytes still owned after the item texts die:
+    /// both key copies and the id/hash metadata. String contents only;
+    /// struct and hash-bucket overhead stay outside the accounting claim.
+    fn retained_input_bytes(&self) -> usize {
+        let meta: usize = self
+            .item_meta
+            .iter()
+            .map(|(id, hash)| id.len() + hash.len())
+            .sum();
+        2 * self.key.len() + meta
+    }
+
     fn status(&self) -> &'static str {
         match self.state {
             JobState::Queued { .. } => "queued",
@@ -155,6 +173,24 @@ fn digest_payload(key: &str, items: &[BatchItem]) -> [u8; 32] {
         update(item.text.as_bytes());
     }
     hasher.finalize().into()
+}
+
+/// Logical request-input bytes a newly admitted job owns while queued: both
+/// key copies (job field and table index), the queued item strings at their
+/// allocated capacities, and the id/hash metadata copies. String contents
+/// only; struct and hash-bucket overhead stay outside the accounting claim.
+pub(crate) fn job_input_bytes(key: &str, items: &[BatchItem]) -> usize {
+    let mut bytes = 2usize.saturating_mul(key.len());
+    for item in items {
+        bytes = bytes
+            .saturating_add(item.id.capacity())
+            .saturating_add(item.content_sha256.capacity())
+            .saturating_add(item.text.capacity())
+            // The admission-time metadata copies.
+            .saturating_add(item.id.len())
+            .saturating_add(item.content_sha256.len());
+    }
+    bytes
 }
 
 fn result_bytes(item_count: usize, dimensions: usize, metadata_bytes: usize) -> Option<u64> {
@@ -229,9 +265,25 @@ impl JobTable {
     }
 
     pub fn admit(&self, key: String, items: Vec<BatchItem>, dimensions: usize) -> AdmitOutcome {
+        self.admit_charged(key, items, dimensions, &mut ByteCharge::none())
+    }
+
+    /// Admission that transfers a job-sized portion of `charge` into the new
+    /// job under the same table lock that inserts it. Every non-`Admitted`
+    /// outcome leaves `charge` with the caller, so a rejected, replayed,
+    /// conflicting, full, or closed candidate never alters a retained job's
+    /// charge.
+    pub(crate) fn admit_charged(
+        &self,
+        key: String,
+        items: Vec<BatchItem>,
+        dimensions: usize,
+        charge: &mut ByteCharge,
+    ) -> AdmitOutcome {
         let digest = digest_payload(&key, &items);
         let text_bytes: u64 = items.iter().map(|item| item.text.len() as u64).sum();
         let result_bytes = admitted_result_bytes(&items, dimensions);
+        let input_bytes = job_input_bytes(&key, &items);
         let mut jobs = self.inner.lock().expect("job table lock");
         if jobs.closed {
             return AdmitOutcome::Closed;
@@ -291,6 +343,7 @@ impl JobTable {
                 result_bytes: 0,
                 state: JobState::Queued { items },
                 completed_at: None,
+                charge: charge.split_or_take(input_bytes),
             },
         );
         AdmitOutcome::Admitted {
@@ -355,6 +408,10 @@ impl JobTable {
         };
         job.result_bytes = result_bytes;
         job.completed_at = Some(Instant::now());
+        // The queued texts died with the worker's items; only the retained
+        // key and metadata stay charged.
+        let retained = job.retained_input_bytes();
+        job.charge.shrink_to(retained);
         jobs.queued_text_bytes -= text_bytes;
         jobs.retained_result_bytes += result_bytes;
         self.enforce_retention(&mut jobs, Some(seq));
@@ -367,14 +424,23 @@ impl JobTable {
 
     /// Terminal-failure bookkeeping shared by every failure path: queued
     /// text is released, the retention clock starts, and eviction runs.
+    /// Idempotent on an already-completed job so a late abandonment guard
+    /// cannot clobber a published result or its byte accounting.
     fn fail_job(&self, jobs: &mut Jobs, seq: u64, code: String, message: String) {
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
+        if job.is_completed() {
+            return;
+        }
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
         job.state = JobState::Failed { code, message };
         job.completed_at = Some(Instant::now());
+        // Queued items (if the worker never started) and worker-owned texts
+        // are both dead at this transition.
+        let retained = job.retained_input_bytes();
+        job.charge.shrink_to(retained);
         jobs.queued_text_bytes -= text_bytes;
         self.enforce_retention(jobs, Some(seq));
     }
@@ -584,6 +650,180 @@ impl JobTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::ByteBudget;
+
+    fn charged_item(id: &str, text: &str) -> BatchItem {
+        BatchItem {
+            id: id.to_owned(),
+            content_sha256: "0".repeat(64),
+            text: text.to_owned(),
+        }
+    }
+
+    fn retained_bytes(key: &str, items: &[BatchItem]) -> usize {
+        let meta: usize = items
+            .iter()
+            .map(|item| item.id.len() + item.content_sha256.len())
+            .sum();
+        2 * key.len() + meta
+    }
+
+    #[test]
+    fn a_charged_job_transfers_shrinks_and_releases_exact_permits() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let jobs = JobTable::new(SynapseLimits::default());
+        let items = vec![charged_item("a", "alpha"), charged_item("b", "beta")];
+        let key = "k".repeat(64);
+        let job_bytes = job_input_bytes(&key, &items);
+        let retained = retained_bytes(&key, &items);
+        assert!(job_bytes > retained);
+
+        let mut candidate = budget.try_charge(job_bytes + 500).expect("candidate");
+        let AdmitOutcome::Admitted { seq, .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut candidate)
+        else {
+            panic!("admitted");
+        };
+        assert_eq!(
+            candidate.bytes(),
+            500,
+            "admission takes exactly the job-sized portion"
+        );
+        drop(candidate);
+        assert_eq!(budget.available(), POOL - job_bytes);
+
+        let taken = jobs.start(seq).expect("starts");
+        assert_eq!(
+            budget.available(),
+            POOL - job_bytes,
+            "the job keeps the whole charge while the worker owns the items"
+        );
+
+        jobs.publish_ready(seq, vec![vec![0.0; 4]; taken.len()]);
+        assert_eq!(
+            budget.available(),
+            POOL - retained,
+            "publication shrinks the charge to retained metadata"
+        );
+
+        jobs.clear();
+        assert_eq!(budget.available(), POOL);
+    }
+
+    #[test]
+    fn non_admitted_outcomes_leave_the_candidate_charge_with_the_caller() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let jobs = JobTable::new(SynapseLimits::default());
+        let key = "k".repeat(64);
+        let items = vec![charged_item("a", "alpha")];
+        let job_bytes = job_input_bytes(&key, &items);
+
+        let mut first = budget.try_charge(job_bytes).expect("first");
+        let AdmitOutcome::Admitted { .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut first)
+        else {
+            panic!("admitted");
+        };
+
+        let mut replay = budget.try_charge(job_bytes).expect("replay");
+        assert!(matches!(
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut replay),
+            AdmitOutcome::Existing(_)
+        ));
+        assert_eq!(
+            replay.bytes(),
+            job_bytes,
+            "replay keeps its candidate charge"
+        );
+        drop(replay);
+
+        let other = vec![charged_item("b", "different")];
+        let mut conflict = budget.try_charge(1_000).expect("conflict");
+        assert!(matches!(
+            jobs.admit_charged(key.clone(), other, 4, &mut conflict),
+            AdmitOutcome::Conflict
+        ));
+        assert_eq!(
+            conflict.bytes(),
+            1_000,
+            "conflict keeps its candidate charge"
+        );
+        drop(conflict);
+
+        jobs.close_admission();
+        let mut closed = budget.try_charge(1_000).expect("closed");
+        assert!(matches!(
+            jobs.admit_charged(
+                "x".repeat(64),
+                vec![charged_item("c", "gamma")],
+                4,
+                &mut closed
+            ),
+            AdmitOutcome::Closed
+        ));
+        assert_eq!(closed.bytes(), 1_000, "closed keeps its candidate charge");
+        drop(closed);
+
+        assert_eq!(
+            budget.available(),
+            POOL,
+            "close_admission dropped the queued job and its whole charge"
+        );
+    }
+
+    #[test]
+    fn failure_eviction_and_expiry_release_their_charges() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let limits = SynapseLimits {
+            max_retained_jobs: 1,
+            ..SynapseLimits::default()
+        };
+        let jobs = JobTable::new(limits);
+
+        let admit = |key: String, items: Vec<BatchItem>| {
+            let bytes = job_input_bytes(&key, &items);
+            let mut charge = budget.try_charge(bytes).expect("charge");
+            let AdmitOutcome::Admitted { seq, .. } = jobs.admit_charged(key, items, 4, &mut charge)
+            else {
+                panic!("admitted");
+            };
+            seq
+        };
+
+        let first_key = "f".repeat(64);
+        let first_items = vec![charged_item("a", "alpha")];
+        let first = admit(first_key.clone(), first_items.clone());
+        jobs.publish_failed(first, "artifact_invalid".to_owned(), "boom".to_owned());
+        assert_eq!(
+            budget.available(),
+            POOL - retained_bytes(&first_key, &first_items),
+            "a failed job that never started still shrinks to retained metadata"
+        );
+
+        jobs.publish_failed(first, "artifact_invalid".to_owned(), "late".to_owned());
+        assert_eq!(
+            budget.available(),
+            POOL - retained_bytes(&first_key, &first_items),
+            "a late abandonment settlement cannot alter completed accounting"
+        );
+
+        let second_key = "e".repeat(64);
+        let second_items = vec![charged_item("b", "beta")];
+        let second = admit(second_key.clone(), second_items.clone());
+        jobs.start(second).expect("starts");
+        jobs.publish_ready(second, vec![vec![0.0; 4]]);
+        assert_eq!(
+            budget.available(),
+            POOL - retained_bytes(&second_key, &second_items),
+            "eviction of the oldest retained job released its remaining charge"
+        );
+
+        jobs.clear();
+        assert_eq!(budget.available(), POOL);
+    }
 
     #[test]
     fn ready_polls_share_the_retained_vector_allocation() {

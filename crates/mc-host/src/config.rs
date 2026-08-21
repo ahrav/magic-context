@@ -42,8 +42,12 @@ pub struct HostLimits {
     pub max_pending_requests: usize,
     /// Concurrently running handler request tasks.
     pub max_handler_tasks: usize,
-    /// Aggregate bytes simultaneously resident in inbound bodies, handler-owned
-    /// request bodies, encoded frames, and writer queues. Must be at least
+    /// Aggregate bytes simultaneously resident under the host's byte
+    /// budgets. The cap includes inbound bodies, handler-owned request
+    /// bodies, parser scratch, request-derived input ownership (Synapse
+    /// query text, queued batch items, retained job metadata), encoded
+    /// frames, and writer queues. An accounting cap over named logical
+    /// payloads, not an exact process-RSS claim. Must be at least
     /// [`MIN_RESIDENT_BYTES`].
     pub max_resident_bytes: u64,
     /// Encoded frames queued per connection writer.

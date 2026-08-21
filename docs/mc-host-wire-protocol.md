@@ -373,11 +373,11 @@ Routed requests on the `synapse/management_surface` route are UTF-8 JSON objects
 
 #### 7.5.1 Validation, bounds, and error codes
 
-Every request body is parsed strictly: duplicate object keys, non-object roots, invalid UTF-8, unknown `method` values, wrong field types, and out-of-bound sizes are rejected before hashing or inference. Whole-body nesting is bounded (8 levels); no valid request needs more than 5. The application error vocabulary is closed:
+Every request body is parsed strictly: duplicate object keys, non-object roots, invalid UTF-8, unknown `method` values, wrong field types, and out-of-bound sizes are rejected before hashing or inference. Whole-body nesting is bounded (8 levels): level eight is valid, level nine is rejected before typed decoding, and JSON delimiters inside strings never count toward depth. `embed.batch` accepts exactly `max_batch_items` elements and rejects the next array element before decoding any of its fields. The host's resident-byte cap (`max_resident_bytes`) additionally covers Synapse request parser scratch and request-owned inputs (query text, queued batch items, retained job key and item metadata) as named logical payloads — it is an accounting boundary, not an exact process-RSS claim — while the Synapse queue and retained-result limits below remain separate, independent gates. The application error vocabulary is closed:
 
 | Code | Meaning | Retry disposition |
 | --- | --- | --- |
-| `queue_full` | admission capacity (job count, aggregate queued request bytes, or query-lane slot) exhausted before admission | bounded client-side retry; the error body carries no `retry_after_ms` and no state was created |
+| `queue_full` | admission capacity (job count, aggregate queued request bytes, or query-lane slot) exhausted before admission, or the fail-fast resident-byte reservation for request parsing and input ownership could not be acquired; in every case no state was created | bounded client-side retry; the error body carries no `retry_after_ms` |
 | `model_loading` | reserved; not emitted by the current host — initialization completes before publication, so loading faults surface as bind-time `artifact_invalid` | bounded retry |
 | `timeout` | request-scoped deadline expired host-side | caller policy |
 | `artifact_invalid` | bundle missing/invalid (bind rejection) or response identity guard failed | permanent; no retry |
@@ -474,6 +474,9 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | target matrix and catalog (Section 7.2, 7.3) | `crates/mc-host/tests/composite_routing.rs` |
 | bundle identity, offline CPU inference, degraded isolation | `crates/mc-host/tests/synapse_bundle.rs` |
 | request validation, bounds, idempotency, cursors, restart fencing | `crates/mc-host/tests/synapse_protocol.rs`, `crates/mc-host/tests/synapse_jobs.rs` |
+| depth boundary (level eight valid, level nine rejected, strings inert) | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `crates/mc-host/tests/synapse_protocol.rs` |
+| batch item bound rejected before decoding the extra element | `crates/mc-host/src/synapse/protocol.rs` (unit tests) |
+| resident reservation: fail-fast `queue_full`, no state, exact release | `crates/mc-host/src/wire.rs`, `crates/mc-host/src/synapse/jobs.rs` (unit tests), `crates/mc-host/tests/synapse_protocol.rs` |
 | four operations over a real authenticated route, shutdown cleanup | `crates/mc-host/tests/synapse_roundtrip.rs` |
 | request-key golden vectors | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` (matching TypeScript golden test) |
 | durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v83.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |

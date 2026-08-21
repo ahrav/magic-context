@@ -307,6 +307,29 @@ enum QueryFault {
     Engine(InferenceError),
 }
 
+/// Fails a started batch job on drop unless disarmed by publication, so a
+/// worker task that unwinds after `start` cannot leave the job pinned in a
+/// Running state with its charge held.
+struct AbandonGuard {
+    inner: Arc<SynapseInner>,
+    seq: u64,
+    armed: bool,
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.jobs.publish_failed(
+                self.seq,
+                "artifact_invalid".to_owned(),
+                "batch worker exited before publication".to_owned(),
+            );
+        }
+    }
+}
+
+const RESPONSE_SCRATCH_BYTES: usize = 256;
+
 fn request_error(error: RequestError) -> RequestOutcome {
     RequestOutcome::Error {
         code: error.code.to_owned(),
@@ -370,6 +393,7 @@ impl SynapseComponent {
         lane: Arc<ReadyLane>,
         text: String,
         deadline_ms: Option<u64>,
+        text_charge: crate::wire::ByteCharge,
     ) -> RequestOutcome {
         if self.inner.closing.is_cancelled() {
             return app_error("cancelled", "the host is shutting down");
@@ -393,6 +417,7 @@ impl SynapseComponent {
         // without orphaning inference.
         self.inner.tracker.spawn(async move {
             let _query_permit = worker_query_permit;
+            let _text_charge = text_charge;
             let mut tx = tx;
             let permit = tokio::select! {
                 biased;
@@ -477,6 +502,7 @@ impl SynapseComponent {
         request_key: String,
         canonical_key: String,
         items: Vec<jobs::BatchItem>,
+        mut charge: crate::wire::ByteCharge,
     ) -> RequestOutcome {
         if request_key != canonical_key {
             // A retained key resent with a different payload is the
@@ -497,7 +523,7 @@ impl SynapseComponent {
         match self
             .inner
             .jobs
-            .admit(request_key.clone(), items, lane.lane.dims)
+            .admit_charged(request_key.clone(), items, lane.lane.dims, &mut charge)
         {
             AdmitOutcome::Existing(descriptor) => {
                 respond(
@@ -556,6 +582,13 @@ impl SynapseComponent {
             let Some(items) = inner.jobs.start(seq) else {
                 return;
             };
+            // `fail_job` is idempotent, so a normal publication wins even if
+            // the guard also fires.
+            let mut settle_guard = AbandonGuard {
+                inner: Arc::clone(&inner),
+                seq,
+                armed: true,
+            };
             let lane_blocking = Arc::clone(&lane);
             let joined = tokio::task::spawn_blocking(move || {
                 let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
@@ -575,6 +608,7 @@ impl SynapseComponent {
                         .publish_failed(seq, "artifact_invalid".to_owned(), reason);
                 }
             }
+            settle_guard.armed = false;
         });
     }
 
@@ -656,22 +690,51 @@ impl CompositeComponent for SynapseComponent {
         let Some(lane) = self.ready_lane() else {
             return app_error("artifact_invalid", "the synapse lane is unavailable");
         };
-        let request =
-            match protocol::parse_request(&ctx.body, ctx.binary, &lane.lane, &self.inner.limits) {
-                Ok(request) => request,
-                Err(error) => return request_error(error),
-            };
+        if let Err(error) = protocol::preflight(&ctx.body, ctx.binary) {
+            return request_error(error);
+        }
+        let Some(reservation_bytes) =
+            protocol::parse_reservation_bytes(ctx.body.len(), &self.inner.limits)
+        else {
+            return app_error("queue_full", "the parse reservation bound is unsatisfiable");
+        };
+        // The handler reserves resident capacity before decoding.
+        let Some(mut charge) = ctx.try_reserve_resident(reservation_bytes) else {
+            return app_error(
+                "queue_full",
+                "resident capacity for request parsing is exhausted",
+            );
+        };
+        let request = match protocol::decode_request(&ctx.body, &lane.lane, &self.inner.limits) {
+            Ok(request) => request,
+            Err(error) => {
+                drop(charge);
+                return request_error(error);
+            }
+        };
         match request {
-            Request::ModelsList => respond(&ctx, protocol::models_list_body(&lane.lane)).await,
+            Request::ModelsList => {
+                drop(charge);
+                respond(&ctx, protocol::models_list_body(&lane.lane)).await
+            }
             Request::EmbedQuery { text, deadline_ms } => {
-                self.handle_query(&ctx, lane, text, deadline_ms).await
+                charge.shrink_to(text.capacity() + RESPONSE_SCRATCH_BYTES);
+                let text_charge = charge.split_or_take(text.capacity());
+                let _handler_charge = charge;
+                self.handle_query(&ctx, lane, text, deadline_ms, text_charge)
+                    .await
             }
             Request::EmbedBatch {
                 request_key,
                 canonical_key,
                 items,
             } => {
-                self.handle_batch(&ctx, lane, request_key, canonical_key, items)
+                let owned = jobs::job_input_bytes(&request_key, &items)
+                    .saturating_add(request_key.capacity())
+                    .saturating_add(canonical_key.capacity())
+                    .saturating_add(RESPONSE_SCRATCH_BYTES);
+                charge.shrink_to(owned);
+                self.handle_batch(&ctx, lane, request_key, canonical_key, items, charge)
                     .await
             }
             Request::EmbedResult {
@@ -679,6 +742,13 @@ impl CompositeComponent for SynapseComponent {
                 request_key,
                 cursor,
             } => {
+                let owned = job_id
+                    .capacity()
+                    .saturating_add(request_key.capacity())
+                    .saturating_add(cursor.as_ref().map_or(0, String::capacity))
+                    .saturating_add(RESPONSE_SCRATCH_BYTES);
+                charge.shrink_to(owned);
+                let _handler_charge = charge;
                 self.handle_result(&ctx, lane, job_id, request_key, cursor)
                     .await
             }

@@ -850,3 +850,105 @@ fn an_unknown_top_level_field_is_rejected_without_reading_its_value() {
         .expect("the envelope without out-of-schema fields is accepted");
     assert_eq!(accepted, protocol::Request::ModelsList);
 }
+
+/// A routed request nested nine levels deep — with `params` preceding
+/// `method` and delimiters hidden inside strings — is refused at the depth
+/// preflight, while string content never counts toward depth.
+#[tokio::test]
+async fn a_routed_depth_nine_request_is_a_schema_violation() {
+    let engine = DeterministicEngine::new();
+    let host = SynapseHost::start(ready_component(engine.clone(), SynapseLimits::default())).await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let lane = test_lane();
+
+    let depth9: &[u8] =
+        br#"{"params":{"a":"}}}}{{{{","b":{"c":{"d":{"e":{"f":{"g":1}}}}}},"method":"embed.query"}"#;
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            support::raw_client::TY_REQUEST,
+            support::raw_client::FLAGS_INTERACTIVE,
+            channel,
+            epoch,
+            corr,
+            depth9,
+        )
+        .await
+        .expect("send depth-nine request");
+    let (_, frame) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("terminal");
+    assert_eq!(frame.error_code(), "schema_violation");
+
+    // The same structural characters inside a string are payload, not depth:
+    // an equivalent query with a delimiter-heavy text still embeds.
+    let mut params = constraints(&lane);
+    params["text"] = "}}}}}}}}{{{{[[[[]]]]".into();
+    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
+    assert_eq!(frame.json()["result"]["done"], true);
+
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the depth-nine request must never reach inference"
+    );
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// A protocol-valid request whose parse reservation exceeds the resident
+/// budget returns `queue_full`, makes no engine call or job, and leaves
+/// capacity for later requests.
+#[tokio::test]
+async fn resident_exhaustion_is_queue_full_with_no_state_and_capacity_reopens() {
+    let engine = DeterministicEngine::new();
+    let limits = SynapseLimits {
+        // Make a ~30 MiB query protocol-valid so the resident reservation is
+        // the rejecting rule rather than the text bound.
+        max_text_bytes: 30 * 1024 * 1024,
+        ..SynapseLimits::default()
+    };
+    let host = SynapseHost::start_with(ready_component(engine.clone(), limits), |config| {
+        // The extra 1 MiB lets the linked catalog fit.
+        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + (1 << 20);
+        config.timing.frame_deadline = std::time::Duration::from_secs(30);
+    })
+    .await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let lane = test_lane();
+
+    let mut params = constraints(&lane);
+    params["text"] = "x".repeat(30 * 1024 * 1024).into();
+    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
+    assert_eq!(frame.error_code(), "queue_full");
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a capacity-rejected request must not reach inference"
+    );
+
+    // No charge leaked: a non-query operation and then a small query both
+    // succeed on the same lane.
+    let frame = call(
+        &mut client,
+        channel,
+        epoch,
+        "models.list",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        frame.json()["result"]["models"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let mut params = constraints(&lane);
+    params["text"] = "small query".into();
+    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
+    assert_eq!(frame.json()["result"]["done"], true);
+    assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    host.shutdown().await.expect("graceful shutdown");
+}

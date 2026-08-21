@@ -329,6 +329,8 @@ pub struct RequestCtx {
     pub binary: bool,
     pub(crate) cancel: CancellationToken,
     pub(crate) stream: crate::dispatch::StreamSink,
+    /// Ingress pool that charged `body`.
+    pub(crate) ingress: crate::wire::ByteBudget,
 }
 
 impl RequestCtx {
@@ -349,6 +351,10 @@ impl RequestCtx {
     /// transfers into either a unary response or a stream item.
     pub async fn reserve_output(&self, max_len: usize) -> Result<OutputBuffer, StreamClosed> {
         self.stream.reserve(max_len).await
+    }
+
+    pub(crate) fn try_reserve_resident(&self, bytes: usize) -> Option<crate::wire::ByteCharge> {
+        self.ingress.try_charge(bytes)
     }
 
     /// Queues one nonterminal `StreamData` item, in order. Returns `Err` once
