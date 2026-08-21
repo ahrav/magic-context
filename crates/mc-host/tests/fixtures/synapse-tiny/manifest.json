@@ -1,0 +1,53 @@
+{
+ "corpus": {
+  "name": "corpus.json",
+  "sha256": "e0cb107686ffd2994279cabd821b0aa47898fccfc410d96807e8c07950bfd6c0"
+ },
+ "dims": 8,
+ "external_initializers": [
+  {
+   "name": "embedding.bin",
+   "sha256": "ffccd76e11144eb737f28a45f9a51e5d70a2cc443f7f56a7e44a5608d5a75efc"
+  }
+ ],
+ "fingerprint": "545a9bc1cf5ef2242187a2462eb8cd55d10f8dd0a79bd914e774ca495c4c7626",
+ "max_tokens": 8,
+ "model": "tiny-test-model",
+ "model_file": {
+  "name": "model.onnx",
+  "sha256": "f3823f4aebcc0af6c99480101918e0a1eafc4b7cb34ee7ab0f911135059fa580"
+ },
+ "output": {
+  "name": "last_hidden_state"
+ },
+ "pooling": "mean",
+ "provenance": {
+  "production": false,
+  "source": "synapse-tiny test generator"
+ },
+ "quantization": "none",
+ "recommended_batch": {
+  "rows": 16,
+  "token_budget": 8192
+ },
+ "schema_version": 1,
+ "table_epoch": 1,
+ "tokenizer": {
+  "config": {
+   "name": "config.json",
+   "sha256": "7eaddf87320fdd5a93a1f1c81ebfbf8c38c062132d82bf2e4dba6ebb2c492827"
+  },
+  "special_tokens_map": {
+   "name": "special_tokens_map.json",
+   "sha256": "4048f1a7a76dd7a8e4239f615e140c4fcad7f343994579a1d79f5e63e6d5df2e"
+  },
+  "tokenizer": {
+   "name": "tokenizer.json",
+   "sha256": "946168992a642bbbb8e4b34294a1b90620dbd7e163b408ee51f3b20daf44053a"
+  },
+  "tokenizer_config": {
+   "name": "tokenizer_config.json",
+   "sha256": "93b83aeb5aaba201e06b07710291f58470b8d07dbdf49a2eb80408351c02df81"
+  }
+ }
+}

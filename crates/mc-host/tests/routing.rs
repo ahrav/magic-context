@@ -59,22 +59,18 @@ async fn catalog_is_truthful_and_filters_exactly() {
         json["subc_ops"],
         serde_json::json!(["route.open", "catalog.list"])
     );
-    // Wake-plane probing stays fail-open only while this stays absent.
-    const WAKE_CREATE: &[u8] = b"wake.create";
-    assert!(
-        !unfiltered
-            .body
-            .windows(WAKE_CREATE.len())
-            .any(|w| w == WAKE_CREATE),
-        "an unimplemented operation must not be advertised"
-    );
+    // The direct host implements only `health.check`; `wake.create` stays
+    // excluded so TypeScript wake-plane probing stays fail-open (AE10).
+    support::assert_control_ops(&json["modules"], &["health.check"]);
 
     let exact = control_once(
         &mut client,
         serde_json::json!({"op": "catalog.list", "module_id": LINKED_MODULE_ID}),
     )
     .await;
-    assert_eq!(exact.json()["modules"].as_array().expect("array").len(), 1);
+    let exact_json = exact.json();
+    assert_eq!(exact_json["modules"].as_array().expect("array").len(), 1);
+    support::assert_control_ops(&exact_json["modules"], &["health.check"]);
 
     let unknown = control_once(
         &mut client,
@@ -253,22 +249,52 @@ async fn unroutable_targets_are_classified_distinctly() {
     let host = TestHost::start().await;
     let mut client = host.client().await;
 
-    for kind in ["management_surface", "internal_service"] {
+    let frame = control_once(
+        &mut client,
+        serde_json::json!({
+            "op": "route.open",
+            "target": {"kind": "internal_service", "module_id": "thalamus", "service_id": "svc"},
+            "identity": {"project_root": ROOT, "harness": "opencode", "session": "s"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        frame.error_code(),
+        "target_unavailable",
+        "internal_service is not routable on this profile"
+    );
+
+    for kind in ["tool_provider", "management_surface"] {
         let frame = control_once(
             &mut client,
             serde_json::json!({
                 "op": "route.open",
-                "target": {"kind": kind, "module_id": "thalamus", "service_id": "svc"},
+                "target": {"kind": kind, "module_id": "thalamus"},
                 "identity": {"project_root": ROOT, "harness": "opencode", "session": "s"}
             }),
         )
         .await;
         assert_eq!(
             frame.error_code(),
-            "target_unavailable",
-            "{kind} is not routable on this profile"
+            "unknown_module",
+            "a recognized kind naming an absent module is unknown_module"
         );
     }
+
+    let frame = control_once(
+        &mut client,
+        serde_json::json!({
+            "op": "route.open",
+            "target": {"kind": "management_surface", "module_id": "magic-context"},
+            "identity": {"project_root": ROOT, "harness": "opencode", "session": "s"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        frame.error_code(),
+        "target_unavailable",
+        "a known module with an unadvertised role is target_unavailable"
+    );
 
     let frame = control_once(
         &mut client,

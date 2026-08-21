@@ -2,13 +2,33 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "../../shared/sqlite";
+import { closeQuietly } from "../../shared/sqlite-helpers";
+import type { EmbeddingPageReceipt } from "./memory/embedding-provider";
+import { runMigrations } from "./migrations";
 import { closeDatabase, openDatabase } from "./storage";
+import { initializeDatabase } from "./storage-db";
 import {
+    applySynapseReceiptGroup,
+    completeSynapseLedgerReceipt,
+    createSynapseLedgerPage,
+    findSynapseLedgerPage,
+    getSynapseLedgerPage,
     listEmbeddingMeasurements,
     listMeasurementRowsWithOwnership,
     MEASUREMENT_CORPUS_SESSION_ROW_CAP,
+    markSynapseLedgerObsolete,
+    markSynapseLedgerOutcome,
+    markSynapseLedgerPolling,
+    markSynapseLedgerReady,
     normalizedQueryHash,
     recordEmbeddingMeasurement,
+    recordSynapseLedgerCursor,
+    recordSynapseLedgerRestart,
+    reopenCompleteSynapseLedgerPage,
+    retrySynapseLedgerPage,
+    SynapseLedgerConflictError,
+    type SynapseLedgerPageInput,
 } from "./storage-embedding-measurements";
 
 describe("embedding measurement corpus", () => {
@@ -171,5 +191,434 @@ describe("embedding measurement corpus", () => {
             limit: 100,
         });
         expect([...firstPage, ...secondPage]).toEqual(owned);
+    });
+});
+
+describe("synapse batch ledger CAS journal", () => {
+    function ledgerDb(): Database {
+        const db = new Database(":memory:");
+        db.exec("PRAGMA foreign_keys=ON");
+        initializeDatabase(db);
+        runMigrations(db);
+        return db;
+    }
+
+    function pageInput(overrides: Partial<SynapseLedgerPageInput> = {}): SynapseLedgerPageInput {
+        return {
+            projectPath: "/repo",
+            sessionId: "ses-1",
+            scope: "memory",
+            laneRole: "primary",
+            destinationModel: "synapse:v1:m",
+            applicationGroup: "memory:1",
+            requestKey: "k".repeat(64),
+            manifest: [{ id: "memory:1", contentSha256: "h1" }],
+            deadlineAt: Date.now() + 60_000,
+            ...overrides,
+        };
+    }
+
+    it("gives equal provider request keys distinct rows per context field", () => {
+        const db = ledgerDb();
+        try {
+            const variants: Partial<SynapseLedgerPageInput>[] = [
+                {},
+                { projectPath: "/other" },
+                { sessionId: "ses-2" },
+                { scope: "commit", applicationGroup: "commit:x" },
+                { laneRole: "shadow" },
+                { destinationModel: "synapse:v1:other" },
+                { applicationGroup: "memory:2" },
+            ];
+            const rowIds = variants.map((v) => createSynapseLedgerPage(db, pageInput(v)).rowId);
+            expect(new Set(rowIds).size).toBe(variants.length);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("rejects a duplicate live page but allows a fresh row once the old one is obsolete", () => {
+        const db = ledgerDb();
+        try {
+            const first = createSynapseLedgerPage(db, pageInput());
+            expect(() => createSynapseLedgerPage(db, pageInput())).toThrow(
+                SynapseLedgerConflictError,
+            );
+            markSynapseLedgerObsolete(db, {
+                rowId: first.rowId,
+                expectedStateVersion: first.stateVersion,
+            });
+            const second = createSynapseLedgerPage(db, pageInput());
+            expect(second.rowId).not.toBe(first.rowId);
+            expect(findSynapseLedgerPage(db, pageInput())?.rowId).toBe(second.rowId);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("walks the legal pending -> polling -> ready -> complete path with monotonic versions", () => {
+        const db = ledgerDb();
+        try {
+            let page = createSynapseLedgerPage(db, pageInput());
+            expect(page.state).toBe("pending");
+            expect(page.stateVersion).toBe(0);
+            expect(page.deadlineAt).toBeGreaterThan(Date.now());
+
+            page = markSynapseLedgerPolling(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+                attemptId: "attempt-1",
+                jobId: "job-1",
+            });
+            expect(page.state).toBe("polling");
+            expect(page.stateVersion).toBe(1);
+            expect(page.attemptId).toBe("attempt-1");
+            expect(page.jobId).toBe("job-1");
+
+            page = recordSynapseLedgerCursor(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+                jobId: "job-1",
+                cursor: "cursor-1",
+            });
+            expect(page.cursor).toBe("cursor-1");
+
+            page = markSynapseLedgerReady(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+                jobId: "job-1",
+            });
+            expect(page.state).toBe("ready");
+
+            page = completeSynapseLedgerReceipt(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+            });
+            expect(page.state).toBe("complete");
+            expect(page.stateVersion).toBe(4);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("treats a zero-row CAS as a hard conflict and never mutates the row", () => {
+        const db = ledgerDb();
+        try {
+            const page = createSynapseLedgerPage(db, pageInput());
+            expect(() =>
+                markSynapseLedgerPolling(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion + 1,
+                    attemptId: "attempt-1",
+                    jobId: "job-1",
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+            const after = getSynapseLedgerPage(db, page.rowId);
+            expect(after?.state).toBe("pending");
+            expect(after?.stateVersion).toBe(page.stateVersion);
+            expect(after?.jobId).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("lets one of two selectors sharing a prior version win and hard-rejects the loser", () => {
+        const db = ledgerDb();
+        try {
+            const created = createSynapseLedgerPage(db, pageInput());
+            const snapshotVersion = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-1",
+                jobId: "job-1",
+            }).stateVersion;
+            const winner = markSynapseLedgerReady(db, {
+                rowId: created.rowId,
+                expectedStateVersion: snapshotVersion,
+                jobId: "job-1",
+            });
+            expect(winner.state).toBe("ready");
+            expect(() =>
+                markSynapseLedgerOutcome(db, {
+                    rowId: created.rowId,
+                    expectedStateVersion: snapshotVersion,
+                    disposition: "retryable",
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+            expect(getSynapseLedgerPage(db, created.rowId)?.state).toBe("ready");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("spends the single restart once, only under the current job and inside the deadline", () => {
+        const db = ledgerDb();
+        try {
+            const created = createSynapseLedgerPage(db, pageInput());
+            let page = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-1",
+                jobId: "job-1",
+            });
+            expect(() =>
+                recordSynapseLedgerRestart(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion,
+                    jobId: "job-other",
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+            page = recordSynapseLedgerRestart(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+                jobId: "job-1",
+            });
+            expect(page.restartCount).toBe(1);
+            expect(page.jobId).toBeNull();
+            expect(page.cursor).toBeNull();
+            const rejoined = db
+                .prepare("UPDATE synapse_batch_ledger SET job_id = 'job-2' WHERE id = ?")
+                .run(page.rowId);
+            expect(rejoined.changes).toBe(1);
+            expect(() =>
+                recordSynapseLedgerRestart(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion,
+                    jobId: "job-2",
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("rejects a restart after the absolute deadline", () => {
+        const db = ledgerDb();
+        try {
+            const created = createSynapseLedgerPage(db, pageInput({ deadlineAt: Date.now() - 1 }));
+            const page = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-1",
+                jobId: "job-1",
+            });
+            expect(() =>
+                recordSynapseLedgerRestart(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion,
+                    jobId: "job-1",
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("permits a retry only for a retryable disposition inside the deadline", () => {
+        const db = ledgerDb();
+        try {
+            const retryable = createSynapseLedgerPage(db, pageInput());
+            let page = markSynapseLedgerOutcome(db, {
+                rowId: retryable.rowId,
+                expectedStateVersion: retryable.stateVersion,
+                disposition: "retryable",
+            });
+            page = retrySynapseLedgerPage(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+            });
+            expect(page.state).toBe("pending");
+            expect(page.failureDisposition).toBeNull();
+
+            const permanent = createSynapseLedgerPage(
+                db,
+                pageInput({ applicationGroup: "memory:permanent" }),
+            );
+            const failed = markSynapseLedgerOutcome(db, {
+                rowId: permanent.rowId,
+                expectedStateVersion: permanent.stateVersion,
+                disposition: "permanent",
+            });
+            expect(() =>
+                retrySynapseLedgerPage(db, {
+                    rowId: failed.rowId,
+                    expectedStateVersion: failed.stateVersion,
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+
+            const expired = createSynapseLedgerPage(
+                db,
+                pageInput({
+                    applicationGroup: "memory:expired",
+                    deadlineAt: Date.now() - 1,
+                }),
+            );
+            const expiredFailed = markSynapseLedgerOutcome(db, {
+                rowId: expired.rowId,
+                expectedStateVersion: expired.stateVersion,
+                disposition: "retryable",
+            });
+            expect(() =>
+                retrySynapseLedgerPage(db, {
+                    rowId: expiredFailed.rowId,
+                    expectedStateVersion: expiredFailed.stateVersion,
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("keeps complete absorbing except the destination-proof reopen, and obsolete terminal", () => {
+        const db = ledgerDb();
+        try {
+            const created = createSynapseLedgerPage(db, pageInput());
+            let page = markSynapseLedgerPolling(db, {
+                rowId: created.rowId,
+                expectedStateVersion: created.stateVersion,
+                attemptId: "attempt-1",
+                jobId: "job-1",
+            });
+            page = markSynapseLedgerReady(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+                jobId: "job-1",
+            });
+            page = completeSynapseLedgerReceipt(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+            });
+            expect(() =>
+                markSynapseLedgerObsolete(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion,
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+            expect(() =>
+                markSynapseLedgerOutcome(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion,
+                    disposition: "retryable",
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+
+            page = reopenCompleteSynapseLedgerPage(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+                deadlineAt: Date.now() + 60_000,
+            });
+            expect(page.state).toBe("pending");
+            expect(page.jobId).toBeNull();
+            expect(page.restartCount).toBe(0);
+
+            page = markSynapseLedgerObsolete(db, {
+                rowId: page.rowId,
+                expectedStateVersion: page.stateVersion,
+            });
+            expect(page.state).toBe("obsolete");
+            const obsoleteVersion = page.stateVersion;
+            for (const attempt of [
+                () =>
+                    retrySynapseLedgerPage(db, {
+                        rowId: page.rowId,
+                        expectedStateVersion: obsoleteVersion,
+                    }),
+                () =>
+                    markSynapseLedgerPolling(db, {
+                        rowId: page.rowId,
+                        expectedStateVersion: obsoleteVersion,
+                        attemptId: "a",
+                        jobId: "j",
+                    }),
+                () =>
+                    completeSynapseLedgerReceipt(db, {
+                        rowId: page.rowId,
+                        expectedStateVersion: obsoleteVersion,
+                    }),
+            ]) {
+                expect(attempt).toThrow(SynapseLedgerConflictError);
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("retires every drifted receipt of a group in one application pass", () => {
+        const db = ledgerDb();
+        try {
+            const group = "memory:drift-group";
+            const toReady = (page: { rowId: number; stateVersion: number }, jobId: string) => {
+                const polling = markSynapseLedgerPolling(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: page.stateVersion,
+                    attemptId: `attempt-${jobId}`,
+                    jobId,
+                });
+                return markSynapseLedgerReady(db, {
+                    rowId: page.rowId,
+                    expectedStateVersion: polling.stateVersion,
+                    jobId,
+                });
+            };
+            const first = toReady(
+                createSynapseLedgerPage(
+                    db,
+                    pageInput({
+                        applicationGroup: group,
+                        manifest: [{ id: "memory:1", contentSha256: "h1" }],
+                    }),
+                ),
+                "job-1",
+            );
+            const second = toReady(
+                createSynapseLedgerPage(
+                    db,
+                    pageInput({
+                        applicationGroup: group,
+                        requestKey: "m".repeat(64),
+                        manifest: [{ id: "memory:2", contentSha256: "h2" }],
+                    }),
+                ),
+                "job-2",
+            );
+            const receipts: EmbeddingPageReceipt[] = [
+                {
+                    rowId: first.rowId,
+                    stateVersion: first.stateVersion,
+                    applicationGroup: group,
+                    items: [{ id: "memory:1", contentSha256: "h1" }],
+                    vectors: new Map([["memory:1", new Float32Array([1])]]),
+                },
+                {
+                    rowId: second.rowId,
+                    stateVersion: second.stateVersion,
+                    applicationGroup: group,
+                    items: [{ id: "memory:2", contentSha256: "h2" }],
+                    vectors: new Map([["memory:2", new Float32Array([2])]]),
+                },
+            ];
+            let wroteDestination = false;
+
+            expect(() =>
+                applySynapseReceiptGroup(db, {
+                    receipts,
+                    expectation: {
+                        scope: "memory",
+                        laneRole: "primary",
+                        destinationModel: "synapse:v1:m",
+                    },
+                    readCurrentHashes: (ids) => new Map(ids.map((id) => [id, `drifted:${id}`])),
+                    writeDestination: () => {
+                        wroteDestination = true;
+                    },
+                }),
+            ).toThrow(SynapseLedgerConflictError);
+
+            expect(wroteDestination).toBe(false);
+            expect(getSynapseLedgerPage(db, first.rowId)?.state).toBe("obsolete");
+            expect(getSynapseLedgerPage(db, second.rowId)?.state).toBe("obsolete");
+        } finally {
+            closeQuietly(db);
+        }
     });
 });

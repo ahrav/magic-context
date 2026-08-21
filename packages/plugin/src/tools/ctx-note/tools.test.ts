@@ -310,6 +310,38 @@ describe("createCtxNoteTools", () => {
         });
     });
 
+    it("passes the unchanged condition to the module backend when the wake plane is absent", async () => {
+        __wakePlaneTest.setCatalogProbe(async () => [
+            { module_id: "other-module", roles: [], control_ops: ["other.operation"] },
+        ]);
+        let receivedSurfaceCondition: string | undefined;
+        tools = createCtxNoteTools({
+            db,
+            dreamerEnabled: true,
+            resolveProjectPath: () => "git:project-a",
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                noteEvaluationAvailable: () => true,
+                note: async (request) => {
+                    receivedSurfaceCondition = request.surfaceCondition;
+                    return "Created smart note #1.";
+                },
+            },
+        });
+
+        const result = await tools.ctx_note.execute(
+            {
+                action: "write",
+                content: "Wake-plane absent module note",
+                surface_condition: "When the scheduled operation completes",
+            },
+            toolContext(),
+        );
+
+        expect(receivedSurfaceCondition).toBe("When the scheduled operation completes");
+        expect(result).toContain("Created smart note #1");
+    });
+
     it("compiles a fenced MODULE-authority smart note before the facade write", async () => {
         tools = createCtxNoteTools({
             db,

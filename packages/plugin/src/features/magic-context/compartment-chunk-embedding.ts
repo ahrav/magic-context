@@ -5,6 +5,7 @@ import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { recursiveCharacterSplit } from "./recursive-text-splitter";
+import { splitUtf8Bytes } from "./search-bounds";
 import type { VectorLoadObserver } from "./search-trace";
 
 export const DEFAULT_COMPARTMENT_CHUNK_MAX_INPUT_TOKENS = 512;
@@ -66,6 +67,7 @@ interface BackfillCandidateRow {
     startMessage: number;
     endMessage: number;
     title: string;
+    createdAt: number;
 }
 
 export interface CompartmentChunkBackfillCandidate {
@@ -74,6 +76,7 @@ export interface CompartmentChunkBackfillCandidate {
     startMessage: number;
     endMessage: number;
     title: string;
+    createdAt: number;
 }
 
 export interface CompartmentChunkWindow {
@@ -118,6 +121,7 @@ const searchRowsStatements = new WeakMap<Database, PreparedStatement>();
 const searchRowsByModelStatements = new WeakMap<Database, PreparedStatement>();
 const searchPoolProbeStatements = new WeakMap<Database, PreparedStatement>();
 const backfillCandidateStatements = new WeakMap<Database, PreparedStatement>();
+const backfillCandidateBeforeStatements = new WeakMap<Database, PreparedStatement>();
 
 const DECODED_SEARCH_POOL_CACHE_MAX_BYTES = 256 * 1024 * 1024;
 const decodedSearchPools = new WeakMap<Database, Map<string, DecodedSearchPoolEntry>>();
@@ -228,15 +232,17 @@ function getSearchRowsStatement(db: Database, withModel: boolean): PreparedState
     return stmt;
 }
 
-function getBackfillCandidateStatement(db: Database): PreparedStatement {
-    let stmt = backfillCandidateStatements.get(db);
+function getBackfillCandidateStatement(db: Database, withCursor = false): PreparedStatement {
+    const statements = withCursor ? backfillCandidateBeforeStatements : backfillCandidateStatements;
+    let stmt = statements.get(db);
     if (!stmt) {
         stmt = db.prepare(
             `SELECT c.id AS id,
                     c.session_id AS sessionId,
                     c.start_message AS startMessage,
                     c.end_message AS endMessage,
-                    c.title AS title
+                    c.title AS title,
+                    c.created_at AS createdAt
              FROM compartments c
              JOIN session_projects sp
                ON sp.session_id = c.session_id
@@ -244,6 +250,7 @@ function getBackfillCandidateStatement(db: Database): PreparedStatement {
               AND sp.project_path = ?
              WHERE c.start_message IS NOT NULL
                AND c.end_message IS NOT NULL
+               ${withCursor ? "AND (c.created_at < ? OR (c.created_at = ? AND c.id < ?))" : ""}
                AND NOT EXISTS (
                    SELECT 1
                    FROM compartment_chunk_embeddings current
@@ -254,7 +261,7 @@ function getBackfillCandidateStatement(db: Database): PreparedStatement {
              ORDER BY c.created_at DESC, c.id DESC
              LIMIT ?`,
         );
-        backfillCandidateStatements.set(db, stmt);
+        statements.set(db, stmt);
     }
     return stmt;
 }
@@ -552,6 +559,7 @@ export function chunkCanonicalText(
     startOrdinal: number,
     endOrdinal: number,
     maxInputTokens: number,
+    maxInputBytes?: number,
 ): CompartmentChunkWindow[] {
     const lines = canonicalText
         .split(/\r?\n/)
@@ -565,15 +573,18 @@ export function chunkCanonicalText(
     const effectiveMax = Math.max(1, Math.floor(normalizedMax * CHUNK_WINDOW_SAFETY_RATIO));
     const fullText = lines.join("\n");
     if (estimateTokens(fullText) <= effectiveMax) {
-        return [
-            {
-                windowIndex: 0,
-                startOrdinal,
-                endOrdinal,
-                text: fullText,
-                chunkHash: hashChunkText(fullText),
-            },
-        ];
+        return constrainWindowsByUtf8Bytes(
+            [
+                {
+                    windowIndex: 0,
+                    startOrdinal,
+                    endOrdinal,
+                    text: fullText,
+                    chunkHash: hashChunkText(fullText),
+                },
+            ],
+            maxInputBytes,
+        );
     }
 
     const windows: CompartmentChunkWindow[] = [];
@@ -641,7 +652,35 @@ export function chunkCanonicalText(
     // flush path and the oversized-line split use `windows.length + 1`), so it is
     // already gap-free and stable — preserve it (chunk identity = compartmentId +
     // windowIndex + hash; renumbering would orphan every stored chunk row).
-    return windows;
+    return constrainWindowsByUtf8Bytes(windows, maxInputBytes);
+}
+
+function constrainWindowsByUtf8Bytes(
+    windows: readonly CompartmentChunkWindow[],
+    maxInputBytes: number | undefined,
+): CompartmentChunkWindow[] {
+    if (
+        maxInputBytes === undefined ||
+        !Number.isInteger(maxInputBytes) ||
+        maxInputBytes < 1 ||
+        windows.every((window) => Buffer.byteLength(window.text, "utf8") <= maxInputBytes)
+    ) {
+        return [...windows];
+    }
+
+    return windows
+        .flatMap((window) =>
+            splitUtf8Bytes(window.text, maxInputBytes).map((text) => ({
+                startOrdinal: window.startOrdinal,
+                endOrdinal: window.endOrdinal,
+                text,
+            })),
+        )
+        .map((window, index) => ({
+            ...window,
+            windowIndex: index + 1,
+            chunkHash: hashChunkText(window.text),
+        }));
 }
 
 /**
@@ -809,6 +848,16 @@ export function replaceCompartmentChunkEmbeddings(
     );
 }
 
+/** Remove one compartment's rows under one model, invalidating decoded pools. */
+export function deleteCompartmentChunkEmbeddingsForModel(
+    db: Database,
+    compartmentId: number,
+    modelId: string,
+): void {
+    getDeleteByCompartmentStatement(db).run(compartmentId, modelId);
+    invalidateDecodedSearchPools(db, ([, , cachedModelId]) => cachedModelId === modelId);
+}
+
 function searchPoolVectorBytes(rows: readonly StoredCompartmentChunkEmbedding[]): number {
     let bytes = 0;
     for (const row of rows) {
@@ -903,18 +952,36 @@ export function loadCompartmentChunkEmbeddingsForSearch(
     return decodedRows;
 }
 
+/** Project-wide candidates for the passive missing-chunk drain, newest-first (a
+ *  fresh compartment is the one a search is most likely to want).
+ *
+ *  `before` is a run-local keyset cursor. It advances past every selected batch,
+ *  including no-work and failed candidates, without growing a SQL parameter
+ *  list. The cursor is not persisted, so failures remain eligible on the next
+ *  maintenance pass. */
 export function loadUnembeddedCompartmentChunkCandidates(
     db: Database,
     projectPath: string,
     modelId: string,
     limit: number,
+    before?: Pick<CompartmentChunkBackfillCandidate, "createdAt" | "id">,
 ): CompartmentChunkBackfillCandidate[] {
-    const rows = getBackfillCandidateStatement(db).all(
-        projectPath,
-        projectPath,
-        modelId,
-        Math.max(1, limit),
-    ) as unknown[];
+    const rows = before
+        ? getBackfillCandidateStatement(db, true).all(
+              projectPath,
+              before.createdAt,
+              before.createdAt,
+              before.id,
+              projectPath,
+              modelId,
+              Math.max(1, limit),
+          )
+        : getBackfillCandidateStatement(db).all(
+              projectPath,
+              projectPath,
+              modelId,
+              Math.max(1, limit),
+          );
     return mapBackfillCandidateRows(rows);
 }
 
@@ -928,7 +995,8 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
                 typeof candidate.sessionId === "string" &&
                 typeof candidate.startMessage === "number" &&
                 typeof candidate.endMessage === "number" &&
-                typeof candidate.title === "string"
+                typeof candidate.title === "string" &&
+                typeof candidate.createdAt === "number"
             );
         })
         .map((row) => ({
@@ -937,6 +1005,7 @@ function mapBackfillCandidateRows(rows: unknown[]): CompartmentChunkBackfillCand
             startMessage: row.startMessage,
             endMessage: row.endMessage,
             title: row.title,
+            createdAt: row.createdAt,
         }));
 }
 
@@ -969,7 +1038,8 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.session_id AS sessionId,
                     c.start_message AS startMessage,
                     c.end_message AS endMessage,
-                    c.title AS title
+                    c.title AS title,
+                    c.created_at AS createdAt
              FROM compartments c
              JOIN session_projects sp
                ON sp.session_id = c.session_id
@@ -1006,7 +1076,8 @@ export function loadUnembeddedSessionChunkCandidates(
                     c.session_id AS sessionId,
                     c.start_message AS startMessage,
                     c.end_message AS endMessage,
-                    c.title AS title
+                    c.title AS title,
+                    c.created_at AS createdAt
              FROM compartments c
              JOIN session_projects sp
                ON sp.session_id = c.session_id

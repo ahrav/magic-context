@@ -6,7 +6,12 @@ export {
     type SubcDiagnosticsEvent,
     type SubcDiagnosticsObserver,
 } from "./client";
-export { Deadline, type MonotonicClock } from "./deadline";
+export {
+    armExpiryTimer,
+    Deadline,
+    type ExpiryTimerScheduler,
+    type MonotonicClock,
+} from "./deadline";
 export {
     isSubcCallError,
     SocketClosedError,

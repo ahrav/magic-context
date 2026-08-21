@@ -79,14 +79,11 @@ export {
     setSqlitePragmaConfig,
 } from "./storage-db";
 export {
-    beginSynapseBatchLedger,
     type EmbeddingMeasurementInput,
     type EmbeddingMeasurementRow,
-    finishSynapseBatchLedger,
     listEmbeddingMeasurements,
     normalizedQueryHash,
     recordEmbeddingMeasurement,
-    type SynapseBatchLedgerInput,
 } from "./storage-embedding-measurements";
 export {
     deleteIdentityRekeyMap,

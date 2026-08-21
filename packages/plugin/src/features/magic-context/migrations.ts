@@ -29,6 +29,8 @@ import {
     ensureColumn,
     healAllNullColumns,
     MEMORIES_AU_TRIGGER_BODY,
+    synapseBatchLedgerDdl,
+    synapseBatchLedgerIndexDdl,
 } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -3142,6 +3144,93 @@ export const MIGRATIONS: Migration[] = [
         },
     },
     {
+        version: 83,
+        description: "context-complete synapse batch ledger with versioned CAS state",
+        up(db: Database): void {
+            if (!tableExists(db, "synapse_batch_ledger")) {
+                db.exec(synapseBatchLedgerDdl("synapse_batch_ledger"));
+                db.exec(synapseBatchLedgerIndexDdl(false));
+                invalidateUnprovenSynapseDestinationRowsV83(db);
+                return;
+            }
+            const columns = new Set(
+                (
+                    db.prepare("PRAGMA table_info(synapse_batch_ledger)").all() as Array<{
+                        name: string;
+                    }>
+                ).map((row) => row.name),
+            );
+            if (columns.has("state_version")) {
+                const hasInterruptedStaging = tableExists(db, "synapse_batch_ledger_legacy_v81");
+                const ledgerIsEmpty =
+                    db.prepare("SELECT 1 FROM synapse_batch_ledger LIMIT 1").get() == null;
+                // The staging table marks an interrupted replacement. An empty
+                // target ledger can also be precreated by database initialization;
+                // without any receipt, Synapse destination rows are unproven.
+                // A populated target ledger without staging may contain
+                // context-complete receipts and must remain untouched on repair reruns.
+                if (hasInterruptedStaging || ledgerIsEmpty) {
+                    invalidateUnprovenSynapseDestinationRowsV83(db);
+                }
+                if (hasInterruptedStaging) {
+                    db.exec("DROP TABLE synapse_batch_ledger_legacy_v81");
+                }
+                return;
+            }
+            const legacyCount = (
+                db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
+                    count: number;
+                }
+            ).count;
+            // A staging copy can survive a failed prior attempt under
+            // transaction adapters that do not honor the requested begin mode;
+            // a leftover copy must not wedge every future open (same defense
+            // as the v49 staging tables).
+            db.exec("DROP TABLE IF EXISTS synapse_batch_ledger_legacy_v81");
+            // Stage the legacy rows in a plain copy instead of ALTER RENAME:
+            // a rename forces SQLite to re-resolve every trigger in the schema,
+            // which fails closed on databases whose memories_au trigger dangles
+            // (minimal fixtures without memories_fts).
+            db.exec(
+                "CREATE TABLE synapse_batch_ledger_legacy_v81 AS SELECT * FROM synapse_batch_ledger",
+            );
+            db.exec("DROP TABLE synapse_batch_ledger");
+            db.exec(synapseBatchLedgerDdl("synapse_batch_ledger"));
+            db.exec(synapseBatchLedgerIndexDdl(false));
+            // Quarantine every legacy row: the v81 schema stored no lane role,
+            // destination model, or application group, so no legacy receipt can
+            // prove full context (including rows that claimed 'complete' before
+            // destination persistence). Each is retained as a terminal
+            // 'obsolete' receipt -- durable and queryable -- and normal domain
+            // selectors rebuild the work under fresh context-complete rows.
+            db.exec(`
+                INSERT INTO synapse_batch_ledger
+                    (project_path, session_id, scope, lane_role, destination_model,
+                     application_group, request_key, manifest_json, state, state_version,
+                     job_id, cursor, deadline_at, restart_count, failure_disposition,
+                     created_at, updated_at)
+                SELECT project_path, session_id, scope,
+                       CASE WHEN session_id LIKE 'shadow:%' THEN 'shadow' ELSE 'primary' END,
+                       '', '', request_key, manifest_json, 'obsolete', 0,
+                       job_id, cursor, NULL, 0, NULL,
+                       created_at, updated_at
+                FROM synapse_batch_ledger_legacy_v81
+            `);
+            const copied = (
+                db.prepare("SELECT COUNT(*) AS count FROM synapse_batch_ledger").get() as {
+                    count: number;
+                }
+            ).count;
+            if (copied !== legacyCount) {
+                throw new Error(
+                    `v83 ledger copy postcondition failed: ${copied} of ${legacyCount} rows`,
+                );
+            }
+            invalidateUnprovenSynapseDestinationRowsV83(db);
+            db.exec("DROP TABLE synapse_batch_ledger_legacy_v81");
+        },
+    },
+    {
         version: 84,
         description:
             "memories-to-claims compatibility contract: crosswalk, revision metadata, operation envelope, outbox, generations, and semantic write guards",
@@ -3222,6 +3311,47 @@ export const MIGRATIONS: Migration[] = [
         },
     },
 ];
+
+/**
+ * Invalidate Synapse-lane destination vectors whose exact source and lane
+ * compatibility cannot be proven from durable state, inside the v83 migration
+ * transaction (R24). Coverage, precisely:
+ *
+ * - `memory_embeddings`: rows under a Synapse lane identity
+ *   (`model_id LIKE 'synapse:v1:%'`) carry no per-row source hash and memory
+ *   content is mutable, so exact source compatibility is unprovable --
+ *   deleted. Normal memory selectors rebuild them on demand.
+ * - `git_commit_embeddings`: a commit's source text is fixed by its SHA (rows
+ *   cascade-delete with `git_commits`) and `model_id` pins the lane
+ *   (model+fingerprint), so source and lane compatibility are provable from
+ *   durable state -- retained.
+ * - `compartment_chunk_embeddings`: compartment text is mutable, and the
+ *   search read path serves stored vectors without reconstructing source
+ *   windows. A stored `chunk_hash` therefore cannot prove source compatibility
+ *   during migration. All Synapse rows are deleted and normal selectors
+ *   rebuild them from current source text.
+ * - Rows under any non-Synapse `model_id` (local/openai lanes) are never
+ *   touched (R25).
+ */
+function invalidateUnprovenSynapseDestinationRowsV83(db: Database): void {
+    const laneLike = "synapse:v1:%";
+    if (tableExists(db, "memory_embeddings")) {
+        const deleted = db
+            .prepare("DELETE FROM memory_embeddings WHERE model_id LIKE ?")
+            .run(laneLike).changes;
+        if (deleted > 0) {
+            log(`[migrations] v83: invalidated ${deleted} unproven synapse memory embedding(s)`);
+        }
+    }
+    if (tableExists(db, "compartment_chunk_embeddings")) {
+        const deleted = db
+            .prepare("DELETE FROM compartment_chunk_embeddings WHERE model_id LIKE ?")
+            .run(laneLike).changes;
+        if (deleted > 0) {
+            log(`[migrations] v83: invalidated ${deleted} unproven synapse chunk embedding(s)`);
+        }
+    }
+}
 
 /**
  * Highest version in the MIGRATIONS array. `LATEST_SUPPORTED_VERSION` in

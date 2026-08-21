@@ -169,7 +169,7 @@ describe("migration v82: claims and evidence schema", () => {
                     .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 82")
                     .get(),
             ).toEqual({ count: 1 });
-            expect(LATEST_MIGRATION_VERSION).toBe(84);
+            expect(LATEST_MIGRATION_VERSION).toBeGreaterThanOrEqual(82);
             expect(db.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
             expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
         } finally {

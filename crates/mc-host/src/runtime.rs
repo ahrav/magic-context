@@ -20,7 +20,7 @@ use crate::connection::{run_connection, GenerationCore};
 use crate::dispatch::{
     finish_route_close, force_close_all_routes, send_connection_goodbye, settle_route,
 };
-use crate::handler::McHostHandler;
+use crate::handler::{McHostHandler, TargetKind};
 use crate::instance::{ConnectionKey, InstanceError, InstanceGuard};
 use crate::routing::RouteRegistry;
 use crate::wire::ByteBudget;
@@ -93,11 +93,7 @@ pub struct HostShared<H> {
     pub limits: HostLimits,
     pub timing: HostTiming,
     pub liveness: Option<LivenessPolicy>,
-    /// The linked module's identity, the only manifest datum the runtime
-    /// reads after startup. The full `ManifestSnapshot` is dropped once the
-    /// catalog cache is built: a large `provides` tree would otherwise stay
-    /// resident for the incarnation outside every byte budget.
-    pub module_id: Arc<str>,
+    pub targets: crate::control::TargetIndex,
     pub catalog: crate::control::CatalogCache,
     pub registry: RouteRegistry,
     pub ingress_budget: ByteBudget,
@@ -108,6 +104,11 @@ pub struct HostShared<H> {
     pub connection_permits: Arc<Semaphore>,
     pub tracker: TaskTracker,
     abort_handles: Mutex<AbortRegistry>,
+    /// One-shot latch for the handler shutdown callback: the abandon-path
+    /// cleanup can run after a `run` future was dropped with the graceful
+    /// path's callback task already spawned and still executing, and a second
+    /// spawn would overlap the handler's shutdown with itself.
+    shutdown_callback_ran: AtomicBool,
     pub shutdown: CancellationToken,
     pub draining: AtomicBool,
     pub fatal: FatalCell,
@@ -227,14 +228,20 @@ impl AbortRegistry {
 
 /// Keeps the instance lock held until every tracked task — including
 /// abort-exempt lifecycle callbacks that still own the handler — has finished,
-/// without blocking `run`'s return. The wait is deliberately unbounded: while
-/// such a callback runs, a successor acquiring the same data directory would
-/// initialize concurrently with live predecessor code, and the lock dies with
-/// the process anyway, so holding it is the truthful answer.
+/// then runs handler shutdown and waits for it without blocking `run`'s return.
+/// The waits are deliberately unbounded: while either callback runs, a
+/// successor acquiring the same data directory would initialize concurrently
+/// with live predecessor code, and the lock dies with the process anyway, so
+/// holding it is the truthful answer.
 fn retain_lock_until_drained<H: McHostHandler>(shared: Arc<HostShared<H>>, guard: InstanceGuard) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
             // The tracker is already closed by the shutdown sequence.
+            shared.tracker.wait().await;
+            run_handler_shutdown(&shared).await;
+            if let Some(message) = shared.fatal.take() {
+                eprintln!("mc-host: deferred handler shutdown failed: {message}");
+            }
             shared.tracker.wait().await;
             drop(shared);
             drop(guard);
@@ -243,18 +250,34 @@ fn retain_lock_until_drained<H: McHostHandler>(shared: Arc<HostShared<H>>, guard
 }
 
 /// Keeps the instance lock held until an aborted initialization task actually
-/// stops, without blocking `run`'s return. The lock is the single-instance
-/// fence: releasing it while the old callback still owns the handler and its
-/// storage descriptor would let a successor initialize the same data
-/// directory concurrently. A successor meanwhile observes `AlreadyRunning`,
-/// which is the truthful answer while that callback runs.
-fn retain_lock_until_stopped<T: Send + 'static>(
+/// stops, then runs the handler shutdown callback, without blocking `run`'s
+/// return. The lock is the single-instance fence: releasing it while the old
+/// callback still owns the handler and its storage descriptor would let a
+/// successor initialize the same data directory concurrently. A successor
+/// meanwhile observes `AlreadyRunning`, which is the truthful answer while
+/// that callback runs.
+///
+/// The shutdown callback runs even though initialization never completed: an
+/// interrupted initialize can already have handed work to component-owned
+/// trackers (blocking bundle loads, native inference), and only `shutdown`
+/// stops and drains those, so skipping it would release the fence beside
+/// live component work. Handler shutdown callbacks are therefore drain-shaped
+/// and state-independent — they must tolerate running against a handler whose
+/// initialize was interrupted. Both awaits are deliberately unbounded, for
+/// the same reason `retain_lock_until_drained`'s wait is: a bound that drops
+/// the guard anyway would release the fence while handler code still runs,
+/// and the lock dies with the process regardless.
+fn retain_lock_until_stopped<H: McHostHandler, T: Send + 'static>(
     guard: InstanceGuard,
+    handler: Arc<H>,
     task: tokio_util::task::AbortOnDropHandle<T>,
 ) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
             let _ = task.await;
+            let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
+            crate::panic_boundary::redact(callback).await;
+            drop(handler);
             drop(guard);
         });
     }
@@ -269,14 +292,80 @@ pub struct LifecycleFailure {
     pub stopped: bool,
 }
 
+fn spawn_handler_shutdown<H: McHostHandler>(handler: Arc<H>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
+        crate::panic_boundary::redact(callback).await;
+    })
+}
+
+/// Owns handler shutdown and the instance guard before `HostShared` exists.
+/// Shutdown runs in its own task so cancelling the waiter transfers that same
+/// task and the guard to a reaper instead of cancelling cleanup or invoking
+/// the callback twice. Successful publication disarms the owner without
+/// spawning cleanup.
+struct PrePublicationCleanup<H: McHostHandler> {
+    guard: Option<InstanceGuard>,
+    handler: Option<Arc<H>>,
+    shutdown: Option<JoinHandle<()>>,
+}
+
+impl<H: McHostHandler> PrePublicationCleanup<H> {
+    fn new(guard: InstanceGuard, handler: Arc<H>) -> Self {
+        Self {
+            guard: Some(guard),
+            handler: Some(handler),
+            shutdown: None,
+        }
+    }
+
+    fn guard_mut(&mut self) -> &mut InstanceGuard {
+        self.guard.as_mut().expect("armed startup cleanup")
+    }
+
+    async fn finish(mut self) {
+        self.shutdown = Some(spawn_handler_shutdown(
+            self.handler.take().expect("armed startup cleanup"),
+        ));
+        let shutdown = self.shutdown.as_mut().expect("started startup cleanup");
+        let _ = shutdown.await;
+        drop(self.shutdown.take());
+        drop(self.guard.take());
+    }
+
+    fn disarm(mut self) -> (InstanceGuard, Arc<H>) {
+        (
+            self.guard.take().expect("armed startup cleanup"),
+            self.handler.take().expect("armed startup cleanup"),
+        )
+    }
+}
+
+impl<H: McHostHandler> Drop for PrePublicationCleanup<H> {
+    fn drop(&mut self) {
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let shutdown = self.shutdown.take().unwrap_or_else(|| {
+                spawn_handler_shutdown(self.handler.take().expect("armed startup cleanup"))
+            });
+            runtime.spawn(async move {
+                let _ = shutdown.await;
+                drop(guard);
+            });
+        }
+    }
+}
+
 /// Cancels host work if the `run` future is dropped instead of completing:
 /// `TaskTracker` does not abort tracked tasks on drop, so a supervisor that
 /// aborts `run` would otherwise leave the health loop and authenticated
 /// connections serving indefinitely while the instance lock frees for a
 /// successor. The guard owns the `InstanceGuard`, and forced cleanup —
-/// exactly-once route-gone before handler drop, publication removal and lock
-/// release last — runs on a spawned task the abandoned future no longer has
-/// to poll. Normal completion disarms it.
+/// exactly-once route-gone, then the handler shutdown callback, publication
+/// removal and lock release last — runs on a spawned task the abandoned
+/// future no longer has to poll. Normal completion disarms it.
 struct AbandonGuard<H: McHostHandler> {
     inner: Option<(Arc<HostShared<H>>, InstanceGuard)>,
 }
@@ -329,11 +418,87 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
                 // initialize this data directory concurrently. The lock lives
                 // on a descriptor that dies with the process.
                 shared.tracker.wait().await;
+                // The handler shutdown callback still runs on this abandoned
+                // path: component-owned work (queued batch workers, tracked
+                // native inference) is only stopped and drained by
+                // `shutdown`, so releasing the lock without it would free the
+                // fence while such work can still start. Running it after the
+                // tracker drained above means it can never overlap a
+                // lifecycle callback that still owns the handler; the
+                // once-latch inside lets a callback already spawned by the
+                // graceful path win instead.
+                run_handler_shutdown(&shared).await;
+                // The callback task is itself tracked and never aborted; a
+                // deadline overrun leaves it running (fatal-latched), and the
+                // lock must outlive it.
+                shared.tracker.wait().await;
                 drop(shared);
                 drop(guard);
             });
         }
     }
+}
+
+/// Validates the startup manifest set and derives the routable
+/// `(module, kind)` pairs, so the published catalog and route admission can
+/// never contradict each other.
+fn build_target_index(
+    manifests: &[crate::handler::ManifestSnapshot],
+) -> Result<crate::control::TargetIndex, HostError> {
+    if manifests.is_empty() || manifests.len() > 2 {
+        return Err(HostError::InitFailed(
+            "the static profile requires one or two module manifests".to_owned(),
+        ));
+    }
+    let mut target_entries: Vec<(Box<str>, Vec<TargetKind>)> = Vec::with_capacity(manifests.len());
+    for manifest in manifests {
+        if let Err(err) = crate::control::validate_manifest_module_id(&manifest.module_id) {
+            return Err(HostError::InitFailed(err));
+        }
+        if target_entries
+            .iter()
+            .any(|(id, _)| id.as_ref() == manifest.module_id)
+        {
+            return Err(HostError::InitFailed(
+                "duplicate module ID across startup manifests".to_owned(),
+            ));
+        }
+        let mut kinds = Vec::new();
+        for entry in &manifest.provides {
+            // A published catalog entry whose role can never route would
+            // contradict route admission, so startup refuses it.
+            let Some(kind) = entry
+                .get("role")
+                .and_then(|role| role.as_str())
+                .and_then(TargetKind::parse)
+            else {
+                return Err(HostError::InitFailed(
+                    "manifest advertises an unsupported role".to_owned(),
+                ));
+            };
+            if kinds.contains(&kind) {
+                return Err(HostError::InitFailed(
+                    "manifest advertises a duplicate target pair".to_owned(),
+                ));
+            }
+            kinds.push(kind);
+        }
+        if kinds.is_empty() {
+            return Err(HostError::InitFailed(
+                "manifest advertises no routable role".to_owned(),
+            ));
+        }
+        target_entries.push((manifest.module_id.clone().into_boxed_str(), kinds));
+    }
+    if !target_entries
+        .iter()
+        .any(|(_, kinds)| kinds.contains(&TargetKind::ToolProvider))
+    {
+        return Err(HostError::InitFailed(
+            "startup manifests do not advertise a tool_provider role".to_owned(),
+        ));
+    }
+    Ok(crate::control::TargetIndex::new(target_entries))
 }
 
 /// Runs one host incarnation to completion.
@@ -349,18 +514,18 @@ pub async fn run<H: McHostHandler>(
 ) -> Result<(), HostError> {
     crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
-    let mut guard =
-        InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
+    let guard = InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
-    let manifest = crate::panic_boundary::redact_sync(|| handler.manifest());
+    let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
+    let targets = build_target_index(&manifests)?;
     // Bounded during serialization, not after: an over-limit manifest must be
     // refused without ever materializing a full copy of its catalog.
     let Ok(catalog) =
-        crate::control::CatalogCache::new_bounded(&manifest, crate::wire::MAX_BODY_LEN as usize)
+        crate::control::CatalogCache::new_bounded(&manifests, crate::wire::MAX_BODY_LEN as usize)
     else {
         return Err(HostError::InitFailed(
-            "linked manifest exceeds the frame limit".to_owned(),
+            "linked manifest catalog exceeds the frame limit".to_owned(),
         ));
     };
     // The cached catalog stays resident for the whole incarnation outside
@@ -375,36 +540,19 @@ pub async fn run<H: McHostHandler>(
             "linked manifest catalog leaves no resident-byte headroom".to_owned(),
         ));
     }
-    // `route.open` admits only manifest-supported roles (protocol §7.2); a
-    // manifest without the tool_provider role would publish a catalog that
-    // says the role is unavailable while route admission still accepted it.
-    if !manifest.provides.iter().any(|entry| {
-        entry.get("role").and_then(|role| role.as_str())
-            == Some(crate::control::TARGET_KIND_TOOL_PROVIDER)
-    }) {
-        return Err(HostError::InitFailed(
-            "linked manifest does not advertise a tool_provider role".to_owned(),
-        ));
-    }
-    // The module ID must satisfy the same bounds route.open enforces on the
-    // client-supplied target, or the catalog advertises a module no request
-    // can name.
-    if let Err(err) = crate::control::validate_manifest_module_id(&manifest.module_id) {
-        return Err(HostError::InitFailed(err));
-    }
 
     // Initialization runs exactly once, before bind; failure or deadline
     // overrun prevents publication entirely (protocol §8.1). Abort-on-drop:
     // if this `run` future is dropped mid-initialize, the callback must not
     // keep running after the instance lock frees for a successor.
     {
-        let handler = Arc::clone(&handler);
+        let init_handler = Arc::clone(&handler);
         // Taken, not cloned: the storage descriptor can be arbitrarily large
         // and must not stay owned by `config` for the incarnation, outside
         // every byte budget — the handler consumes the only copy.
         let init = std::mem::take(&mut config.init);
         let mut init_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            let callback = crate::panic_boundary::redact_sync(|| handler.initialize(init));
+            let callback = crate::panic_boundary::redact_sync(|| init_handler.initialize(init));
             crate::panic_boundary::redact(callback).await
         }));
         let joined = tokio::select! {
@@ -422,9 +570,11 @@ pub async fn run<H: McHostHandler>(
             // owns the handler and the initialization payload, and a
             // successor starting against the same data directory would run a
             // second initialization concurrently — so the guard moves into a
-            // detached reaper that waits for the task and drops it last.
+            // detached reaper that waits for the task, runs the handler
+            // shutdown callback (draining any component-owned work the
+            // interrupted initialize already started), and drops it last.
             init_task.abort();
-            retain_lock_until_stopped(guard, init_task);
+            retain_lock_until_stopped(guard, Arc::clone(&handler), init_task);
             return Err(HostError::InitFailed(
                 "shutdown requested during initialization".to_owned(),
             ));
@@ -432,6 +582,14 @@ pub async fn run<H: McHostHandler>(
         match joined {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(err))) => {
+                // A failed initialization can still have left handler-owned
+                // work running: a composite's primary may have initialized
+                // successfully before its secondary failed, and only the
+                // shutdown callback stops it. Awaiting it here keeps the
+                // single-instance fence — `guard` drops when this returns —
+                // held until the handler is actually idle.
+                PrePublicationCleanup::new(guard, handler).finish().await;
+
                 // The handler-authored message can carry data derived from
                 // the opaque storage descriptor (credentials, endpoints);
                 // startup diagnostics get bounded structure only (V24).
@@ -441,6 +599,10 @@ pub async fn run<H: McHostHandler>(
                 )));
             }
             Ok(Err(join_err)) => {
+                // A panic can happen after initialization starts handler-owned
+                // work, so it has the same cleanup obligation as a returned
+                // initialization error.
+                PrePublicationCleanup::new(guard, handler).finish().await;
                 let kind = if join_err.is_panic() {
                     "panic"
                 } else {
@@ -450,7 +612,7 @@ pub async fn run<H: McHostHandler>(
             }
             Err(_) => {
                 init_task.abort();
-                retain_lock_until_stopped(guard, init_task);
+                retain_lock_until_stopped(guard, Arc::clone(&handler), init_task);
                 return Err(HostError::InitFailed(
                     "initialize deadline expired".to_owned(),
                 ));
@@ -458,36 +620,55 @@ pub async fn run<H: McHostHandler>(
         }
     }
 
-    // Shutdown between initialization and publication: nothing was published
-    // and no work exists to drain, so completing without binding is the
-    // graceful outcome.
-    if shutdown.is_cancelled() {
-        return Ok(());
+    // Initialization has run, so every early return from here must drain the
+    // handler before `guard` drops: a completed initialize can have opened
+    // stores or started handler-owned work, and only the shutdown callback
+    // stops it. `AbandonGuard` takes that duty over once it exists, which is
+    // why these steps are grouped instead of each returning through `?`.
+    let mut cleanup = PrePublicationCleanup::new(guard, handler);
+    let setup = async {
+        // Shutdown between initialization and publication: nothing was
+        // published and no route work exists, so this is the graceful
+        // outcome — the initialized handler still has to be drained.
+        if shutdown.is_cancelled() {
+            return Ok(None);
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(HostError::Io)?;
+        let port = listener.local_addr().map_err(HostError::Io)?.port();
+        cleanup
+            .guard_mut()
+            .publish(port, &config.daemon_ver)
+            .map_err(HostError::Instance)?;
+        Ok(Some(listener))
     }
+    .await;
+    let listener = match setup {
+        Ok(Some(listener)) => listener,
+        Ok(None) => {
+            cleanup.finish().await;
+            return Ok(());
+        }
+        Err(err) => {
+            cleanup.finish().await;
+            return Err(err);
+        }
+    };
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(HostError::Io)?;
-    let port = listener.local_addr().map_err(HostError::Io)?.port();
+    let (guard, handler) = cleanup.disarm();
 
     let auth_key = ConnectionKey(*guard.key().bytes());
     let daemon_id = *guard.daemon_id();
-    guard
-        .publish(port, &config.daemon_ver)
-        .map_err(HostError::Instance)?;
 
-    // Only the module ID outlives startup; the snapshot's provides tree can
-    // approach the frame limit and must not stay resident beside budgets
-    // that only subtract the serialized catalog.
-    let module_id: Arc<str> = Arc::from(manifest.module_id.as_str());
-    drop(manifest);
+    drop(manifests);
 
     let shared = Arc::new(HostShared {
         handler,
         limits: config.limits.clone(),
         timing: config.timing.clone(),
         liveness: config.liveness.clone(),
-        module_id,
+        targets,
         catalog,
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
@@ -502,6 +683,7 @@ pub async fn run<H: McHostHandler>(
         connection_permits: Arc::new(Semaphore::new(config.limits.max_connections)),
         tracker: TaskTracker::new(),
         abort_handles: Mutex::new(AbortRegistry::new()),
+        shutdown_callback_ran: AtomicBool::new(false),
         shutdown: shutdown.clone(),
         draining: AtomicBool::new(false),
         fatal: FatalCell::new(),
@@ -714,8 +896,68 @@ async fn shutdown_sequence<H: McHostHandler>(
         // while a callback still owns the handler would let a successor start
         // against the predecessor's in-flight cleanup.
         let lifecycle_chain = shared.timing.lifecycle_callback_deadline.saturating_mul(2);
-        let _ = timeout(lifecycle_chain, shared.tracker.wait()).await;
+        if timeout(lifecycle_chain, shared.tracker.wait())
+            .await
+            .is_err()
+        {
+            // A callback outlived the whole chain budget and still owns the
+            // handler; running the shutdown callback beside it would overlap
+            // two handler callbacks, and the doctrine prefers the fatal latch
+            // over overlap (see the forced route close in dispatch). The
+            // caller's non-graceful branch keeps the instance fence held
+            // until the tracker actually drains.
+            shared.fatal.trip(
+                &shared.shutdown,
+                "lifecycle callback did not stop before handler shutdown".to_owned(),
+            );
+            return false;
+        }
+        run_handler_shutdown(shared).await;
         return false;
     }
-    drained_in_time
+    run_handler_shutdown(shared).await && drained_in_time
+}
+
+/// Runs the handler shutdown callback exactly once, after route cleanup.
+/// The callback is never aborted: a deadline overrun trips the fatal latch
+/// and returns non-graceful while the still-tracked task keeps running, so
+/// the handler stays owned until it actually stops.
+async fn run_handler_shutdown<H: McHostHandler>(shared: &Arc<HostShared<H>>) -> bool {
+    // First caller wins: the abandon-path cleanup can fire after a `run`
+    // future was dropped mid-shutdown-sequence, when this callback's task was
+    // already spawned and keeps running detached from the dropped join. A
+    // second spawn would break the exactly-once contract; the loser reports
+    // non-graceful and the tracker still reaps the winner's task.
+    if shared
+        .shutdown_callback_ran
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return false;
+    }
+    let handler = Arc::clone(&shared.handler);
+    let mut task = shared.spawn_lifecycle(async move {
+        let callback = crate::panic_boundary::redact_sync(|| handler.shutdown());
+        crate::panic_boundary::redact(callback).await;
+    });
+    match timeout(shared.timing.lifecycle_callback_deadline, &mut task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(join_err)) => {
+            let kind = if join_err.is_panic() {
+                "panicked"
+            } else {
+                "was aborted"
+            };
+            shared
+                .fatal
+                .trip(&shared.shutdown, format!("shutdown callback {kind}"));
+            false
+        }
+        Err(_) => {
+            shared.fatal.trip(
+                &shared.shutdown,
+                "shutdown callback deadline expired".to_owned(),
+            );
+            false
+        }
+    }
 }

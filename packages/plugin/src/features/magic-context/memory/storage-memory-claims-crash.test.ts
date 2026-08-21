@@ -777,7 +777,7 @@ describe("v84 process-crash matrix", () => {
                 expect(crash.acknowledged).toBeFalse();
                 const committed = site === "claims-migration.050.commit.after";
                 const afterKill = semanticSnapshot(dbPath);
-                expect(afterKill.schemaVersion).toBe(committed ? 84 : 82);
+                expect(afterKill.schemaVersion).toBe(committed ? 84 : 83);
                 expect(compatSchemaExists(dbPath)).toBe(committed);
                 if (committed) {
                     expect(meta(afterKill, CLAIMS_BACKFILL_META_KEYS.phase)).toBe("complete");
@@ -802,7 +802,7 @@ describe("v84 process-crash matrix", () => {
                     acknowledgement: "ambiguous",
                     recoveredState: committed
                         ? "complete-v84-roll-forward"
-                        : "complete-v82-rerun-to-v84",
+                        : "complete-v83-rerun-to-v84",
                     semanticDigest: stableDigest,
                 });
             }

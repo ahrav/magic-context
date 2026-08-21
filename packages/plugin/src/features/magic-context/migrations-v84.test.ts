@@ -92,12 +92,12 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
                 expect(
                     db
                         .prepare(
-                            "SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 83",
+                            "SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 84",
                         )
                         .get(),
                 ).toEqual({ count: 1 });
             }
-            expect(LATEST_MIGRATION_VERSION).toBe(83);
+            expect(LATEST_MIGRATION_VERSION).toBe(84);
         } finally {
             closeQuietly(fresh);
             closeQuietly(upgraded);
@@ -156,7 +156,7 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
                 db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'legacy_memory_claims'").get(),
             ).toBeNull();
             expect(
-                db.prepare("SELECT 1 FROM schema_migrations WHERE version = 83").get(),
+                db.prepare("SELECT 1 FROM schema_migrations WHERE version = 84").get(),
             ).toBeNull();
 
             clearClaimsBackfillFailpoints();
@@ -185,15 +185,15 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
     test("a replayed v84 no-ops over its published schema; a partial schema refuses", () => {
         const db = migratedDb();
         try {
-            db.prepare("DELETE FROM schema_migrations WHERE version = 83").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version = 84").run();
             runMigrations(db);
             expect(
                 db
-                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 83")
+                    .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 84")
                     .get(),
             ).toEqual({ count: 1 });
 
-            db.prepare("DELETE FROM schema_migrations WHERE version = 83").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version = 84").run();
             db.exec("DROP TABLE claim_backfill_failures");
             expect(() => runMigrations(db)).toThrow(/replay guard/);
         } finally {
@@ -352,7 +352,8 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
         const db = migratedDb();
         try {
             expect(schemaVersionIsSupported(db, 82)).toBeFalse();
-            expect(schemaVersionIsSupported(db, 83)).toBeTrue();
+            expect(schemaVersionIsSupported(db, 83)).toBeFalse();
+            expect(schemaVersionIsSupported(db, 84)).toBeTrue();
         } finally {
             closeQuietly(db);
         }

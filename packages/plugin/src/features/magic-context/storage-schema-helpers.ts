@@ -26,6 +26,51 @@ export const MEMORIES_AU_TRIGGER_BODY = `AFTER UPDATE OF content, category ON me
       INSERT INTO memories_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
     END`;
 
+/**
+ * One ledger row is one provider page under its full destination context;
+ * the stable row id is the durable receipt identity. Live-row uniqueness is
+ * a partial index excluding terminal 'obsolete' rows, so quarantined and
+ * retired receipts stay durable and queryable while a fresh attempt for the
+ * same page identity can occupy a new row.
+ */
+export function synapseBatchLedgerDdl(tableName: string, ifNotExists = false): string {
+    const clause = ifNotExists ? "IF NOT EXISTS " : "";
+    return `
+        CREATE TABLE ${clause}${tableName} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT '',
+            lane_role TEXT NOT NULL DEFAULT 'primary' CHECK(lane_role IN ('primary', 'shadow')),
+            destination_model TEXT NOT NULL DEFAULT '',
+            application_group TEXT NOT NULL DEFAULT '',
+            request_key TEXT NOT NULL DEFAULT '',
+            manifest_json TEXT NOT NULL DEFAULT '[]',
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'polling', 'ready', 'complete', 'failed', 'obsolete')),
+            state_version INTEGER NOT NULL DEFAULT 0,
+            attempt_id TEXT,
+            job_id TEXT,
+            cursor TEXT,
+            deadline_at INTEGER,
+            restart_count INTEGER NOT NULL DEFAULT 0,
+            failure_disposition TEXT CHECK(failure_disposition IS NULL OR failure_disposition IN ('retryable', 'permanent')),
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+    `;
+}
+
+export function synapseBatchLedgerIndexDdl(ifNotExists: boolean): string {
+    const clause = ifNotExists ? "IF NOT EXISTS " : "";
+    return `
+        CREATE UNIQUE INDEX ${clause}idx_synapse_batch_ledger_identity
+            ON synapse_batch_ledger(project_path, session_id, scope, lane_role, destination_model, application_group, request_key)
+            WHERE state != 'obsolete';
+        CREATE INDEX ${clause}idx_synapse_batch_ledger_session
+            ON synapse_batch_ledger(session_id, updated_at);
+    `;
+}
+
 // Intentional: the definition regex allows single quotes and parens because SQLite column
 // defaults use them (e.g. TEXT DEFAULT '', INTEGER DEFAULT 0). All callsites pass hardcoded
 // string literals — no user input reaches this function, so the regex is sufficient.

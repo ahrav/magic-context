@@ -800,6 +800,7 @@ pub async fn open_route<H: McHostHandler>(
     shared: Arc<HostShared<H>>,
     gen: Arc<GenerationCore>,
     corr: u64,
+    target: crate::handler::RouteTarget,
     identity: crate::handler::RouteIdentity,
 ) {
     if shared.draining.load(Ordering::SeqCst) {
@@ -833,7 +834,8 @@ pub async fn open_route<H: McHostHandler>(
     // the handle, and route-gone must follow a completed or failed bind, not
     // interleave with it).
     let bind_task = shared.spawn_lifecycle(async move {
-        let callback = crate::panic_boundary::redact_sync(|| handler.bind(handle, identity));
+        let callback =
+            crate::panic_boundary::redact_sync(|| handler.bind(handle, target, identity));
         tokio::select! {
             outcome = crate::panic_boundary::redact(callback) => Some(outcome),
             () = tokio::time::sleep(bind_deadline) => {

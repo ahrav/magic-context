@@ -9,6 +9,7 @@ import { getDataDir } from "../../shared/data-path";
 import { getHarness } from "../../shared/harness";
 import {
     AdmissionClass,
+    armExpiryTimer,
     type BindIdentity,
     Deadline,
     isConsumerReconnectTransient,
@@ -300,18 +301,22 @@ export class SubcModuleTransport {
         // receives the original settlement, and a post-race rejection is
         // delivered here instead of the process-level unhandled hook.
         operation.catch(() => {});
-        const remainingMs = deadline.remainingMs();
-        if (remainingMs <= 0) throw makeError();
-        let timer: ReturnType<typeof setTimeout> | undefined;
+        if (deadline.remainingMs() <= 0) throw makeError();
+        let cancelTimer: (() => void) | undefined;
         try {
             return await Promise.race([
                 operation,
                 new Promise<T>((_resolve, reject) => {
-                    timer = setTimeout(() => reject(makeError()), remainingMs);
+                    // armExpiryTimer guarantees the rejection implies
+                    // deadline.isExpired(): the retry gate in call() consults
+                    // isExpired() after catching this rejection, and an
+                    // early-fired deadline error would let the pre-send replay
+                    // token spend a second connect and route open.
+                    cancelTimer = armExpiryTimer(deadline, () => reject(makeError()));
                 }),
             ]);
         } finally {
-            if (timer) clearTimeout(timer);
+            cancelTimer?.();
         }
     }
 

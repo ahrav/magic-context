@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { wakePlaneStatus } from "../src/features/magic-context/smart-notes/wake-plane";
 import { SubcClient } from "../src/shared/mc-host-client";
 
 const OVERALL_DEADLINE_MS = 60_000;
@@ -137,6 +138,17 @@ try {
     const connectionFile = await waitForReady(child, READY_DEADLINE_MS);
     log(`perf_host READY, connection file ${connectionFile}`);
 
+    const previousXdgDataHome = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = dataDir;
+    try {
+        const status = await wakePlaneStatus();
+        assert.equal(status, "absent", `direct host must probe as wake-plane absent (got ${status})`);
+    } finally {
+        if (previousXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = previousXdgDataHome;
+    }
+    log("production wake-plane probe returned absent");
+
     const client = await SubcClient.connect({ connectionFile });
     log(`connected (daemonVer=${client.daemonVer})`);
     try {
@@ -176,4 +188,4 @@ try {
     clearTimeout(watchdog);
     teardown();
 }
-console.log("smoke: PASS (real-host mc-host-client round trip)");
+console.log("smoke: PASS (real-host mc-host-client round trip + wake-plane absent)");

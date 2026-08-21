@@ -7,13 +7,18 @@ import { fileURLToPath } from "node:url";
 const ENTRIES = {
     adversarial: "run-mc-host-client-adversarial.ts",
     smoke: "smoke-mc-host-client.ts",
+    synapse: "smoke-mc-host-synapse.ts",
 } as const;
 
 const mode = process.argv[2] ?? "all";
-if (mode !== "adversarial" && mode !== "smoke" && mode !== "all") {
-    console.error(`usage: run-mc-host-client-node.ts [adversarial|smoke|all] (got "${mode}")`);
+if (mode !== "adversarial" && mode !== "smoke" && mode !== "synapse" && mode !== "all") {
+    console.error(
+        `usage: run-mc-host-client-node.ts [adversarial|smoke|synapse|all] (got "${mode}")`,
+    );
     process.exit(2);
 }
+// The synapse smoke needs a native ONNX Runtime library, so it runs only
+// when named explicitly.
 const selected = mode === "all" ? (["adversarial", "smoke"] as const) : ([mode] as const);
 
 const here = dirname(fileURLToPath(import.meta.url));
