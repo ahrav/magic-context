@@ -573,6 +573,17 @@ impl JobTable {
         boundaries
     }
 
+    /// Releases every expired retained job and its charge. Runs before the
+    /// parse reservation in the request path: every other sweep site
+    /// (admission, poll, key lookup) sits after the reservation, so without
+    /// this pass charges past their retention period could hold the ingress
+    /// pool below the minimum reservation and make every request fail
+    /// `queue_full` — including the ones that would have swept.
+    pub fn sweep(&self) {
+        let mut jobs = self.inner.lock().expect("job table lock");
+        self.sweep_expired(&mut jobs);
+    }
+
     fn sweep_expired(&self, jobs: &mut Jobs) {
         let now = Instant::now();
         let expired: Vec<u64> = jobs
@@ -832,6 +843,40 @@ mod tests {
 
         jobs.clear();
         assert_eq!(budget.available(), POOL);
+    }
+
+    /// `sweep` alone must release expired charges: it is the only sweep
+    /// site that runs before the parse reservation, so it is what keeps
+    /// expired retained charges from wedging the ingress pool into a
+    /// permanent `queue_full`.
+    #[test]
+    fn sweep_releases_expired_charges_without_a_request_path() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let limits = SynapseLimits {
+            retention: std::time::Duration::ZERO,
+            ..SynapseLimits::default()
+        };
+        let jobs = JobTable::new(limits);
+
+        let key = "s".repeat(64);
+        let items = vec![charged_item("a", "alpha")];
+        let mut charge = budget
+            .try_charge(job_input_bytes(&key, &items))
+            .expect("charge");
+        let AdmitOutcome::Admitted { seq, .. } = jobs.admit_charged(key, items, 4, &mut charge)
+        else {
+            panic!("admitted");
+        };
+        jobs.publish_failed(seq, "artifact_invalid".to_owned(), "boom".to_owned());
+        assert!(budget.available() < POOL, "the retained charge is held");
+
+        jobs.sweep();
+        assert_eq!(
+            budget.available(),
+            POOL,
+            "sweep released the expired job's charge"
+        );
     }
 
     #[test]

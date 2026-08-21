@@ -726,6 +726,10 @@ impl CompositeComponent for SynapseComponent {
         else {
             return app_error("queue_full", "the parse reservation bound is unsatisfiable");
         };
+        // Expired retained charges are released before reserving so they
+        // can never wedge the pool: every other sweep site runs after the
+        // reservation and is unreachable once the pool is exhausted.
+        self.inner.jobs.sweep();
         // The handler reserves resident capacity before decoding.
         let Some(mut charge) = ctx.try_reserve_resident(reservation_bytes) else {
             return app_error(
