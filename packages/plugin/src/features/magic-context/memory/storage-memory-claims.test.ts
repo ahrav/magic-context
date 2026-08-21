@@ -39,7 +39,7 @@ function migratedDb(): Database {
     return db;
 }
 
-/** Pre-v83 rows below the high-water boundary: inserted before migrations run. */
+/** Pre-v84 rows below the high-water boundary: inserted before migrations run. */
 function v82DatabaseWithRows(contents: readonly string[], projectPath = PROJECT): Database {
     const db = new Database(":memory:");
     db.exec("PRAGMA foreign_keys=ON");

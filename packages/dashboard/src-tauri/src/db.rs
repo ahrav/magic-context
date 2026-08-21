@@ -4115,11 +4115,11 @@ pub fn invalidate_all_memory_block_caches(conn: &Connection) -> Result<usize, ru
     )
 }
 
-// ── v83 claims-schema write fence ────────────────────────────
+// ── v84 claims-schema write fence ────────────────────────────
 
 /// User-facing refusal for semantic memory writes on a claims-guarded DB.
 const CLAIMS_SCHEMA_WRITE_ERROR_MESSAGE: &str =
-    "This Magic Context database uses the v83 claims schema. \
+    "This Magic Context database uses the v84 claims schema. \
      Memory editing requires an updated dashboard. Reads remain available.";
 
 /// True when the plugin's claims migration has installed the

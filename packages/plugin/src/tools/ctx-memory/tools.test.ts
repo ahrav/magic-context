@@ -1991,7 +1991,7 @@ describe("createCtxMemoryTools", () => {
     });
 });
 
-describe("createCtxMemoryTools on a migrated v83 database (claims kernel, U3)", () => {
+describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", () => {
     const OWN_PROJECT = "git:claims-own";
     const FOREIGN_PROJECT = "git:claims-foreign";
 
@@ -2055,7 +2055,7 @@ describe("createCtxMemoryTools on a migrated v83 database (claims kernel, U3)", 
         expect(claimRevisionContents(db, memory.id)).toEqual(["Use bun for scripts."]);
     });
 
-    it("updating an unlinked pre-v83 row adopts the preimage as revision 1 and the new content as revision 2", async () => {
+    it("updating an unlinked pre-v84 row adopts the preimage as revision 1 and the new content as revision 2", async () => {
         // An unlinked row simulates a boundary member the lazy backfill has
         // not adopted yet: a projection row with no crosswalk entry.
         let unlinkedId = 0;

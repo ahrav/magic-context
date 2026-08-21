@@ -32,11 +32,11 @@ function migratedDb(): Database {
     return db;
 }
 
-/** A legacy database carrying pre-v83 memories: rows inserted BEFORE the
- *  migration chain runs, so v83 records them under its high-water boundary. */
+/** A legacy database carrying pre-v84 memories: rows inserted BEFORE the
+ *  migration chain runs, so v84 records them under its high-water boundary. */
 function v82DatabaseWithRows(
     contents: readonly string[],
-    projectPath = "git:v83-fixture",
+    projectPath = "git:v84-fixture",
 ): Database {
     const db = new Database(":memory:");
     db.exec("PRAGMA foreign_keys=ON");
@@ -60,7 +60,7 @@ function metaValue(db: Database, key: string): string | null {
     return row?.value ?? null;
 }
 
-function v83ObjectRows(db: Database): Array<Record<string, unknown>> {
+function v84ObjectRows(db: Database): Array<Record<string, unknown>> {
     const tables = new Set<string>(MEMORY_CLAIMS_COMPAT_TABLES);
     return (
         db
@@ -71,12 +71,12 @@ function v83ObjectRows(db: Database): Array<Record<string, unknown>> {
     ).filter((row) => tables.has(row.tbl_name) || row.name.startsWith("memories_claims_"));
 }
 
-describe("migration v83: memories-to-claims compatibility contract", () => {
+describe("migration v84: memories-to-claims compatibility contract", () => {
     afterEach(() => {
         clearClaimsBackfillFailpoints();
         setClaimsBackfillCalibrationForTests(null);
     });
-    test("a fresh database and a v82-upgraded database publish identical v83 objects and one version row", () => {
+    test("a fresh database and a v82-upgraded database publish identical v84 objects and one version row", () => {
         const fresh = migratedDb();
         const upgraded = v82DatabaseWithRows(["carried row"]);
         try {
@@ -87,7 +87,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                         .get(table),
                 ).toBeTruthy();
             }
-            expect(v83ObjectRows(upgraded)).toEqual(v83ObjectRows(fresh));
+            expect(v84ObjectRows(upgraded)).toEqual(v84ObjectRows(fresh));
             for (const db of [fresh, upgraded]) {
                 expect(
                     db
@@ -171,7 +171,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
         }
     });
 
-    test("v83 takes over v22 pending state even when the claims corpus is already complete", () => {
+    test("v84 takes over v22 pending state even when the claims corpus is already complete", () => {
         const db = migratedDb();
         try {
             expect(metaValue(db, CLAIMS_BACKFILL_META_KEYS.mode)).toBe("empty");
@@ -182,7 +182,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
         }
     });
 
-    test("a replayed v83 no-ops over its published schema; a partial schema refuses", () => {
+    test("a replayed v84 no-ops over its published schema; a partial schema refuses", () => {
         const db = migratedDb();
         try {
             db.prepare("DELETE FROM schema_migrations WHERE version = 83").run();
@@ -212,7 +212,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                     .prepare(
                         `INSERT INTO memories (project_path, category, content, normalized_hash,
                             first_seen_at, created_at, updated_at, last_seen_at)
-                         VALUES ('git:v83-fixture', 'NAMING', 'held-open insert', 'hash:ho', 1, 1, 1, 1)`,
+                         VALUES ('git:v84-fixture', 'NAMING', 'held-open insert', 'hash:ho', 1, 1, 1, 1)`,
                     )
                     .run(),
             ).toThrow(/claims-write kernel/);
@@ -238,12 +238,12 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                 createMemoryWithClaimsInCurrentTransaction(
                     db,
                     {
-                        producer: "v83-held-open",
+                        producer: "v84-held-open",
                         operationKey: "linked-project-path",
                         requestDigest: "f".repeat(64),
                     },
                     {
-                        projectPath: "git:v83-fixture",
+                        projectPath: "git:v84-fixture",
                         category: "CONSTRAINTS",
                         content: "linked project path target",
                         normalizedHash: "hash:linked-project-path",
@@ -325,7 +325,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                         .prepare(
                             "SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?",
                         )
-                        .get("git:v83-fixture") as { id: number }
+                        .get("git:v84-fixture") as { id: number }
                 ).id;
                 ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
                     kind: "migration",
@@ -348,7 +348,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
         }
     });
 
-    test("a v82 binary refuses a v83 database through the schema fence", () => {
+    test("a v82 binary refuses a v84 database through the schema fence", () => {
         const db = migratedDb();
         try {
             expect(schemaVersionIsSupported(db, 82)).toBeFalse();
@@ -358,19 +358,19 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
         }
     });
 
-    test("the v83 compatibility tables are append-only and generations are monotonic", () => {
+    test("the v84 compatibility tables are append-only and generations are monotonic", () => {
         const db = migratedDb();
         try {
             const outcome = runInMemoryClaimsWriteTransaction(db, () =>
                 createMemoryWithClaimsInCurrentTransaction(
                     db,
                     {
-                        producer: "v83-test",
+                        producer: "v84-test",
                         operationKey: "append-only-seed",
                         requestDigest: "a".repeat(64),
                     },
                     {
-                        projectPath: "git:v83-append",
+                        projectPath: "git:v84-append",
                         category: "CONSTRAINTS",
                         content: "append-only seed",
                         normalizedHash: "hash:seed",
@@ -382,12 +382,12 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                 createMemoryWithClaimsInCurrentTransaction(
                     db,
                     {
-                        producer: "v83-test",
+                        producer: "v84-test",
                         operationKey: "outbox-project-guard",
                         requestDigest: "e".repeat(64),
                     },
                     {
-                        projectPath: "git:v83-other-project",
+                        projectPath: "git:v84-other-project",
                         category: "CONSTRAINTS",
                         content: "other project seed",
                         normalizedHash: "hash:other-project",
@@ -474,12 +474,12 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                     createMemoryWithClaimsInCurrentTransaction(
                         db,
                         {
-                            producer: "v83-test",
+                            producer: "v84-test",
                             operationKey: `replace-collision-${recursiveTriggers}`,
                             requestDigest: "d".repeat(64),
                         },
                         {
-                            projectPath: "git:v83-replace",
+                            projectPath: "git:v84-replace",
                             category: "CONSTRAINTS",
                             content: "replace collision seed",
                             normalizedHash: "hash:replace-collision",
@@ -527,12 +527,12 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                 createMemoryWithClaimsInCurrentTransaction(
                     db,
                     {
-                        producer: "v83-test",
+                        producer: "v84-test",
                         operationKey: "dup-link-seed",
                         requestDigest: "b".repeat(64),
                     },
                     {
-                        projectPath: "git:v83-dup",
+                        projectPath: "git:v84-dup",
                         category: "CONSTRAINTS",
                         content: "duplicate link seed",
                         normalizedHash: "hash:dup",
@@ -563,7 +563,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
         }
     });
 
-    test("v83 publishes the revision-metadata hash index and the dedup probe uses it", () => {
+    test("v84 publishes the revision-metadata hash index and the dedup probe uses it", () => {
         const db = migratedDb();
         try {
             expect(
@@ -594,12 +594,12 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                     createMemoryWithClaimsInCurrentTransaction(
                         db,
                         {
-                            producer: "v83-prune",
+                            producer: "v84-prune",
                             operationKey: key,
                             requestDigest: "c".repeat(64),
                         },
                         {
-                            projectPath: "git:v83-prune",
+                            projectPath: "git:v84-prune",
                             category: "CONSTRAINTS",
                             content,
                             normalizedHash: `hash:${content}`,
@@ -620,7 +620,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                 runMemoryClaimOperationInCurrentTransaction(
                     db,
                     {
-                        producer: "v83-prune",
+                        producer: "v84-prune",
                         operationKey: "straddle",
                         requestDigest: "1".repeat(64),
                     },
@@ -649,7 +649,7 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                 runMemoryClaimOperationInCurrentTransaction(
                     db,
                     {
-                        producer: "v83-prune",
+                        producer: "v84-prune",
                         operationKey: "no-effects",
                         requestDigest: "2".repeat(64),
                     },

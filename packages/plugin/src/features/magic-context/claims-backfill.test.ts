@@ -351,7 +351,7 @@ describe("claims backfill selection and conversion", () => {
         const evidence = JSON.parse(
             readFileSync(
                 new URL(
-                    "../../../../../docs/evidence/claims-backfill/v83-threshold.json",
+                    "../../../../../docs/evidence/claims-backfill/v84-threshold.json",
                     import.meta.url,
                 ),
                 "utf8",

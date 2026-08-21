@@ -1,5 +1,5 @@
 /**
- * v83 memories-to-claims backfill engine (U5): batch selection, checkpointing,
+ * v84 memories-to-claims backfill engine (U5): batch selection, checkpointing,
  * reconciliation, scheduling, and operational status for the high-water legacy
  * corpus. It drives the U2 kernel row-adoption and relationship-translation
  * primitives — the transition logic itself lives in
@@ -7,7 +7,7 @@
  *
  * Modes (R7-R9):
  * - empty: the migration completes synchronously (owned by migrations.ts).
- * - eager: rows, relationships, and reconciliation commit inside the v83
+ * - eager: rows, relationships, and reconciliation commit inside the v84
  *   migration transaction; gated on calibration evidence, resolved v22
  *   identity state, and a fully convertible corpus.
  * - lazy: the migration records only the pending high-water checkpoint; the
@@ -107,7 +107,7 @@ function hitFailpoint(id: BackfillFailpointId): void {
     activeFailpoints.get(id)?.();
 }
 
-/** Called by migrations.ts at the v83 migration cut points. */
+/** Called by migrations.ts at the v84 migration cut points. */
 export function hitClaimsMigrationFailpoint(id: ClaimsMigrationFailpointId): void {
     hitFailpoint(id);
 }
@@ -156,8 +156,8 @@ export function getActiveClaimsBackfillPolicy(): ClaimsBackfillCalibratedPolicy 
 
 /**
  * Hard ceiling on any calibrated eager cutoff. The eager path converts the
- * whole corpus while holding the v83 migration write lock, and the checked-in
- * calibration evidence (docs/evidence/claims-backfill/v83-threshold.json)
+ * whole corpus while holding the v84 migration write lock, and the checked-in
+ * calibration evidence (docs/evidence/claims-backfill/v84-threshold.json)
  * budgets that lock at 2500ms — 2x margin under the 5s sibling busy_timeout.
  * The evidence measures a 1K-row corpus at ~660ms worst case and a 10K-row
  * corpus at ~10.8s, so 1000 is the largest measured scale whose slowest run
@@ -218,7 +218,7 @@ function readIntMeta(db: Database, key: string): number {
 // CLAIMS_BACKFILL_META_KEYS. The `claims_backfill_` prefix keeps them inside
 // the schema module's test-drop cleanup wildcard.
 
-/** Human-readable reason behind the recorded v83 mode decision (doctor status). */
+/** Human-readable reason behind the recorded v84 mode decision (doctor status). */
 export const CLAIMS_BACKFILL_MODE_REASON_META_KEY = "claims_backfill_mode_decision_reason";
 /** Digest of the boundary-scoped blocking failure set at the blocked checkpoint. */
 const CLAIMS_BACKFILL_BLOCKED_DIGEST_META_KEY = "claims_backfill_blocked_failure_digest";
@@ -332,7 +332,7 @@ function eagerConversionBlockers(db: Database): string | null {
 }
 
 /**
- * Select the v83 conversion mode inside the migration transaction. Missing
+ * Select the v84 conversion mode inside the migration transaction. Missing
  * calibration evidence, a corpus above the calibrated cutoff, unresolved v22
  * identity work, or an unconvertible row all force lazy mode.
  */
@@ -665,7 +665,7 @@ function countBoundaryCrosswalkRows(db: Database, boundary: number): number {
  *   (an above-boundary diagnostic belongs to live writers: it stays visible
  *   on the repair surface but the boundary backfill can never clear it, so
  *   it must not gate completion);
- * - v83's adopted v22 identity work is resolved.
+ * - v84's adopted v22 identity work is resolved.
  */
 export function inspectClaimsBackfillReconciliation(
     db: Database,
@@ -934,7 +934,7 @@ function writeCompletionCheckpoint(db: Database): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Convert the whole boundary corpus inside the caller-owned v83 migration
+ * Convert the whole boundary corpus inside the caller-owned v84 migration
  * transaction: rows, relationships, then the reconciliation oracle. A failed
  * oracle throws, rolling the entire migration back to complete v82 state.
  */
@@ -956,7 +956,7 @@ export function runEagerClaimsBackfillInMigrationTransaction(db: Database): void
                 const row = readMemoryProjectionRow(db, id);
                 if (!row) continue;
                 if (!adoptBoundaryMemoryRowInCurrentTransaction(db, row)) {
-                    throw new Error(`v83 eager backfill could not adopt memory ${id}`);
+                    throw new Error(`v84 eager backfill could not adopt memory ${id}`);
                 }
             }
             cursor = ids[ids.length - 1];
@@ -972,7 +972,7 @@ export function runEagerClaimsBackfillInMigrationTransaction(db: Database): void
         const report = inspectClaimsBackfillReconciliation(db);
         if (!report.ok) {
             throw new Error(
-                `v83 eager backfill reconciliation refused: ${report.problems.join("; ")}`,
+                `v84 eager backfill reconciliation refused: ${report.problems.join("; ")}`,
             );
         }
         hitClaimsMigrationFailpoint("claims-migration.030.reconcile.after");
@@ -1360,7 +1360,7 @@ export interface ClaimsBackfillStatusReport {
     reconciliationVersion: string | null;
     finalOutboxWatermark: number;
     calibrationDigest: string | null;
-    /** Why the recorded v83 mode was selected; null when the meta row is absent. */
+    /** Why the recorded v84 mode was selected; null when the meta row is absent. */
     modeDecisionReason: string | null;
     /** Reconciliation problems, populated only when requested. */
     problems: string[];

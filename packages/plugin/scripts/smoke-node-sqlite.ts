@@ -276,7 +276,7 @@ try {
     } catch {
         guardBlocked = true;
     }
-    check("v83 guard rejects a bare semantic insert", guardBlocked);
+    check("v84 guard rejects a bare semantic insert", guardBlocked);
 
     const kernelCreated = runInMemoryClaimsWriteTransaction(kernelDb, () =>
         createMemoryWithClaimsInCurrentTransaction(
@@ -292,7 +292,7 @@ try {
         ),
     );
     check(
-        "v83 kernel create links a claim",
+        "v84 kernel create links a claim",
         kernelCreated.result.claimId !== null && kernelCreated.result.revisionId !== null,
         JSON.stringify(kernelCreated),
     );
@@ -311,7 +311,7 @@ try {
         );
     }).immediate();
     const currentClaim = getCurrentMemoryClaimByLegacyMemoryId(kernelDb, kernelCreated.result.memoryId);
-    check("v83 nested update advanced to revision 2", currentClaim?.revision === 2);
+    check("v84 nested update advanced to revision 2", currentClaim?.revision === 2);
 
     const tupleCounts = (): string =>
         JSON.stringify({
@@ -343,14 +343,14 @@ try {
     }
     clearMemoryClaimFailpoints();
     check(
-        "v83 failpoint rollback leaves no tuple residue",
+        "v84 failpoint rollback leaves no tuple residue",
         rolledBack && tupleCounts() === countsBefore,
         tupleCounts(),
     );
 
     const projectionRow = readMemoryProjectionRow(kernelDb, kernelCreated.result.memoryId);
     check(
-        "v83 legacy projection and current claim read the same state",
+        "v84 legacy projection and current claim read the same state",
         projectionRow?.content === currentClaim?.content &&
             projectionRow?.category === currentClaim?.category &&
             projectionRow?.normalized_hash === currentClaim?.normalizedHash &&

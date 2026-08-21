@@ -103,7 +103,7 @@ function relocationEnvelope(operation: string, request: unknown): MemoryClaimOpe
 /**
  * Claim adoption for a plain rekey. An unlinked row adopts its preimage
  * under the TARGET numeric project — the raw source path is what made it
- * unlinkable — which also satisfies the v83 boundary identity guard before
+ * unlinkable — which also satisfies the v84 boundary identity guard before
  * the project_path UPDATE runs. A row already linked to the target project
  * (the routine dir: → git: adoption) needs nothing: the numeric project and
  * claims are retained.
@@ -310,7 +310,7 @@ function moveLinkedMemoryAcrossProjects(
             // The inserted copy inherits the source row's merged_from /
             // superseded_by_memory_id under a fresh id, so no relationship
             // source exists for it yet. Translating here records that source
-            // row (which the v83 relationship guards check before any later
+            // row (which the v84 relationship guards check before any later
             // mutation or delete) and re-links the lineage edges to the
             // target claim.
             effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, newRow));
@@ -386,7 +386,7 @@ function rekeyMemoryRowWithCollisionMergeInner(
             }
         }
         // The canonical claim and both crosswalk links must exist BEFORE the
-        // source row deletes: the v83 boundary guard refuses to delete an
+        // source row deletes: the v84 boundary guard refuses to delete an
         // unlinked boundary row.
         if (claimsActive) adoptRelocationMergeClaims(db, rowId, collision.id, toIdentity);
         // Preserve an embedding on the surviving target BEFORE the source row's

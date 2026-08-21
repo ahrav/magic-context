@@ -1,5 +1,5 @@
 /**
- * Transaction-local memory/claims kernel (KTD1, KTD3, KTD6-KTD8): every v83
+ * Transaction-local memory/claims kernel (KTD1, KTD3, KTD6-KTD8): every v84
  * semantic or lifecycle memory operation commits claim changes, the legacy
  * `memories` compatibility projection, operation envelope, claim-change
  * outbox rows, and one generation bump per touched project in the CALLER's
@@ -94,7 +94,7 @@ export function acknowledgeMemoryClaimResult(): void {
 const compatSchemaCache = new WeakMap<Database, true>();
 
 /**
- * Whether this database migrated to v83. A negative probe is never cached:
+ * Whether this database migrated to v84. A negative probe is never cached:
  * a sibling process can migrate the shared file after this handle opened.
  */
 export function hasMemoryClaimsCompatSchema(db: Database): boolean {
@@ -2199,7 +2199,7 @@ export function listCurrentMemoryClaimsByProject(
 }
 
 /**
- * Supported writers never commit these shapes; only direct SQL can. The v83
+ * Supported writers never commit these shapes; only direct SQL can. The v84
  * sibling of `findClaimGraphCorruption`: a memory-linked claim revision
  * without its metadata row, or a crosswalk whose canonical resolution or
  * project ownership is inconsistent.

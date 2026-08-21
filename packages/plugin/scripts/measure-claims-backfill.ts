@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
 /**
- * Claims-backfill calibration (KTD4): measures the eager v83 conversion over
+ * Claims-backfill calibration (KTD4): measures the eager v84 conversion over
  * deterministic corpora and writes the evidence artifact
- * `docs/evidence/claims-backfill/v83-threshold.json`. The default bounded run
+ * `docs/evidence/claims-backfill/v84-threshold.json`. The default bounded run
  * measures 1K/10K and records 100K/1M plus Node as explicit omissions;
  * CLAIMS_BACKFILL_FULL=1 enables all Bun scales.
  *
@@ -218,7 +218,7 @@ function measureScale(workDir: string, scale: number): ScaleMeasurement {
         slowestMs,
         lockDurationMs: slowestMs,
         lockDurationMetric:
-            "full runMigrations() wall time over the populated legacy baseline (forced eager v83); the duration a sibling start would wait",
+            "full runMigrations() wall time over the populated legacy baseline (forced eager v84); the duration a sibling start would wait",
     };
 }
 
@@ -297,7 +297,7 @@ function main(): void {
     const outputPath = join(
         import.meta.dir,
         "../../..",
-        "docs/evidence/claims-backfill/v83-threshold.json",
+        "docs/evidence/claims-backfill/v84-threshold.json",
     );
     mkdirSync(dirname(outputPath), { recursive: true });
     writeFileSync(outputPath, `${JSON.stringify(evidence, null, 2)}\n`);

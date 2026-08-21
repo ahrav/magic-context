@@ -167,10 +167,10 @@ function printDoctorHelp(): void {
         "    magic-context-pi doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows",
     );
     console.log(
-        "    magic-context-pi doctor --check-claims-backfill  Show v83 claims backfill status",
+        "    magic-context-pi doctor --check-claims-backfill  Show v84 claims backfill status",
     );
     console.log(
-        "    magic-context-pi doctor --retry-claims-backfill  Repair and resume the v83 claims backfill",
+        "    magic-context-pi doctor --retry-claims-backfill  Repair and resume the v84 claims backfill",
     );
     console.log(
         '    magic-context-pi doctor --waive-claims-backfill-failure <id> --rationale "<why>"  Waive a reviewed lineage failure',

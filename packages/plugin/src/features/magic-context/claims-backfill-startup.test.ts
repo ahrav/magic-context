@@ -49,7 +49,7 @@ const COMPLETE_SUMMARY: ClaimsBackfillRunSummary = {
 };
 
 describe("runClaimsBackfillStartup", () => {
-    test("pre-v83 storage runs only the legacy v22 scheduler", async () => {
+    test("pre-v84 storage runs only the legacy v22 scheduler", async () => {
         const db = database(false);
         let v22Runs = 0;
         let claimRuns = 0;

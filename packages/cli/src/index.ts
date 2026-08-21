@@ -64,8 +64,8 @@ function printUsage(): void {
     console.log("    doctor --check-v22-backfill       Show v22 memory backfill status");
     console.log("    doctor --retry-v22-backfill       Retry failed v22 memory backfill rows");
     console.log("    doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows");
-    console.log("    doctor --check-claims-backfill    Show v83 claims backfill status");
-    console.log("    doctor --retry-claims-backfill    Repair and resume the v83 claims backfill");
+    console.log("    doctor --check-claims-backfill    Show v84 claims backfill status");
+    console.log("    doctor --retry-claims-backfill    Repair and resume the v84 claims backfill");
     console.log(
         '    doctor --waive-claims-backfill-failure <id> --rationale "<why>"  Waive a reviewed lineage failure',
     );

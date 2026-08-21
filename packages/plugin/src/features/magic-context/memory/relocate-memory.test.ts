@@ -55,7 +55,7 @@ afterEach(() => {
     db = null;
 });
 
-describe("relocate-memory claims (v83)", () => {
+describe("relocate-memory claims (v84)", () => {
     test("rekeying an unlinked row adopts its claim under the target project before the identity move", () => {
         const database = makeDb();
         const rowId = insertUnlinkedMemory(database, "/raw/legacy/path", "raw fact", "rk-h1");
@@ -357,7 +357,7 @@ describe("relocate-memory claims (v83)", () => {
         expect(copiedClaim?.content).toBe("copied fact");
     });
 
-    test("a pre-v83 database keeps the plain rekey behavior", () => {
+    test("a pre-v84 database keeps the plain rekey behavior", () => {
         const database = new Database(":memory:");
         db = database;
         database.exec(`

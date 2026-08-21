@@ -3142,11 +3142,11 @@ export const MIGRATIONS: Migration[] = [
         },
     },
     {
-        version: 83,
+        version: 84,
         description:
             "memories-to-claims compatibility contract: crosswalk, revision metadata, operation envelope, outbox, generations, and semantic write guards",
         up(db: Database): void {
-            // A replayed v83 must no-op over its own published schema, but a
+            // A replayed v84 must no-op over its own published schema, but a
             // partial or foreign `legacy_memory_claims` table is corruption.
             if (tableExists(db, "legacy_memory_claims")) {
                 const missing = MEMORY_CLAIMS_COMPAT_TABLES.filter(
@@ -3154,7 +3154,7 @@ export const MIGRATIONS: Migration[] = [
                 );
                 if (missing.length > 0) {
                     throw new Error(
-                        `v83 replay guard: legacy_memory_claims exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                        `v84 replay guard: legacy_memory_claims exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
                     );
                 }
                 return;
@@ -3202,7 +3202,7 @@ export const MIGRATIONS: Migration[] = [
             // The reason persists to meta so the doctor status can surface it
             // long after the migration log line scrolls away.
             writeMeta.run(CLAIMS_BACKFILL_MODE_REASON_META_KEY, decision.reason);
-            log(`[migrations] v83: claims backfill mode ${decision.mode}: ${decision.reason}`);
+            log(`[migrations] v84: claims backfill mode ${decision.mode}: ${decision.reason}`);
             if (decision.mode === "empty") {
                 // An empty corpus completes synchronously in the migration
                 // (R7): there is nothing to convert, so the completion
@@ -3350,7 +3350,7 @@ export function runMigrations(db: Database): void {
                     db.prepare(
                         "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                     ).run(migration.version, migration.description, Date.now());
-                    if (migration.version === 83) {
+                    if (migration.version === 84) {
                         hitClaimsMigrationFailpoint("claims-migration.040.version.after");
                     }
                     return true;
@@ -3358,7 +3358,7 @@ export function runMigrations(db: Database): void {
                 .immediate();
 
             if (!applied || !migration) break;
-            if (migration.version === 83) {
+            if (migration.version === 84) {
                 hitClaimsMigrationFailpoint("claims-migration.050.commit.after");
             }
             if (migration.version <= 61) touchedLegacyAuthorityBatch = true;

@@ -2865,7 +2865,7 @@ describe("memory authority protocol", () => {
     });
 });
 
-describe("module mirror claims (v83)", () => {
+describe("module mirror claims (v84)", () => {
     const MODULE_PROJECT = "git:mirror-module";
 
     function moduleSnapshot(

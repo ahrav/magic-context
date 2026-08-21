@@ -27,7 +27,7 @@
       ],
       "slowestMs": 660.13,
       "lockDurationMs": 660.13,
-      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v83); the duration a sibling start would wait"
+      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v84); the duration a sibling start would wait"
     },
     {
       "scale": 10000,
@@ -42,7 +42,7 @@
       ],
       "slowestMs": 10842.04,
       "lockDurationMs": 10842.04,
-      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v83); the duration a sibling start would wait"
+      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v84); the duration a sibling start would wait"
     }
   ],
   "skippedScales": [

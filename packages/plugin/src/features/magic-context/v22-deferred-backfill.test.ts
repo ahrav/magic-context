@@ -225,7 +225,7 @@ describe("runDeferredV22Backfill", () => {
         expect(total.c).toBe(1);
     });
 
-    test("a concurrent bare project_path mutation is rejected by the v83 semantic guard", async () => {
+    test("a concurrent bare project_path mutation is rejected by the v84 semantic guard", async () => {
         const database = makeDb();
         const rowId = insertMemory(database, "/race", "race");
 
@@ -253,13 +253,13 @@ describe("runDeferredV22Backfill", () => {
     });
 });
 
-describe("v22 backfill under the v83 claims contract", () => {
+describe("v22 backfill under the v84 claims contract", () => {
     function makeV82StyleDb(rows: Array<{ projectPath: string; content: string; hash: string }>): {
         database: Database;
         ids: number[];
     } {
         // Rows inserted BEFORE the migration chain runs sit at or below the
-        // v83 high-water boundary, so their identity moves and deletes are
+        // v84 high-water boundary, so their identity moves and deletes are
         // fenced by the boundary guards until they acquire crosswalk links.
         const database = new Database(":memory:");
         db = database;
@@ -282,7 +282,7 @@ describe("v22 backfill under the v83 claims contract", () => {
         return { database, ids };
     }
 
-    test("boundary rows adopt claims before the identity move and a clean run resolves the v83 takeover", async () => {
+    test("boundary rows adopt claims before the identity move and a clean run resolves the v84 takeover", async () => {
         const { database, ids } = makeV82StyleDb([
             { projectPath: "/legacy/one", content: "unique fact", hash: "v22-h1" },
         ]);
@@ -366,7 +366,7 @@ describe("v22 backfill under the v83 claims contract", () => {
         expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("none");
     });
 
-    test("unresolved failures keep the v83 takeover pending", async () => {
+    test("unresolved failures keep the v84 takeover pending", async () => {
         const { database } = makeV82StyleDb([
             { projectPath: "/denied", content: "blocked fact", hash: "blocked-h1" },
         ]);

@@ -26,7 +26,7 @@ import { MEMORY_CLAIM_FAILPOINT_IDS } from "./storage-memory-claims.ts";
 const REPO_ROOT = existsSync(resolve(process.cwd(), "packages", "plugin"))
     ? process.cwd()
     : resolve(process.cwd(), "../..");
-const EVIDENCE_PATH = resolve(REPO_ROOT, "docs/evidence/claims-backfill/v83-process-crash.json");
+const EVIDENCE_PATH = resolve(REPO_ROOT, "docs/evidence/claims-backfill/v84-process-crash.json");
 const WORKER_SOURCE = resolve(
     REPO_ROOT,
     "packages/plugin/src/features/magic-context/memory/fixtures/claims-crash-worker.ts",
@@ -292,7 +292,7 @@ function insertLegacyRows(db: Database): void {
     insert.run("superseded crash fact", "hash:superseded", 1);
 }
 
-function prepareEmptyV83(path: string): void {
+function prepareEmptyV84(path: string): void {
     const db = openFixture(path);
     try {
         initializeDatabase(db);
@@ -481,7 +481,7 @@ function meta(snapshot: SemanticSnapshot, key: string): string | null {
 }
 
 function assertMemoryTuple(snapshot: SemanticSnapshot, committed: boolean): void {
-    expect(snapshot.schemaVersion).toBe(83);
+    expect(snapshot.schemaVersion).toBe(84);
     expect(snapshot.memories).toHaveLength(committed ? 1 : 0);
     expect(snapshot.links).toHaveLength(committed ? 1 : 0);
     expect(snapshot.revisions).toHaveLength(committed ? 1 : 0);
@@ -509,7 +509,7 @@ function assertMemoryTuple(snapshot: SemanticSnapshot, committed: boolean): void
 }
 
 function assertBackfillCut(snapshot: SemanticSnapshot, scenario: string): void {
-    expect(snapshot.schemaVersion).toBe(83);
+    expect(snapshot.schemaVersion).toBe(84);
     if (scenario === "lazy-row-uncommitted") {
         expect(snapshot.links).toHaveLength(0);
         expect(meta(snapshot, CLAIMS_BACKFILL_META_KEYS.phase)).toBe("rows");
@@ -666,7 +666,7 @@ function verifyOrWriteEvidence(report: Record<string, unknown>): void {
     });
 }
 
-describe("v83 process-crash matrix", () => {
+describe("v84 process-crash matrix", () => {
     test("reaches, kills, reopens, recovers, and checks every stable Bun and Node cut", async () => {
         const matrix: CampaignEntry[] = [];
         const sqliteVersions = { bun: "", node: "" };
@@ -680,7 +680,7 @@ describe("v83 process-crash matrix", () => {
         for (const runtime of runtimes()) {
             for (const site of MEMORY_CLAIM_FAILPOINT_IDS) {
                 const dbPath = join(rootDir, `${runtime.name}-${site}.db`);
-                prepareEmptyV83(dbPath);
+                prepareEmptyV84(dbPath);
                 const crash = await crashWorker(runtime, "crash-memory", dbPath, site);
                 const committed =
                     site === "memory-claim.060.commit.after" ||
@@ -777,7 +777,7 @@ describe("v83 process-crash matrix", () => {
                 expect(crash.acknowledged).toBeFalse();
                 const committed = site === "claims-migration.050.commit.after";
                 const afterKill = semanticSnapshot(dbPath);
-                expect(afterKill.schemaVersion).toBe(committed ? 83 : 82);
+                expect(afterKill.schemaVersion).toBe(committed ? 84 : 82);
                 expect(compatSchemaExists(dbPath)).toBe(committed);
                 if (committed) {
                     expect(meta(afterKill, CLAIMS_BACKFILL_META_KEYS.phase)).toBe("complete");
@@ -801,8 +801,8 @@ describe("v83 process-crash matrix", () => {
                     checked: true,
                     acknowledgement: "ambiguous",
                     recoveredState: committed
-                        ? "complete-v83-roll-forward"
-                        : "complete-v82-rerun-to-v83",
+                        ? "complete-v84-roll-forward"
+                        : "complete-v82-rerun-to-v84",
                     semanticDigest: stableDigest,
                 });
             }

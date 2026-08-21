@@ -170,7 +170,7 @@ function adoptIdentityMergeRowClaims(
             const effects: MemoryClaimEffect[] = [];
             if (collisionTargetId === null) {
                 // Adoption must precede the caller's project_path UPDATE: an
-                // unlinked boundary row would trip the v83 identity-move guard.
+                // unlinked boundary row would trip the v84 identity-move guard.
                 const wasLinked = readMemoryClaimLink(db, sourceId) !== null;
                 const link = ensureMemoryClaimLinkInCurrentTransaction(db, sourceRow, projectId, {
                     kind: "migration",

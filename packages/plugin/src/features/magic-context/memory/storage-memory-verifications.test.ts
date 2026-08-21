@@ -182,7 +182,7 @@ function claimEventOutcomes(db: Database, memoryId: number): string[] {
     ).map((row) => row.outcome);
 }
 
-describe("verification claim effects on a migrated v83 database (KTD5)", () => {
+describe("verification claim effects on a migrated v84 database (KTD5)", () => {
     test("a mapped-only file snapshot adds NO verification event and no outbox effect", () => {
         const db = freshDb();
         try {

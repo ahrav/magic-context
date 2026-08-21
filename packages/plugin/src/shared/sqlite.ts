@@ -280,9 +280,9 @@ const privilegeDepth = new WeakMap<Database, number>();
 const claimCompatStateTableCache = new WeakMap<Database, true>();
 
 // Module mirror transactions must hold BOTH the module-authority privilege
-// and the v83 claims-write capability (KTD6): the two guards live in separate
+// and the v84 claims-write capability (KTD6): the two guards live in separate
 // tables so TypeScript claim writers never gain module authority, but a
-// privileged mirror write on a migrated-v83 database would otherwise trip the
+// privileged mirror write on a migrated-v84 database would otherwise trip the
 // semantic memory guards. A negative table probe is never cached because a
 // sibling process can migrate the shared file after this handle opened.
 function hasClaimCompatibilityWriteState(db: Database): boolean {

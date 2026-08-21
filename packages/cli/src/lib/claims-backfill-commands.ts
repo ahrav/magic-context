@@ -56,7 +56,7 @@ export function renderClaimsBackfillStatus(
 ): void {
     if (!status.applicable) {
         harness.log.info(
-            "claims backfill status: not applicable (database has not migrated to v83)",
+            "claims backfill status: not applicable (database has not migrated to v84)",
         );
         return;
     }
@@ -152,7 +152,7 @@ export async function runClaimsBackfillCommands(
             const status = getClaimsBackfillStatus(db);
             if (!status.applicable) {
                 harness.log.info(
-                    "claims backfill retry: not applicable (database has not migrated to v83)",
+                    "claims backfill retry: not applicable (database has not migrated to v84)",
                 );
             } else {
                 if (status.v22Takeover === "pending") {

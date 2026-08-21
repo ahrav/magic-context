@@ -574,7 +574,7 @@ describe("migration v80: memory_stats telemetry side table", () => {
         cleanups.push(() => closeQuietly(migrator));
 
         // The held-open v79 statement inserts and receives stats atomically.
-        // On a v83 database bare inserts are guard-rejected (AE8), so the
+        // On a v84 database bare inserts are guard-rejected (AE8), so the
         // legacy-shaped statement runs under the claims-write capability to
         // keep exercising the v80 stats trigger.
         const result = runInMemoryClaimsWriteTransaction(

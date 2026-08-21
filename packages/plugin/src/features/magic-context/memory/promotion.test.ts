@@ -498,7 +498,7 @@ describe("promotion", () => {
         });
     });
 
-    describe("#given a migrated v83 database", () => {
+    describe("#given a migrated v84 database", () => {
         function migratedDb(): Database {
             const database = new Database(":memory:");
             initializeDatabase(database);

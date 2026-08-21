@@ -388,7 +388,7 @@ describe("project identity merge", () => {
     });
 });
 
-describe("project identity merge claims (v83)", () => {
+describe("project identity merge claims (v84)", () => {
     function aliasProjectId(database: Database, identity: string): number {
         return (
             database

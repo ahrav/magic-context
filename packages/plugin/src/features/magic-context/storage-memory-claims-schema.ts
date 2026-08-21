@@ -1,5 +1,5 @@
 /**
- * v83 memories-to-claims compatibility DDL: the legacy-memory crosswalk,
+ * v84 memories-to-claims compatibility DDL: the legacy-memory crosswalk,
  * append-only revision metadata, audit-only cross-project merge lineage,
  * idempotent operation envelope, local claim-change outbox, monotonic project
  * generations, the bounded backfill repair surface, and the transaction-scoped
@@ -11,7 +11,7 @@
  * import it directly under Node's type-stripping loader, which cannot resolve
  * extensionless runtime imports.
  *
- * Every object here is migration-owned (created by migration v83, never by
+ * Every object here is migration-owned (created by migration v84, never by
  * `initializeDatabase()`), following the v80/v82 precedent.
  *
  * Append-only contract (KTD2, R1, R13): legacy_memory_claims,
@@ -62,20 +62,20 @@ export const APPEND_ONLY_MEMORY_CLAIMS_TABLES = [
 ] as const;
 
 /**
- * `schema_migrations_meta` keys owned by the v83 claims backfill. U2 creates
+ * `schema_migrations_meta` keys owned by the v84 claims backfill. U2 creates
  * the contract and records initial state; U5 drives the transitions and only
  * the final reconciliation transaction may flip phase to `complete`.
  */
 export const CLAIMS_BACKFILL_META_KEYS = {
-    /** `empty` | `lazy` | `eager` — how the v83 corpus converts. */
+    /** `empty` | `lazy` | `eager` — how the v84 corpus converts. */
     mode: "claims_backfill_mode",
     /** Calibration digest for the selected backfill mode. */
     calibrationDigest: "claims_backfill_calibration_digest",
-    /** High-water `memories.id` at the v83 migration boundary (R1). */
+    /** High-water `memories.id` at the v84 migration boundary (R1). */
     boundaryMemoryId: "claims_backfill_boundary_memory_id",
     /** Expected crosswalk link count for the boundary corpus (R11). */
     expectedRowCount: "claims_backfill_expected_row_count",
-    /** `none` | `pending` — pending v22 identity work adopted by v83 (R19). */
+    /** `none` | `pending` — pending v22 identity work adopted by v84 (R19). */
     v22Takeover: "claims_backfill_v22_takeover",
     /** `rows` | `relationships` | `reconciling` | `complete` | `blocked`. */
     phase: "claims_backfill_phase",
@@ -89,7 +89,7 @@ export const CLAIMS_BACKFILL_META_KEYS = {
     finalOutboxWatermark: "claims_backfill_final_outbox_watermark",
 } as const;
 
-/** Full v83 compatibility object graph: tables, indexes, then guards. */
+/** Full v84 compatibility object graph: tables, indexes, then guards. */
 export function createMemoryClaimsCompatSchema(db: Database): void {
     db.exec(`
     CREATE TABLE legacy_memory_claims (
@@ -496,7 +496,7 @@ export function memoryRelationshipSourceMatchSql(alias: string): string {
 }
 
 /**
- * v83 semantic write guards over the legacy compatibility surface (R14).
+ * v84 semantic write guards over the legacy compatibility surface (R14).
  *
  * INSERT, DELETE, semantic-column UPDATE on `memories`, and every write to
  * the `memory_verifications` side table are rejected unless the transaction
@@ -506,7 +506,7 @@ export function memoryRelationshipSourceMatchSql(alias: string): string {
  * `memories_telemetry_freeze_guard` precedent) so a held-open full-row UPDATE
  * that binds the old semantic values back keeps working.
  *
- * Boundary protection (KTD9): every row at or below the v83 high-water
+ * Boundary protection (KTD9): every row at or below the v84 high-water
  * boundary must acquire its non-cascading crosswalk link before deletion or
  * identity movement — even with the capability held — so lazy backfill never
  * loses a boundary member.
@@ -520,12 +520,12 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
     CREATE TRIGGER memories_claims_write_guard_insert
     BEFORE INSERT ON memories
     WHEN ${capabilityCheck}
-    BEGIN SELECT RAISE(ABORT, 'memories semantic writes require the v83 claims-write kernel'); END;
+    BEGIN SELECT RAISE(ABORT, 'memories semantic writes require the v84 claims-write kernel'); END;
 
     CREATE TRIGGER memories_claims_write_guard_delete
     BEFORE DELETE ON memories
     WHEN ${capabilityCheck}
-    BEGIN SELECT RAISE(ABORT, 'memories semantic writes require the v83 claims-write kernel'); END;
+    BEGIN SELECT RAISE(ABORT, 'memories semantic writes require the v84 claims-write kernel'); END;
 
     CREATE TRIGGER memories_claims_write_guard_update
     BEFORE UPDATE OF project_path, content, category, normalized_hash, importance, scope, shareable,
@@ -549,14 +549,14 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
         OR NEW.merged_from IS NOT OLD.merged_from
         OR NEW.metadata_json IS NOT OLD.metadata_json
     ) AND ${capabilityCheck}
-    BEGIN SELECT RAISE(ABORT, 'memories semantic writes require the v83 claims-write kernel'); END;
+    BEGIN SELECT RAISE(ABORT, 'memories semantic writes require the v84 claims-write kernel'); END;
 
     -- Boundary rows must be linked before they can leave the corpus (R1).
     CREATE TRIGGER memories_claims_boundary_delete_guard
     BEFORE DELETE ON memories
     WHEN OLD.id <= ${boundary}
       AND NOT EXISTS (SELECT 1 FROM legacy_memory_claims WHERE memory_id = OLD.id)
-    BEGIN SELECT RAISE(ABORT, 'v83 boundary memories require a claim crosswalk link before delete'); END;
+    BEGIN SELECT RAISE(ABORT, 'v84 boundary memories require a claim crosswalk link before delete'); END;
 
     CREATE TRIGGER memories_claims_relationship_delete_guard
     BEFORE DELETE ON memories
@@ -580,7 +580,7 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
     WHEN NEW.project_path IS NOT OLD.project_path
       AND OLD.id <= ${boundary}
       AND NOT EXISTS (SELECT 1 FROM legacy_memory_claims WHERE memory_id = OLD.id)
-    BEGIN SELECT RAISE(ABORT, 'v83 boundary memories require a claim crosswalk link before identity moves'); END;
+    BEGIN SELECT RAISE(ABORT, 'v84 boundary memories require a claim crosswalk link before identity moves'); END;
     `);
     if (
         db
@@ -594,15 +594,15 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
         CREATE TRIGGER memory_verifications_claims_write_guard_insert
         BEFORE INSERT ON memory_verifications
         WHEN ${capabilityCheck}
-        BEGIN SELECT RAISE(ABORT, 'memory_verifications writes require the v83 claims-write kernel'); END;
+        BEGIN SELECT RAISE(ABORT, 'memory_verifications writes require the v84 claims-write kernel'); END;
         CREATE TRIGGER memory_verifications_claims_write_guard_update
         BEFORE UPDATE ON memory_verifications
         WHEN ${capabilityCheck}
-        BEGIN SELECT RAISE(ABORT, 'memory_verifications writes require the v83 claims-write kernel'); END;
+        BEGIN SELECT RAISE(ABORT, 'memory_verifications writes require the v84 claims-write kernel'); END;
         CREATE TRIGGER memory_verifications_claims_write_guard_delete
         BEFORE DELETE ON memory_verifications
         WHEN ${capabilityCheck}
-        BEGIN SELECT RAISE(ABORT, 'memory_verifications writes require the v83 claims-write kernel'); END;
+        BEGIN SELECT RAISE(ABORT, 'memory_verifications writes require the v84 claims-write kernel'); END;
         `);
     }
 }
@@ -619,7 +619,7 @@ export function assertMemoryClaimsSchemaForeignKeys(db: Database): void {
         if (rows.length > 0) violations.push(`${table}: ${rows.length} violation(s)`);
     }
     if (violations.length > 0) {
-        throw new Error(`v83 foreign_key_check failed: ${violations.join("; ")}`);
+        throw new Error(`v84 foreign_key_check failed: ${violations.join("; ")}`);
     }
 }
 
@@ -646,7 +646,7 @@ export function dropMemoryClaimsCompatObjectsForTests(db: Database): void {
         DROP TABLE IF EXISTS claim_compatibility_write_state;
         DROP TABLE IF EXISTS claim_change_log_prune_state;
     `);
-    db.prepare("DELETE FROM schema_migrations WHERE version >= 83").run();
+    db.prepare("DELETE FROM schema_migrations WHERE version >= 84").run();
     try {
         db.prepare("DELETE FROM schema_migrations_meta WHERE key LIKE 'claims_backfill_%'").run();
     } catch {

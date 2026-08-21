@@ -642,7 +642,7 @@ describe("applyMigrateSession — memory actions", () => {
     });
 });
 
-describe("applyMigrateSession — claims (v83)", () => {
+describe("applyMigrateSession — claims (v84)", () => {
     it("routes a session-relocation move through claim-aware identity adoption", () => {
         const oc = makeOpencodeDb();
         const ctx = new Database(":memory:");

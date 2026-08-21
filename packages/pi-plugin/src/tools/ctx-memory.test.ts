@@ -1186,7 +1186,7 @@ describe("createCtxMemoryTool", () => {
 	});
 });
 
-describe("createCtxMemoryTool on a migrated v83 database (claims kernel, U3 parity)", () => {
+describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 parity)", () => {
 	function countRows(
 		db: ReturnType<typeof createTestDb>,
 		table: string,
@@ -1268,7 +1268,7 @@ describe("createCtxMemoryTool on a migrated v83 database (claims kernel, U3 pari
 		}
 	});
 
-	it("updating an unlinked pre-v83 row adopts the preimage as revision 1 and the new content as revision 2 (Pi parity)", async () => {
+	it("updating an unlinked pre-v84 row adopts the preimage as revision 1 and the new content as revision 2 (Pi parity)", async () => {
 		const db = createTestDb();
 		try {
 			const projectIdentity = resolveProjectIdentity(process.cwd());

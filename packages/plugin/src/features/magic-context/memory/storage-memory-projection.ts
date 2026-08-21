@@ -1,7 +1,7 @@
 /**
- * Transaction-local legacy `memories` projection primitives for the v83
- * memory/claims kernel (KTD1). Exact SQL over the migrated v83 shape (every
- * column exists at v83), no transaction ownership, no cache invalidation, no
+ * Transaction-local legacy `memories` projection primitives for the v84
+ * memory/claims kernel (KTD1). Exact SQL over the migrated v84 shape (every
+ * column exists at v84), no transaction ownership, no cache invalidation, no
  * claim knowledge. The kernel imports this leaf plus the transaction-local
  * claim primitives; `storage-memory.ts` and harness adapters depend on the
  * kernel, never the reverse — so this module must not import
@@ -11,7 +11,7 @@
  * script, whose loader cannot resolve extensionless runtime imports.
  *
  * Every writer here assumes the caller already holds a write transaction with
- * the claims-write capability enabled; the v83 guards reject these statements
+ * the claims-write capability enabled; the v84 guards reject these statements
  * otherwise.
  */
 

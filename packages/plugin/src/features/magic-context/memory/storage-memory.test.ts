@@ -735,10 +735,10 @@ describe("getMemoriesByRequestedIds", () => {
 });
 
 // ---------------------------------------------------------------------------
-// U1 characterization: the pre-v83 memory mutation inventory over the REAL
+// U1 characterization: the pre-v84 memory mutation inventory over the REAL
 // migrated v82 schema. These tests lock in the exact current base-row, stats,
 // FTS, embedding, and side-table effects of every legacy semantic writer so
-// the v83 claims kernel (U2-U6) can be proven behavior-preserving. Do not
+// the v84 claims kernel (U2-U6) can be proven behavior-preserving. Do not
 // "fix" a surprising assertion here — it is the contract being preserved.
 // ---------------------------------------------------------------------------
 describe("migrated-v82 mutation inventory characterization", () => {
@@ -867,7 +867,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
             nowMs: 1_000,
         });
         saveEmbedding(migrated, memory.id, new Float32Array([0.5, 0.25]), "local:model-a");
-        // Fixture seeding of pre-existing semantic state must hold the v83
+        // Fixture seeding of pre-existing semantic state must hold the v84
         // claims-write capability; the guards reject bare semantic UPDATEs.
         runInMemoryClaimsWriteTransaction(migrated, () => {
             migrated
@@ -1052,12 +1052,12 @@ describe("migrated-v82 mutation inventory characterization", () => {
         expect(baseRow(migrated, memory.id)?.verified_at).toBe(verifiedAt);
     });
 
-    it("classification builds exact metadata for pre-v83 and v83 no-op/all-field updates", () => {
-        const preV83 = migratedDb();
-        dropMemoryClaimsCompatObjectsForTests(preV83);
+    it("classification builds exact metadata for pre-v84 and v84 no-op/all-field updates", () => {
+        const preV84 = migratedDb();
+        dropMemoryClaimsCompatObjectsForTests(preV84);
         migrated = migratedDb();
         try {
-            const legacy = insertMemory(preV83, {
+            const legacy = insertMemory(preV84, {
                 projectPath: "git:classification-parity",
                 category: "CONSTRAINTS",
                 content: "legacy classification fact",
@@ -1067,7 +1067,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
                 category: "CONSTRAINTS",
                 content: "claims classification fact",
             });
-            const v83CountsBefore = {
+            const v84CountsBefore = {
                 revisions: (
                     migrated.prepare("SELECT COUNT(*) AS count FROM claim_revisions").get() as {
                         count: number;
@@ -1081,7 +1081,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
             };
 
             expect(
-                setMemoryClassification(preV83, legacy.id, {
+                setMemoryClassification(preV84, legacy.id, {
                     importance: 50,
                     scope: "project",
                     shareable: false,
@@ -1095,21 +1095,21 @@ describe("migrated-v82 mutation inventory characterization", () => {
                 }),
             ).toBeFalse();
             expect(migrated.prepare("SELECT COUNT(*) AS count FROM claim_revisions").get()).toEqual(
-                { count: v83CountsBefore.revisions },
+                { count: v84CountsBefore.revisions },
             );
             expect(
                 migrated.prepare("SELECT COUNT(*) AS count FROM claim_change_outbox").get(),
-            ).toEqual({ count: v83CountsBefore.outbox });
+            ).toEqual({ count: v84CountsBefore.outbox });
 
             const allFields = {
                 importance: 91,
                 scope: "ecosystem" as const,
                 shareable: true,
             };
-            expect(setMemoryClassification(preV83, legacy.id, allFields)).toBeTrue();
+            expect(setMemoryClassification(preV84, legacy.id, allFields)).toBeTrue();
             expect(setMemoryClassification(migrated, claims.id, allFields)).toBeTrue();
             for (const [database, id] of [
-                [preV83, legacy.id],
+                [preV84, legacy.id],
                 [migrated, claims.id],
             ] as const) {
                 expect(
@@ -1125,7 +1125,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
                 shareable: 1,
             });
         } finally {
-            closeQuietly(preV83);
+            closeQuietly(preV84);
         }
     });
 

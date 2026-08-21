@@ -751,7 +751,7 @@ fn managed_memory_update_is_rejected_by_the_database_guard() {
 
 /// Text the write fence surfaces through commands.rs's `.to_string()` — the
 /// dashboard's UI toast shows exactly this string.
-const CLAIMS_FENCE_MESSAGE: &str = "This Magic Context database uses the v83 claims schema. \
+const CLAIMS_FENCE_MESSAGE: &str = "This Magic Context database uses the v84 claims schema. \
      Memory editing requires an updated dashboard. Reads remain available.";
 
 /// Mirrors the capability table the plugin's claims migration creates; the
