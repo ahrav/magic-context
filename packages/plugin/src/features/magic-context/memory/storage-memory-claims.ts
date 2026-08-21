@@ -1373,6 +1373,56 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                 input.nowMs,
             );
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
+            // The rewrite can repair the very reason the preimage was
+            // unadoptable (an empty-content row given real content), so the
+            // repaired postimage adopts inside the same operation; committing
+            // the projection alone would strand a now-adoptable row unlinked.
+            const post = readMemoryProjectionRow(db, row.id);
+            if (
+                post &&
+                projectId !== null &&
+                memoryClaimAdoptionFailureReason(post, projectId) === null
+            ) {
+                const link = ensureMemoryClaimLinkInCurrentTransaction(
+                    db,
+                    post,
+                    projectId,
+                    liveProvenance(envelope, input.sourceSessionId ?? post.source_session_id),
+                );
+                const effects: MemoryClaimEffect[] = [
+                    {
+                        effectKey: `memory:${row.id}:upsert`,
+                        projectId,
+                        claimId: link.claimId,
+                        effectType: "upsert" as const,
+                    },
+                ];
+                // The projection keeps its verified columns across a content
+                // rewrite, so the adopted claim's current revision needs its
+                // own verified event.
+                if (memoryRowHasPositiveVerification(db, post)) {
+                    addVerificationEvent(db, {
+                        revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                        outcome: "verified",
+                        verifier: envelope.producer,
+                    });
+                    effects.push({
+                        effectKey: `memory:${row.id}:evidence`,
+                        projectId,
+                        claimId: link.claimId,
+                        effectType: "evidence" as const,
+                    });
+                }
+                return {
+                    result: {
+                        memoryId: row.id,
+                        claimId: link.claimId,
+                        revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                        found: true,
+                    },
+                    effects,
+                };
+            }
             return { result: unlinkableResult(row.id), effects: [] };
         }
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
@@ -2298,6 +2348,23 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 addVerificationEvent(db, {
                     revisionId: readClaimCurrentRevisionId(db, link.claimId),
                     outcome,
+                    verifier: envelope.producer,
+                });
+                effects.push({
+                    effectKey: `memory:${post.id}:evidence`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "evidence" as const,
+                });
+            } else if (preimageAdopted && memoryRowHasPositiveVerification(db, post)) {
+                // Side-table-only verification never sets the projection
+                // columns, so the gate above sees no change on a first
+                // adoption; the adopted claim still owes one verified event
+                // for the row's pre-existing verified state. The else-if
+                // keeps the delta at one event.
+                addVerificationEvent(db, {
+                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                    outcome: "verified",
                     verifier: envelope.producer,
                 });
                 effects.push({

@@ -809,6 +809,10 @@ function storageMemoryClaimEnvelope(
         producer: identity?.producer ?? "storage-memory",
         operationKey: identity?.operationKey ?? `${operation}:${randomUUID()}`,
         requestDigest: identity?.requestDigest ?? computeClaimRequestDigest(request),
+        // A generated random key can never be presented again, so a
+        // zero-effect run has no replay value and must not persist an
+        // operation row; caller-supplied keys keep the durable contract.
+        ...(identity?.operationKey === undefined ? { ephemeral: true as const } : {}),
     };
 }
 

@@ -339,6 +339,68 @@ describe("memory/claims kernel: content and classification updates", () => {
         }
     });
 
+    test("a content update that repairs an empty-content row adopts the repaired postimage in the same operation", () => {
+        const db = track(migratedDb());
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', '', 'hash:repairable empty', 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT).lastInsertRowid,
+            );
+        });
+        // A prior claims-aware write records the blocking empty-content failure.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("repair-empty-0", { id: memoryId }),
+                { memoryId, status: "active" },
+            ),
+        );
+        expect(
+            db
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(String(memoryId)),
+        ).toEqual({ disposition: "blocking" });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("repair-empty-1", { id: memoryId }),
+                {
+                    memoryId,
+                    content: "repaired wording",
+                    normalizedHash: "hash:repaired wording",
+                },
+            ),
+        );
+
+        // The repaired postimage links inside the same operation: real claim
+        // and revision ids, an upsert effect, and the failure resolves.
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(outcome.result.revisionId).not.toBeNull();
+        expect(readMemoryClaimLink(db, memoryId)?.claimId).toBe(outcome.result.claimId as number);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+        expect(claim?.content).toBe("repaired wording");
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'upsert' AND effect_key = 'memory:${memoryId}:upsert'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'repair-empty-1')`,
+            ),
+        ).toBe(1);
+        expect(
+            db
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(String(memoryId)),
+        ).toEqual({ disposition: "resolved" });
+    });
+
     test("a classification-only change appends a same-content revision with new metadata; a seen-count bump touches only memory_stats", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "classify-seed", "classified fact");
@@ -1068,6 +1130,58 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
                 `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'`,
             ),
         ).toBe(2);
+    });
+
+    test("a first module delta on an unlinked side-table-verified row with unchanged state records one verified event with evidence", () => {
+        const db = track(migratedDb());
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', 'side verified module fact', 'hash:side verified module fact', 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT).lastInsertRowid,
+            );
+            // Pre-v84 TypeScript verification: positive verified_at lives only
+            // in memory_verifications; the projection columns stay unverified.
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/compat.ts', 123, 100)`,
+            ).run(memoryId);
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("module-side-verified-1", { key: "module-side-verified" }),
+                { memoryId, applyProjection: () => {} },
+            ),
+        );
+
+        // The status gate sees no change, advance, or revision for a
+        // side-table-only row, so the first adoption itself carries the
+        // pre-existing verified state: one event on the current revision
+        // plus a matching evidence effect.
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(
+            db
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(outcome.result.claimId),
+        ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'evidence' AND effect_key = 'memory:${memoryId}:evidence'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'module-side-verified-1')`,
+            ),
+        ).toBe(1);
     });
 });
 

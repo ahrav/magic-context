@@ -103,6 +103,9 @@ function relocationEnvelope(operation: string, request: unknown): MemoryClaimOpe
         producer: RELOCATION_PRODUCER,
         operationKey: `${operation}:${randomUUID()}`,
         requestDigest: computeClaimRequestDigest(request),
+        // The random key can never be presented again, so a zero-effect run
+        // has no replay value and must not persist an operation row.
+        ephemeral: true,
     };
 }
 
@@ -127,20 +130,23 @@ function requireRelocationTargetProject(db: Database, toIdentity: string): numbe
  * category, hash) tuple — including one archived by a prior delete of the
  * target-project equivalent. Sync the claim lifecycle from the adopted
  * projection row so an active row never points at an archived claim, and
- * carry the row's verified status onto the claim as evidence. Returns the
- * effects the caller must emit for what actually changed.
+ * carry the row's verified status onto the claim as evidence. The producer
+ * stamps the lifecycle and verification events with the adopting operation's
+ * identity. Returns the effects the caller must emit for what actually
+ * changed.
  */
-function syncAdoptedRelocationClaimState(
+export function syncAdoptedRelocationClaimState(
     db: Database,
     row: MemoryProjectionRow,
     link: MemoryClaimLink,
     projectId: number,
+    producer: string,
 ): MemoryClaimEffect[] {
     const effects: MemoryClaimEffect[] = [];
     const desiredState = claimStateFromMemoryStatus(row.status);
     if (readCurrentClaimSemanticState(db, link.claimId).state !== desiredState) {
         if (desiredState === "archived") {
-            retireMemoryClaimInCurrentTransaction(db, link.claimId, RELOCATION_PRODUCER);
+            retireMemoryClaimInCurrentTransaction(db, link.claimId, producer);
         } else {
             setClaimLifecycleStateInCurrentTransaction(db, link.claimId, desiredState);
         }
@@ -151,14 +157,7 @@ function syncAdoptedRelocationClaimState(
             effectType: "lifecycle" as const,
         });
     }
-    if (
-        recordAdoptedMemoryVerifiedEventInCurrentTransaction(
-            db,
-            row,
-            link.claimId,
-            RELOCATION_PRODUCER,
-        )
-    ) {
+    if (recordAdoptedMemoryVerifiedEventInCurrentTransaction(db, row, link.claimId, producer)) {
         effects.push({
             effectKey: `memory:${row.id}:evidence`,
             projectId,
@@ -187,7 +186,13 @@ function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId:
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, targetProjectId, {
                 kind: "migration",
             });
-            const stateEffects = syncAdoptedRelocationClaimState(db, row, link, targetProjectId);
+            const stateEffects = syncAdoptedRelocationClaimState(
+                db,
+                row,
+                link,
+                targetProjectId,
+                RELOCATION_PRODUCER,
+            );
             const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(
                 db,
                 row,
@@ -210,16 +215,16 @@ function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId:
 }
 
 /**
- * Blocking diagnostic for a collision merge the relocation cannot take: the
+ * Blocking diagnostic for a collision merge the caller cannot take: the
  * surviving target row is unadoptable, so no canonical claim can anchor the
- * source's crosswalk link before the source row's delete — and the merge
- * keeps the TARGET's bytes, so deleting the source into an unadoptable
+ * source's crosswalk link before the source row leaves the corpus — and the
+ * merge keeps the TARGET's bytes, so folding the source into an unadoptable
  * survivor would silently discard content. Mirrors the repoint diagnostic
  * shape so the repair lane surfaces the stalled merge; the leading
  * `memory:<sourceId>` in the item key is what the boundary gating parser
  * reads, keeping completion fail-closed while a boundary source is stranded.
  */
-function recordSkippedCollisionMergeDiagnostic(
+export function recordSkippedCollisionMergeDiagnostic(
     db: Database,
     sourceId: number,
     targetId: number,
@@ -463,6 +468,7 @@ export function moveLinkedMemoryAcrossProjects(
                 newRow,
                 newLink,
                 targetProjectId,
+                RELOCATION_PRODUCER,
             );
             retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
             recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, newLink);

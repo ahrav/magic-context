@@ -4,7 +4,11 @@ import {
     readMemorySideTableVerifiedAt,
     recordAdoptedMemoryVerifiedEventInCurrentTransaction,
 } from "./claims-backfill";
-import { moveLinkedMemoryAcrossProjects } from "./memory/relocate-memory";
+import {
+    moveLinkedMemoryAcrossProjects,
+    recordSkippedCollisionMergeDiagnostic,
+    syncAdoptedRelocationClaimState,
+} from "./memory/relocate-memory";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 import {
     computeClaimRequestDigest,
@@ -161,33 +165,55 @@ function logRow(
     ).run(fromIdentity, toIdentity, tableName, rowId, action, targetRowId, mergedAt);
 }
 
+/**
+ * Claim adoption for one merged memory row. Returns false only when a
+ * collision merge must be skipped because the surviving target cannot adopt
+ * the canonical claim; every other shape lets the caller's merge proceed.
+ */
 function adoptIdentityMergeRowClaims(
     db: Database,
     sourceId: number,
     collisionTargetId: number | null,
     toIdentity: string,
     mergedAt: number,
-): void {
+): boolean {
     const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
     if (projectId === null) {
         // The merge itself proceeds (boundary rows self-heal via lazy
         // backfill); the blocking diagnostic makes the skipped claim work
         // observable per row.
         recordMemoryClaimLinkFailure(db, sourceId, toIdentity, "unresolved-project-identity");
-        return;
+        return true;
     }
     const sourceRow = readMemoryProjectionRow(db, sourceId);
-    if (!sourceRow || sourceRow.content.length === 0) return;
-    runMemoryClaimOperationInCurrentTransaction(
-        db,
-        {
-            producer: "identity-merge",
-            operationKey: `merge-row:${randomUUID()}`,
-            requestDigest: computeClaimRequestDigest({ sourceId, collisionTargetId, toIdentity }),
-        },
-        () => {
-            const effects: MemoryClaimEffect[] = [];
-            if (collisionTargetId === null) {
+    if (!sourceRow) return true;
+    const sourceFailure = memoryClaimAdoptionFailureReason(sourceRow, projectId);
+    if (collisionTargetId === null) {
+        if (sourceFailure !== null) {
+            // An unadoptable source (empty content or claim-invalid metadata)
+            // cannot link; record the blocking diagnostic and let the
+            // caller's relationship-guard check decide whether the rekey
+            // itself can still proceed.
+            recordMemoryClaimLinkFailure(db, sourceId, toIdentity, sourceFailure);
+            return true;
+        }
+        runMemoryClaimOperationInCurrentTransaction(
+            db,
+            {
+                producer: "identity-merge",
+                operationKey: `merge-row:${randomUUID()}`,
+                requestDigest: computeClaimRequestDigest({
+                    sourceId,
+                    collisionTargetId,
+                    toIdentity,
+                }),
+                // The random key can never be presented again, so a
+                // zero-effect run (an already-linked no-delta row) has no
+                // replay value and must not persist an operation row.
+                ephemeral: true,
+            },
+            () => {
+                const effects: MemoryClaimEffect[] = [];
                 // Adoption must precede the caller's project_path UPDATE: an
                 // unlinked boundary row would trip the v84 identity-move guard.
                 const wasLinked = readMemoryClaimLink(db, sourceId) !== null;
@@ -205,33 +231,46 @@ function adoptIdentityMergeRowClaims(
                         effectType: "upsert" as const,
                     });
                 }
-                if (
-                    recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+                // Adoption can reuse a canonical claim archived by a prior
+                // delete of the target-project equivalent; the sync
+                // reactivates it from the row's status and carries the row's
+                // verified state onto the claim as evidence.
+                effects.push(
+                    ...syncAdoptedRelocationClaimState(
                         db,
                         sourceRow,
-                        link.claimId,
-                        "identity-merge",
-                    )
-                ) {
-                    effects.push({
-                        effectKey: `memory:${sourceId}:evidence`,
+                        link,
                         projectId,
-                        claimId: link.claimId,
-                        effectType: "evidence" as const,
-                    });
-                }
-                return { result: link.claimId, effects };
-            }
-            const targetRow = readMemoryProjectionRow(db, collisionTargetId);
-            if (!targetRow || targetRow.content.length === 0) {
-                // The caller archives the source row as superseded by this
-                // target; a target that cannot carry the canonical claim would
-                // leave the source claim active on suppressed history. Fail
-                // the merge so the transaction rolls back.
-                throw new Error(
-                    `identity merge collision target ${collisionTargetId} ${targetRow ? "has empty content" : "has no projection row"} and cannot adopt the canonical claim for memory ${sourceId}`,
+                        "identity-merge",
+                    ),
                 );
-            }
+                return { result: link.claimId, effects };
+            },
+        );
+        return true;
+    }
+    const targetRow = readMemoryProjectionRow(db, collisionTargetId);
+    if (!targetRow) return false;
+    const targetFailure = memoryClaimAdoptionFailureReason(targetRow, projectId);
+    if (targetFailure !== null) {
+        // The caller archives the source row as superseded by this target; a
+        // target that cannot carry the canonical claim would leave the source
+        // claim active on suppressed history. Skip the merge for this row
+        // with a blocking diagnostic instead of failing the whole merge.
+        recordSkippedCollisionMergeDiagnostic(db, sourceId, collisionTargetId, targetFailure);
+        return false;
+    }
+    runMemoryClaimOperationInCurrentTransaction(
+        db,
+        {
+            producer: "identity-merge",
+            operationKey: `merge-row:${randomUUID()}`,
+            requestDigest: computeClaimRequestDigest({ sourceId, collisionTargetId, toIdentity }),
+            // Same random-key contract as the non-collision envelope above.
+            ephemeral: true,
+        },
+        () => {
+            const effects: MemoryClaimEffect[] = [];
             const targetWasLinked = readMemoryClaimLink(db, collisionTargetId) !== null;
             const targetLink = ensureMemoryClaimLinkInCurrentTransaction(db, targetRow, projectId, {
                 kind: "migration",
@@ -285,16 +324,24 @@ function adoptIdentityMergeRowClaims(
             }
             let sourceLink = readMemoryClaimLink(db, sourceId);
             if (!sourceLink) {
-                sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
-                    db,
-                    sourceRow,
-                    projectId,
-                    { kind: "migration" },
-                    { adoptDivergentContent: false },
-                );
+                if (sourceFailure === null) {
+                    sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
+                        db,
+                        sourceRow,
+                        projectId,
+                        { kind: "migration" },
+                        { adoptDivergentContent: false },
+                    );
+                } else {
+                    // An unadoptable source cannot form the duplicate
+                    // crosswalk link; the archive below still proceeds and
+                    // the skipped link stays observable as a blocking
+                    // rows-phase diagnostic.
+                    recordMemoryClaimLinkFailure(db, sourceId, toIdentity, sourceFailure);
+                }
             }
             effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, sourceRow));
-            if (sourceLink.claimId !== targetLink.claimId) {
+            if (sourceLink && sourceLink.claimId !== targetLink.claimId) {
                 // A colliding source with its own claim retires it with
                 // supersession lineage; two active claims must not survive for
                 // one surviving fact.
@@ -310,6 +357,7 @@ function adoptIdentityMergeRowClaims(
             return { result: targetLink.claimId, effects };
         },
     );
+    return true;
 }
 
 /**
@@ -361,8 +409,14 @@ function mergeMemoryRow(
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
-        if (claimsActive) {
-            adoptIdentityMergeRowClaims(db, sourceId, targetId, toIdentity, mergedAt);
+        // An unadoptable collision target cannot anchor the canonical claim,
+        // so the merge is skipped for this row (fail-visible diagnostic,
+        // source row preserved) before any stats or verification mutation.
+        if (
+            claimsActive &&
+            !adoptIdentityMergeRowClaims(db, sourceId, targetId, toIdentity, mergedAt)
+        ) {
+            return false;
         }
         const mergedSeen = Math.max(
             effectiveSeenCount(targetId, collision.seen_count),

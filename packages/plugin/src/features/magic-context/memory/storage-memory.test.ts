@@ -941,6 +941,36 @@ describe("migrated-v82 mutation inventory characterization", () => {
         archiveMemory(migrated, 424_242, "reason");
     });
 
+    it("status: repeated unkeyed writes on an unadoptable row persist no claim operations; a keyed write does", () => {
+        migrated = migratedDb();
+        const memory = insertMemory(migrated, {
+            projectPath: "/legacy/raw-ephemeral",
+            category: "CONSTRAINTS",
+            content: "raw path fact",
+            nowMs: 1_000,
+        });
+        const operations = () =>
+            (
+                migrated.prepare("SELECT COUNT(*) AS count FROM claim_operations").get() as {
+                    count: number;
+                }
+            ).count;
+        // The unadoptable insert itself is zero-effect, so its random-key
+        // envelope persists no operation row.
+        expect(operations()).toBe(0);
+
+        updateMemoryStatus(migrated, memory.id, "permanent");
+        updateMemoryStatus(migrated, memory.id, "active");
+        expect(operations()).toBe(0);
+
+        // A caller-supplied durable key keeps the replay contract.
+        updateMemoryStatus(migrated, memory.id, "archived", {
+            producer: "storage-memory",
+            operationKey: "status-keyed-1",
+        });
+        expect(operations()).toBe(1);
+    });
+
     it("delete: removes base row, cascades stats/embeddings/verifications, clears FTS", () => {
         migrated = migratedDb();
         const memory = insertMemory(migrated, {

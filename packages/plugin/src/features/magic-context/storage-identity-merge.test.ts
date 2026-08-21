@@ -4,6 +4,7 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { partitionVerifyScope } from "./dreamer/verify-gate";
 import { createSourceSpan } from "./memory/storage-claims";
 import {
+    deleteMemory,
     insertMemory as insertMemoryThroughKernel,
     updateMemoryStatus,
 } from "./memory/storage-memory";
@@ -653,16 +654,16 @@ describe("project identity merge claims (v84)", () => {
         });
     });
 
-    test("an empty-content collision target aborts the merge and rolls back", () => {
+    test("an empty-content collision target skips the row with a diagnostic instead of rolling back", () => {
         const database = makeDb();
         const sourceId = insertMemory(database, "dir:old", "legacy fact", "same-hash");
         const targetId = insertMemory(database, "git:new", "", "same-hash");
 
-        expect(() => mergeProjectIdentities(database, "dir:old", "git:new", { now: 50 })).toThrow(
-            new RegExp(`collision target ${targetId} has empty content`),
-        );
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 50 });
 
-        // The rolled-back transaction leaves the source row unchanged.
+        // The merge completes; the skipped row survives untouched under the
+        // source identity and the stalled merge surfaces as a blocking
+        // diagnostic.
         expect(
             database
                 .prepare(
@@ -670,9 +671,26 @@ describe("project identity merge claims (v84)", () => {
                 )
                 .get(sourceId),
         ).toEqual({ project_path: "dir:old", status: "active", by: null });
-        expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
-            count: 0,
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${sourceId}:collision-merge:${targetId}`),
+        ).toEqual({
+            phase: "relationships",
+            item_kind: "merge",
+            reason_code: "empty-content",
+            disposition: "blocking",
         });
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM identity_merge_log WHERE table_name = 'memories'",
+                )
+                .get(),
+        ).toEqual({ count: 0 });
     });
 
     test("a collision merge between unregistered raw paths records a blocking diagnostic for the skipped claim work", () => {
@@ -936,6 +954,84 @@ describe("project identity merge claims (v84)", () => {
                 )
                 .get(`memory:${rowId}:evidence`),
         ).toEqual({ count: 1 });
+    });
+
+    test("a non-collision merge onto a claims-deleted equivalent reactivates the adopted claim", () => {
+        const database = makeDb();
+        const deleted = insertMemoryThroughKernel(database, {
+            projectPath: "git:new",
+            category: "CONSTRAINTS",
+            content: "revived fact",
+        });
+        const archivedLink = readMemoryClaimLink(database, deleted.id);
+        deleteMemory(database, deleted.id);
+        expect(
+            database
+                .prepare("SELECT state FROM claims WHERE id = ?")
+                .get(archivedLink?.claimId ?? 0),
+        ).toEqual({ state: "archived" });
+        const sourceId = insertMemory(database, "dir:old", "revived fact", deleted.normalizedHash);
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 60 });
+
+        // The rekeyed row adopts the archived canonical claim and reactivates
+        // it from the row's status, with a lifecycle effect for the
+        // transition.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(sourceId),
+        ).toEqual({ project_path: "git:new" });
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(database, sourceId);
+        expect(claim?.claimId).toBe(archivedLink?.claimId ?? 0);
+        expect(claim?.state).toBe("active");
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'lifecycle'`,
+                )
+                .get(`memory:${sourceId}:lifecycle`),
+        ).toEqual({ count: 1 });
+    });
+
+    test("a claim-invalid unlinked row is diagnosed without rolling back the rest of the merge", () => {
+        const database = makeDb();
+        const healthyId = insertMemory(database, "dir:old", "healthy fact", "healthy-h1");
+        const invalidId = insertMemory(
+            database,
+            "dir:old",
+            "invalid importance fact",
+            "invalid-h1",
+        );
+        // Schema-legal but claim-invalid: `memories` has no CHECK on importance.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database.prepare("UPDATE memories SET importance = 0 WHERE id = ?").run(invalidId);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 70 });
+
+        // The healthy row rekeys and links; the invalid row rekeys unlinked
+        // with a blocking diagnostic instead of aborting the whole merge.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(healthyId),
+        ).toEqual({ project_path: "git:new" });
+        expect(readMemoryClaimLink(database, healthyId)).not.toBeNull();
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(invalidId),
+        ).toEqual({ project_path: "git:new" });
+        expect(readMemoryClaimLink(database, invalidId)).toBeNull();
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(String(invalidId)),
+        ).toEqual({
+            phase: "rows",
+            item_kind: "memory",
+            reason_code: "invalid-importance",
+            disposition: "blocking",
+        });
     });
 
     test("a generic rekey routes an unadoptable lineage-bearing row to a diagnostic instead of aborting", () => {
