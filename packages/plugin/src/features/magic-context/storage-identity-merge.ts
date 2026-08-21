@@ -284,32 +284,48 @@ function adoptIdentityMergeRowClaims(
                 });
             }
             // Pre-v84 TypeScript verification writes a positive verified_at
-            // only to the memory_verifications side table, so the side
-            // table's maximum stands in when the source projection columns
-            // are unset.
+            // only to the memory_verifications side table, so each side's
+            // side-table maximum stands in when its projection columns are
+            // unset.
             const sourceVerifiedAt =
                 sourceRow.verification_status === "verified" && (sourceRow.verified_at ?? 0) > 0
                     ? (sourceRow.verified_at as number)
                     : readMemorySideTableVerifiedAt(db, sourceId);
+            const targetProjectionVerified =
+                targetRow.verification_status === "verified" && (targetRow.verified_at ?? 0) > 0;
+            const targetVerifiedAt = targetProjectionVerified
+                ? (targetRow.verified_at as number)
+                : readMemorySideTableVerifiedAt(db, collisionTargetId);
+            const adoptedVerifiedAt = Math.max(sourceVerifiedAt, targetVerifiedAt);
             if (
-                sourceVerifiedAt > 0 &&
-                (targetRow.verification_status !== "verified" || (targetRow.verified_at ?? 0) <= 0)
+                (sourceVerifiedAt > 0 && !targetProjectionVerified) ||
+                (!targetWasLinked && targetVerifiedAt > 0)
             ) {
-                // The caller copies the source's verification mappings onto
-                // the survivor with verified_at preserved, so compat readers
-                // (which filter on verified_at) treat the survivor as
-                // verified. Promote the survivor's projection columns to
-                // match and record the verified event on the canonical claim
-                // so the promotion carries claim evidence.
-                db.prepare(
-                    `UPDATE memories
-                        SET verification_status = 'verified', verified_at = ?, updated_at = ?
-                      WHERE id = ?`,
-                ).run(sourceVerifiedAt, mergedAt, collisionTargetId);
+                // Two verification transfers land on the survivor's claim: the
+                // caller copies the source's verification mappings onto the
+                // survivor with verified_at preserved (compat readers filter
+                // on verified_at), and a freshly-adopted target's own
+                // pre-existing verification would otherwise leave its new
+                // claim eventless. Promote the survivor's projection columns
+                // when they are unset and record one verified event on the
+                // canonical claim so either path carries claim evidence; the
+                // single funnel keeps a both-verified collision from
+                // double-recording the bare-INSERT event.
+                if (!targetProjectionVerified) {
+                    db.prepare(
+                        `UPDATE memories
+                            SET verification_status = 'verified', verified_at = ?, updated_at = ?
+                          WHERE id = ?`,
+                    ).run(adoptedVerifiedAt, mergedAt, collisionTargetId);
+                }
                 if (
                     recordAdoptedMemoryVerifiedEventInCurrentTransaction(
                         db,
-                        sourceRow,
+                        {
+                            id: collisionTargetId,
+                            verification_status: "verified",
+                            verified_at: adoptedVerifiedAt,
+                        },
                         targetLink.claimId,
                         "identity-merge",
                     )

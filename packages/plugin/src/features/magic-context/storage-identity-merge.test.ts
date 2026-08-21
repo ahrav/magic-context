@@ -917,6 +917,101 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("a collision merge records a freshly-adopted target's own side-table verification as claim evidence", () => {
+        const database = makeDb();
+        insertMemory(database, "git:source", "shared fact", "shared-h1");
+        const targetId = insertMemory(database, "git:target", "shared fact", "shared-h1");
+        // Pre-v84 TypeScript verification on the TARGET only: positive
+        // verified_at lives in memory_verifications; the source carries no
+        // verification anywhere.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 123, 100)`,
+                )
+                .run(targetId);
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        // The unlinked target is adopted during the merge; its pre-existing
+        // verification promotes the projection and lands on the fresh claim
+        // instead of leaving it eventless.
+        expect(
+            database
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(targetId),
+        ).toEqual({ status: "verified", at: 123 });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(survivorClaim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "identity-merge" }]);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${targetId}:evidence`),
+        ).toEqual({ count: 1 });
+    });
+
+    test("a collision merge with both sides verified records exactly one verified event", () => {
+        const database = makeDb();
+        const sourceId = insertMemory(database, "git:source", "shared fact", "shared-h1");
+        const targetId = insertMemory(database, "git:target", "shared fact", "shared-h1");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+                )
+                .run(sourceId);
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 200, 100)`,
+                )
+                .run(targetId);
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        // Both the source transfer and the target's own adoption qualify, but
+        // the single funnel records one event with the maximum verified_at.
+        expect(
+            database
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(targetId),
+        ).toEqual({ status: "verified", at: 200 });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(survivorClaim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "identity-merge" }]);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${targetId}:evidence`),
+        ).toEqual({ count: 1 });
+    });
+
     test("a non-collision merge carries a side-table-only verified unlinked row onto its claim with evidence", () => {
         const database = makeDb();
         const rowId = insertMemory(database, "dir:old", "legacy verified fact", "legacy-v1");

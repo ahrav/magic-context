@@ -44,25 +44,17 @@ export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfill
 export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     if (options.clear) return runClear();
 
-    const argv = options.argv ?? [];
-    const adapters = await resolveAdaptersForCommand(argv, {
-        allowMulti: true,
-        verb: "diagnose",
-    });
-
-    if (adapters.length === 0) {
-        log.warn("No harness selected.");
-        return 0;
-    }
-
     let sharedCommandExitCode: number | null = null;
 
-    // The v22 backfill commands operate on the SHARED cortexkit DB (harness-
-    // agnostic — there is no per-harness shard for backfill state). Run them
-    // exactly ONCE here, not once per adapter: dispatching to both an OpenCode
-    // and a Pi adapter would run the same rekey/retry/check against the same
-    // physical DB twice, producing confusing doubled output (e.g. the second
-    // pass reports "Re-keyed 0 row(s)" because the first already moved them).
+    // The v22 and claims backfill commands operate on the SHARED cortexkit DB
+    // (harness-agnostic — the DB path takes no adapter input), so they run
+    // before adapter resolution: resolution prompts interactively and exits 0
+    // on cancel, an empty selection, or a headless host, which would skip the
+    // requested repair while reporting success. Run them exactly ONCE here,
+    // not once per adapter: dispatching to both an OpenCode and a Pi adapter
+    // would run the same rekey/retry/check against the same physical DB
+    // twice, producing confusing doubled output (e.g. the second pass reports
+    // "Re-keyed 0 row(s)" because the first already moved them).
     if (hasV22Command(options)) {
         let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
         const result = await runV22BackfillCommands(
@@ -109,6 +101,17 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
         sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, result.exitCode);
     }
     if (sharedCommandExitCode !== null) return sharedCommandExitCode;
+
+    const argv = options.argv ?? [];
+    const adapters = await resolveAdaptersForCommand(argv, {
+        allowMulti: true,
+        verb: "diagnose",
+    });
+
+    if (adapters.length === 0) {
+        log.warn("No harness selected.");
+        return 0;
+    }
 
     // Reconcile interrupted cross-harness session migrations. The journal lives
     // in the SHARED cortexkit DB (harness-agnostic), so this runs exactly once

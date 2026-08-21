@@ -23,4 +23,19 @@ describe("unified doctor claims backfill dispatch", () => {
             source.match(/Math\.max\(sharedCommandExitCode \?\? 0, result\.exitCode\)/g),
         ).toHaveLength(2);
     });
+
+    test("dispatches shared-DB commands before interactive harness resolution", () => {
+        // The shared-DB path takes no adapter input, and resolution exits 0 on
+        // cancel, an empty selection, or a headless host. Dispatch placed after
+        // resolution would silently skip the requested check on those paths, so
+        // both shared-DB blocks (and their exit-code return) must precede the
+        // resolveAdaptersForCommand call.
+        const resolution = source.indexOf("resolveAdaptersForCommand(");
+        expect(resolution).toBeGreaterThan(-1);
+        expect(source.indexOf("runV22BackfillCommands(")).toBeLessThan(resolution);
+        expect(source.indexOf("runClaimsBackfillCommands(")).toBeLessThan(resolution);
+        expect(
+            source.indexOf("if (sharedCommandExitCode !== null) return sharedCommandExitCode"),
+        ).toBeLessThan(resolution);
+    });
 });
