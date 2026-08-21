@@ -13,7 +13,9 @@ import {
     hasMemoryClaimsCompatSchema,
     type MemoryClaimEffect,
     type MemoryClaimLink,
+    type MemoryClaimLinkFailureReason,
     type MemoryClaimOperationEnvelope,
+    memoryClaimAdoptionFailureReason,
     readCurrentClaimSemanticState,
     readMemoryClaimLink,
     recordMemoryClaimSupersessionInCurrentTransaction,
@@ -276,6 +278,36 @@ function adoptRelocationMergeClaims(
 }
 
 /**
+ * Blocking relationships-phase diagnostic for a supersession edge the move
+ * cannot repoint: the referrer is unadoptable, so no claim link — and
+ * therefore no relationship snapshot — can authorize rewriting its lineage
+ * columns. Mirrors the kernel's relationships-phase failure rows so the
+ * repair lane surfaces the stranded edge.
+ */
+function recordSkippedReferrerRepointDiagnostic(
+    db: Database,
+    referencingId: number,
+    supersededById: number,
+    reason: MemoryClaimLinkFailureReason,
+): void {
+    const now = Date.now();
+    db.prepare(
+        `INSERT INTO claim_backfill_failures
+            (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+         VALUES ('relationships', 'supersession', ?, ?, ?, 'blocking', ?, ?)
+         ON CONFLICT(phase, item_kind, item_key)
+         DO UPDATE SET reason_code = excluded.reason_code, detail = excluded.detail,
+                       disposition = 'blocking', updated_at = excluded.updated_at`,
+    ).run(
+        `memory:${referencingId}:supersession-repoint:${supersededById}`,
+        reason,
+        JSON.stringify({ supersededByMemoryId: supersededById }),
+        now,
+        now,
+    );
+}
+
+/**
  * Authorized cross-project MOVE of a claim-linked row. The crosswalk is
  * append-only and keyed by memory id, so a linked row can never re-link to a
  * second numeric project in place. The move therefore inserts a fresh
@@ -303,6 +335,7 @@ export function moveLinkedMemoryAcrossProjects(
             .prepare("SELECT id FROM memories WHERE superseded_by_memory_id = ? ORDER BY id")
             .all(rowId) as Array<{ id: number }>
     ).map((row) => row.id);
+    const repointableIds: number[] = [];
     for (const referencingId of referencingIds) {
         const referencingRow = readMemoryProjectionRow(db, referencingId);
         if (!referencingRow) continue;
@@ -310,11 +343,26 @@ export function moveLinkedMemoryAcrossProjects(
             db,
             referencingRow.project_path,
         );
-        if (projectId === null || referencingRow.content.length === 0) continue;
+        const failure = memoryClaimAdoptionFailureReason(referencingRow, projectId);
+        if (projectId === null || failure !== null) {
+            // An unadoptable referrer cannot carry the relationship snapshot
+            // the v84 guard demands, so the repoint below must leave it
+            // pointing at the deleted source row. Record the stranded edge as
+            // a blocking diagnostic for the repair lane instead of letting
+            // the guard abort the whole move.
+            recordSkippedReferrerRepointDiagnostic(
+                db,
+                referencingId,
+                rowId,
+                failure ?? "unresolved-project-identity",
+            );
+            continue;
+        }
         ensureMemoryClaimLinkInCurrentTransaction(db, referencingRow, projectId, {
             kind: "migration",
         });
         translateMemoryClaimRelationshipsInCurrentTransaction(db, referencingRow);
+        repointableIds.push(referencingId);
     }
 
     const columns = getMemoryCopyColumns(db);
@@ -346,9 +394,15 @@ export function moveLinkedMemoryAcrossProjects(
         `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
          SELECT ?, file_path, verified_at, mapped_at FROM memory_verifications WHERE memory_id = ?`,
     ).run(newId, rowId);
-    db.prepare(
-        "UPDATE memories SET superseded_by_memory_id = ? WHERE superseded_by_memory_id = ?",
-    ).run(newId, rowId);
+    if (repointableIds.length > 0) {
+        // Only referrers whose current lineage is snapshotted may change
+        // their lineage columns; the v84 relationship guard aborts the
+        // UPDATE for any other row.
+        db.prepare(
+            `UPDATE memories SET superseded_by_memory_id = ?
+              WHERE superseded_by_memory_id = ? AND id IN (${repointableIds.map(() => "?").join(", ")})`,
+        ).run(newId, rowId, ...repointableIds);
+    }
 
     runMemoryClaimOperationInCurrentTransaction(
         db,

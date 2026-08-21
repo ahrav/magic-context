@@ -509,6 +509,19 @@ export function recordMemoryClaimLinkFailure(
     ).run(String(memoryId), reason, projectPath.slice(0, 512), now, now);
 }
 
+/**
+ * Flip a memory's rows-phase blocking/retry failure to resolved once its
+ * crosswalk link exists — the live-writer twin of the backfill sweep
+ * (`sweepResolvedRowFailures`). Warnings stay visible on the repair surface.
+ */
+export function resolveMemoryClaimLinkFailure(db: Database, memoryId: number): void {
+    db.prepare(
+        `UPDATE claim_backfill_failures SET disposition = 'resolved', updated_at = ?
+          WHERE phase = 'rows' AND item_kind = 'memory' AND item_key = ?
+            AND disposition IN ('blocking', 'retry')`,
+    ).run(Date.now(), String(memoryId));
+}
+
 function createMemoryObservation(
     db: Database,
     args: {
@@ -614,6 +627,26 @@ export function readMemoryClaimLink(db: Database, memoryId: number): MemoryClaim
                FROM legacy_memory_claims WHERE memory_id = ?`,
         )
         .get(memoryId) ?? null) as MemoryClaimLink | null;
+}
+
+/**
+ * True when another crosswalk row on the claim still references a live
+ * (active or permanent) memories row. A canonical claim shared by several
+ * projections (the dedup branch of `ensureMemoryClaimLinkInCurrentTransaction`)
+ * retires only with its last live link; retiring it earlier would flip the
+ * surviving projections' claim reads to archived.
+ */
+function claimHasOtherLiveMemoryLink(db: Database, claimId: number, memoryId: number): boolean {
+    const sibling = db
+        .prepare(
+            `SELECT 1 FROM legacy_memory_claims lmc
+               JOIN memories m ON m.id = lmc.memory_id
+              WHERE lmc.claim_id = ? AND lmc.memory_id <> ?
+                AND m.status IN ('active', 'permanent')
+              LIMIT 1`,
+        )
+        .get(claimId, memoryId);
+    return sibling !== null && sibling !== undefined;
 }
 
 interface CanonicalHashMatch extends MemoryClaimLink {
@@ -754,6 +787,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
             observationId,
             now,
         );
+        resolveMemoryClaimLinkFailure(db, row.id);
         return {
             memoryId: row.id,
             canonicalMemoryId: canonical.canonicalMemoryId,
@@ -790,6 +824,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
             (memory_id, canonical_memory_id, claim_id, project_id, root_observation_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
     ).run(row.id, row.id, created.claimId, projectId, observationId, now);
+    resolveMemoryClaimLinkFailure(db, row.id);
     return {
         memoryId: row.id,
         canonicalMemoryId: row.id,
@@ -1472,16 +1507,27 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                 effectType: "upsert" as const,
             });
         }
-        setClaimLifecycleStateInCurrentTransaction(
-            db,
-            link.claimId,
-            claimStateFromMemoryStatus(input.status),
-        );
-        if (input.status === "archived") {
-            addVerificationEvent(db, {
-                revisionId: readClaimCurrentRevisionId(db, link.claimId),
-                outcome: "archive",
-                verifier: envelope.producer,
+        const nextState = claimStateFromMemoryStatus(input.status);
+        // A shared canonical claim (several crosswalk rows, one claim, via
+        // the dedup branch) retires only with its last live link; archiving
+        // one projection while a sibling stays live leaves the claim and its
+        // lifecycle stream untouched. Un-archive directions always apply.
+        const retireBlocked =
+            nextState === "archived" && claimHasOtherLiveMemoryLink(db, link.claimId, row.id);
+        if (!retireBlocked) {
+            setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
+            if (input.status === "archived") {
+                addVerificationEvent(db, {
+                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                    outcome: "archive",
+                    verifier: envelope.producer,
+                });
+            }
+            effects.push({
+                effectKey: `memory:${row.id}:lifecycle`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "lifecycle" as const,
             });
         }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
@@ -1494,16 +1540,7 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                 revisionId,
                 found: true,
             },
-            effects: [
-                ...effects,
-                {
-                    effectKey: `memory:${row.id}:lifecycle`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "lifecycle" as const,
-                },
-                ...relationshipEffects,
-            ],
+            effects: [...effects, ...relationshipEffects],
         };
     });
 }
@@ -1536,26 +1573,30 @@ export function deleteMemoryWithClaimsInCurrentTransaction(
             kind: "migration",
         });
         const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
-        setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
-        addVerificationEvent(db, {
-            revisionId: readClaimCurrentRevisionId(db, link.claimId),
-            outcome: "archive",
-            verifier: envelope.producer,
-        });
+        const effects: MemoryClaimEffect[] = [];
+        // A shared canonical claim retires only with its last live link;
+        // deleting one projection while a sibling stays live leaves the
+        // claim and its lifecycle stream untouched.
+        if (!claimHasOtherLiveMemoryLink(db, link.claimId, row.id)) {
+            setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
+            addVerificationEvent(db, {
+                revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                outcome: "archive",
+                verifier: envelope.producer,
+            });
+            effects.push({
+                effectKey: `memory:${row.id}:lifecycle`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "lifecycle" as const,
+            });
+        }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         deleteMemoryProjectionRow(db, row.id);
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
         return {
             result: { memoryId: row.id, claimId: link.claimId, revisionId: null, found: true },
-            effects: [
-                {
-                    effectKey: `memory:${row.id}:lifecycle`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "lifecycle" as const,
-                },
-                ...relationshipEffects,
-            ],
+            effects: [...effects, ...relationshipEffects],
         };
     });
 }
@@ -1605,14 +1646,20 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
             });
             translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
 
-            const effects: MemoryClaimEffect[] = [
-                {
-                    effectKey: `memory:${row.id}:lifecycle`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "lifecycle" as const,
-                },
-            ];
+            // A shared canonical claim retires only with its last live link;
+            // the superseded projection flips to archived below, so only
+            // sibling crosswalk rows count.
+            const retireClaim = !claimHasOtherLiveMemoryLink(db, link.claimId, row.id);
+            const effects: MemoryClaimEffect[] = retireClaim
+                ? [
+                      {
+                          effectKey: `memory:${row.id}:lifecycle`,
+                          projectId,
+                          claimId: link.claimId,
+                          effectType: "lifecycle" as const,
+                      },
+                  ]
+                : [];
             let supersededByClaimId: number | null = null;
             const target = readMemoryProjectionRow(db, input.supersededByMemoryId);
             const targetProjectId = target
@@ -1639,7 +1686,9 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                     });
                 }
             }
-            setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
+            if (retireClaim) {
+                setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
+            }
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             setMemoryProjectionSuperseded(db, row.id, input.supersededByMemoryId, input.nowMs);
             const post = readMemoryProjectionRow(db, row.id);

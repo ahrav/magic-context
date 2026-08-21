@@ -331,6 +331,79 @@ describe("relocate-memory claims (v84)", () => {
         ).not.toThrow();
     });
 
+    test("a cross-project move repoints only snapshotted referrers and records diagnostics for unadoptable ones", () => {
+        const database = makeDb();
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "moving fact",
+        });
+        const adoptable = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "pointing fact",
+        });
+        const unadoptable = insertUnlinkedMemory(database, "git:project-a", "", "empty-h1");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id IN (?, ?)")
+                .run(source.id, adoptable.id, unadoptable);
+        });
+        // The target numeric project must exist for the authorized move path.
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [source.id], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const moved = database
+            .prepare(
+                "SELECT id FROM memories WHERE project_path = 'git:project-b' AND content = 'moving fact'",
+            )
+            .get() as { id: number };
+        // The adoptable referrer is repointed and its rewritten lineage is
+        // snapshotted, so later lineage writes pass the relationship guard.
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(adoptable.id),
+        ).toEqual({ s: moved.id });
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS c FROM claim_memory_relationship_sources
+                      WHERE memory_id = ? AND superseded_by_memory_id = ?`,
+                )
+                .get(adoptable.id, moved.id),
+        ).toEqual({ c: 1 });
+        // The unadoptable referrer keeps its original pointer (visible to the
+        // repair lane) and surfaces as a blocking relationships-phase
+        // diagnostic instead of aborting the move on the relationship guard.
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(unadoptable),
+        ).toEqual({ s: source.id });
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${unadoptable}:supersession-repoint:${source.id}`),
+        ).toEqual({
+            phase: "relationships",
+            item_kind: "supersession",
+            reason_code: "empty-content",
+            disposition: "blocking",
+        });
+    });
+
     test("copying creates a target claim for each fresh row and leaves the source intact", () => {
         const database = makeDb();
         const source = insertMemory(database, {

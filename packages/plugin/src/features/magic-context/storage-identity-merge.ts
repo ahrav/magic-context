@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../../shared/sqlite";
+import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "./claims-backfill";
 import { moveLinkedMemoryAcrossProjects } from "./memory/relocate-memory";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 import {
@@ -7,7 +8,9 @@ import {
     ensureMemoryClaimLinkInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
     type MemoryClaimEffect,
+    memoryClaimAdoptionFailureReason,
     readMemoryClaimLink,
+    recordMemoryClaimLinkFailure,
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     retireMemoryClaimInCurrentTransaction,
@@ -18,6 +21,10 @@ import {
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
 import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
+import {
+    memoryLineagePresentSql,
+    memoryRelationshipSourceMatchSql,
+} from "./storage-memory-claims-schema";
 import {
     applyIdentityMergeToProjectRegistry,
     discoverIdentityTables,
@@ -156,6 +163,7 @@ function adoptIdentityMergeRowClaims(
     sourceId: number,
     collisionTargetId: number | null,
     toIdentity: string,
+    mergedAt: number,
 ): void {
     const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
     if (projectId === null) return;
@@ -212,6 +220,38 @@ function adoptIdentityMergeRowClaims(
                     effectType: "upsert" as const,
                 });
             }
+            if (
+                sourceRow.verification_status === "verified" &&
+                (sourceRow.verified_at ?? 0) > 0 &&
+                (targetRow.verification_status !== "verified" || (targetRow.verified_at ?? 0) <= 0)
+            ) {
+                // The caller copies the source's verification mappings onto
+                // the survivor with verified_at preserved, so compat readers
+                // (which filter on verified_at) treat the survivor as
+                // verified. Promote the survivor's projection columns to
+                // match and record the verified event on the canonical claim
+                // so the promotion carries claim evidence.
+                db.prepare(
+                    `UPDATE memories
+                        SET verification_status = 'verified', verified_at = ?, updated_at = ?
+                      WHERE id = ?`,
+                ).run(sourceRow.verified_at, mergedAt, collisionTargetId);
+                if (
+                    recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+                        db,
+                        sourceRow,
+                        targetLink.claimId,
+                        "identity-merge",
+                    )
+                ) {
+                    effects.push({
+                        effectKey: `memory:${collisionTargetId}:evidence`,
+                        projectId,
+                        claimId: targetLink.claimId,
+                        effectType: "evidence" as const,
+                    });
+                }
+            }
             let sourceLink = readMemoryClaimLink(db, sourceId);
             if (!sourceLink) {
                 sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
@@ -238,6 +278,24 @@ function adoptIdentityMergeRowClaims(
             }
             return { result: targetLink.claimId, effects };
         },
+    );
+}
+
+/**
+ * Mirror of the memories_claims_relationship_update_guard predicate: true
+ * when a project_path rekey of this row would abort because the row carries
+ * lineage with no matching relationship snapshot.
+ */
+function rekeyTripsRelationshipGuard(db: Database, memoryId: number): boolean {
+    return Boolean(
+        db
+            .prepare(
+                `SELECT 1 FROM memories m
+                  WHERE m.id = ?
+                    AND ${memoryLineagePresentSql("m")}
+                    AND NOT ${memoryRelationshipSourceMatchSql("m")}`,
+            )
+            .get(memoryId),
     );
 }
 
@@ -273,7 +331,7 @@ function mergeMemoryRow(
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
         if (claimsActive) {
-            adoptIdentityMergeRowClaims(db, sourceId, targetId, toIdentity);
+            adoptIdentityMergeRowClaims(db, sourceId, targetId, toIdentity, mergedAt);
         }
         const mergedSeen = Math.max(
             effectiveSeenCount(targetId, collision.seen_count),
@@ -433,7 +491,20 @@ function mergeMemoryRow(
             );
             return true;
         }
-        adoptIdentityMergeRowClaims(db, sourceId, null, toIdentity);
+        adoptIdentityMergeRowClaims(db, sourceId, null, toIdentity, mergedAt);
+        const projectionRow = readMemoryProjectionRow(db, sourceId);
+        const failure = projectionRow
+            ? memoryClaimAdoptionFailureReason(projectionRow, targetProjectId)
+            : null;
+        if (failure !== null && rekeyTripsRelationshipGuard(db, sourceId)) {
+            // An unadoptable row cannot carry a relationship snapshot (the
+            // snapshot requires a claim link), so a lineage-bearing one would
+            // trip the v84 relationship guard on the project_path rekey and
+            // abort the whole merge. Record the blocking diagnostic and leave
+            // the row under the source identity for the repair lane.
+            recordMemoryClaimLinkFailure(db, sourceId, fromIdentity, failure);
+            return false;
+        }
     }
     const result = db
         .prepare("UPDATE memories SET project_path = ? WHERE id = ? AND project_path = ?")

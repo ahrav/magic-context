@@ -657,8 +657,10 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
         const reconciliation = inspectClaimsBackfillReconciliation(db);
         expect(reconciliation.ok).toBeTrue();
         expect(reconciliation.warningCount).toBe(0);
+        const status = getClaimsBackfillStatus(db);
+        expect(status.state).toBe("complete");
         // The DB-wide repair surface still reports the live-writer warning.
-        expect(getClaimsBackfillStatus(db).warningFailures).toBe(1);
+        expect(status.warningFailures).toBe(1);
     });
 
     test("a persistently blocked checkpoint skips the full re-scan while the failure set is unchanged", async () => {

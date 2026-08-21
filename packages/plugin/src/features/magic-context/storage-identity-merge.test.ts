@@ -770,6 +770,94 @@ describe("project identity merge claims (v84)", () => {
         ).not.toThrow();
     });
 
+    test("a collision merge promotes a verified source's status onto the survivor with claim evidence", () => {
+        const database = makeDb();
+        const source = insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const target = insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+                )
+                .run(source.id);
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        // The survivor's projection is promoted (compat readers filter on
+        // verified_at) with the source's verified_at preserved.
+        expect(
+            database
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(target.id),
+        ).toEqual({ status: "verified", at: 123 });
+        // The survivor's claim carries exactly one verified event and the
+        // promotion emits an evidence effect.
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, target.id);
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(survivorClaim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "identity-merge" }]);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${target.id}:evidence`),
+        ).toEqual({ count: 1 });
+    });
+
+    test("a generic rekey routes an unadoptable lineage-bearing row to a diagnostic instead of aborting", () => {
+        const database = makeDb();
+        const adoptableId = insertMemory(database, "dir:old", "movable fact", "move-h1");
+        const strandedId = insertMemory(database, "dir:old", "", "empty-h1");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET merged_from = 'identity-merge' WHERE id = ?")
+                .run(strandedId);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 70 });
+
+        // The adoptable row rekeys; the unadoptable row cannot satisfy the
+        // v84 relationship guard (no claim link, so no snapshot), so it stays
+        // under the source identity with a blocking diagnostic.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(adoptableId),
+        ).toEqual({ project_path: "git:new" });
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(strandedId),
+        ).toEqual({ project_path: "dir:old" });
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(String(strandedId)),
+        ).toEqual({
+            phase: "rows",
+            item_kind: "memory",
+            reason_code: "empty-content",
+            disposition: "blocking",
+        });
+    });
+
     test("still refuses a two-project merge when a mirror episode also carries an observation-less span", () => {
         const database = makeDb();
         insertMemoryThroughKernel(database, {

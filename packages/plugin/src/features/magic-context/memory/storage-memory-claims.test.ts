@@ -556,6 +556,87 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         });
     });
 
+    test("deleting one projection of a shared canonical claim retires the claim only with its last live link", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "shared-dup", "shared claim fact");
+        // The live-DB shape after an identity merge: a second path string
+        // aliased to the same project, so the unique (path, category, hash)
+        // projection index admits a duplicate row that dedups onto the
+        // survivor's canonical claim.
+        const aliasPath = "git:kernel-project-alias";
+        const projectId = (
+            db
+                .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
+                .get(PROJECT) as { id: number }
+        ).id;
+        db.prepare(
+            "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, 1)",
+        ).run(aliasPath, projectId);
+        let sourceId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            sourceId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(aliasPath, "shared claim fact", "hash:shared claim fact").lastInsertRowid,
+            );
+        });
+
+        // Archiving the source links it as a duplicate of the shared claim
+        // but leaves the claim active: the survivor link is still live.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("shared-archive-src", { id: sourceId }),
+                { memoryId: sourceId, status: "archived" },
+            ),
+        );
+        expect(count(db, "legacy_memory_claims", `claim_id = ${survivor.claimId}`)).toBe(2);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(0);
+
+        // Deleting the archived source leaves the shared claim and its
+        // lifecycle stream untouched.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("shared-delete-src", { id: sourceId }),
+                { memoryId: sourceId },
+            ),
+        );
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+        expect(getCurrentMemoryClaimByLegacyMemoryId(db, survivor.memoryId)?.state).toBe("active");
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                "effect_type = 'lifecycle' AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'shared-delete-src')",
+            ),
+        ).toBe(0);
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(0);
+
+        // Deleting the survivor retires the last live link, so the claim
+        // archives now.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("shared-delete-survivor", { id: survivor.memoryId }),
+                { memoryId: survivor.memoryId },
+            ),
+        );
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "archived",
+        });
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(1);
+    });
+
     test("same-project supersession records a supersedes conflict and retires the source claim", () => {
         const db = track(migratedDb());
         const source = createSeedMemory(db, "supersede-source", "old wording fact");
@@ -730,6 +811,45 @@ describe("memory/claims kernel: unresolved identity fallback", () => {
             reason_code: "unresolved-project-identity",
             disposition: "blocking",
         });
+    });
+
+    test("a claims-aware write that links a repaired row resolves its blocking failure without the backfill runner", () => {
+        const db = track(migratedDb());
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            createMemoryWithClaimsInCurrentTransaction(db, envelope("repair-1", { raw: true }), {
+                projectPath: "/legacy/repairable-path",
+                category: "CONSTRAINTS",
+                content: "repairable fact",
+                normalizedHash: "hash:repairable fact",
+            }),
+        );
+        const memoryId = outcome.result.memoryId;
+        expect(
+            db
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(String(memoryId)),
+        ).toEqual({ disposition: "blocking" });
+
+        // Doctor-style identity repair; the next claims-aware write links the
+        // row through the crosswalk and clears the failure itself.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET project_path = ? WHERE id = ?").run(PROJECT, memoryId);
+        });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("repair-2", { id: memoryId }),
+                { memoryId, status: "active" },
+            ),
+        );
+        expect(count(db, "legacy_memory_claims", `memory_id = ${memoryId}`)).toBe(1);
+        expect(
+            db
+                .prepare(
+                    "SELECT phase, item_kind, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(memoryId)),
+        ).toEqual({ phase: "rows", item_kind: "memory", disposition: "resolved" });
     });
 
     test("an unlinked row with claim-invalid metadata records a blocking failure and applies the projection instead of aborting", () => {
