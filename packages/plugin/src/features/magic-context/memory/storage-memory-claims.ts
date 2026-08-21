@@ -18,7 +18,7 @@
  * state; the v22 takeover (U4) and doctor retry (U5) own the repair.
  */
 
-import type { Database } from "../../../shared/sqlite";
+import { type Database, hasClaimCompatibilityWriteState } from "../../../shared/sqlite.ts";
 import {
     addClaimConflictInCurrentTransaction,
     addVerificationEvent,
@@ -92,23 +92,14 @@ export function acknowledgeMemoryClaimResult(): void {
 // Schema probe, capability, and transaction adapters
 // ---------------------------------------------------------------------------
 
-const compatSchemaCache = new WeakMap<Database, true>();
-
 /**
- * Whether this database migrated to v84. A negative probe is never cached:
- * a sibling process can migrate the shared file after this handle opened.
+ * Whether this database migrated to v84. Delegates to the shared probe so
+ * this module and the privileged-writer path in shared/sqlite.ts share one
+ * positive-only cache: a negative probe is never cached, because a sibling
+ * process can migrate the shared file after this handle opened.
  */
 export function hasMemoryClaimsCompatSchema(db: Database): boolean {
-    if (compatSchemaCache.get(db)) return true;
-    const present = Boolean(
-        db
-            .prepare(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_compatibility_write_state'",
-            )
-            .get(),
-    );
-    if (present) compatSchemaCache.set(db, true);
-    return present;
+    return hasClaimCompatibilityWriteState(db);
 }
 
 const capabilityDepth = new WeakMap<Database, number>();

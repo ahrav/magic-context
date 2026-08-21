@@ -401,8 +401,9 @@ export function applyIdentityMergeToProjectRegistry(
     // rows, which the identity merge relocates itself, and the episodes
     // minted by that adoption carry only crosswalk root observations and
     // revision evidence for crosswalked claims. A bare episode (one without
-    // observations, or with an observation outside the crosswalk) and a
-    // non-crosswalked claim are authoritative and still refuse the merge.
+    // observations, with an observation outside the crosswalk, or with a
+    // span carrying no observation at all) and a non-crosswalked claim are
+    // authoritative and still refuse the merge.
     // Without the crosswalk table every episode or claim is authoritative.
     const hasCrosswalk = tableExists(db, "legacy_memory_claims");
     const ownsChildren = (
@@ -431,6 +432,14 @@ export function applyIdentityMergeToProjectRegistry(
                                          JOIN legacy_memory_claims lmc ON lmc.claim_id = rev.claim_id
                                         WHERE ce.observation_id = o.id
                                     )
+                              )
+                              OR EXISTS (
+                                  SELECT 1 FROM source_spans s
+                                   WHERE s.episode_id = e.id
+                                     AND NOT EXISTS (
+                                         SELECT 1 FROM observations o
+                                          WHERE o.source_span_id = s.id
+                                     )
                               )
                           )
                    )

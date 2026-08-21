@@ -66,7 +66,9 @@ import type { MemoryClaimOperationIdentity } from "@magic-context/core/features/
 import {
 	computeClaimRequestDigest,
 	hasMemoryClaimsCompatSchema,
+	type MemoryClaimOperationEnvelope,
 	readMemoryClaimOperationResult,
+	runMemoryClaimOperationInCurrentTransaction,
 	updateMemoryContentWithClaimsInCurrentTransaction,
 	withClaimsWriteCapabilityInCurrentTransaction,
 	withMemoryClaimGenerationContextInCurrentTransaction,
@@ -254,6 +256,18 @@ function inactiveMemoryError(
 	action: "updating" | "merging" | "archiving",
 ): string {
 	return `Error: Memory with ID ${id} is archived or superseded; restore it before ${action}.`;
+}
+
+// Envelopes require a digest; the tool's claim identities always carry one,
+// so the cast only narrows the optional field.
+function toClaimOperationEnvelope(
+	identity: MemoryClaimOperationIdentity,
+): MemoryClaimOperationEnvelope {
+	return {
+		producer: identity.producer,
+		operationKey: identity.operationKey,
+		requestDigest: identity.requestDigest as string,
+	};
 }
 
 // Per-id not-found / not-visible wording. Sharing one message between the two
@@ -526,29 +540,86 @@ export function createCtxMemoryTool(
 				};
 				const writeIdentity = claimOperationIdentity("write", writeRequest);
 				if (writeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
-					const replay = readMemoryClaimOperationResult<{ memoryId: number }>(
-						deps.db,
-						{
-							producer: writeIdentity.producer,
-							operationKey: writeIdentity.operationKey,
-							requestDigest: writeIdentity.requestDigest as string,
-						},
-					);
+					const envelope = toClaimOperationEnvelope(writeIdentity);
+					const replay = readMemoryClaimOperationResult<{
+						memoryId: number;
+						duplicate?: boolean;
+					}>(deps.db, envelope);
 					if (replay) {
 						return ok(
-							`Saved memory [ID: ${replay.result.memoryId}] in ${rawCategory}.`,
+							replay.result.duplicate
+								? `Memory already exists [ID: ${replay.result.memoryId}] in ${rawCategory} (seen count incremented).`
+								: `Saved memory [ID: ${replay.result.memoryId}] in ${rawCategory}.`,
 						);
 					}
+					// The duplicate short-circuit runs inside the envelope so a
+					// committed-but-unacked write replays its stored outcome
+					// instead of re-bumping seen_count; the insert runs under
+					// its own storage-generated key.
+					const outcome = deps.db
+						.transaction(() =>
+							withMemoryClaimGenerationContextInCurrentTransaction(
+								deps.db,
+								() =>
+									runMemoryClaimOperationInCurrentTransaction<{
+										memoryId: number;
+										duplicate: boolean;
+									}>(deps.db, envelope, () => {
+										const existing = getMemoryByHash(
+											deps.db,
+											projectIdentity,
+											rawCategory,
+											normalizedHash,
+										);
+										if (existing) {
+											updateMemorySeenCount(deps.db, existing.id);
+											return {
+												result: { memoryId: existing.id, duplicate: true },
+												effects: [],
+											};
+										}
+										const inserted = insertMemoryIdempotent(deps.db, {
+											projectPath: projectIdentity,
+											category: rawCategory,
+											content,
+											sourceSessionId: sessionId,
+											sourceType: dreamerAllowed ? "dreamer" : "agent",
+										});
+										return {
+											result: {
+												memoryId: inserted.memory.id,
+												duplicate: !inserted.inserted,
+											},
+											effects: [],
+										};
+									}),
+							),
+						)
+						.immediate();
+					if (outcome.result.duplicate) {
+						return ok(
+							`Memory already exists [ID: ${outcome.result.memoryId}] in ${rawCategory} (seen count incremented).`,
+						);
+					}
+					if (!outcome.replayed) {
+						queueEmbedding({
+							deps,
+							projectIdentity,
+							memoryId: outcome.result.memoryId,
+							content,
+						});
+					}
+					return ok(
+						`Saved memory [ID: ${outcome.result.memoryId}] in ${rawCategory}.`,
+					);
 				}
 
-				const existing = writeIdentity
-					? null
-					: getMemoryByHash(
-							deps.db,
-							projectIdentity,
-							rawCategory,
-							normalizedHash,
-						);
+				const existing = getMemoryByHash(
+					deps.db,
+					projectIdentity,
+					rawCategory,
+					normalizedHash,
+				);
 				if (existing) {
 					updateMemorySeenCount(deps.db, existing.id);
 					return ok(
@@ -638,6 +709,28 @@ export function createCtxMemoryTool(
 					return err("Error: 'content' is required when action is 'update'.");
 				}
 
+				const normalizedHash = computeNormalizedHash(content);
+				const updateIdentity = claimOperationIdentity(`update:${updateId}`, {
+					id: updateId,
+					content,
+					normalizedHash,
+				});
+				// Replay before live-row validation: a committed-but-unacked
+				// update must return its stored result even after the target
+				// row was archived or removed. The stored result carries the
+				// category so the message never reads the live row.
+				if (updateIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
+					const replay = readMemoryClaimOperationResult<{
+						memoryId: number;
+						category: string;
+					}>(deps.db, toClaimOperationEnvelope(updateIdentity));
+					if (replay) {
+						return ok(
+							`Updated memory [ID: ${replay.result.memoryId}] in ${replay.result.category}.`,
+						);
+					}
+				}
+
 				const memory = getMemoryById(deps.db, updateId);
 				const updateAllowed = memory
 					? dreamerAllowed
@@ -651,7 +744,6 @@ export function createCtxMemoryTool(
 					return err(inactiveMemoryError(updateId, "updating"));
 				}
 
-				const normalizedHash = computeNormalizedHash(content);
 				const targetIdentity = targetIdentityForStoredPath(memory.projectPath);
 				const duplicate = getMemoryByHash(
 					deps.db,
@@ -665,17 +757,45 @@ export function createCtxMemoryTool(
 					);
 				}
 
-				const updateIdentity = claimOperationIdentity(`update:${memory.id}`, {
-					id: memory.id,
-					content,
-					normalizedHash,
-				});
 				let replayed = false;
 				deps.db
 					.transaction(() =>
 						withMemoryClaimGenerationContextInCurrentTransaction(
 							deps.db,
 							() => {
+								if (updateIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
+									// The tool owns the envelope so the stored
+									// result carries the category; the storage
+									// update runs under its own generated key.
+									const outcome = runMemoryClaimOperationInCurrentTransaction(
+										deps.db,
+										toClaimOperationEnvelope(updateIdentity),
+										() => {
+											updateMemoryContentInCurrentTransaction(
+												deps.db,
+												memory,
+												content,
+												normalizedHash,
+											);
+											queueMemoryMutation(deps.db, {
+												projectPath: targetIdentity,
+												mutationType: "update",
+												targetMemoryId: memory.id,
+												category: memory.category,
+												newContent: content,
+											});
+											return {
+												result: {
+													memoryId: memory.id,
+													category: memory.category,
+												},
+												effects: [],
+											};
+										},
+									);
+									replayed = outcome.replayed;
+									return;
+								}
 								replayed = updateMemoryContentInCurrentTransaction(
 									deps.db,
 									memory,
@@ -729,9 +849,6 @@ export function createCtxMemoryTool(
 				const sourceMemories = ids
 					.map((id) => getMemoryById(deps.db, id))
 					.filter((memory): memory is Memory => Boolean(memory));
-				if (sourceMemories.length !== ids.length) {
-					return err("Error: One or more source memories were not found.");
-				}
 				const requestedCategoryTyped: MemoryCategory | undefined =
 					params.category;
 				const category = requestedCategoryTyped ?? sourceMemories[0]?.category;
@@ -747,23 +864,26 @@ export function createCtxMemoryTool(
 					category,
 					projectIdentity,
 				});
+				// Replay before the source-existence check: a source deleted
+				// between attempts must not turn a committed-but-unacked merge
+				// retry into a not-found error. The stored result carries the
+				// category so the message never depends on the live sources.
 				if (mergeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
-					const replay = readMemoryClaimOperationResult<{ memoryId: number }>(
-						deps.db,
-						{
-							producer: mergeIdentity.producer,
-							operationKey: mergeIdentity.operationKey,
-							requestDigest: mergeIdentity.requestDigest as string,
-						},
-					);
+					const replay = readMemoryClaimOperationResult<{
+						memoryId: number;
+						category: string;
+					}>(deps.db, toClaimOperationEnvelope(mergeIdentity));
 					if (replay) {
 						const supersededIds = ids.filter(
 							(id) => id !== replay.result.memoryId,
 						);
 						return ok(
-							`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${replay.result.memoryId}] in ${category}; superseded [${supersededIds.join(", ")}].`,
+							`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${replay.result.memoryId}] in ${replay.result.category}; superseded [${supersededIds.join(", ")}].`,
 						);
 					}
+				}
+				if (sourceMemories.length !== ids.length) {
+					return err("Error: One or more source memories were not found.");
 				}
 
 				// Cross-identity consolidation is a DREAMER-ONLY capability: each
@@ -865,11 +985,8 @@ export function createCtxMemoryTool(
 								if (mergeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
 									const replay = readMemoryClaimOperationResult<{
 										memoryId: number;
-									}>(deps.db, {
-										producer: mergeIdentity.producer,
-										operationKey: mergeIdentity.operationKey,
-										requestDigest: mergeIdentity.requestDigest as string,
-									});
+										category: string;
+									}>(deps.db, toClaimOperationEnvelope(mergeIdentity));
 									if (replay) {
 										canonicalMemoryId = replay.result.memoryId;
 										mergeReplayed = true;
@@ -903,10 +1020,9 @@ export function createCtxMemoryTool(
 										// Already inside the merge's transaction and claim
 										// generation context; the standalone updateMemoryContent
 										// would open a nested claims write transaction. The merge
-										// replay row is recorded by mergeMemoryStats below under
-										// mergeIdentity, so the content update carries no identity
-										// (reusing mergeIdentity here would make mergeMemoryStats
-										// replay-skip the stats write). Parity with OpenCode.
+										// replay row is recorded by the tool-owned envelope below
+										// under mergeIdentity, so the content update carries no
+										// identity of its own. Parity with OpenCode.
 										updateMemoryContentInCurrentTransaction(
 											deps.db,
 											canonicalMemory,
@@ -932,7 +1048,6 @@ export function createCtxMemoryTool(
 									mergedRetrievalCount,
 									mergedFrom,
 									mergedStatus,
-									mergeIdentity,
 								);
 
 								for (const memory of sourceMemories) {
@@ -964,6 +1079,21 @@ export function createCtxMemoryTool(
 										category,
 										newContent: content,
 									});
+								}
+
+								// The tool owns the merge envelope so the stored result
+								// carries the category the replay message needs; the
+								// storage-layer writes above run under their own
+								// generated keys.
+								if (mergeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
+									runMemoryClaimOperationInCurrentTransaction(
+										deps.db,
+										toClaimOperationEnvelope(mergeIdentity),
+										() => ({
+											result: { memoryId: canonicalMemory.id, category },
+											effects: [],
+										}),
+									);
 								}
 								canonicalMemoryId = canonicalMemory.id;
 							},
@@ -1018,11 +1148,10 @@ export function createCtxMemoryTool(
 						const identity = archiveIdentity(memoryId);
 						return (
 							identity !== undefined &&
-							readMemoryClaimOperationResult(deps.db, {
-								producer: identity.producer,
-								operationKey: identity.operationKey,
-								requestDigest: identity.requestDigest as string,
-							}) !== null
+							readMemoryClaimOperationResult(
+								deps.db,
+								toClaimOperationEnvelope(identity),
+							) !== null
 						);
 					});
 				if (archiveReplay) {

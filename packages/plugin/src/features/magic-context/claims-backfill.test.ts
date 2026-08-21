@@ -628,6 +628,39 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
         expect(listClaimsBackfillFailures(db, { dispositions: ["blocking"] })).toHaveLength(2);
     });
 
+    test("an above-boundary blocking failure does not flip a non-complete phase to blocked", () => {
+        const { db } = migrateLazy([{ content: "boundary row" }]);
+        const boundary = getClaimsBackfillStatus(db).boundaryMemoryId;
+        db.prepare(
+            `INSERT INTO claim_backfill_failures
+                (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+             VALUES ('rows', 'memory', ?, 'unresolved-project-identity', '', 'blocking', 1, 1)`,
+        ).run(String(boundary + 1));
+
+        const status = getClaimsBackfillStatus(db);
+        expect(status.state).toBe("pending");
+        // The repair surface still reports the live-writer failure DB-wide.
+        expect(status.blockingFailures).toBe(1);
+    });
+
+    test("an above-boundary warning does not pin completion to complete-with-warnings", async () => {
+        const { db } = migrateLazy([{ content: "boundary row" }]);
+        const boundary = getClaimsBackfillStatus(db).boundaryMemoryId;
+        db.prepare(
+            `INSERT INTO claim_backfill_failures
+                (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+             VALUES ('rows', 'memory', ?, 'unresolved-project-identity', '', 'warning', 1, 1)`,
+        ).run(String(boundary + 1));
+
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        const reconciliation = inspectClaimsBackfillReconciliation(db);
+        expect(reconciliation.ok).toBeTrue();
+        expect(reconciliation.warningCount).toBe(0);
+        // The DB-wide repair surface still reports the live-writer warning.
+        expect(getClaimsBackfillStatus(db).warningFailures).toBe(1);
+    });
+
     test("a persistently blocked checkpoint skips the full re-scan while the failure set is unchanged", async () => {
         const { db } = migrateLazy([{ content: "blocked row", category: "" }]);
         const first = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });

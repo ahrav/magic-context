@@ -369,6 +369,17 @@ function mergeMemoryRow(
                     updated_at = ?
               WHERE id = ? AND project_path = ?`,
         ).run(targetId, String(sourceId), "identity-merge", mergedAt, sourceId, fromIdentity);
+        if (claimsActive) {
+            // The archive UPDATE rewrites the source row's lineage after the
+            // adoption pass snapshotted the pre-archive row, so no
+            // relationship source matches the new (merged_from,
+            // superseded_by_memory_id) pair and any later lineage UPDATE or
+            // DELETE on the row would trip the v84 relationship guard.
+            // Re-snapshot the post-archive row; the supersession itself is
+            // already recorded above, so this appends only the source row.
+            const post = readMemoryProjectionRow(db, sourceId);
+            if (post) translateMemoryClaimRelationshipsInCurrentTransaction(db, post);
+        }
         db.prepare(
             `INSERT INTO memory_mutation_log
                 (project_path, mutation_type, target_memory_id, superseded_by_id, category, queued_at)

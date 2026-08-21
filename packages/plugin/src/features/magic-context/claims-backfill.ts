@@ -916,7 +916,7 @@ export function inspectClaimsBackfillReconciliation(
     return {
         ok: problems.length === 0,
         problems,
-        warningCount: countFailures(db, ["warning"]),
+        warningCount: countBoundaryFailures(db, ["warning"], boundary),
     };
 }
 
@@ -1403,6 +1403,12 @@ export function getClaimsBackfillStatus(
     const state = readClaimsBackfillState(db);
     const blocking = countFailures(db, ["blocking", "retry"]);
     const warnings = countFailures(db, ["warning"]);
+    // The reported blockingFailures count stays DB-wide (the repair surface
+    // shows every open failure), but the operational-state decision gates on
+    // the boundary corpus like the run/step paths: an above-boundary failure
+    // belongs to live writers and must not flip a non-complete phase to
+    // blocked (which would invite a wasteful doctor force-reset).
+    const gatingBlocking = countBoundaryFailures(db, ["blocking", "retry"], state.boundaryMemoryId);
     const reconciliation =
         options.includeProblems && state.mode !== null
             ? inspectClaimsBackfillReconciliation(db, state)
@@ -1413,7 +1419,7 @@ export function getClaimsBackfillStatus(
         operational = "blocked";
     } else if (state.phase === "complete" && state.v22Takeover !== "pending") {
         operational = warnings > 0 ? "complete-with-warnings" : "complete";
-    } else if (state.phase === "blocked" || blocking > 0 || state.v22Takeover === "pending") {
+    } else if (state.phase === "blocked" || gatingBlocking > 0 || state.v22Takeover === "pending") {
         operational = "blocked";
     } else operational = "pending";
     const problems = reconciliation?.problems ?? [];

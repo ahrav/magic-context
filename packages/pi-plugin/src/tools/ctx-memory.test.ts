@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import {
+	deleteMemory,
 	getMemoryById,
 	insertMemory,
 } from "../../../plugin/src/features/magic-context/memory/storage-memory";
@@ -1590,6 +1591,131 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 				).toBe(1);
 			}
 			expect(countRows(db, "claim_merge_lineage")).toBe(0);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("a duplicate write with a tool-call id persists an envelope and replays without a second seen-count bump", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi duplicate write original.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "write",
+				category: "CONSTRAINTS",
+				content: "Pi duplicate write original.",
+			};
+
+			const first = await run(tool, args, "pi-dup-write");
+			expect(first.content[0]?.text).toBe(
+				`Memory already exists [ID: ${memory.id}] in CONSTRAINTS (seen count incremented).`,
+			);
+			expect(getMemoryById(db, memory.id)?.seenCount).toBe(2);
+			expect(
+				countRows(
+					db,
+					"claim_operations",
+					"producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:pi-dup-write:write'",
+				),
+			).toBe(1);
+
+			const replay = await run(tool, args, "pi-dup-write");
+			expect(replay.content[0]?.text).toBe(first.content[0]?.text);
+			expect(getMemoryById(db, memory.id)?.seenCount).toBe(2);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("update replay returns the stored result after the target row is archived", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi replay update original.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "update",
+				ids: [memory.id],
+				content: "Pi replay update corrected.",
+			};
+
+			const first = await run(tool, args, "pi-replay-update");
+			expect(first.content[0]?.text).toBe(
+				`Updated memory [ID: ${memory.id}] in CONSTRAINTS.`,
+			);
+
+			const archived = await run(
+				tool,
+				{ action: "archive", ids: [memory.id] },
+				"pi-replay-update-archive",
+			);
+			expect(archived.content[0]?.text).toContain("Archived memory");
+
+			const operationsBefore = countRows(db, "claim_operations");
+			const replay = await run(tool, args, "pi-replay-update");
+			expect(replay.content[0]?.text).toBe(first.content[0]?.text);
+			expect(countRows(db, "claim_operations")).toBe(operationsBefore);
+			expect(getMemoryById(db, memory.id)?.status).toBe("archived");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("merge replay returns the stored result after a source memory is deleted", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay source one.",
+			});
+			const second = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay source two.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "merge",
+				ids: [first.id, second.id],
+				category: "CONSTRAINTS",
+				content: "Pi merge replay canonical.",
+			};
+
+			const merged = await run(tool, args, "pi-replay-merge");
+			expect(merged.content[0]?.text).toContain("Merged memories");
+
+			deleteMemory(db, first.id);
+			expect(getMemoryById(db, first.id)).toBeNull();
+
+			const replay = await run(tool, args, "pi-replay-merge");
+			expect(replay.content[0]?.text).toBe(merged.content[0]?.text);
 		} finally {
 			closeQuietly(db);
 		}

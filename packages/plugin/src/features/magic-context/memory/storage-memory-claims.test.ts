@@ -743,8 +743,7 @@ describe("memory/claims kernel: unresolved identity fallback", () => {
                             seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
                          VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
                     )
-                    .run(PROJECT, "invalid scope fact", "hash:invalid scope fact")
-                    .lastInsertRowid,
+                    .run(PROJECT, "invalid scope fact", "hash:invalid scope fact").lastInsertRowid,
             );
             // Schema-legal but claim-invalid: `memories` has no CHECK on scope.
             db.prepare("UPDATE memories SET scope = '' WHERE id = ?").run(memoryId);

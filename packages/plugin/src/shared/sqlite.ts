@@ -285,7 +285,9 @@ const claimCompatStateTableCache = new WeakMap<Database, true>();
 // privileged mirror write on a migrated-v84 database would otherwise trip the
 // semantic memory guards. A negative table probe is never cached because a
 // sibling process can migrate the shared file after this handle opened.
-function hasClaimCompatibilityWriteState(db: Database): boolean {
+// Exported as the single v84 schema probe: `hasMemoryClaimsCompatSchema`
+// delegates here so both callers share one positive-only cache.
+export function hasClaimCompatibilityWriteState(db: Database): boolean {
     if (claimCompatStateTableCache.get(db)) return true;
     const present = Boolean(
         db

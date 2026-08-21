@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { partitionVerifyScope } from "./dreamer/verify-gate";
+import { createSourceSpan } from "./memory/storage-claims";
 import {
     insertMemory as insertMemoryThroughKernel,
     updateMemoryStatus,
@@ -721,5 +722,87 @@ describe("project identity merge claims (v84)", () => {
                 )
                 .get(target.id),
         ).toEqual({ importance: 91, scope: "ecosystem", shareable: 1, classified_at: 20 });
+    });
+
+    test("a collision merge re-snapshots the archived source row's rewritten lineage", () => {
+        const database = makeDb();
+        const source = insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const target = insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        // The archive UPDATE rewrites the source row's lineage after the
+        // adoption snapshot, so the post-archive values need their own
+        // relationship source or the v84 guard rejects every later lineage
+        // write on the row.
+        const archived = database
+            .prepare(
+                `SELECT merged_from AS mergedFrom, superseded_by_memory_id AS supersededBy
+                   FROM memories WHERE id = ?`,
+            )
+            .get(source.id) as { mergedFrom: string; supersededBy: number };
+        expect(archived.supersededBy).toBe(target.id);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_memory_relationship_sources
+                      WHERE memory_id = ? AND merged_from IS ? AND superseded_by_memory_id IS ?`,
+                )
+                .get(source.id, archived.mergedFrom, archived.supersededBy),
+        ).toEqual({ count: 1 });
+
+        // A later claims-capable lineage write on the archived row passes the
+        // relationship guard instead of aborting.
+        expect(() =>
+            runInMemoryClaimsWriteTransaction(database, () => {
+                database
+                    .prepare("UPDATE memories SET superseded_by_memory_id = NULL WHERE id = ?")
+                    .run(source.id);
+            }),
+        ).not.toThrow();
+    });
+
+    test("still refuses a two-project merge when a mirror episode also carries an observation-less span", () => {
+        const database = makeDb();
+        insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "mirrored fact",
+        });
+        insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "target fact",
+        });
+        const sourceProjectId = aliasProjectId(database, "git:source");
+        const episodeId = (
+            database
+                .prepare("SELECT id FROM episodes WHERE project_id = ? ORDER BY id LIMIT 1")
+                .get(sourceProjectId) as { id: number }
+        ).id;
+        // The mirror episode's own observation is crosswalked, so the episode
+        // satisfies neither authoritative branch on its own; a span carrying
+        // no observation at all is authoritative history and must refuse the
+        // merge rather than strand the episode on a merged-away project.
+        createSourceSpan(database, {
+            episodeId,
+            sourceLocator: "conversation:manual",
+            content: "authoritative span",
+            startOffset: 0,
+            endOffset: 18,
+        });
+
+        expect(() => mergeProjectIdentities(database, "git:source", "git:target")).toThrow(
+            /authoritative episodes or claims/,
+        );
+        expect(aliasProjectId(database, "git:source")).toBe(sourceProjectId);
     });
 });
