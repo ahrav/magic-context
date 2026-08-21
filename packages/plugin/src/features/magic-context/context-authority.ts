@@ -8,10 +8,13 @@ import {
     computeClaimRequestDigest,
     ensureMemoryClaimLinkInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
+    type MemoryClaimEffect,
     type MemoryClaimLink,
+    type MemoryClaimLinkFailureReason,
     memoryClaimAdoptionFailureReason,
     readMemoryClaimLink,
     readMemoryClaimOperationResult,
+    recordMemoryClaimLinkFailure,
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
@@ -2145,15 +2148,26 @@ function readTranslatableSupersessionPairs(db: Database): TranslatedSupersession
         .all() as TranslatedSupersessionPair[];
 }
 
-/** The claim link a projection row can hold: its existing crosswalk link, or
- * a fresh adoption when the row satisfies the claim adoption contract. A row
- * with an unresolvable project or claim-invalid metadata stays unlinked for
- * the repair lanes. */
-function adoptableMemoryClaimLink(db: Database, row: MemoryProjectionRow): MemoryClaimLink | null {
+/** Non-mutating adoptability probe for a pending-pair endpoint: its existing
+ * crosswalk link, or the project it could adopt under. An unlinked row with
+ * an unresolvable project or claim-invalid metadata carries its failure
+ * reason for the diagnostic surface; nothing is written. */
+interface PendingEndpointProbe {
+    row: MemoryProjectionRow;
+    link: MemoryClaimLink | null;
+    adoptableProjectId: number | null;
+    failure: MemoryClaimLinkFailureReason | null;
+}
+
+function probePendingSupersessionEndpoint(
+    db: Database,
+    row: MemoryProjectionRow,
+): PendingEndpointProbe {
+    const link = readMemoryClaimLink(db, row.id);
+    if (link) return { row, link, adoptableProjectId: null, failure: null };
     const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-    if (projectId === null || memoryClaimAdoptionFailureReason(row, projectId) !== null)
-        return null;
-    return ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, { kind: "migration" });
+    const failure = memoryClaimAdoptionFailureReason(row, projectId);
+    return { row, link: null, adoptableProjectId: failure === null ? projectId : null, failure };
 }
 
 /**
@@ -2164,16 +2178,18 @@ function adoptableMemoryClaimLink(db: Database, row: MemoryProjectionRow): Memor
  * pair. The pending row clears only when the pair holds (or already held)
  * its claim edge; a content-bearing endpoint that cannot adopt — unresolved
  * project identity or claim-invalid metadata — keeps the row so a later page
- * retries after repair. The adoptability probe runs OUTSIDE the claim
- * envelope: a not-yet-adoptable pair commits no envelope at all, because the
- * pair-keyed digest would replay a false result forever and a zero-effect
- * envelope is unprunable.
+ * retries after repair, and records a blocking rows-phase diagnostic for the
+ * repair lanes. The adoptability probe is read-only and runs OUTSIDE the
+ * claim envelope: a not-yet-adoptable pair commits no claim write at all,
+ * because the pair-keyed digest would replay a false result forever and a
+ * zero-effect envelope is unprunable.
  *
- * The projection side (pointer, relationship snapshot) runs on every call,
- * like the module-delta kernel's applyProjection, so a page replay converges
- * even when the claim envelope replays. The relationship-source snapshot is
- * refreshed around the pointer write so the relationship write guard sees
- * the preimage before the write and the translated state after it.
+ * A first resolution performs BOTH endpoint adoptions, the pointer write,
+ * the supersession edge, and the pre/post lineage snapshots inside the pair
+ * envelope, so every effect — including a newly linked endpoint's upsert —
+ * reaches the outbox. The projection side (pointer, relationship snapshot)
+ * still runs on every replayed or not-yet-linkable call, like the
+ * module-delta kernel's applyProjection, so a page replay converges.
  */
 function translatePendingSupersessionClaims(db: Database, statements: MirrorPageStatements): void {
     for (const pair of readTranslatableSupersessionPairs(db)) {
@@ -2189,42 +2205,45 @@ function translatePendingSupersessionClaims(db: Database, statements: MirrorPage
                 targetId: pair.targetId,
             }),
         };
-        // A replayed envelope must append zero claim rows, so adoption is
-        // gated on the replay probe; the committed first run already linked
-        // both endpoints, and the crosswalk is retained, never deleted.
         const replayed = readMemoryClaimOperationResult<boolean>(db, envelope) !== null;
-        const sourceLink =
-            readMemoryClaimLink(db, pair.sourceId) ??
-            (replayed ? null : adoptableMemoryClaimLink(db, source));
-        const targetLink =
-            readMemoryClaimLink(db, pair.targetId) ??
-            (replayed ? null : adoptableMemoryClaimLink(db, target));
+        const sourceProbe = probePendingSupersessionEndpoint(db, source);
+        const targetProbe = probePendingSupersessionEndpoint(db, target);
+        const bothLinkable =
+            (sourceProbe.link !== null || sourceProbe.adoptableProjectId !== null) &&
+            (targetProbe.link !== null || targetProbe.adoptableProjectId !== null);
 
-        // Snapshot the source's current lineage so the pointer write below
-        // matches the guard's preimage requirement (no-op when unlinked). A
-        // pointer written by an earlier not-yet-linkable run translates its
-        // edge here, so the returned effects ride the pair envelope below
-        // instead of being dropped.
-        const snapshotEffects = sourceLink
-            ? translateMemoryClaimRelationshipsInCurrentTransaction(db, source)
-            : [];
-        statements.updateSuperseded.run(pair.targetId, pair.sourceId);
-        // The pending row is the pair's only retry driver: it clears when the
-        // claim edge exists (linked now, or committed by an earlier run), and
-        // survives an unadoptable endpoint so a later page re-attempts the
-        // pair once its row is repaired.
-        if (replayed || (sourceLink && targetLink)) {
-            statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
-        }
-
-        if (sourceLink && targetLink) {
+        if (!replayed && bothLinkable) {
             runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
+                const effects: MemoryClaimEffect[] = [];
+                const adopt = (probe: PendingEndpointProbe): MemoryClaimLink => {
+                    if (probe.link) return probe.link;
+                    const link = ensureMemoryClaimLinkInCurrentTransaction(
+                        db,
+                        probe.row,
+                        probe.adoptableProjectId as number,
+                        { kind: "migration" },
+                    );
+                    effects.push({
+                        effectKey: `memory:${probe.row.id}:upsert`,
+                        projectId: link.projectId,
+                        claimId: link.claimId,
+                        effectType: "upsert" as const,
+                    });
+                    return link;
+                };
+                const sourceLink = adopt(sourceProbe);
+                const targetLink = adopt(targetProbe);
+                // Snapshot the source's current lineage so the pointer write
+                // below matches the guard's preimage requirement; a pointer
+                // written by an earlier not-yet-linkable run translates its
+                // edge here.
+                effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, source));
+                statements.updateSuperseded.run(pair.targetId, pair.sourceId);
                 const recorded = recordMemoryClaimSupersessionInCurrentTransaction(
                     db,
                     sourceLink,
                     targetLink,
                 );
-                const effects = [...snapshotEffects];
                 if (recorded) {
                     effects.push({
                         effectKey: `memory:${pair.targetId}:supersede`,
@@ -2233,13 +2252,49 @@ function translatePendingSupersessionClaims(db: Database, statements: MirrorPage
                         effectType: "evidence" as const,
                     });
                 }
+                // Refresh the snapshot to the translated pointer so later
+                // relationship mutations on the source row pass the write
+                // guard; the translation's effects ride this envelope.
+                const post = readMemoryProjectionRow(db, pair.sourceId);
+                if (post) {
+                    effects.push(
+                        ...translateMemoryClaimRelationshipsInCurrentTransaction(db, post),
+                    );
+                }
                 return { result: recorded, effects };
             });
+            statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
+            continue;
         }
 
-        // Refresh the snapshot to the translated pointer so later
-        // relationship mutations on the source row pass the write guard.
-        if (sourceLink) {
+        // Replay, or a pair with an unadoptable endpoint: projection-side
+        // convergence only (pointer + snapshots) — no claim write happens
+        // outside an envelope. The pending row is the pair's only retry
+        // driver: it clears when the committed envelope exists, and survives
+        // an unadoptable endpoint so a later page re-attempts the pair.
+        if (sourceProbe.link) translateMemoryClaimRelationshipsInCurrentTransaction(db, source);
+        statements.updateSuperseded.run(pair.targetId, pair.sourceId);
+        if (replayed) {
+            statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
+        } else {
+            if (sourceProbe.failure) {
+                recordMemoryClaimLinkFailure(
+                    db,
+                    source.id,
+                    source.project_path,
+                    sourceProbe.failure,
+                );
+            }
+            if (targetProbe.failure) {
+                recordMemoryClaimLinkFailure(
+                    db,
+                    target.id,
+                    target.project_path,
+                    targetProbe.failure,
+                );
+            }
+        }
+        if (sourceProbe.link) {
             const post = readMemoryProjectionRow(db, pair.sourceId);
             if (post) translateMemoryClaimRelationshipsInCurrentTransaction(db, post);
         }

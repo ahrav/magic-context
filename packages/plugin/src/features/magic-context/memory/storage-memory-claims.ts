@@ -658,6 +658,39 @@ function claimHasOtherLiveMemoryLink(db: Database, claimId: number, memoryId: nu
     return sibling !== null && sibling !== undefined;
 }
 
+const CLAIM_STATE_RANK: Record<ClaimState, number> = { archived: 0, active: 1, permanent: 2 };
+
+/**
+ * The lifecycle state a canonical claim should hold given one linked
+ * projection's imminent status: the max-rank state (archived < active <
+ * permanent) across every surviving linked projection, with THIS row's next
+ * status substituted for its stored one (the projection write lands after
+ * the claim write). A claim whose links all point at archived or deleted
+ * rows resolves to archived. Generalizes the sibling-liveness retire gate:
+ * one projection's transition can neither downgrade a permanent sibling nor
+ * strand a stale permanent state once the last permanent link archives.
+ */
+export function sharedClaimStateFromLiveLinks(
+    db: Database,
+    claimId: number,
+    memoryId: number,
+    nextStatus: string,
+): ClaimState {
+    let state = claimStateFromMemoryStatus(nextStatus);
+    const siblings = db
+        .prepare(
+            `SELECT m.status AS status FROM legacy_memory_claims lmc
+               JOIN memories m ON m.id = lmc.memory_id
+              WHERE lmc.claim_id = ? AND lmc.memory_id <> ?`,
+        )
+        .all(claimId, memoryId) as Array<{ status: string }>;
+    for (const sibling of siblings) {
+        const siblingState = claimStateFromMemoryStatus(sibling.status);
+        if (CLAIM_STATE_RANK[siblingState] > CLAIM_STATE_RANK[state]) state = siblingState;
+    }
+    return state;
+}
+
 interface CanonicalHashMatch extends MemoryClaimLink {
     currentRevisionId: number;
     currentContent: string;
@@ -1316,6 +1349,13 @@ export interface UpdateMemoryContentClaimInput {
     content: string;
     normalizedHash: string;
     sourceSessionId?: string | null;
+    /**
+     * The caller's verdict invalidated the previous verification: the kernel
+     * deletes the `memory_verifications` rows inside this transaction and
+     * suppresses the verified-event carry, so the new revision never claims
+     * verified for content the verdict rejected.
+     */
+    clearsVerification?: boolean;
     nowMs?: number;
 }
 
@@ -1356,6 +1396,12 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
         const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
+        // The verdict-driven clear owns the side-table delete inside this
+        // transaction; the carry gates below are suppressed with it because
+        // the projection's verified columns describe the rejected content.
+        if (input.clearsVerification) {
+            db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(row.id);
+        }
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
         if (failure !== null || projectId === null || input.content.length === 0) {
@@ -1400,7 +1446,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                 // The projection keeps its verified columns across a content
                 // rewrite, so the adopted claim's current revision needs its
                 // own verified event.
-                if (memoryRowHasPositiveVerification(db, post)) {
+                if (!input.clearsVerification && memoryRowHasPositiveVerification(db, post)) {
                     addVerificationEvent(db, {
                         revisionId: readClaimCurrentRevisionId(db, link.claimId),
                         outcome: "verified",
@@ -1462,7 +1508,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
         // content rewrite, so the appended revision needs its own verified
         // event — without one the claim's current revision reads unverified
         // while the projection stays verified.
-        if (memoryRowHasPositiveVerification(db, row)) {
+        if (!input.clearsVerification && memoryRowHasPositiveVerification(db, row)) {
             addVerificationEvent(db, {
                 revisionId,
                 outcome: "verified",
@@ -1618,16 +1664,15 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                 effectType: "upsert" as const,
             });
         }
-        const nextState = claimStateFromMemoryStatus(input.status);
         // A shared canonical claim (several crosswalk rows, one claim, via
-        // the dedup branch) retires only with its last live link; archiving
-        // one projection while a sibling stays live leaves the claim and its
-        // lifecycle stream untouched. Un-archive directions always apply.
-        const retireBlocked =
-            nextState === "archived" && claimHasOtherLiveMemoryLink(db, link.claimId, row.id);
-        if (!retireBlocked) {
+        // the dedup branch) holds the max-rank state across its surviving
+        // linked projections, so one projection's transition can neither
+        // downgrade a permanent sibling nor strand a stale permanent state.
+        // An unchanged state writes nothing and emits no lifecycle effect.
+        const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, input.status);
+        if (readCurrentClaimSemanticState(db, link.claimId).state !== nextState) {
             setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
-            if (input.status === "archived") {
+            if (nextState === "archived" && input.status === "archived") {
                 addVerificationEvent(db, {
                     revisionId: readClaimCurrentRevisionId(db, link.claimId),
                     outcome: "archive",
@@ -1872,11 +1917,19 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
             kind: "migration",
         });
         const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
-        setClaimLifecycleStateInCurrentTransaction(
-            db,
-            link.claimId,
-            claimStateFromMemoryStatus(input.status),
-        );
+        const effects: MemoryClaimEffect[] = [];
+        // Shared-claim rule: the claim holds the max-rank state across its
+        // surviving linked projections; an unchanged state writes nothing.
+        const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, input.status);
+        if (readCurrentClaimSemanticState(db, link.claimId).state !== nextState) {
+            setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
+            effects.push({
+                effectKey: `memory:${row.id}:lifecycle`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "lifecycle" as const,
+            });
+        }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         applyProjection();
         const post = readMemoryProjectionRow(db, row.id);
@@ -1888,15 +1941,7 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
         return {
             result: { memoryId: row.id, claimId: link.claimId, revisionId: null, found: true },
-            effects: [
-                {
-                    effectKey: `memory:${row.id}:lifecycle`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "lifecycle" as const,
-                },
-                ...relationshipEffects,
-            ],
+            effects: [...effects, ...relationshipEffects],
         };
     });
 }
@@ -2315,7 +2360,15 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 });
             }
 
-            const desiredState = claimStateFromMemoryStatus(post.status);
+            // Shared-claim rule: the claim holds the max-rank state across
+            // its surviving linked projections, so a delta on one projection
+            // cannot downgrade a permanent sibling.
+            const desiredState = sharedClaimStateFromLiveLinks(
+                db,
+                link.claimId,
+                post.id,
+                post.status,
+            );
             if (current.state !== desiredState) {
                 setClaimLifecycleStateInCurrentTransaction(db, link.claimId, desiredState);
                 if (desiredState === "archived") {

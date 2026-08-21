@@ -530,6 +530,9 @@ function isPrimaryMutable(memory: Memory | null): memory is Memory {
 function rewriteMemoryContent(db: Database, memory: Memory, content: string, hash: string): void {
     if (hasMemoryClaimsCompatSchema(db)) {
         runInMemoryClaimsWriteTransaction(db, () => {
+            // The update verdict declared the previous verification wrong, so
+            // the kernel clears the side table and suppresses the verified
+            // carry inside the same claims transaction.
             updateMemoryContentWithClaimsInCurrentTransaction(
                 db,
                 {
@@ -537,9 +540,13 @@ function rewriteMemoryContent(db: Database, memory: Memory, content: string, has
                     operationKey: `update:${randomUUID()}`,
                     requestDigest: computeClaimRequestDigest({ id: memory.id, content, hash }),
                 },
-                { memoryId: memory.id, content, normalizedHash: hash },
+                {
+                    memoryId: memory.id,
+                    content,
+                    normalizedHash: hash,
+                    clearsVerification: true,
+                },
             );
-            db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memory.id);
         });
         invalidateMemory(memory.projectPath, memory.id);
         return;

@@ -314,14 +314,35 @@ export async function runDeferredV22Backfill(
                 const verifyMemory = db.prepare(
                     "SELECT project_path FROM memories WHERE id = ? AND project_path = ?",
                 );
+                // Per-row savepoint with a nested generation scope: a residual
+                // throw from the rekey rolls back exactly that row's writes
+                // (including its speculative generation allocations) while the
+                // enclosing batch transaction keeps its cursor, failure rows,
+                // and the other rows' work.
+                const rekeyRowInSavepoint = db.transaction((row: ResolvedBackfillRow) =>
+                    withMemoryClaimGenerationContextInCurrentTransaction(db, () =>
+                        rekeyMemoryRowWithCollisionMerge(
+                            db,
+                            row.id,
+                            row.project_path,
+                            row.identity,
+                        ),
+                    ),
+                );
 
                 for (const row of resolvedRows) {
-                    const changed = rekeyMemoryRowWithCollisionMerge(
-                        db,
-                        row.id,
-                        row.project_path,
-                        row.identity,
-                    );
+                    let changed = false;
+                    try {
+                        changed = rekeyRowInSavepoint(row);
+                    } catch (error) {
+                        // The failure surface doctor --retry-v22-backfill
+                        // drains: a throw poisons only this row, never the
+                        // batch, so the cursor still advances and startup
+                        // reruns stay idempotent.
+                        recordFailure(db, { ...row, ...classifyBackfillError(error) }, now);
+                        failedRows += 1;
+                        continue;
+                    }
                     if (changed) {
                         changedRows += 1;
                         changedIdentities.add(row.identity);
@@ -331,6 +352,22 @@ export async function runDeferredV22Backfill(
                             upsertRekeyMap(db, legacyRustIdentity, row.identity, now);
                         }
                         deleteFailure(db, row.id);
+                    } else if (verifyMemory.get(row.id, row.project_path)) {
+                        // The rekey declined the row (claim-invalid metadata
+                        // or a blocked collision merge) and left it in place;
+                        // record it on the v22 failure surface so the doctor
+                        // retry can drain it after repair.
+                        recordFailure(
+                            db,
+                            {
+                                ...row,
+                                errorClass: "unknown",
+                                errorMessage:
+                                    "row was skipped by the collision-aware rekey; see claim_backfill_failures for the blocking reason",
+                            },
+                            now,
+                        );
+                        failedRows += 1;
                     }
                 }
 

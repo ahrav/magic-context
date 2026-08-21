@@ -5,13 +5,17 @@ import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { ProjectIdentityError } from "./memory/project-identity";
-import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
+import {
+    readMemoryClaimLink,
+    runInMemoryClaimsWriteTransaction,
+} from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { getProjectState } from "./storage-project-state";
 import {
     BATCH_SIZE,
     computeLegacyRustDirIdentity,
+    doctorRetryV22Backfill,
     runDeferredV22Backfill,
 } from "./v22-deferred-backfill";
 
@@ -254,7 +258,9 @@ describe("runDeferredV22Backfill", () => {
 });
 
 describe("v22 backfill under the v84 claims contract", () => {
-    function makeV82StyleDb(rows: Array<{ projectPath: string; content: string; hash: string }>): {
+    function makeV82StyleDb(
+        rows: Array<{ projectPath: string; content: string; hash: string; importance?: number }>,
+    ): {
         database: Database;
         ids: number[];
     } {
@@ -270,10 +276,10 @@ describe("v22 backfill under the v84 claims contract", () => {
             const result = database
                 .prepare(
                     `INSERT INTO memories
-                        (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
-                     VALUES (?, 'CONSTRAINTS', ?, ?, 1, 1, 1, 1)`,
+                        (project_path, category, content, normalized_hash, importance, first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (?, 'CONSTRAINTS', ?, ?, ?, 1, 1, 1, 1)`,
                 )
-                .run(row.projectPath, row.content, row.hash) as {
+                .run(row.projectPath, row.content, row.hash, row.importance ?? null) as {
                 lastInsertRowid: number | bigint;
             };
             ids.push(Number(result.lastInsertRowid));
@@ -404,6 +410,114 @@ describe("v22 backfill under the v84 claims contract", () => {
 
         expect(summary.status).toBe("completed_with_failures");
         expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("pending");
+    });
+
+    test("claim-invalid rows fail per-row, the batch completes, and the doctor drains them after repair", async () => {
+        // Real directories: the doctor retry resolves identities with the
+        // real resolver, which falls back to dir: identities for these.
+        const importanceDir = makeTempDir();
+        const emptyDir = makeTempDir();
+        const { database, ids } = makeV82StyleDb([
+            {
+                projectPath: importanceDir,
+                content: "importance fact",
+                hash: "ci-h1",
+                importance: 0,
+            },
+            { projectPath: emptyDir, content: "", hash: "ci-h2" },
+            { projectPath: "/legacy/healthy", content: "healthy fact", hash: "ci-h3" },
+        ]);
+        const [importanceId, emptyId, healthyId] = ids as [number, number, number];
+
+        const summary = await runDeferredV22Backfill(database, {
+            resolveIdentity: () => "git:claim-invalid",
+            yieldToEventLoop: async () => {},
+        });
+
+        expect(summary.status).toBe("completed_with_failures");
+        expect(summary.changedRows).toBe(1);
+        expect(summary.failedRows).toBe(2);
+        // The batch cursor advances past every row, including the failed ones.
+        expect(metaValue(database, "v22_legacy_memory_backfill_cursor")).toBe(String(healthyId));
+        // The healthy row rekeyed and linked.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(healthyId),
+        ).toEqual({ project_path: "git:claim-invalid" });
+        expect(readMemoryClaimLink(database, healthyId)).not.toBeNull();
+        // Both claim-invalid rows stay at their legacy paths on the doctor-
+        // drainable v22 failure surface, keeping the takeover gated.
+        expect(
+            database.prepare("SELECT row_id FROM v22_backfill_failures ORDER BY row_id").all(),
+        ).toEqual([{ row_id: importanceId }, { row_id: emptyId }]);
+        expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("pending");
+
+        // A rerun neither throws nor re-fails the recorded rows.
+        const rerun = await runDeferredV22Backfill(database, {
+            resolveIdentity: () => "git:claim-invalid",
+            yieldToEventLoop: async () => {},
+        });
+        expect(rerun.status).toBe("completed_with_failures");
+        expect(rerun.failedRows).toBe(0);
+        expect(rerun.failureCount).toBe(2);
+
+        // Repairing the metadata lets the doctor retry drain both failures.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database.prepare("UPDATE memories SET importance = 50 WHERE id = ?").run(importanceId);
+            database
+                .prepare("UPDATE memories SET content = 'repaired fact' WHERE id = ?")
+                .run(emptyId);
+        });
+        const retry = await doctorRetryV22Backfill(database);
+        expect(retry).toMatchObject({
+            attempted: 2,
+            succeeded: 2,
+            failed: 0,
+            skipped: 0,
+            status: "completed",
+        });
+        expect(readMemoryClaimLink(database, importanceId)).not.toBeNull();
+        expect(readMemoryClaimLink(database, emptyId)).not.toBeNull();
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS c FROM claim_backfill_failures WHERE disposition = 'blocking'",
+                )
+                .get(),
+        ).toEqual({ c: 0 });
+        expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("none");
+    });
+
+    test("a residual per-row rekey throw becomes a v22 failure row instead of a batch crash", async () => {
+        const { database, ids } = makeV82StyleDb([
+            { projectPath: "/legacy/unresolvable", content: "unresolvable fact", hash: "rt-h1" },
+            { projectPath: "/legacy/resolvable", content: "resolvable fact", hash: "rt-h2" },
+        ]);
+        const [unresolvableId, resolvableId] = ids as [number, number];
+
+        const summary = await runDeferredV22Backfill(database, {
+            // A non-canonical identity passes resolution but throws inside the
+            // rekey (no canonical claims project can anchor the link),
+            // exercising the per-row savepoint funnel.
+            resolveIdentity: (raw) =>
+                raw === "/legacy/unresolvable" ? "/still/raw" : "git:resolved-residual",
+            yieldToEventLoop: async () => {},
+        });
+
+        expect(summary.status).toBe("completed_with_failures");
+        expect(summary.changedRows).toBe(1);
+        expect(summary.failedRows).toBe(1);
+        const failure = database
+            .prepare("SELECT row_id, error_class, error_message FROM v22_backfill_failures")
+            .get() as { row_id: number; error_class: string; error_message: string };
+        expect(failure.row_id).toBe(unresolvableId);
+        expect(failure.error_class).toBe("unknown");
+        expect(failure.error_message).toContain("does not resolve to a canonical");
+        // The failed row is untouched at its legacy path; the healthy row
+        // still rekeyed and linked inside the same batch transaction.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(unresolvableId),
+        ).toEqual({ project_path: "/legacy/unresolvable" });
+        expect(readMemoryClaimLink(database, resolvableId)).not.toBeNull();
     });
 
     test("a terminal initial status syncs the takeover key from the failure surface", async () => {

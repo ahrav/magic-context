@@ -1644,3 +1644,103 @@ describe("memory/claims kernel: module delta replay", () => {
         expect(snapshotCounts(db)).toEqual(before);
     });
 });
+
+describe("memory/claims kernel: shared-claim lifecycle rank", () => {
+    /** Second projection row deduped onto the seeded claim via an alias path
+     *  (the live-DB shape after an identity merge): the unique (path,
+     *  category, hash) projection index admits the duplicate, and its first
+     *  kernel write links it to the survivor's canonical claim. */
+    function insertAliasSibling(db: Database, content: string): number {
+        const aliasPath = "git:kernel-project-alias";
+        const projectId = (
+            db
+                .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
+                .get(PROJECT) as { id: number }
+        ).id;
+        db.prepare(
+            "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, 1)",
+        ).run(aliasPath, projectId);
+        let siblingId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            siblingId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(aliasPath, content, `hash:${content}`).lastInsertRowid,
+            );
+        });
+        return siblingId;
+    }
+
+    function setStatus(db: Database, key: string, memoryId: number, status: string): void {
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(db, envelope(key, { key, memoryId }), {
+                memoryId,
+                status,
+            }),
+        );
+    }
+
+    test("restoring an archived sibling never downgrades a permanent shared claim", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "rank-restore-seed", "rank restore fact");
+        setStatus(db, "rank-restore-permanent", survivor.memoryId, "permanent");
+        const siblingId = insertAliasSibling(db, "rank restore fact");
+        setStatus(db, "rank-restore-archive-sibling", siblingId, "archived");
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "permanent",
+        });
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(0);
+
+        setStatus(db, "rank-restore-restore-sibling", siblingId, "active");
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "permanent",
+        });
+        // Neither sibling transition changed the max-rank state, so no
+        // lifecycle effect reached the outbox for them.
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'lifecycle' AND operation_id IN (
+                    SELECT id FROM claim_operations
+                     WHERE operation_key IN ('rank-restore-archive-sibling', 'rank-restore-restore-sibling'))`,
+            ),
+        ).toBe(0);
+    });
+
+    test("demoting the only permanent sibling moves the shared claim to active", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "rank-demote-seed", "rank demote fact");
+        const siblingId = insertAliasSibling(db, "rank demote fact");
+        setStatus(db, "rank-demote-permanent", siblingId, "permanent");
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "permanent",
+        });
+
+        setStatus(db, "rank-demote-active", siblingId, "active");
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+    });
+
+    test("archiving the only permanent sibling leaves the shared claim active, not stale-permanent", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "rank-archive-seed", "rank archive fact");
+        const siblingId = insertAliasSibling(db, "rank archive fact");
+        setStatus(db, "rank-archive-permanent", siblingId, "permanent");
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "permanent",
+        });
+
+        setStatus(db, "rank-archive-archive", siblingId, "archived");
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+        // The survivor still asserts the claim, so no archive event fires.
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(0);
+    });
+});

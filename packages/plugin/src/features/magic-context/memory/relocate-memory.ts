@@ -7,7 +7,6 @@ import {
     requireEffectiveSeenCount,
 } from "./storage-memory";
 import {
-    claimStateFromMemoryStatus,
     computeClaimRequestDigest,
     ensureMemoryClaimLinkInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
@@ -18,11 +17,13 @@ import {
     memoryClaimAdoptionFailureReason,
     readCurrentClaimSemanticState,
     readMemoryClaimLink,
+    recordMemoryClaimLinkFailure,
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     retireMemoryClaimInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
     setClaimLifecycleStateInCurrentTransaction,
+    sharedClaimStateFromLiveLinks,
     translateMemoryClaimRelationshipsInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
@@ -143,7 +144,10 @@ export function syncAdoptedRelocationClaimState(
     producer: string,
 ): MemoryClaimEffect[] {
     const effects: MemoryClaimEffect[] = [];
-    const desiredState = claimStateFromMemoryStatus(row.status);
+    // Shared-claim rule: the claim holds the max-rank state across its
+    // surviving linked projections, so adopting one row cannot downgrade a
+    // permanent sibling's claim.
+    const desiredState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, row.status);
     if (readCurrentClaimSemanticState(db, link.claimId).state !== desiredState) {
         if (desiredState === "archived") {
             retireMemoryClaimInCurrentTransaction(db, link.claimId, producer);
@@ -600,7 +604,21 @@ function rekeyMemoryRowWithCollisionMergeInner(
                 link,
             );
         }
-        if (!link) adoptRelocationRekeyClaim(db, rowId, targetProjectId);
+        if (!link) {
+            const projectionRow = readMemoryProjectionRow(db, rowId);
+            if (!projectionRow) return false;
+            const failure = memoryClaimAdoptionFailureReason(projectionRow, targetProjectId);
+            if (failure !== null) {
+                // A claim-invalid row (empty content, bad metadata) cannot
+                // acquire the crosswalk link the boundary identity guard
+                // demands before the project_path UPDATE, so the rekey skips
+                // it fail-visible (blocking diagnostic) instead of aborting
+                // the caller's batch.
+                recordMemoryClaimLinkFailure(db, rowId, toIdentity, failure);
+                return false;
+            }
+            adoptRelocationRekeyClaim(db, rowId, targetProjectId);
+        }
     }
 
     const result = db

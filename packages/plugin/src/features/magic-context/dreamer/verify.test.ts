@@ -427,6 +427,56 @@ describe("applyVerifyManifest", () => {
         }
     });
 
+    test("an update verdict on a side-table-verified row does not carry the verification onto the new revision", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Old value lives in src/old.ts.",
+                sourceSessionId: "ses",
+            });
+            // Positive side-table verification for the OLD content — the very
+            // claim the update verdict is about to declare wrong.
+            recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
+
+            const result = await applyVerifyManifest(
+                verifyArgs(db, dir, projectIdentity),
+                [
+                    {
+                        id: memory.id,
+                        category: memory.category,
+                        content: memory.content,
+                        mappedFiles: ["src/old.ts"],
+                    },
+                ],
+                `<verify><update id="${memory.id}" files="src/new.ts">New value lives in src/new.ts.</update></verify>`,
+            );
+            expect(result).toEqual({ verified: 0, updated: 1, archived: 0 });
+
+            const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+            expect(claim?.revision).toBe(2);
+            expect(claim?.content).toBe("New value lives in src/new.ts.");
+            // The rejected content's verification carries onto nothing: the
+            // new current revision has no verified event (revision 1 keeps
+            // the event that verified the OLD content), and the side table is
+            // cleared inside the same transaction.
+            expect(
+                db
+                    .prepare(
+                        `SELECT COUNT(*) AS c FROM verification_events ve
+                          WHERE ve.revision_id = ? AND ve.outcome = 'verified'`,
+                    )
+                    .get(claim?.revisionId),
+            ).toEqual({ c: 0 });
+            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("rejects conflicting terminal verdicts for the same memory id", async () => {
         const db = freshDb();
         try {
