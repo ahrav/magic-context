@@ -38,15 +38,20 @@ import {
     findMemoryClaimsCompatCorruption,
     hasMemoryClaimsCompatSchema,
     listMemoryRelationshipSources,
+    type MemoryClaimEffect,
     type MemoryClaimLink,
     memoryClaimAdoptionFailureReason,
     memoryClaimMetadataFailureReason,
     memoryClaimSupersessionExists,
     parseMemoryClaimMergedFrom,
+    readCurrentClaimSemanticState,
     readMemoryClaimLink,
     recordMemoryClaimLinkFailure,
     resolveMemoryClaimProjectInCurrentTransaction,
+    retireMemoryClaimInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    setClaimLifecycleStateInCurrentTransaction,
+    sharedClaimStateFromLiveLinks,
     translateMemoryClaimRelationshipsInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
@@ -607,6 +612,36 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, adoptProjectId, {
                 kind: "migration",
             });
+            const effects: MemoryClaimEffect[] = [
+                {
+                    effectKey: `memory:${row.id}:upsert`,
+                    projectId: adoptProjectId,
+                    claimId: link.claimId,
+                    effectType: "upsert" as const,
+                },
+            ];
+            // Adoption can reuse a canonical claim whose stored state
+            // reflects only the rows adopted before this one. Recompute the
+            // shared max-rank state so id order cannot strand an archived
+            // claim under a live projection or downgrade a permanent sibling.
+            const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, row.status);
+            if (readCurrentClaimSemanticState(db, link.claimId).state !== nextState) {
+                if (nextState === "archived") {
+                    retireMemoryClaimInCurrentTransaction(
+                        db,
+                        link.claimId,
+                        CLAIMS_BACKFILL_PRODUCER,
+                    );
+                } else {
+                    setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
+                }
+                effects.push({
+                    effectKey: `memory:${row.id}:lifecycle`,
+                    projectId: adoptProjectId,
+                    claimId: link.claimId,
+                    effectType: "lifecycle" as const,
+                });
+            }
             recordAdoptedMemoryVerifiedEventInCurrentTransaction(
                 db,
                 row,
@@ -615,14 +650,7 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
             );
             return {
                 result: { memoryId: row.id, claimId: link.claimId },
-                effects: [
-                    {
-                        effectKey: `memory:${row.id}:upsert`,
-                        projectId: adoptProjectId,
-                        claimId: link.claimId,
-                        effectType: "upsert" as const,
-                    },
-                ],
+                effects,
             };
         },
     );
@@ -953,10 +981,36 @@ export function inspectClaimsBackfillReconciliation(
 
     if (state.v22Takeover === "pending") problems.push("pending v22 identity work");
 
+    // Warning-class lifecycle oracle: a boundary claim whose stored state
+    // diverges from the max-rank state derived from its linked projections —
+    // the SQL twin of `sharedClaimStateFromLiveLinks` with no substituted
+    // row (a claim with no surviving projection rows derives archived).
+    // Warning disposition: any later kernel write on a linked row repairs
+    // the state, so a mismatch never gates completion.
+    const lifecycleMismatches = countScalar(
+        db,
+        `SELECT COUNT(*) AS count FROM claims c
+          WHERE EXISTS (
+                SELECT 1 FROM legacy_memory_claims b
+                 WHERE b.claim_id = c.id AND b.memory_id <= ?
+            )
+            AND c.state <> (
+                SELECT CASE COALESCE(MAX(CASE m.status
+                                WHEN 'permanent' THEN 2
+                                WHEN 'active' THEN 1
+                                ELSE 0 END), 0)
+                       WHEN 2 THEN 'permanent' WHEN 1 THEN 'active' ELSE 'archived' END
+                  FROM legacy_memory_claims lmc
+                  JOIN memories m ON m.id = lmc.memory_id
+                 WHERE lmc.claim_id = c.id
+            )`,
+        boundary,
+    );
+
     return {
         ok: problems.length === 0,
         problems,
-        warningCount: countBoundaryFailures(db, ["warning"], boundary),
+        warningCount: countBoundaryFailures(db, ["warning"], boundary) + lifecycleMismatches,
     };
 }
 

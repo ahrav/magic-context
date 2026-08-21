@@ -623,8 +623,15 @@ function insertRevisionMemoryMetadata(
     );
 }
 
-export function claimStateFromMemoryStatus(status: string): ClaimState {
-    return status === "permanent" || status === "archived" ? status : "active";
+/**
+ * Unknown or NULL projection status maps to archived, not active: every
+ * legacy reader omits rows outside the three known statuses, so the claim
+ * mirror must never publish such a row as live.
+ */
+export function claimStateFromMemoryStatus(status: string | null): ClaimState {
+    if (status === "permanent" || status === "archived") return status;
+    if (status === "active") return "active";
+    return "archived";
 }
 
 export function readMemoryClaimLink(db: Database, memoryId: number): MemoryClaimLink | null {
@@ -683,7 +690,7 @@ export function sharedClaimStateFromLiveLinks(
                JOIN memories m ON m.id = lmc.memory_id
               WHERE lmc.claim_id = ? AND lmc.memory_id <> ?`,
         )
-        .all(claimId, memoryId) as Array<{ status: string }>;
+        .all(claimId, memoryId) as Array<{ status: string | null }>;
     for (const sibling of siblings) {
         const siblingState = claimStateFromMemoryStatus(sibling.status);
         if (CLAIM_STATE_RANK[siblingState] > CLAIM_STATE_RANK[state]) state = siblingState;
@@ -1325,8 +1332,13 @@ export function createMemoryWithClaimsInCurrentTransaction(
             liveProvenance(envelope, input.sourceSessionId),
         );
         // Re-adding content whose canonical claim was archived by a delete
-        // reactivates the claim alongside the fresh projection row.
-        setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "active");
+        // reactivates the claim alongside the fresh projection row. The
+        // max-rank shared state (not a hardcoded 'active') keeps a permanent
+        // sibling's claim permanent.
+        const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, memoryId, "active");
+        if (readCurrentClaimSemanticState(db, link.claimId).state !== nextState) {
+            setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
+        }
         const revisionId = readClaimCurrentRevisionId(db, link.claimId);
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");

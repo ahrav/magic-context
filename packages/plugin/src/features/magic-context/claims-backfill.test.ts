@@ -774,6 +774,25 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
 });
 
 describe("claims backfill reconciliation", () => {
+    test("a boundary claim whose state diverges from its linked projections is a warning, not a blocker", async () => {
+        const { db, ids } = migrateLazy([{ content: "lifecycle drift row" }]);
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        expect(inspectClaimsBackfillReconciliation(db).warningCount).toBe(0);
+
+        // A raw projection write that bypasses the kernel models the drift
+        // the lifecycle oracle exists to surface.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(ids[0]);
+        });
+
+        const report = inspectClaimsBackfillReconciliation(db);
+        expect(report.ok).toBeTrue();
+        expect(report.warningCount).toBe(1);
+        const rerun = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(rerun.status).toBe("complete-with-warnings");
+    });
+
     test("refuses missing metadata, root evidence, outbox, generation, and lineage disposition", async () => {
         const { db } = migrateLazy([
             { content: "source", hash: "source" },
@@ -1028,5 +1047,86 @@ describe("claims backfill lazy preimage adoption effects", () => {
                 )
                 .get(),
         ).toEqual({ count: 1 });
+    });
+});
+
+describe("claims backfill dedup adoption lifecycle", () => {
+    /**
+     * The dir:→git: rekey map entry makes the v82 registry seed register the
+     * dir: identity as an alias of the git: terminal project, so both rows
+     * resolve to one project and dedup onto one canonical claim.
+     */
+    function migrateLazyWithRekeyedAlias(rows: readonly LegacyRow[]): {
+        db: Database;
+        ids: number[];
+    } {
+        const fixture = prepareLegacyDb(rows);
+        fixture.db.exec(`
+            CREATE TABLE IF NOT EXISTS v22_identity_rekey_map (
+                old_project_path TEXT PRIMARY KEY,
+                new_project_path TEXT NOT NULL,
+                rekeyed_at INTEGER NOT NULL
+            );
+            INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at)
+            VALUES ('dir:/rekeyed-checkout', 'git:claims-backfill-a', 1);
+        `);
+        runMigrations(fixture.db);
+        return fixture;
+    }
+
+    function linkedClaimState(db: Database, memoryId: number): { claimId: number; state: string } {
+        return db
+            .prepare(
+                `SELECT lmc.claim_id AS claimId, c.state AS state
+                   FROM legacy_memory_claims lmc JOIN claims c ON c.id = lmc.claim_id
+                  WHERE lmc.memory_id = ?`,
+            )
+            .get(memoryId) as { claimId: number; state: string };
+    }
+
+    test("an archived alias row adopted before its active twin leaves the shared claim active", async () => {
+        const { db, ids } = migrateLazyWithRekeyedAlias([
+            {
+                projectPath: "dir:/rekeyed-checkout",
+                content: "shared fact",
+                hash: "hash:shared",
+                status: "archived",
+            },
+            { content: "shared fact", hash: "hash:shared" },
+        ]);
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        const first = linkedClaimState(db, ids[0]);
+        const second = linkedClaimState(db, ids[1]);
+        expect(second.claimId).toBe(first.claimId);
+        expect(first.state).toBe("active");
+        expect(inspectClaimsBackfillReconciliation(db).warningCount).toBe(0);
+    });
+
+    test("an archived alias row adopted before its permanent twin leaves the shared claim permanent", async () => {
+        const { db, ids } = migrateLazyWithRekeyedAlias([
+            {
+                projectPath: "dir:/rekeyed-checkout",
+                content: "shared fact",
+                hash: "hash:shared",
+                status: "archived",
+            },
+            { content: "shared fact", hash: "hash:shared", status: "permanent" },
+        ]);
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        const first = linkedClaimState(db, ids[0]);
+        const second = linkedClaimState(db, ids[1]);
+        expect(second.claimId).toBe(first.claimId);
+        expect(first.state).toBe("permanent");
+        expect(inspectClaimsBackfillReconciliation(db).warningCount).toBe(0);
+    });
+
+    test("an unknown legacy status adopts as archived, never active", async () => {
+        const { db, ids } = migrateLazy([{ content: "deleted status row", status: "deleted" }]);
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        expect(linkedClaimState(db, ids[0]).state).toBe("archived");
+        expect(inspectClaimsBackfillReconciliation(db).warningCount).toBe(0);
     });
 });

@@ -11,6 +11,7 @@ import {
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
     ClaimOperationKeyReuseError,
     canonicalMemoryProjectPathSql,
+    claimStateFromMemoryStatus,
     clearMemoryClaimFailpoints,
     createMemoryWithClaimsInCurrentTransaction,
     deleteMemoryWithClaimsInCurrentTransaction,
@@ -1646,12 +1647,11 @@ describe("memory/claims kernel: module delta replay", () => {
 });
 
 describe("memory/claims kernel: shared-claim lifecycle rank", () => {
-    /** Second projection row deduped onto the seeded claim via an alias path
-     *  (the live-DB shape after an identity merge): the unique (path,
-     *  category, hash) projection index admits the duplicate, and its first
-     *  kernel write links it to the survivor's canonical claim. */
-    function insertAliasSibling(db: Database, content: string): number {
-        const aliasPath = "git:kernel-project-alias";
+    /** Register a second path string aliased to the seed project (the live-DB
+     *  shape after an identity merge): the unique (path, category, hash)
+     *  projection index then admits duplicate rows that dedup onto the
+     *  survivor's canonical claim. */
+    function registerAliasPath(db: Database, aliasPath: string): void {
         const projectId = (
             db
                 .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
@@ -1660,6 +1660,13 @@ describe("memory/claims kernel: shared-claim lifecycle rank", () => {
         db.prepare(
             "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, 1)",
         ).run(aliasPath, projectId);
+    }
+
+    /** Second projection row deduped onto the seeded claim via an alias path:
+     *  its first kernel write links it to the survivor's canonical claim. */
+    function insertAliasSibling(db: Database, content: string): number {
+        const aliasPath = "git:kernel-project-alias";
+        registerAliasPath(db, aliasPath);
         let siblingId = 0;
         runInMemoryClaimsWriteTransaction(db, () => {
             siblingId = Number(
@@ -1742,5 +1749,32 @@ describe("memory/claims kernel: shared-claim lifecycle rank", () => {
         });
         // The survivor still asserts the claim, so no archive event fires.
         expect(count(db, "verification_events", "outcome = 'archive'")).toBe(0);
+    });
+
+    test("creating a duplicate via an alias path never downgrades a permanent shared claim", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "rank-create-seed", "rank create fact");
+        setStatus(db, "rank-create-permanent", survivor.memoryId, "permanent");
+        registerAliasPath(db, "git:kernel-project-alias");
+        const duplicate = createSeedMemory(
+            db,
+            "rank-create-duplicate",
+            "rank create fact",
+            "git:kernel-project-alias",
+        );
+        expect(duplicate.claimId).toBe(survivor.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "permanent",
+        });
+    });
+});
+
+describe("claim state from memory status", () => {
+    test("unknown or NULL status maps to archived, never active", () => {
+        expect(claimStateFromMemoryStatus("active")).toBe("active");
+        expect(claimStateFromMemoryStatus("permanent")).toBe("permanent");
+        expect(claimStateFromMemoryStatus("archived")).toBe("archived");
+        expect(claimStateFromMemoryStatus("deleted")).toBe("archived");
+        expect(claimStateFromMemoryStatus(null)).toBe("archived");
     });
 });
