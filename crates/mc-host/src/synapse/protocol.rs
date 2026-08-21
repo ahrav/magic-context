@@ -589,7 +589,12 @@ pub(crate) fn decode_request(
             parse_query(envelope.0.params.0, lane, limits)
         }
         "embed.batch" => {
-            let params = decode_batch(body, limits.max_batch_items)?;
+            // Every accepted item consumes at least RESERVE_MIN_ITEM_BODY_BYTES
+            // of body (a 64-hex hash plus field skeleton), so tightening the
+            // item cap by the body can never reject a batch the configured
+            // cap would have accepted; it only stops a small request from
+            // pre-allocating (and reserving) configuration-sized capacity.
+            let params = decode_batch(body, body_item_bound(body.len(), limits.max_batch_items))?;
             parse_batch(params, lane, limits)
         }
         "embed.result" => {
@@ -634,6 +639,14 @@ const RESERVE_BODY_FACTOR: usize = 3;
 /// bound.
 const RESERVE_MIN_ITEM_BODY_BYTES: usize = 64;
 
+/// The most batch items a body of `body_len` bytes can decode into:
+/// the configured cap, tightened by what the body could physically
+/// contain. Shared by the parse reservation and the batch seed's
+/// pre-allocation so both scale with the request, not the configuration.
+fn body_item_bound(body_len: usize, max_batch_items: usize) -> usize {
+    max_batch_items.min(body_len / RESERVE_MIN_ITEM_BODY_BYTES + 1)
+}
+
 /// Conservative upper bound on every parse-phase heap allocation for one
 /// request body — the allocation phase ledger's maximum covered phase.
 /// `None` on arithmetic overflow, which callers treat as unsatisfiable.
@@ -642,9 +655,7 @@ const RESERVE_MIN_ITEM_BODY_BYTES: usize = 64;
 /// inflate the method-independent reservation for small (or non-batch)
 /// bodies past the ingress pool and wedge every request into `queue_full`.
 pub(crate) fn parse_reservation_bytes(body_len: usize, limits: &SynapseLimits) -> Option<usize> {
-    let item_bound = limits
-        .max_batch_items
-        .min(body_len / RESERVE_MIN_ITEM_BODY_BYTES + 1);
+    let item_bound = body_item_bound(body_len, limits.max_batch_items);
     body_len
         .checked_mul(RESERVE_BODY_FACTOR)?
         .checked_add(item_bound.checked_mul(RESERVE_PER_ITEM_BYTES)?)?
