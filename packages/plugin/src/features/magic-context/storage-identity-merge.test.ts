@@ -822,6 +822,57 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("a collision merge promotes a side-table-only verified source onto the survivor with claim evidence", () => {
+        const database = makeDb();
+        const source = insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const target = insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        // Pre-v84 TypeScript verification: positive verified_at lives only in
+        // memory_verifications; the projection columns stay unverified.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 123, 100)`,
+                )
+                .run(source.id);
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        expect(
+            database
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(target.id),
+        ).toEqual({ status: "verified", at: 123 });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, target.id);
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(survivorClaim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "identity-merge" }]);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${target.id}:evidence`),
+        ).toEqual({ count: 1 });
+    });
+
     test("a generic rekey routes an unadoptable lineage-bearing row to a diagnostic instead of aborting", () => {
         const database = makeDb();
         const adoptableId = insertMemory(database, "dir:old", "movable fact", "move-h1");

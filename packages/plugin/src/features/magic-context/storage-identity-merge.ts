@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../../shared/sqlite";
-import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "./claims-backfill";
+import {
+    readMemorySideTableVerifiedAt,
+    recordAdoptedMemoryVerifiedEventInCurrentTransaction,
+} from "./claims-backfill";
 import { moveLinkedMemoryAcrossProjects } from "./memory/relocate-memory";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 import {
@@ -220,9 +223,16 @@ function adoptIdentityMergeRowClaims(
                     effectType: "upsert" as const,
                 });
             }
+            // Pre-v84 TypeScript verification writes a positive verified_at
+            // only to the memory_verifications side table, so the side
+            // table's maximum stands in when the source projection columns
+            // are unset.
+            const sourceVerifiedAt =
+                sourceRow.verification_status === "verified" && (sourceRow.verified_at ?? 0) > 0
+                    ? (sourceRow.verified_at as number)
+                    : readMemorySideTableVerifiedAt(db, sourceId);
             if (
-                sourceRow.verification_status === "verified" &&
-                (sourceRow.verified_at ?? 0) > 0 &&
+                sourceVerifiedAt > 0 &&
                 (targetRow.verification_status !== "verified" || (targetRow.verified_at ?? 0) <= 0)
             ) {
                 // The caller copies the source's verification mappings onto
@@ -235,7 +245,7 @@ function adoptIdentityMergeRowClaims(
                     `UPDATE memories
                         SET verification_status = 'verified', verified_at = ?, updated_at = ?
                       WHERE id = ?`,
-                ).run(sourceRow.verified_at, mergedAt, collisionTargetId);
+                ).run(sourceVerifiedAt, mergedAt, collisionTargetId);
                 if (
                     recordAdoptedMemoryVerifiedEventInCurrentTransaction(
                         db,

@@ -320,6 +320,45 @@ describe("memory/claims kernel: content and classification updates", () => {
                 .get(seeded.memoryId),
         ).toEqual({ seen_count: 2 });
     });
+
+    test("a content update without a source session carries the row's session; a telemetry-only delta appends nothing", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "content-session-seed", "session default fact");
+
+        const updated = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("content-session-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    content: "session default fact v2",
+                    normalizedHash: "hash:session default fact v2",
+                    nowMs: 2_000,
+                },
+            ),
+        );
+        expect(updated.result.revisionId).not.toBeNull();
+        expect(
+            db
+                .prepare("SELECT source_session_id AS session FROM claim_revisions WHERE id = ?")
+                .get(updated.result.revisionId),
+        ).toEqual({ session: "ses-kernel" });
+
+        // The revision carries the row's session, so a following module
+        // snapshot with an unchanged postimage appends nothing.
+        const before = snapshotCounts(db);
+        const delta = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("content-session-2", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId, applyProjection: () => {} },
+            ),
+        );
+        expect(delta.result.revisionId).toBeNull();
+        const after = snapshotCounts(db);
+        expect(after.claim_revisions).toBe(before.claim_revisions);
+        expect(after.claim_change_outbox).toBe(before.claim_change_outbox);
+    });
 });
 
 describe("memory/claims kernel: atomicity and idempotency", () => {
@@ -779,6 +818,60 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
                 .prepare("SELECT verification_status FROM memories WHERE id = ?")
                 .get(seeded.memoryId),
         ).toEqual({ verification_status: "stale" });
+    });
+
+    test("a module delta advancing verified_at with a content change lands one verified event on the new revision", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "reverify-seed", "reverify fact");
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("reverify-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET verification_status = 'verified', verified_at = 5000 WHERE id = ?",
+                        ).run(seeded.memoryId);
+                    },
+                },
+            ),
+        );
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(1);
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("reverify-2", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET content = ?, normalized_hash = ?, verified_at = 6000 WHERE id = ?",
+                        ).run("reverify fact v2", "hash:reverify fact v2", seeded.memoryId);
+                    },
+                },
+            ),
+        );
+        expect(outcome.result.revisionId).not.toBeNull();
+        // The re-verification event attaches to the NEW current revision,
+        // with a matching evidence effect; the status did not change.
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(2);
+        expect(
+            db
+                .prepare(
+                    "SELECT revision_id AS revisionId FROM verification_events WHERE outcome = 'verified' ORDER BY id DESC LIMIT 1",
+                )
+                .get(),
+        ).toEqual({ revisionId: outcome.result.revisionId });
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'`,
+            ),
+        ).toBe(2);
     });
 });
 

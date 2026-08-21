@@ -533,23 +533,40 @@ function readClaimCurrentRevisionId(db: Database, claimId: number): number {
 }
 
 /**
- * Carry a projection row's verified status onto its adopted claim as one
- * current-revision verified event. Mapped-only rows (no positive
- * `verified_at`) record nothing. Shared by the boundary backfill and the
- * relocation adoption sites; returns true when an event was recorded so
- * callers can emit a matching evidence effect.
+ * Compat verification truth for one memory outside the projection columns:
+ * the maximum `memory_verifications.verified_at`, or 0 when the row is
+ * mapped-only or unmapped. Pre-v84 TypeScript verification writes a positive
+ * `verified_at` only to this side table, never to the projection's
+ * verification columns.
+ */
+export function readMemorySideTableVerifiedAt(db: Database, memoryId: number): number {
+    const row = db
+        .prepare(
+            "SELECT MAX(verified_at) AS verifiedAt FROM memory_verifications WHERE memory_id = ?",
+        )
+        .get(memoryId) as { verifiedAt: number | null } | undefined;
+    return row?.verifiedAt ?? 0;
+}
+
+/**
+ * Carry a memory's verified status onto its adopted claim as one
+ * current-revision verified event. A row counts as verified when either the
+ * projection columns say so or the `memory_verifications` side table carries
+ * a positive `verified_at` (the only place pre-v84 TypeScript verification
+ * writes). Mapped-only rows (no positive `verified_at` anywhere) record
+ * nothing. Shared by the boundary backfill, relocation, and identity-merge
+ * adoption sites; returns true when an event was recorded so callers can
+ * emit a matching evidence effect.
  */
 export function recordAdoptedMemoryVerifiedEventInCurrentTransaction(
     db: Database,
-    row: Pick<MemoryProjectionRow, "verification_status" | "verified_at">,
+    row: Pick<MemoryProjectionRow, "id" | "verification_status" | "verified_at">,
     claimId: number,
     verifier: string,
 ): boolean {
-    if (
-        row.verification_status !== "verified" ||
-        row.verified_at === null ||
-        row.verified_at <= 0
-    ) {
+    const projectionVerified =
+        row.verification_status === "verified" && row.verified_at !== null && row.verified_at > 0;
+    if (!projectionVerified && readMemorySideTableVerifiedAt(db, row.id) <= 0) {
         return false;
     }
     addVerificationEvent(db, {

@@ -1341,11 +1341,15 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
+        // The projection write leaves source_session_id untouched, so the
+        // revision defaults to the row's session (like every other revision
+        // path); an explicit input session still wins.
+        const sessionId = input.sourceSessionId ?? row.source_session_id;
         const observationId = createMemoryObservation(db, {
             projectId,
             memoryId: row.id,
             content: input.content,
-            provenance: liveProvenance(envelope, input.sourceSessionId),
+            provenance: liveProvenance(envelope, sessionId),
         });
         // The content update resets shareable in the projection; the revision
         // metadata mirrors that post-state.
@@ -1357,7 +1361,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                 normalizedHash: input.normalizedHash,
                 shareable: 0,
             }),
-            sourceSessionId: input.sourceSessionId ?? null,
+            sourceSessionId: sessionId,
         });
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         updateMemoryProjectionContent(db, row.id, input.content, input.normalizedHash, input.nowMs);
@@ -2054,6 +2058,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
     const replay = readMemoryClaimOperationResult<ModuleMemoryDeltaResult>(db, envelope);
     const pre = readMemoryProjectionRow(db, input.memoryId);
     let preLink: MemoryClaimLink | null = null;
+    let preimageAdopted = false;
     let preRelationshipEffects: MemoryClaimEffect[] = [];
     if (pre && pre.content.length > 0) {
         if (replay) {
@@ -2070,9 +2075,16 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 preProjectId !== null &&
                 memoryClaimAdoptionFailureReason(pre, preProjectId) === null
             ) {
+                // The adoption writes the link before the postimage probe
+                // below reads it, so the probe must not mistake this run's
+                // own adoption for a pre-existing link: a first adoption owes
+                // the outbox an upsert effect even when the postimage is
+                // semantically unchanged.
+                const wasLinked = readMemoryClaimLink(db, pre.id) !== null;
                 preLink = ensureMemoryClaimLinkInCurrentTransaction(db, pre, preProjectId, {
                     kind: "migration",
                 });
+                preimageAdopted = !wasLinked;
             }
         }
         if (preLink) {
@@ -2132,7 +2144,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 };
             }
 
-            const previouslyLinked = readMemoryClaimLink(db, post.id) !== null;
+            const previouslyLinked = !preimageAdopted && readMemoryClaimLink(db, post.id) !== null;
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, post, projectId, {
                 kind: "live",
                 producer: envelope.producer,
@@ -2200,7 +2212,17 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
             }
 
             const outcome = VERIFICATION_EVENT_OUTCOMES[post.verification_status];
-            if (outcome && post.verification_status !== (pre?.verification_status ?? null)) {
+            const statusChanged = post.verification_status !== (pre?.verification_status ?? null);
+            // A verified row can re-verify (verified_at advances) or gain a
+            // content revision without a status flip; both leave the current
+            // revision with no evidence unless an event lands here. The block
+            // runs after the revision append, so the event attaches to the
+            // new current revision. The single guard fires at most one event
+            // per delta, so an overlapping status change cannot double-emit.
+            const positiveAdvanced =
+                outcome === "verified" && (post.verified_at ?? 0) > (pre?.verified_at ?? 0);
+            const positiveRevision = outcome === "verified" && revisionId !== null;
+            if (outcome && (statusChanged || positiveAdvanced || positiveRevision)) {
                 addVerificationEvent(db, {
                     revisionId: readClaimCurrentRevisionId(db, link.claimId),
                     outcome,

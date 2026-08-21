@@ -24,6 +24,8 @@ import {
 } from "./claims-backfill";
 import { deleteMemory, insertMemory } from "./memory/storage-memory";
 import {
+    applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
+    computeClaimRequestDigest,
     parseMemoryClaimMergedFrom,
     runInMemoryClaimsWriteTransaction,
 } from "./memory/storage-memory-claims";
@@ -885,5 +887,108 @@ describe("claims backfill reconciliation", () => {
         expect(report.ok).toBeFalse();
         expect(report.problems.join("\n")).toContain("missing a crosswalk link");
         expect(report.problems.join("\n")).toContain("does not equal expected");
+    });
+});
+
+describe("claims backfill lazy preimage adoption effects", () => {
+    function operationOutbox(db: Database, operationKey: string): Array<{ effectKey: string }> {
+        return db
+            .prepare(
+                `SELECT effect_key AS effectKey FROM claim_change_outbox
+                  WHERE operation_id = (SELECT id FROM claim_operations WHERE operation_key = ?)`,
+            )
+            .all(operationKey) as Array<{ effectKey: string }>;
+    }
+
+    function expectedEffectCount(db: Database, operationKey: string): number {
+        return (
+            db
+                .prepare(
+                    "SELECT expected_effect_count AS count FROM claim_operations WHERE operation_key = ?",
+                )
+                .get(operationKey) as { count: number }
+        ).count;
+    }
+
+    function moduleDelta(db: Database, memoryId: number, operationKey: string): void {
+        runInMemoryClaimsWriteTransaction(db, () => {
+            const outcome = applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "kernel-test",
+                    operationKey,
+                    requestDigest: computeClaimRequestDigest({ key: operationKey }),
+                },
+                // An empty projection delta models a telemetry-only snapshot:
+                // the postimage is semantically unchanged.
+                { memoryId, applyProjection: () => {} },
+            );
+            expect(outcome.result.claimId).not.toBeNull();
+        });
+    }
+
+    test("a telemetry-only module delta on an unlinked boundary row emits the adoption upsert and reconciles", () => {
+        const { db, ids } = migrateLazy([{ content: "lazy adoption row" }]);
+
+        moduleDelta(db, ids[0], "lazy-adopt-1");
+
+        const outbox = operationOutbox(db, "lazy-adopt-1");
+        expect(outbox.map((row) => row.effectKey)).toContain(`memory:${ids[0]}:upsert`);
+        expect(expectedEffectCount(db, "lazy-adopt-1")).toBe(outbox.length);
+        expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
+    });
+
+    test("a telemetry-only module delta on an unlinked boundary row with lineage emits the upsert and lineage effects", () => {
+        const { db, ids } = migrateLazy([
+            { content: "lineage source", hash: "lineage-source" },
+            { content: "lineage target", hash: "lineage-target", mergedFrom: "[1]" },
+        ]);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            const source = readMemoryProjectionRow(db, ids[0]);
+            if (!source) throw new Error(`missing boundary memory ${ids[0]}`);
+            expect(adoptBoundaryMemoryRowInCurrentTransaction(db, source)).toBeTrue();
+        });
+
+        moduleDelta(db, ids[1], "lazy-adopt-lineage-1");
+
+        const keys = operationOutbox(db, "lazy-adopt-lineage-1").map((row) => row.effectKey);
+        expect(keys).toContain(`memory:${ids[1]}:upsert`);
+        expect(
+            keys.some(
+                (key) =>
+                    key.startsWith(`memory:${ids[1]}:relations:`) && key.endsWith(":lineage:0"),
+            ),
+        ).toBeTrue();
+        expect(expectedEffectCount(db, "lazy-adopt-lineage-1")).toBe(keys.length);
+    });
+
+    test("boundary adoption records one verified event for a side-table-only verified row", () => {
+        const { db, ids } = migrateLazy([
+            { content: "compat verified row", mappedFile: "src/compat.ts" },
+            { content: "mapped-only row", hash: "mapped-only", mappedFile: "src/mapped.ts" },
+        ]);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memory_verifications SET verified_at = 4600 WHERE memory_id = ?",
+            ).run(ids[0]);
+        });
+
+        runInMemoryClaimsWriteTransaction(db, () => {
+            for (const id of ids) {
+                const row = readMemoryProjectionRow(db, id);
+                if (!row) throw new Error(`missing boundary memory ${id}`);
+                expect(adoptBoundaryMemoryRowInCurrentTransaction(db, row)).toBeTrue();
+            }
+        });
+
+        // The projection columns stay unverified; only the side table carries
+        // the positive verified_at. The mapped-only row records nothing.
+        expect(
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM verification_events WHERE outcome = 'verified' AND verifier = 'claims-backfill'",
+                )
+                .get(),
+        ).toEqual({ count: 1 });
     });
 });
