@@ -675,6 +675,32 @@ describe("project identity merge claims (v84)", () => {
         });
     });
 
+    test("a collision merge between unregistered raw paths records a blocking diagnostic for the skipped claim work", () => {
+        const database = makeDb();
+        const sourceId = insertMemory(database, "/old/raw-checkout", "shared fact", "same-hash");
+        const targetId = insertMemory(database, "/new/raw-checkout", "shared fact", "same-hash");
+
+        mergeProjectIdentities(database, "/old/raw-checkout", "/new/raw-checkout", { now: 70 });
+
+        // The merge proceeds: the source is archived as superseded by the
+        // collision survivor even though no claim work could run.
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ status: "archived", by: targetId });
+        // The skipped claims-side work is observable as a blocking failure
+        // keyed to the source row.
+        expect(
+            database
+                .prepare(
+                    `SELECT reason_code, disposition FROM claim_backfill_failures
+                      WHERE item_kind = 'memory' AND item_key = ?`,
+                )
+                .get(String(sourceId)),
+        ).toEqual({ reason_code: "unresolved-project-identity", disposition: "blocking" });
+    });
+
     test("a collision merge carries the winning classification into the survivor's claim", () => {
         const database = makeDb();
         const source = insertMemoryThroughKernel(database, {

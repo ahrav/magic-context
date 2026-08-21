@@ -30,6 +30,7 @@ import {
     updateMemoryContentWithClaimsInCurrentTransaction,
     updateMemoryVerificationWithClaimsInCurrentTransaction,
 } from "./storage-memory-claims";
+import { recordMemoryMapping, recordMemoryVerifications } from "./storage-memory-verifications";
 
 const PROJECT = "git:kernel-project";
 
@@ -818,6 +819,44 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
                 .prepare("SELECT verification_status FROM memories WHERE id = ?")
                 .get(seeded.memoryId),
         ).toEqual({ verification_status: "stale" });
+    });
+
+    test("ephemeral zero-effect envelopes persist nothing; effect-bearing ones insert normally", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "ephemeral-seed", "ephemeral fact");
+        const operationsBefore = count(db, "claim_operations");
+        const outboxBefore = count(db, "claim_change_outbox");
+        const generationBefore = db
+            .prepare("SELECT generation FROM claim_project_generations")
+            .get() as { generation: number };
+
+        // Mapped-only snapshots always yield zero effects: their random-key
+        // envelopes must not accumulate in claim_operations.
+        recordMemoryMapping(db, seeded.memoryId, ["src/a.ts"], 5_000);
+        recordMemoryMapping(db, seeded.memoryId, ["src/b.ts"], 6_000);
+        expect(count(db, "claim_operations")).toBe(operationsBefore);
+        expect(count(db, "claim_change_outbox")).toBe(outboxBefore);
+        expect(db.prepare("SELECT generation FROM claim_project_generations").get()).toEqual(
+            generationBefore,
+        );
+        // The side-table snapshot itself still applies.
+        expect(
+            db
+                .prepare("SELECT file_path FROM memory_verifications WHERE memory_id = ?")
+                .all(seeded.memoryId),
+        ).toEqual([{ file_path: "src/b.ts" }]);
+
+        // A verified snapshot carries an evidence effect, so its ephemeral
+        // envelope inserts with the full outbox contract.
+        recordMemoryVerifications(db, seeded.memoryId, ["src/a.ts"], 7_000);
+        expect(count(db, "claim_operations")).toBe(operationsBefore + 1);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'`,
+            ),
+        ).toBe(1);
     });
 
     test("a module delta advancing verified_at with a content change lands one verified event on the new revision", () => {

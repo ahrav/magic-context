@@ -3482,4 +3482,90 @@ describe("module mirror claims (v84)", () => {
             database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
         ).toEqual({ c: 0 });
     });
+
+    test("a claim-invalid supersession target keeps its pending reference until a repaired page links the pair", () => {
+        const database = db();
+        // The target carries real content but claim-invalid metadata, so the
+        // content gate passes while adoption fails.
+        const invalidPage = page(0, [
+            {
+                feedSeq: 1,
+                op: "insert",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "old fact", "mm-h1", {
+                    superseded_by_memory_id: 12,
+                }),
+            },
+            {
+                feedSeq: 2,
+                op: "insert",
+                moduleRowId: 12,
+                snapshot: moduleSnapshot(12, "new fact", "mm-h2", { scope: "bogus" }),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: invalidPage });
+
+        const sourceId = (
+            database.prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-h1'").get() as {
+                id: number;
+            }
+        ).id;
+        const targetId = (
+            database.prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-h2'").get() as {
+                id: number;
+            }
+        ).id;
+        // Projection convergence: the pointer is written, but the pending
+        // reference survives with no supersede envelope, so the pair stays
+        // reachable for a retry after repair.
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ s: targetId });
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 1 });
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key LIKE 'memories:supersede:%'",
+                )
+                .get(),
+        ).toEqual({ c: 0 });
+        expect(claimState(database).conflicts).toBe(0);
+
+        // The module repairs the target's metadata: the next page adopts the
+        // target, records the claim edge, and clears the pending reference.
+        const repairedPage = page(2, [
+            {
+                feedSeq: 3,
+                op: "update",
+                moduleRowId: 12,
+                snapshot: moduleSnapshot(12, "new fact", "mm-h2"),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: repairedPage });
+        expect(claimState(database).conflicts).toBe(1);
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key = ?")
+                .get(`memories:supersede:${sourceId}:${targetId}`),
+        ).toEqual({ c: 1 });
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 0 });
+        // The pointer predates the pair link, so the edge translates through
+        // the lineage-snapshot path; exactly one supersession evidence effect
+        // reaches the outbox.
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS c FROM claim_change_outbox
+                      WHERE effect_type = 'evidence'
+                        AND (effect_key = ? OR effect_key LIKE ?)`,
+                )
+                .get(`memory:${targetId}:supersede`, `memory:${sourceId}:relations:%:supersession`),
+        ).toEqual({ c: 1 });
+    });
 });

@@ -208,6 +208,11 @@ export interface MemoryClaimOperationEnvelope {
     operationKey: string;
     /** Canonical request digest (SHA-256 hex over the canonical request). */
     requestDigest: string;
+    /** Marks a random-key envelope no caller can ever present again. A
+     *  zero-effect run of an ephemeral envelope persists nothing: its replay
+     *  record would be unreachable, so storing it only grows
+     *  claim_operations. */
+    ephemeral?: true;
 }
 
 export type MemoryClaimEffectType = "upsert" | "lifecycle" | "evidence";
@@ -288,6 +293,10 @@ export function runMemoryClaimOperationInCurrentTransaction<T>(
     if (replay) return replay;
 
     const { result, effects } = work();
+    // An ephemeral envelope's random key can never be presented again, so a
+    // zero-effect run has no replay value: skip the claim_operations insert,
+    // outbox stamps, and generation allocation entirely.
+    if (envelope.ephemeral && effects.length === 0) return { result, replayed: false };
     const now = Date.now();
     const operationId = toRowId(
         db

@@ -169,7 +169,13 @@ function adoptIdentityMergeRowClaims(
     mergedAt: number,
 ): void {
     const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
-    if (projectId === null) return;
+    if (projectId === null) {
+        // The merge itself proceeds (boundary rows self-heal via lazy
+        // backfill); the blocking diagnostic makes the skipped claim work
+        // observable per row.
+        recordMemoryClaimLinkFailure(db, sourceId, toIdentity, "unresolved-project-identity");
+        return;
+    }
     const sourceRow = readMemoryProjectionRow(db, sourceId);
     if (!sourceRow || sourceRow.content.length === 0) return;
     runMemoryClaimOperationInCurrentTransaction(

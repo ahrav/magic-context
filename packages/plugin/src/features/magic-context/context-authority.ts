@@ -2158,20 +2158,22 @@ function adoptableMemoryClaimLink(db: Database, row: MemoryProjectionRow): Memor
 
 /**
  * Resolve pending supersession references under the claims kernel. A pair
- * translates — projection pointer written, pending row cleared — only when
- * both endpoints carry real content: a placeholder-empty endpoint (minted
- * for a module row whose snapshot has not arrived yet) keeps its pending
- * reference so the next feed page retries the pair. The adoptability probe
- * runs OUTSIDE the claim envelope: a not-yet-adoptable pair commits no
- * envelope at all, because the pair-keyed digest would replay a false result
- * forever and a zero-effect envelope is unprunable.
+ * translates its pointer only when both endpoints carry real content: a
+ * placeholder-empty endpoint (minted for a module row whose snapshot has not
+ * arrived yet) keeps its pending reference so the next feed page retries the
+ * pair. The pending row clears only when the pair holds (or already held)
+ * its claim edge; a content-bearing endpoint that cannot adopt — unresolved
+ * project identity or claim-invalid metadata — keeps the row so a later page
+ * retries after repair. The adoptability probe runs OUTSIDE the claim
+ * envelope: a not-yet-adoptable pair commits no envelope at all, because the
+ * pair-keyed digest would replay a false result forever and a zero-effect
+ * envelope is unprunable.
  *
- * The projection side (pointer, pending row, relationship snapshot) runs on
- * every call, like the module-delta kernel's applyProjection, so a page
- * replay converges even when the claim envelope replays. The
- * relationship-source snapshot is refreshed around the pointer write so the
- * relationship write guard sees the preimage before the write and the
- * translated state after it.
+ * The projection side (pointer, relationship snapshot) runs on every call,
+ * like the module-delta kernel's applyProjection, so a page replay converges
+ * even when the claim envelope replays. The relationship-source snapshot is
+ * refreshed around the pointer write so the relationship write guard sees
+ * the preimage before the write and the translated state after it.
  */
 function translatePendingSupersessionClaims(db: Database, statements: MirrorPageStatements): void {
     for (const pair of readTranslatableSupersessionPairs(db)) {
@@ -2199,10 +2201,21 @@ function translatePendingSupersessionClaims(db: Database, statements: MirrorPage
             (replayed ? null : adoptableMemoryClaimLink(db, target));
 
         // Snapshot the source's current lineage so the pointer write below
-        // matches the guard's preimage requirement (no-op when unlinked).
-        if (sourceLink) translateMemoryClaimRelationshipsInCurrentTransaction(db, source);
+        // matches the guard's preimage requirement (no-op when unlinked). A
+        // pointer written by an earlier not-yet-linkable run translates its
+        // edge here, so the returned effects ride the pair envelope below
+        // instead of being dropped.
+        const snapshotEffects = sourceLink
+            ? translateMemoryClaimRelationshipsInCurrentTransaction(db, source)
+            : [];
         statements.updateSuperseded.run(pair.targetId, pair.sourceId);
-        statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
+        // The pending row is the pair's only retry driver: it clears when the
+        // claim edge exists (linked now, or committed by an earlier run), and
+        // survives an unadoptable endpoint so a later page re-attempts the
+        // pair once its row is repaired.
+        if (replayed || (sourceLink && targetLink)) {
+            statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
+        }
 
         if (sourceLink && targetLink) {
             runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
@@ -2211,19 +2224,16 @@ function translatePendingSupersessionClaims(db: Database, statements: MirrorPage
                     sourceLink,
                     targetLink,
                 );
-                return {
-                    result: recorded,
-                    effects: recorded
-                        ? [
-                              {
-                                  effectKey: `memory:${pair.targetId}:supersede`,
-                                  projectId: targetLink.projectId,
-                                  claimId: targetLink.claimId,
-                                  effectType: "evidence" as const,
-                              },
-                          ]
-                        : [],
-                };
+                const effects = [...snapshotEffects];
+                if (recorded) {
+                    effects.push({
+                        effectKey: `memory:${pair.targetId}:supersede`,
+                        projectId: targetLink.projectId,
+                        claimId: targetLink.claimId,
+                        effectType: "evidence" as const,
+                    });
+                }
+                return { result: recorded, effects };
             });
         }
 
