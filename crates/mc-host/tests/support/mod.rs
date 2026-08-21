@@ -710,3 +710,19 @@ pub fn echo_body(payload: &str) -> Vec<u8> {
 pub fn mode_body(value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&value).expect("body serializes")
 }
+
+/// Asserts every catalog module's `control_ops` equals `expected` exactly, so
+/// an unimplemented operation such as `wake.create` can never be advertised
+/// (protocol AE10) and TypeScript wake-plane probing stays fail-open.
+pub fn assert_control_ops(modules: &serde_json::Value, expected: &[&str]) {
+    let modules = modules.as_array().expect("modules array");
+    assert!(!modules.is_empty(), "catalog returned no modules");
+    let expected = serde_json::json!(expected);
+    for module in modules {
+        assert_eq!(
+            module["control_ops"], expected,
+            "{} control_ops must list implemented operations only",
+            module["module_id"]
+        );
+    }
+}

@@ -18,7 +18,7 @@
 
 import { Socket } from "node:net";
 import { type AuthByteIo, AuthError, authenticateClient } from "./auth";
-import type { Deadline } from "./deadline";
+import { armExpiryTimer, type Deadline } from "./deadline";
 import { SocketClosedError, SocketTimeoutError, SubcCallError } from "./errors";
 import {
     buildFlags,
@@ -212,7 +212,8 @@ interface PendingEntry {
     heldBytes: number;
     resolve: (terminal: RequestTerminal) => void;
     reject: (error: unknown) => void;
-    deadlineTimer: ReturnType<typeof setTimeout> | null;
+    /** Cancels the deadline timer chain; stays valid across re-arms. */
+    cancelDeadlineTimer: (() => void) | null;
     queuedItem: QueuedItem | null;
     ticket: CleanupTicket | null;
 }
@@ -540,7 +541,7 @@ export class ConnectionGeneration {
             heldBytes: 0,
             resolve: resolveResult,
             reject: rejectResult,
-            deadlineTimer: null,
+            cancelDeadlineTimer: null,
             queuedItem: null,
             ticket: null,
         };
@@ -560,7 +561,7 @@ export class ConnectionGeneration {
         };
         entry.queuedItem = item;
         this.pending.set(key, entry);
-        entry.deadlineTimer = this.armTimer(params.deadline.remainingMs(), () =>
+        entry.cancelDeadlineTimer = this.armDeadlineTimer(params.deadline, () =>
             this.onRequestDeadline(entry),
         );
         this.enqueueItem(item);
@@ -696,7 +697,7 @@ export class ConnectionGeneration {
     // ------------------------------------------------------------------
 
     private async setup(deadline: Deadline): Promise<void> {
-        const setupTimer = this.armTimer(deadline.remainingMs(), () =>
+        const cancelSetupTimer = this.armDeadlineTimer(deadline, () =>
             this.retire(
                 "setup_deadline",
                 new SocketTimeoutError("connection setup deadline expired"),
@@ -720,7 +721,7 @@ export class ConnectionGeneration {
             this.phase = "frames";
             this.moveAuthLeftoverToInbox();
         } finally {
-            this.disarmTimer(setupTimer);
+            cancelSetupTimer();
         }
         this.processInbox();
     }
@@ -1185,9 +1186,9 @@ export class ConnectionGeneration {
     }
 
     private clearEntryDeadline(entry: PendingEntry): void {
-        if (entry.deadlineTimer !== null) {
-            this.disarmTimer(entry.deadlineTimer);
-            entry.deadlineTimer = null;
+        if (entry.cancelDeadlineTimer !== null) {
+            entry.cancelDeadlineTimer();
+            entry.cancelDeadlineTimer = null;
         }
     }
 
@@ -1520,6 +1521,21 @@ export class ConnectionGeneration {
         );
         this.timers.add(timer);
         return timer;
+    }
+
+    /**
+     * Deadline-bound timer whose callback implies `deadline.isExpired()`.
+     * Request and setup deadline errors feed replay-token gates that
+     * re-sample `isExpired()`; a single-shot timer can fire fractionally
+     * early and let the token spend a spurious extra attempt. Re-arms
+     * stay inside the retirement-gated tracked timer set. The returned
+     * cancel function stays valid across re-arms.
+     */
+    private armDeadlineTimer(deadline: Deadline, fn: () => void): () => void {
+        return armExpiryTimer(deadline, fn, {
+            schedule: (fire, ms) => this.armTimer(ms, fire),
+            cancel: (handle) => this.disarmTimer(handle as ReturnType<typeof setTimeout>),
+        });
     }
 
     private disarmTimer(timer: ReturnType<typeof setTimeout>): void {

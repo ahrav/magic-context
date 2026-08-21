@@ -86,16 +86,9 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
     let body = frame.json();
     let modules = body["modules"].as_array().expect("modules");
     assert_eq!(modules.len(), 2);
-    // `control_ops` excludes `wake.create` because the direct host does not
-    // implement it; wake-plane probes therefore fail open.
-    for module in modules {
-        assert_eq!(
-            module["control_ops"],
-            serde_json::json!([]),
-            "{} must not advertise unimplemented operations",
-            module["module_id"]
-        );
-    }
+    // Neither module implements any control op; `wake.create` stays
+    // excluded so wake-plane probes fail open (AE10).
+    support::assert_control_ops(&body["modules"], &[]);
 
     let err = client
         .route_open_target("management_surface", "synapse", ROOT, "opencode", "s1")

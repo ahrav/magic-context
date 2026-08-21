@@ -70,3 +70,49 @@ export class Deadline {
         return new Deadline(Math.min(this.clock() + budgetMs, this.endMs), this.clock);
     }
 }
+
+/**
+ * Timer hooks for {@link armExpiryTimer}. Callers with tracked timers (a
+ * connection's retirement-gated timer set) plug in their own schedule/cancel
+ * pair; the default is a plain `setTimeout`/`clearTimeout`.
+ */
+export interface ExpiryTimerScheduler {
+    schedule(fn: () => void, ms: number): unknown;
+    cancel(handle: unknown): void;
+}
+
+const defaultScheduler: ExpiryTimerScheduler = {
+    schedule: (fn, ms) => setTimeout(fn, ms),
+    cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
+/**
+ * Run `onExpired` only once `deadline.isExpired()` is provably true.
+ *
+ * `setTimeout` truncates fractional delays and its clock is sampled
+ * independently of the deadline's, so a single-shot timer armed with
+ * `remainingMs()` can fire a sub-millisecond slice before the monotonic end.
+ * Callers that consult `isExpired()` after receiving a deadline rejection —
+ * the one-shot replay-token gates — need the two to agree: an early-fired
+ * deadline error while `isExpired()` still reads false lets the replay token
+ * spend a spurious extra connect and route open. This re-arms until the
+ * deadline is provably expired, so `onExpired` implies `isExpired()`.
+ *
+ * Returns a cancel function that stays valid across re-arms.
+ */
+export function armExpiryTimer(
+    deadline: Deadline,
+    onExpired: () => void,
+    scheduler: ExpiryTimerScheduler = defaultScheduler,
+): () => void {
+    let handle: unknown;
+    const fire = (): void => {
+        if (!deadline.isExpired()) {
+            handle = scheduler.schedule(fire, Math.max(1, deadline.remainingMs()));
+            return;
+        }
+        onExpired();
+    };
+    handle = scheduler.schedule(fire, Math.max(0, deadline.remainingMs()));
+    return () => scheduler.cancel(handle);
+}
