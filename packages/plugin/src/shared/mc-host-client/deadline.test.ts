@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { Deadline, type MonotonicClock } from "./deadline";
+import {
+    armExpiryTimer,
+    Deadline,
+    type ExpiryTimerScheduler,
+    type MonotonicClock,
+} from "./deadline";
 
 function fakeClock(startMs = 0): { clock: MonotonicClock; advance: (ms: number) => void } {
     let now = startMs;
@@ -116,5 +121,107 @@ describe("Deadline", () => {
         expect(deadline.isExpired()).toBe(false);
         expect(deadline.remainingMs()).toBeGreaterThan(0);
         expect(deadline.remainingMs()).toBeLessThanOrEqual(60_000);
+    });
+});
+
+/** Manually-driven scheduler: the test decides exactly when a timer fires. */
+function fakeScheduler(): {
+    scheduler: ExpiryTimerScheduler;
+    fireNext: () => void;
+    scheduledCount: () => number;
+    cancelledCount: () => number;
+} {
+    let nextHandle = 0;
+    const armed = new Map<number, () => void>();
+    let scheduled = 0;
+    let cancelled = 0;
+    return {
+        scheduler: {
+            schedule: (fn: () => void) => {
+                scheduled += 1;
+                nextHandle += 1;
+                armed.set(nextHandle, fn);
+                return nextHandle;
+            },
+            cancel: (handle: unknown) => {
+                if (armed.delete(handle as number)) cancelled += 1;
+            },
+        },
+        fireNext: () => {
+            const [handle, fn] = [...armed.entries()][0] ?? [];
+            if (handle === undefined || !fn) throw new Error("no timer armed");
+            armed.delete(handle);
+            fn();
+        },
+        scheduledCount: () => scheduled,
+        cancelledCount: () => cancelled,
+    };
+}
+
+describe("armExpiryTimer", () => {
+    test("an early-fired timer re-arms instead of reporting expiry", () => {
+        const { clock, advance } = fakeClock();
+        const { scheduler, fireNext, scheduledCount } = fakeScheduler();
+        const deadline = Deadline.start(30, clock);
+        let expired = 0;
+        armExpiryTimer(deadline, () => (expired += 1), scheduler);
+
+        // The timer fires while the deadline's clock still reads unexpired —
+        // the truncated-setTimeout race. The callback must not run.
+        advance(29);
+        fireNext();
+        expect(expired).toBe(0);
+        expect(scheduledCount()).toBe(2);
+
+        // Once the clock passes the end, the re-armed timer reports expiry,
+        // so the callback always implies isExpired().
+        advance(1);
+        expect(deadline.isExpired()).toBe(true);
+        fireNext();
+        expect(expired).toBe(1);
+    });
+
+    test("re-arms repeatedly until the deadline is provably expired", () => {
+        const { clock, advance } = fakeClock();
+        const { scheduler, fireNext } = fakeScheduler();
+        const deadline = Deadline.start(10, clock);
+        let expired = 0;
+        armExpiryTimer(deadline, () => (expired += 1), scheduler);
+
+        for (let elapsed = 0; elapsed < 10; elapsed += 2) {
+            fireNext();
+            expect(expired).toBe(0);
+            advance(2);
+        }
+        fireNext();
+        expect(expired).toBe(1);
+    });
+
+    test("cancel stays valid across re-arms", () => {
+        const { clock, advance } = fakeClock();
+        const { scheduler, fireNext, cancelledCount } = fakeScheduler();
+        const deadline = Deadline.start(30, clock);
+        let expired = 0;
+        const cancel = armExpiryTimer(deadline, () => (expired += 1), scheduler);
+
+        advance(15);
+        fireNext(); // early fire → re-arm replaces the original handle
+        cancel(); // must cancel the re-armed timer, not the stale handle
+        expect(cancelledCount()).toBe(1);
+        advance(1_000);
+        expect(deadline.isExpired()).toBe(true);
+        expect(expired).toBe(0);
+        expect(() => fireNext()).toThrow("no timer armed");
+    });
+
+    test("an already-expired deadline reports on the first fire", () => {
+        const { clock, advance } = fakeClock();
+        const { scheduler, fireNext } = fakeScheduler();
+        const deadline = Deadline.start(5, clock);
+        advance(10);
+        let expired = 0;
+        armExpiryTimer(deadline, () => (expired += 1), scheduler);
+        fireNext();
+        expect(expired).toBe(1);
     });
 });

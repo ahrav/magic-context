@@ -83,8 +83,12 @@ async fn corrupt_bundle_degrades_synapse_and_keeps_magic_context_routable() {
         .expect("catalog request");
     let frame = client.frame_within(BUDGET).await.expect("catalog");
     assert_eq!(frame.corr, corr);
-    let modules = frame.json()["modules"].as_array().expect("modules").len();
-    assert_eq!(modules, 2);
+    let body = frame.json();
+    let modules = body["modules"].as_array().expect("modules");
+    assert_eq!(modules.len(), 2);
+    // Neither module implements any control op; `wake.create` stays
+    // excluded so wake-plane probes fail open (AE10).
+    support::assert_control_ops(&body["modules"], &[]);
 
     let err = client
         .route_open_target("management_surface", "synapse", ROOT, "opencode", "s1")

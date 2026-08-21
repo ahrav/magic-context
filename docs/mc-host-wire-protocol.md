@@ -350,10 +350,10 @@ An unfiltered request MUST return exactly two entries — `magic-context` then `
 | `modules[i].module_id` | `magic-context` or `synapse` |
 | `modules[i].module_version` | that manifest's exact build version |
 | `modules[i].roles` | that manifest's complete `provides` array, including tool schemas |
-| `modules[i].control_ops` | implemented module control operations only; currently no `wake.create` |
+| `modules[i].control_ops` | implemented module control operations only; the direct profile never includes `wake.create` |
 | `subc_ops` | `route.open`, `catalog.list` |
 
-The Synapse entry is immutable identity, not readiness: it stays in the catalog even when the model bundle is missing or invalid (Section 7.5.1). Current direct host does not implement `wake.create`, so wake-plane probing remains fail-open. `generation` changes only when catalog content changes and is unrelated to connection generation.
+The Synapse entry is immutable identity, not readiness: it stays in the catalog even when the model bundle is missing or invalid (Section 7.5.1). The direct host is final-decision unsupported for `wake.create`: an advertised `wake.create` entry is an ownership certificate for the complete scheduled-wake lifecycle (durable scheduling, agent-callable lifecycle operations, backlog adoption, and readiness withdrawal), not a readiness hint, and the direct profile owns none of it. Wake-plane probing therefore remains fail-open against this profile; only a future host that owns the complete lifecycle may advertise the capability. `generation` changes only when catalog content changes and is unrelated to connection generation.
 
 ### 7.4 Operation classification
 
@@ -784,7 +784,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | --- | --- | --- |
 | `packages/plugin/src/hooks/magic-context/module-transport.ts` | v2 auth/frame, route cache by generation, opaque bodies, close race, outcome-safe retry | `magic-context-c50.5` |
 | `packages/plugin/src/features/magic-context/memory/embedding-synapse.ts` | managed call and `not_sent` / `outcome_unknown` / `terminal` distinction; its synapse `management_surface` route binds under the Section 7.2 matrix and speaks the Section 7.5 application protocol | `magic-context-c50.5`, synapse protocol in `magic-context-c50.6` |
-| `packages/plugin/src/features/magic-context/smart-notes/wake-plane.ts` | tagged truthful catalog; absent `wake.create` fails open | `magic-context-c50.5` |
+| `packages/plugin/src/features/magic-context/smart-notes/wake-plane.ts` | tagged truthful catalog; absent `wake.create` fails open (final direct-host posture, `magic-context-c50.7`) | `magic-context-c50.5`, `magic-context-c50.7` |
 | `crates/mc-module/src/historian_producer.rs` | raw auth, first endpoint, route open, monotonic correlation, streaming, Error, Goodbye; Ping/Pong echo required (Section 9.3, currently missing) | `magic-context-c50.4`, route target in `magic-context-c50.11` |
 | `crates/mc-module/src/session_resolver.rs` | managed Rust route-open deadline and terminal module errors; its thalamus `management_surface` target is unsupported by this profile and MUST be replaced or disabled (Section 7.2) | `magic-context-c50.4` |
 | `crates/mc-module/src/lib.rs` | initialize once, bind before response, route-gone once, atomics-only health, store readiness | `magic-context-c50.3` / `.4` |
