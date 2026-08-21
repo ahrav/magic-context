@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { inspectClaimsBackfillReconciliation } from "../claims-backfill";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { sha256Utf8Hex } from "./storage-claims";
@@ -20,7 +21,9 @@ import {
     MEMORY_CLAIM_FAILPOINT_IDS,
     type MemoryClaimFailpointId,
     type MemoryClaimOperationEnvelope,
+    memoryClaimSupersessionExists,
     mergeMemoryStatsWithClaimsInCurrentTransaction,
+    readMemoryClaimLink,
     replaceMemoryVerificationFilesWithClaimsInCurrentTransaction,
     runInMemoryClaimsWriteTransaction,
     setMemoryClaimFailpoint,
@@ -286,6 +289,54 @@ describe("memory/claims kernel: content and classification updates", () => {
                 }
             ).generation,
         ).toBe(2);
+    });
+
+    test("a content update on a verified memory records a verified event on the new revision", () => {
+        const db = track(migratedDb());
+        const projectionSeed = createSeedMemory(db, "verified-update-seed", "projection verified");
+        const sideTableSeed = createSeedMemory(db, "side-verified-update-seed", "side verified");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+            ).run(projectionSeed.memoryId);
+            // Pre-v84 TypeScript verification: positive verified_at lives only
+            // in memory_verifications; the projection columns stay unverified.
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/compat.ts', 123, 100)`,
+            ).run(sideTableSeed.memoryId);
+        });
+
+        for (const [key, seeded] of [
+            ["verified-update-1", projectionSeed],
+            ["side-verified-update-1", sideTableSeed],
+        ] as const) {
+            const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+                updateMemoryContentWithClaimsInCurrentTransaction(db, envelope(key, { key }), {
+                    memoryId: seeded.memoryId,
+                    content: `${key} rewritten`,
+                    normalizedHash: `hash:${key} rewritten`,
+                }),
+            );
+            expect(outcome.result.revisionId).not.toBeNull();
+            // The verified event attaches to the NEW current revision, with a
+            // matching evidence effect in the operation's outbox.
+            expect(
+                db
+                    .prepare(
+                        "SELECT outcome, verifier FROM verification_events WHERE revision_id = ?",
+                    )
+                    .all(outcome.result.revisionId),
+            ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
+            expect(
+                count(
+                    db,
+                    "claim_change_outbox",
+                    `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'
+                     AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = '${key}')`,
+                ),
+            ).toBe(1);
+        }
     });
 
     test("a classification-only change appends a same-content revision with new metadata; a seen-count bump touches only memory_stats", () => {
@@ -715,6 +766,112 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
                 "operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'supersede-1')",
             ),
         ).toBe(2);
+    });
+
+    test("superseding a shared-claim projection with a live sibling records no supersession edge", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "shared-supersede", "shared supersede fact");
+        const target = createSeedMemory(db, "shared-supersede-target", "replacement fact");
+        // The live-DB shape after an identity merge: a second path string
+        // aliased to the same project admits a duplicate row that dedups onto
+        // the survivor's canonical claim.
+        const aliasPath = "git:kernel-project-alias";
+        const projectId = (
+            db
+                .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
+                .get(PROJECT) as { id: number }
+        ).id;
+        db.prepare(
+            "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, 1)",
+        ).run(aliasPath, projectId);
+        let sourceId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            sourceId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(aliasPath, "shared supersede fact", "hash:shared supersede fact")
+                    .lastInsertRowid,
+            );
+        });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("shared-supersede-archive", { id: sourceId }),
+                { memoryId: sourceId, status: "archived" },
+            ),
+        );
+        expect(count(db, "legacy_memory_claims", `claim_id = ${survivor.claimId}`)).toBe(2);
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("shared-supersede-1", { id: sourceId }),
+                { memoryId: sourceId, supersededByMemoryId: target.memoryId },
+            ),
+        );
+
+        // No edge: the survivor's live link still asserts the shared claim,
+        // and the post-state re-snapshot must not re-create it either.
+        expect(count(db, "claim_conflicts")).toBe(0);
+        const sourceLink = readMemoryClaimLink(db, sourceId);
+        const targetLink = readMemoryClaimLink(db, target.memoryId);
+        if (!sourceLink || !targetLink) throw new Error("expected both endpoints linked");
+        expect(memoryClaimSupersessionExists(db, sourceLink, targetLink)).toBeFalse();
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+        expect(
+            count(db, "claim_change_outbox", `effect_key = 'memory:${target.memoryId}:evidence'`),
+        ).toBe(0);
+        // The row-level pointer and relationship snapshot stay intact, and
+        // the disposition oracle still reports the token translated.
+        expect(
+            db
+                .prepare("SELECT status, superseded_by_memory_id FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ status: "archived", superseded_by_memory_id: target.memoryId });
+        expect(
+            count(
+                db,
+                "claim_memory_relationship_sources",
+                `memory_id = ${sourceId} AND superseded_by_memory_id = ${target.memoryId}`,
+            ),
+        ).toBe(1);
+        expect(
+            db
+                .prepare(
+                    `SELECT DISTINCT reason_code, disposition FROM claim_backfill_failures
+                      WHERE phase = 'relationships' AND item_kind = 'supersession'`,
+                )
+                .all(),
+        ).toEqual([{ reason_code: "translated-supersession", disposition: "resolved" }]);
+        // The reconciliation oracle reads the same supersession-exists probe;
+        // the gated edge must not surface as an undisposed token or blocking
+        // failure (migratedDb always reports pending v22 identity work).
+        expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([
+            "pending v22 identity work",
+        ]);
+
+        // Superseding the survivor retires the last live link, so the edge
+        // records as before.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("shared-supersede-2", { id: survivor.memoryId }),
+                { memoryId: survivor.memoryId, supersededByMemoryId: target.memoryId },
+            ),
+        );
+        expect(count(db, "claim_conflicts", "relation = 'supersedes'")).toBe(1);
+        const survivorLink = readMemoryClaimLink(db, survivor.memoryId);
+        if (!survivorLink) throw new Error("expected survivor link");
+        expect(memoryClaimSupersessionExists(db, survivorLink, targetLink)).toBeTrue();
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "archived",
+        });
     });
 
     test("a cross-project supersession records audit-only merge lineage instead of a conflict", () => {

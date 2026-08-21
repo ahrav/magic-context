@@ -899,6 +899,45 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("a non-collision merge carries a side-table-only verified unlinked row onto its claim with evidence", () => {
+        const database = makeDb();
+        const rowId = insertMemory(database, "dir:old", "legacy verified fact", "legacy-v1");
+        // Pre-v84 TypeScript verification: positive verified_at lives only in
+        // memory_verifications; the projection columns stay unverified.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 123, 100)`,
+                )
+                .run(rowId);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 60 });
+
+        // The rekeyed row adopts a claim carrying one verified event plus a
+        // matching evidence effect — the same promotion the collision branch
+        // performs.
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(database, rowId);
+        expect(claim?.state).toBe("active");
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(claim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "identity-merge" }]);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${rowId}:evidence`),
+        ).toEqual({ count: 1 });
+    });
+
     test("a generic rekey routes an unadoptable lineage-bearing row to a diagnostic instead of aborting", () => {
         const database = makeDb();
         const adoptableId = insertMemory(database, "dir:old", "movable fact", "move-h1");

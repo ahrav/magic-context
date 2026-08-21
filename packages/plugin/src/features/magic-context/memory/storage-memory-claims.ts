@@ -848,9 +848,12 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
 /**
  * Record one supersession edge between two linked memories' current
  * revisions: same-project pairs use `claim_conflicts` (supersedes), distinct
- * projects use the audit-only `claim_merge_lineage` relation (KTD8). Both
- * paths are idempotent, so page replay or a doctor retry cannot duplicate
- * lineage. Returns true only when a new edge was recorded.
+ * projects use the audit-only `claim_merge_lineage` relation (KTD8). A
+ * source claim with another live crosswalk link records nothing: the sibling
+ * projection still asserts the claim, so an edge would mark the survivor's
+ * claim superseded. Both paths are idempotent, so page replay or a doctor
+ * retry cannot duplicate lineage. Returns true only when a new edge was
+ * recorded.
  */
 export function recordMemoryClaimSupersessionInCurrentTransaction(
     db: Database,
@@ -860,6 +863,7 @@ export function recordMemoryClaimSupersessionInCurrentTransaction(
     // A duplicate link shares its canonical claim; a claim cannot supersede
     // itself.
     if (source.claimId === target.claimId) return false;
+    if (claimHasOtherLiveMemoryLink(db, source.claimId, source.memoryId)) return false;
     const sourceRevisionId = readClaimCurrentRevisionId(db, source.claimId);
     const targetRevisionId = readClaimCurrentRevisionId(db, target.claimId);
     if (source.projectId === target.projectId) {
@@ -1316,6 +1320,30 @@ export interface UpdateMemoryContentClaimInput {
 }
 
 /**
+ * Same positivity rule as claims-backfill's
+ * `recordAdoptedMemoryVerifiedEventInCurrentTransaction`: a row counts as
+ * verified when the projection columns say so or the `memory_verifications`
+ * side table carries a positive `verified_at` (the only place pre-v84
+ * TypeScript verification writes). Duplicated locally because importing
+ * claims-backfill here would form a runtime import cycle and break this
+ * module's explicit-`.ts` import contract for the Node SQLite smoke script.
+ */
+function memoryRowHasPositiveVerification(
+    db: Database,
+    row: Pick<MemoryProjectionRow, "id" | "verification_status" | "verified_at">,
+): boolean {
+    if (row.verification_status === "verified" && row.verified_at !== null && row.verified_at > 0) {
+        return true;
+    }
+    const side = db
+        .prepare(
+            "SELECT MAX(verified_at) AS verifiedAt FROM memory_verifications WHERE memory_id = ?",
+        )
+        .get(row.id) as { verifiedAt: number | null } | undefined;
+    return (side?.verifiedAt ?? 0) > 0;
+}
+
+/**
  * Content rewrite: adopt an unlinked preimage as revision 1, then append the
  * requested content as the next revision in the same transaction (R10),
  * update the projection semantic fields, and invalidate derived rows.
@@ -1372,19 +1400,37 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             }),
             sourceSessionId: sessionId,
         });
+        const effects: MemoryClaimEffect[] = [
+            {
+                effectKey: `memory:${row.id}:upsert`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "upsert" as const,
+            },
+        ];
+        // The projection deliberately keeps its verified columns across a
+        // content rewrite, so the appended revision needs its own verified
+        // event — without one the claim's current revision reads unverified
+        // while the projection stays verified.
+        if (memoryRowHasPositiveVerification(db, row)) {
+            addVerificationEvent(db, {
+                revisionId,
+                outcome: "verified",
+                verifier: envelope.producer,
+            });
+            effects.push({
+                effectKey: `memory:${row.id}:evidence`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "evidence" as const,
+            });
+        }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         updateMemoryProjectionContent(db, row.id, input.content, input.normalizedHash, input.nowMs);
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
         return {
             result: { memoryId: row.id, claimId: link.claimId, revisionId, found: true },
-            effects: [
-                {
-                    effectKey: `memory:${row.id}:upsert`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "upsert" as const,
-                },
-            ],
+            effects,
         };
     });
 }
@@ -2146,10 +2192,27 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
             const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, post.project_path);
             const failure = recordMemoryClaimAdoptionFailure(db, post, projectId);
             if (failure !== null || projectId === null) {
+                // The preimage adoption above already committed claim,
+                // crosswalk, and relationship rows, so a first adoption still
+                // owes the outbox its upsert effect — dropping it would leave
+                // the crosswalk row without an outbox effect forever.
+                if (preimageAdopted && preLink) {
+                    effects.push({
+                        effectKey: `memory:${post.id}:upsert`,
+                        projectId: preLink.projectId,
+                        claimId: preLink.claimId,
+                        effectType: "upsert" as const,
+                    });
+                }
                 hitMemoryClaimFailpoint("memory-claim.010.claim.after");
                 return {
-                    result: { memoryId: post.id, claimId: null, revisionId: null, removed: false },
-                    effects: [],
+                    result: {
+                        memoryId: post.id,
+                        claimId: preLink?.claimId ?? null,
+                        revisionId: null,
+                        removed: false,
+                    },
+                    effects,
                 };
             }
 

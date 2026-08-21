@@ -962,6 +962,44 @@ describe("claims backfill lazy preimage adoption effects", () => {
         expect(expectedEffectCount(db, "lazy-adopt-lineage-1")).toBe(keys.length);
     });
 
+    test("a module delta that empties a boundary row still emits the preimage adoption upsert and reconciles", async () => {
+        const { db, ids } = migrateLazy([{ content: "boundary emptied row" }]);
+
+        // The preimage is adoptable, the emptied postimage is not; the
+        // adoption committed claim/crosswalk rows, so the operation still
+        // owes the outbox its upsert effect.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            const outcome = applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "kernel-test",
+                    operationKey: "lazy-adopt-empty-1",
+                    requestDigest: computeClaimRequestDigest({ key: "lazy-adopt-empty-1" }),
+                },
+                {
+                    memoryId: ids[0],
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET content = '', normalized_hash = 'hash:emptied' WHERE id = ?",
+                        ).run(ids[0]);
+                    },
+                },
+            );
+            expect(outcome.result.claimId).not.toBeNull();
+        });
+
+        const outbox = operationOutbox(db, "lazy-adopt-empty-1");
+        expect(outbox.map((row) => row.effectKey)).toContain(`memory:${ids[0]}:upsert`);
+        expect(expectedEffectCount(db, "lazy-adopt-empty-1")).toBe(outbox.length);
+
+        // The backfill sweep resolves the empty-content diagnostic (the row
+        // is linked), and the adoption's outbox effect satisfies the
+        // crosswalk reconciliation check.
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
+    });
+
     test("boundary adoption records one verified event for a side-table-only verified row", () => {
         const { db, ids } = migrateLazy([
             { content: "compat verified row", mappedFile: "src/compat.ts" },

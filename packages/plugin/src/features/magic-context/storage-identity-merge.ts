@@ -205,6 +205,21 @@ function adoptIdentityMergeRowClaims(
                         effectType: "upsert" as const,
                     });
                 }
+                if (
+                    recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+                        db,
+                        sourceRow,
+                        link.claimId,
+                        "identity-merge",
+                    )
+                ) {
+                    effects.push({
+                        effectKey: `memory:${sourceId}:evidence`,
+                        projectId,
+                        claimId: link.claimId,
+                        effectType: "evidence" as const,
+                    });
+                }
                 return { result: link.claimId, effects };
             }
             const targetRow = readMemoryProjectionRow(db, collisionTargetId);
