@@ -307,7 +307,22 @@ export class SubcModuleTransport {
             return await Promise.race([
                 operation,
                 new Promise<T>((_resolve, reject) => {
-                    timer = setTimeout(() => reject(makeError()), remainingMs);
+                    // setTimeout truncates a fractional delay, so the timer can
+                    // fire a sub-millisecond slice before `deadline.endMs` on the
+                    // monotonic timeline. The retry gate in call() consults
+                    // `deadline.isExpired()` after catching this rejection; a
+                    // deadline error while the deadline still reads unexpired
+                    // would let the pre-send replay token spend a second connect
+                    // and route open. Re-arm until the deadline is provably
+                    // expired so the rejection and isExpired() always agree.
+                    const fire = (): void => {
+                        if (!deadline.isExpired()) {
+                            timer = setTimeout(fire, Math.max(1, deadline.remainingMs()));
+                            return;
+                        }
+                        reject(makeError());
+                    };
+                    timer = setTimeout(fire, remainingMs);
                 }),
             ]);
         } finally {
