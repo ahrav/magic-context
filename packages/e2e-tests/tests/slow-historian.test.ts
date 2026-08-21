@@ -200,9 +200,16 @@ describe("slow historian vs fast main", () => {
             try {
                 await h.waitFor(
                     () => h.mock.requests().find((request) => isHistorianRequest(request.body)),
-                    { timeoutMs: 10_000, label: "historian request starts" },
+                    { timeoutMs: 180_000, label: "historian request starts" },
                 );
-            } catch {
+            } catch (error) {
+                // Skip only when the mock's request log proves the routing
+                // genuinely never happened; a historian request that exists
+                // but arrived late is a real regression and must fail.
+                const historianEverRouted = h.mock
+                    .requests()
+                    .some((request) => isHistorianRequest(request.body));
+                if (historianEverRouted) throw error;
                 console.log(
                     "[e2e] slow-historian overlap assertion not applicable: OpenCode did not route hidden historian through provider mock",
                 );

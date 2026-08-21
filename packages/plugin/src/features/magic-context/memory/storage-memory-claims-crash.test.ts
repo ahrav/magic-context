@@ -111,6 +111,16 @@ let nodeBundle = "";
 const close = (db: Database): void => closeQuietly(db);
 
 beforeAll(() => {
+    // Fail fast on renamed manifest paths; the campaign otherwise surfaces a
+    // stale entry only as a late ENOENT from readFileSync mid-run.
+    const missingImplementationFiles = IMPLEMENTATION_FILES.filter(
+        (path) => !existsSync(resolve(REPO_ROOT, path)),
+    );
+    if (missingImplementationFiles.length > 0) {
+        throw new Error(
+            `IMPLEMENTATION_FILES manifest paths missing on disk: ${missingImplementationFiles.join(", ")}`,
+        );
+    }
     rootDir = mkdtempSync(join(tmpdir(), "claims-crash-campaign-"));
     nodeBundle = join(rootDir, "claims-crash-worker.mjs");
     const build = Bun.spawnSync([

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../../shared/sqlite";
+import { moveLinkedMemoryAcrossProjects } from "./memory/relocate-memory";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
 import {
     computeClaimRequestDigest,
@@ -12,6 +13,7 @@ import {
     retireMemoryClaimInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
     translateMemoryClaimRelationshipsInCurrentTransaction,
+    updateMemoryClassificationWithClaimsInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
@@ -190,7 +192,13 @@ function adoptIdentityMergeRowClaims(
             }
             const targetRow = readMemoryProjectionRow(db, collisionTargetId);
             if (!targetRow || targetRow.content.length === 0) {
-                return { result: null, effects };
+                // The caller archives the source row as superseded by this
+                // target; a target that cannot carry the canonical claim would
+                // leave the source claim active on suppressed history. Fail
+                // the merge so the transaction rolls back.
+                throw new Error(
+                    `identity merge collision target ${collisionTargetId} ${targetRow ? "has empty content" : "has no projection row"} and cannot adopt the canonical claim for memory ${sourceId}`,
+                );
             }
             const targetWasLinked = readMemoryClaimLink(db, collisionTargetId) !== null;
             const targetLink = ensureMemoryClaimLinkInCurrentTransaction(db, targetRow, projectId, {
@@ -242,6 +250,7 @@ function mergeMemoryRow(
 ): boolean {
     const sourceId = row.id;
     if (typeof sourceId !== "number") return false;
+    const claimsActive = hasMemoryClaimsCompatSchema(db);
     const statsBacked = hasMemoryStatsTable(db);
     const effectiveSeenCount = (memoryId: number, baseValue: unknown): number => {
         if (!statsBacked) return Number(baseValue ?? 1);
@@ -263,7 +272,7 @@ function mergeMemoryRow(
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
-        if (hasMemoryClaimsCompatSchema(db)) {
+        if (claimsActive) {
             adoptIdentityMergeRowClaims(db, sourceId, targetId, toIdentity);
         }
         const mergedSeen = Math.max(
@@ -273,11 +282,39 @@ function mergeMemoryRow(
         const sourceClassifiedAt = Number(row.classified_at ?? 0);
         const targetClassifiedAt = Number(collision.classified_at ?? 0);
         if (sourceClassifiedAt > targetClassifiedAt) {
-            db.prepare(
-                `UPDATE memories
-                    SET importance = ?, scope = ?, shareable = ?, classified_at = ?
-                  WHERE id = ?`,
-            ).run(row.importance, row.scope, row.shareable, row.classified_at, targetId);
+            if (claimsActive) {
+                // The winning classification goes through the claims kernel:
+                // it appends a same-content revision carrying the metadata and
+                // emits the upsert effect on the survivor's project. A raw
+                // projection UPDATE would leave the survivor's claim stale.
+                // The kernel stamps classified_at from nowMs, so the survivor
+                // inherits the source's newer classification timestamp.
+                updateMemoryClassificationWithClaimsInCurrentTransaction(
+                    db,
+                    {
+                        producer: "identity-merge",
+                        operationKey: `merge-classification:${randomUUID()}`,
+                        requestDigest: computeClaimRequestDigest({
+                            sourceId,
+                            targetId,
+                            toIdentity,
+                        }),
+                    },
+                    {
+                        memoryId: targetId,
+                        importance: row.importance as number,
+                        scope: row.scope as string,
+                        shareable: row.shareable as number,
+                        nowMs: sourceClassifiedAt,
+                    },
+                );
+            } else {
+                db.prepare(
+                    `UPDATE memories
+                        SET importance = ?, scope = ?, shareable = ?, classified_at = ?
+                      WHERE id = ?`,
+                ).run(row.importance, row.scope, row.shareable, row.classified_at, targetId);
+            }
         }
         const sourceHasCue = typeof row.mural_cue === "string" && row.mural_cue.length > 0;
         const targetHasCue =
@@ -350,7 +387,41 @@ function mergeMemoryRow(
         return true;
     }
 
-    if (hasMemoryClaimsCompatSchema(db)) {
+    if (claimsActive) {
+        const targetProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
+        const link = targetProjectId !== null ? readMemoryClaimLink(db, sourceId) : null;
+        if (targetProjectId !== null && link && link.projectId !== targetProjectId) {
+            // The crosswalk is append-only, so a row linked to another numeric
+            // project cannot re-link in place: an in-place project_path rekey
+            // would strand the claim under the source project and make every
+            // later claims-aware write fail the outbox project guard. The
+            // authorized cross-project move inserts a fresh projection row at
+            // the target with a fresh claim and retires the source claim with
+            // lineage.
+            if (
+                !moveLinkedMemoryAcrossProjects(
+                    db,
+                    sourceId,
+                    fromIdentity,
+                    toIdentity,
+                    targetProjectId,
+                    link,
+                )
+            ) {
+                return false;
+            }
+            logRow(
+                db,
+                fromIdentity,
+                toIdentity,
+                "memories",
+                String(sourceId),
+                "rekeyed",
+                null,
+                mergedAt,
+            );
+            return true;
+        }
         adoptIdentityMergeRowClaims(db, sourceId, null, toIdentity);
     }
     const result = db

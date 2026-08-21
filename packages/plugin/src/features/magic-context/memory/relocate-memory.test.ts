@@ -393,4 +393,30 @@ describe("relocate-memory claims (v84)", () => {
             project_path: "git:new",
         });
     });
+
+    test("a non-canonical relocation target throws instead of silently skipping claim work", () => {
+        const database = makeDb();
+        const memory = insertMemory(database, {
+            projectPath: "git:origin",
+            category: "CONSTRAINTS",
+            content: "anchored fact",
+        });
+
+        expect(() =>
+            inTransaction(database, () =>
+                rekeyMemoryRowWithCollisionMerge(database, memory.id, "git:origin", "/raw/target"),
+            ),
+        ).toThrow(/does not resolve to a canonical git:\/dir: project/);
+        expect(() =>
+            inTransaction(database, () =>
+                copyMemoriesToProject(database, [memory.id], "/raw/target"),
+            ),
+        ).toThrow(/does not resolve to a canonical git:\/dir: project/);
+
+        // The rolled-back transactions leave the row where it was.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(memory.id),
+        ).toEqual({ project_path: "git:origin" });
+        expect(database.prepare("SELECT COUNT(*) AS c FROM memories").get()).toEqual({ c: 1 });
+    });
 });

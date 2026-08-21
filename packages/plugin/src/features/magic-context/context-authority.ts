@@ -1927,7 +1927,11 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
     }
 }
 
-function repairNullClobberedMemoryRows(statements: MirrorPageStatements): void {
+function repairNullClobberedMemoryRows(
+    db: Database,
+    statements: MirrorPageStatements,
+    claimsActive: boolean,
+): void {
     const pending = statements.repairPending.get() as { dirty?: number } | undefined;
     if (pending?.dirty !== 1) return;
     const candidates = statements.repairCandidates.all() as Array<{
@@ -1957,7 +1961,35 @@ function repairNullClobberedMemoryRows(statements: MirrorPageStatements): void {
         if (sourceType === null && importance === null) continue;
         // This idempotent repair handles stores where sparse mapping records overwrote
         // source_type and importance with null before the mirror retained full snapshots.
-        statements.repairMemory.run(sourceType, importance, candidate.id);
+        const applyProjection = (): void => {
+            statements.repairMemory.run(sourceType, importance, candidate.id);
+        };
+        if (claimsActive) {
+            // source_type and importance are claim-semantic columns, so the
+            // repair routes through the module-delta kernel: the revision,
+            // outbox effect, and generation stay in step with the projection.
+            // The operation key carries the value digest so a repeat of the
+            // same repair replays, while a later repair with different
+            // snapshot values gets a fresh envelope instead of a key-reuse
+            // failure.
+            const requestDigest = computeClaimRequestDigest({
+                repair: "null-clobbered-metadata",
+                memoryId: candidate.id,
+                sourceType,
+                importance,
+            });
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "module-mirror",
+                    operationKey: `memories:metadata-repair:${candidate.id}:${requestDigest}`,
+                    requestDigest,
+                },
+                { memoryId: candidate.id, applyProjection },
+            );
+        } else {
+            applyProjection();
+        }
     }
     // The candidate query is an intentional full pass only while dirty. Clearing the flag
     // makes subsequent mirror pages avoid the unindexed scan entirely.
@@ -2334,7 +2366,7 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                     if (translatablePairs.length > 0) {
                         recordTranslatedSupersessionClaims(db, translatablePairs);
                     }
-                    repairNullClobberedMemoryRows(statements);
+                    repairNullClobberedMemoryRows(db, statements, claimsActive);
                 }
                 for (const projectPath of touchedProjects) {
                     bumpDomainMutationEpoch(db, projectPath, page.domain);

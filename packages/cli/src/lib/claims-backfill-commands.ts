@@ -78,7 +78,22 @@ export function renderClaimsBackfillStatus(
     // diagnostics that only live writers can repair: they never gate
     // completion but must stay visible to the operator.
     if (status.state === "blocked" || status.state === "pending" || status.blockingFailures > 0) {
-        for (const failure of listClaimsBackfillFailures(db, { limit: 10 })) {
+        // Blocking and retry rows outrank warnings: the listing is id-ordered
+        // and capped, so a page of older warnings would otherwise hide the
+        // failures that gate completion.
+        const failures = listClaimsBackfillFailures(db, {
+            dispositions: ["blocking", "retry"],
+            limit: 10,
+        });
+        if (failures.length < 10) {
+            failures.push(
+                ...listClaimsBackfillFailures(db, {
+                    dispositions: ["warning"],
+                    limit: 10 - failures.length,
+                }),
+            );
+        }
+        for (const failure of failures) {
             harness.log.warn(
                 `failure #${failure.id} [${failure.disposition}] ${failure.phase}/${failure.itemKind} ${failure.itemKey}: ${failure.reasonCode}`,
             );

@@ -598,6 +598,29 @@ describe("doctor claims backfill commands", () => {
         });
         expect(messages.join("\n")).toContain("claims backfill status: complete-with-warnings");
     });
+
+    it("status lists blocking failures ahead of older warnings", async () => {
+        const database = makeDb();
+        const insertFailure = database.prepare(
+            `INSERT INTO claim_backfill_failures
+                (phase, item_kind, item_key, reason_code, detail, disposition, rationale, created_at, updated_at)
+             VALUES ('relationships', 'lineage', ?, ?, '', ?, ?, 1, 1)`,
+        );
+        for (let index = 0; index < 12; index += 1) {
+            insertFailure.run(`warning-${index}`, "operator-warning", "warning", "reviewed");
+        }
+        insertFailure.run("blocking-item", "dangling-lineage", "blocking", null);
+
+        const messages: string[] = [];
+        await runClaimsBackfillCommands(makeHarness(database, messages), {
+            checkClaimsBackfill: true,
+        });
+
+        const failureLines = messages.filter((message) => message.includes("failure #"));
+        expect(failureLines).toHaveLength(10);
+        expect(failureLines[0]).toContain("[blocking]");
+        expect(failureLines[0]).toContain("dangling-lineage");
+    });
 });
 
 describe("doctor v22 backfill commands", () => {

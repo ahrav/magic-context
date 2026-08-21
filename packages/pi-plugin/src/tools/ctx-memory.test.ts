@@ -12,6 +12,8 @@ import {
 	runInMemoryClaimsWriteTransaction,
 } from "../../../plugin/src/features/magic-context/memory/storage-memory-claims";
 import { getMemoryMutationsForRender } from "../../../plugin/src/features/magic-context/storage";
+import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
+import { Database } from "../../../plugin/src/shared/sqlite";
 import { closeQuietly } from "../../../plugin/src/shared/sqlite-helpers";
 import { createTestDb, fakeContext } from "../test-utils.test";
 import { createCtxMemoryTool as createCtxMemoryToolRuntime } from "./ctx-memory";
@@ -1352,7 +1354,7 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 				countRows(
 					db,
 					"claim_operations",
-					`producer = 'ctx-memory-pi' AND operation_key = 'pi-lost-ack:update:${memory.id}'`,
+					`producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:pi-lost-ack:update:${memory.id}'`,
 				),
 			).toBe(1);
 			expect(
@@ -1437,7 +1439,7 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 					countRows(
 						db,
 						"claim_operations",
-						`producer = 'ctx-memory-pi' AND operation_key = '${callId}:merge'`,
+						`producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:${callId}:merge'`,
 					),
 				).toBe(1);
 				await expect(
@@ -1494,6 +1496,41 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 			expect(
 				countRows(db, "claim_change_outbox", "effect_type = 'lifecycle'"),
 			).toBeGreaterThanOrEqual(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("archive with a tool-call id skips the replay probe on a pre-v84 database", async () => {
+		// Base schema only — no v84 claims tables, so an unguarded
+		// readMemoryClaimOperationResult would throw "no such table:
+		// claim_operations" before validation even runs.
+		const db = new Database(":memory:") as ReturnType<typeof createTestDb>;
+		try {
+			initializeDatabase(db);
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pre-v84 archive target.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+
+			const result = await run(tool, {
+				action: "archive",
+				ids: [memory.id],
+			});
+
+			expect(result.isError).toBeUndefined();
+			expect(result.content[0]?.text).toBe(
+				`Archived memory [ID: ${memory.id}].`,
+			);
+			expect(getMemoryById(db, memory.id)?.status).toBe("archived");
 		} finally {
 			closeQuietly(db);
 		}

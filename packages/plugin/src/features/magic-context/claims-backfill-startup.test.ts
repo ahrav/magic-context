@@ -166,4 +166,36 @@ describe("runClaimsBackfillStartup", () => {
         expect(second.summary?.batches).toBe(0);
         expect(messages.join("\n")).toContain("--retry-claims-backfill");
     });
+
+    test("post-completion within-boundary blocking rows surface at startup instead of a silent no-op", async () => {
+        const db = database(false, true);
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS schema_migrations_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT OR REPLACE INTO schema_migrations_meta (key, value)
+            VALUES ('v22_legacy_memory_backfill', 'completed');
+        `);
+        runMigrations(db);
+        const first = await runClaimsBackfillStartup(db, { log: () => {} });
+        expect(first.summary?.status).toBe("complete");
+
+        // A live writer records a blocking diagnostic inside the boundary
+        // corpus while the checkpoint still reads `complete`; the startup
+        // gate must run the oracle and surface it instead of early-returning
+        // on the raw phase.
+        db.prepare(
+            `INSERT INTO claim_backfill_failures
+                (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+             VALUES ('rows', 'memory', '1', 'unresolved-project-identity', '', 'blocking', 1, 1)`,
+        ).run();
+
+        const messages: string[] = [];
+        const second = await runClaimsBackfillStartup(db, {
+            log: (message) => messages.push(message),
+        });
+        expect(second.summary?.status).toBe("blocked");
+        expect(messages.join("\n")).toContain("--retry-claims-backfill");
+    });
 });

@@ -6,9 +6,10 @@
  * claims-write capability plus the semantic write guards it stands down
  * (KTD2, KTD3, KTD6-KTD8).
  *
- * Dependency-light on purpose: this module may only use type-only imports so
- * the Node SQLite smoke (`packages/plugin/scripts/smoke-node-sqlite.ts`) can
- * import it directly under Node's type-stripping loader, which cannot resolve
+ * Dependency-light on purpose: runtime imports here must carry explicit `.ts`
+ * extensions so the Node SQLite smoke
+ * (`packages/plugin/scripts/smoke-node-sqlite.ts`) can import this module
+ * directly under Node's type-stripping loader, which cannot resolve
  * extensionless runtime imports.
  *
  * Every object here is migration-owned (created by migration v84, never by
@@ -30,7 +31,7 @@
  * observed by the guards.
  */
 
-import type { Database } from "../../shared/sqlite";
+import { type Database, isInTransaction } from "../../shared/sqlite.ts";
 
 export const MEMORY_CLAIMS_COMPAT_TABLES = [
     "legacy_memory_claims",
@@ -339,8 +340,11 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
     -- transaction and every outbox effect of the operation must sit at or
     -- below the recorded consumed watermark. FK RESTRICT from
     -- claim_change_outbox additionally forces children to be pruned first.
+    -- A zero-effect envelope never leaves: it is the only idempotent-replay
+    -- record for its operation key.
     CREATE TRIGGER claim_operations_append_only_delete BEFORE DELETE ON claim_operations
     WHEN COALESCE((SELECT enabled FROM claim_change_log_prune_state WHERE id = 1), 0) = 0
+      OR OLD.expected_effect_count = 0
       OR EXISTS (
           SELECT 1 FROM claim_change_outbox
            WHERE operation_id = OLD.id
@@ -412,7 +416,9 @@ export interface ClaimChangeLogPruneResult {
  * watermark, so no code path can shed change-log rows the consumer has not
  * acknowledged.
  *
- * Runs inside the CALLER's write transaction. Records `consumedWatermark`
+ * Runs inside the CALLER's write transaction (enforced: throws in autocommit,
+ * where the enabled=1 capability row would commit and be visible to other
+ * connections). Records `consumedWatermark`
  * (monotonic: the stored watermark never regresses), enables the prune
  * capability, deletes `claim_change_outbox` rows with id at or below the
  * watermark first (the outbox references `claim_operations` with ON DELETE
@@ -427,6 +433,11 @@ export function pruneClaimChangeLogInCurrentTransaction(
     db: Database,
     consumedWatermark: number,
 ): ClaimChangeLogPruneResult {
+    if (!isInTransaction(db)) {
+        throw new Error(
+            "pruneClaimChangeLogInCurrentTransaction requires the caller's open write transaction: in autocommit the enabled=1 capability row would commit and be visible to other connections",
+        );
+    }
     if (!Number.isSafeInteger(consumedWatermark) || consumedWatermark < 0) {
         throw new Error(
             `claim change-log consumed watermark must be a non-negative integer: ${String(consumedWatermark)}`,

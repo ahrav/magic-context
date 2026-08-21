@@ -85,9 +85,21 @@ export const CLAIMS_MIGRATION_FAILPOINT_IDS = [
     "claims-migration.050.commit.after",
 ] as const;
 
+/**
+ * Concurrency seams, not crash sites: the process-crash matrix excludes
+ * them. They let a test interleave a writer between two runner reads that
+ * commit in separate transactions.
+ */
+export const CLAIMS_BACKFILL_CONCURRENCY_FAILPOINT_IDS = [
+    "claims-backfill.025.reconcile-oracle.after",
+] as const;
+
 export type ClaimsBackfillFailpointId = (typeof CLAIMS_BACKFILL_FAILPOINT_IDS)[number];
 export type ClaimsMigrationFailpointId = (typeof CLAIMS_MIGRATION_FAILPOINT_IDS)[number];
-type BackfillFailpointId = ClaimsBackfillFailpointId | ClaimsMigrationFailpointId;
+type BackfillFailpointId =
+    | ClaimsBackfillFailpointId
+    | ClaimsMigrationFailpointId
+    | (typeof CLAIMS_BACKFILL_CONCURRENCY_FAILPOINT_IDS)[number];
 
 const activeFailpoints = new Map<BackfillFailpointId, () => void>();
 
@@ -816,62 +828,35 @@ export function inspectClaimsBackfillReconciliation(
         );
     };
     const sourceIsDisposed = (source: (typeof relationshipSources)[number]): boolean => {
-        const link = readLink(source.memoryId);
-        const prefix = `memory:${source.memoryId}:relations:${source.sourceDigest}`;
-        if (source.supersededByMemoryId !== null) {
-            const targetLink = readLink(source.supersededByMemoryId);
-            if (
-                !tokenIsDisposed(
-                    "supersession",
-                    `${prefix}:superseded-by`,
-                    link !== null && targetLink !== null && supersessionExists(link, targetLink),
-                )
-            ) {
-                return false;
-            }
-        }
-        for (const token of parseMemoryClaimMergedFrom(source.mergedFrom)) {
-            let resolvedInGraph = token.kind === "marker";
-            if (token.kind === "id" && link !== null) {
-                const sourceLink = readLink(token.id as number);
-                resolvedInGraph = sourceLink !== null && supersessionExists(sourceLink, link);
-            }
-            if (
-                !tokenIsDisposed(
-                    "lineage",
-                    `${prefix}:merged-from:${token.ordinal}`,
-                    resolvedInGraph,
-                )
-            ) {
+        for (const token of disposalTokens(source)) {
+            if (!tokenIsDisposed(token.itemKind, token.itemKey, token.resolvedInGraph)) {
                 return false;
             }
         }
         return true;
     };
-    const currentSourceDisposed = new Map<number, boolean>();
-    for (const [memoryId, source] of currentSourceByMemory) {
-        currentSourceDisposed.set(memoryId, sourceIsDisposed(source));
-    }
-    for (const source of relationshipSources) {
+    /**
+     * One source expands to its supersession token plus its merged-from
+     * lineage tokens, each carrying the graph-resolution flag the disposition
+     * check consumes. `sourceIsDisposed` and the completion count below walk
+     * this same expansion, so the replaced-source check and the completion
+     * oracle cannot silently diverge on token keys or resolution semantics.
+     */
+    function* disposalTokens(source: (typeof relationshipSources)[number]): Generator<{
+        itemKind: "lineage" | "supersession";
+        itemKey: string;
+        resolvedInGraph: boolean;
+    }> {
         const link = readLink(source.memoryId);
         const prefix = `memory:${source.memoryId}:relations:${source.sourceDigest}`;
-        const current = currentSourceByMemory.get(source.memoryId);
-        const replacedByDisposedSource =
-            current !== undefined &&
-            current.sourceId > source.sourceId &&
-            currentSourceDisposed.get(source.memoryId) === true;
         if (source.supersededByMemoryId !== null) {
             const targetLink = readLink(source.supersededByMemoryId);
-            if (
-                !tokenIsDisposed(
-                    "supersession",
-                    `${prefix}:superseded-by`,
+            yield {
+                itemKind: "supersession",
+                itemKey: `${prefix}:superseded-by`,
+                resolvedInGraph:
                     link !== null && targetLink !== null && supersessionExists(link, targetLink),
-                    replacedByDisposedSource,
-                )
-            ) {
-                tokensWithoutDisposition += 1;
-            }
+            };
         }
         for (const token of parseMemoryClaimMergedFrom(source.mergedFrom)) {
             let resolvedInGraph = token.kind === "marker";
@@ -879,11 +864,29 @@ export function inspectClaimsBackfillReconciliation(
                 const sourceLink = readLink(token.id as number);
                 resolvedInGraph = sourceLink !== null && supersessionExists(sourceLink, link);
             }
+            yield {
+                itemKind: "lineage",
+                itemKey: `${prefix}:merged-from:${token.ordinal}`,
+                resolvedInGraph,
+            };
+        }
+    }
+    const currentSourceDisposed = new Map<number, boolean>();
+    for (const [memoryId, source] of currentSourceByMemory) {
+        currentSourceDisposed.set(memoryId, sourceIsDisposed(source));
+    }
+    for (const source of relationshipSources) {
+        const current = currentSourceByMemory.get(source.memoryId);
+        const replacedByDisposedSource =
+            current !== undefined &&
+            current.sourceId > source.sourceId &&
+            currentSourceDisposed.get(source.memoryId) === true;
+        for (const token of disposalTokens(source)) {
             if (
                 !tokenIsDisposed(
-                    "lineage",
-                    `${prefix}:merged-from:${token.ordinal}`,
-                    resolvedInGraph,
+                    token.itemKind,
+                    token.itemKey,
+                    token.resolvedInGraph,
                     replacedByDisposedSource,
                 )
             ) {
@@ -1227,8 +1230,15 @@ export async function runClaimsBackfill(
         const blocking = countBoundaryFailures(db, ["blocking", "retry"], state.boundaryMemoryId);
         if (unlinked > 0 || blocking > 0) {
             // The corpus changed between the oracle read and this
-            // transaction; fall back to the rows phase to re-derive.
+            // transaction; fall back to the rows phase to re-derive. Every
+            // cursor resets with the phase: the batch queries select strictly
+            // above their cursor, so a stale cursor would hide the very rows
+            // the fallback exists to re-observe and the re-derive would
+            // re-block with an unchanged failure digest.
             writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "rows");
+            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
+            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
+            writeMeta(db, CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY, "0");
             return { kind: "advance" };
         }
         writeCompletionCheckpoint(db);
@@ -1309,6 +1319,7 @@ export async function runClaimsBackfill(
                 // The oracle is read-only: run it outside the write lock,
                 // then decide inside one short transaction (R11).
                 const report = inspectClaimsBackfillReconciliation(db);
+                hitFailpoint("claims-backfill.025.reconcile-oracle.after");
                 step = await runBatch(() => finalizeReconciliation(report));
             }
         } else {

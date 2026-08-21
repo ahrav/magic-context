@@ -183,18 +183,22 @@ function bumpProjectMemoryEpochInTransaction(db: Database, identity: string, now
     ).run(identity, now);
 }
 
+/**
+ * The claims takeover key derives from the v22 failure surface: remaining
+ * failures keep the claims backfill gated on v22 identity work; a clean
+ * corpus releases it. No-op on a database without the claims compat schema.
+ */
+function syncClaimsTakeoverMeta(db: Database, failureCount: number): void {
+    if (!hasMemoryClaimsCompatSchema(db)) return;
+    writeMeta(db, CLAIMS_BACKFILL_META_KEYS.v22Takeover, failureCount > 0 ? "pending" : "none");
+}
+
 function updateFinalBackfillStatus(db: Database): V22BackfillStatus {
     const failureCount = countFailures(db);
     const status: V22BackfillStatus = failureCount > 0 ? "completed_with_failures" : "completed";
     db.transaction(() => {
         writeMeta(db, BACKFILL_META_KEY, status);
-        if (hasMemoryClaimsCompatSchema(db)) {
-            writeMeta(
-                db,
-                CLAIMS_BACKFILL_META_KEYS.v22Takeover,
-                status === "completed" ? "none" : "pending",
-            );
-        }
+        syncClaimsTakeoverMeta(db, failureCount);
     }).immediate();
     return status;
 }
@@ -228,12 +232,18 @@ export async function runDeferredV22Backfill(
 ): Promise<V22BackfillSummary> {
     const initialStatus = readMeta(db, BACKFILL_META_KEY);
     if (initialStatus === "completed" || initialStatus === "skipped") {
+        const failureCount = countFailures(db);
+        // A runner without the claims compat schema reaches this terminal
+        // status without ever writing the takeover key, so a key the v84
+        // migration stamped `pending` re-derives from the failure surface
+        // here; otherwise it gates the claims backfill forever.
+        syncClaimsTakeoverMeta(db, failureCount);
         return {
             status: initialStatus,
             processedRows: 0,
             changedRows: 0,
             failedRows: 0,
-            failureCount: countFailures(db),
+            failureCount,
             lastCursor: parseCursor(readMeta(db, BACKFILL_CURSOR_META_KEY)),
         };
     }

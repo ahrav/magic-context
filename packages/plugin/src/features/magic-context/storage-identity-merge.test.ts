@@ -2,9 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { partitionVerifyScope } from "./dreamer/verify-gate";
-import { insertMemory as insertMemoryThroughKernel } from "./memory/storage-memory";
+import {
+    insertMemory as insertMemoryThroughKernel,
+    updateMemoryStatus,
+} from "./memory/storage-memory";
 import {
     getCurrentMemoryClaimByLegacyMemoryId,
+    readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
 } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
@@ -419,13 +423,22 @@ describe("project identity merge claims (v84)", () => {
 
         mergeProjectIdentities(database, "git:source", "git:target", { now: 77 });
 
-        // The unique memory moves to the target identity with its claim link
-        // alive; the colliding memory archives in place under the survivor.
+        // The unique memory moves through the authorized cross-project move:
+        // a fresh row + claim at the target, the source row deleted, the
+        // source claim retired. The colliding memory archives in place under
+        // the survivor.
         expect(
             database
-                .prepare("SELECT project_path, status FROM memories WHERE id = ?")
+                .prepare("SELECT COUNT(*) AS count FROM memories WHERE id = ?")
                 .get(movedSource.id),
-        ).toEqual({ project_path: "git:target", status: "active" });
+        ).toEqual({ count: 0 });
+        const movedRow = database
+            .prepare(
+                `SELECT id, status FROM memories
+                  WHERE project_path = 'git:target' AND content = 'source-only fact'`,
+            )
+            .get() as { id: number; status: string };
+        expect(movedRow.status).toBe("active");
         expect(
             database
                 .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
@@ -464,12 +477,25 @@ describe("project identity merge claims (v84)", () => {
                 .get(),
         ).toEqual({ count: 0 });
 
-        // The moved memory's claim link still resolves to its active claim.
-        const movedClaim = getCurrentMemoryClaimByLegacyMemoryId(database, movedSource.id);
+        // The moved row's claim is owned by the TARGET project, so later
+        // claims-aware writes pass the outbox project guard; the deleted
+        // source row's claim retired with cross-project lineage.
+        const movedClaim = getCurrentMemoryClaimByLegacyMemoryId(database, movedRow.id);
         expect(movedClaim?.state).toBe("active");
         expect(movedClaim?.content).toBe("source-only fact");
+        expect(movedClaim?.projectId).toBe(targetProjectId);
+        const movedLink = readMemoryClaimLink(database, movedRow.id);
+        expect(movedLink?.projectId).toBe(targetProjectId);
+        expect(getCurrentMemoryClaimByLegacyMemoryId(database, movedSource.id)?.state).toBe(
+            "archived",
+        );
+        updateMemoryStatus(database, movedRow.id, "permanent");
+        expect(
+            database.prepare("SELECT status FROM memories WHERE id = ?").get(movedRow.id),
+        ).toEqual({ status: "permanent" });
 
-        // The colliding source claim retires with cross-project lineage.
+        // The colliding source claim retires with cross-project lineage; the
+        // moved claim records its own lineage row.
         const collidingClaimId = (
             database
                 .prepare("SELECT claim_id AS id FROM legacy_memory_claims WHERE memory_id = ?")
@@ -485,7 +511,7 @@ describe("project identity merge claims (v84)", () => {
                       WHERE source_project_id = ? AND target_project_id = ?`,
                 )
                 .get(sourceProjectId, targetProjectId),
-        ).toEqual({ count: 1 });
+        ).toEqual({ count: 2 });
     });
 
     test("still refuses a two-project merge when the source owns an authoritative episode", () => {
@@ -624,5 +650,76 @@ describe("project identity merge claims (v84)", () => {
         expect(database.prepare("SELECT COUNT(*) AS count FROM claim_conflicts").get()).toEqual({
             count: 0,
         });
+    });
+
+    test("an empty-content collision target aborts the merge and rolls back", () => {
+        const database = makeDb();
+        const sourceId = insertMemory(database, "dir:old", "legacy fact", "same-hash");
+        const targetId = insertMemory(database, "git:new", "", "same-hash");
+
+        expect(() => mergeProjectIdentities(database, "dir:old", "git:new", { now: 50 })).toThrow(
+            new RegExp(`collision target ${targetId} has empty content`),
+        );
+
+        // The rolled-back transaction leaves the source row unchanged.
+        expect(
+            database
+                .prepare(
+                    "SELECT project_path, status, superseded_by_memory_id AS by FROM memories WHERE id = ?",
+                )
+                .get(sourceId),
+        ).toEqual({ project_path: "dir:old", status: "active", by: null });
+        expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
+            count: 0,
+        });
+    });
+
+    test("a collision merge carries the winning classification into the survivor's claim", () => {
+        const database = makeDb();
+        const source = insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const target = insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `UPDATE memories
+                        SET importance = 91, scope = 'ecosystem', shareable = 1, classified_at = 20
+                      WHERE id = ?`,
+                )
+                .run(source.id);
+            database
+                .prepare(
+                    `UPDATE memories
+                        SET importance = 12, scope = 'project', shareable = 0, classified_at = 10
+                      WHERE id = ?`,
+                )
+                .run(target.id);
+        });
+        const revisionBefore = getCurrentMemoryClaimByLegacyMemoryId(database, target.id)?.revision;
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        // The survivor's current claim metadata reflects the winning
+        // classification through an appended revision, not a projection-only
+        // UPDATE.
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, target.id);
+        expect(survivorClaim?.importance).toBe(91);
+        expect(survivorClaim?.memoryScope).toBe("ecosystem");
+        expect(survivorClaim?.shareable).toBe(1);
+        expect(survivorClaim?.revision).toBe((revisionBefore ?? 0) + 1);
+        expect(
+            database
+                .prepare(
+                    "SELECT importance, scope, shareable, classified_at FROM memories WHERE id = ?",
+                )
+                .get(target.id),
+        ).toEqual({ importance: 91, scope: "ecosystem", shareable: 1, classified_at: 20 });
     });
 });

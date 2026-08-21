@@ -381,4 +381,35 @@ describe("v22 backfill under the v84 claims contract", () => {
         expect(summary.status).toBe("completed_with_failures");
         expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("pending");
     });
+
+    test("a terminal initial status syncs the takeover key from the failure surface", async () => {
+        // A pre-v84 runner records the terminal v22 status without writing
+        // the takeover key, so the early return must derive it from the
+        // failure surface instead of leaving the migration's `pending` stamp.
+        const database = makeDb();
+        database
+            .prepare("UPDATE schema_migrations_meta SET value = 'completed' WHERE key = ?")
+            .run("v22_legacy_memory_backfill");
+        expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("pending");
+
+        const clean = await runDeferredV22Backfill(database, { yieldToEventLoop: async () => {} });
+        expect(clean.status).toBe("completed");
+        expect(clean.processedRows).toBe(0);
+        expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("none");
+
+        const rowId = insertMemory(database, "git:terminal-sync", "terminal-sync");
+        database
+            .prepare(
+                `INSERT INTO v22_backfill_failures
+                    (table_name, row_id, raw_project_path, error_class, error_message, failed_at)
+                 VALUES ('memories', ?, '/denied', 'permission_denied', 'permission denied', 1)`,
+            )
+            .run(rowId);
+        const withFailures = await runDeferredV22Backfill(database, {
+            yieldToEventLoop: async () => {},
+        });
+        expect(withFailures.status).toBe("completed");
+        expect(withFailures.failureCount).toBe(1);
+        expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("pending");
+    });
 });

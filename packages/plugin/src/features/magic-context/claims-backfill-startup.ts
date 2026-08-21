@@ -32,7 +32,11 @@ export async function runClaimsBackfillStartup(
         return { ranV22Backfill: true, summary: null };
     }
 
-    let status = getClaimsBackfillStatus(db);
+    // includeProblems runs the reconciliation oracle, so the early return
+    // below gates on the oracle-aware state: a `complete` phase whose corpus
+    // has since grown within-boundary blocking rows reports `blocked` and
+    // falls through to the runner, which surfaces the doctor retry guidance.
+    let status = getClaimsBackfillStatus(db, { includeProblems: true });
     if (!status.applicable) {
         return { ranV22Backfill: false, summary: null };
     }
@@ -41,9 +45,9 @@ export async function runClaimsBackfillStartup(
     if (status.v22Takeover === "pending") {
         ranV22Backfill = true;
         await runV22(db);
-        status = getClaimsBackfillStatus(db);
+        status = getClaimsBackfillStatus(db, { includeProblems: true });
     }
-    if (status.phase === "complete" && status.v22Takeover !== "pending") {
+    if (status.state === "complete" || status.state === "complete-with-warnings") {
         return { ranV22Backfill, summary: null };
     }
 

@@ -433,8 +433,12 @@ export const CANONICAL_MEMORY_PROJECT_PATH_PREFIXES = ["git:", "dir:"] as const;
  * the same list the TS resolver consumes.
  */
 export function canonicalMemoryProjectPathSql(column: string): string {
+    // substr equality is a BINARY compare, matching the TS resolver's
+    // case-sensitive startsWith; LIKE is ASCII-case-insensitive and would
+    // accept 'GIT:'/'DIR:' rows the resolver rejects.
     const branches = CANONICAL_MEMORY_PROJECT_PATH_PREFIXES.map(
-        (prefix) => `(${column} LIKE '${prefix}%' AND length(${column}) > ${prefix.length})`,
+        (prefix) =>
+            `(substr(${column}, 1, ${prefix.length}) = '${prefix}' AND length(${column}) > ${prefix.length})`,
     );
     return `(${branches.join(" OR ")})`;
 }
@@ -690,10 +694,11 @@ function appendMemoryClaimRevision(
 
 export interface EnsureMemoryClaimLinkOptions {
     /**
-     * When false, a hash-equal preimage whose bytes differ from the canonical
-     * content links WITHOUT appending a revision (the source bytes stay
-     * retained on the root observation). Merge-delete relocations use this so
-     * the canonical claim keeps reflecting the surviving projection row (R6).
+     * When false, a hash-equal preimage whose content or revision metadata
+     * differs from the canonical claim links WITHOUT appending a revision
+     * (the source bytes stay retained on the root observation). Merge-delete
+     * relocations use this so the canonical claim keeps reflecting the
+     * surviving projection row (R6).
      */
     adoptDivergentContent?: boolean;
 }
@@ -702,8 +707,9 @@ export interface EnsureMemoryClaimLinkOptions {
  * Ensure the memory row has its durable claim link, adopting the preimage as
  * revision 1 when unlinked (R10). Exact-hash dedup selects the existing
  * canonical claim for the (project, category, normalized hash) tuple before
- * allocating a new one (KTD3, R6); a hash-equal preimage whose bytes differ
- * from the canonical content appends a revision so the claim reflects it.
+ * allocating a new one (KTD3, R6); a hash-equal preimage whose content or
+ * revision metadata differs from the canonical claim's current semantic
+ * state appends a revision so the claim reflects it.
  */
 export function ensureMemoryClaimLinkInCurrentTransaction(
     db: Database,
@@ -727,14 +733,22 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
             content: row.content,
             provenance,
         });
-        if ((options.adoptDivergentContent ?? true) && canonical.currentContent !== row.content) {
-            appendMemoryClaimRevision(db, {
-                claimId: canonical.claimId,
-                content: row.content,
-                observationId,
-                metadata: metadataFromProjectionRow(row),
-                sourceSessionId: row.source_session_id,
-            });
+        if (options.adoptDivergentContent ?? true) {
+            // Compare the full semantic state, not content alone: a re-added
+            // memory can carry the same bytes with divergent importance /
+            // scope / metadata, and reusing the canonical claim as-is would
+            // reactivate it with stale revision metadata.
+            const current = readCurrentClaimSemanticState(db, canonical.claimId);
+            const desiredMeta = metadataFromProjectionRow(row);
+            if (claimSemanticStateDiffers(current, row.content, desiredMeta)) {
+                appendMemoryClaimRevision(db, {
+                    claimId: canonical.claimId,
+                    content: row.content,
+                    observationId,
+                    metadata: desiredMeta,
+                    sourceSessionId: row.source_session_id,
+                });
+            }
         }
         db.prepare(
             `INSERT INTO legacy_memory_claims
@@ -1404,7 +1418,10 @@ export interface SetMemoryStatusClaimInput {
 /**
  * Lifecycle transition (archive, restore, permanent): claim state change
  * plus an archive verification event when archiving, and the projection
- * status/metadata update. No revision — prior revisions stay untouched (R3).
+ * status/metadata update. A pure status change appends no revision — prior
+ * revisions stay untouched (R3) — but a metadata_json replacement (e.g. an
+ * archive reason) appends a same-content revision so the claim history keeps
+ * matching the projection metadata.
  */
 export function setMemoryStatusWithClaimsInCurrentTransaction(
     db: Database,
@@ -1431,6 +1448,29 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
             kind: "migration",
         });
         const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
+        const effects: MemoryClaimEffect[] = [];
+        let revisionId: number | null = null;
+        if (input.metadataJson !== undefined && input.metadataJson !== row.metadata_json) {
+            const observationId = createMemoryObservation(db, {
+                projectId,
+                memoryId: row.id,
+                content: row.content,
+                provenance: liveProvenance(envelope),
+            });
+            revisionId = appendMemoryClaimRevision(db, {
+                claimId: link.claimId,
+                content: row.content,
+                observationId,
+                metadata: metadataFromProjectionRow(row, { metadataJson: input.metadataJson }),
+                sourceSessionId: row.source_session_id,
+            });
+            effects.push({
+                effectKey: `memory:${row.id}:upsert`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "upsert" as const,
+            });
+        }
         setClaimLifecycleStateInCurrentTransaction(
             db,
             link.claimId,
@@ -1450,10 +1490,11 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
             result: {
                 memoryId: row.id,
                 claimId: link.claimId,
-                revisionId: null,
+                revisionId,
                 found: true,
             },
             effects: [
+                ...effects,
                 {
                     effectKey: `memory:${row.id}:lifecycle`,
                     projectId,
@@ -1957,15 +1998,29 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
 ): MemoryClaimOperationOutcome<ModuleMemoryDeltaResult> {
     // Preimage adoption runs BEFORE the projection delta (R10) so a boundary
     // row acquires its non-cascading link before a tombstone deletes it or an
-    // update rewrites it. Idempotent on replay: an existing link short-circuits.
+    // update rewrites it — but only on a first run: a replayed envelope must
+    // append zero claim rows (AE7), so the replay probe gates adoption. The
+    // relationship-source snapshot still runs on replay: it is digest-
+    // idempotent, no-ops without a link, and the projection's lineage-write
+    // guard requires the preimage snapshot before every mutation.
+    const replay = readMemoryClaimOperationResult<ModuleMemoryDeltaResult>(db, envelope);
     const pre = readMemoryProjectionRow(db, input.memoryId);
     let preLink: MemoryClaimLink | null = null;
     if (pre && pre.content.length > 0) {
-        const preProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, pre.project_path);
-        if (preProjectId !== null) {
-            preLink = ensureMemoryClaimLinkInCurrentTransaction(db, pre, preProjectId, {
-                kind: "migration",
-            });
+        if (replay) {
+            preLink = readMemoryClaimLink(db, pre.id);
+        } else {
+            const preProjectId = resolveMemoryClaimProjectInCurrentTransaction(
+                db,
+                pre.project_path,
+            );
+            if (preProjectId !== null) {
+                preLink = ensureMemoryClaimLinkInCurrentTransaction(db, pre, preProjectId, {
+                    kind: "migration",
+                });
+            }
+        }
+        if (preLink) {
             translateMemoryClaimRelationshipsInCurrentTransaction(db, pre);
         }
     }

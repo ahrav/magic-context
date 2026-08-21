@@ -762,4 +762,50 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
             closeQuietly(db);
         }
     });
+
+    test("a zero-effect operation envelope refuses deletion even with the prune capability held", () => {
+        const db = migratedDb();
+        try {
+            db.prepare(
+                `INSERT INTO claim_operations
+                    (producer, operation_key, request_digest, expected_effect_count, result_json, created_at)
+                 VALUES ('v84-prune', 'no-effects', ?, 0, 'null', 1)`,
+            ).run("2".repeat(64));
+            db.exec("BEGIN IMMEDIATE");
+            try {
+                // Capability held, watermark above everything, no outbox
+                // children: both retention disjuncts pass, so only the
+                // zero-effect guard can reject the delete.
+                db.prepare(
+                    `INSERT INTO claim_change_log_prune_state (id, enabled, consumed_watermark)
+                     VALUES (1, 1, 1000)`,
+                ).run();
+                expect(() =>
+                    db
+                        .prepare("DELETE FROM claim_operations WHERE operation_key = 'no-effects'")
+                        .run(),
+                ).toThrow(/append-only/);
+            } finally {
+                db.exec("ROLLBACK");
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("pruneClaimChangeLogInCurrentTransaction refuses to run outside a transaction", () => {
+        const db = migratedDb();
+        try {
+            expect(() => pruneClaimChangeLogInCurrentTransaction(db, 0)).toThrow(
+                /write transaction/,
+            );
+            // The refusal precedes the capability INSERT: no enabled=1 row
+            // ever commits for other connections to observe.
+            expect(
+                db.prepare("SELECT COUNT(*) AS count FROM claim_change_log_prune_state").get(),
+            ).toEqual({ count: 0 });
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });

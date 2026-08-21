@@ -643,6 +643,34 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
         expect(getClaimsBackfillStatus(db).phase).toBe("blocked");
     });
 
+    test("a corpus change between the oracle read and finalize resets cursors for the re-derive", async () => {
+        const { db, ids } = migrateLazy([
+            { content: "lineage source", hash: "source" },
+            { content: "lineage target", hash: "target", mergedFrom: "[1]" },
+        ]);
+        // One-shot writer race: after the oracle reads a clean report but
+        // before finalize commits, the translated lineage disposition flips
+        // back to blocking. The finalize recheck must fall back to the rows
+        // phase with zeroed cursors so the relationships re-scan re-observes
+        // memory 2 and re-resolves the disposition; stale cursors would skip
+        // it and re-block behind an unchanged digest.
+        let injected = false;
+        setClaimsBackfillFailpoint("claims-backfill.025.reconcile-oracle.after", () => {
+            if (injected) return;
+            injected = true;
+            db.prepare(
+                `UPDATE claim_backfill_failures SET disposition = 'blocking'
+                  WHERE phase = 'relationships' AND item_key LIKE ?`,
+            ).run(`memory:${ids[1]}:%`);
+        });
+
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(injected).toBeTrue();
+        expect(summary.status).toBe("complete");
+        expect(getClaimsBackfillStatus(db).phase).toBe("complete");
+        expect(listClaimsBackfillFailures(db, { dispositions: ["blocking"] })).toHaveLength(0);
+    });
+
     test("waiving the blocking failure changes the digest and the next start resets and completes", async () => {
         const { db } = migrateLazy([{ content: "lineage row", mergedFrom: "[999]" }]);
         expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(

@@ -268,6 +268,40 @@ describe("memory migration (E3.2)", () => {
             const epochAfter = getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0;
             expect(epochAfter).toBeGreaterThan(epochBefore);
         });
+
+        it("shares one claim project generation across the whole delete+reinsert batch", () => {
+            const db = openTestDb();
+            const projectPath = "git:generation-batch";
+            insertMemory(db, {
+                projectPath,
+                category: "ARCHITECTURE_DECISIONS",
+                content: "old A",
+            });
+            insertMemory(db, { projectPath, category: "KNOWN_ISSUES", content: "old B" });
+            const beforeMax = (
+                db.prepare("SELECT COALESCE(MAX(id), 0) AS max FROM claim_change_outbox").get() as {
+                    max: number;
+                }
+            ).max;
+
+            applyMemoryMigration(db, projectPath, {
+                memories: [
+                    { category: "ARCHITECTURE", content: "new A" },
+                    { category: "CONSTRAINTS", content: "new B" },
+                ],
+                userObservations: [],
+                parsed: true,
+            });
+
+            // Every claim operation in the batch (2 deletes + 2 inserts) shares
+            // the generation allocated once for the migration transaction.
+            const generations = db
+                .prepare(
+                    "SELECT DISTINCT generation FROM claim_change_outbox WHERE id > ? ORDER BY generation",
+                )
+                .all(beforeMax) as Array<{ generation: number }>;
+            expect(generations).toHaveLength(1);
+        });
     });
 
     describe("once-per-project guard", () => {

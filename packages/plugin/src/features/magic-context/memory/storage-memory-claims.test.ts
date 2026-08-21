@@ -7,7 +7,9 @@ import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { sha256Utf8Hex } from "./storage-claims";
 import {
+    applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
     ClaimOperationKeyReuseError,
+    canonicalMemoryProjectPathSql,
     clearMemoryClaimFailpoints,
     createMemoryWithClaimsInCurrentTransaction,
     deleteMemoryWithClaimsInCurrentTransaction,
@@ -776,5 +778,174 @@ describe("memory/claims kernel: current-claim reads and corruption reporting", (
         expect(() => getCurrentMemoryClaimByLegacyMemoryId(db, seeded.memoryId)).toThrow(
             /no memory metadata row/,
         );
+    });
+});
+
+describe("canonical project path SQL predicate", () => {
+    test("the SQL twin is binary like the TS resolver: case-variant and bare prefixes are rejected", () => {
+        const db = track(migratedDb());
+        const matches = (value: string): number =>
+            (
+                db
+                    .prepare(
+                        `SELECT CASE WHEN ${canonicalMemoryProjectPathSql(
+                            `'${value.replaceAll("'", "''")}'`,
+                        )} THEN 1 ELSE 0 END AS hit`,
+                    )
+                    .get() as { hit: number }
+            ).hit;
+        expect(matches("git:abc")).toBe(1);
+        expect(matches("dir:/x")).toBe(1);
+        expect(matches("GIT:abc")).toBe(0);
+        expect(matches("Dir:/x")).toBe(0);
+        expect(matches("git:")).toBe(0);
+        expect(matches("dir:")).toBe(0);
+        expect(matches("/legacy/raw-path")).toBe(0);
+    });
+});
+
+describe("memory/claims kernel: canonical claim reuse", () => {
+    test("re-adding hash-equal content with divergent metadata appends a same-content revision", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "canon-meta-seed", "shared dedup fact");
+        // Delete frees the (project, category, hash) slot; the archived claim
+        // and its crosswalk stay behind as the canonical match.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("canon-meta-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            createMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("canon-meta-readd", { readd: true }),
+                {
+                    projectPath: PROJECT,
+                    category: "CONSTRAINTS",
+                    content: "shared dedup fact",
+                    normalizedHash: "hash:shared dedup fact",
+                    importance: 85,
+                    sourceSessionId: "ses-kernel-2",
+                    sourceType: "user",
+                    nowMs: 2_000,
+                },
+            ),
+        );
+        expect(outcome.result.claimId).toBe(seeded.claimId);
+        expect(count(db, "claim_revisions", `claim_id = ${seeded.claimId}`)).toBe(2);
+        const revision = db
+            .prepare(
+                `SELECT rev.content AS content, meta.importance AS importance,
+                        meta.source_type AS sourceType, claims.state AS state
+                   FROM claims
+                   JOIN claim_revisions rev ON rev.id = claims.current_revision_id
+                   JOIN claim_revision_memory_metadata meta ON meta.revision_id = rev.id
+                  WHERE claims.id = ?`,
+            )
+            .get(seeded.claimId) as {
+            content: string;
+            importance: number;
+            sourceType: string;
+            state: string;
+        };
+        expect(revision).toEqual({
+            content: "shared dedup fact",
+            importance: 85,
+            sourceType: "user",
+            state: "active",
+        });
+    });
+});
+
+describe("memory/claims kernel: status transitions with metadata replacement", () => {
+    test("archiving with replacement metadata appends a same-content revision; a status-only transition does not", () => {
+        const db = track(migratedDb());
+        const withMeta = createSeedMemory(db, "archive-meta-seed", "archive metadata fact");
+        const statusOnly = createSeedMemory(db, "archive-plain-seed", "archive plain fact");
+        const metadataJson = JSON.stringify({ archive_reason: "stale" });
+
+        const metaOutcome = runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("archive-meta-1", { id: withMeta.memoryId }),
+                { memoryId: withMeta.memoryId, status: "archived", metadataJson },
+            ),
+        );
+        expect(metaOutcome.result.revisionId).not.toBeNull();
+        expect(count(db, "claim_revisions", `claim_id = ${withMeta.claimId}`)).toBe(2);
+        expect(
+            db
+                .prepare(
+                    "SELECT metadata_json FROM claim_revision_memory_metadata WHERE revision_id = ?",
+                )
+                .get(metaOutcome.result.revisionId),
+        ).toEqual({ metadata_json: metadataJson });
+        expect(
+            db
+                .prepare("SELECT content FROM claim_revisions WHERE id = ?")
+                .get(metaOutcome.result.revisionId),
+        ).toEqual({ content: "archive metadata fact" });
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(withMeta.claimId)).toEqual({
+            state: "archived",
+        });
+        expect(
+            count(db, "claim_change_outbox", `effect_key = 'memory:${withMeta.memoryId}:upsert'`),
+        ).toBe(2);
+
+        const plainOutcome = runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("archive-plain-1", { id: statusOnly.memoryId }),
+                { memoryId: statusOnly.memoryId, status: "archived" },
+            ),
+        );
+        expect(plainOutcome.result.revisionId).toBeNull();
+        expect(count(db, "claim_revisions", `claim_id = ${statusOnly.claimId}`)).toBe(1);
+    });
+});
+
+describe("memory/claims kernel: module delta replay", () => {
+    test("a replayed envelope appends no claim rows for a now-adoptable preimage", () => {
+        const db = track(migratedDb());
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run("/legacy/raw-module-path", "module fact", "hash:module fact")
+                    .lastInsertRowid,
+            );
+        });
+        const env = envelope("module-replay-1", { key: "module-replay" });
+        const first = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(db, env, {
+                memoryId,
+                applyProjection: () => {},
+            }),
+        );
+        expect(first.replayed).toBeFalse();
+        expect(first.result.claimId).toBeNull();
+
+        // The row later rekeys to a canonical identity, so the preimage is now
+        // adoptable — but the committed envelope must keep the replay side-effect
+        // free instead of appending claim rows outside envelope accounting.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET project_path = ? WHERE id = ?").run(PROJECT, memoryId);
+        });
+        const before = snapshotCounts(db);
+        const replayed = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(db, env, {
+                memoryId,
+                applyProjection: () => {},
+            }),
+        );
+        expect(replayed.replayed).toBeTrue();
+        expect(snapshotCounts(db)).toEqual(before);
     });
 });

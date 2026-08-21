@@ -11,6 +11,7 @@ import { bumpEpochsForWorkspaceMembers } from "../storage";
 import { insertUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { resolveProjectIdentity } from "./project-identity";
 import { deleteMemory, getAllActiveMemoriesForMigration, insertMemory } from "./storage-memory";
+import { withMemoryClaimGenerationContextInCurrentTransaction } from "./storage-memory-claims";
 import type { Memory, MemoryCategory } from "./types";
 
 // Minimal structural client type — avoids importing the heavy PluginContext into
@@ -220,29 +221,34 @@ export function applyMemoryMigration(
     const existing = getAllActiveMemoriesForMigration(db, projectPath);
     let removed = 0;
     let inserted = 0;
-    db.transaction(() => {
-        for (const m of existing) {
-            deleteMemory(db, m.id);
-            removed++;
-        }
-        for (const m of result.memories) {
-            insertMemory(db, {
-                projectPath,
-                category: m.category,
-                content: m.content,
-                sourceType: "historian",
-            });
-            inserted++;
-        }
-        // Migration is a NON-ADDITIVE rewrite (delete + reinsert), so the m[0]
-        // baseline is now stale for any active session. Bump the project memory
-        // epoch in the same transaction so the next pass re-materializes m[0]
-        // with the recategorized set (the additive maxMemoryId path would not
-        // catch the deletions).
-        if (removed > 0 || inserted > 0) {
-            bumpEpochsForWorkspaceMembers(db, projectPath);
-        }
-    })();
+    // The generation context spans the whole batch so every per-row claim
+    // operation shares one claim project generation, matching the other batch
+    // writers (tools, relocation, backfill, identity merge).
+    db.transaction(() =>
+        withMemoryClaimGenerationContextInCurrentTransaction(db, () => {
+            for (const m of existing) {
+                deleteMemory(db, m.id);
+                removed++;
+            }
+            for (const m of result.memories) {
+                insertMemory(db, {
+                    projectPath,
+                    category: m.category,
+                    content: m.content,
+                    sourceType: "historian",
+                });
+                inserted++;
+            }
+            // Migration is a NON-ADDITIVE rewrite (delete + reinsert), so the m[0]
+            // baseline is now stale for any active session. Bump the project memory
+            // epoch in the same transaction so the next pass re-materializes m[0]
+            // with the recategorized set (the additive maxMemoryId path would not
+            // catch the deletions).
+            if (removed > 0 || inserted > 0) {
+                bumpEpochsForWorkspaceMembers(db, projectPath);
+            }
+        }),
+    )();
     return { removed, inserted };
 }
 

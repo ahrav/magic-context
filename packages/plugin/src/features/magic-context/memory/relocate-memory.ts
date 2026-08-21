@@ -101,6 +101,22 @@ function relocationEnvelope(operation: string, request: unknown): MemoryClaimOpe
 }
 
 /**
+ * Claims-active relocations require a resolvable target project. Silently
+ * skipping claim work on an unresolved target would delete source rows
+ * without lineage or leave fresh rows permanently unlinked (the crosswalk is
+ * append-only), so an unresolvable target fails the operation instead.
+ */
+function requireRelocationTargetProject(db: Database, toIdentity: string): number {
+    const targetProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
+    if (targetProjectId === null) {
+        throw new Error(
+            `memory relocation target ${toIdentity} does not resolve to a canonical git:/dir: project; claims-linked rows cannot relocate to an unresolvable identity`,
+        );
+    }
+    return targetProjectId;
+}
+
+/**
  * Claim adoption for a plain rekey. An unlinked row adopts its preimage
  * under the TARGET numeric project — the raw source path is what made it
  * unlinkable — which also satisfies the v84 boundary identity guard before
@@ -152,8 +168,7 @@ function adoptRelocationMergeClaims(
     targetId: number,
     toIdentity: string,
 ): void {
-    const targetProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
-    if (targetProjectId === null) return;
+    const targetProjectId = requireRelocationTargetProject(db, toIdentity);
     const targetRow = readMemoryProjectionRow(db, targetId);
     if (!targetRow || targetRow.content.length === 0) return;
     const sourceRow = readMemoryProjectionRow(db, sourceId);
@@ -216,7 +231,7 @@ function adoptRelocationMergeClaims(
  * cross-project lineage, repoints sibling supersession references, and
  * deletes the source row — whose durable link survives the delete.
  */
-function moveLinkedMemoryAcrossProjects(
+export function moveLinkedMemoryAcrossProjects(
     db: Database,
     rowId: number,
     fromProjectPath: string,
@@ -404,21 +419,19 @@ function rekeyMemoryRowWithCollisionMergeInner(
     }
 
     if (claimsActive) {
-        const targetProjectId = resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity);
-        if (targetProjectId !== null) {
-            const link = readMemoryClaimLink(db, rowId);
-            if (link && link.projectId !== targetProjectId) {
-                return moveLinkedMemoryAcrossProjects(
-                    db,
-                    rowId,
-                    fromProjectPath,
-                    toIdentity,
-                    targetProjectId,
-                    link,
-                );
-            }
-            if (!link) adoptRelocationRekeyClaim(db, rowId, targetProjectId);
+        const targetProjectId = requireRelocationTargetProject(db, toIdentity);
+        const link = readMemoryClaimLink(db, rowId);
+        if (link && link.projectId !== targetProjectId) {
+            return moveLinkedMemoryAcrossProjects(
+                db,
+                rowId,
+                fromProjectPath,
+                toIdentity,
+                targetProjectId,
+                link,
+            );
         }
+        if (!link) adoptRelocationRekeyClaim(db, rowId, targetProjectId);
     }
 
     const result = db
@@ -536,9 +549,7 @@ function copyMemoriesToProjectInner(
           )
         : null;
     const claimsActive = hasMemoryClaimsCompatSchema(db);
-    const targetProjectId = claimsActive
-        ? resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity)
-        : null;
+    const targetProjectId = claimsActive ? requireRelocationTargetProject(db, toIdentity) : null;
     let relocated = 0;
     let skipped = 0;
     for (const id of ids) {

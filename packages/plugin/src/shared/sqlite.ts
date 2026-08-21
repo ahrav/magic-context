@@ -298,7 +298,11 @@ function hasClaimCompatibilityWriteState(db: Database): boolean {
     return present;
 }
 
-function isInTransaction(db: Database): boolean {
+/**
+ * True while the connection holds an open transaction. bun:sqlite and
+ * better-sqlite3 expose `inTransaction`; node:sqlite exposes `isTransaction`.
+ */
+export function isInTransaction(db: Database): boolean {
     const candidate = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
     return candidate.inTransaction === true || candidate.isTransaction === true;
 }

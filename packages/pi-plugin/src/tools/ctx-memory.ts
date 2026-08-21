@@ -48,7 +48,6 @@ import {
 	mergeMemoryStats,
 	saveEmbedding,
 	supersededMemory,
-	updateMemoryContent,
 	updateMemorySeenCount,
 	V2_MEMORY_CATEGORIES,
 } from "@magic-context/core/features/magic-context/memory";
@@ -425,6 +424,10 @@ export function createCtxMemoryTool(
 					"Error: Could not resolve project identity for memory action.",
 				);
 			}
+			const sessionId = ctx.sessionManager.getSessionId();
+			// claim_operations is UNIQUE(producer, operation_key) DB-wide while
+			// tool-call ids are only unique within a session, so the key carries
+			// the session id (mirrors OpenCode's toolContext.sessionID scoping).
 			const claimOperationIdentity = (
 				suffix: string,
 				request: unknown,
@@ -432,7 +435,7 @@ export function createCtxMemoryTool(
 				toolCallId
 					? {
 							producer: "ctx-memory-pi",
-							operationKey: `${toolCallId}:${suffix}`,
+							operationKey: `${sessionId}:${toolCallId}:${suffix}`,
 							requestDigest: computeClaimRequestDigest(request),
 						}
 					: undefined;
@@ -503,7 +506,6 @@ export function createCtxMemoryTool(
 			) {
 				return err("Cross-session memory is disabled for this project.");
 			}
-			const sessionId = ctx.sessionManager.getSessionId();
 
 			if (params.action === "write") {
 				const content = params.content?.trim();
@@ -898,9 +900,16 @@ export function createCtxMemoryTool(
 										canonicalMemory.content !== content ||
 										canonicalMemory.normalizedHash !== normalizedHash;
 									if (canonicalContentChanged) {
-										updateMemoryContent(
+										// Already inside the merge's transaction and claim
+										// generation context; the standalone updateMemoryContent
+										// would open a nested claims write transaction. The merge
+										// replay row is recorded by mergeMemoryStats below under
+										// mergeIdentity, so the content update carries no identity
+										// (reusing mergeIdentity here would make mergeMemoryStats
+										// replay-skip the stats write). Parity with OpenCode.
+										updateMemoryContentInCurrentTransaction(
 											deps.db,
-											canonicalMemory.id,
+											canonicalMemory,
 											content,
 											normalizedHash,
 										);
@@ -1003,17 +1012,19 @@ export function createCtxMemoryTool(
 							? { id: memoryId, reason: params.reason.trim() }
 							: { id: memoryId, status: "archived" },
 					);
-				const archiveReplay = archiveIds.every((memoryId) => {
-					const identity = archiveIdentity(memoryId);
-					return (
-						identity !== undefined &&
-						readMemoryClaimOperationResult(deps.db, {
-							producer: identity.producer,
-							operationKey: identity.operationKey,
-							requestDigest: identity.requestDigest as string,
-						}) !== null
-					);
-				});
+				const archiveReplay =
+					hasMemoryClaimsCompatSchema(deps.db) &&
+					archiveIds.every((memoryId) => {
+						const identity = archiveIdentity(memoryId);
+						return (
+							identity !== undefined &&
+							readMemoryClaimOperationResult(deps.db, {
+								producer: identity.producer,
+								operationKey: identity.operationKey,
+								requestDigest: identity.requestDigest as string,
+							}) !== null
+						);
+					});
 				if (archiveReplay) {
 					const reasonSuffix = params.reason ? ` (${params.reason})` : "";
 					const idList = archiveIds.join(", ");

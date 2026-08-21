@@ -6,6 +6,7 @@ import { DREAMER_AGENT } from "../../agents/dreamer";
 import { SIDEKICK_AGENT } from "../../agents/sidekick";
 import {
     computeNormalizedHash,
+    deleteMemory,
     getMemoriesByProject,
     getMemoryById,
     getMemoryMutationsForRender,
@@ -784,6 +785,24 @@ describe("createCtxMemoryTools", () => {
             );
             expect(failed).toContain("Error");
             expect(getMemoryById(db, third.id)?.status).toBe("active");
+        });
+
+        it("archives with a tool-call id on a database without the claims schema", async () => {
+            const memory = insertMemory(db, {
+                projectPath: "/repo/project",
+                category: "KNOWN_ISSUES",
+                content: "Pre-claims archive target.",
+            });
+
+            // A pre-v84 database has no claim_operations table; the replay
+            // gate must not read it just because a tool-call id is present.
+            const result = await tools.ctx_memory.execute(
+                { action: "archive", ids: [memory.id] },
+                toolContext("ses-memory", "general", "tool-call-pre-claims"),
+            );
+
+            expect(result).toContain(`Archived memory [ID: ${memory.id}]`);
+            expect(getMemoryById(db, memory.id)?.status).toBe("archived");
         });
 
         it("rejects archived memories with the same inactive-memory error used by update and merge", async () => {
@@ -2126,7 +2145,7 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
             countRows(
                 db,
                 "claim_operations",
-                `producer = 'ctx-memory-opencode' AND operation_key = 'tool-call-lost-ack:update:${memory.id}'`,
+                `producer = 'ctx-memory-opencode' AND operation_key = 'ses-lost-ack:tool-call-lost-ack:update:${memory.id}'`,
             ),
         ).toBe(1);
         expect(
@@ -2143,6 +2162,109 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
                 context,
             ),
         ).rejects.toThrow(/already committed for a different request digest/);
+    });
+
+    it("a duplicate write with a tool-call id persists an envelope and replays without a second seen-count bump", async () => {
+        const memory = insertMemory(db, {
+            projectPath: OWN_PROJECT,
+            category: "CONSTRAINTS",
+            content: "Duplicate write original.",
+        });
+        let syncCalls = 0;
+        const syncTools = createCtxMemoryTools({
+            db,
+            resolveProjectPath: () => OWN_PROJECT,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            rustToolBackends: {
+                memorySync: () => {
+                    syncCalls += 1;
+                },
+            },
+        });
+        const args = {
+            action: "write" as const,
+            category: "CONSTRAINTS" as const,
+            content: "Duplicate write original.",
+        };
+        const context = toolContext("ses-dup-write", "general", "tool-call-dup-write");
+
+        const first = await syncTools.ctx_memory.execute(args, context);
+        expect(first).toBe(
+            `Memory already exists [ID: ${memory.id}] in CONSTRAINTS (seen count incremented).`,
+        );
+        expect(getMemoryById(db, memory.id)?.seenCount).toBe(2);
+        expect(syncCalls).toBe(1);
+        expect(
+            countRows(
+                db,
+                "claim_operations",
+                "producer = 'ctx-memory-opencode' AND operation_key = 'ses-dup-write:tool-call-dup-write:write'",
+            ),
+        ).toBe(1);
+
+        const replay = await syncTools.ctx_memory.execute(args, context);
+        expect(replay).toBe(first);
+        expect(getMemoryById(db, memory.id)?.seenCount).toBe(2);
+        expect(syncCalls).toBe(1);
+    });
+
+    it("update replay returns the stored result after the target row is archived", async () => {
+        const memory = insertMemory(db, {
+            projectPath: OWN_PROJECT,
+            category: "CONSTRAINTS",
+            content: "Replay update original.",
+        });
+        const args = {
+            action: "update" as const,
+            ids: [memory.id],
+            content: "Replay update corrected.",
+        };
+        const context = toolContext("ses-replay-update", "general", "tool-call-replay-update");
+
+        const first = await tools.ctx_memory.execute(args, context);
+        expect(first).toBe(`Updated memory [ID: ${memory.id}] in CONSTRAINTS.`);
+
+        const archived = await tools.ctx_memory.execute(
+            { action: "archive", ids: [memory.id] },
+            toolContext(),
+        );
+        expect(archived).toContain("Archived memory");
+
+        const operationsBefore = countRows(db, "claim_operations");
+        const replay = await tools.ctx_memory.execute(args, context);
+        expect(replay).toBe(first);
+        expect(countRows(db, "claim_operations")).toBe(operationsBefore);
+        expect(getMemoryById(db, memory.id)?.status).toBe("archived");
+    });
+
+    it("merge replay returns the stored result after a source memory is deleted", async () => {
+        const first = insertMemory(db, {
+            projectPath: OWN_PROJECT,
+            category: "CONSTRAINTS",
+            content: "Merge replay source one.",
+        });
+        const second = insertMemory(db, {
+            projectPath: OWN_PROJECT,
+            category: "CONSTRAINTS",
+            content: "Merge replay source two.",
+        });
+        const args = {
+            action: "merge" as const,
+            ids: [first.id, second.id],
+            category: "CONSTRAINTS" as const,
+            content: "Merge replay canonical.",
+        };
+        const context = toolContext("ses-replay-merge", "general", "tool-call-replay-merge");
+
+        const merged = await tools.ctx_memory.execute(args, context);
+        expect(merged).toContain("Merged memories");
+
+        deleteMemory(db, first.id);
+        expect(getMemoryById(db, first.id)).toBeNull();
+
+        const replay = await tools.ctx_memory.execute(args, context);
+        expect(replay).toBe(merged);
     });
 
     it("two connections replay stable merges before mutating existing or fresh canonicals", async () => {
@@ -2233,7 +2355,7 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
                     countRows(
                         db,
                         "claim_operations",
-                        `producer = 'ctx-memory-opencode' AND operation_key = 'stable-merge-${existingCanonical}:merge'`,
+                        `producer = 'ctx-memory-opencode' AND operation_key = 'ses-stable-merge:stable-merge-${existingCanonical}:merge'`,
                     ),
                 ).toBe(1);
                 await expect(
@@ -2300,7 +2422,10 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
         expect(
             countRows(db, "claim_change_outbox", "effect_type = 'lifecycle'"),
         ).toBeGreaterThanOrEqual(2);
-        expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore + 2);
+        // The reasoned archive rewrites metadata_json, which appends a revision
+        // and an upsert effect alongside its lifecycle effect; the reasonless
+        // archive emits a lifecycle effect only.
+        expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore + 3);
         const generationAfter = (
             db
                 .prepare("SELECT MAX(generation) AS generation FROM claim_project_generations")

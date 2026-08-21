@@ -27,7 +27,7 @@
       ],
       "slowestMs": 660.13,
       "lockDurationMs": 660.13,
-      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v83); the duration a sibling start would wait"
+      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v84); the duration a sibling start would wait"
     },
     {
       "scale": 10000,
@@ -42,7 +42,7 @@
       ],
       "slowestMs": 10842.04,
       "lockDurationMs": 10842.04,
-      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v83); the duration a sibling start would wait"
+      "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v84); the duration a sibling start would wait"
     }
   ],
   "skippedScales": [
@@ -60,5 +60,5 @@
   "productionCutoff": 0,
   "productionCutoffReason": "production policy stays at cutoff 0 (PRODUCTION_CLAIMS_BACKFILL_POLICY = null): full 1K/10K/100K/1M Bun and Node reference-host evidence was not run and reviewed; omissions were not extrapolated",
   "evidenceDigestPolicy": "sha256(JSON.stringify(measurements))",
-  "evidenceDigest": "5dd2bc00de0baf93a63f8131176a019c8b27c026d4a90cc68f75d041992d9962"
+  "evidenceDigest": "236ae1ef3353267b60d08fd3e1ca98052c6e08dada9396e1576aa3c753bd2f4e"
 }
