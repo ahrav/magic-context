@@ -1327,14 +1327,25 @@ mod tests {
 
     #[test]
     fn the_maximum_default_reservation_fits_the_default_ingress_pool() {
+        // The ingress pool built at startup (runtime.rs) is
+        // max_resident_bytes - EGRESS_RESERVED_BYTES - catalog_resident.
+        // The resident catalog is deployment-dependent (bounded only by the
+        // frame limit), so this pins the default limits against a named
+        // allowance rather than the theoretical catalog maximum. A
+        // deployment whose catalog or tuned-down max_resident_bytes eats
+        // past this allowance lowers the largest admittable request rather
+        // than wedging the host: smaller bodies reserve proportionally
+        // less and still admit.
+        const CATALOG_ALLOWANCE_BYTES: u64 = 1 << 20;
         let bound = parse_reservation_bytes(MAX_BODY_BYTES, &SynapseLimits::default())
             .expect("the default bound is computable");
         let limits = crate::config::HostLimits::default();
-        let ingress = limits.max_resident_bytes - crate::config::EGRESS_RESERVED_BYTES;
-        // One maximum body charge plus its parse reservation must fit with
-        // a megabyte to spare for a linked catalog.
+        let ingress = limits.max_resident_bytes
+            - crate::config::EGRESS_RESERVED_BYTES
+            - CATALOG_ALLOWANCE_BYTES;
+        // One maximum body charge plus its parse reservation must fit.
         assert!(
-            (bound + MAX_BODY_BYTES) as u64 + (1 << 20) <= ingress,
+            (bound + MAX_BODY_BYTES) as u64 <= ingress,
             "bound {bound} does not fit the default ingress pool {ingress}"
         );
     }
