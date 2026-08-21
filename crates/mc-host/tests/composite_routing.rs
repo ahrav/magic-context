@@ -299,6 +299,16 @@ async fn two_target_catalog_lists_both_modules_deterministically() {
     assert_eq!(modules[0]["roles"][0]["role"], "tool_provider");
     assert_eq!(modules[1]["module_id"], "synapse");
     assert_eq!(modules[1]["roles"][0]["role"], "management_surface");
+    // `control_ops` excludes `wake.create` because the direct host does not
+    // implement it; wake-plane probes therefore fail open.
+    for module in modules {
+        assert_eq!(
+            module["control_ops"],
+            serde_json::json!([]),
+            "{} must not advertise unimplemented operations",
+            module["module_id"]
+        );
+    }
 
     for (filter, expected) in [("magic-context", 1), ("synapse", 1), ("unknown", 0)] {
         let corr = client
@@ -307,10 +317,16 @@ async fn two_target_catalog_lists_both_modules_deterministically() {
             .expect("send filtered catalog.list");
         let frame = client.frame_within(BUDGET).await.expect("catalog");
         assert_eq!(frame.corr, corr);
-        let modules = frame.json()["modules"].as_array().expect("modules").len();
+        let body = frame.json();
+        let modules = body["modules"].as_array().expect("modules").len();
         assert_eq!(modules, expected, "filter {filter}");
         if expected == 1 {
-            assert_eq!(frame.json()["modules"][0]["module_id"], filter);
+            assert_eq!(body["modules"][0]["module_id"], filter);
+            assert_eq!(
+                body["modules"][0]["control_ops"],
+                serde_json::json!([]),
+                "filtered {filter} entry must not advertise unimplemented operations"
+            );
         }
     }
 

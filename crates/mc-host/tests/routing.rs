@@ -59,14 +59,13 @@ async fn catalog_is_truthful_and_filters_exactly() {
         json["subc_ops"],
         serde_json::json!(["route.open", "catalog.list"])
     );
-    // Wake-plane probing stays fail-open only while this stays absent.
-    const WAKE_CREATE: &[u8] = b"wake.create";
-    assert!(
-        !unfiltered
-            .body
-            .windows(WAKE_CREATE.len())
-            .any(|w| w == WAKE_CREATE),
-        "an unimplemented operation must not be advertised"
+    // `control_ops` excludes `wake.create` because the direct host does not
+    // implement it; TypeScript wake-plane probing therefore stays fail-open
+    // (protocol AE10).
+    assert_eq!(
+        modules[0]["control_ops"],
+        serde_json::json!(["health.check"]),
+        "control_ops must list implemented operations only"
     );
 
     let exact = control_once(
@@ -74,7 +73,14 @@ async fn catalog_is_truthful_and_filters_exactly() {
         serde_json::json!({"op": "catalog.list", "module_id": LINKED_MODULE_ID}),
     )
     .await;
-    assert_eq!(exact.json()["modules"].as_array().expect("array").len(), 1);
+    let exact_json = exact.json();
+    let exact_modules = exact_json["modules"].as_array().expect("array");
+    assert_eq!(exact_modules.len(), 1);
+    assert_eq!(
+        exact_modules[0]["control_ops"],
+        serde_json::json!(["health.check"]),
+        "the exact filter must return the same structured operation list"
+    );
 
     let unknown = control_once(
         &mut client,
