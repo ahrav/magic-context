@@ -418,7 +418,16 @@ impl JobTable {
     }
 
     pub fn publish_failed(&self, seq: u64, code: String, message: String) {
-        let mut jobs = self.inner.lock().expect("job table lock");
+        // `AbandonGuard::drop` calls this, possibly while unwinding from a
+        // panic raised under this same mutex further down the stack. An
+        // `.expect()` on the poisoned lock would panic inside a `Drop`
+        // during unwind and abort the process, so recover the poisoned
+        // state instead: `fail_job` tolerates partially updated entries
+        // (missing or already-completed jobs are no-ops).
+        let mut jobs = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.fail_job(&mut jobs, seq, code, message);
     }
 

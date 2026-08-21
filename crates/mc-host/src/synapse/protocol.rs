@@ -1327,4 +1327,80 @@ mod tests {
         let large = parse_reservation_bytes(2048, &limits).expect("large");
         assert!(large > small);
     }
+
+    /// The resident-byte guarantee rests on `parse_reservation_bytes`
+    /// dominating the post-decode owned bytes the handler shrinks to:
+    /// `ByteCharge::shrink_to` cannot grow a charge and `split_or_take`
+    /// falls back to "take what is left", so an undersized reservation is a
+    /// silent under-charge. This pins the dominance for the adversarial
+    /// shapes most likely to break it: escape-heavy strings (where serde's
+    /// decode scratch capacity, not the decoded length, is what the owned
+    /// `String` keeps) and item metadata at its size limits.
+    #[test]
+    fn the_parse_reservation_dominates_post_decode_owned_bytes() {
+        const RESPONSE_SCRATCH_BYTES: usize = super::super::RESPONSE_SCRATCH_BYTES;
+        let limits = SynapseLimits::default();
+        let lane = lane();
+
+        // Query path: owned = text.capacity() + response scratch.
+        for text_json in [
+            "\\\"".repeat(4096),    // two body bytes per decoded byte
+            "\\u0041".repeat(1024), // six body bytes per decoded byte
+        ] {
+            let body = format!(
+                concat!(
+                    "{{\"method\":\"embed.query\",\"params\":{{",
+                    "\"model\":\"{}\",\"required_fingerprint\":\"{}\",",
+                    "\"required_epoch\":{},\"allow_equivalent\":false,",
+                    "\"accept_declared\":false,\"text\":\"{}\"}}}}"
+                ),
+                lane.model, lane.fingerprint, lane.table_epoch, text_json,
+            )
+            .into_bytes();
+            let reservation =
+                parse_reservation_bytes(body.len(), &limits).expect("bound is computable");
+            let Request::EmbedQuery { text, .. } =
+                parse_request(&body, false, &lane, &limits).expect("query parses")
+            else {
+                panic!("expected a query");
+            };
+            let owned = text.capacity() + RESPONSE_SCRATCH_BYTES;
+            assert!(
+                reservation >= owned,
+                "reservation {reservation} does not dominate query owned bytes {owned}"
+            );
+        }
+
+        // Batch path: owned exactly as `handle` sizes the shrink — the
+        // job's input bytes plus both key capacities and response scratch.
+        let items_json: Vec<String> = (0..8)
+            .map(|index| {
+                let decoded = "\"".repeat(512);
+                format!(
+                    "{{\"id\":\"{index:0>256}\",\"text\":\"{}\",\"content_sha256\":\"{}\"}}",
+                    "\\\"".repeat(512),
+                    sha256_hex(decoded.as_bytes()),
+                )
+            })
+            .collect();
+        let body = batch_body(&lane, &format!("[{}]", items_json.join(",")));
+        let reservation =
+            parse_reservation_bytes(body.len(), &limits).expect("bound is computable");
+        let Request::EmbedBatch {
+            request_key,
+            canonical_key,
+            items,
+        } = parse_request(&body, false, &lane, &limits).expect("batch parses")
+        else {
+            panic!("expected a batch");
+        };
+        let owned = super::super::jobs::job_input_bytes(&request_key, &items)
+            + request_key.capacity()
+            + canonical_key.capacity()
+            + RESPONSE_SCRATCH_BYTES;
+        assert!(
+            reservation >= owned,
+            "reservation {reservation} does not dominate batch owned bytes {owned}"
+        );
+    }
 }

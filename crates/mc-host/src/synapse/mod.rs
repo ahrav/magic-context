@@ -330,6 +330,21 @@ impl Drop for AbandonGuard {
 
 const RESPONSE_SCRATCH_BYTES: usize = 256;
 
+/// The parse reservation must dominate every post-decode owned size the
+/// handler shrinks to. `ByteCharge::shrink_to` cannot grow a charge, and
+/// `split_or_take` falls back to "take what is left" rather than erroring,
+/// so an undersized reservation silently under-charges the job — the bug
+/// class the resident budget exists to close. After `shrink_to(owned)` the
+/// charge holds `min(reservation, owned)`, so holding fewer than `owned`
+/// bytes proves the reservation formula no longer dominates real usage.
+fn debug_assert_reservation_covered(charge: &crate::wire::ByteCharge, owned: usize) {
+    debug_assert!(
+        charge.bytes() >= owned,
+        "parse reservation ({} bytes) is smaller than the post-decode owned bytes ({owned})",
+        charge.bytes(),
+    );
+}
+
 fn request_error(error: RequestError) -> RequestOutcome {
     RequestOutcome::Error {
         code: error.code.to_owned(),
@@ -718,7 +733,9 @@ impl CompositeComponent for SynapseComponent {
                 respond(&ctx, protocol::models_list_body(&lane.lane)).await
             }
             Request::EmbedQuery { text, deadline_ms } => {
-                charge.shrink_to(text.capacity() + RESPONSE_SCRATCH_BYTES);
+                let owned = text.capacity() + RESPONSE_SCRATCH_BYTES;
+                charge.shrink_to(owned);
+                debug_assert_reservation_covered(&charge, owned);
                 let text_charge = charge.split_or_take(text.capacity());
                 let _handler_charge = charge;
                 self.handle_query(&ctx, lane, text, deadline_ms, text_charge)
@@ -734,6 +751,7 @@ impl CompositeComponent for SynapseComponent {
                     .saturating_add(canonical_key.capacity())
                     .saturating_add(RESPONSE_SCRATCH_BYTES);
                 charge.shrink_to(owned);
+                debug_assert_reservation_covered(&charge, owned);
                 self.handle_batch(&ctx, lane, request_key, canonical_key, items, charge)
                     .await
             }
@@ -748,6 +766,7 @@ impl CompositeComponent for SynapseComponent {
                     .saturating_add(cursor.as_ref().map_or(0, String::capacity))
                     .saturating_add(RESPONSE_SCRATCH_BYTES);
                 charge.shrink_to(owned);
+                debug_assert_reservation_covered(&charge, owned);
                 let _handler_charge = charge;
                 self.handle_result(&ctx, lane, job_id, request_key, cursor)
                     .await
