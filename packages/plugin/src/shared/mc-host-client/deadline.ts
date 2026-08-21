@@ -108,6 +108,10 @@ export function armExpiryTimer(
     let handle: unknown;
     const fire = (): void => {
         if (!deadline.isExpired()) {
+            // Re-arms floor at 1ms: near expiry remainingMs() is fractional,
+            // and a 0ms reschedule loop would spin the event loop until the
+            // clock crosses the end. The initial arm floors at 0 so an
+            // already-expired deadline still fires (and rejects) immediately.
             handle = scheduler.schedule(fire, Math.max(1, deadline.remainingMs()));
             return;
         }
