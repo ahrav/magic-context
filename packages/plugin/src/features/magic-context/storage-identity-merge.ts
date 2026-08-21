@@ -11,7 +11,9 @@ import {
     resolveMemoryClaimProjectInCurrentTransaction,
     retireMemoryClaimInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    translateMemoryClaimRelationshipsInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
 import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
 import {
@@ -173,6 +175,9 @@ function adoptIdentityMergeRowClaims(
                 const link = ensureMemoryClaimLinkInCurrentTransaction(db, sourceRow, projectId, {
                     kind: "migration",
                 });
+                effects.push(
+                    ...translateMemoryClaimRelationshipsInCurrentTransaction(db, sourceRow),
+                );
                 if (!wasLinked) {
                     effects.push({
                         effectKey: `memory:${sourceId}:upsert`,
@@ -209,6 +214,7 @@ function adoptIdentityMergeRowClaims(
                     { adoptDivergentContent: false },
                 );
             }
+            effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, sourceRow));
             if (sourceLink.claimId !== targetLink.claimId) {
                 // A colliding source with its own claim retires it with
                 // supersession lineage; two active claims must not survive for
@@ -517,7 +523,9 @@ export function mergeProjectIdentities(
     const mergedAt = options.now ?? Date.now();
     const withWriteScope = (fn: () => void): void => {
         if (hasMemoryClaimsCompatSchema(db)) {
-            withClaimsWriteCapabilityInCurrentTransaction(db, fn);
+            withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+                withMemoryClaimGenerationContextInCurrentTransaction(db, fn),
+            );
         } else {
             fn();
         }

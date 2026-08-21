@@ -794,14 +794,21 @@ export class ModuleMemoryAuthorityError extends Error {
     }
 }
 
+export interface MemoryClaimOperationIdentity {
+    producer: string;
+    operationKey: string;
+    requestDigest?: string;
+}
+
 function storageMemoryClaimEnvelope(
     operation: string,
     request: unknown,
+    identity?: MemoryClaimOperationIdentity,
 ): MemoryClaimOperationEnvelope {
     return {
-        producer: "storage-memory",
-        operationKey: `${operation}:${randomUUID()}`,
-        requestDigest: sha256Utf8Hex(JSON.stringify(request)),
+        producer: identity?.producer ?? "storage-memory",
+        operationKey: identity?.operationKey ?? `${operation}:${randomUUID()}`,
+        requestDigest: identity?.requestDigest ?? sha256Utf8Hex(JSON.stringify(request)),
     };
 }
 
@@ -826,17 +833,25 @@ function assertTsMemoryIdWriteAllowed(db: Database, id: number): Memory | null {
     return memory;
 }
 
-export function insertMemory(db: Database, input: MemoryInput): Memory {
+export function insertMemory(
+    db: Database,
+    input: MemoryInput,
+    operationIdentity?: MemoryClaimOperationIdentity,
+): Memory {
     assertTsMemoryWriteAllowed(db, input.projectPath);
     const now = input.nowMs ?? Date.now();
     const normalizedHash = computeNormalizedHash(input.content);
     if (hasMemoryClaimsCompatSchema(db)) {
-        const envelope = storageMemoryClaimEnvelope("insert", {
-            projectPath: input.projectPath,
-            category: input.category,
-            normalizedHash,
-            content: input.content,
-        });
+        const envelope = storageMemoryClaimEnvelope(
+            "insert",
+            {
+                projectPath: input.projectPath,
+                category: input.category,
+                normalizedHash,
+                content: input.content,
+            },
+            operationIdentity,
+        );
         const outcome = runInMemoryClaimsWriteTransaction(db, () =>
             createMemoryWithClaimsInCurrentTransaction(db, envelope, {
                 projectPath: input.projectPath,
@@ -876,9 +891,13 @@ export function insertMemory(db: Database, input: MemoryInput): Memory {
  * bump seen_count/last_seen_at on the existing row and return it instead of
  * surfacing a transient write failure.
  */
-export function insertMemoryIdempotent(db: Database, input: MemoryInput): InsertMemoryResult {
+export function insertMemoryIdempotent(
+    db: Database,
+    input: MemoryInput,
+    operationIdentity?: MemoryClaimOperationIdentity,
+): InsertMemoryResult {
     try {
-        return { memory: insertMemory(db, input), inserted: true };
+        return { memory: insertMemory(db, input, operationIdentity), inserted: true };
     } catch (error) {
         if (!isUniqueConstraintError(error)) {
             throw error;
@@ -1278,19 +1297,29 @@ export function updateMemoryRetrievalCount(db: Database, id: number): void {
     getUpdateMemoryRetrievalCountStatement(db).run(now, now, id);
 }
 
-export function updateMemoryStatus(db: Database, id: number, status: MemoryStatus): void {
+export function updateMemoryStatus(
+    db: Database,
+    id: number,
+    status: MemoryStatus,
+    operationIdentity?: MemoryClaimOperationIdentity,
+): boolean {
     assertTsMemoryIdWriteAllowed(db, id);
     if (hasMemoryClaimsCompatSchema(db)) {
-        const envelope = storageMemoryClaimEnvelope("set-status", { id, status });
-        runInMemoryClaimsWriteTransaction(db, () =>
+        const envelope = storageMemoryClaimEnvelope(
+            "set-status",
+            { id, status },
+            operationIdentity,
+        );
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
             setMemoryStatusWithClaimsInCurrentTransaction(db, envelope, {
                 memoryId: id,
                 status,
             }),
         );
-        return;
+        return outcome.replayed;
     }
     getUpdateMemoryStatusStatement(db).run(status, Date.now(), id);
+    return false;
 }
 
 function mergeMetadataJson(existing: string | null, patch: Record<string, string>): string | null {
@@ -1348,19 +1377,20 @@ export function updateMemoryContent(
     id: number,
     content: string,
     normalizedHash: string,
-): void {
+    operationIdentity?: MemoryClaimOperationIdentity,
+): boolean {
     // Intentional: read outside transaction — Bun is single-threaded so no concurrent
     // modification can happen. The projectPath is only used for cache invalidation after
     // the write, which self-heals on next search if stale.
     const memory = assertTsMemoryIdWriteAllowed(db, id);
 
     if (hasMemoryClaimsCompatSchema(db)) {
-        const envelope = storageMemoryClaimEnvelope("update-content", {
-            id,
-            content,
-            normalizedHash,
-        });
-        runInMemoryClaimsWriteTransaction(db, () =>
+        const envelope = storageMemoryClaimEnvelope(
+            "update-content",
+            { id, content, normalizedHash },
+            operationIdentity,
+        );
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
             updateMemoryContentWithClaimsInCurrentTransaction(db, envelope, {
                 memoryId: id,
                 content,
@@ -1370,7 +1400,7 @@ export function updateMemoryContent(
         if (memory) {
             invalidateMemory(memory.projectPath, id);
         }
-        return;
+        return outcome.replayed;
     }
 
     db.transaction(() => {
@@ -1418,6 +1448,7 @@ export function updateMemoryContent(
     if (memory) {
         invalidateMemory(memory.projectPath, id);
     }
+    return false;
 }
 
 export interface MemoryClassificationUpdate {
@@ -1448,11 +1479,13 @@ export function setMemoryClassification(
 
     const assignments: string[] = [];
     const values: Array<number | string> = [];
+    const changed: { importance?: number; scope?: string; shareable?: number } = {};
     if (hasImportance) {
         const next = normalizeImportance(classification.importance as number);
         if (memory.importance !== next) {
             assignments.push("importance = ?");
             values.push(next);
+            changed.importance = next;
         }
     }
     if (hasScope) {
@@ -1463,6 +1496,7 @@ export function setMemoryClassification(
         if (memory.scope !== next) {
             assignments.push("scope = ?");
             values.push(next);
+            changed.scope = next;
         }
     }
     if (hasShareable) {
@@ -1470,6 +1504,7 @@ export function setMemoryClassification(
         if ((memory.shareable ? 1 : 0) !== next) {
             assignments.push("shareable = ?");
             values.push(next);
+            changed.shareable = next;
         }
     }
 
@@ -1483,13 +1518,6 @@ export function setMemoryClassification(
             // semantic change: no revision, no claim work, no outbox.
             db.prepare("UPDATE memories SET classified_at = ? WHERE id = ?").run(Date.now(), id);
             return false;
-        }
-        const changed: { importance?: number; scope?: string; shareable?: number } = {};
-        for (let index = 0; index < assignments.length; index += 1) {
-            const column = assignments[index];
-            if (column.startsWith("importance")) changed.importance = values[index] as number;
-            else if (column.startsWith("scope")) changed.scope = values[index] as string;
-            else if (column.startsWith("shareable")) changed.shareable = values[index] as number;
         }
         const envelope = storageMemoryClaimEnvelope("classify", { id, ...changed });
         runInMemoryClaimsWriteTransaction(db, () =>
@@ -1515,19 +1543,29 @@ export function setMemoryClassification(
     return fieldChanged;
 }
 
-export function supersededMemory(db: Database, id: number, supersededById: number): void {
+export function supersededMemory(
+    db: Database,
+    id: number,
+    supersededById: number,
+    operationIdentity?: MemoryClaimOperationIdentity,
+): boolean {
     assertTsMemoryIdWriteAllowed(db, id);
     if (hasMemoryClaimsCompatSchema(db)) {
-        const envelope = storageMemoryClaimEnvelope("supersede", { id, supersededById });
-        runInMemoryClaimsWriteTransaction(db, () =>
+        const envelope = storageMemoryClaimEnvelope(
+            "supersede",
+            { id, supersededById },
+            operationIdentity,
+        );
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
             supersedeMemoryWithClaimsInCurrentTransaction(db, envelope, {
                 memoryId: id,
                 supersededByMemoryId: supersededById,
             }),
         );
-        return;
+        return outcome.replayed;
     }
     getSupersededMemoryStatement(db).run(supersededById, Date.now(), id);
+    return false;
 }
 
 export function mergeMemoryStats(
@@ -1537,19 +1575,18 @@ export function mergeMemoryStats(
     retrievalCount: number,
     mergedFrom: string,
     status: MemoryStatus,
-): void {
+    operationIdentity?: MemoryClaimOperationIdentity,
+): boolean {
     assertTsMemoryIdWriteAllowed(db, id);
     const now = Date.now();
     if (hasMemoryClaimsCompatSchema(db)) {
-        const envelope = storageMemoryClaimEnvelope("merge-stats", {
-            id,
-            seenCount,
-            retrievalCount,
-            mergedFrom,
-            status,
-        });
+        const envelope = storageMemoryClaimEnvelope(
+            "merge-stats",
+            { id, seenCount, retrievalCount, mergedFrom, status },
+            operationIdentity,
+        );
         try {
-            runInMemoryClaimsWriteTransaction(db, () =>
+            const outcome = runInMemoryClaimsWriteTransaction(db, () =>
                 mergeMemoryStatsWithClaimsInCurrentTransaction(db, envelope, {
                     memoryId: id,
                     seenCount,
@@ -1559,13 +1596,13 @@ export function mergeMemoryStats(
                     nowMs: now,
                 }),
             );
+            return outcome.replayed;
         } catch (error) {
             if (error instanceof MemoryClaimsStatsIntegrityError) {
                 throw new MemoryStatsIntegrityError(id);
             }
             throw error;
         }
-        return;
     }
     if (hasMemoryStatsTable(db)) {
         // Base and stats update times come from one clock read; the canonical
@@ -1590,39 +1627,49 @@ export function mergeMemoryStats(
                 throw new MemoryStatsIntegrityError(id);
             }
         })();
-        return;
+        return false;
     }
     getMergeMemoryStatsStatement(db).run(seenCount, retrievalCount, mergedFrom, status, now, id);
+    return false;
 }
 
-export function archiveMemory(db: Database, id: number, reason?: string): void {
+export function archiveMemory(
+    db: Database,
+    id: number,
+    reason?: string,
+    operationIdentity?: MemoryClaimOperationIdentity,
+): boolean {
     const trimmedReason = reason?.trim();
     if (!trimmedReason) {
-        updateMemoryStatus(db, id, "archived");
-        return;
+        return updateMemoryStatus(db, id, "archived", operationIdentity);
     }
 
     const memory = assertTsMemoryIdWriteAllowed(db, id);
     if (!memory) {
-        return;
+        return false;
     }
 
     const mergedMetadata = mergeMetadataJson(memory.metadataJson, {
         archive_reason: trimmedReason,
     });
     if (hasMemoryClaimsCompatSchema(db)) {
-        const envelope = storageMemoryClaimEnvelope("archive", { id, reason: trimmedReason });
-        runInMemoryClaimsWriteTransaction(db, () =>
+        const envelope = storageMemoryClaimEnvelope(
+            "archive",
+            { id, reason: trimmedReason },
+            operationIdentity,
+        );
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
             setMemoryStatusWithClaimsInCurrentTransaction(db, envelope, {
                 memoryId: id,
                 status: "archived",
                 metadataJson: mergedMetadata,
             }),
         );
-        return;
+        return outcome.replayed;
     }
 
     getUpdateArchivedMemoryStatement(db).run(mergedMetadata, Date.now(), id);
+    return false;
 }
 
 export function deleteMemory(db: Database, id: number): void {

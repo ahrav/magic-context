@@ -3020,6 +3020,63 @@ describe("module mirror claims (v83)", () => {
         expect(getMirrorCursor(database, "memories")).toBe(1);
     });
 
+    test("a multi-row page and relationship envelope share one project generation", () => {
+        const database = db();
+        const relationshipPage = page(0, [
+            {
+                feedSeq: 1,
+                op: "insert",
+                moduleRowId: 1,
+                snapshot: moduleSnapshot(1, "relationship source", "mm-rel-1", {
+                    superseded_by_memory_id: 2,
+                }),
+            },
+            {
+                feedSeq: 2,
+                op: "insert",
+                moduleRowId: 2,
+                snapshot: moduleSnapshot(2, "relationship target", "mm-rel-2", {
+                    merged_from: "[1]",
+                }),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: relationshipPage });
+
+        const generations = database
+            .prepare("SELECT generation FROM claim_project_generations")
+            .all() as Array<{ generation: number }>;
+        expect(generations).toEqual([{ generation: 1 }]);
+        expect(
+            database.prepare("SELECT DISTINCT generation FROM claim_change_outbox").all(),
+        ).toEqual([{ generation: 1 }]);
+        expect(database.prepare("SELECT COUNT(*) AS count FROM claim_conflicts").get()).toEqual({
+            count: 1,
+        });
+        expect(
+            database
+                .prepare(
+                    `SELECT reason_code, disposition FROM claim_backfill_failures
+                      WHERE item_kind = 'lineage' ORDER BY id DESC LIMIT 1`,
+                )
+                .get(),
+        ).toEqual({ reason_code: "translated-lineage", disposition: "resolved" });
+        expect(
+            database
+                .prepare(
+                    "SELECT merged_from FROM claim_memory_relationship_sources WHERE memory_id = 2 ORDER BY id DESC LIMIT 1",
+                )
+                .get(),
+        ).toEqual({ merged_from: "[1]" });
+
+        const before = JSON.stringify(claimState(database));
+        resetCursorForReplay(database);
+        applyMirrorPage({ db: database, page: relationshipPage });
+        expect(JSON.stringify(claimState(database))).toBe(before);
+        expect(database.prepare("SELECT generation FROM claim_project_generations").get()).toEqual({
+            generation: 1,
+        });
+    });
+
     test("a content-changing snapshot appends one revision; telemetry-only and exact replay append none", () => {
         const database = db();
         const insertPage = page(0, [

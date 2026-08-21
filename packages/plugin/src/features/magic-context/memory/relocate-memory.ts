@@ -17,7 +17,9 @@ import {
     resolveMemoryClaimProjectInCurrentTransaction,
     retireMemoryClaimInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    translateMemoryClaimRelationshipsInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./storage-memory-claims";
 import { readMemoryProjectionRow } from "./storage-memory-projection";
 import type { MemoryStatus } from "./types";
@@ -116,6 +118,10 @@ function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId:
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, targetProjectId, {
                 kind: "migration",
             });
+            const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(
+                db,
+                row,
+            );
             return {
                 result: link.claimId,
                 effects: [
@@ -125,6 +131,7 @@ function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId:
                         claimId: link.claimId,
                         effectType: "upsert" as const,
                     },
+                    ...relationshipEffects,
                 ],
             };
         },
@@ -180,6 +187,11 @@ function adoptRelocationMergeClaims(
                     { adoptDivergentContent: false },
                 );
             }
+            if (sourceLink && sourceRow) {
+                effects.push(
+                    ...translateMemoryClaimRelationshipsInCurrentTransaction(db, sourceRow),
+                );
+            }
             if (sourceLink && sourceLink.claimId !== targetLink.claimId) {
                 retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
                 recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink);
@@ -216,6 +228,26 @@ function moveLinkedMemoryAcrossProjects(
         | { project_path: string }
         | undefined;
     if (current?.project_path !== fromProjectPath) return false;
+    const sourceRow = readMemoryProjectionRow(db, rowId);
+    if (sourceRow) translateMemoryClaimRelationshipsInCurrentTransaction(db, sourceRow);
+    const referencingIds = (
+        db
+            .prepare("SELECT id FROM memories WHERE superseded_by_memory_id = ? ORDER BY id")
+            .all(rowId) as Array<{ id: number }>
+    ).map((row) => row.id);
+    for (const referencingId of referencingIds) {
+        const referencingRow = readMemoryProjectionRow(db, referencingId);
+        if (!referencingRow) continue;
+        const projectId = resolveMemoryClaimProjectInCurrentTransaction(
+            db,
+            referencingRow.project_path,
+        );
+        if (projectId === null || referencingRow.content.length === 0) continue;
+        ensureMemoryClaimLinkInCurrentTransaction(db, referencingRow, projectId, {
+            kind: "migration",
+        });
+        translateMemoryClaimRelationshipsInCurrentTransaction(db, referencingRow);
+    }
 
     const columns = getMemoryCopyColumns(db);
     const selectExprs = columns.map((c) => (c === "project_path" ? "? AS project_path" : c));
@@ -261,23 +293,32 @@ function moveLinkedMemoryAcrossProjects(
             });
             retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
             recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, newLink);
-            return {
-                result: newLink.claimId,
-                effects: [
-                    {
-                        effectKey: `memory:${newId}:upsert`,
-                        projectId: targetProjectId,
-                        claimId: newLink.claimId,
-                        effectType: "upsert" as const,
-                    },
-                    {
-                        effectKey: `memory:${rowId}:lifecycle`,
-                        projectId: sourceLink.projectId,
-                        claimId: sourceLink.claimId,
-                        effectType: "lifecycle" as const,
-                    },
-                ],
-            };
+            const effects: MemoryClaimEffect[] = [
+                {
+                    effectKey: `memory:${newId}:upsert`,
+                    projectId: targetProjectId,
+                    claimId: newLink.claimId,
+                    effectType: "upsert",
+                },
+                {
+                    effectKey: `memory:${rowId}:lifecycle`,
+                    projectId: sourceLink.projectId,
+                    claimId: sourceLink.claimId,
+                    effectType: "lifecycle",
+                },
+            ];
+            for (const referencingId of referencingIds) {
+                const referencingRow = readMemoryProjectionRow(db, referencingId);
+                if (referencingRow) {
+                    effects.push(
+                        ...translateMemoryClaimRelationshipsInCurrentTransaction(
+                            db,
+                            referencingRow,
+                        ),
+                    );
+                }
+            }
+            return { result: newLink.claimId, effects };
         },
     );
 
@@ -295,8 +336,11 @@ function rekeyMemoryRowWithCollisionMergeInner(
     const statsBacked = hasMemoryStatsTable(db);
     const seenCountSql = effectiveSeenCountSql(db);
     const row = db
-        .prepare(`SELECT category, normalized_hash, ${seenCountSql} FROM memories WHERE id = ?`)
-        .get(rowId) as
+        .prepare(
+            `SELECT category, normalized_hash, ${seenCountSql}
+               FROM memories WHERE id = ? AND project_path = ?`,
+        )
+        .get(rowId, fromProjectPath) as
         | { category: string; normalized_hash: string; seen_count: number | null }
         | undefined;
     if (!row) return false;
@@ -397,26 +441,32 @@ export function moveMemoriesToProject(
     fromProjectPath: string,
     toIdentity: string,
 ): RelocateResult {
-    let relocated = 0;
-    let merged = 0;
-    for (const id of ids) {
-        // Detect the merge branch by checking for a pre-existing equivalent
-        // before the rekey, so we can report move-vs-merge accurately.
-        const row = db
-            .prepare("SELECT category, normalized_hash FROM memories WHERE id = ?")
-            .get(id) as { category: string; normalized_hash: string } | undefined;
-        if (!row) continue;
-        const collision = db
-            .prepare(
-                `SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? LIMIT 1`,
-            )
-            .get(toIdentity, row.category, row.normalized_hash) as { id: number } | undefined;
-        const changed = rekeyMemoryRowWithCollisionMerge(db, id, fromProjectPath, toIdentity);
-        if (!changed) continue;
-        if (collision && collision.id !== id) merged += 1;
-        else relocated += 1;
-    }
-    return { relocated, merged, skipped: 0 };
+    return withMemoryClaimGenerationContextInCurrentTransaction(db, () => {
+        let relocated = 0;
+        let merged = 0;
+        for (const id of ids) {
+            // Detect the merge branch by checking for a pre-existing equivalent
+            // before the rekey, so we can report move-vs-merge accurately.
+            const row = db
+                .prepare(
+                    "SELECT category, normalized_hash FROM memories WHERE id = ? AND project_path = ?",
+                )
+                .get(id, fromProjectPath) as
+                | { category: string; normalized_hash: string }
+                | undefined;
+            if (!row) continue;
+            const collision = db
+                .prepare(
+                    `SELECT id FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ? LIMIT 1`,
+                )
+                .get(toIdentity, row.category, row.normalized_hash) as { id: number } | undefined;
+            const changed = rekeyMemoryRowWithCollisionMerge(db, id, fromProjectPath, toIdentity);
+            if (!changed) continue;
+            if (collision && collision.id !== id) merged += 1;
+            else relocated += 1;
+        }
+        return { relocated, merged, skipped: 0 };
+    });
 }
 
 const memoryCopyColumnsCache = new WeakMap<Database, string[]>();
@@ -447,7 +497,9 @@ export function copyMemoriesToProject(
 ): RelocateResult {
     if (hasMemoryClaimsCompatSchema(db)) {
         return withClaimsWriteCapabilityInCurrentTransaction(db, () =>
-            copyMemoriesToProjectInner(db, ids, toIdentity),
+            withMemoryClaimGenerationContextInCurrentTransaction(db, () =>
+                copyMemoriesToProjectInner(db, ids, toIdentity),
+            ),
         );
     }
     return copyMemoriesToProjectInner(db, ids, toIdentity);

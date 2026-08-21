@@ -32,17 +32,27 @@ import {
     ensureMemoryClaimLinkInCurrentTransaction,
     findMemoryClaimsCompatCorruption,
     hasMemoryClaimsCompatSchema,
-    type MemoryClaimLink,
+    listMemoryRelationshipSources,
+    memoryClaimAdoptionFailureReason,
+    memoryClaimMetadataFailureReason,
+    memoryClaimSupersessionExists,
+    parseMemoryClaimMergedFrom,
     readMemoryClaimLink,
-    recordMemoryClaimSupersessionInCurrentTransaction,
+    recordMemoryClaimLinkFailure,
     resolveMemoryClaimProjectInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    translateMemoryClaimRelationshipsInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
 import {
     type MemoryProjectionRow,
     readMemoryProjectionRow,
 } from "./memory/storage-memory-projection";
-import { CLAIMS_BACKFILL_META_KEYS } from "./storage-memory-claims-schema";
+import { CLAIMS_AND_EVIDENCE_TABLES } from "./storage-claims-schema";
+import {
+    CLAIMS_BACKFILL_META_KEYS,
+    MEMORY_CLAIMS_COMPAT_TABLES,
+} from "./storage-memory-claims-schema";
 
 export const CLAIMS_BACKFILL_PRODUCER = "claims-backfill";
 export const CLAIMS_BACKFILL_BATCH_SIZE = 25;
@@ -229,6 +239,14 @@ function eagerConversionBlockers(db: Database): string | null {
         "SELECT COUNT(*) AS count FROM memories WHERE length(content) = 0",
     );
     if (emptyContent > 0) return `${emptyContent} row(s) with empty content`;
+    for (const { id } of db.prepare("SELECT id FROM memories ORDER BY id").all() as Array<{
+        id: number;
+    }>) {
+        const row = readMemoryProjectionRow(db, id);
+        if (!row) continue;
+        const failure = memoryClaimMetadataFailureReason(row);
+        if (failure) return `memory ${id} has invalid claim metadata: ${failure}`;
+    }
     const memoryIds = new Set(
         (db.prepare("SELECT id FROM memories").all() as Array<{ id: number }>).map((row) => row.id),
     );
@@ -247,7 +265,7 @@ function eagerConversionBlockers(db: Database): string | null {
         if (row.superseded_by_memory_id !== null && !memoryIds.has(row.superseded_by_memory_id)) {
             return `memory ${row.id} supersession dangles`;
         }
-        for (const token of parseMergedFromLineage(row.merged_from)) {
+        for (const token of parseMemoryClaimMergedFrom(row.merged_from)) {
             if (token.kind === "malformed") return `memory ${row.id} has malformed lineage`;
             if (token.kind === "id" && token.id !== undefined && !memoryIds.has(token.id)) {
                 return `memory ${row.id} lineage token ${token.ordinal} dangles`;
@@ -305,44 +323,6 @@ export function decideClaimsBackfillMode(
 
 type FailurePhase = "rows" | "relationships" | "reconcile";
 
-interface BackfillFailureInput {
-    phase: FailurePhase;
-    itemKind: string;
-    itemKey: string;
-    reasonCode: string;
-    detail: string;
-}
-
-/**
- * Record or refresh one bounded diagnostic. An operator-approved warning
- * disposition (with rationale) survives re-derivation; everything else
- * returns to blocking until the underlying item resolves.
- */
-function upsertBackfillFailure(db: Database, input: BackfillFailureInput): void {
-    const now = Date.now();
-    db.prepare(
-        `INSERT INTO claim_backfill_failures
-            (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'blocking', ?, ?)
-         ON CONFLICT(phase, item_kind, item_key) DO UPDATE SET
-            reason_code = excluded.reason_code,
-            detail = excluded.detail,
-            disposition = CASE WHEN claim_backfill_failures.disposition = 'warning'
-                THEN 'warning' ELSE 'blocking' END,
-            rationale = CASE WHEN claim_backfill_failures.disposition = 'warning'
-                THEN claim_backfill_failures.rationale ELSE NULL END,
-            updated_at = excluded.updated_at`,
-    ).run(
-        input.phase,
-        input.itemKind,
-        input.itemKey,
-        input.reasonCode,
-        input.detail.slice(0, 2000),
-        now,
-        now,
-    );
-}
-
 function markFailureResolved(
     db: Database,
     phase: FailurePhase,
@@ -354,27 +334,6 @@ function markFailureResolved(
           WHERE phase = ? AND item_kind = ? AND item_key = ?
             AND disposition IN ('blocking', 'retry', 'warning')`,
     ).run(Date.now(), phase, itemKind, itemKey);
-}
-
-function recordRelationshipDisposition(
-    db: Database,
-    itemKind: "lineage" | "supersession",
-    itemKey: string,
-    reasonCode: string,
-    detail: string,
-): void {
-    const now = Date.now();
-    db.prepare(
-        `INSERT INTO claim_backfill_failures
-            (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
-         VALUES ('relationships', ?, ?, ?, ?, 'resolved', ?, ?)
-         ON CONFLICT(phase, item_kind, item_key) DO UPDATE SET
-            reason_code = excluded.reason_code,
-            detail = excluded.detail,
-            disposition = 'resolved',
-            rationale = NULL,
-            updated_at = excluded.updated_at`,
-    ).run(itemKind, itemKey, reasonCode, detail.slice(0, 2000), now, now);
 }
 
 function countFailures(
@@ -411,47 +370,6 @@ function sweepResolvedRowFailures(db: Database): void {
     ).run(Date.now());
 }
 
-/**
- * Relationship failures whose source item no longer exists in the current
- * corpus (the row was removed, its lineage was rewritten, or a token ordinal
- * fell off). The live translation pass resolves tokens that now succeed;
- * this sweep retires the ones with nothing left to translate.
- */
-function sweepStaleRelationshipFailures(db: Database): void {
-    const failures = db
-        .prepare(
-            `SELECT id, item_kind AS itemKind, item_key AS itemKey FROM claim_backfill_failures
-              WHERE phase = 'relationships' AND disposition IN ('blocking', 'retry')`,
-        )
-        .all() as Array<{ id: number; itemKind: string; itemKey: string }>;
-    if (failures.length === 0) return;
-    const resolve = db.prepare(
-        "UPDATE claim_backfill_failures SET disposition = 'resolved', updated_at = ? WHERE id = ?",
-    );
-    const now = Date.now();
-    for (const failure of failures) {
-        const match = /^memory:(\d+):(superseded-by|merged-from(?::(\d+))?)$/.exec(failure.itemKey);
-        if (!match) continue;
-        const memoryId = Number.parseInt(match[1], 10);
-        const row = db
-            .prepare("SELECT merged_from, superseded_by_memory_id FROM memories WHERE id = ?")
-            .get(memoryId) as
-            | { merged_from: string | null; superseded_by_memory_id: number | null }
-            | undefined;
-        if (!row) {
-            resolve.run(now, failure.id);
-            continue;
-        }
-        if (failure.itemKey.endsWith(":superseded-by")) {
-            if (row.superseded_by_memory_id === null) resolve.run(now, failure.id);
-            continue;
-        }
-        const ordinal = match[3] === undefined ? 0 : Number.parseInt(match[3], 10);
-        const tokens = parseMergedFromLineage(row.merged_from);
-        if (ordinal >= tokens.length) resolve.run(now, failure.id);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Row adoption (drives the U2 kernel; R1-R6, R10)
 // ---------------------------------------------------------------------------
@@ -479,16 +397,12 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
     row: MemoryProjectionRow,
 ): boolean {
     const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-    if (projectId === null || row.content.length === 0) {
-        upsertBackfillFailure(db, {
-            phase: "rows",
-            itemKind: "memory",
-            itemKey: String(row.id),
-            reasonCode: projectId === null ? "unresolved-project-identity" : "empty-content",
-            detail: row.project_path.slice(0, 512),
-        });
+    const failure = memoryClaimAdoptionFailureReason(row, projectId);
+    if (failure) {
+        recordMemoryClaimLinkFailure(db, row.id, row.project_path, failure);
         return false;
     }
+    const adoptProjectId = projectId as number;
     runMemoryClaimOperationInCurrentTransaction(
         db,
         {
@@ -497,7 +411,7 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
             requestDigest: computeClaimRequestDigest({ backfillRow: row.id }),
         },
         () => {
-            const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
+            const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, adoptProjectId, {
                 kind: "migration",
             });
             if (
@@ -516,7 +430,7 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
                 effects: [
                     {
                         effectKey: `memory:${row.id}:upsert`,
-                        projectId,
+                        projectId: adoptProjectId,
                         claimId: link.claimId,
                         effectType: "upsert" as const,
                     },
@@ -532,202 +446,10 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
 // Relationship translation (KTD5, KTD8, R3-R6)
 // ---------------------------------------------------------------------------
 
-export interface LineageToken {
-    ordinal: number;
-    raw: string;
-    kind: "id" | "marker" | "malformed";
-    id?: number;
-}
-
-/**
- * Parse a legacy `merged_from` value: a JSON array of numeric memory ids
- * (tool/dreamer merges) or a comma-delimited history whose tokens are
- * numeric ids or the literal `identity-merge` marker. Everything else is a
- * malformed token preserved verbatim for the repair surface.
- */
-export function parseMergedFromLineage(raw: string | null): LineageToken[] {
-    if (raw === null) return [];
-    const trimmed = raw.trim();
-    if (trimmed.length === 0) return [];
-    if (trimmed.startsWith("[")) {
-        let parsed: unknown;
-        try {
-            parsed = JSON.parse(trimmed);
-        } catch {
-            return [{ ordinal: 0, raw: trimmed, kind: "malformed" }];
-        }
-        if (!Array.isArray(parsed)) return [{ ordinal: 0, raw: trimmed, kind: "malformed" }];
-        return parsed.map((value, ordinal) => {
-            const numeric =
-                typeof value === "number"
-                    ? value
-                    : typeof value === "string" && /^\d+$/.test(value.trim())
-                      ? Number.parseInt(value.trim(), 10)
-                      : null;
-            return numeric !== null && Number.isSafeInteger(numeric) && numeric >= 1
-                ? { ordinal, raw: String(value), kind: "id" as const, id: numeric }
-                : {
-                      ordinal,
-                      raw: JSON.stringify(value) ?? String(value),
-                      kind: "malformed" as const,
-                  };
-        });
-    }
-    return trimmed.split(",").map((part, ordinal) => {
-        const token = part.trim();
-        if (token === "identity-merge") return { ordinal, raw: token, kind: "marker" as const };
-        if (/^\d+$/.test(token)) {
-            return { ordinal, raw: token, kind: "id" as const, id: Number.parseInt(token, 10) };
-        }
-        return { ordinal, raw: token, kind: "malformed" as const };
-    });
-}
-
-function lineageTokenDetail(token: LineageToken): string {
-    return JSON.stringify({
-        ordinal: token.ordinal,
-        raw: token.raw.slice(0, 160),
-        digest: sha256Utf8Hex(token.raw),
-    });
-}
-
-/**
- * Whether a supersession edge between the two claims already exists at any
- * revision pair. Claim-level rather than current-revision-level: a later
- * live revision must not make an already-recorded historical edge look
- * missing (which would either duplicate it or block reconciliation).
- */
-function supersessionEdgeExists(
-    db: Database,
-    source: MemoryClaimLink,
-    target: MemoryClaimLink,
-): boolean {
-    if (source.claimId === target.claimId) return true;
-    if (source.projectId === target.projectId) {
-        return Boolean(
-            db
-                .prepare(
-                    `SELECT 1 FROM claim_conflicts cc
-                       JOIN claim_revisions lr ON lr.id = cc.left_revision_id
-                       JOIN claim_revisions rr ON rr.id = cc.right_revision_id
-                      WHERE cc.relation = 'supersedes' AND lr.claim_id = ? AND rr.claim_id = ?
-                      LIMIT 1`,
-                )
-                .get(target.claimId, source.claimId),
-        );
-    }
-    return Boolean(
-        db
-            .prepare(
-                `SELECT 1 FROM claim_merge_lineage cml
-                   JOIN claim_revisions sr ON sr.id = cml.source_revision_id
-                   JOIN claim_revisions tr ON tr.id = cml.target_revision_id
-                  WHERE sr.claim_id = ? AND tr.claim_id = ?
-                  LIMIT 1`,
-            )
-            .get(source.claimId, target.claimId),
-    );
-}
-
-function recordEdgeIfMissing(db: Database, source: MemoryClaimLink, target: MemoryClaimLink): void {
-    if (supersessionEdgeExists(db, source, target)) return;
-    recordMemoryClaimSupersessionInCurrentTransaction(db, source, target);
-}
-
 interface LineageRowShape {
     id: number;
     merged_from: string | null;
     superseded_by_memory_id: number | null;
-}
-
-/**
- * Translate one current boundary row's recoverable relations: same-project
- * supersession through `claim_conflicts`, cross-project merges through the
- * audit-only `claim_merge_lineage`, and one bounded durable diagnostic per
- * dangling or malformed token. Idempotent per edge and per token.
- */
-export function translateBoundaryRowRelationshipsInCurrentTransaction(
-    db: Database,
-    row: LineageRowShape,
-): void {
-    const link = readMemoryClaimLink(db, row.id);
-    // An unlinked row is a rows-phase problem; the completion anti-join
-    // already refuses it, so relationship translation just skips it.
-    if (!link) return;
-
-    if (row.superseded_by_memory_id !== null) {
-        const itemKey = `memory:${row.id}:superseded-by`;
-        const targetLink = readMemoryClaimLink(db, row.superseded_by_memory_id);
-        if (targetLink) {
-            recordEdgeIfMissing(db, link, targetLink);
-            recordRelationshipDisposition(
-                db,
-                "supersession",
-                itemKey,
-                "translated-supersession",
-                lineageTokenDetail({
-                    ordinal: 0,
-                    raw: String(row.superseded_by_memory_id),
-                    kind: "id",
-                }),
-            );
-        } else {
-            upsertBackfillFailure(db, {
-                phase: "relationships",
-                itemKind: "supersession",
-                itemKey,
-                reasonCode: "dangling-supersession",
-                detail: lineageTokenDetail({
-                    ordinal: 0,
-                    raw: String(row.superseded_by_memory_id),
-                    kind: "id",
-                }),
-            });
-        }
-    }
-
-    for (const token of parseMergedFromLineage(row.merged_from)) {
-        const itemKey = `memory:${row.id}:merged-from:${token.ordinal}`;
-        if (token.kind === "marker") {
-            recordRelationshipDisposition(
-                db,
-                "lineage",
-                itemKey,
-                "identity-merge-marker",
-                lineageTokenDetail(token),
-            );
-            continue;
-        }
-        if (token.kind === "id") {
-            const sourceLink = readMemoryClaimLink(db, token.id as number);
-            if (sourceLink) {
-                recordEdgeIfMissing(db, sourceLink, link);
-                recordRelationshipDisposition(
-                    db,
-                    "lineage",
-                    itemKey,
-                    "translated-lineage",
-                    lineageTokenDetail(token),
-                );
-                continue;
-            }
-            upsertBackfillFailure(db, {
-                phase: "relationships",
-                itemKind: "lineage",
-                itemKey,
-                reasonCode: "dangling-lineage",
-                detail: lineageTokenDetail(token),
-            });
-            continue;
-        }
-        upsertBackfillFailure(db, {
-            phase: "relationships",
-            itemKind: "lineage",
-            itemKey,
-            reasonCode: "malformed-lineage",
-            detail: lineageTokenDetail(token),
-        });
-    }
 }
 
 const LINEAGE_ROWS_WHERE = `id <= ? AND (
@@ -784,8 +506,9 @@ function countBoundaryCrosswalkRows(db: Database, boundary: number): number {
  *   linked before deletion (expected-count oracle);
  * - crosswalks, revision metadata, and root evidence are intact;
  * - every boundary claim has an outbox effect and a project generation;
- * - every re-derived lineage token is resolved in the graph or carries a
- *   warning/resolved disposition;
+ * - every re-derived lineage token is resolved in the graph or carries an
+ *   operator warning; an append-only replaced source is terminal only when a
+ *   newer source snapshot exists and that current snapshot is fully disposed;
  * - no blocking or retry diagnostic remains anywhere;
  * - v83's adopted v22 identity work is resolved.
  */
@@ -852,6 +575,16 @@ export function inspectClaimsBackfillReconciliation(
     if (missingOutbox > 0)
         problems.push(`${missingOutbox} crosswalk row(s) missing an outbox effect`);
 
+    const mismatchedOutboxProjects = countScalar(
+        db,
+        `SELECT COUNT(*) AS count FROM claim_change_outbox o
+           LEFT JOIN claims c ON c.id = o.claim_id
+          WHERE c.id IS NULL OR c.project_id IS NOT o.project_id`,
+    );
+    if (mismatchedOutboxProjects > 0) {
+        problems.push(`${mismatchedOutboxProjects} outbox effect(s) have a mismatched project`);
+    }
+
     const missingGeneration = countScalar(
         db,
         `SELECT COUNT(*) AS count FROM legacy_memory_claims lmc
@@ -864,39 +597,128 @@ export function inspectClaimsBackfillReconciliation(
         problems.push(`${missingGeneration} crosswalk row(s) missing a project generation`);
     }
 
+    const unsnapshottedRelationshipRows = countScalar(
+        db,
+        `SELECT COUNT(*) AS count FROM memories m
+          WHERE m.id <= ?
+            AND (m.superseded_by_memory_id IS NOT NULL OR COALESCE(TRIM(m.merged_from), '') <> '')
+            AND NOT EXISTS (
+                SELECT 1 FROM claim_memory_relationship_sources source
+                 WHERE source.memory_id = m.id
+                   AND source.merged_from IS m.merged_from
+                   AND source.superseded_by_memory_id IS m.superseded_by_memory_id
+            )`,
+        boundary,
+    );
+    if (unsnapshottedRelationshipRows > 0) {
+        problems.push(
+            `${unsnapshottedRelationshipRows} relationship source row(s) were not persisted`,
+        );
+    }
+
     let tokensWithoutDisposition = 0;
     const readDisposition = db.prepare(
-        `SELECT disposition FROM claim_backfill_failures
+        `SELECT disposition, reason_code AS reasonCode FROM claim_backfill_failures
           WHERE phase = 'relationships' AND item_kind = ? AND item_key = ?`,
     );
-    for (const row of selectLineageRows(db, boundary, 0, null)) {
-        const link = readMemoryClaimLink(db, row.id);
-        if (row.superseded_by_memory_id !== null) {
-            const targetLink = readMemoryClaimLink(db, row.superseded_by_memory_id);
-            const resolvedInGraph =
-                link !== null &&
-                targetLink !== null &&
-                supersessionEdgeExists(db, link, targetLink);
-            const disposition = readDisposition.get(
-                "supersession",
-                `memory:${row.id}:superseded-by`,
-            ) as { disposition: string } | undefined;
-            if (!disposition || (disposition.disposition === "resolved" && !resolvedInGraph)) {
-                tokensWithoutDisposition += 1;
+    const relationshipSources = listMemoryRelationshipSources(db, boundary);
+    const currentSourceByMemory = new Map<number, (typeof relationshipSources)[number]>();
+    for (const source of relationshipSources) currentSourceByMemory.set(source.memoryId, source);
+    const tokenIsDisposed = (
+        itemKind: "lineage" | "supersession",
+        itemKey: string,
+        resolvedInGraph: boolean,
+        replacedByDisposedSource = false,
+    ): boolean => {
+        const disposition = readDisposition.get(itemKind, itemKey) as
+            | { disposition: string; reasonCode: string }
+            | undefined;
+        return (
+            disposition?.disposition === "warning" ||
+            (disposition?.disposition === "resolved" &&
+                (resolvedInGraph ||
+                    (disposition.reasonCode === "relationship-source-replaced" &&
+                        replacedByDisposedSource)))
+        );
+    };
+    const sourceIsDisposed = (source: (typeof relationshipSources)[number]): boolean => {
+        const link = readMemoryClaimLink(db, source.memoryId);
+        const prefix = `memory:${source.memoryId}:relations:${source.sourceDigest}`;
+        if (source.supersededByMemoryId !== null) {
+            const targetLink = readMemoryClaimLink(db, source.supersededByMemoryId);
+            if (
+                !tokenIsDisposed(
+                    "supersession",
+                    `${prefix}:superseded-by`,
+                    link !== null &&
+                        targetLink !== null &&
+                        memoryClaimSupersessionExists(db, link, targetLink),
+                )
+            ) {
+                return false;
             }
         }
-        for (const token of parseMergedFromLineage(row.merged_from)) {
+        for (const token of parseMemoryClaimMergedFrom(source.mergedFrom)) {
             let resolvedInGraph = token.kind === "marker";
             if (token.kind === "id" && link !== null) {
                 const sourceLink = readMemoryClaimLink(db, token.id as number);
                 resolvedInGraph =
-                    sourceLink !== null && supersessionEdgeExists(db, sourceLink, link);
+                    sourceLink !== null && memoryClaimSupersessionExists(db, sourceLink, link);
             }
-            const disposition = readDisposition.get(
-                "lineage",
-                `memory:${row.id}:merged-from:${token.ordinal}`,
-            ) as { disposition: string } | undefined;
-            if (!disposition || (disposition.disposition === "resolved" && !resolvedInGraph)) {
+            if (
+                !tokenIsDisposed(
+                    "lineage",
+                    `${prefix}:merged-from:${token.ordinal}`,
+                    resolvedInGraph,
+                )
+            ) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const currentSourceDisposed = new Map<number, boolean>();
+    for (const [memoryId, source] of currentSourceByMemory) {
+        currentSourceDisposed.set(memoryId, sourceIsDisposed(source));
+    }
+    for (const source of relationshipSources) {
+        const link = readMemoryClaimLink(db, source.memoryId);
+        const prefix = `memory:${source.memoryId}:relations:${source.sourceDigest}`;
+        const current = currentSourceByMemory.get(source.memoryId);
+        const replacedByDisposedSource =
+            current !== undefined &&
+            current.sourceId > source.sourceId &&
+            currentSourceDisposed.get(source.memoryId) === true;
+        if (source.supersededByMemoryId !== null) {
+            const targetLink = readMemoryClaimLink(db, source.supersededByMemoryId);
+            if (
+                !tokenIsDisposed(
+                    "supersession",
+                    `${prefix}:superseded-by`,
+                    link !== null &&
+                        targetLink !== null &&
+                        memoryClaimSupersessionExists(db, link, targetLink),
+                    replacedByDisposedSource,
+                )
+            ) {
+                tokensWithoutDisposition += 1;
+            }
+        }
+        for (const token of parseMemoryClaimMergedFrom(source.mergedFrom)) {
+            let resolvedInGraph = token.kind === "marker";
+            if (token.kind === "id" && link !== null) {
+                const sourceLink = readMemoryClaimLink(db, token.id as number);
+                resolvedInGraph =
+                    sourceLink !== null && memoryClaimSupersessionExists(db, sourceLink, link);
+            }
+            if (
+                !tokenIsDisposed(
+                    "lineage",
+                    `${prefix}:merged-from:${token.ordinal}`,
+                    resolvedInGraph,
+                    replacedByDisposedSource,
+                )
+            ) {
                 tokensWithoutDisposition += 1;
             }
         }
@@ -907,6 +729,14 @@ export function inspectClaimsBackfillReconciliation(
 
     const blocking = countFailures(db, ["blocking", "retry"]);
     if (blocking > 0) problems.push(`${blocking} blocking backfill failure(s) remain`);
+
+    for (const table of [...CLAIMS_AND_EVIDENCE_TABLES, ...MEMORY_CLAIMS_COMPAT_TABLES]) {
+        // pi-lens-ignore: sql-injection
+        const violations = db.prepare(`PRAGMA foreign_key_check(${table})`).all() as unknown[];
+        if (violations.length > 0) {
+            problems.push(`${table}: ${violations.length} foreign key violation(s)`);
+        }
+    }
 
     if (state.v22Takeover === "pending") problems.push("pending v22 identity work");
 
@@ -939,58 +769,59 @@ function writeCompletionCheckpoint(db: Database): void {
  * oracle throws, rolling the entire migration back to complete v82 state.
  */
 export function runEagerClaimsBackfillInMigrationTransaction(db: Database): void {
-    const state = readClaimsBackfillState(db);
-    const boundary = state.boundaryMemoryId;
+    withMemoryClaimGenerationContextInCurrentTransaction(db, () => {
+        const state = readClaimsBackfillState(db);
+        const boundary = state.boundaryMemoryId;
 
-    let cursor = 0;
-    while (true) {
-        const ids = db
-            .prepare(
-                `SELECT id FROM memories
+        let cursor = 0;
+        while (true) {
+            const ids = db
+                .prepare(
+                    `SELECT id FROM memories
                   WHERE id > ? AND id <= ? AND NOT EXISTS (
                       SELECT 1 FROM legacy_memory_claims lmc WHERE lmc.memory_id = memories.id
                   )
                   ORDER BY id ASC LIMIT ?`,
-            )
-            .all(cursor, boundary, CLAIMS_BACKFILL_BATCH_SIZE) as Array<{ id: number }>;
-        if (ids.length === 0) break;
-        for (const { id } of ids) {
-            const row = readMemoryProjectionRow(db, id);
-            if (!row) continue;
-            if (!adoptBoundaryMemoryRowInCurrentTransaction(db, row)) {
-                throw new Error(`v83 eager backfill could not adopt memory ${id}`);
+                )
+                .all(cursor, boundary, CLAIMS_BACKFILL_BATCH_SIZE) as Array<{ id: number }>;
+            if (ids.length === 0) break;
+            for (const { id } of ids) {
+                const row = readMemoryProjectionRow(db, id);
+                if (!row) continue;
+                if (!adoptBoundaryMemoryRowInCurrentTransaction(db, row)) {
+                    throw new Error(`v83 eager backfill could not adopt memory ${id}`);
+                }
             }
+            cursor = ids[ids.length - 1].id;
         }
-        cursor = ids[ids.length - 1].id;
-    }
-    writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, String(boundary));
-    hitClaimsMigrationFailpoint("claims-migration.020.rows.after");
+        writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, String(boundary));
+        hitClaimsMigrationFailpoint("claims-migration.020.rows.after");
 
-    for (const row of selectLineageRows(db, boundary, 0, null)) {
-        translateBoundaryRowRelationshipsInCurrentTransaction(db, row);
-    }
-    writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, String(boundary));
+        for (const row of selectLineageRows(db, boundary, 0, null)) {
+            translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
+        }
+        writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, String(boundary));
 
-    const report = inspectClaimsBackfillReconciliation(db);
-    if (!report.ok) {
-        throw new Error(`v83 eager backfill reconciliation refused: ${report.problems.join("; ")}`);
-    }
-    hitClaimsMigrationFailpoint("claims-migration.030.reconcile.after");
-    writeCompletionCheckpoint(db);
+        const report = inspectClaimsBackfillReconciliation(db);
+        if (!report.ok) {
+            throw new Error(
+                `v83 eager backfill reconciliation refused: ${report.problems.join("; ")}`,
+            );
+        }
+        hitClaimsMigrationFailpoint("claims-migration.030.reconcile.after");
+        writeCompletionCheckpoint(db);
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Lazy runner (R9, KTD9)
 // ---------------------------------------------------------------------------
 
-function isSqliteBusyError(error: unknown): boolean {
+export function isRetryableSqliteBusyError(error: unknown): boolean {
     if (!error || typeof error !== "object") return false;
-    const candidate = error as { code?: unknown; message?: unknown };
-    if (candidate.code === "SQLITE_BUSY" || candidate.code === "SQLITE_LOCKED") return true;
-    return (
-        typeof candidate.message === "string" &&
-        /database is locked|sqlite_(busy|locked)/i.test(candidate.message)
-    );
+    const candidate = error as { code?: unknown; errcode?: unknown };
+    if (candidate.code === "SQLITE_BUSY" || candidate.code === "SQLITE_BUSY_SNAPSHOT") return true;
+    return typeof candidate.errcode === "number" && (candidate.errcode & 0xff) === 5;
 }
 
 const DEFAULT_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
@@ -1078,11 +909,15 @@ export async function runClaimsBackfill(
     const runBatch = async (work: () => BatchStep): Promise<BatchStep | "busy"> => {
         for (let attempt = 0; ; attempt += 1) {
             try {
-                const step = db.transaction(work).immediate();
+                const step = db
+                    .transaction(() =>
+                        withMemoryClaimGenerationContextInCurrentTransaction(db, work),
+                    )
+                    .immediate();
                 hitFailpoint("claims-backfill.020.batch-commit.after");
                 return step;
             } catch (error) {
-                if (!isSqliteBusyError(error)) throw error;
+                if (!isRetryableSqliteBusyError(error)) throw error;
                 const delayMs = retryDelaysMs[attempt];
                 if (delayMs === undefined) return "busy";
                 await sleep(delayMs);
@@ -1144,7 +979,6 @@ export async function runClaimsBackfill(
             batchSize,
         );
         if (rows.length === 0) {
-            sweepStaleRelationshipFailures(db);
             const blocking = countFailures(db, ["blocking", "retry"], "relationships");
             if (blocking === 0) {
                 writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "reconciling");
@@ -1157,7 +991,7 @@ export async function runClaimsBackfill(
             };
         }
         for (const row of rows) {
-            translateBoundaryRowRelationshipsInCurrentTransaction(db, row);
+            translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         }
         writeMeta(
             db,
@@ -1175,9 +1009,8 @@ export async function runClaimsBackfill(
         const state = readClaimsBackfillState(db);
         sweepResolvedRowFailures(db);
         for (const row of selectLineageRows(db, state.boundaryMemoryId, 0, null)) {
-            translateBoundaryRowRelationshipsInCurrentTransaction(db, row);
+            translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         }
-        sweepStaleRelationshipFailures(db);
         const report = inspectClaimsBackfillReconciliation(db, readClaimsBackfillState(db));
         if (!report.ok) {
             writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "blocked");
@@ -1305,17 +1138,20 @@ export function getClaimsBackfillStatus(
     const state = readClaimsBackfillState(db);
     const blocking = countFailures(db, ["blocking", "retry"]);
     const warnings = countFailures(db, ["warning"]);
+    const reconciliation =
+        options.includeProblems && state.mode !== null
+            ? inspectClaimsBackfillReconciliation(db, state)
+            : null;
     let operational: ClaimsBackfillOperationalState;
     if (state.mode === null) operational = "not-applicable";
-    else if (state.phase === "complete" && state.v22Takeover !== "pending") {
+    else if (state.phase === "complete" && reconciliation && !reconciliation.ok) {
+        operational = "blocked";
+    } else if (state.phase === "complete" && state.v22Takeover !== "pending") {
         operational = warnings > 0 ? "complete-with-warnings" : "complete";
     } else if (state.phase === "blocked" || blocking > 0 || state.v22Takeover === "pending") {
         operational = "blocked";
     } else operational = "pending";
-    const problems =
-        options.includeProblems && state.mode !== null && operational !== "complete"
-            ? inspectClaimsBackfillReconciliation(db, state).problems
-            : [];
+    const problems = reconciliation?.problems ?? [];
     return {
         applicable: state.mode !== null,
         state: operational,
@@ -1424,7 +1260,7 @@ export async function doctorRetryClaimsBackfill(
     db: Database,
     options: ClaimsBackfillRunOptions = {},
 ): Promise<ClaimsBackfillDoctorRetryResult> {
-    const before = getClaimsBackfillStatus(db);
+    const before = getClaimsBackfillStatus(db, { includeProblems: true });
     if (
         !before.applicable ||
         before.state === "complete" ||
@@ -1433,13 +1269,14 @@ export async function doctorRetryClaimsBackfill(
         return { before, after: before, summary: null };
     }
     db.transaction(() => {
-        const phase = readMeta(db, CLAIMS_BACKFILL_META_KEYS.phase);
-        const takeover = readMeta(db, CLAIMS_BACKFILL_META_KEYS.v22Takeover);
-        if (phase === "complete" && takeover !== "pending") return;
         writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "rows");
         writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
         writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
     }).immediate();
     const summary = await runClaimsBackfill(db, options);
-    return { before, after: getClaimsBackfillStatus(db), summary };
+    return {
+        before,
+        after: getClaimsBackfillStatus(db, { includeProblems: true }),
+        summary,
+    };
 }

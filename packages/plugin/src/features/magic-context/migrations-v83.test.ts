@@ -232,6 +232,58 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                 count: 0,
             });
 
+            const linked = runInMemoryClaimsWriteTransaction(db, () =>
+                createMemoryWithClaimsInCurrentTransaction(
+                    db,
+                    {
+                        producer: "v83-held-open",
+                        operationKey: "linked-project-path",
+                        requestDigest: "f".repeat(64),
+                    },
+                    {
+                        projectPath: "git:v83-fixture",
+                        category: "CONSTRAINTS",
+                        content: "linked project path target",
+                        normalizedHash: "hash:linked-project-path",
+                    },
+                ),
+            );
+            const linkedBefore = JSON.stringify(
+                db.prepare("SELECT * FROM memories WHERE id = ?").get(linked.result.memoryId),
+            );
+            const tupleBefore = [
+                "claim_operations",
+                "claim_change_outbox",
+                "claim_project_generations",
+            ].map(
+                (table) =>
+                    (
+                        db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
+                            count: number;
+                        }
+                    ).count,
+            );
+            expect(() =>
+                db
+                    .prepare("UPDATE memories SET project_path = 'git:bare-bypass' WHERE id = ?")
+                    .run(linked.result.memoryId),
+            ).toThrow(/claims-write kernel/);
+            expect(
+                JSON.stringify(
+                    db.prepare("SELECT * FROM memories WHERE id = ?").get(linked.result.memoryId),
+                ),
+            ).toBe(linkedBefore);
+            expect(
+                ["claim_operations", "claim_change_outbox", "claim_project_generations"].map(
+                    (table) =>
+                        (
+                            db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
+                                count: number;
+                            }
+                        ).count,
+                ),
+            ).toEqual(tupleBefore);
+
             // Telemetry and derived-cache writes remain outside the guard.
             db.prepare(
                 "UPDATE memory_stats SET seen_count = seen_count + 1, last_seen_at = 2, updated_at = 2 WHERE memory_id = ?",
@@ -324,6 +376,52 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                 ),
             );
             expect(outcome.result.claimId).not.toBeNull();
+            const other = runInMemoryClaimsWriteTransaction(db, () =>
+                createMemoryWithClaimsInCurrentTransaction(
+                    db,
+                    {
+                        producer: "v83-test",
+                        operationKey: "outbox-project-guard",
+                        requestDigest: "e".repeat(64),
+                    },
+                    {
+                        projectPath: "git:v83-other-project",
+                        category: "CONSTRAINTS",
+                        content: "other project seed",
+                        normalizedHash: "hash:other-project",
+                    },
+                ),
+            );
+            const operationId = (
+                db
+                    .prepare(
+                        "SELECT id FROM claim_operations WHERE operation_key = 'append-only-seed'",
+                    )
+                    .get() as { id: number }
+            ).id;
+            const otherProjectId = (
+                db
+                    .prepare("SELECT project_id AS id FROM claims WHERE id = ?")
+                    .get(other.result.claimId) as { id: number }
+            ).id;
+            expect(() =>
+                db
+                    .prepare(
+                        `INSERT INTO claim_change_outbox
+                            (operation_id, effect_key, project_id, claim_id, effect_type, generation, created_at)
+                         VALUES (?, 'forged:wrong-project', ?, ?, 'upsert', 1, 1)`,
+                    )
+                    .run(operationId, otherProjectId, outcome.result.claimId),
+            ).toThrow(/outbox project must match/);
+            expect(() =>
+                db
+                    .prepare(
+                        `INSERT INTO claim_change_outbox
+                            (operation_id, effect_key, project_id, claim_id, effect_type, generation, created_at)
+                         VALUES (?, 'forged:missing-claim', ?, 999999, 'upsert', 1, 1)`,
+                    )
+                    .run(operationId, otherProjectId),
+            ).toThrow(/outbox project must match/);
 
             for (const table of APPEND_ONLY_MEMORY_CLAIMS_TABLES) {
                 const count = (
@@ -358,6 +456,65 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
             ).toThrow(/append-only/);
         } finally {
             closeQuietly(db);
+        }
+    });
+
+    test("crosswalk REPLACE cannot move a canonical claim to a fresh memory id", () => {
+        for (const recursiveTriggers of [0, 1]) {
+            const db = migratedDb();
+            try {
+                db.exec(
+                    recursiveTriggers === 0
+                        ? "PRAGMA recursive_triggers=OFF"
+                        : "PRAGMA recursive_triggers=ON",
+                );
+                const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+                    createMemoryWithClaimsInCurrentTransaction(
+                        db,
+                        {
+                            producer: "v83-test",
+                            operationKey: `replace-collision-${recursiveTriggers}`,
+                            requestDigest: "d".repeat(64),
+                        },
+                        {
+                            projectPath: "git:v83-replace",
+                            category: "CONSTRAINTS",
+                            content: "replace collision seed",
+                            normalizedHash: "hash:replace-collision",
+                        },
+                    ),
+                );
+                const original = JSON.stringify(
+                    db
+                        .prepare("SELECT * FROM legacy_memory_claims WHERE memory_id = ?")
+                        .get(outcome.result.memoryId),
+                );
+                const link = JSON.parse(original) as Record<string, number>;
+                expect(() =>
+                    db
+                        .prepare(
+                            `INSERT OR REPLACE INTO legacy_memory_claims
+                                (memory_id, canonical_memory_id, claim_id, project_id, root_observation_id, created_at)
+                             VALUES (?, ?, ?, ?, ?, 999)`,
+                        )
+                        .run(
+                            outcome.result.memoryId + 10_000,
+                            outcome.result.memoryId + 10_000,
+                            link.claim_id,
+                            link.project_id,
+                            link.root_observation_id,
+                        ),
+                ).toThrow(/append-only/);
+                expect(
+                    JSON.stringify(
+                        db
+                            .prepare("SELECT * FROM legacy_memory_claims WHERE memory_id = ?")
+                            .get(outcome.result.memoryId),
+                    ),
+                ).toBe(original);
+            } finally {
+                closeQuietly(db);
+            }
         }
     });
 

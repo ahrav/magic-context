@@ -5364,6 +5364,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// renderCompartmentInjection pair (transform.ts:587-616 + ~960).
 	let injectionResult: PiInjectionResult | null = null;
 	if (args.injection) {
+		if (!piM0State)
+			throw new Error("memory injection requires hard-signal state");
 		try {
 			const tInjection = performance.now();
 			// NOTE: do NOT clear the m[0]/m[1] cache on a cache-busting pass. A new
@@ -5375,7 +5377,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// HARD triggers (model/system/ttl/epoch/upgrade/mutation) still
 			// re-materialize inside mustMaterializePi when genuinely needed.
 			const wireInjectionResult = injectM0M1PiForRun(
-				piM0State!,
+				piM0State,
 				args.db,
 				args.messages as Parameters<typeof injectM0M1Pi>[2],
 				args.entryIds,

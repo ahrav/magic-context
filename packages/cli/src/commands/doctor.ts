@@ -55,6 +55,8 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
         return 0;
     }
 
+    let sharedCommandExitCode: number | null = null;
+
     // The v22 backfill commands operate on the SHARED cortexkit DB (harness-
     // agnostic — there is no per-harness shard for backfill state). Run them
     // exactly ONCE here, not once per adapter: dispatching to both an OpenCode
@@ -81,7 +83,7 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
             },
             options,
         );
-        if (result.handled) return result.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, result.exitCode);
     }
 
     if (hasClaimsBackfillCommand(options)) {
@@ -104,8 +106,9 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
             },
             options,
         );
-        if (result.handled) return result.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, result.exitCode);
     }
+    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
 
     // Reconcile interrupted cross-harness session migrations. The journal lives
     // in the SHARED cortexkit DB (harness-agnostic), so this runs exactly once

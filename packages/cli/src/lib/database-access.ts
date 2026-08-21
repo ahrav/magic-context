@@ -54,6 +54,17 @@ export class OutdatedSchemaVersionError extends Error {
  */
 export const CLI_SCHEMA_FLOOR_VERSION = LATEST_SUPPORTED_VERSION;
 
+function configureWriteConnection(db: DatabaseType): void {
+    // Total claims-backfill lock budget: 25.9s = five 5s waits + 900ms backoff. commentlint: allow(JUDGE)
+    db.exec("PRAGMA busy_timeout=5000");
+    db.exec("PRAGMA foreign_keys=ON");
+    const row = db.prepare("PRAGMA foreign_keys").get() as Record<string, unknown>;
+    if (Object.values(row)[0] !== 1) {
+        db.close();
+        throw new Error("SQLite foreign_keys could not be enabled for CLI mutation");
+    }
+}
+
 /**
  * Opens an existing SQLite file without silently creating an empty replacement.
  * Callers must treat null as a graceful missing-database path.
@@ -80,11 +91,13 @@ export function openExistingDatabase(
         const db = new Database(path, { create: false, readwrite: true } as unknown as {
             readonly: boolean;
         });
+        configureWriteConnection(db);
         return db;
     }
     const uri = pathToFileURL(path);
     uri.searchParams.set("mode", "rw");
     const db = new Database(uri.href);
+    configureWriteConnection(db);
     return db;
 }
 

@@ -164,7 +164,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
                 ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
                 checkClaimsBackfill: rest.includes("--check-claims-backfill"),
                 retryClaimsBackfill: rest.includes("--retry-claims-backfill"),
-                ...(waiveClaimsBackfillFailure !== null ? { waiveClaimsBackfillFailure } : {}),
+                ...(rest.includes("--waive-claims-backfill-failure")
+                    ? { waiveClaimsBackfillFailure }
+                    : {}),
                 ...(waiveRationale !== null ? { waiveRationale } : {}),
                 argv: rest,
             });

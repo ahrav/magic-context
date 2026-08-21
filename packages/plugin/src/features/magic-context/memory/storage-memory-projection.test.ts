@@ -10,7 +10,6 @@ import {
     deleteMemoryProjectionRow,
     insertMemoryProjectionRow,
     readMemoryProjectionRow,
-    readMemoryProjectionRowByHash,
     replaceMemoryProjectionVerificationFiles,
     setMemoryProjectionSuperseded,
     toSafeChangeCount,
@@ -80,22 +79,11 @@ describe("memory projection leaf", () => {
         ).toHaveLength(1);
     });
 
-    test("reads resolve by id and by exact (project, category, hash)", () => {
+    test("reads resolve by id", () => {
         db = migratedDb();
         const id = insertRow();
         expect(readMemoryProjectionRow(db, id)?.content).toBe("projection fact");
         expect(readMemoryProjectionRow(db, 424_242)).toBeNull();
-        expect(
-            readMemoryProjectionRowByHash(
-                db,
-                "git:projection",
-                "CONSTRAINTS",
-                "hash:projection fact",
-            )?.id,
-        ).toBe(id);
-        expect(
-            readMemoryProjectionRowByHash(db, "git:projection", "NAMING", "hash:projection fact"),
-        ).toBeNull();
     });
 
     test("content update rewrites semantics, resets derived state, and keeps verification columns", () => {
@@ -203,17 +191,18 @@ describe("memory projection leaf", () => {
             db.prepare("SELECT status, superseded_by_memory_id FROM memories WHERE id = ?").get(id),
         ).toEqual({ status: "archived", superseded_by_memory_id: 999 });
 
+        const mergeId = insertRow("merge projection fact", 6_500);
         const changes = runInMemoryClaimsWriteTransaction(db, () =>
-            updateMemoryProjectionMerge(db, id, "[7]", "permanent", 9, 4, 7_000),
+            updateMemoryProjectionMerge(db, mergeId, "[7]", "permanent", 9, 4, 7_000),
         );
         expect(changes).toEqual({ baseChanges: 1, statsChanges: 1 });
-        expect(db.prepare("SELECT merged_from, status FROM memories WHERE id = ?").get(id)).toEqual(
-            { merged_from: "[7]", status: "permanent" },
-        );
+        expect(
+            db.prepare("SELECT merged_from, status FROM memories WHERE id = ?").get(mergeId),
+        ).toEqual({ merged_from: "[7]", status: "permanent" });
         expect(
             db
                 .prepare("SELECT seen_count, retrieval_count FROM memory_stats WHERE memory_id = ?")
-                .get(id),
+                .get(mergeId),
         ).toEqual({ seen_count: 9, retrieval_count: 4 });
     });
 

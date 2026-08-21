@@ -77,20 +77,6 @@ export function readMemoryProjectionRow(db: Database, id: number): MemoryProject
         null) as MemoryProjectionRow | null;
 }
 
-export function readMemoryProjectionRowByHash(
-    db: Database,
-    projectPath: string,
-    category: string,
-    normalizedHash: string,
-): MemoryProjectionRow | null {
-    return (db
-        .prepare(
-            `SELECT ${PROJECTION_COLUMNS} FROM memories
-              WHERE project_path = ? AND category = ? AND normalized_hash = ?`,
-        )
-        .get(projectPath, category, normalizedHash) ?? null) as MemoryProjectionRow | null;
-}
-
 /**
  * Insert one projection row with the legacy defaults. The v80
  * `memories_stats_ai` trigger creates the stats baseline and the FTS trigger

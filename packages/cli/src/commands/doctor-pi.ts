@@ -1066,6 +1066,8 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         return runIssueFlow({ cwd, prompts, deps });
     }
 
+    let sharedCommandExitCode: number | null = null;
+
     let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
     const v22Result = await runV22BackfillCommands(
         {
@@ -1086,7 +1088,7 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         options,
     );
     if (v22Result.handled) {
-        return v22Result.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, v22Result.exitCode);
     }
 
     let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
@@ -1109,8 +1111,9 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         options,
     );
     if (claimsResult.handled) {
-        return claimsResult.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, claimsResult.exitCode);
     }
+    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
 
     prompts.intro("Magic Context for Pi Doctor");
     const first = await runHealthChecks({
@@ -1175,7 +1178,7 @@ export function parseDoctorArgs(args: string[]): RunDoctorOptions {
         ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
         checkClaimsBackfill: args.includes("--check-claims-backfill"),
         retryClaimsBackfill: args.includes("--retry-claims-backfill"),
-        ...(waiveClaimsBackfillFailure !== null ? { waiveClaimsBackfillFailure } : {}),
+        ...(args.includes("--waive-claims-backfill-failure") ? { waiveClaimsBackfillFailure } : {}),
         ...(waiveRationale !== null ? { waiveRationale } : {}),
     };
 }

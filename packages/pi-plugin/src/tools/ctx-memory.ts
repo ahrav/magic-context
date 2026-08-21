@@ -42,6 +42,7 @@ import {
 	hasMemoryClassifiedAtColumn,
 	hasMemoryShareableColumn,
 	insertMemory,
+	insertMemoryIdempotent,
 	type Memory,
 	type MemoryCategory,
 	mergeMemoryStats,
@@ -63,10 +64,13 @@ import {
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
+import type { MemoryClaimOperationIdentity } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	hasMemoryClaimsCompatSchema,
+	readMemoryClaimOperationResult,
 	updateMemoryContentWithClaimsInCurrentTransaction,
 	withClaimsWriteCapabilityInCurrentTransaction,
+	withMemoryClaimGenerationContextInCurrentTransaction,
 } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	type ContextDatabase,
@@ -282,23 +286,27 @@ function updateMemoryContentInCurrentTransaction(
 	memory: Memory,
 	content: string,
 	normalizedHash: string,
-): void {
+	operationIdentity?: MemoryClaimOperationIdentity,
+): boolean {
 	if (hasMemoryClaimsCompatSchema(db)) {
-		withClaimsWriteCapabilityInCurrentTransaction(db, () => {
-			updateMemoryContentWithClaimsInCurrentTransaction(
+		const outcome = withClaimsWriteCapabilityInCurrentTransaction(db, () => {
+			return updateMemoryContentWithClaimsInCurrentTransaction(
 				db,
 				{
-					producer: "ctx-memory-pi",
-					operationKey: `update:${crypto.randomUUID()}`,
-					requestDigest: sha256Utf8Hex(
-						JSON.stringify({ id: memory.id, content, normalizedHash }),
-					),
+					producer: operationIdentity?.producer ?? "ctx-memory-pi",
+					operationKey:
+						operationIdentity?.operationKey ?? `update:${crypto.randomUUID()}`,
+					requestDigest:
+						operationIdentity?.requestDigest ??
+						sha256Utf8Hex(
+							JSON.stringify({ id: memory.id, content, normalizedHash }),
+						),
 				},
 				{ memoryId: memory.id, content, normalizedHash },
 			);
 		});
 		invalidateMemory(memory.projectPath, memory.id);
-		return;
+		return outcome.replayed;
 	}
 	db.prepare(
 		"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
@@ -318,6 +326,7 @@ function updateMemoryContentInCurrentTransaction(
 		memory.id,
 	);
 	invalidateMemory(memory.projectPath, memory.id);
+	return false;
 }
 
 function queueEmbedding(args: {
@@ -383,7 +392,7 @@ export function createCtxMemoryTool(
 		description,
 		parameters: ParamsSchema,
 		async execute(
-			_toolCallId,
+			toolCallId,
 			params: CtxMemoryParams,
 			_signal,
 			_onUpdate,
@@ -414,6 +423,17 @@ export function createCtxMemoryTool(
 					"Error: Could not resolve project identity for memory action.",
 				);
 			}
+			const claimOperationIdentity = (
+				suffix: string,
+				request: unknown,
+			): MemoryClaimOperationIdentity | undefined =>
+				toolCallId
+					? {
+							producer: "ctx-memory-pi",
+							operationKey: `${toolCallId}:${suffix}`,
+							requestDigest: sha256Utf8Hex(JSON.stringify(request)),
+						}
+					: undefined;
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
 			const workspaceIdentitySet = resolveWorkspaceIdentitySet(
 				deps.db,
@@ -493,12 +513,38 @@ export function createCtxMemoryTool(
 					return err("Error: 'category' is required when action is 'write'.");
 				}
 
-				const existing = getMemoryByHash(
-					deps.db,
-					projectIdentity,
-					rawCategory,
-					computeNormalizedHash(content),
-				);
+				const normalizedHash = computeNormalizedHash(content);
+				const writeRequest = {
+					projectPath: projectIdentity,
+					category: rawCategory,
+					normalizedHash,
+					content,
+				};
+				const writeIdentity = claimOperationIdentity("write", writeRequest);
+				if (writeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
+					const replay = readMemoryClaimOperationResult<{ memoryId: number }>(
+						deps.db,
+						{
+							producer: writeIdentity.producer,
+							operationKey: writeIdentity.operationKey,
+							requestDigest: writeIdentity.requestDigest as string,
+						},
+					);
+					if (replay) {
+						return ok(
+							`Saved memory [ID: ${replay.result.memoryId}] in ${rawCategory}.`,
+						);
+					}
+				}
+
+				const existing = writeIdentity
+					? null
+					: getMemoryByHash(
+							deps.db,
+							projectIdentity,
+							rawCategory,
+							normalizedHash,
+						);
 				if (existing) {
 					updateMemorySeenCount(deps.db, existing.id);
 					return ok(
@@ -506,13 +552,23 @@ export function createCtxMemoryTool(
 					);
 				}
 
-				const memory = insertMemory(deps.db, {
-					projectPath: projectIdentity,
-					category: rawCategory,
-					content,
-					sourceSessionId: sessionId,
-					sourceType: dreamerAllowed ? "dreamer" : "agent",
-				});
+				const insertResult = insertMemoryIdempotent(
+					deps.db,
+					{
+						projectPath: projectIdentity,
+						category: rawCategory,
+						content,
+						sourceSessionId: sessionId,
+						sourceType: dreamerAllowed ? "dreamer" : "agent",
+					},
+					writeIdentity,
+				);
+				if (!insertResult.inserted) {
+					return ok(
+						`Memory already exists [ID: ${insertResult.memory.id}] in ${rawCategory} (seen count incremented).`,
+					);
+				}
+				const memory = insertResult.memory;
 
 				queueEmbedding({ deps, projectIdentity, memoryId: memory.id, content });
 				// Do NOT invalidate the m[0]/m[1] cache here. An additive write is a
@@ -605,23 +661,40 @@ export function createCtxMemoryTool(
 					);
 				}
 
+				const updateIdentity = claimOperationIdentity(`update:${memory.id}`, {
+					id: memory.id,
+					content,
+					normalizedHash,
+				});
+				let replayed = false;
 				deps.db
-					.transaction(() => {
-						updateMemoryContentInCurrentTransaction(
+					.transaction(() =>
+						withMemoryClaimGenerationContextInCurrentTransaction(
 							deps.db,
-							memory,
-							content,
-							normalizedHash,
-						);
-						queueMemoryMutation(deps.db, {
-							projectPath: targetIdentity,
-							mutationType: "update",
-							targetMemoryId: memory.id,
-							category: memory.category,
-							newContent: content,
-						});
-					})
+							() => {
+								replayed = updateMemoryContentInCurrentTransaction(
+									deps.db,
+									memory,
+									content,
+									normalizedHash,
+									updateIdentity,
+								);
+								if (!replayed) {
+									queueMemoryMutation(deps.db, {
+										projectPath: targetIdentity,
+										mutationType: "update",
+										targetMemoryId: memory.id,
+										category: memory.category,
+										newContent: content,
+									});
+								}
+							},
+						),
+					)
 					.immediate();
+				if (replayed) {
+					return ok(`Updated memory [ID: ${memory.id}] in ${memory.category}.`);
+				}
 				queueEmbedding({
 					deps,
 					projectIdentity: targetIdentity,
@@ -654,6 +727,39 @@ export function createCtxMemoryTool(
 					.filter((memory): memory is Memory => Boolean(memory));
 				if (sourceMemories.length !== ids.length) {
 					return err("Error: One or more source memories were not found.");
+				}
+				const requestedCategoryTyped: MemoryCategory | undefined =
+					params.category;
+				const category = requestedCategoryTyped ?? sourceMemories[0]?.category;
+				if (!category) {
+					return err(
+						"Error: A valid category is required when action is 'merge'.",
+					);
+				}
+				const normalizedHash = computeNormalizedHash(content);
+				const mergeIdentity = claimOperationIdentity("merge", {
+					ids,
+					content,
+					category,
+					projectIdentity,
+				});
+				if (mergeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
+					const replay = readMemoryClaimOperationResult<{ memoryId: number }>(
+						deps.db,
+						{
+							producer: mergeIdentity.producer,
+							operationKey: mergeIdentity.operationKey,
+							requestDigest: mergeIdentity.requestDigest as string,
+						},
+					);
+					if (replay) {
+						const supersededIds = ids.filter(
+							(id) => id !== replay.result.memoryId,
+						);
+						return ok(
+							`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${replay.result.memoryId}] in ${category}; superseded [${supersededIds.join(", ")}].`,
+						);
+					}
 				}
 
 				// Cross-identity consolidation is a DREAMER-ONLY capability: each
@@ -706,33 +812,6 @@ export function createCtxMemoryTool(
 					);
 				}
 
-				// Schema-validated literal union — no runtime re-check needed.
-				const requestedCategoryTyped: MemoryCategory | undefined =
-					params.category;
-				const fallbackCategory = sourceMemories[0]?.category;
-				const category: MemoryCategory | undefined =
-					requestedCategoryTyped ?? fallbackCategory;
-				if (!category) {
-					return err(
-						"Error: A valid category is required when action is 'merge'.",
-					);
-				}
-
-				const normalizedHash = computeNormalizedHash(content);
-				const duplicate = getMemoryByHash(
-					deps.db,
-					projectIdentity,
-					category,
-					normalizedHash,
-				);
-				const canonicalExisting =
-					duplicate && ids.includes(duplicate.id) ? duplicate : null;
-				if (duplicate && !canonicalExisting) {
-					return err(
-						`Error: Memory content already exists as ID ${duplicate.id}; update or archive existing duplicates instead.`,
-					);
-				}
-
 				// Aggregate stats from all source memories.
 				const mergedSeenCount = sourceMemories.reduce(
 					(sum, memory) => sum + memory.seenCount,
@@ -771,89 +850,132 @@ export function createCtxMemoryTool(
 					? "permanent"
 					: "active";
 
-				let canonicalMemory!: Memory;
+				let canonicalMemoryId: number | null = null;
+				let mergeConflict: string | null = null;
+				let mergeReplayed = false;
 				deps.db
-					.transaction(() => {
-						let canonicalContentChanged = false;
-						if (canonicalExisting) {
-							// One of the source memories already has the merged content.
-							// Update it in place to absorb stats from the others.
-							canonicalMemory = canonicalExisting;
-							canonicalContentChanged =
-								canonicalMemory.content !== content ||
-								canonicalMemory.normalizedHash !== normalizedHash;
-							if (canonicalContentChanged) {
-								updateMemoryContent(
+					.transaction(() =>
+						withMemoryClaimGenerationContextInCurrentTransaction(
+							deps.db,
+							() => {
+								if (mergeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
+									const replay = readMemoryClaimOperationResult<{
+										memoryId: number;
+									}>(deps.db, {
+										producer: mergeIdentity.producer,
+										operationKey: mergeIdentity.operationKey,
+										requestDigest: mergeIdentity.requestDigest as string,
+									});
+									if (replay) {
+										canonicalMemoryId = replay.result.memoryId;
+										mergeReplayed = true;
+										return;
+									}
+								}
+								const lockedDuplicate = getMemoryByHash(
 									deps.db,
-									canonicalMemory.id,
-									content,
+									projectIdentity,
+									category,
 									normalizedHash,
 								);
-							}
-						} else {
-							// Insert a fresh canonical memory with the merged content.
-							canonicalMemory = insertMemory(deps.db, {
-								projectPath: projectIdentity,
-								category,
-								content,
-								sourceSessionId: sessionId,
-								sourceType: dreamerAllowed ? "dreamer" : "agent",
-							});
-						}
+								const canonicalExisting =
+									lockedDuplicate && ids.includes(lockedDuplicate.id)
+										? lockedDuplicate
+										: null;
+								if (lockedDuplicate && !canonicalExisting) {
+									mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+									return;
+								}
+								let canonicalMemory: Memory;
+								let canonicalContentChanged = false;
+								if (canonicalExisting) {
+									// One of the source memories already has the merged content.
+									// Update it in place to absorb stats from the others.
+									canonicalMemory = canonicalExisting;
+									canonicalContentChanged =
+										canonicalMemory.content !== content ||
+										canonicalMemory.normalizedHash !== normalizedHash;
+									if (canonicalContentChanged) {
+										updateMemoryContent(
+											deps.db,
+											canonicalMemory.id,
+											content,
+											normalizedHash,
+										);
+									}
+								} else {
+									// Insert a fresh canonical memory with the merged content.
+									canonicalMemory = insertMemory(deps.db, {
+										projectPath: projectIdentity,
+										category,
+										content,
+										sourceSessionId: sessionId,
+										sourceType: dreamerAllowed ? "dreamer" : "agent",
+									});
+								}
 
-						mergeMemoryStats(
-							deps.db,
-							canonicalMemory.id,
-							mergedSeenCount,
-							mergedRetrievalCount,
-							mergedFrom,
-							mergedStatus,
-						);
+								mergeMemoryStats(
+									deps.db,
+									canonicalMemory.id,
+									mergedSeenCount,
+									mergedRetrievalCount,
+									mergedFrom,
+									mergedStatus,
+									mergeIdentity,
+								);
 
-						for (const memory of sourceMemories) {
-							if (memory.id === canonicalMemory.id) {
-								continue;
-							}
-							supersededMemory(deps.db, memory.id, canonicalMemory.id);
-							queueMemoryMutation(deps.db, {
-								// Normalize the stored path to the resolved identity
-								// before queueing — the render-side mutation-log reader
-								// matches exact project_path, and OpenCode + dashboard
-								// both normalize first. A legacy raw filesystem path here
-								// would write a row that normalized git:/dir: sessions
-								// never read (the supersede delta would silently vanish).
-								projectPath: normalizeStoredProjectPath(memory.projectPath),
-								mutationType: "superseded",
-								targetMemoryId: memory.id,
-								supersededById: canonicalMemory.id,
-							});
-						}
+								for (const memory of sourceMemories) {
+									if (memory.id === canonicalMemory.id) {
+										continue;
+									}
+									supersededMemory(deps.db, memory.id, canonicalMemory.id);
+									queueMemoryMutation(deps.db, {
+										// Normalize the stored path to the resolved identity
+										// before queueing — the render-side mutation-log reader
+										// matches exact project_path, and OpenCode + dashboard
+										// both normalize first. A legacy raw filesystem path here
+										// would write a row that normalized git:/dir: sessions
+										// never read (the supersede delta would silently vanish).
+										projectPath: normalizeStoredProjectPath(memory.projectPath),
+										mutationType: "superseded",
+										targetMemoryId: memory.id,
+										supersededById: canonicalMemory.id,
+									});
+								}
 
-						if (canonicalExisting && canonicalContentChanged) {
-							queueMemoryMutation(deps.db, {
-								projectPath: normalizeStoredProjectPath(
-									canonicalMemory.projectPath,
-								),
-								mutationType: "update",
-								targetMemoryId: canonicalMemory.id,
-								category,
-								newContent: content,
-							});
-						}
-					})
+								if (canonicalExisting && canonicalContentChanged) {
+									queueMemoryMutation(deps.db, {
+										projectPath: normalizeStoredProjectPath(
+											canonicalMemory.projectPath,
+										),
+										mutationType: "update",
+										targetMemoryId: canonicalMemory.id,
+										category,
+										newContent: content,
+									});
+								}
+								canonicalMemoryId = canonicalMemory.id;
+							},
+						),
+					)
 					.immediate();
 
-				queueEmbedding({
-					deps,
-					projectIdentity,
-					memoryId: canonicalMemory.id,
-					content,
-				});
+				if (mergeConflict || canonicalMemoryId === null) {
+					return err(mergeConflict ?? "Error: Failed to merge memories.");
+				}
+				if (!mergeReplayed) {
+					queueEmbedding({
+						deps,
+						projectIdentity,
+						memoryId: canonicalMemoryId,
+						content,
+					});
+				}
 				const supersededIds = sourceMemories
 					.map((memory) => memory.id)
-					.filter((id) => id !== canonicalMemory.id);
+					.filter((id) => id !== canonicalMemoryId);
 				return ok(
-					`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${canonicalMemory.id}] in ${category}; superseded [${supersededIds.join(", ")}].`,
+					`Merged memories [${ids.join(", ")}] into canonical memory [ID: ${canonicalMemoryId}] in ${category}; superseded [${supersededIds.join(", ")}].`,
 				);
 			}
 
@@ -870,6 +992,32 @@ export function createCtxMemoryTool(
 				}
 				// De-dupe (first-seen order): `ids:[42,42]` archives once.
 				const archiveIds = [...new Set(rawArchiveIds)];
+				const archiveIdentity = (
+					memoryId: number,
+				): MemoryClaimOperationIdentity | undefined =>
+					claimOperationIdentity(
+						`archive:${memoryId}`,
+						params.reason?.trim()
+							? { id: memoryId, reason: params.reason.trim() }
+							: { id: memoryId, status: "archived" },
+					);
+				const archiveReplay = archiveIds.every((memoryId) => {
+					const identity = archiveIdentity(memoryId);
+					return (
+						identity !== undefined &&
+						readMemoryClaimOperationResult(deps.db, {
+							producer: identity.producer,
+							operationKey: identity.operationKey,
+							requestDigest: identity.requestDigest as string,
+						}) !== null
+					);
+				});
+				if (archiveReplay) {
+					const reasonSuffix = params.reason ? ` (${params.reason})` : "";
+					const idList = archiveIds.join(", ");
+					const plural = archiveIds.length > 1 ? "memories" : "memory";
+					return ok(`Archived ${plural} [ID: ${idList}]${reasonSuffix}.`);
+				}
 				// Validate the whole batch BEFORE mutating so a typo'd id can't
 				// half-archive a batch (all-or-nothing, matching the transaction).
 				for (const memoryId of archiveIds) {
@@ -899,16 +1047,28 @@ export function createCtxMemoryTool(
 					};
 				});
 				deps.db
-					.transaction(() => {
-						for (const target of targets) {
-							archiveMemory(deps.db, target.memoryId, params.reason);
-							queueMemoryMutation(deps.db, {
-								projectPath: target.projectIdentity,
-								mutationType: "archive",
-								targetMemoryId: target.memoryId,
-							});
-						}
-					})
+					.transaction(() =>
+						withMemoryClaimGenerationContextInCurrentTransaction(
+							deps.db,
+							() => {
+								for (const target of targets) {
+									const replayed = archiveMemory(
+										deps.db,
+										target.memoryId,
+										params.reason,
+										archiveIdentity(target.memoryId),
+									);
+									if (!replayed) {
+										queueMemoryMutation(deps.db, {
+											projectPath: target.projectIdentity,
+											mutationType: "archive",
+											targetMemoryId: target.memoryId,
+										});
+									}
+								}
+							},
+						),
+					)
 					.immediate();
 				const reasonSuffix = params.reason ? ` (${params.reason})` : "";
 				const idList = archiveIds.join(", ");

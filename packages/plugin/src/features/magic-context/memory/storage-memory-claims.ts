@@ -112,6 +112,41 @@ export function hasMemoryClaimsCompatSchema(db: Database): boolean {
 
 const capabilityDepth = new WeakMap<Database, number>();
 
+interface MemoryClaimGenerationContext {
+    generations: Map<number, { generation: number; existed: boolean }>;
+}
+
+const generationContexts = new WeakMap<Database, MemoryClaimGenerationContext>();
+
+/**
+ * Outer transaction shares one generation allocation per touched project.
+ * Nested scopes restore allocation snapshots after errors so rolled-back
+ * savepoints do not retain allocations.
+ */
+export function withMemoryClaimGenerationContextInCurrentTransaction<T>(
+    db: Database,
+    fn: () => T,
+): T {
+    const existing = generationContexts.get(db);
+    if (existing) {
+        const snapshot = new Map(existing.generations);
+        try {
+            return fn();
+        } catch (error) {
+            existing.generations = snapshot;
+            throw error;
+        }
+    }
+
+    const context: MemoryClaimGenerationContext = { generations: new Map() };
+    generationContexts.set(db, context);
+    try {
+        return fn();
+    } finally {
+        generationContexts.delete(db);
+    }
+}
+
 /**
  * Enable the claims-write capability for `fn` inside the CALLER's write
  * transaction. Only the outermost scope clears the flag, and it clears
@@ -159,7 +194,9 @@ export function runInMemoryClaimsWriteTransaction<T>(db: Database, fn: () => T):
     const outermost = (capabilityDepth.get(db) ?? 0) === 0;
     const result = db
         .transaction(() => {
-            const value = withClaimsWriteCapabilityInCurrentTransaction(db, fn);
+            const value = withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+                withMemoryClaimGenerationContextInCurrentTransaction(db, fn),
+            );
             if (outermost) hitMemoryClaimFailpoint("memory-claim.050.commit.before");
             return value;
         })
@@ -210,6 +247,30 @@ export function computeClaimRequestDigest(request: unknown): string {
     return sha256Utf8Hex(JSON.stringify(request));
 }
 
+export function readMemoryClaimOperationResult<T>(
+    db: Database,
+    envelope: MemoryClaimOperationEnvelope,
+): MemoryClaimOperationOutcome<T> | null {
+    const existing = db
+        .prepare(
+            "SELECT request_digest AS requestDigest, result_json AS resultJson FROM claim_operations WHERE producer = ? AND operation_key = ?",
+        )
+        .get(envelope.producer, envelope.operationKey) as
+        | { requestDigest: string; resultJson: string }
+        | undefined;
+    if (!existing) return null;
+    if (existing.requestDigest !== envelope.requestDigest) {
+        throw new ClaimOperationKeyReuseError(envelope.producer, envelope.operationKey);
+    }
+    try {
+        return { result: JSON.parse(existing.resultJson) as T, replayed: true };
+    } catch (error) {
+        throw new ClaimGraphCorruptionError(
+            `claim operation ${envelope.producer}/${envelope.operationKey} stored an unparseable result: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
+}
+
 function toRowId(result: unknown): number {
     const rowid = (result as { lastInsertRowid?: number | bigint }).lastInsertRowid;
     const value = Number(rowid);
@@ -231,27 +292,8 @@ export function runMemoryClaimOperationInCurrentTransaction<T>(
     envelope: MemoryClaimOperationEnvelope,
     work: () => { result: T; effects: readonly MemoryClaimEffect[] },
 ): MemoryClaimOperationOutcome<T> {
-    const existing = db
-        .prepare(
-            "SELECT request_digest AS requestDigest, result_json AS resultJson FROM claim_operations WHERE producer = ? AND operation_key = ?",
-        )
-        .get(envelope.producer, envelope.operationKey) as
-        | { requestDigest: string; resultJson: string }
-        | undefined;
-    if (existing) {
-        if (existing.requestDigest !== envelope.requestDigest) {
-            throw new ClaimOperationKeyReuseError(envelope.producer, envelope.operationKey);
-        }
-        let stored: T;
-        try {
-            stored = JSON.parse(existing.resultJson) as T;
-        } catch (error) {
-            throw new ClaimGraphCorruptionError(
-                `claim operation ${envelope.producer}/${envelope.operationKey} stored an unparseable result: ${error instanceof Error ? error.message : String(error)}`,
-            );
-        }
-        return { result: stored, replayed: true };
-    }
+    const replay = readMemoryClaimOperationResult<T>(db, envelope);
+    if (replay) return replay;
 
     const { result, effects } = work();
     const now = Date.now();
@@ -272,15 +314,19 @@ export function runMemoryClaimOperationInCurrentTransaction<T>(
             ),
     );
 
-    const generationByProject = new Map<number, number>();
-    const projectHasGenerationRow = new Map<number, boolean>();
+    const context = generationContexts.get(db);
+    const generationByProject = context?.generations ?? new Map();
+    const newlyAllocatedProjects = new Set<number>();
     for (const effect of effects) {
         if (generationByProject.has(effect.projectId)) continue;
         const row = db
             .prepare("SELECT generation FROM claim_project_generations WHERE project_id = ?")
             .get(effect.projectId) as { generation: number } | null | undefined;
-        projectHasGenerationRow.set(effect.projectId, row != null);
-        generationByProject.set(effect.projectId, (row?.generation ?? 0) + 1);
+        generationByProject.set(effect.projectId, {
+            generation: (row?.generation ?? 0) + 1,
+            existed: row != null,
+        });
+        newlyAllocatedProjects.add(effect.projectId);
     }
     const insertOutbox = db.prepare(
         `INSERT INTO claim_change_outbox
@@ -294,25 +340,25 @@ export function runMemoryClaimOperationInCurrentTransaction<T>(
             effect.projectId,
             effect.claimId,
             effect.effectType,
-            generationByProject.get(effect.projectId) as number,
+            generationByProject.get(effect.projectId)?.generation as number,
             now,
         );
     }
     hitMemoryClaimFailpoint("memory-claim.030.outbox.after");
 
-    for (const [projectId, generation] of generationByProject) {
-        // UPDATE-then-INSERT instead of an upsert: the append-only collision
-        // trigger fires on every INSERT, including ON CONFLICT resolution.
-        // The branch uses the transaction-local read above, not the reported
-        // change count, which bun:sqlite may widen to a total-changes delta.
-        if (projectHasGenerationRow.get(projectId)) {
+    for (const projectId of newlyAllocatedProjects) {
+        const allocation = generationByProject.get(projectId);
+        if (!allocation) continue;
+        // Append-only collision guards inspect every INSERT, including ON
+        // CONFLICT resolution, so allocation uses UPDATE-then-INSERT.
+        if (allocation.existed) {
             db.prepare(
                 "UPDATE claim_project_generations SET generation = ?, updated_at = ? WHERE project_id = ?",
-            ).run(generation, now, projectId);
+            ).run(allocation.generation, now, projectId);
         } else {
             db.prepare(
                 "INSERT INTO claim_project_generations (project_id, generation, updated_at) VALUES (?, ?, ?)",
-            ).run(projectId, generation, now);
+            ).run(projectId, allocation.generation, now);
         }
     }
     hitMemoryClaimFailpoint("memory-claim.040.generation.after");
@@ -349,7 +395,16 @@ export interface MemoryClaimLink {
     rootObservationId: number;
 }
 
-export type MemoryClaimLinkFailureReason = "unresolved-project-identity" | "empty-content";
+export type MemoryClaimLinkFailureReason =
+    | "unresolved-project-identity"
+    | "empty-content"
+    | "empty-category"
+    | "empty-normalized-hash"
+    | "invalid-importance"
+    | "invalid-scope"
+    | "invalid-shareable"
+    | "empty-source-session-id"
+    | "empty-source-type";
 
 export class MemoryClaimsStatsIntegrityError extends Error {
     readonly memoryId: number;
@@ -381,7 +436,41 @@ export function resolveMemoryClaimProjectInCurrentTransaction(
     return null;
 }
 
-function recordMemoryClaimLinkFailure(
+export function memoryClaimMetadataFailureReason(
+    row: MemoryProjectionRow,
+): MemoryClaimLinkFailureReason | null {
+    if (typeof row.category !== "string" || row.category.length === 0) return "empty-category";
+    if (typeof row.normalized_hash !== "string" || row.normalized_hash.length === 0) {
+        return "empty-normalized-hash";
+    }
+    const importance = row.importance;
+    if (
+        importance !== null &&
+        (!Number.isInteger(importance) || importance < 1 || importance > 100)
+    ) {
+        return "invalid-importance";
+    }
+    if (row.scope !== "project" && row.scope !== "ecosystem" && row.scope !== "universe") {
+        return "invalid-scope";
+    }
+    if (row.shareable !== 0 && row.shareable !== 1) return "invalid-shareable";
+    if (row.source_session_id === "") return "empty-source-session-id";
+    if (typeof row.source_type !== "string" || row.source_type.length === 0) {
+        return "empty-source-type";
+    }
+    return null;
+}
+
+export function memoryClaimAdoptionFailureReason(
+    row: MemoryProjectionRow,
+    projectId: number | null,
+): MemoryClaimLinkFailureReason | null {
+    if (projectId === null) return "unresolved-project-identity";
+    if (typeof row.content !== "string" || row.content.length === 0) return "empty-content";
+    return memoryClaimMetadataFailureReason(row);
+}
+
+export function recordMemoryClaimLinkFailure(
     db: Database,
     memoryId: number,
     projectPath: string,
@@ -457,9 +546,9 @@ function metadataFromProjectionRow(
         category: row.category,
         normalizedHash: row.normalized_hash,
         importance: clampImportance(row.importance),
-        memoryScope: row.scope || "project",
-        shareable: row.shareable ? 1 : 0,
-        sourceType: row.source_type || "historian",
+        memoryScope: row.scope,
+        shareable: row.shareable,
+        sourceType: row.source_type,
         expiresAt: row.expires_at,
         metadataJson: row.metadata_json,
         ...overrides,
@@ -600,6 +689,9 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
     const existing = readMemoryClaimLink(db, row.id);
     if (existing) return existing;
 
+    const failure = memoryClaimAdoptionFailureReason(row, projectId);
+    if (failure) throw new Error(`memory ${row.id} cannot be adopted into claims: ${failure}`);
+
     const now = Date.now();
     const canonical = findCanonicalLinkByHash(db, projectId, row.category, row.normalized_hash);
     if (canonical && canonical.canonicalMemoryId !== row.id) {
@@ -720,6 +812,292 @@ export function recordMemoryClaimSupersessionInCurrentTransaction(
     return true;
 }
 
+export interface MemoryClaimLineageToken {
+    ordinal: number;
+    raw: string;
+    kind: "id" | "marker" | "malformed";
+    id?: number;
+}
+
+export interface MemoryRelationshipSourceRow {
+    sourceId: number;
+    memoryId: number;
+    sourceDigest: string;
+    mergedFrom: string | null;
+    supersededByMemoryId: number | null;
+}
+
+export function parseMemoryClaimMergedFrom(raw: string | null): MemoryClaimLineageToken[] {
+    if (raw === null) return [];
+    const trimmed = raw.trim();
+    if (trimmed.length === 0) return [];
+    if (trimmed.startsWith("[")) {
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(trimmed);
+        } catch {
+            return [{ ordinal: 0, raw: trimmed, kind: "malformed" }];
+        }
+        if (!Array.isArray(parsed)) return [{ ordinal: 0, raw: trimmed, kind: "malformed" }];
+        return parsed.map((value, ordinal) => {
+            const numeric =
+                typeof value === "number"
+                    ? value
+                    : typeof value === "string" && /^\d+$/.test(value.trim())
+                      ? Number.parseInt(value.trim(), 10)
+                      : null;
+            return numeric !== null && Number.isSafeInteger(numeric) && numeric >= 1
+                ? { ordinal, raw: String(value), kind: "id" as const, id: numeric }
+                : {
+                      ordinal,
+                      raw: JSON.stringify(value) ?? String(value),
+                      kind: "malformed" as const,
+                  };
+        });
+    }
+    return trimmed.split(",").map((part, ordinal) => {
+        const token = part.trim();
+        if (token === "identity-merge") return { ordinal, raw: token, kind: "marker" as const };
+        if (/^\d+$/.test(token)) {
+            return { ordinal, raw: token, kind: "id" as const, id: Number.parseInt(token, 10) };
+        }
+        return { ordinal, raw: token, kind: "malformed" as const };
+    });
+}
+
+function memoryRelationshipSourceDigest(row: {
+    merged_from: string | null;
+    superseded_by_memory_id: number | null;
+}): string {
+    return sha256Utf8Hex(JSON.stringify([row.merged_from, row.superseded_by_memory_id]));
+}
+
+function memoryRelationshipTokenDetail(token: MemoryClaimLineageToken): string {
+    return JSON.stringify({
+        ordinal: token.ordinal,
+        raw: token.raw.slice(0, 160),
+        digest: sha256Utf8Hex(token.raw),
+    });
+}
+
+function upsertMemoryRelationshipDisposition(
+    db: Database,
+    itemKind: "lineage" | "supersession",
+    itemKey: string,
+    reasonCode: string,
+    detail: string,
+    resolved: boolean,
+): void {
+    const now = Date.now();
+    db.prepare(
+        `INSERT INTO claim_backfill_failures
+            (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+         VALUES ('relationships', ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(phase, item_kind, item_key) DO UPDATE SET
+            reason_code = excluded.reason_code,
+            detail = excluded.detail,
+            disposition = CASE
+                WHEN claim_backfill_failures.disposition = 'warning' THEN 'warning'
+                ELSE excluded.disposition
+            END,
+            rationale = CASE
+                WHEN claim_backfill_failures.disposition = 'warning'
+                THEN claim_backfill_failures.rationale ELSE NULL
+            END,
+            updated_at = excluded.updated_at`,
+    ).run(
+        itemKind,
+        itemKey,
+        reasonCode,
+        detail.slice(0, 2000),
+        resolved ? "resolved" : "blocking",
+        now,
+        now,
+    );
+}
+
+export function memoryClaimSupersessionExists(
+    db: Database,
+    source: MemoryClaimLink,
+    target: MemoryClaimLink,
+): boolean {
+    if (source.claimId === target.claimId) return true;
+    if (source.projectId === target.projectId) {
+        return Boolean(
+            db
+                .prepare(
+                    `SELECT 1 FROM claim_conflicts cc
+                       JOIN claim_revisions left_rev ON left_rev.id = cc.left_revision_id
+                       JOIN claim_revisions right_rev ON right_rev.id = cc.right_revision_id
+                      WHERE cc.relation = 'supersedes'
+                        AND left_rev.claim_id = ? AND right_rev.claim_id = ? LIMIT 1`,
+                )
+                .get(target.claimId, source.claimId),
+        );
+    }
+    return Boolean(
+        db
+            .prepare(
+                `SELECT 1 FROM claim_merge_lineage cml
+                   JOIN claim_revisions source_rev ON source_rev.id = cml.source_revision_id
+                   JOIN claim_revisions target_rev ON target_rev.id = cml.target_revision_id
+                  WHERE source_rev.claim_id = ? AND target_rev.claim_id = ? LIMIT 1`,
+            )
+            .get(source.claimId, target.claimId),
+    );
+}
+
+export function listMemoryRelationshipSources(
+    db: Database,
+    boundaryMemoryId: number,
+): MemoryRelationshipSourceRow[] {
+    return db
+        .prepare(
+            `SELECT id AS sourceId, memory_id AS memoryId, source_digest AS sourceDigest,
+                    merged_from AS mergedFrom,
+                    superseded_by_memory_id AS supersededByMemoryId
+               FROM claim_memory_relationship_sources
+              WHERE memory_id <= ? ORDER BY memory_id, id`,
+        )
+        .all(boundaryMemoryId) as MemoryRelationshipSourceRow[];
+}
+
+export function translateMemoryClaimRelationshipsInCurrentTransaction(
+    db: Database,
+    row: Pick<MemoryProjectionRow, "id" | "merged_from" | "superseded_by_memory_id">,
+): MemoryClaimEffect[] {
+    const link = readMemoryClaimLink(db, row.id);
+    if (!link) return [];
+
+    const sourceDigest = memoryRelationshipSourceDigest(row);
+    if (
+        !db
+            .prepare(
+                "SELECT 1 FROM claim_memory_relationship_sources WHERE memory_id = ? AND source_digest = ?",
+            )
+            .get(row.id, sourceDigest)
+    ) {
+        db.prepare(
+            `INSERT INTO claim_memory_relationship_sources
+                (memory_id, source_digest, merged_from, superseded_by_memory_id, created_at)
+             VALUES (?, ?, ?, ?, ?)`,
+        ).run(row.id, sourceDigest, row.merged_from, row.superseded_by_memory_id, Date.now());
+    }
+
+    const prefix = `memory:${row.id}:relations:${sourceDigest}`;
+    db.prepare(
+        `UPDATE claim_backfill_failures
+            SET disposition = 'resolved', reason_code = 'relationship-source-replaced',
+                rationale = NULL, updated_at = ?
+          WHERE phase = 'relationships'
+            AND item_key LIKE ?
+            AND item_key NOT LIKE ?
+            AND disposition IN ('blocking', 'retry')`,
+    ).run(Date.now(), `memory:${row.id}:relations:%`, `${prefix}:%`);
+
+    const effects: MemoryClaimEffect[] = [];
+    if (row.superseded_by_memory_id !== null) {
+        const itemKey = `${prefix}:superseded-by`;
+        const target = readMemoryClaimLink(db, row.superseded_by_memory_id);
+        if (target) {
+            const recorded = memoryClaimSupersessionExists(db, link, target)
+                ? false
+                : recordMemoryClaimSupersessionInCurrentTransaction(db, link, target);
+            upsertMemoryRelationshipDisposition(
+                db,
+                "supersession",
+                itemKey,
+                "translated-supersession",
+                memoryRelationshipTokenDetail({
+                    ordinal: 0,
+                    raw: String(row.superseded_by_memory_id),
+                    kind: "id",
+                }),
+                true,
+            );
+            if (recorded) {
+                effects.push({
+                    effectKey: `${prefix}:supersession`,
+                    projectId: target.projectId,
+                    claimId: target.claimId,
+                    effectType: "evidence",
+                });
+            }
+        } else {
+            upsertMemoryRelationshipDisposition(
+                db,
+                "supersession",
+                itemKey,
+                "dangling-supersession",
+                memoryRelationshipTokenDetail({
+                    ordinal: 0,
+                    raw: String(row.superseded_by_memory_id),
+                    kind: "id",
+                }),
+                false,
+            );
+        }
+    }
+
+    for (const token of parseMemoryClaimMergedFrom(row.merged_from)) {
+        const itemKey = `${prefix}:merged-from:${token.ordinal}`;
+        if (token.kind === "marker") {
+            upsertMemoryRelationshipDisposition(
+                db,
+                "lineage",
+                itemKey,
+                "identity-merge-marker",
+                memoryRelationshipTokenDetail(token),
+                true,
+            );
+            continue;
+        }
+        if (token.kind === "id") {
+            const source = readMemoryClaimLink(db, token.id as number);
+            if (source) {
+                const recorded = memoryClaimSupersessionExists(db, source, link)
+                    ? false
+                    : recordMemoryClaimSupersessionInCurrentTransaction(db, source, link);
+                upsertMemoryRelationshipDisposition(
+                    db,
+                    "lineage",
+                    itemKey,
+                    "translated-lineage",
+                    memoryRelationshipTokenDetail(token),
+                    true,
+                );
+                if (recorded) {
+                    effects.push({
+                        effectKey: `${prefix}:lineage:${token.ordinal}`,
+                        projectId: link.projectId,
+                        claimId: link.claimId,
+                        effectType: "evidence",
+                    });
+                }
+                continue;
+            }
+            upsertMemoryRelationshipDisposition(
+                db,
+                "lineage",
+                itemKey,
+                "dangling-lineage",
+                memoryRelationshipTokenDetail(token),
+                false,
+            );
+            continue;
+        }
+        upsertMemoryRelationshipDisposition(
+            db,
+            "lineage",
+            itemKey,
+            "malformed-lineage",
+            memoryRelationshipTokenDetail(token),
+            false,
+        );
+    }
+    return effects;
+}
+
 /** Claim lifecycle state change (active | permanent | archived). */
 export function setClaimLifecycleStateInCurrentTransaction(
     db: Database,
@@ -780,10 +1158,6 @@ function liveProvenance(
     };
 }
 
-function requireProjectionRow(db: Database, memoryId: number): MemoryProjectionRow | null {
-    return readMemoryProjectionRow(db, memoryId);
-}
-
 /**
  * New memory: projection insert (allocating the canonical memory id while
  * the transaction is uncommitted, KTD3), claim revision 1 with live
@@ -809,7 +1183,7 @@ export function createMemoryWithClaimsInCurrentTransaction(
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return { result: unlinkableResult(memoryId), effects: [] };
         }
-        const row = requireProjectionRow(db, memoryId) as MemoryProjectionRow;
+        const row = readMemoryProjectionRow(db, memoryId) as MemoryProjectionRow;
         const link = ensureMemoryClaimLinkInCurrentTransaction(
             db,
             row,
@@ -855,7 +1229,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
     input: UpdateMemoryContentClaimInput,
 ): MemoryClaimOperationOutcome<MemoryClaimWriteResult> {
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
-        const row = requireProjectionRow(db, input.memoryId);
+        const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         if (projectId === null || row.content.length === 0 || input.content.length === 0) {
@@ -933,7 +1307,7 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
     input: UpdateMemoryClassificationClaimInput,
 ): MemoryClaimOperationOutcome<MemoryClaimWriteResult> {
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
-        const row = requireProjectionRow(db, input.memoryId);
+        const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         const projectionUpdate = {
@@ -1012,7 +1386,7 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
     input: SetMemoryStatusClaimInput,
 ): MemoryClaimOperationOutcome<MemoryClaimWriteResult> {
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
-        const row = requireProjectionRow(db, input.memoryId);
+        const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         if (projectId === null || row.content.length === 0) {
@@ -1030,6 +1404,7 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
+        const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         setClaimLifecycleStateInCurrentTransaction(
             db,
             link.claimId,
@@ -1059,6 +1434,7 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                     claimId: link.claimId,
                     effectType: "lifecycle" as const,
                 },
+                ...relationshipEffects,
             ],
         };
     });
@@ -1075,7 +1451,7 @@ export function deleteMemoryWithClaimsInCurrentTransaction(
     input: { memoryId: number },
 ): MemoryClaimOperationOutcome<MemoryClaimWriteResult> {
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
-        const row = requireProjectionRow(db, input.memoryId);
+        const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         if (projectId === null || row.content.length === 0) {
@@ -1096,6 +1472,7 @@ export function deleteMemoryWithClaimsInCurrentTransaction(
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
+        const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
         addVerificationEvent(db, {
             revisionId: readClaimCurrentRevisionId(db, link.claimId),
@@ -1114,6 +1491,7 @@ export function deleteMemoryWithClaimsInCurrentTransaction(
                     claimId: link.claimId,
                     effectType: "lifecycle" as const,
                 },
+                ...relationshipEffects,
             ],
         };
     });
@@ -1138,7 +1516,7 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
         db,
         envelope,
         () => {
-            const row = requireProjectionRow(db, input.memoryId);
+            const row = readMemoryProjectionRow(db, input.memoryId);
             if (!row) {
                 return {
                     result: {
@@ -1167,7 +1545,7 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
                 kind: "migration",
             });
-            const sourceRevisionId = readClaimCurrentRevisionId(db, link.claimId);
+            translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
 
             const effects: MemoryClaimEffect[] = [
                 {
@@ -1178,7 +1556,7 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                 },
             ];
             let supersededByClaimId: number | null = null;
-            const target = requireProjectionRow(db, input.supersededByMemoryId);
+            const target = readMemoryProjectionRow(db, input.supersededByMemoryId);
             const targetProjectId = target
                 ? resolveMemoryClaimProjectInCurrentTransaction(db, target.project_path)
                 : null;
@@ -1189,37 +1567,21 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                     targetProjectId,
                     { kind: "migration" },
                 );
-                const targetRevisionId = readClaimCurrentRevisionId(db, targetLink.claimId);
                 supersededByClaimId = targetLink.claimId;
-                if (targetProjectId === projectId) {
-                    addClaimConflictInCurrentTransaction(db, {
-                        relation: "supersedes",
-                        leftRevisionId: targetRevisionId,
-                        rightRevisionId: sourceRevisionId,
+                if (recordMemoryClaimSupersessionInCurrentTransaction(db, link, targetLink)) {
+                    effects.push({
+                        effectKey: `memory:${target.id}:evidence`,
+                        projectId: targetProjectId,
+                        claimId: targetLink.claimId,
+                        effectType: "evidence" as const,
                     });
-                } else {
-                    db.prepare(
-                        `INSERT INTO claim_merge_lineage
-                        (source_revision_id, source_project_id, target_revision_id, target_project_id, created_at)
-                     VALUES (?, ?, ?, ?, ?)`,
-                    ).run(
-                        sourceRevisionId,
-                        projectId,
-                        targetRevisionId,
-                        targetProjectId,
-                        Date.now(),
-                    );
                 }
-                effects.push({
-                    effectKey: `memory:${target.id}:evidence`,
-                    projectId: targetProjectId,
-                    claimId: targetLink.claimId,
-                    effectType: "evidence" as const,
-                });
             }
             setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             setMemoryProjectionSuperseded(db, row.id, input.supersededByMemoryId, input.nowMs);
+            const post = readMemoryProjectionRow(db, row.id);
+            if (post) translateMemoryClaimRelationshipsInCurrentTransaction(db, post);
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return {
                 result: {
@@ -1255,7 +1617,7 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
     input: MergeMemoryStatsClaimInput,
 ): MemoryClaimOperationOutcome<MemoryClaimWriteResult> {
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
-        const row = requireProjectionRow(db, input.memoryId);
+        const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const applyProjection = (): void => {
             const { baseChanges, statsChanges } = updateMemoryProjectionMerge(
@@ -1287,6 +1649,7 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
+        const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         setClaimLifecycleStateInCurrentTransaction(
             db,
             link.claimId,
@@ -1294,6 +1657,12 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
         );
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         applyProjection();
+        const post = readMemoryProjectionRow(db, row.id);
+        if (post) {
+            relationshipEffects.push(
+                ...translateMemoryClaimRelationshipsInCurrentTransaction(db, post),
+            );
+        }
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
         return {
             result: { memoryId: row.id, claimId: link.claimId, revisionId: null, found: true },
@@ -1304,6 +1673,7 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
                     claimId: link.claimId,
                     effectType: "lifecycle" as const,
                 },
+                ...relationshipEffects,
             ],
         };
     });
@@ -1332,7 +1702,7 @@ export function updateMemoryVerificationWithClaimsInCurrentTransaction(
     input: UpdateMemoryVerificationClaimInput,
 ): MemoryClaimOperationOutcome<MemoryClaimWriteResult> {
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
-        const row = requireProjectionRow(db, input.memoryId);
+        const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         if (projectId === null || row.content.length === 0) {
@@ -1405,7 +1775,7 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
         db,
         envelope,
         () => {
-            const row = requireProjectionRow(db, input.memoryId);
+            const row = readMemoryProjectionRow(db, input.memoryId);
             const verifiedAt = input.verified ? input.now : 0;
             if (!row) {
                 const rowsWritten = replaceMemoryProjectionVerificationFiles(
@@ -1570,6 +1940,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
             preLink = ensureMemoryClaimLinkInCurrentTransaction(db, pre, preProjectId, {
                 kind: "migration",
             });
+            translateMemoryClaimRelationshipsInCurrentTransaction(db, pre);
         }
     }
 
@@ -1634,6 +2005,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 sourceSessionId: post.source_session_id,
             });
 
+            effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, post));
             const current = readCurrentClaimSemanticState(db, link.claimId);
             const desiredMeta = metadataFromProjectionRow(post);
             let revisionId: number | null = null;

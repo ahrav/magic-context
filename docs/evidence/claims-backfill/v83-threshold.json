@@ -1,7 +1,7 @@
 {
   "schemaVersion": "claims-backfill-threshold/v1",
-  "generatedAt": "2026-08-20T17:07:22.069Z",
-  "commit": "21f816b395ee45227b50182a997b209fac892193",
+  "generatedAt": "2026-08-20T22:41:59.269Z",
+  "commit": "10673ca972471d04ed7b1a87a3b6b6e95c67d1bb",
   "runtime": "bun 1.3.14",
   "runtimeCoverage": {
     "bun": "measured",
@@ -21,12 +21,12 @@
       "mergedRows": 12,
       "relationshipDensity": 0.07,
       "runsMs": [
-        657.83,
-        636.29,
-        632.36
+        660.13,
+        654.92,
+        627.51
       ],
-      "slowestMs": 657.83,
-      "lockDurationMs": 657.83,
+      "slowestMs": 660.13,
+      "lockDurationMs": 660.13,
       "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v83); the duration a sibling start would wait"
     },
     {
@@ -36,12 +36,12 @@
       "mergedRows": 189,
       "relationshipDensity": 0.073,
       "runsMs": [
-        11786.22,
-        12250.18,
-        12033.23
+        10217.55,
+        10674.36,
+        10842.04
       ],
-      "slowestMs": 12250.18,
-      "lockDurationMs": 12250.18,
+      "slowestMs": 10842.04,
+      "lockDurationMs": 10842.04,
       "lockDurationMetric": "full runMigrations() wall time over the populated legacy baseline (forced eager v83); the duration a sibling start would wait"
     }
   ],
@@ -60,5 +60,5 @@
   "productionCutoff": 0,
   "productionCutoffReason": "production policy stays at cutoff 0 (PRODUCTION_CLAIMS_BACKFILL_POLICY = null): full 1K/10K/100K/1M Bun and Node reference-host evidence was not run and reviewed; omissions were not extrapolated",
   "evidenceDigestPolicy": "sha256(JSON.stringify(measurements))",
-  "evidenceDigest": "d4be28db6ddd6eab0e7859f56de54a2dd6863d9f82edf51b55aec147e55b7781"
+  "evidenceDigest": "5dd2bc00de0baf93a63f8131176a019c8b27c026d4a90cc68f75d041992d9962"
 }

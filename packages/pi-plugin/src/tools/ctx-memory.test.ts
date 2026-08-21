@@ -1,17 +1,78 @@
 import { describe, expect, it } from "bun:test";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import {
 	getMemoryById,
 	insertMemory,
-} from "@magic-context/core/features/magic-context/memory/storage-memory";
+} from "../../../plugin/src/features/magic-context/memory/storage-memory";
 import {
 	getCurrentMemoryClaimByLegacyMemoryId,
 	runInMemoryClaimsWriteTransaction,
-} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
-import { getMemoryMutationsForRender } from "@magic-context/core/features/magic-context/storage";
-import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+} from "../../../plugin/src/features/magic-context/memory/storage-memory-claims";
+import { getMemoryMutationsForRender } from "../../../plugin/src/features/magic-context/storage";
+import { closeQuietly } from "../../../plugin/src/shared/sqlite-helpers";
 import { createTestDb, fakeContext } from "../test-utils.test";
-import { createCtxMemoryTool } from "./ctx-memory";
+import { createCtxMemoryTool as createCtxMemoryToolRuntime } from "./ctx-memory";
+
+interface TestToolResult {
+	content: Array<{ text?: string }>;
+	isError?: boolean;
+}
+
+interface TestMemoryTool {
+	execute(
+		toolCallId: string,
+		params: Record<string, unknown>,
+		signal: AbortSignal,
+		onUpdate: unknown,
+		context: unknown,
+	): Promise<TestToolResult>;
+}
+
+const createCtxMemoryTool = createCtxMemoryToolRuntime as unknown as (
+	deps: Parameters<typeof createCtxMemoryToolRuntime>[0],
+) => TestMemoryTool;
+
+function hideFirstClaimOperationRead(
+	database: ReturnType<typeof createTestDb>,
+): ReturnType<typeof createTestDb> {
+	let hidden = false;
+	return new Proxy(database, {
+		get(target, property) {
+			if (property === "prepare") {
+				return (sql: string) => {
+					const statement = target.prepare(sql);
+					if (
+						!hidden &&
+						sql.includes(
+							"SELECT request_digest AS requestDigest, result_json AS resultJson FROM claim_operations",
+						)
+					) {
+						hidden = true;
+						return new Proxy(statement, {
+							get(statementTarget, statementProperty) {
+								if (statementProperty === "get") return () => undefined;
+								const value = Reflect.get(
+									statementTarget,
+									statementProperty,
+									statementTarget,
+								);
+								return typeof value === "function"
+									? value.bind(statementTarget)
+									: value;
+							},
+						});
+					}
+					return statement;
+				};
+			}
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as ReturnType<typeof createTestDb>;
+}
 
 describe("createCtxMemoryTool", () => {
 	it("rejects list for primary agents and allows it for dreamer agents", async () => {
@@ -1185,11 +1246,15 @@ describe("createCtxMemoryTool on a migrated v83 database (claims kernel, U3 pari
 			const idMatch = first.content[0]?.text?.match(/ID:\s*(\d+)/);
 			const memoryId = Number(idMatch?.[1]);
 
-			const second = await run(tool, {
-				action: "write",
-				category: "CONSTRAINTS",
-				content: "Use bun for scripts.",
-			});
+			const second = await run(
+				tool,
+				{
+					action: "write",
+					category: "CONSTRAINTS",
+					content: "Use bun for scripts.",
+				},
+				"call-claims-distinct-repeat",
+			);
 			expect(second.content[0]?.text).toContain(
 				`Memory already exists [ID: ${memoryId}] in CONSTRAINTS (seen count incremented).`,
 			);
@@ -1242,6 +1307,151 @@ describe("createCtxMemoryTool on a migrated v83 database (claims kernel, U3 pari
 			);
 		} finally {
 			closeQuietly(db);
+		}
+	});
+
+	it("same Pi tool-call id replays a lost acknowledgement without duplicate tuple effects", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi lost acknowledgement original.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "update",
+				ids: [memory.id],
+				content: "Pi lost acknowledgement corrected.",
+			};
+
+			const first = await run(tool, args, "pi-lost-ack");
+			const tables = [
+				"claim_revisions",
+				"claim_operations",
+				"claim_change_outbox",
+				"claim_project_generations",
+				"memory_mutation_log",
+			];
+			const afterFirst = tables.map((table) => countRows(db, table));
+			const second = await run(tool, args, "pi-lost-ack");
+
+			expect(second.content[0]?.text).toBe(first.content[0]?.text);
+			expect(tables.map((table) => countRows(db, table))).toEqual(afterFirst);
+			expect(claimRevisionContents(db, memory.id)).toEqual([
+				"Pi lost acknowledgement original.",
+				"Pi lost acknowledgement corrected.",
+			]);
+			expect(
+				countRows(
+					db,
+					"claim_operations",
+					`producer = 'ctx-memory-pi' AND operation_key = 'pi-lost-ack:update:${memory.id}'`,
+				),
+			).toBe(1);
+			expect(
+				countRows(
+					db,
+					"memory_mutation_log",
+					`mutation_type = 'update' AND target_memory_id = ${memory.id}`,
+				),
+			).toBe(1);
+
+			await expect(
+				run(
+					tool,
+					{ ...args, content: "Different Pi request under reused id." },
+					"pi-lost-ack",
+				),
+			).rejects.toThrow(/already committed for a different request digest/);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("two connections replay stable merges before mutating existing or fresh canonicals (Pi parity)", async () => {
+		for (const existingCanonical of [true, false]) {
+			const dir = mkdtempSync(join(tmpdir(), "pi-ctx-memory-merge-race-"));
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			const peer = createTestDb(path);
+			try {
+				db.exec("PRAGMA busy_timeout=1000");
+				peer.exec("PRAGMA busy_timeout=1000");
+				const projectIdentity = resolveProjectIdentity(process.cwd());
+				const first = insertMemory(db, {
+					projectPath: projectIdentity,
+					category: "CONSTRAINTS",
+					content: `Pi stable merge first ${existingCanonical}`,
+				});
+				const second = insertMemory(db, {
+					projectPath: projectIdentity,
+					category: "CONSTRAINTS",
+					content: `Pi stable merge second ${existingCanonical}`,
+				});
+				const content = existingCanonical
+					? first.content
+					: `Pi stable merge fresh canonical ${existingCanonical}`;
+				const args = {
+					action: "merge",
+					ids: [first.id, second.id],
+					category: "CONSTRAINTS",
+					content,
+				};
+				const callId = `pi-stable-merge-${existingCanonical}`;
+				const winnerTool = createCtxMemoryTool({
+					db: peer,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: true,
+				});
+				const winner = await run(winnerTool, args, callId);
+				const tables = [
+					"claim_revisions",
+					"claim_operations",
+					"claim_change_outbox",
+					"claim_project_generations",
+					"memory_mutation_log",
+				];
+				const afterWinner = tables.map((table) => countRows(db, table));
+				const staleTool = createCtxMemoryTool({
+					db: hideFirstClaimOperationRead(db),
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: true,
+				});
+
+				const replay = await run(staleTool, args, callId);
+
+				expect(replay.content[0]?.text).toBe(winner.content[0]?.text);
+				expect(tables.map((table) => countRows(db, table))).toEqual(
+					afterWinner,
+				);
+				expect(
+					countRows(
+						db,
+						"claim_operations",
+						`producer = 'ctx-memory-pi' AND operation_key = '${callId}:merge'`,
+					),
+				).toBe(1);
+				await expect(
+					run(
+						staleTool,
+						{ ...args, content: `${content} digest mismatch` },
+						callId,
+					),
+				).rejects.toThrow(/already committed for a different request digest/);
+			} finally {
+				closeQuietly(peer);
+				closeQuietly(db);
+				rmSync(dir, { recursive: true, force: true });
+			}
 		}
 	});
 

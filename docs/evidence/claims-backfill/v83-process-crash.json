@@ -1,8 +1,8 @@
 {
   "schemaVersion": "claims-process-crash-evidence/v1",
-  "commitUnderTest": "a669230606b2d443d3b9247db82674aae74b4c18",
+  "commitUnderTest": "10673ca972471d04ed7b1a87a3b6b6e95c67d1bb",
   "dirtyDiffDigestPolicy": "sha256(sorted U6 implementation path + NUL + full file bytes + NUL); evidence file excluded",
-  "dirtyDiffDigest": "a514c4a147167156d01e72d88fbaecb05fa5779189e45eccad37888329c2ac7b",
+  "dirtyDiffDigest": "49d9d5df5d6aa5680917ebdf496e8f25ea773d8f90be8b203a545e46eeae4b95",
   "implementationFiles": [
     "ARCHITECTURE.md",
     "STRUCTURE.md",
@@ -140,7 +140,7 @@
       "checked": true,
       "acknowledgement": "not-observed",
       "recoveredState": "complete-new-tuple",
-      "semanticDigest": "2fd104f162f90490481a2f257ff8e3de7684956ec1321c2b04ef6ca409048538"
+      "semanticDigest": "4c734ea34df87364fbdf296a315afc467558ffee868223df20ec72a15e480283"
     },
     {
       "runtime": "bun",
@@ -153,7 +153,7 @@
       "checked": true,
       "acknowledgement": "observed",
       "recoveredState": "complete-new-tuple",
-      "semanticDigest": "2fd104f162f90490481a2f257ff8e3de7684956ec1321c2b04ef6ca409048538"
+      "semanticDigest": "4c734ea34df87364fbdf296a315afc467558ffee868223df20ec72a15e480283"
     },
     {
       "runtime": "bun",
@@ -166,7 +166,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "bun",
@@ -179,7 +179,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "bun",
@@ -192,7 +192,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "bun",
@@ -205,7 +205,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "bun",
@@ -218,7 +218,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "bun",
@@ -231,7 +231,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "bun",
@@ -244,7 +244,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "bun",
@@ -257,7 +257,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "bun",
@@ -270,7 +270,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "bun",
@@ -283,7 +283,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v83-roll-forward",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "node",
@@ -361,7 +361,7 @@
       "checked": true,
       "acknowledgement": "not-observed",
       "recoveredState": "complete-new-tuple",
-      "semanticDigest": "2fd104f162f90490481a2f257ff8e3de7684956ec1321c2b04ef6ca409048538"
+      "semanticDigest": "4c734ea34df87364fbdf296a315afc467558ffee868223df20ec72a15e480283"
     },
     {
       "runtime": "node",
@@ -374,7 +374,7 @@
       "checked": true,
       "acknowledgement": "observed",
       "recoveredState": "complete-new-tuple",
-      "semanticDigest": "2fd104f162f90490481a2f257ff8e3de7684956ec1321c2b04ef6ca409048538"
+      "semanticDigest": "4c734ea34df87364fbdf296a315afc467558ffee868223df20ec72a15e480283"
     },
     {
       "runtime": "node",
@@ -387,7 +387,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "node",
@@ -400,7 +400,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "node",
@@ -413,7 +413,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "node",
@@ -426,7 +426,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "node",
@@ -439,7 +439,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "lazy-resumed-to-uninterrupted-digest",
-      "semanticDigest": "7b8813483d5c07ed2e21f8f0440e9f5ffc029bfc5288328eda3cee7d3c570a46"
+      "semanticDigest": "c1592cfdb0070903c06b4060fc511403fde6c2552bfc5b41f2d639f59d192e4d"
     },
     {
       "runtime": "node",
@@ -452,7 +452,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "node",
@@ -465,7 +465,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "node",
@@ -478,7 +478,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "node",
@@ -491,7 +491,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v82-rerun-to-v83",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     },
     {
       "runtime": "node",
@@ -504,7 +504,7 @@
       "checked": true,
       "acknowledgement": "ambiguous",
       "recoveredState": "complete-v83-roll-forward",
-      "semanticDigest": "68b11a2d274eaf5ac402d88cdab24bc26b145ba21db7dc813e852c19c6f3b893"
+      "semanticDigest": "906fabb920b9352e0d8c1f77a273833c07eae578cac118569bbf1b3395249df5"
     }
   ],
   "acknowledgementWitness": "Supervisor-owned: observed only after an explicit worker acknowledgement event; not-observed before that event; ambiguous where no response acknowledgement exists.",

@@ -188,7 +188,7 @@ describe("project identity merge", () => {
             database
                 .prepare(
                     `UPDATE memories
-                    SET importance = 91, scope = 'workspace', shareable = 1, classified_at = 20,
+                    SET importance = 91, scope = 'ecosystem', shareable = 1, classified_at = 20,
                         mural_cue = 'new cue', mural_cue_hash = 'cue-hash', mural_cue_at = 30,
                         mural_cue_rejection_count = 2
                   WHERE id = ?`,
@@ -227,7 +227,7 @@ describe("project identity merge", () => {
                 .get(targetId),
         ).toEqual({
             importance: 91,
-            scope: "workspace",
+            scope: "ecosystem",
             shareable: 1,
             classified_at: 20,
             mural_cue: "new cue",

@@ -622,6 +622,8 @@ export async function runDoctor(
         return runIssueFlow();
     }
 
+    let sharedCommandExitCode: number | null = null;
+
     let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
     const v22Result = await runV22BackfillCommands(
         {
@@ -642,7 +644,7 @@ export async function runDoctor(
         options,
     );
     if (v22Result.handled) {
-        return v22Result.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, v22Result.exitCode);
     }
 
     let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
@@ -665,8 +667,9 @@ export async function runDoctor(
         options,
     );
     if (claimsResult.handled) {
-        return claimsResult.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, claimsResult.exitCode);
     }
+    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
 
     intro("Magic Context Doctor");
 

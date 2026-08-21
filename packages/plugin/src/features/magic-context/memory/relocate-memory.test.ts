@@ -107,6 +107,51 @@ describe("relocate-memory claims (v83)", () => {
         expect(database.prepare("SELECT COUNT(*) AS c FROM claims").get()).toEqual({ c: 1 });
     });
 
+    test("a collision request cannot move a row owned by another source project", () => {
+        const database = makeDb();
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "equivalent relocation fact",
+        });
+        const sourceC = insertMemory(database, {
+            projectPath: "git:project-c",
+            category: "CONSTRAINTS",
+            content: "equivalent relocation fact",
+        });
+        const before = JSON.stringify({
+            memories: database.prepare("SELECT * FROM memories ORDER BY id").all(),
+            links: database.prepare("SELECT * FROM legacy_memory_claims ORDER BY memory_id").all(),
+            claims: database.prepare("SELECT * FROM claims ORDER BY id").all(),
+            generations: database
+                .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                .all(),
+        });
+
+        const changed = inTransaction(database, () =>
+            rekeyMemoryRowWithCollisionMerge(
+                database,
+                sourceC.id,
+                "git:project-a",
+                "git:project-b",
+            ),
+        );
+
+        expect(changed).toBeFalse();
+        expect(
+            JSON.stringify({
+                memories: database.prepare("SELECT * FROM memories ORDER BY id").all(),
+                links: database
+                    .prepare("SELECT * FROM legacy_memory_claims ORDER BY memory_id")
+                    .all(),
+                claims: database.prepare("SELECT * FROM claims ORDER BY id").all(),
+                generations: database
+                    .prepare("SELECT * FROM claim_project_generations ORDER BY project_id")
+                    .all(),
+            }),
+        ).toBe(before);
+    });
+
     test("a collision merge selects one canonical claim, links the deleted source, and preserves stats", () => {
         const database = makeDb();
         const target = insertMemory(database, {
@@ -219,7 +264,7 @@ describe("relocate-memory claims (v83)", () => {
         expect(movedClaim?.content).toBe("moving fact");
         expect(movedClaim?.claimId).not.toBe(sourceLink?.claimId);
         expect(database.prepare("SELECT COUNT(*) AS c FROM claim_merge_lineage").get()).toEqual({
-            c: 1,
+            c: 2,
         });
     });
 

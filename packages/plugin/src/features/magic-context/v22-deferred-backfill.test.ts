@@ -225,27 +225,25 @@ describe("runDeferredV22Backfill", () => {
         expect(total.c).toBe(1);
     });
 
-    test("concurrent project_path mutation is a guarded no-op", async () => {
+    test("a concurrent bare project_path mutation is rejected by the v83 semantic guard", async () => {
         const database = makeDb();
         const rowId = insertMemory(database, "/race", "race");
 
-        const summary = await runDeferredV22Backfill(database, {
-            resolveIdentity: () => "git:resolved-after-race",
-            yieldToEventLoop: async () => {},
-            onBatchResolved: () => {
-                database
-                    .prepare("UPDATE memories SET project_path = 'git:concurrent' WHERE id = ?")
-                    .run(rowId);
-            },
-        });
+        await expect(
+            runDeferredV22Backfill(database, {
+                resolveIdentity: () => "git:resolved-after-race",
+                yieldToEventLoop: async () => {},
+                onBatchResolved: () => {
+                    database
+                        .prepare("UPDATE memories SET project_path = 'git:concurrent' WHERE id = ?")
+                        .run(rowId);
+                },
+            }),
+        ).rejects.toThrow(/claims-write kernel/);
 
-        expect(summary.changedRows).toBe(0);
-        const row = database
-            .prepare("SELECT project_path FROM memories WHERE id = ?")
-            .get(rowId) as {
-            project_path: string;
-        };
-        expect(row.project_path).toBe("git:concurrent");
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(rowId),
+        ).toEqual({ project_path: "/race" });
         expect(getProjectState(database, "git:resolved-after-race")).toBeNull();
     });
 

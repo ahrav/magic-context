@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
+import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import {
+    createMemoryWithClaimsInCurrentTransaction,
+    runInMemoryClaimsWriteTransaction,
+} from "../../../plugin/src/features/magic-context/memory/storage-memory-claims";
 import {
     initializeDatabase,
     runMigrations,
-} from "@magic-context/core/features/magic-context/storage";
-import { computeLegacyRustDirIdentity } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
-import { Database } from "@magic-context/core/shared/sqlite";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+} from "../../../plugin/src/features/magic-context/storage";
+import { computeLegacyRustDirIdentity } from "../../../plugin/src/features/magic-context/v22-deferred-backfill";
+import { Database } from "../../../plugin/src/shared/sqlite";
 import { runClaimsBackfillCommands } from "../lib/claims-backfill-commands";
 import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION,
@@ -426,6 +429,19 @@ describe("doctor OpenCode helper logic", () => {
 });
 
 describe("doctor claims backfill commands", () => {
+    it("runs mixed v22 and claims commands sequentially with one combined exit", () => {
+        const source = readFileSync(new URL("./doctor-opencode.ts", import.meta.url), "utf8");
+        expect(source.indexOf("runV22BackfillCommands(")).toBeLessThan(
+            source.indexOf("runClaimsBackfillCommands("),
+        );
+        expect(source).toContain(
+            "if (sharedCommandExitCode !== null) return sharedCommandExitCode",
+        );
+        expect(
+            source.match(/Math\.max\(sharedCommandExitCode \?\? 0, \w+Result\.exitCode\)/g),
+        ).toHaveLength(2);
+    });
+
     it("status is read-only and reports blocked state with exact repair command", async () => {
         const database = makeDb();
         const messages: string[] = [];
@@ -477,6 +493,67 @@ describe("doctor claims backfill commands", () => {
         expect(
             database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),
         ).toEqual(versionBefore);
+    });
+
+    it("blocked retry exits 1 and malformed waiver ids are rejected exactly", async () => {
+        const database = makeDb();
+        database.exec(`
+            UPDATE schema_migrations_meta SET value = 'blocked' WHERE key = 'claims_backfill_phase';
+            UPDATE schema_migrations_meta SET value = 'none' WHERE key = 'claims_backfill_v22_takeover';
+            INSERT INTO claim_backfill_failures
+                (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+            VALUES ('rows', 'memory', '999', 'unresolved-project-identity', '', 'blocking', 1, 1);
+        `);
+        const retry = await runClaimsBackfillCommands(makeHarness(database, []), {
+            retryClaimsBackfill: true,
+        });
+        expect(retry.exitCode).toBe(1);
+
+        for (const invalid of [null, "--force", "7junk", "0", "-1"]) {
+            const messages: string[] = [];
+            const result = await runClaimsBackfillCommands(makeHarness(database, messages), {
+                waiveClaimsBackfillFailure: invalid,
+                waiveRationale: "reviewed",
+            });
+            expect(result.exitCode).toBe(1);
+            expect(messages.join("\n")).toContain("requires a numeric failure id");
+        }
+    });
+
+    it("explicit completed status reconciles and reports corruption as blocked", async () => {
+        const database = makeDb();
+        database
+            .prepare(
+                "UPDATE schema_migrations_meta SET value = 'none' WHERE key = 'claims_backfill_v22_takeover'",
+            )
+            .run();
+        const created = runInMemoryClaimsWriteTransaction(database, () =>
+            createMemoryWithClaimsInCurrentTransaction(
+                database,
+                {
+                    producer: "doctor-test",
+                    operationKey: "completed-corruption",
+                    requestDigest: "a".repeat(64),
+                },
+                {
+                    projectPath: "git:doctor-corruption",
+                    category: "CONSTRAINTS",
+                    content: "doctor corruption target",
+                    normalizedHash: "doctor-corruption-hash",
+                },
+            ),
+        );
+        database.exec("DROP TRIGGER claim_revision_memory_metadata_append_only_delete");
+        database
+            .prepare("DELETE FROM claim_revision_memory_metadata WHERE revision_id = ?")
+            .run(created.result.revisionId);
+
+        const messages: string[] = [];
+        await runClaimsBackfillCommands(makeHarness(database, messages), {
+            checkClaimsBackfill: true,
+        });
+        expect(messages.join("\n")).toContain("claims backfill status: blocked");
+        expect(messages.join("\n")).toContain("revision(s) missing memory metadata");
     });
 
     it("status distinguishes pending, completed, and completed-with-warnings", async () => {

@@ -221,8 +221,45 @@ function createTestDb(dbPath = ":memory:"): Database {
     return db;
 }
 
-const toolContext = (sessionID = "ses-memory", agent = "general") =>
-    ({ sessionID, agent, directory: "/repo/project" }) as never;
+function hideFirstClaimOperationRead(database: Database): Database {
+    let hidden = false;
+    return new Proxy(database, {
+        get(target, property) {
+            if (property === "prepare") {
+                return (sql: string) => {
+                    const statement = target.prepare(sql);
+                    if (
+                        !hidden &&
+                        sql.includes(
+                            "SELECT request_digest AS requestDigest, result_json AS resultJson FROM claim_operations",
+                        )
+                    ) {
+                        hidden = true;
+                        return new Proxy(statement, {
+                            get(statementTarget, statementProperty) {
+                                if (statementProperty === "get") return () => undefined;
+                                const value = Reflect.get(
+                                    statementTarget,
+                                    statementProperty,
+                                    statementTarget,
+                                );
+                                return typeof value === "function"
+                                    ? value.bind(statementTarget)
+                                    : value;
+                            },
+                        });
+                    }
+                    return statement;
+                };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    }) as Database;
+}
+
+const toolContext = (sessionID = "ses-memory", agent = "general", callID?: string) =>
+    ({ sessionID, agent, directory: "/repo/project", ...(callID ? { callID } : {}) }) as never;
 
 const dreamerToolContext = (directory: string) =>
     ({ sessionID: "ses-dream", agent: DREAMER_AGENT, directory }) as never;
@@ -2046,6 +2083,171 @@ describe("createCtxMemoryTools on a migrated v83 database (claims kernel, U3)", 
         ]);
         expect(countRows(db, "claim_operations")).toBe(1);
         expect(getMemoryById(db, unlinkedId)?.content).toBe("Corrected unlinked fact.");
+    });
+
+    it("same OpenCode tool-call id replays a lost acknowledgement without duplicate tuple effects", async () => {
+        const memory = insertMemory(db, {
+            projectPath: OWN_PROJECT,
+            category: "CONSTRAINTS",
+            content: "Lost acknowledgement original.",
+        });
+        const args = {
+            action: "update" as const,
+            ids: [memory.id],
+            content: "Lost acknowledgement corrected.",
+        };
+        const context = toolContext("ses-lost-ack", "general", "tool-call-lost-ack");
+
+        const first = await tools.ctx_memory.execute(args, context);
+        const afterFirst = [
+            "claim_revisions",
+            "claim_operations",
+            "claim_change_outbox",
+            "claim_project_generations",
+            "memory_mutation_log",
+        ].map((table) => countRows(db, table));
+        const second = await tools.ctx_memory.execute(args, context);
+
+        expect(second).toBe(first);
+        expect(
+            [
+                "claim_revisions",
+                "claim_operations",
+                "claim_change_outbox",
+                "claim_project_generations",
+                "memory_mutation_log",
+            ].map((table) => countRows(db, table)),
+        ).toEqual(afterFirst);
+        expect(claimRevisionContents(db, memory.id)).toEqual([
+            "Lost acknowledgement original.",
+            "Lost acknowledgement corrected.",
+        ]);
+        expect(
+            countRows(
+                db,
+                "claim_operations",
+                `producer = 'ctx-memory-opencode' AND operation_key = 'tool-call-lost-ack:update:${memory.id}'`,
+            ),
+        ).toBe(1);
+        expect(
+            countRows(
+                db,
+                "memory_mutation_log",
+                `mutation_type = 'update' AND target_memory_id = ${memory.id}`,
+            ),
+        ).toBe(1);
+
+        await expect(
+            tools.ctx_memory.execute(
+                { ...args, content: "Different request under reused id." },
+                context,
+            ),
+        ).rejects.toThrow(/already committed for a different request digest/);
+    });
+
+    it("two connections replay stable merges before mutating existing or fresh canonicals", async () => {
+        for (const existingCanonical of [true, false]) {
+            closeQuietly(db);
+            _resetProjectEmbeddingRegistryForTests();
+            const dir = mkdtempSync(join(tmpdir(), "ctx-memory-merge-race-"));
+            const path = join(dir, "context.db");
+            db = new Database(path);
+            initializeDatabase(db);
+            runMigrations(db);
+            db.exec("PRAGMA busy_timeout=1000");
+            const peer = new Database(path);
+            peer.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=1000");
+            try {
+                const first = insertMemory(db, {
+                    projectPath: OWN_PROJECT,
+                    category: "CONSTRAINTS",
+                    content: `stable merge first ${existingCanonical}`,
+                });
+                const second = insertMemory(db, {
+                    projectPath: OWN_PROJECT,
+                    category: "CONSTRAINTS",
+                    content: `stable merge second ${existingCanonical}`,
+                });
+                const content = existingCanonical
+                    ? first.content
+                    : `stable merge fresh canonical ${existingCanonical}`;
+                let embeddingCalls = 0;
+                let syncCalls = 0;
+                installTestEmbeddingProvider(async () => {
+                    embeddingCalls += 1;
+                    return new Float32Array([1, 0]);
+                });
+                registerMemoryEmbeddingsForProject(db, OWN_PROJECT);
+                const deps = {
+                    resolveProjectPath: () => OWN_PROJECT,
+                    memoryEnabled: true,
+                    embeddingEnabled: true,
+                    rustToolBackends: {
+                        memorySync: () => {
+                            syncCalls += 1;
+                        },
+                    },
+                };
+                const winningTools = createCtxMemoryTools({ ...deps, db: peer });
+                const args = {
+                    action: "merge" as const,
+                    ids: [first.id, second.id],
+                    category: "CONSTRAINTS" as const,
+                    content,
+                };
+                const context = toolContext(
+                    "ses-stable-merge",
+                    DREAMER_AGENT,
+                    `stable-merge-${existingCanonical}`,
+                );
+
+                const winner = await winningTools.ctx_memory.execute(args, context);
+                for (
+                    let attempt = 0;
+                    countRows(db, "memory_embeddings") === 0 && attempt < 20;
+                    attempt += 1
+                ) {
+                    await wait(5);
+                }
+                const tables = [
+                    "claim_revisions",
+                    "claim_operations",
+                    "claim_change_outbox",
+                    "claim_project_generations",
+                    "memory_mutation_log",
+                    "memory_embeddings",
+                ];
+                const afterWinner = tables.map((table) => countRows(db, table));
+
+                const staleTools = createCtxMemoryTools({
+                    ...deps,
+                    db: hideFirstClaimOperationRead(db),
+                });
+                const replay = await staleTools.ctx_memory.execute(args, context);
+
+                expect(replay).toBe(winner);
+                expect(tables.map((table) => countRows(db, table))).toEqual(afterWinner);
+                expect(embeddingCalls).toBe(1);
+                expect(syncCalls).toBe(1);
+                expect(
+                    countRows(
+                        db,
+                        "claim_operations",
+                        `producer = 'ctx-memory-opencode' AND operation_key = 'stable-merge-${existingCanonical}:merge'`,
+                    ),
+                ).toBe(1);
+                await expect(
+                    staleTools.ctx_memory.execute(
+                        { ...args, content: `${content} digest mismatch` },
+                        context,
+                    ),
+                ).rejects.toThrow(/already committed for a different request digest/);
+            } finally {
+                closeQuietly(peer);
+                closeQuietly(db);
+                rmSync(dir, { recursive: true, force: true });
+            }
+        }
     });
 
     it("archive with and without a reason commits claim retirement, projection, mutation log, outbox, and generation together", async () => {

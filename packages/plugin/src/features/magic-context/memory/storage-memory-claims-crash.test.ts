@@ -20,6 +20,7 @@ import {
 import { runMigrations } from "../migrations.ts";
 import { initializeDatabase } from "../storage-db.ts";
 import { CLAIMS_BACKFILL_META_KEYS } from "../storage-memory-claims-schema.ts";
+import { computeNormalizedHash } from "./normalize-hash.ts";
 import { MEMORY_CLAIM_FAILPOINT_IDS } from "./storage-memory-claims.ts";
 
 const REPO_ROOT = existsSync(resolve(process.cwd(), "packages", "plugin"))
@@ -493,13 +494,13 @@ function assertMemoryTuple(snapshot: SemanticSnapshot, committed: boolean): void
     expect(snapshot.memories[0]).toMatchObject({
         content: "crash-safe claim tuple",
         content_hex: Buffer.from("crash-safe claim tuple").toString("hex").toUpperCase(),
-        normalized_hash: "hash:crash-safe-claim-tuple",
+        normalized_hash: computeNormalizedHash("crash-safe claim tuple"),
         status: "active",
     });
     expect(snapshot.revisions[0]).toMatchObject({
         content: "crash-safe claim tuple",
         content_sha256: createHash("sha256").update("crash-safe claim tuple").digest("hex"),
-        normalized_hash: "hash:crash-safe-claim-tuple",
+        normalized_hash: computeNormalizedHash("crash-safe claim tuple"),
         state: "active",
     });
     expect(snapshot.operations[0]).toMatchObject({ expected_effect_count: 1 });

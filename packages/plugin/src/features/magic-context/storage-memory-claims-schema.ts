@@ -31,6 +31,7 @@ export const MEMORY_CLAIMS_COMPAT_TABLES = [
     "legacy_memory_claims",
     "claim_revision_memory_metadata",
     "claim_merge_lineage",
+    "claim_memory_relationship_sources",
     "claim_operations",
     "claim_change_outbox",
     "claim_project_generations",
@@ -43,6 +44,7 @@ export const APPEND_ONLY_MEMORY_CLAIMS_TABLES = [
     "legacy_memory_claims",
     "claim_revision_memory_metadata",
     "claim_merge_lineage",
+    "claim_memory_relationship_sources",
     "claim_operations",
     "claim_change_outbox",
 ] as const;
@@ -74,22 +76,6 @@ export const CLAIMS_BACKFILL_META_KEYS = {
     /** Max claim_change_outbox id at completion — the U8 handoff watermark. */
     finalOutboxWatermark: "claims_backfill_final_outbox_watermark",
 } as const;
-
-/**
- * SQL predicate that fires the semantic guards only for writers WITHOUT the
- * claims-write capability. Deliberately a durable state-table check (never a
- * connection-local UDF) and deliberately a SEPARATE table from the v80
- * `context_privilege_state` module-authority privilege (KTD6): TypeScript
- * claim writers must not gain module authority by holding this capability,
- * and module mirror transactions hold BOTH so the guards compose.
- */
-export function claimsWriteCapabilityCheck(): string {
-    return "COALESCE((SELECT enabled FROM claim_compatibility_write_state WHERE id = 1), 0) = 0";
-}
-
-function boundaryMemoryIdSql(): string {
-    return `COALESCE((SELECT CAST(value AS INTEGER) FROM schema_migrations_meta WHERE key = '${CLAIMS_BACKFILL_META_KEYS.boundaryMemoryId}'), 0)`;
-}
 
 /** Full v83 compatibility object graph: tables, indexes, then guards. */
 export function createMemoryClaimsCompatSchema(db: Database): void {
@@ -145,6 +131,18 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
         UNIQUE (source_revision_id, target_revision_id)
     );
 
+    -- Raw relationship preimages survive projection deletion and identity
+    -- movement, so reconciliation can prove every lineage token was handled.
+    CREATE TABLE claim_memory_relationship_sources (
+        id INTEGER PRIMARY KEY,
+        memory_id INTEGER NOT NULL CHECK (typeof(memory_id) = 'integer' AND memory_id >= 1),
+        source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+        merged_from TEXT,
+        superseded_by_memory_id INTEGER,
+        created_at INTEGER NOT NULL,
+        UNIQUE (memory_id, source_digest)
+    );
+
     -- Idempotency and replay envelope (KTD7, R13).
     CREATE TABLE claim_operations (
         id INTEGER PRIMARY KEY,
@@ -173,6 +171,7 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
         UNIQUE (operation_id, effect_key)
     );
     CREATE INDEX idx_claim_change_outbox_project ON claim_change_outbox(project_id, generation);
+    CREATE INDEX idx_claim_change_outbox_claim ON claim_change_outbox(claim_id);
 
     -- Monotonic claim-domain change token: one increment per touched project
     -- per outer semantic transaction (KTD7).
@@ -217,6 +216,13 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
     BEGIN SELECT RAISE(ABORT, 'legacy_memory_claims is append-only: deletes are not allowed'); END;
     CREATE TRIGGER legacy_memory_claims_append_only_insert_collision BEFORE INSERT ON legacy_memory_claims
     WHEN EXISTS (SELECT 1 FROM legacy_memory_claims WHERE memory_id = NEW.memory_id)
+      OR (
+          NEW.memory_id = NEW.canonical_memory_id
+          AND EXISTS (
+              SELECT 1 FROM legacy_memory_claims
+               WHERE memory_id = canonical_memory_id AND claim_id = NEW.claim_id
+          )
+      )
     BEGIN SELECT RAISE(ABORT, 'legacy_memory_claims is append-only: key collisions cannot replace rows'); END;
 
     -- The stored claim/project must be the claim's own project. IS NOT is
@@ -277,6 +283,21 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
     ) IS NOT NEW.target_project_id
     BEGIN SELECT RAISE(ABORT, 'claim_merge_lineage target project must match the target revision project'); END;
 
+    CREATE TRIGGER claim_memory_relationship_sources_append_only_update
+    BEFORE UPDATE ON claim_memory_relationship_sources
+    BEGIN SELECT RAISE(ABORT, 'claim_memory_relationship_sources is append-only: updates are not allowed'); END;
+    CREATE TRIGGER claim_memory_relationship_sources_append_only_delete
+    BEFORE DELETE ON claim_memory_relationship_sources
+    BEGIN SELECT RAISE(ABORT, 'claim_memory_relationship_sources is append-only: deletes are not allowed'); END;
+    CREATE TRIGGER claim_memory_relationship_sources_append_only_insert_collision
+    BEFORE INSERT ON claim_memory_relationship_sources
+    WHEN EXISTS (
+        SELECT 1 FROM claim_memory_relationship_sources
+         WHERE id = NEW.id
+            OR (memory_id = NEW.memory_id AND source_digest = NEW.source_digest)
+    )
+    BEGIN SELECT RAISE(ABORT, 'claim_memory_relationship_sources is append-only: key collisions cannot replace rows'); END;
+
     CREATE TRIGGER claim_operations_append_only_update BEFORE UPDATE ON claim_operations
     BEGIN SELECT RAISE(ABORT, 'claim_operations is append-only: the committed result is immutable'); END;
     CREATE TRIGGER claim_operations_append_only_delete BEFORE DELETE ON claim_operations
@@ -298,6 +319,12 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
         WHERE id = NEW.id OR (operation_id = NEW.operation_id AND effect_key = NEW.effect_key)
     )
     BEGIN SELECT RAISE(ABORT, 'claim_change_outbox is append-only: key collisions cannot replace rows'); END;
+
+    -- Every effect belongs to the claim's project. IS NOT makes missing claims
+    -- fail closed here instead of relying only on connection-local FK state.
+    CREATE TRIGGER claim_change_outbox_project_guard BEFORE INSERT ON claim_change_outbox
+    WHEN (SELECT project_id FROM claims WHERE id = NEW.claim_id) IS NOT NEW.project_id
+    BEGIN SELECT RAISE(ABORT, 'claim_change_outbox project must match the linked claim project'); END;
 
     -- Generations only move forward; a project's token can never regress or
     -- disappear.
@@ -329,8 +356,9 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
  * loses a boundary member.
  */
 export function installMemoryClaimsWriteGuards(db: Database): void {
-    const capabilityCheck = claimsWriteCapabilityCheck();
-    const boundary = boundaryMemoryIdSql();
+    const capabilityCheck =
+        "COALESCE((SELECT enabled FROM claim_compatibility_write_state WHERE id = 1), 0) = 0";
+    const boundary = `COALESCE((SELECT CAST(value AS INTEGER) FROM schema_migrations_meta WHERE key = '${CLAIMS_BACKFILL_META_KEYS.boundaryMemoryId}'), 0)`;
     // pi-lens-ignore: sql-injection
     db.exec(`
     CREATE TRIGGER memories_claims_write_guard_insert
@@ -344,16 +372,18 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
     BEGIN SELECT RAISE(ABORT, 'memories semantic writes require the v83 claims-write kernel'); END;
 
     CREATE TRIGGER memories_claims_write_guard_update
-    BEFORE UPDATE OF content, category, normalized_hash, importance, scope, shareable,
-        source_type, expires_at, status, verification_status, verified_at,
+    BEFORE UPDATE OF project_path, content, category, normalized_hash, importance, scope, shareable,
+        source_session_id, source_type, expires_at, status, verification_status, verified_at,
         superseded_by_memory_id, merged_from, metadata_json ON memories
     WHEN (
-        NEW.content IS NOT OLD.content
+        NEW.project_path IS NOT OLD.project_path
+        OR NEW.content IS NOT OLD.content
         OR NEW.category IS NOT OLD.category
         OR NEW.normalized_hash IS NOT OLD.normalized_hash
         OR NEW.importance IS NOT OLD.importance
         OR NEW.scope IS NOT OLD.scope
         OR NEW.shareable IS NOT OLD.shareable
+        OR NEW.source_session_id IS NOT OLD.source_session_id
         OR NEW.source_type IS NOT OLD.source_type
         OR NEW.expires_at IS NOT OLD.expires_at
         OR NEW.status IS NOT OLD.status
@@ -371,6 +401,33 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
     WHEN OLD.id <= ${boundary}
       AND NOT EXISTS (SELECT 1 FROM legacy_memory_claims WHERE memory_id = OLD.id)
     BEGIN SELECT RAISE(ABORT, 'v83 boundary memories require a claim crosswalk link before delete'); END;
+
+    CREATE TRIGGER memories_claims_relationship_delete_guard
+    BEFORE DELETE ON memories
+    WHEN (OLD.superseded_by_memory_id IS NOT NULL OR COALESCE(TRIM(OLD.merged_from), '') <> '')
+      AND NOT EXISTS (
+          SELECT 1 FROM claim_memory_relationship_sources
+           WHERE memory_id = OLD.id
+             AND merged_from IS OLD.merged_from
+             AND superseded_by_memory_id IS OLD.superseded_by_memory_id
+      )
+    BEGIN SELECT RAISE(ABORT, 'memory relationships require translation before delete'); END;
+
+    CREATE TRIGGER memories_claims_relationship_update_guard
+    BEFORE UPDATE OF project_path, superseded_by_memory_id, merged_from ON memories
+    WHEN (
+        NEW.project_path IS NOT OLD.project_path
+        OR NEW.superseded_by_memory_id IS NOT OLD.superseded_by_memory_id
+        OR NEW.merged_from IS NOT OLD.merged_from
+    )
+      AND (OLD.superseded_by_memory_id IS NOT NULL OR COALESCE(TRIM(OLD.merged_from), '') <> '')
+      AND NOT EXISTS (
+          SELECT 1 FROM claim_memory_relationship_sources
+           WHERE memory_id = OLD.id
+             AND merged_from IS OLD.merged_from
+             AND superseded_by_memory_id IS OLD.superseded_by_memory_id
+      )
+    BEGIN SELECT RAISE(ABORT, 'memory relationships require translation before mutation'); END;
 
     CREATE TRIGGER memories_claims_boundary_identity_guard
     BEFORE UPDATE OF project_path ON memories
@@ -427,6 +484,8 @@ export function dropMemoryClaimsCompatObjectsForTests(db: Database): void {
         DROP TRIGGER IF EXISTS memories_claims_write_guard_delete;
         DROP TRIGGER IF EXISTS memories_claims_boundary_delete_guard;
         DROP TRIGGER IF EXISTS memories_claims_boundary_identity_guard;
+        DROP TRIGGER IF EXISTS memories_claims_relationship_delete_guard;
+        DROP TRIGGER IF EXISTS memories_claims_relationship_update_guard;
         DROP TRIGGER IF EXISTS memory_verifications_claims_write_guard_insert;
         DROP TRIGGER IF EXISTS memory_verifications_claims_write_guard_update;
         DROP TRIGGER IF EXISTS memory_verifications_claims_write_guard_delete;
@@ -434,6 +493,7 @@ export function dropMemoryClaimsCompatObjectsForTests(db: Database): void {
         DROP TABLE IF EXISTS claim_operations;
         DROP TABLE IF EXISTS claim_project_generations;
         DROP TABLE IF EXISTS claim_backfill_failures;
+        DROP TABLE IF EXISTS claim_memory_relationship_sources;
         DROP TABLE IF EXISTS claim_merge_lineage;
         DROP TABLE IF EXISTS claim_revision_memory_metadata;
         DROP TABLE IF EXISTS legacy_memory_claims;

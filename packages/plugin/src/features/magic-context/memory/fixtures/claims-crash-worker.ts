@@ -8,11 +8,10 @@ import {
     setClaimsBackfillFailpoint,
 } from "../../claims-backfill.ts";
 import { runMigrations } from "../../migrations.ts";
+import { insertMemory } from "../storage-memory.ts";
 import {
     acknowledgeMemoryClaimResult,
-    createMemoryWithClaimsInCurrentTransaction,
     type MemoryClaimFailpointId,
-    runInMemoryClaimsWriteTransaction,
     setMemoryClaimFailpoint,
 } from "../storage-memory-claims.ts";
 
@@ -45,7 +44,6 @@ const memoryInput = {
     projectPath: "git:claims-crash",
     category: "CONSTRAINTS" as const,
     content: "crash-safe claim tuple",
-    normalizedHash: "hash:crash-safe-claim-tuple",
     sourceSessionId: "ses_claims_crash",
     sourceType: "agent" as const,
     nowMs: 1_777_777,
@@ -57,9 +55,7 @@ const memoryEnvelope = {
 };
 
 const runMemory = (db: Database): void => {
-    runInMemoryClaimsWriteTransaction(db, () =>
-        createMemoryWithClaimsInCurrentTransaction(db, memoryEnvelope, memoryInput),
-    );
+    insertMemory(db, memoryInput, memoryEnvelope);
 };
 
 const sqliteVersion = (db: Database): string =>

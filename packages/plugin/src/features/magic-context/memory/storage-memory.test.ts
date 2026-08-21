@@ -6,6 +6,7 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
 import { countingDatabase } from "../sql-counters";
 import { initializeDatabase } from "../storage-db";
+import { dropMemoryClaimsCompatObjectsForTests } from "../storage-memory-claims-schema";
 import {
     archiveMemory,
     clearEmbeddingsForProject,
@@ -33,6 +34,7 @@ import {
     saveEmbedding,
     searchMemoriesFTS,
     searchMemoriesFTSUnion,
+    setMemoryClassification,
     supersededMemory,
     updateMemoryContent,
     updateMemoryRetrievalCount,
@@ -42,7 +44,10 @@ import {
 } from "./index";
 import { computeNormalizedHash } from "./normalize-hash";
 import { rekeyMemoryRowWithCollisionMerge } from "./relocate-memory";
-import { runInMemoryClaimsWriteTransaction } from "./storage-memory-claims";
+import {
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+} from "./storage-memory-claims";
 
 let db: Database;
 
@@ -1045,6 +1050,83 @@ describe("migrated-v82 mutation inventory characterization", () => {
         updateMemoryVerification(migrated, memory.id, "stale");
         expect(baseRow(migrated, memory.id)?.verification_status).toBe("stale");
         expect(baseRow(migrated, memory.id)?.verified_at).toBe(verifiedAt);
+    });
+
+    it("classification builds exact metadata for pre-v83 and v83 no-op/all-field updates", () => {
+        const preV83 = migratedDb();
+        dropMemoryClaimsCompatObjectsForTests(preV83);
+        migrated = migratedDb();
+        try {
+            const legacy = insertMemory(preV83, {
+                projectPath: "git:classification-parity",
+                category: "CONSTRAINTS",
+                content: "legacy classification fact",
+            });
+            const claims = insertMemory(migrated, {
+                projectPath: "git:classification-parity",
+                category: "CONSTRAINTS",
+                content: "claims classification fact",
+            });
+            const v83CountsBefore = {
+                revisions: (
+                    migrated.prepare("SELECT COUNT(*) AS count FROM claim_revisions").get() as {
+                        count: number;
+                    }
+                ).count,
+                outbox: (
+                    migrated.prepare("SELECT COUNT(*) AS count FROM claim_change_outbox").get() as {
+                        count: number;
+                    }
+                ).count,
+            };
+
+            expect(
+                setMemoryClassification(preV83, legacy.id, {
+                    importance: 50,
+                    scope: "project",
+                    shareable: false,
+                }),
+            ).toBeFalse();
+            expect(
+                setMemoryClassification(migrated, claims.id, {
+                    importance: 50,
+                    scope: "project",
+                    shareable: false,
+                }),
+            ).toBeFalse();
+            expect(migrated.prepare("SELECT COUNT(*) AS count FROM claim_revisions").get()).toEqual(
+                { count: v83CountsBefore.revisions },
+            );
+            expect(
+                migrated.prepare("SELECT COUNT(*) AS count FROM claim_change_outbox").get(),
+            ).toEqual({ count: v83CountsBefore.outbox });
+
+            const allFields = {
+                importance: 91,
+                scope: "ecosystem" as const,
+                shareable: true,
+            };
+            expect(setMemoryClassification(preV83, legacy.id, allFields)).toBeTrue();
+            expect(setMemoryClassification(migrated, claims.id, allFields)).toBeTrue();
+            for (const [database, id] of [
+                [preV83, legacy.id],
+                [migrated, claims.id],
+            ] as const) {
+                expect(
+                    database
+                        .prepare("SELECT importance, scope, shareable FROM memories WHERE id = ?")
+                        .get(id),
+                ).toEqual({ importance: 91, scope: "ecosystem", shareable: 1 });
+            }
+            expect(getCurrentMemoryClaimByLegacyMemoryId(migrated, claims.id)).toMatchObject({
+                revision: 2,
+                importance: 91,
+                memoryScope: "ecosystem",
+                shareable: 1,
+            });
+        } finally {
+            closeQuietly(preV83);
+        }
     });
 
     it("identity repair: rekey moves project_path in place; a collision merges stats and deletes the source", () => {

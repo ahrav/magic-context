@@ -11,6 +11,7 @@ import {
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
 import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
 
@@ -2273,72 +2274,78 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
 
     let nextCursor = durableCursor;
     withPrivilegedWriter(db, () => {
-        db.transaction(() => {
-            ensureMemoryRepairState(db);
-            const statements = prepareMirrorPageStatements(db);
-            const currentResnapshotState =
-                page.domain === "memories" ? memoryResnapshotState(db) : null;
-            let resnapshotStatus =
-                page.domain === "memories" ? (currentResnapshotState?.status ?? null) : "complete";
-            if (
-                page.domain === "memories" &&
-                durableCursor === 0 &&
-                currentResnapshotState &&
-                resnapshotStatus !== "complete"
-            ) {
-                // A cursor-zero replay observes every insert before its tombstone, so it is
-                // equivalent to a live resnapshot and may safely enable destructive cleanup.
-                statements.markRepairPending.run(Date.now());
+        db.transaction(() =>
+            withMemoryClaimGenerationContextInCurrentTransaction(db, () => {
+                ensureMemoryRepairState(db);
+                const statements = prepareMirrorPageStatements(db);
+                const currentResnapshotState =
+                    page.domain === "memories" ? memoryResnapshotState(db) : null;
+                let resnapshotStatus =
+                    page.domain === "memories"
+                        ? (currentResnapshotState?.status ?? null)
+                        : "complete";
                 if (
-                    !casMemoryResnapshotState(
-                        db,
-                        currentResnapshotState,
-                        "complete",
-                        currentResnapshotState.generation,
-                    )
+                    page.domain === "memories" &&
+                    durableCursor === 0 &&
+                    currentResnapshotState &&
+                    resnapshotStatus !== "complete"
                 ) {
-                    throw new Error("memory mirror resnapshot ownership changed during replay");
+                    // A cursor-zero replay observes every insert before its tombstone, so it is
+                    // equivalent to a live resnapshot and may safely enable destructive cleanup.
+                    statements.markRepairPending.run(Date.now());
+                    if (
+                        !casMemoryResnapshotState(
+                            db,
+                            currentResnapshotState,
+                            "complete",
+                            currentResnapshotState.generation,
+                        )
+                    ) {
+                        throw new Error("memory mirror resnapshot ownership changed during replay");
+                    }
+                    resnapshotStatus = "complete";
                 }
-                resnapshotStatus = "complete";
-            }
-            if (
-                page.domain === "memories" &&
-                resnapshotStatus !== "complete" &&
-                page.rows.some((feed) => feed.op === "tombstone")
-            ) {
-                // Upgrade cursors can start after a canonical insert. Never delete through a
-                // tombstone until the module's current live identities have been captured.
-                throw new Error("memory mirror resnapshot must complete before tombstones");
-            }
-            const touchedProjects = new Set<string>();
-            const claimsActive = hasMemoryClaimsCompatSchema(db);
-            for (const feed of page.rows) {
-                if (feed.domain !== page.domain || feed.feed_seq <= nextCursor) continue;
-                const projectPath = rowString(feed.full_row_snapshot, "project_path");
-                if (projectPath) touchedProjects.add(projectPath);
-                if (feed.domain === "memories") {
-                    if (claimsActive) applyMemoryRowWithClaims(db, feed, statements);
-                    else applyMemoryRow(db, feed, statements);
-                } else applyNoteRow(db, feed, statements);
-                nextCursor = feed.feed_seq;
-            }
-            if (page.domain === "memories") {
-                const translatablePairs = claimsActive ? readTranslatableSupersessionPairs(db) : [];
-                translateMemoryReferences(statements);
-                if (translatablePairs.length > 0) {
-                    recordTranslatedSupersessionClaims(db, translatablePairs);
+                if (
+                    page.domain === "memories" &&
+                    resnapshotStatus !== "complete" &&
+                    page.rows.some((feed) => feed.op === "tombstone")
+                ) {
+                    // Upgrade cursors can start after a canonical insert. Never delete through a
+                    // tombstone until the module's current live identities have been captured.
+                    throw new Error("memory mirror resnapshot must complete before tombstones");
                 }
-                repairNullClobberedMemoryRows(statements);
-            }
-            for (const projectPath of touchedProjects) {
-                bumpDomainMutationEpoch(db, projectPath, page.domain);
-            }
-            if (page.next_cursor < nextCursor) {
-                throw new Error("mirror page moved its cursor backwards");
-            }
-            nextCursor = Math.max(nextCursor, page.next_cursor);
-            statements.updateCursor.run(page.domain, nextCursor, Date.now());
-        }).immediate();
+                const touchedProjects = new Set<string>();
+                const claimsActive = hasMemoryClaimsCompatSchema(db);
+                for (const feed of page.rows) {
+                    if (feed.domain !== page.domain || feed.feed_seq <= nextCursor) continue;
+                    const projectPath = rowString(feed.full_row_snapshot, "project_path");
+                    if (projectPath) touchedProjects.add(projectPath);
+                    if (feed.domain === "memories") {
+                        if (claimsActive) applyMemoryRowWithClaims(db, feed, statements);
+                        else applyMemoryRow(db, feed, statements);
+                    } else applyNoteRow(db, feed, statements);
+                    nextCursor = feed.feed_seq;
+                }
+                if (page.domain === "memories") {
+                    const translatablePairs = claimsActive
+                        ? readTranslatableSupersessionPairs(db)
+                        : [];
+                    translateMemoryReferences(statements);
+                    if (translatablePairs.length > 0) {
+                        recordTranslatedSupersessionClaims(db, translatablePairs);
+                    }
+                    repairNullClobberedMemoryRows(statements);
+                }
+                for (const projectPath of touchedProjects) {
+                    bumpDomainMutationEpoch(db, projectPath, page.domain);
+                }
+                if (page.next_cursor < nextCursor) {
+                    throw new Error("mirror page moved its cursor backwards");
+                }
+                nextCursor = Math.max(nextCursor, page.next_cursor);
+                statements.updateCursor.run(page.domain, nextCursor, Date.now());
+            }),
+        ).immediate();
     });
     return nextCursor;
 }

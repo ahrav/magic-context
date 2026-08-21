@@ -49,6 +49,45 @@ const RETRY_COMMAND = "magic-context doctor --retry-claims-backfill";
 const WAIVE_COMMAND =
     'magic-context doctor --waive-claims-backfill-failure <id> --rationale "<why>"';
 
+export function renderClaimsBackfillStatus(
+    harness: ClaimsBackfillCommandHarness,
+    db: Database,
+    status: ReturnType<typeof getClaimsBackfillStatus>,
+): void {
+    if (!status.applicable) {
+        harness.log.info(
+            "claims backfill status: not applicable (database has not migrated to v83)",
+        );
+        return;
+    }
+    harness.log.info(
+        `claims backfill status: ${status.state}; mode=${status.mode}; phase=${status.phase}; ` +
+            `linked=${status.linkedBoundaryRows}/${status.expectedRowCount}; boundary=${status.boundaryMemoryId}; ` +
+            `blocking=${status.blockingFailures}; warnings=${status.warningFailures}; v22=${status.v22Takeover}`,
+    );
+    if (status.state === "complete" || status.state === "complete-with-warnings") {
+        harness.log.info(
+            `reconciliation version ${status.reconciliationVersion}; final outbox watermark ${status.finalOutboxWatermark}`,
+        );
+    }
+    for (const problem of status.problems) harness.log.warn(`reconciliation: ${problem}`);
+    if (status.state === "blocked" || status.state === "pending") {
+        for (const failure of listClaimsBackfillFailures(db, { limit: 10 })) {
+            harness.log.warn(
+                `failure #${failure.id} [${failure.disposition}] ${failure.phase}/${failure.itemKind} ${failure.itemKey}: ${failure.reasonCode}`,
+            );
+        }
+    }
+    if (status.state === "blocked") {
+        harness.log.warn(`Repair with: ${RETRY_COMMAND}`);
+        harness.log.warn(`Waive a reviewed lineage failure with: ${WAIVE_COMMAND}`);
+    } else if (status.state === "complete-with-warnings") {
+        harness.log.warn(
+            `${status.warningFailures} operator-waived warning(s) retained on the repair surface.`,
+        );
+    }
+}
+
 export async function runClaimsBackfillCommands(
     harness: ClaimsBackfillCommandHarness,
     args: ClaimsBackfillCommandArgs,
@@ -70,45 +109,16 @@ export async function runClaimsBackfillCommands(
         const schemaVersionBefore = getPersistedSchemaVersion(db);
 
         if (args.checkClaimsBackfill) {
-            const status = getClaimsBackfillStatus(db, { includeProblems: true });
-            if (!status.applicable) {
-                harness.log.info(
-                    "claims backfill status: not applicable (database has not migrated to v83)",
-                );
-            } else {
-                harness.log.info(
-                    `claims backfill status: ${status.state}; mode=${status.mode}; phase=${status.phase}; ` +
-                        `linked=${status.linkedBoundaryRows}/${status.expectedRowCount}; boundary=${status.boundaryMemoryId}; ` +
-                        `blocking=${status.blockingFailures}; warnings=${status.warningFailures}; v22=${status.v22Takeover}`,
-                );
-                if (status.state === "complete" || status.state === "complete-with-warnings") {
-                    harness.log.info(
-                        `reconciliation version ${status.reconciliationVersion}; final outbox watermark ${status.finalOutboxWatermark}`,
-                    );
-                }
-                for (const problem of status.problems) {
-                    harness.log.warn(`reconciliation: ${problem}`);
-                }
-                if (status.state === "blocked" || status.state === "pending") {
-                    for (const failure of listClaimsBackfillFailures(db, { limit: 10 })) {
-                        harness.log.warn(
-                            `failure #${failure.id} [${failure.disposition}] ${failure.phase}/${failure.itemKind} ${failure.itemKey}: ${failure.reasonCode}`,
-                        );
-                    }
-                }
-                if (status.state === "blocked") {
-                    harness.log.warn(`Repair with: ${RETRY_COMMAND}`);
-                    harness.log.warn(`Waive a reviewed lineage failure with: ${WAIVE_COMMAND}`);
-                } else if (status.state === "complete-with-warnings") {
-                    harness.log.warn(
-                        `${status.warningFailures} operator-waived warning(s) retained on the repair surface.`,
-                    );
-                }
-            }
+            renderClaimsBackfillStatus(
+                harness,
+                db,
+                getClaimsBackfillStatus(db, { includeProblems: true }),
+            );
         }
 
         if (args.waiveClaimsBackfillFailure !== undefined) {
-            const failureId = Number.parseInt(args.waiveClaimsBackfillFailure ?? "", 10);
+            const rawFailureId = args.waiveClaimsBackfillFailure ?? "";
+            const failureId = /^\d+$/.test(rawFailureId) ? Number(rawFailureId) : 0;
             const rationale = args.waiveRationale?.trim() ?? "";
             if (!Number.isSafeInteger(failureId) || failureId < 1) {
                 harness.log.error(
@@ -159,6 +169,7 @@ export async function runClaimsBackfillCommands(
                     harness.log.warn(
                         `claims backfill still ${retry.after.state}: ${retry.summary.problems.join("; ") || "see --check-claims-backfill"}`,
                     );
+                    return { handled: true, exitCode: 1 };
                 }
             }
         }

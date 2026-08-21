@@ -7,19 +7,26 @@ import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    adoptBoundaryMemoryRowInCurrentTransaction,
     clearClaimsBackfillFailpoints,
     computeClaimsBackfillEvidenceDigest,
     decideClaimsBackfillMode,
     doctorRetryClaimsBackfill,
     getClaimsBackfillStatus,
     inspectClaimsBackfillReconciliation,
+    isRetryableSqliteBusyError,
     listClaimsBackfillFailures,
-    parseMergedFromLineage,
     recordClaimsBackfillWarningDisposition,
     runClaimsBackfill,
     setClaimsBackfillCalibrationForTests,
     setClaimsBackfillFailpoint,
 } from "./claims-backfill";
+import { deleteMemory, insertMemory } from "./memory/storage-memory";
+import {
+    parseMemoryClaimMergedFrom,
+    runInMemoryClaimsWriteTransaction,
+} from "./memory/storage-memory-claims";
+import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
@@ -28,12 +35,14 @@ interface LegacyRow {
     category?: string;
     content: string;
     hash?: string;
+    scope?: string;
     status?: string;
     verificationStatus?: string;
     verifiedAt?: number | null;
     mergedFrom?: string | null;
     supersededBy?: number | null;
     metadataJson?: string | null;
+    sourceSessionId?: string | null;
     mappedFile?: string;
 }
 
@@ -69,9 +78,10 @@ function prepareLegacyDb(
     const insert = db.prepare(
         `INSERT INTO memories
             (project_path, category, content, normalized_hash, importance, scope, shareable,
-             source_type, first_seen_at, created_at, updated_at, last_seen_at, status,
-             verification_status, verified_at, merged_from, superseded_by_memory_id, metadata_json)
-         VALUES (?, ?, ?, ?, 73, 'ecosystem', 1, 'historian', 11, 12, 13, 14, ?, ?, ?, ?, ?, ?)`,
+             source_session_id, source_type, first_seen_at, created_at, updated_at, last_seen_at,
+             status, verification_status, verified_at, merged_from, superseded_by_memory_id,
+             metadata_json)
+         VALUES (?, ?, ?, ?, 73, ?, 1, ?, 'historian', 11, 12, 13, 14, ?, ?, ?, ?, ?, ?)`,
     );
     const ids: number[] = [];
     for (const [index, row] of rows.entries()) {
@@ -80,6 +90,8 @@ function prepareLegacyDb(
             row.category ?? "CONSTRAINTS",
             row.content,
             row.hash ?? `hash:${index + 1}`,
+            row.scope ?? "ecosystem",
+            row.sourceSessionId ?? null,
             row.status ?? "active",
             row.verificationStatus ?? "unverified",
             row.verifiedAt ?? null,
@@ -209,6 +221,47 @@ describe("claims backfill selection and conversion", () => {
         expect(decideClaimsBackfillMode(decisionDb, 1, false).mode).toBe("lazy");
     });
 
+    test("invalid legacy metadata enters the same bounded blocked lane in lazy and forced-eager modes", async () => {
+        const cases: Array<[LegacyRow, string]> = [
+            [{ content: "empty category", category: "" }, "empty-category"],
+            [{ content: "empty hash", hash: "" }, "empty-normalized-hash"],
+            [{ content: "empty scope", scope: "" }, "invalid-scope"],
+            [{ content: "empty source session", sourceSessionId: "" }, "empty-source-session-id"],
+        ];
+        for (const [row, reason] of cases) {
+            for (const calibrated of [false, true]) {
+                const fixture = prepareLegacyDb([row]);
+                if (calibrated) {
+                    setClaimsBackfillCalibrationForTests({
+                        cutoffRows: 1,
+                        evidenceDigest: "c".repeat(64),
+                    });
+                }
+                runMigrations(fixture.db);
+                setClaimsBackfillCalibrationForTests(null);
+                expect(getClaimsBackfillStatus(fixture.db).mode).toBe("lazy");
+                expect(
+                    (await runClaimsBackfill(fixture.db, { yieldToEventLoop: async () => {} }))
+                        .status,
+                ).toBe("blocked");
+                expect(
+                    listClaimsBackfillFailures(fixture.db, { dispositions: ["blocking"] }),
+                ).toEqual([expect.objectContaining({ phase: "rows", reasonCode: reason })]);
+                expect(
+                    fixture.db
+                        .prepare(
+                            `SELECT
+                                (SELECT COUNT(*) FROM legacy_memory_claims) AS links,
+                                (SELECT COUNT(*) FROM claims) AS claims,
+                                (SELECT COUNT(*) FROM claim_operations) AS operations,
+                                (SELECT COUNT(*) FROM claim_change_outbox) AS effects`,
+                        )
+                        .get(),
+                ).toEqual({ links: 0, claims: 0, operations: 0, effects: 0 });
+            }
+        }
+    });
+
     test("forced eager and lazy preserve metadata, mappings, stats, evidence, lineage, and equivalent graph", async () => {
         const eager = migrateEager(RELATIONAL_FIXTURE);
         const lazy = migrateLazy(RELATIONAL_FIXTURE);
@@ -291,12 +344,12 @@ describe("claims backfill selection and conversion", () => {
     });
 
     test("historical JSON and comma lineage parsing is deterministic and preserves malformed raw tokens", () => {
-        expect(parseMergedFromLineage('[1,"2",null]')).toEqual([
+        expect(parseMemoryClaimMergedFrom('[1,"2",null]')).toEqual([
             { ordinal: 0, raw: "1", kind: "id", id: 1 },
             { ordinal: 1, raw: "2", kind: "id", id: 2 },
             { ordinal: 2, raw: "null", kind: "malformed" },
         ]);
-        expect(parseMergedFromLineage("3, identity-merge, broken token")).toEqual([
+        expect(parseMemoryClaimMergedFrom("3, identity-merge, broken token")).toEqual([
             { ordinal: 0, raw: "3", kind: "id", id: 3 },
             { ordinal: 1, raw: "identity-merge", kind: "marker" },
             { ordinal: 2, raw: "broken token", kind: "malformed" },
@@ -344,6 +397,55 @@ describe("claims backfill batching and recovery", () => {
                 )
                 .get(),
         ).toEqual({ count: 1 });
+    });
+
+    test("a linked row deleted before the relationship phase retains lineage required for completion", async () => {
+        const { db, ids } = migrateLazy([
+            { content: "lineage source", hash: "lineage-source" },
+            { content: "lineage target", hash: "lineage-target", mergedFrom: "[1]" },
+        ]);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            for (const id of ids) {
+                const row = readMemoryProjectionRow(db, id);
+                if (!row) throw new Error(`missing boundary memory ${id}`);
+                expect(adoptBoundaryMemoryRowInCurrentTransaction(db, row)).toBeTrue();
+            }
+        });
+
+        deleteMemory(db, ids[1]);
+        expect(db.prepare("SELECT 1 FROM memories WHERE id = ?").get(ids[1])).toBeNull();
+        expect(
+            db
+                .prepare(
+                    "SELECT merged_from FROM claim_memory_relationship_sources WHERE memory_id = ?",
+                )
+                .get(ids[1]),
+        ).toEqual({ merged_from: "[1]" });
+        expect(
+            db
+                .prepare(
+                    `SELECT disposition FROM claim_backfill_failures
+                      WHERE phase = 'relationships' AND item_kind = 'lineage'`,
+                )
+                .get(),
+        ).toEqual({ disposition: "resolved" });
+
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        expect(db.prepare("SELECT COUNT(*) AS count FROM claim_conflicts").get()).toEqual({
+            count: 1,
+        });
+        expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
+    });
+
+    test("busy classification retries only SQLite base code 5 adapter shapes", () => {
+        expect(isRetryableSqliteBusyError({ code: "SQLITE_BUSY" })).toBeTrue();
+        expect(isRetryableSqliteBusyError({ code: "SQLITE_BUSY_SNAPSHOT" })).toBeTrue();
+        expect(isRetryableSqliteBusyError({ code: "ERR_SQLITE_ERROR", errcode: 5 })).toBeTrue();
+        expect(isRetryableSqliteBusyError({ code: "ERR_SQLITE_ERROR", errcode: 0x105 })).toBeTrue();
+        expect(isRetryableSqliteBusyError({ code: "SQLITE_LOCKED" })).toBeFalse();
+        expect(isRetryableSqliteBusyError({ code: "ERR_SQLITE_ERROR", errcode: 6 })).toBeFalse();
+        expect(isRetryableSqliteBusyError(new Error("database is locked"))).toBeFalse();
     });
 
     test("busy retry exhaustion leaves the checkpoint pending", async () => {
@@ -409,6 +511,44 @@ describe("claims backfill batching and recovery", () => {
         expect(getClaimsBackfillStatus(first).state).toBe("complete");
     });
 
+    test("a replaced dangling source is terminal only after a newer current source is disposed", async () => {
+        const { db, ids } = migrateLazy([
+            { content: "rewritten lineage target", mergedFrom: "[999]" },
+        ]);
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(
+            "blocked",
+        );
+        const [failure] = listClaimsBackfillFailures(db, { dispositions: ["blocking"] });
+        expect(failure).toMatchObject({ reasonCode: "dangling-lineage" });
+
+        db.prepare(
+            `UPDATE claim_backfill_failures
+                SET disposition = 'resolved', reason_code = 'relationship-source-replaced'
+              WHERE id = ?`,
+        ).run(failure.id);
+        expect(inspectClaimsBackfillReconciliation(db).problems.join("\n")).toContain(
+            "lineage token(s) without a disposition",
+        );
+
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET merged_from = 'identity-merge' WHERE id = ?").run(
+                ids[0],
+            );
+        });
+        const retry = await doctorRetryClaimsBackfill(db, {
+            yieldToEventLoop: async () => {},
+        });
+        expect(retry.after.state).toBe("complete");
+        expect(
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM claim_memory_relationship_sources WHERE memory_id = ?",
+                )
+                .get(ids[0]),
+        ).toEqual({ count: 2 });
+        expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
+    });
+
     test("malformed and dangling lineage block, durable warning dispositions allow idempotent completion", async () => {
         const { db } = migrateLazy([{ content: "lineage target", mergedFrom: '[999,"broken"]' }]);
         const blocked = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
@@ -470,6 +610,70 @@ describe("claims backfill reconciliation", () => {
         expect(report.problems.join("\n")).toContain("missing an outbox effect");
         expect(report.problems.join("\n")).toContain("missing a project generation");
         expect(report.problems.join("\n")).toContain("lineage token(s) without a disposition");
+    });
+
+    test("existing outbox project corruption blocks final reconciliation", async () => {
+        const { db } = migrateLazy([{ content: "outbox project oracle" }]);
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(
+            "complete",
+        );
+        const other = insertMemory(db, {
+            projectPath: "git:claims-backfill-other",
+            category: "CONSTRAINTS",
+            content: "other project claim",
+        });
+        const source = db
+            .prepare(
+                "SELECT claim_id AS claimId FROM legacy_memory_claims ORDER BY memory_id LIMIT 1",
+            )
+            .get() as { claimId: number };
+        const otherProject = db
+            .prepare("SELECT project_id AS projectId FROM legacy_memory_claims WHERE memory_id = ?")
+            .get(other.id) as { projectId: number };
+        const operation = db
+            .prepare("SELECT id FROM claim_operations ORDER BY id LIMIT 1")
+            .get() as {
+            id: number;
+        };
+        db.exec("DROP TRIGGER claim_change_outbox_project_guard");
+        db.prepare(
+            `INSERT INTO claim_change_outbox
+                (operation_id, effect_key, project_id, claim_id, effect_type, generation, created_at)
+             VALUES (?, 'forged:mismatched-project', ?, ?, 'upsert', 1, 1)`,
+        ).run(operation.id, otherProject.projectId, source.claimId);
+
+        const report = inspectClaimsBackfillReconciliation(db);
+        expect(report.ok).toBeFalse();
+        expect(report.problems).toContain("1 outbox effect(s) have a mismatched project");
+    });
+
+    test("completed status and doctor retry stay blocked on targeted claim foreign-key violations", async () => {
+        const { db } = migrateLazy([{ content: "foreign key oracle" }]);
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(
+            "complete",
+        );
+        db.exec(`
+            PRAGMA foreign_keys=OFF;
+            DROP TRIGGER claim_change_outbox_project_guard;
+        `);
+        const operationId = (
+            db.prepare("SELECT id FROM claim_operations LIMIT 1").get() as { id: number }
+        ).id;
+        db.prepare(
+            `INSERT INTO claim_change_outbox
+                (operation_id, effect_key, project_id, claim_id, effect_type, generation, created_at)
+             VALUES (?, 'orphan:test', 999999, 999999, 'upsert', 1, 1)`,
+        ).run(operationId);
+        db.exec("PRAGMA foreign_keys=ON");
+
+        const status = getClaimsBackfillStatus(db, { includeProblems: true });
+        expect(status.state).toBe("blocked");
+        expect(status.problems.join("\n")).toContain(
+            "claim_change_outbox: 2 foreign key violation(s)",
+        );
+        const retry = await doctorRetryClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(retry.summary?.status).toBe("blocked");
+        expect(retry.after.state).toBe("blocked");
     });
 
     test("expected count and boundary anti-join refuse a missing crosswalk despite complete cursors", async () => {
