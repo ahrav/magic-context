@@ -31,6 +31,7 @@ import {
     hasMemoryClaimsCompatSchema,
     runInMemoryClaimsWriteTransaction,
     updateMemoryContentWithClaimsInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
 } from "../memory/storage-memory-claims";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { recordChildInvocation } from "../subagent-token-capture";
@@ -471,32 +472,37 @@ export async function applyVerifyManifest(
         return { verified, updated, archived };
     }
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-        for (const w of writes) {
-            const memory = getMemoryById(args.db, w.id);
-            if (!isPrimaryMutable(memory)) continue;
-            if (w.kind === "verify") {
-                recordMemoryVerifications(args.db, w.id, w.files, now);
-                verified += 1;
-            } else if (w.kind === "update") {
-                rewriteMemoryContent(args.db, memory, w.content, w.hash);
-                queueMemoryMutation(args.db, {
-                    projectPath: args.projectIdentity,
-                    mutationType: "update",
-                    targetMemoryId: w.id,
-                    category: memory.category,
-                    newContent: w.content,
-                });
-                updated += 1;
-            } else {
-                archiveMemory(args.db, w.id, w.reason);
-                queueMemoryMutation(args.db, {
-                    projectPath: args.projectIdentity,
-                    mutationType: "archive",
-                    targetMemoryId: w.id,
-                });
-                archived += 1;
+        // The shared generation context spans the per-item claim writes, so
+        // one lease-guarded transaction allocates one claim project
+        // generation per touched project (KTD7).
+        withMemoryClaimGenerationContextInCurrentTransaction(args.db, () => {
+            for (const w of writes) {
+                const memory = getMemoryById(args.db, w.id);
+                if (!isPrimaryMutable(memory)) continue;
+                if (w.kind === "verify") {
+                    recordMemoryVerifications(args.db, w.id, w.files, now);
+                    verified += 1;
+                } else if (w.kind === "update") {
+                    rewriteMemoryContent(args.db, memory, w.content, w.hash);
+                    queueMemoryMutation(args.db, {
+                        projectPath: args.projectIdentity,
+                        mutationType: "update",
+                        targetMemoryId: w.id,
+                        category: memory.category,
+                        newContent: w.content,
+                    });
+                    updated += 1;
+                } else {
+                    archiveMemory(args.db, w.id, w.reason);
+                    queueMemoryMutation(args.db, {
+                        projectPath: args.projectIdentity,
+                        mutationType: "archive",
+                        targetMemoryId: w.id,
+                    });
+                    archived += 1;
+                }
             }
-        }
+        });
     });
     return { verified, updated, archived };
 }

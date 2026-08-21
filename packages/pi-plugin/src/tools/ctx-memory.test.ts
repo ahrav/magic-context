@@ -1440,7 +1440,7 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 					countRows(
 						db,
 						"claim_operations",
-						`producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:${callId}:merge'`,
+						`producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:${callId}:merge:2'`,
 					),
 				).toBe(1);
 				await expect(
@@ -1715,6 +1715,50 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 			expect(getMemoryById(db, first.id)).toBeNull();
 
 			const replay = await run(tool, args, "pi-replay-merge");
+			expect(replay.content[0]?.text).toBe(merged.content[0]?.text);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("merge replay works without a category argument after every source is hard-deleted", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay derived-category source one.",
+			});
+			const second = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay derived-category source two.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			// No `category`: the first run derives it from the sources; the
+			// replay identity must not depend on that derivation.
+			const args = {
+				action: "merge",
+				ids: [first.id, second.id],
+				content: "Pi merge replay derived-category canonical.",
+			};
+
+			const merged = await run(tool, args, "pi-replay-merge-derived");
+			expect(merged.content[0]?.text).toContain("Merged memories");
+			expect(merged.content[0]?.text).toContain("in CONSTRAINTS");
+
+			deleteMemory(db, first.id);
+			deleteMemory(db, second.id);
+			expect(getMemoryById(db, first.id)).toBeNull();
+			expect(getMemoryById(db, second.id)).toBeNull();
+
+			const replay = await run(tool, args, "pi-replay-merge-derived");
 			expect(replay.content[0]?.text).toBe(merged.content[0]?.text);
 		} finally {
 			closeQuietly(db);

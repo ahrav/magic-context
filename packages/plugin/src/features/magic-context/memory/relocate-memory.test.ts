@@ -404,6 +404,59 @@ describe("relocate-memory claims (v84)", () => {
         });
     });
 
+    test("a collision merge into an empty-content target skips with a diagnostic instead of deleting the source", () => {
+        const database = makeDb();
+        // The target numeric project must exist for the claims-active merge path.
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+        // Whitespace-only source and empty target normalize identically, so
+        // they collide on (category, normalized_hash) while the target stays
+        // unadoptable (empty content) and the source raw bytes are non-empty.
+        const targetId = insertUnlinkedMemory(database, "git:project-b", "", "merge-empty-h1");
+        const sourceId = insertUnlinkedMemory(database, "git:project-a", "   ", "merge-empty-h1");
+        // Mark the source as a v84 boundary row: deleting it without a
+        // crosswalk link aborts on memories_claims_boundary_delete_guard.
+        database
+            .prepare(
+                `INSERT OR REPLACE INTO schema_migrations_meta (key, value)
+                 VALUES ('claims_backfill_boundary_memory_id', ?)`,
+            )
+            .run(String(sourceId));
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [sourceId], "git:project-a", "git:project-b"),
+        );
+
+        // The merge is skipped, not aborted: the source survives under its
+        // original project (nothing merged), the empty target is untouched,
+        // and the stalled merge surfaces as a blocking diagnostic.
+        expect(result).toEqual({ relocated: 0, merged: 0, skipped: 0 });
+        expect(
+            database
+                .prepare("SELECT project_path, content FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ project_path: "git:project-a", content: "   " });
+        expect(database.prepare("SELECT content FROM memories WHERE id = ?").get(targetId)).toEqual(
+            { content: "" },
+        );
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${sourceId}:collision-merge:${targetId}`),
+        ).toEqual({
+            phase: "relationships",
+            item_kind: "merge",
+            reason_code: "empty-content",
+            disposition: "blocking",
+        });
+    });
+
     test("copying creates a target claim for each fresh row and leaves the source intact", () => {
         const database = makeDb();
         const source = insertMemory(database, {

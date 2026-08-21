@@ -210,22 +210,66 @@ function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId:
 }
 
 /**
+ * Blocking diagnostic for a collision merge the relocation cannot take: the
+ * surviving target row is unadoptable, so no canonical claim can anchor the
+ * source's crosswalk link before the source row's delete — and the merge
+ * keeps the TARGET's bytes, so deleting the source into an unadoptable
+ * survivor would silently discard content. Mirrors the repoint diagnostic
+ * shape so the repair lane surfaces the stalled merge; the leading
+ * `memory:<sourceId>` in the item key is what the boundary gating parser
+ * reads, keeping completion fail-closed while a boundary source is stranded.
+ */
+function recordSkippedCollisionMergeDiagnostic(
+    db: Database,
+    sourceId: number,
+    targetId: number,
+    reason: MemoryClaimLinkFailureReason,
+): void {
+    const now = Date.now();
+    db.prepare(
+        `INSERT INTO claim_backfill_failures
+            (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+         VALUES ('relationships', 'merge', ?, ?, ?, 'blocking', ?, ?)
+         ON CONFLICT(phase, item_kind, item_key)
+         DO UPDATE SET reason_code = excluded.reason_code, detail = excluded.detail,
+                       disposition = 'blocking', updated_at = excluded.updated_at`,
+    ).run(
+        `memory:${sourceId}:collision-merge:${targetId}`,
+        reason,
+        JSON.stringify({ collisionTargetMemoryId: targetId }),
+        now,
+        now,
+    );
+}
+
+/**
  * Claim canonicalization for a collision merge: the surviving target row
  * owns (or adopts) the canonical claim, the deleted source row records its
  * link to that canonical claim (duplicate crosswalk link), and a source that
  * carried its OWN claim retires it with supersession lineage. The source
  * bytes stay retained on the duplicate link's root observation, so the
  * canonical claim keeps reflecting the surviving projection row.
+ *
+ * Returns false — merge must not proceed — when the target row is
+ * unadoptable: no canonical claim can exist for it, so the source link the
+ * boundary delete guard demands cannot anchor anywhere, and the merge would
+ * delete the source while the unadoptable target keeps its (empty) bytes.
+ * That skip records a blocking diagnostic instead of losing data.
  */
 function adoptRelocationMergeClaims(
     db: Database,
     sourceId: number,
     targetId: number,
     toIdentity: string,
-): void {
+): boolean {
     const targetProjectId = requireRelocationTargetProject(db, toIdentity);
     const targetRow = readMemoryProjectionRow(db, targetId);
-    if (!targetRow || targetRow.content.length === 0) return;
+    if (!targetRow) return false;
+    const targetFailure = memoryClaimAdoptionFailureReason(targetRow, targetProjectId);
+    if (targetFailure !== null) {
+        recordSkippedCollisionMergeDiagnostic(db, sourceId, targetId, targetFailure);
+        return false;
+    }
     const sourceRow = readMemoryProjectionRow(db, sourceId);
     runMemoryClaimOperationInCurrentTransaction(
         db,
@@ -275,6 +319,7 @@ function adoptRelocationMergeClaims(
             return { result: targetLink.claimId, effects };
         },
     );
+    return true;
 }
 
 /**
@@ -493,6 +538,14 @@ function rekeyMemoryRowWithCollisionMergeInner(
         | undefined;
 
     if (collision && collision.id !== rowId) {
+        // The canonical claim and both crosswalk links must exist BEFORE the
+        // source row deletes: the v84 boundary guard refuses to delete an
+        // unlinked boundary row. An unadoptable target cannot anchor those
+        // links, so the merge is skipped there (fail-visible diagnostic,
+        // source row preserved) before any stats or embedding mutation.
+        if (claimsActive && !adoptRelocationMergeClaims(db, rowId, collision.id, toIdentity)) {
+            return false;
+        }
         // requireEffectiveSeenCount rejects a NULL stats read on a v80 database
         // (a missing stats row is corruption) before the merge computes a
         // default count and deletes the source row. The check lives inside the
@@ -514,10 +567,6 @@ function rekeyMemoryRowWithCollisionMergeInner(
                 );
             }
         }
-        // The canonical claim and both crosswalk links must exist BEFORE the
-        // source row deletes: the v84 boundary guard refuses to delete an
-        // unlinked boundary row.
-        if (claimsActive) adoptRelocationMergeClaims(db, rowId, collision.id, toIdentity);
         // Preserve an embedding on the surviving target BEFORE the source row's
         // embedding FK-cascades away on DELETE (memory_embeddings.memory_id
         // REFERENCES memories(id) ON DELETE CASCADE). INSERT OR IGNORE keeps the

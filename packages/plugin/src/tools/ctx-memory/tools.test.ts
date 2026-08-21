@@ -2267,6 +2267,43 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
         expect(replay).toBe(merged);
     });
 
+    it("merge replay works without a category argument after every source is hard-deleted", async () => {
+        const first = insertMemory(db, {
+            projectPath: OWN_PROJECT,
+            category: "CONSTRAINTS",
+            content: "Merge replay derived-category source one.",
+        });
+        const second = insertMemory(db, {
+            projectPath: OWN_PROJECT,
+            category: "CONSTRAINTS",
+            content: "Merge replay derived-category source two.",
+        });
+        // No `category`: the first run derives it from the sources; the
+        // replay identity must not depend on that derivation.
+        const args = {
+            action: "merge" as const,
+            ids: [first.id, second.id],
+            content: "Merge replay derived-category canonical.",
+        };
+        const context = toolContext(
+            "ses-replay-merge-derived",
+            "general",
+            "tool-call-replay-merge-derived",
+        );
+
+        const merged = await tools.ctx_memory.execute(args, context);
+        expect(merged).toContain("Merged memories");
+        expect(merged).toContain("in CONSTRAINTS");
+
+        deleteMemory(db, first.id);
+        deleteMemory(db, second.id);
+        expect(getMemoryById(db, first.id)).toBeNull();
+        expect(getMemoryById(db, second.id)).toBeNull();
+
+        const replay = await tools.ctx_memory.execute(args, context);
+        expect(replay).toBe(merged);
+    });
+
     it("two connections replay stable merges before mutating existing or fresh canonicals", async () => {
         for (const existingCanonical of [true, false]) {
             closeQuietly(db);
@@ -2355,7 +2392,7 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
                     countRows(
                         db,
                         "claim_operations",
-                        `producer = 'ctx-memory-opencode' AND operation_key = 'ses-stable-merge:stable-merge-${existingCanonical}:merge'`,
+                        `producer = 'ctx-memory-opencode' AND operation_key = 'ses-stable-merge:stable-merge-${existingCanonical}:merge:2'`,
                     ),
                 ).toBe(1);
                 await expect(

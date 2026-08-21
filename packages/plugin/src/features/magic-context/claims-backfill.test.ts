@@ -706,6 +706,30 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
         expect(listClaimsBackfillFailures(db, { dispositions: ["blocking"] })).toHaveLength(0);
     });
 
+    test("a takeover flip to pending between the oracle read and finalize does not certify complete", async () => {
+        const { db } = migrateLazy([{ content: "takeover race row" }]);
+        // One-shot writer race: syncClaimsTakeoverMeta is non-monotonic, so a
+        // v22 runner can flip the takeover key none → pending after the
+        // oracle reads a clean report but before finalize commits. The
+        // finalize recheck must treat the pending takeover as decisive, like
+        // the oracle does, instead of certifying completion over it.
+        let injected = false;
+        setClaimsBackfillFailpoint("claims-backfill.025.reconcile-oracle.after", () => {
+            if (injected) return;
+            injected = true;
+            db.prepare(
+                `INSERT INTO schema_migrations_meta (key, value) VALUES (?, 'pending')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            ).run("claims_backfill_v22_takeover");
+        });
+
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(injected).toBeTrue();
+        expect(summary.status).toBe("blocked");
+        expect(summary.problems.join("\n")).toContain("pending v22 identity work");
+        expect(getClaimsBackfillStatus(db).phase).not.toBe("complete");
+    });
+
     test("waiving the blocking failure changes the digest and the next start resets and completes", async () => {
         const { db } = migrateLazy([{ content: "lineage row", mergedFrom: "[999]" }]);
         expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(

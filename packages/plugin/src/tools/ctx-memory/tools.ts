@@ -912,25 +912,25 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     return "Error: 'content' is required when action is 'merge'.";
                 }
 
-                const sourceMemories = ids
-                    .map((id) => getMemoryById(deps.db, id))
-                    .filter((memory): memory is Memory => Boolean(memory));
-                const category =
-                    getValidatedCategory(args.category) ?? sourceMemories[0]?.category ?? null;
-                if (!category) {
-                    return "Error: A valid category is required when action is 'merge'.";
-                }
                 const normalizedHash = computeNormalizedHash(content);
-                const mergeIdentity = claimOperationIdentity("merge", {
+                // The identity digest uses only source-independent inputs (the
+                // requested category, not one derived from a live source row),
+                // so a retry can reconstruct it after every source is deleted.
+                // The `merge:2` key suffix versions the digest shape: an
+                // envelope recorded under the old `merge` key carries the old
+                // digest, and probing it with the new digest would throw
+                // ClaimOperationKeyReuseError instead of replaying.
+                const mergeIdentity = claimOperationIdentity("merge:2", {
                     ids,
                     content,
-                    category,
+                    requestedCategory: args.category ?? null,
                     projectPath,
                 });
-                // Replay before the source-existence check: a source deleted
-                // between attempts must not turn a committed-but-unacked merge
-                // retry into a not-found error. The stored result carries the
-                // category so the message never depends on the live sources.
+                // Replay before the source-existence and category checks: a
+                // source deleted between attempts must not turn a
+                // committed-but-unacked merge retry into a not-found or
+                // category error. The stored result carries the category so
+                // the message never depends on the live sources.
                 if (mergeIdentity && claimsSchema) {
                     const replay = readMemoryClaimOperationResult<{
                         memoryId: number;
@@ -940,6 +940,19 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         const supersededIds = ids.filter((id) => id !== replay.result.memoryId);
                         return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${replay.result.memoryId}] in ${replay.result.category}; superseded [${supersededIds.join(", ")}].`;
                     }
+                }
+                const sourceMemories = ids
+                    .map((id) => getMemoryById(deps.db, id))
+                    .filter((memory): memory is Memory => Boolean(memory));
+                const category =
+                    getValidatedCategory(args.category) ?? sourceMemories[0]?.category ?? null;
+                if (!category) {
+                    // An unresolvable category usually means the sources are
+                    // gone (it falls back to sourceMemories[0]); report the
+                    // real problem instead of a misleading category error.
+                    return sourceMemories.length !== ids.length
+                        ? "Error: One or more source memories were not found."
+                        : "Error: A valid category is required when action is 'merge'.";
                 }
                 if (sourceMemories.length !== ids.length) {
                     return "Error: One or more source memories were not found.";

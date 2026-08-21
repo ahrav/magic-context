@@ -1070,6 +1070,134 @@ describe("memory/claims kernel: status transitions with metadata replacement", (
     });
 });
 
+describe("memory/claims kernel: relationship and session-attribution effects", () => {
+    function insertUnlinkedRow(db: Database, content: string, mergedFrom: string): number {
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            merged_from, seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT, content, `hash:${content}`, mergedFrom).lastInsertRowid,
+            );
+        });
+        return memoryId;
+    }
+
+    function operationOutbox(db: Database, operationKey: string): Array<{ effectKey: string }> {
+        return db
+            .prepare(
+                `SELECT effect_key AS effectKey FROM claim_change_outbox
+                  WHERE operation_id = (SELECT id FROM claim_operations WHERE operation_key = ?)`,
+            )
+            .all(operationKey) as Array<{ effectKey: string }>;
+    }
+
+    function expectedEffectCount(db: Database, operationKey: string): number {
+        return (
+            db
+                .prepare(
+                    "SELECT expected_effect_count AS count FROM claim_operations WHERE operation_key = ?",
+                )
+                .get(operationKey) as { count: number }
+        ).count;
+    }
+
+    test("a module delta first adoption with pre-existing lineage records the lineage effect in the outbox", () => {
+        const db = track(migratedDb());
+        const source = createSeedMemory(db, "module-lineage-source", "module lineage source");
+        const memoryId = insertUnlinkedRow(db, "module lineage fact", `[${source.memoryId}]`);
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("module-lineage-1", { key: "module-lineage" }),
+                { memoryId, applyProjection: () => {} },
+            ),
+        );
+        expect(outcome.result.claimId).not.toBeNull();
+
+        const outbox = operationOutbox(db, "module-lineage-1");
+        expect(
+            outbox.some(
+                (row) =>
+                    row.effectKey.startsWith(`memory:${memoryId}:relations:`) &&
+                    row.effectKey.endsWith(":lineage:0"),
+            ),
+        ).toBeTrue();
+        expect(expectedEffectCount(db, "module-lineage-1")).toBe(outbox.length);
+    });
+
+    test("superseding a row with pre-existing lineage keeps the lineage effect in the outbox", () => {
+        const db = track(migratedDb());
+        const source = createSeedMemory(db, "supersede-lineage-source", "supersede lineage source");
+        const target = createSeedMemory(db, "supersede-lineage-target", "supersede lineage target");
+        const memoryId = insertUnlinkedRow(db, "supersede lineage fact", `[${source.memoryId}]`);
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("supersede-lineage-1", { id: memoryId }),
+                { memoryId, supersededByMemoryId: target.memoryId },
+            ),
+        );
+        expect(outcome.result.supersededByClaimId).toBe(target.claimId);
+
+        const outbox = operationOutbox(db, "supersede-lineage-1");
+        const keys = outbox.map((row) => row.effectKey);
+        expect(
+            keys.some(
+                (key) =>
+                    key.startsWith(`memory:${memoryId}:relations:`) && key.endsWith(":lineage:0"),
+            ),
+        ).toBeTrue();
+        expect(keys).toContain(`memory:${memoryId}:lifecycle`);
+        expect(keys).toContain(`memory:${target.memoryId}:evidence`);
+        expect(outbox).toHaveLength(3);
+        expect(expectedEffectCount(db, "supersede-lineage-1")).toBe(3);
+    });
+
+    test("a module delta changing only source_session_id appends a revision carrying the new session id", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "session-reattr-seed", "session reattribution fact");
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("session-reattr-1", { key: "session-reattr" }),
+                {
+                    memoryId: seeded.memoryId,
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET source_session_id = 'ses-reattributed' WHERE id = ?",
+                        ).run(seeded.memoryId);
+                    },
+                },
+            ),
+        );
+
+        expect(outcome.result.revisionId).not.toBeNull();
+        const revision = db
+            .prepare(
+                "SELECT revision, source_session_id AS sourceSessionId FROM claim_revisions WHERE id = ?",
+            )
+            .get(outcome.result.revisionId) as { revision: number; sourceSessionId: string | null };
+        expect(revision.revision).toBe(2);
+        expect(revision.sourceSessionId).toBe("ses-reattributed");
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${seeded.memoryId}:upsert'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'session-reattr-1')`,
+            ),
+        ).toBe(1);
+    });
+});
+
 describe("memory/claims kernel: module delta replay", () => {
     test("a replayed envelope appends no claim rows for a now-adoptable preimage", () => {
         const db = track(migratedDb());

@@ -13,6 +13,7 @@ import { effectiveSeenCountSql } from "./memory/storage-memory";
 import {
     hasMemoryClaimsCompatSchema,
     withClaimsWriteCapabilityInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
 import { CLAIMS_BACKFILL_META_KEYS } from "./storage-memory-claims-schema";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
@@ -348,7 +349,12 @@ export async function runDeferredV22Backfill(
                 writeMeta(db, BACKFILL_CURSOR_META_KEY, String(finalCursor));
             };
             if (hasMemoryClaimsCompatSchema(db)) {
-                withClaimsWriteCapabilityInCurrentTransaction(db, applyBatch);
+                // The shared generation context spans the per-row kernel
+                // operations, so one transaction allocates one claim project
+                // generation per touched project (KTD7).
+                withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+                    withMemoryClaimGenerationContextInCurrentTransaction(db, applyBatch),
+                );
             } else {
                 applyBatch();
             }
@@ -483,25 +489,39 @@ export async function doctorRekeyV22DirIdentity(
     let changedRows = 0;
 
     db.transaction(() => {
-        const now = Date.now();
-        // Per-row collision-aware rekey: a bulk
-        // `UPDATE ... WHERE project_path = oldIdentity` aborts the whole
-        // transaction on UNIQUE(project_path, category, normalized_hash) when
-        // some rows collide with memories already under newIdentity. Iterate so
-        // colliding rows merge instead of poisoning the batch.
-        const rowIds = (
-            db.prepare("SELECT id FROM memories WHERE project_path = ?").all(oldIdentity) as Array<{
-                id: number;
-            }>
-        ).map((r) => r.id);
-        upsertRekeyMap(db, oldIdentity, newIdentity, now);
-        for (const rowId of rowIds) {
-            if (rekeyMemoryRowWithCollisionMerge(db, rowId, oldIdentity, newIdentity)) {
-                changedRows += 1;
+        const applyRekeys = (): void => {
+            const now = Date.now();
+            // Per-row collision-aware rekey: a bulk
+            // `UPDATE ... WHERE project_path = oldIdentity` aborts the whole
+            // transaction on UNIQUE(project_path, category, normalized_hash) when
+            // some rows collide with memories already under newIdentity. Iterate so
+            // colliding rows merge instead of poisoning the batch.
+            const rowIds = (
+                db
+                    .prepare("SELECT id FROM memories WHERE project_path = ?")
+                    .all(oldIdentity) as Array<{
+                    id: number;
+                }>
+            ).map((r) => r.id);
+            upsertRekeyMap(db, oldIdentity, newIdentity, now);
+            for (const rowId of rowIds) {
+                if (rekeyMemoryRowWithCollisionMerge(db, rowId, oldIdentity, newIdentity)) {
+                    changedRows += 1;
+                }
             }
-        }
-        if (changedRows > 0) {
-            bumpProjectMemoryEpochInTransaction(db, newIdentity, now);
+            if (changedRows > 0) {
+                bumpProjectMemoryEpochInTransaction(db, newIdentity, now);
+            }
+        };
+        if (hasMemoryClaimsCompatSchema(db)) {
+            // The shared generation context spans the per-row kernel
+            // operations, so one transaction allocates one claim project
+            // generation per touched project (KTD7).
+            withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+                withMemoryClaimGenerationContextInCurrentTransaction(db, applyRekeys),
+            );
+        } else {
+            applyRekeys();
         }
     })();
 

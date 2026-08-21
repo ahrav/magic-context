@@ -566,4 +566,59 @@ describe("applyVerifyManifest", () => {
             closeQuietly(db);
         }
     });
+
+    test("one manifest transaction shares a single claim generation across items (KTD7)", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test";
+            const dir = tempProject();
+            const seed = (content: string) =>
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content,
+                    sourceSessionId: "ses",
+                });
+            const verifiedMemory = seed("Verified fact lives in src/old.ts.");
+            const updatedMemory = seed("Old value lives in src/old.ts.");
+            const archivedMemory = seed("Removed thing lived in src/old.ts.");
+            const items = [verifiedMemory, updatedMemory, archivedMemory].map((memory) => ({
+                id: memory.id,
+                category: memory.category,
+                content: memory.content,
+                mappedFiles: ["src/old.ts"],
+            }));
+            const generationBefore = (
+                db
+                    .prepare(
+                        "SELECT COALESCE(MAX(generation), 0) AS generation FROM claim_project_generations",
+                    )
+                    .get() as { generation: number }
+            ).generation;
+
+            const result = await applyVerifyManifest(
+                verifyArgs(db, dir, projectIdentity),
+                items,
+                `<verify>` +
+                    `<verified id="${verifiedMemory.id}" files="src/old.ts"/>` +
+                    `<update id="${updatedMemory.id}" files="src/new.ts">New value lives in src/new.ts.</update>` +
+                    `<archive id="${archivedMemory.id}" reason="stale"/>` +
+                    `</verify>`,
+            );
+            expect(result).toEqual({ verified: 1, updated: 1, archived: 1 });
+
+            // All three items commit inside one lease-guarded transaction, so
+            // the project generation advances by exactly one.
+            const generationAfter = (
+                db
+                    .prepare(
+                        "SELECT COALESCE(MAX(generation), 0) AS generation FROM claim_project_generations",
+                    )
+                    .get() as { generation: number }
+            ).generation;
+            expect(generationAfter).toBe(generationBefore + 1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });

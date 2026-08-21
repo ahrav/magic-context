@@ -765,7 +765,9 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
             // reactivate it with stale revision metadata.
             const current = readCurrentClaimSemanticState(db, canonical.claimId);
             const desiredMeta = metadataFromProjectionRow(row);
-            if (claimSemanticStateDiffers(current, row.content, desiredMeta)) {
+            if (
+                claimSemanticStateDiffers(current, row.content, desiredMeta, row.source_session_id)
+            ) {
                 appendMemoryClaimRevision(db, {
                     claimId: canonical.claimId,
                     content: row.content,
@@ -1644,22 +1646,24 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
                 kind: "migration",
             });
-            translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
+            const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(
+                db,
+                row,
+            );
 
             // A shared canonical claim retires only with its last live link;
             // the superseded projection flips to archived below, so only
             // sibling crosswalk rows count.
             const retireClaim = !claimHasOtherLiveMemoryLink(db, link.claimId, row.id);
-            const effects: MemoryClaimEffect[] = retireClaim
-                ? [
-                      {
-                          effectKey: `memory:${row.id}:lifecycle`,
-                          projectId,
-                          claimId: link.claimId,
-                          effectType: "lifecycle" as const,
-                      },
-                  ]
-                : [];
+            const effects: MemoryClaimEffect[] = [...relationshipEffects];
+            if (retireClaim) {
+                effects.push({
+                    effectKey: `memory:${row.id}:lifecycle`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "lifecycle" as const,
+                });
+            }
             let supersededByClaimId: number | null = null;
             const target = readMemoryProjectionRow(db, input.supersededByMemoryId);
             const targetProjectId = target
@@ -1692,6 +1696,9 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             setMemoryProjectionSuperseded(db, row.id, input.supersededByMemoryId, input.nowMs);
             const post = readMemoryProjectionRow(db, row.id);
+            // Post-state snapshot only: the supersession edge is already
+            // recorded above, so this translation returns no new effects — it
+            // exists to satisfy the projection's lineage-write guard.
             if (post) translateMemoryClaimRelationshipsInCurrentTransaction(db, post);
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return {
@@ -1965,6 +1972,7 @@ export interface CurrentClaimSemanticState {
     sourceType: string | null;
     expiresAt: number | null;
     metadataJson: string | null;
+    sourceSessionId: string | null;
 }
 
 export function readCurrentClaimSemanticState(
@@ -1973,7 +1981,8 @@ export function readCurrentClaimSemanticState(
 ): CurrentClaimSemanticState {
     const row = db
         .prepare(
-            `SELECT rev.content AS content, claims.state AS state,
+            `SELECT rev.content AS content, rev.source_session_id AS sourceSessionId,
+                    claims.state AS state,
                     meta.category AS category, meta.normalized_hash AS normalizedHash,
                     meta.importance AS importance, meta.memory_scope AS memoryScope,
                     meta.shareable AS shareable, meta.source_type AS sourceType,
@@ -1996,6 +2005,7 @@ function claimSemanticStateDiffers(
     current: CurrentClaimSemanticState,
     content: string,
     desired: RevisionMemoryMetadataInput,
+    sourceSessionId: string | null,
 ): boolean {
     return (
         current.content !== content ||
@@ -2006,7 +2016,11 @@ function claimSemanticStateDiffers(
         current.shareable !== desired.shareable ||
         current.sourceType !== desired.sourceType ||
         (current.expiresAt ?? null) !== (desired.expiresAt ?? null) ||
-        (current.metadataJson ?? null) !== (desired.metadataJson ?? null)
+        (current.metadataJson ?? null) !== (desired.metadataJson ?? null) ||
+        // Session attribution is a semantic revision column: the projection
+        // write guard covers it and appendMemoryClaimRevision persists it, so
+        // a re-attribution without a content change still needs a revision.
+        (current.sourceSessionId ?? null) !== (sourceSessionId ?? null)
     );
 }
 
@@ -2040,6 +2054,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
     const replay = readMemoryClaimOperationResult<ModuleMemoryDeltaResult>(db, envelope);
     const pre = readMemoryProjectionRow(db, input.memoryId);
     let preLink: MemoryClaimLink | null = null;
+    let preRelationshipEffects: MemoryClaimEffect[] = [];
     if (pre && pre.content.length > 0) {
         if (replay) {
             preLink = readMemoryClaimLink(db, pre.id);
@@ -2061,7 +2076,11 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
             }
         }
         if (preLink) {
-            translateMemoryClaimRelationshipsInCurrentTransaction(db, pre);
+            // Preimage lineage recorded here threads into the envelope
+            // closure below (like preLink) so a first adoption's relationship
+            // effects reach the outbox and bump the touched generations.
+            const translated = translateMemoryClaimRelationshipsInCurrentTransaction(db, pre);
+            if (!replay) preRelationshipEffects = translated;
         }
     }
 
@@ -2073,7 +2092,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
         envelope,
         () => {
             const post = readMemoryProjectionRow(db, input.memoryId);
-            const effects: MemoryClaimEffect[] = [];
+            const effects: MemoryClaimEffect[] = [...preRelationshipEffects];
             if (!post) {
                 // Tombstone removed the projection row: retire the claim, keep
                 // the crosswalk (retention, not erasure).
@@ -2125,7 +2144,14 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
             const current = readCurrentClaimSemanticState(db, link.claimId);
             const desiredMeta = metadataFromProjectionRow(post);
             let revisionId: number | null = null;
-            if (claimSemanticStateDiffers(current, post.content, desiredMeta)) {
+            if (
+                claimSemanticStateDiffers(
+                    current,
+                    post.content,
+                    desiredMeta,
+                    post.source_session_id,
+                )
+            ) {
                 const observationId = createMemoryObservation(db, {
                     projectId,
                     memoryId: post.id,

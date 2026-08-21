@@ -1237,9 +1237,9 @@ export async function runClaimsBackfill(
      * the read-only oracle OUTSIDE the write lock and passes its report in;
      * this short immediate transaction re-verifies the decisive conditions —
      * phase unchanged, zero unlinked boundary rows, zero boundary-scoped
-     * blocking failures — so a write racing between the oracle read and this
-     * commit cannot certify a stale state, then publishes the completion
-     * checkpoint.
+     * blocking failures, no pending v22 takeover — so a write racing between
+     * the oracle read and this commit cannot certify a stale state, then
+     * publishes the completion checkpoint.
      */
     const finalizeReconciliation = (report: ClaimsBackfillReconciliationReport): BatchStep => {
         const phase = readMeta(db, CLAIMS_BACKFILL_META_KEYS.phase);
@@ -1251,7 +1251,7 @@ export async function runClaimsBackfill(
         }
         const unlinked = countUnlinkedBoundaryRows(db, state.boundaryMemoryId);
         const blocking = countBoundaryFailures(db, ["blocking", "retry"], state.boundaryMemoryId);
-        if (unlinked > 0 || blocking > 0) {
+        if (unlinked > 0 || blocking > 0 || state.v22Takeover === "pending") {
             // The corpus changed between the oracle read and this
             // transaction; fall back to the rows phase to re-derive. Every
             // cursor resets with the phase: the batch queries select strictly

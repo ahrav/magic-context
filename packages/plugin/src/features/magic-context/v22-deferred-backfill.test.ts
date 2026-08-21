@@ -366,6 +366,30 @@ describe("v22 backfill under the v84 claims contract", () => {
         expect(metaValue(database, "claims_backfill_v22_takeover")).toBe("none");
     });
 
+    test("a batch of rekeys into one project shares a single claim generation (KTD7)", async () => {
+        const { database } = makeV82StyleDb([
+            { projectPath: "/proj/gen-one", content: "generation fact one", hash: "gen-h1" },
+            { projectPath: "/proj/gen-two", content: "generation fact two", hash: "gen-h2" },
+        ]);
+
+        const summary = await runDeferredV22Backfill(database, {
+            resolveIdentity: () => "git:gen-shared",
+            yieldToEventLoop: async () => {},
+        });
+
+        expect(summary.status).toBe("completed");
+        expect(summary.changedRows).toBe(2);
+        // Both rows adopt claims in one batch transaction, so the project
+        // allocates exactly one generation shared by every outbox row.
+        const generations = database
+            .prepare("SELECT generation FROM claim_project_generations")
+            .all() as Array<{ generation: number }>;
+        expect(generations).toEqual([{ generation: 1 }]);
+        expect(
+            database.prepare("SELECT DISTINCT generation FROM claim_change_outbox").all(),
+        ).toEqual([{ generation: 1 }]);
+    });
+
     test("unresolved failures keep the v84 takeover pending", async () => {
         const { database } = makeV82StyleDb([
             { projectPath: "/denied", content: "blocked fact", hash: "blocked-h1" },
