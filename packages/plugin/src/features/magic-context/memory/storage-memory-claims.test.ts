@@ -731,6 +731,51 @@ describe("memory/claims kernel: unresolved identity fallback", () => {
             disposition: "blocking",
         });
     });
+
+    test("an unlinked row with claim-invalid metadata records a blocking failure and applies the projection instead of aborting", () => {
+        const db = track(migratedDb());
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT, "invalid scope fact", "hash:invalid scope fact")
+                    .lastInsertRowid,
+            );
+            // Schema-legal but claim-invalid: `memories` has no CHECK on scope.
+            db.prepare("UPDATE memories SET scope = '' WHERE id = ?").run(memoryId);
+        });
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("invalid-scope-1", { id: memoryId }),
+                { memoryId, status: "archived" },
+            ),
+        );
+        expect(outcome.result).toMatchObject({ memoryId, claimId: null, found: true });
+        expect(count(db, "claims")).toBe(0);
+        expect(count(db, "legacy_memory_claims")).toBe(0);
+        expect(count(db, "claim_change_outbox")).toBe(0);
+        expect(db.prepare("SELECT status FROM memories WHERE id = ?").get(memoryId)).toEqual({
+            status: "archived",
+        });
+        expect(
+            db
+                .prepare(
+                    "SELECT phase, item_kind, reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(memoryId)),
+        ).toEqual({
+            phase: "rows",
+            item_kind: "memory",
+            reason_code: "invalid-scope",
+            disposition: "blocking",
+        });
+    });
 });
 
 describe("memory/claims kernel: current-claim reads and corruption reporting", () => {

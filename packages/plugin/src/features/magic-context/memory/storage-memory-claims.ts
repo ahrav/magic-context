@@ -11,10 +11,11 @@
  * extensionless runtime imports.
  *
  * A row whose project identity cannot resolve to the numeric registry (a raw
- * pre-v22 path) or whose content is empty cannot form a claim. Those writes
- * apply the projection under the capability and record a blocking
- * `claim_backfill_failures` row instead of silently inventing claim state;
- * the v22 takeover (U4) and doctor retry (U5) own the repair.
+ * pre-v22 path), whose content is empty, or whose schema-legal metadata is
+ * claim-invalid (bad scope, importance, shareable, ...) cannot form a claim.
+ * Those writes apply the projection under the capability and record a
+ * blocking `claim_backfill_failures` row instead of silently inventing claim
+ * state; the v22 takeover (U4) and doctor retry (U5) own the repair.
  */
 
 import type { Database } from "../../../shared/sqlite";
@@ -1186,6 +1187,30 @@ function unlinkableResult(memoryId: number, found = true): MemoryClaimWriteResul
     return { memoryId, claimId: null, revisionId: null, found };
 }
 
+/**
+ * Pre-adoption gate shared by the direct write paths: computes the FULL
+ * adoption failure reason — unresolved identity, empty content, and the
+ * schema-legal metadata shapes `memories` cannot reject (bad scope,
+ * importance, shareable, ...) — and records the blocking failure row. A
+ * non-null return means the caller applies its projection mutation and
+ * returns an unlinkable result instead of reaching the invariant throw
+ * inside `ensureMemoryClaimLinkInCurrentTransaction`; the v22 takeover (U4)
+ * and doctor retry (U5) own the repair. Callers keep a redundant
+ * `projectId === null` term in their branch condition purely to narrow the
+ * type — the returned reason already covers it.
+ */
+function recordMemoryClaimAdoptionFailure(
+    db: Database,
+    row: MemoryProjectionRow,
+    projectId: number | null,
+): MemoryClaimLinkFailureReason | null {
+    const failure = memoryClaimAdoptionFailureReason(row, projectId);
+    if (failure !== null) {
+        recordMemoryClaimLinkFailure(db, row.id, row.project_path, failure);
+    }
+    return failure;
+}
+
 function liveProvenance(
     envelope: MemoryClaimOperationEnvelope,
     sourceSessionId?: string | null,
@@ -1212,18 +1237,13 @@ export function createMemoryWithClaimsInCurrentTransaction(
     return runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
         const memoryId = insertMemoryProjectionRow(db, input);
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, input.projectPath);
-        if (projectId === null || input.content.length === 0) {
-            recordMemoryClaimLinkFailure(
-                db,
-                memoryId,
-                input.projectPath,
-                projectId === null ? "unresolved-project-identity" : "empty-content",
-            );
+        const row = readMemoryProjectionRow(db, memoryId) as MemoryProjectionRow;
+        const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+        if (failure !== null || projectId === null) {
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return { result: unlinkableResult(memoryId), effects: [] };
         }
-        const row = readMemoryProjectionRow(db, memoryId) as MemoryProjectionRow;
         const link = ensureMemoryClaimLinkInCurrentTransaction(
             db,
             row,
@@ -1272,13 +1292,13 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
         const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-        if (projectId === null || row.content.length === 0 || input.content.length === 0) {
-            recordMemoryClaimLinkFailure(
-                db,
-                row.id,
-                row.project_path,
-                projectId === null ? "unresolved-project-identity" : "empty-content",
-            );
+        const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+        if (failure !== null || projectId === null || input.content.length === 0) {
+            // An empty replacement content cannot form a revision even when
+            // the preimage row itself is adoptable.
+            if (failure === null) {
+                recordMemoryClaimLinkFailure(db, row.id, row.project_path, "empty-content");
+            }
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             updateMemoryProjectionContent(
                 db,
@@ -1355,13 +1375,8 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
             scope: input.scope,
             shareable: input.shareable,
         };
-        if (projectId === null || row.content.length === 0) {
-            recordMemoryClaimLinkFailure(
-                db,
-                row.id,
-                row.project_path,
-                projectId === null ? "unresolved-project-identity" : "empty-content",
-            );
+        const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+        if (failure !== null || projectId === null) {
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             updateMemoryProjectionClassification(db, row.id, projectionUpdate, input.nowMs);
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -1432,13 +1447,8 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
         const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-        if (projectId === null || row.content.length === 0) {
-            recordMemoryClaimLinkFailure(
-                db,
-                row.id,
-                row.project_path,
-                projectId === null ? "unresolved-project-identity" : "empty-content",
-            );
+        const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+        if (failure !== null || projectId === null) {
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             updateMemoryProjectionStatus(db, row.id, input.status, input.metadataJson, input.nowMs);
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -1521,13 +1531,8 @@ export function deleteMemoryWithClaimsInCurrentTransaction(
         const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-        if (projectId === null || row.content.length === 0) {
-            recordMemoryClaimLinkFailure(
-                db,
-                row.id,
-                row.project_path,
-                projectId === null ? "unresolved-project-identity" : "empty-content",
-            );
+        const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+        if (failure !== null || projectId === null) {
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             // The boundary guard still rejects this delete for an unlinked
             // boundary row: an unlinkable boundary member must stay until the
@@ -1594,13 +1599,8 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                 };
             }
             const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-            if (projectId === null || row.content.length === 0) {
-                recordMemoryClaimLinkFailure(
-                    db,
-                    row.id,
-                    row.project_path,
-                    projectId === null ? "unresolved-project-identity" : "empty-content",
-                );
+            const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+            if (failure !== null || projectId === null) {
                 hitMemoryClaimFailpoint("memory-claim.010.claim.after");
                 setMemoryProjectionSuperseded(db, row.id, input.supersededByMemoryId, input.nowMs);
                 hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -1627,7 +1627,11 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
             const targetProjectId = target
                 ? resolveMemoryClaimProjectInCurrentTransaction(db, target.project_path)
                 : null;
-            if (target && targetProjectId !== null && target.content.length > 0) {
+            if (
+                target &&
+                targetProjectId !== null &&
+                memoryClaimAdoptionFailureReason(target, targetProjectId) === null
+            ) {
                 const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
                     db,
                     target,
@@ -1701,13 +1705,8 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
             }
         };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-        if (projectId === null || row.content.length === 0) {
-            recordMemoryClaimLinkFailure(
-                db,
-                row.id,
-                row.project_path,
-                projectId === null ? "unresolved-project-identity" : "empty-content",
-            );
+        const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+        if (failure !== null || projectId === null) {
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             applyProjection();
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -1772,13 +1771,8 @@ export function updateMemoryVerificationWithClaimsInCurrentTransaction(
         const row = readMemoryProjectionRow(db, input.memoryId);
         if (!row) return { result: unlinkableResult(input.memoryId, false), effects: [] };
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-        if (projectId === null || row.content.length === 0) {
-            recordMemoryClaimLinkFailure(
-                db,
-                row.id,
-                row.project_path,
-                projectId === null ? "unresolved-project-identity" : "empty-content",
-            );
+        const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
+        if (failure !== null || projectId === null) {
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             updateMemoryProjectionVerification(db, row.id, input.verificationStatus, input.nowMs);
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -1858,15 +1852,12 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
                 };
             }
             const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
-            if (!input.verified || projectId === null || row.content.length === 0) {
-                if (input.verified) {
-                    recordMemoryClaimLinkFailure(
-                        db,
-                        row.id,
-                        row.project_path,
-                        projectId === null ? "unresolved-project-identity" : "empty-content",
-                    );
-                }
+            // A mapped-only snapshot never records a failure: it performs no
+            // claim mutation, so an unlinkable row is not blocked by it.
+            const failure = input.verified
+                ? recordMemoryClaimAdoptionFailure(db, row, projectId)
+                : null;
+            if (!input.verified || failure !== null || projectId === null) {
                 hitMemoryClaimFailpoint("memory-claim.010.claim.after");
                 const rowsWritten = replaceMemoryProjectionVerificationFiles(
                     db,
@@ -2014,7 +2005,13 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 db,
                 pre.project_path,
             );
-            if (preProjectId !== null) {
+            // Only an adoptable preimage links here; an unadoptable one (raw
+            // identity or claim-invalid metadata) stays unlinked for the
+            // repair lanes instead of aborting the mirror page.
+            if (
+                preProjectId !== null &&
+                memoryClaimAdoptionFailureReason(pre, preProjectId) === null
+            ) {
                 preLink = ensureMemoryClaimLinkInCurrentTransaction(db, pre, preProjectId, {
                     kind: "migration",
                 });
@@ -2064,13 +2061,8 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
             }
 
             const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, post.project_path);
-            if (projectId === null || post.content.length === 0) {
-                recordMemoryClaimLinkFailure(
-                    db,
-                    post.id,
-                    post.project_path,
-                    projectId === null ? "unresolved-project-identity" : "empty-content",
-                );
+            const failure = recordMemoryClaimAdoptionFailure(db, post, projectId);
+            if (failure !== null || projectId === null) {
                 hitMemoryClaimFailpoint("memory-claim.010.claim.after");
                 return {
                     result: { memoryId: post.id, claimId: null, revisionId: null, removed: false },
@@ -2159,7 +2151,11 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 const targetProjectId = target
                     ? resolveMemoryClaimProjectInCurrentTransaction(db, target.project_path)
                     : null;
-                if (target && targetProjectId !== null && target.content.length > 0) {
+                if (
+                    target &&
+                    targetProjectId !== null &&
+                    memoryClaimAdoptionFailureReason(target, targetProjectId) === null
+                ) {
                     const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
                         db,
                         target,
