@@ -16,13 +16,18 @@
  *
  * Append-only contract (KTD2, R1, R13): legacy_memory_claims,
  * claim_revision_memory_metadata, claim_merge_lineage, claim_operations, and
- * claim_change_outbox reject every UPDATE and DELETE, plus any INSERT that
- * collides with a primary or unique key — so `INSERT OR REPLACE` cannot bypass
- * the delete guard when recursive triggers are disabled (the
- * storage-claims-schema.ts v82 precedent). `claim_project_generations` stays
- * mutable but strictly monotonic, `claim_backfill_failures` is the mutable
- * repair surface, and `claim_compatibility_write_state` is the transaction-
- * scoped capability row observed by the guards.
+ * claim_change_outbox reject every UPDATE, plus any INSERT that collides with
+ * a primary or unique key — so `INSERT OR REPLACE` cannot bypass the delete
+ * guard when recursive triggers are disabled (the storage-claims-schema.ts
+ * v82 precedent). DELETE is likewise rejected everywhere except the
+ * change-log retention contract: claim_operations and claim_change_outbox
+ * rows whose effects the outbox consumer has durably consumed may be pruned
+ * through `pruneClaimChangeLogInCurrentTransaction`, gated by the
+ * `claim_change_log_prune_state` capability row and its recorded consumed
+ * watermark. `claim_project_generations` stays mutable but strictly
+ * monotonic, `claim_backfill_failures` is the mutable repair surface, and
+ * `claim_compatibility_write_state` is the transaction-scoped capability row
+ * observed by the guards.
  */
 
 import type { Database } from "../../shared/sqlite";
@@ -37,9 +42,16 @@ export const MEMORY_CLAIMS_COMPAT_TABLES = [
     "claim_project_generations",
     "claim_backfill_failures",
     "claim_compatibility_write_state",
+    "claim_change_log_prune_state",
 ] as const;
 
-/** Tables whose rows are immutable at the database boundary. */
+/**
+ * Tables whose rows are immutable at the database boundary. UPDATE is
+ * rejected absolutely; DELETE is rejected too, except that claim_operations
+ * and claim_change_outbox admit watermark-gated pruning under the
+ * claim_change_log_prune_state capability (see
+ * `pruneClaimChangeLogInCurrentTransaction`).
+ */
 export const APPEND_ONLY_MEMORY_CLAIMS_TABLES = [
     "legacy_memory_claims",
     "claim_revision_memory_metadata",
@@ -116,6 +128,11 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
         metadata_json TEXT,
         created_at INTEGER NOT NULL
     );
+    -- Exact-hash dedup resolves (project, category, normalized hash) on every
+    -- memory write; the hash-first probe makes that a point lookup instead of
+    -- a metadata scan.
+    CREATE INDEX idx_claim_revision_memory_metadata_hash
+        ON claim_revision_memory_metadata(normalized_hash, category);
 
     -- Audit-only relation for merge edges that cannot use same-project
     -- claim_conflicts (KTD8). Never an authorization or retrieval edge.
@@ -206,6 +223,23 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
     CREATE TABLE claim_compatibility_write_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1))
+    );
+
+    -- Change-log retention state (the claim_compatibility_write_state
+    -- pattern, in a deliberately separate table so claims writers never gain
+    -- prune authority). enabled is transaction-scoped: set inside the owning
+    -- prune transaction and cleared before commit. consumed_watermark is
+    -- durable and monotonic: the highest claim_change_outbox id the outbox
+    -- consumer has durably consumed. The claim_operations and
+    -- claim_change_outbox DELETE triggers permit a delete only while
+    -- enabled = 1 AND the deleted change-log state sits at or below this
+    -- watermark.
+    CREATE TABLE claim_change_log_prune_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+        consumed_watermark INTEGER NOT NULL DEFAULT 0 CHECK (
+            typeof(consumed_watermark) = 'integer' AND consumed_watermark >= 0
+        )
     );
     `);
 
@@ -300,8 +334,20 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
 
     CREATE TRIGGER claim_operations_append_only_update BEFORE UPDATE ON claim_operations
     BEGIN SELECT RAISE(ABORT, 'claim_operations is append-only: the committed result is immutable'); END;
+    -- Retention contract: an operation row leaves only through consumption-
+    -- driven pruning — the prune capability must be enabled in the current
+    -- transaction and every outbox effect of the operation must sit at or
+    -- below the recorded consumed watermark. FK RESTRICT from
+    -- claim_change_outbox additionally forces children to be pruned first.
     CREATE TRIGGER claim_operations_append_only_delete BEFORE DELETE ON claim_operations
-    BEGIN SELECT RAISE(ABORT, 'claim_operations is append-only: deletes are not allowed'); END;
+    WHEN COALESCE((SELECT enabled FROM claim_change_log_prune_state WHERE id = 1), 0) = 0
+      OR EXISTS (
+          SELECT 1 FROM claim_change_outbox
+           WHERE operation_id = OLD.id
+             AND id > COALESCE(
+                 (SELECT consumed_watermark FROM claim_change_log_prune_state WHERE id = 1), 0)
+      )
+    BEGIN SELECT RAISE(ABORT, 'claim_operations is append-only: deletes require the prune capability and effects at or below the consumed watermark'); END;
     CREATE TRIGGER claim_operations_append_only_insert_collision BEFORE INSERT ON claim_operations
     WHEN EXISTS (
         SELECT 1 FROM claim_operations
@@ -311,8 +357,15 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
 
     CREATE TRIGGER claim_change_outbox_append_only_update BEFORE UPDATE ON claim_change_outbox
     BEGIN SELECT RAISE(ABORT, 'claim_change_outbox is append-only: updates are not allowed'); END;
+    -- Retention contract: an outbox effect leaves only through consumption-
+    -- driven pruning — the prune capability must be enabled in the current
+    -- transaction and the effect's id must sit at or below the recorded
+    -- consumed watermark.
     CREATE TRIGGER claim_change_outbox_append_only_delete BEFORE DELETE ON claim_change_outbox
-    BEGIN SELECT RAISE(ABORT, 'claim_change_outbox is append-only: deletes are not allowed'); END;
+    WHEN COALESCE((SELECT enabled FROM claim_change_log_prune_state WHERE id = 1), 0) = 0
+      OR OLD.id > COALESCE(
+          (SELECT consumed_watermark FROM claim_change_log_prune_state WHERE id = 1), 0)
+    BEGIN SELECT RAISE(ABORT, 'claim_change_outbox is append-only: deletes require the prune capability and an id at or below the consumed watermark'); END;
     CREATE TRIGGER claim_change_outbox_append_only_insert_collision BEFORE INSERT ON claim_change_outbox
     WHEN EXISTS (
         SELECT 1 FROM claim_change_outbox
@@ -337,6 +390,109 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
     WHEN EXISTS (SELECT 1 FROM claim_project_generations WHERE project_id = NEW.project_id)
     BEGIN SELECT RAISE(ABORT, 'claim_project_generations key collisions cannot replace rows'); END;
     `);
+}
+
+export interface ClaimChangeLogPruneResult {
+    /** claim_change_outbox rows removed (id at or below the watermark). */
+    prunedOutboxRows: number;
+    /** claim_operations rows removed (every effect at or below the watermark). */
+    prunedOperationRows: number;
+}
+
+/**
+ * Consumption-driven retention for the claim change log (KTD7).
+ *
+ * `claim_operations` and `claim_change_outbox` rows are immutable, but once
+ * the outbox consumer has durably consumed every effect at or below an
+ * outbox id, the rows at or below that watermark carry no remaining delivery
+ * obligation and may be pruned. The DELETE triggers enforce this contract at
+ * the database boundary: a delete commits only while the
+ * `claim_change_log_prune_state` capability row is enabled in the current
+ * transaction AND the deleted state sits at or below the recorded consumed
+ * watermark, so no code path can shed change-log rows the consumer has not
+ * acknowledged.
+ *
+ * Runs inside the CALLER's write transaction. Records `consumedWatermark`
+ * (monotonic: the stored watermark never regresses), enables the prune
+ * capability, deletes `claim_change_outbox` rows with id at or below the
+ * watermark first (the outbox references `claim_operations` with ON DELETE
+ * RESTRICT), then deletes `claim_operations` rows whose every declared
+ * effect has been pruned. An operation keeping any effect above the
+ * watermark stays; an operation declaring zero effects also stays — its
+ * envelope is the only idempotent-replay record for that operation key. The
+ * capability clears before this function returns, so enabled=1 never
+ * survives to commit.
+ */
+export function pruneClaimChangeLogInCurrentTransaction(
+    db: Database,
+    consumedWatermark: number,
+): ClaimChangeLogPruneResult {
+    if (!Number.isSafeInteger(consumedWatermark) || consumedWatermark < 0) {
+        throw new Error(
+            `claim change-log consumed watermark must be a non-negative integer: ${String(consumedWatermark)}`,
+        );
+    }
+    db.prepare(
+        `INSERT INTO claim_change_log_prune_state (id, enabled, consumed_watermark)
+         VALUES (1, 1, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             enabled = 1,
+             consumed_watermark = MAX(consumed_watermark, excluded.consumed_watermark)`,
+    ).run(consumedWatermark);
+    try {
+        // Row counts come from pre-delete SELECTs: the sqlite adapters do not
+        // all report per-statement change counts reliably.
+        const prunedOutboxRows = (
+            db
+                .prepare("SELECT COUNT(*) AS count FROM claim_change_outbox WHERE id <= ?")
+                .get(consumedWatermark) as { count: number }
+        ).count;
+        db.prepare("DELETE FROM claim_change_outbox WHERE id <= ?").run(consumedWatermark);
+        const fullyConsumedOperations = `
+            SELECT id FROM claim_operations
+             WHERE expected_effect_count > 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM claim_change_outbox
+                    WHERE claim_change_outbox.operation_id = claim_operations.id
+               )`;
+        const prunedOperationRows = (
+            db.prepare(`SELECT COUNT(*) AS count FROM (${fullyConsumedOperations})`).get() as {
+                count: number;
+            }
+        ).count;
+        db.prepare(`DELETE FROM claim_operations WHERE id IN (${fullyConsumedOperations})`).run();
+        return { prunedOutboxRows, prunedOperationRows };
+    } finally {
+        db.prepare("UPDATE claim_change_log_prune_state SET enabled = 0 WHERE id = 1").run();
+    }
+}
+
+/**
+ * Predicate over a `memories`-shaped row alias: true when the row carries
+ * relationship lineage — a supersession pointer or a nonblank merged_from.
+ * COALESCE(TRIM(...), '') folds NULL, empty, and whitespace-only merged_from
+ * into "no lineage". Single source of truth for the relationship guard
+ * triggers here and the backfill lineage scans.
+ */
+export function memoryLineagePresentSql(alias: string): string {
+    return `(${alias}.superseded_by_memory_id IS NOT NULL OR COALESCE(TRIM(${alias}.merged_from), '') <> '')`;
+}
+
+/**
+ * Condition matching a `claim_memory_relationship_sources` snapshot row to
+ * the aliased `memories` row's current lineage state. IS comparisons keep
+ * NULL lineage columns comparable, so a row whose exact
+ * (merged_from, superseded_by_memory_id) preimage is snapshotted satisfies
+ * the condition. The subquery aliases the sources table as `source`; callers
+ * must not bind that alias to the outer row.
+ */
+export function memoryRelationshipSourceMatchSql(alias: string): string {
+    return `EXISTS (
+        SELECT 1 FROM claim_memory_relationship_sources source
+         WHERE source.memory_id = ${alias}.id
+           AND source.merged_from IS ${alias}.merged_from
+           AND source.superseded_by_memory_id IS ${alias}.superseded_by_memory_id
+    )`;
 }
 
 /**
@@ -404,13 +560,8 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
 
     CREATE TRIGGER memories_claims_relationship_delete_guard
     BEFORE DELETE ON memories
-    WHEN (OLD.superseded_by_memory_id IS NOT NULL OR COALESCE(TRIM(OLD.merged_from), '') <> '')
-      AND NOT EXISTS (
-          SELECT 1 FROM claim_memory_relationship_sources
-           WHERE memory_id = OLD.id
-             AND merged_from IS OLD.merged_from
-             AND superseded_by_memory_id IS OLD.superseded_by_memory_id
-      )
+    WHEN ${memoryLineagePresentSql("OLD")}
+      AND NOT ${memoryRelationshipSourceMatchSql("OLD")}
     BEGIN SELECT RAISE(ABORT, 'memory relationships require translation before delete'); END;
 
     CREATE TRIGGER memories_claims_relationship_update_guard
@@ -420,13 +571,8 @@ export function installMemoryClaimsWriteGuards(db: Database): void {
         OR NEW.superseded_by_memory_id IS NOT OLD.superseded_by_memory_id
         OR NEW.merged_from IS NOT OLD.merged_from
     )
-      AND (OLD.superseded_by_memory_id IS NOT NULL OR COALESCE(TRIM(OLD.merged_from), '') <> '')
-      AND NOT EXISTS (
-          SELECT 1 FROM claim_memory_relationship_sources
-           WHERE memory_id = OLD.id
-             AND merged_from IS OLD.merged_from
-             AND superseded_by_memory_id IS OLD.superseded_by_memory_id
-      )
+      AND ${memoryLineagePresentSql("OLD")}
+      AND NOT ${memoryRelationshipSourceMatchSql("OLD")}
     BEGIN SELECT RAISE(ABORT, 'memory relationships require translation before mutation'); END;
 
     CREATE TRIGGER memories_claims_boundary_identity_guard
@@ -498,6 +644,7 @@ export function dropMemoryClaimsCompatObjectsForTests(db: Database): void {
         DROP TABLE IF EXISTS claim_revision_memory_metadata;
         DROP TABLE IF EXISTS legacy_memory_claims;
         DROP TABLE IF EXISTS claim_compatibility_write_state;
+        DROP TABLE IF EXISTS claim_change_log_prune_state;
     `);
     db.prepare("DELETE FROM schema_migrations WHERE version >= 83").run();
     try {

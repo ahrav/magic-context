@@ -173,10 +173,15 @@ function measureScale(workDir: string, scale: number): ScaleMeasurement {
                 VALUES ('v22_legacy_memory_backfill', 'completed');
             `);
             stats = buildCorpus(db, scale);
-            setClaimsBackfillCalibrationForTests({
-                cutoffRows: scale,
-                evidenceDigest: "f".repeat(64),
-            });
+            setClaimsBackfillCalibrationForTests(
+                {
+                    cutoffRows: scale,
+                    evidenceDigest: "f".repeat(64),
+                },
+                // Measurement must force eager conversion above the shipped
+                // ceiling; the ceiling's own justification comes from these runs.
+                { bypassCutoffCeilingForMeasurement: true },
+            );
             const start = performance.now();
             runMigrations(db);
             const elapsed = performance.now() - start;

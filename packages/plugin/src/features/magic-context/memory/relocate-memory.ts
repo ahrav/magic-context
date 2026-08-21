@@ -307,6 +307,13 @@ function moveLinkedMemoryAcrossProjects(
                     effectType: "lifecycle",
                 },
             ];
+            // The inserted copy inherits the source row's merged_from /
+            // superseded_by_memory_id under a fresh id, so no relationship
+            // source exists for it yet. Translating here records that source
+            // row (which the v83 relationship guards check before any later
+            // mutation or delete) and re-links the lineage edges to the
+            // target claim.
+            effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, newRow));
             for (const referencingId of referencingIds) {
                 const referencingRow = readMemoryProjectionRow(db, referencingId);
                 if (referencingRow) {

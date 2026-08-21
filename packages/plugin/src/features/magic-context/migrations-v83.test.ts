@@ -12,6 +12,7 @@ import {
     createMemoryWithClaimsInCurrentTransaction,
     ensureMemoryClaimLinkInCurrentTransaction,
     runInMemoryClaimsWriteTransaction,
+    runMemoryClaimOperationInCurrentTransaction,
 } from "./memory/storage-memory-claims";
 import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
@@ -20,6 +21,7 @@ import {
     APPEND_ONLY_MEMORY_CLAIMS_TABLES,
     CLAIMS_BACKFILL_META_KEYS,
     MEMORY_CLAIMS_COMPAT_TABLES,
+    pruneClaimChangeLogInCurrentTransaction,
 } from "./storage-memory-claims-schema";
 
 function migratedDb(): Database {
@@ -556,6 +558,205 @@ describe("migration v83: memories-to-claims compatibility contract", () => {
                     (memory_id, canonical_memory_id, claim_id, project_id, root_observation_id, created_at)
                  VALUES (999, ?, ?, ?, ?, 1)`,
             ).run(link.memory_id, link.claim_id, link.project_id, link.root_observation_id);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("v83 publishes the revision-metadata hash index and the dedup probe uses it", () => {
+        const db = migratedDb();
+        try {
+            expect(
+                db
+                    .prepare(
+                        "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = 'idx_claim_revision_memory_metadata_hash'",
+                    )
+                    .get(),
+            ).toEqual({ tbl_name: "claim_revision_memory_metadata" });
+            const plan = JSON.stringify(
+                db
+                    .prepare(
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM claim_revision_memory_metadata meta WHERE meta.category = ? AND meta.normalized_hash = ?",
+                    )
+                    .all("CONSTRAINTS", "hash:probe"),
+            );
+            expect(plan).toContain("idx_claim_revision_memory_metadata_hash");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("change-log pruning: plain deletes abort; the prune function removes only consumed rows", () => {
+        const db = migratedDb();
+        try {
+            const seed = (key: string, content: string) =>
+                runInMemoryClaimsWriteTransaction(db, () =>
+                    createMemoryWithClaimsInCurrentTransaction(
+                        db,
+                        {
+                            producer: "v83-prune",
+                            operationKey: key,
+                            requestDigest: "c".repeat(64),
+                        },
+                        {
+                            projectPath: "git:v83-prune",
+                            category: "CONSTRAINTS",
+                            content,
+                            normalizedHash: `hash:${content}`,
+                        },
+                    ),
+                );
+            const first = seed("prune-seed-1", "prune seed one");
+            seed("prune-seed-2", "prune seed two");
+            const claimId = first.result.claimId as number;
+            const projectId = (
+                db.prepare("SELECT project_id AS id FROM claims WHERE id = ?").get(claimId) as {
+                    id: number;
+                }
+            ).id;
+            // A third operation carrying two effects, so one effect can sit
+            // above the watermark while the other is consumed.
+            db.transaction(() =>
+                runMemoryClaimOperationInCurrentTransaction(
+                    db,
+                    {
+                        producer: "v83-prune",
+                        operationKey: "straddle",
+                        requestDigest: "1".repeat(64),
+                    },
+                    () => ({
+                        result: null,
+                        effects: [
+                            {
+                                effectKey: "straddle:one",
+                                projectId,
+                                claimId,
+                                effectType: "evidence" as const,
+                            },
+                            {
+                                effectKey: "straddle:two",
+                                projectId,
+                                claimId,
+                                effectType: "evidence" as const,
+                            },
+                        ],
+                    }),
+                ),
+            ).immediate();
+            // A zero-effect operation: its envelope is the only replay record
+            // for that key, so pruning never removes it.
+            db.transaction(() =>
+                runMemoryClaimOperationInCurrentTransaction(
+                    db,
+                    {
+                        producer: "v83-prune",
+                        operationKey: "no-effects",
+                        requestDigest: "2".repeat(64),
+                    },
+                    () => ({ result: null, effects: [] }),
+                ),
+            ).immediate();
+
+            const outboxIds = (
+                db.prepare("SELECT id FROM claim_change_outbox ORDER BY id").all() as Array<{
+                    id: number;
+                }>
+            ).map((row) => row.id);
+            expect(outboxIds).toHaveLength(4);
+            const straddleOpId = (
+                db
+                    .prepare("SELECT id FROM claim_operations WHERE operation_key = 'straddle'")
+                    .get() as { id: number }
+            ).id;
+            const prune = (watermark: number) =>
+                db
+                    .transaction(() => pruneClaimChangeLogInCurrentTransaction(db, watermark))
+                    .immediate();
+
+            // Without the prune capability every delete aborts.
+            expect(() => db.prepare("DELETE FROM claim_change_outbox").run()).toThrow(
+                /append-only/,
+            );
+            expect(() => db.prepare("DELETE FROM claim_operations").run()).toThrow(/append-only/);
+
+            // Watermark covers the first three effects: the two fully
+            // consumed operations go; the straddle operation keeps its
+            // remaining effect and survives.
+            const watermark = outboxIds[2] as number;
+            expect(prune(watermark)).toEqual({ prunedOutboxRows: 3, prunedOperationRows: 2 });
+            expect(
+                (
+                    db.prepare("SELECT id FROM claim_change_outbox ORDER BY id").all() as Array<{
+                        id: number;
+                    }>
+                ).map((row) => row.id),
+            ).toEqual([outboxIds[3] as number]);
+            expect(
+                (
+                    db
+                        .prepare("SELECT operation_key AS key FROM claim_operations ORDER BY id")
+                        .all() as Array<{ key: string }>
+                ).map((row) => row.key),
+            ).toEqual(["straddle", "no-effects"]);
+            expect(
+                db
+                    .prepare(
+                        "SELECT enabled, consumed_watermark FROM claim_change_log_prune_state WHERE id = 1",
+                    )
+                    .get(),
+            ).toEqual({ enabled: 0, consumed_watermark: watermark });
+
+            // The capability cleared with the prune scope: a plain delete
+            // still aborts even below the recorded watermark.
+            expect(() => db.prepare("DELETE FROM claim_change_outbox").run()).toThrow(
+                /append-only/,
+            );
+            expect(() =>
+                db.prepare("DELETE FROM claim_operations WHERE operation_key = 'no-effects'").run(),
+            ).toThrow(/append-only/);
+
+            // Even with the capability held, state above the watermark
+            // refuses to leave.
+            db.exec("BEGIN IMMEDIATE");
+            try {
+                db.prepare(
+                    "UPDATE claim_change_log_prune_state SET enabled = 1 WHERE id = 1",
+                ).run();
+                expect(() =>
+                    db.prepare("DELETE FROM claim_change_outbox WHERE id = ?").run(outboxIds[3]),
+                ).toThrow(/consumed watermark/);
+                expect(() =>
+                    db.prepare("DELETE FROM claim_operations WHERE id = ?").run(straddleOpId),
+                ).toThrow(/consumed watermark/);
+            } finally {
+                db.exec("ROLLBACK");
+            }
+
+            // Consuming the final effect releases the straddle operation;
+            // the recorded watermark never regresses; the zero-effect
+            // envelope stays.
+            expect(prune(outboxIds[3] as number)).toEqual({
+                prunedOutboxRows: 1,
+                prunedOperationRows: 1,
+            });
+            expect(prune(1)).toEqual({ prunedOutboxRows: 0, prunedOperationRows: 0 });
+            expect(
+                db
+                    .prepare(
+                        "SELECT consumed_watermark AS watermark FROM claim_change_log_prune_state WHERE id = 1",
+                    )
+                    .get(),
+            ).toEqual({ watermark: outboxIds[3] as number });
+            expect(db.prepare("SELECT COUNT(*) AS count FROM claim_change_outbox").get()).toEqual({
+                count: 0,
+            });
+            expect(
+                (
+                    db.prepare("SELECT operation_key AS key FROM claim_operations").all() as Array<{
+                        key: string;
+                    }>
+                ).map((row) => row.key),
+            ).toEqual(["no-effects"]);
         } finally {
             closeQuietly(db);
         }

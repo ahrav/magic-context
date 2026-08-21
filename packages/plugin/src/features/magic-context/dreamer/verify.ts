@@ -26,8 +26,8 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
-import { sha256Utf8Hex } from "../memory/storage-claims";
 import {
+    computeClaimRequestDigest,
     hasMemoryClaimsCompatSchema,
     runInMemoryClaimsWriteTransaction,
     updateMemoryContentWithClaimsInCurrentTransaction,
@@ -529,7 +529,7 @@ function rewriteMemoryContent(db: Database, memory: Memory, content: string, has
                 {
                     producer: "dreamer-verify",
                     operationKey: `update:${randomUUID()}`,
-                    requestDigest: sha256Utf8Hex(JSON.stringify({ id: memory.id, content, hash })),
+                    requestDigest: computeClaimRequestDigest({ id: memory.id, content, hash }),
                 },
                 { memoryId: memory.id, content, normalizedHash: hash },
             );

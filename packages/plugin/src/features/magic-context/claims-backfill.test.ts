@@ -8,6 +8,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     adoptBoundaryMemoryRowInCurrentTransaction,
+    CLAIMS_BACKFILL_EAGER_CUTOFF_CEILING,
     clearClaimsBackfillFailpoints,
     computeClaimsBackfillEvidenceDigest,
     decideClaimsBackfillMode,
@@ -219,6 +220,33 @@ describe("claims backfill selection and conversion", () => {
         expect(decideClaimsBackfillMode(decisionDb, 2, true).mode).toBe("lazy");
         setClaimsBackfillCalibrationForTests(null);
         expect(decideClaimsBackfillMode(decisionDb, 1, false).mode).toBe("lazy");
+    });
+
+    test("a bare 'git:' project path forces lazy mode under a calibrated policy", () => {
+        const { db } = prepareLegacyDb([{ content: "bare prefix row", projectPath: "git:" }]);
+        setClaimsBackfillCalibrationForTests({ cutoffRows: 1, evidenceDigest: "d".repeat(64) });
+        const decision = decideClaimsBackfillMode(db, 1, false);
+        expect(decision.mode).toBe("lazy");
+        expect(decision.reason).toContain("noncanonical project path");
+    });
+
+    test("a cutoff above the measured lock-budget ceiling is uncalibrated and forces lazy mode", () => {
+        const { db } = prepareLegacyDb([{ content: "ceiling row" }]);
+        setClaimsBackfillCalibrationForTests({
+            cutoffRows: CLAIMS_BACKFILL_EAGER_CUTOFF_CEILING + 1,
+            evidenceDigest: "e".repeat(64),
+        });
+        const rejected = decideClaimsBackfillMode(db, 1, false);
+        expect(rejected).toMatchObject({
+            mode: "lazy",
+            calibrationDigest: "none",
+            reason: "no calibration evidence",
+        });
+        setClaimsBackfillCalibrationForTests({
+            cutoffRows: CLAIMS_BACKFILL_EAGER_CUTOFF_CEILING,
+            evidenceDigest: "e".repeat(64),
+        });
+        expect(decideClaimsBackfillMode(db, 1, false).mode).toBe("eager");
     });
 
     test("invalid legacy metadata enters the same bounded blocked lane in lazy and forced-eager modes", async () => {
@@ -570,6 +598,89 @@ describe("claims backfill batching and recovery", () => {
         expect(retry.before.phase).toBe("blocked");
         expect(retry.after.phase).toBe("complete");
         expect((await doctorRetryClaimsBackfill(db)).summary).toBeNull();
+    });
+});
+
+describe("claims backfill boundary scoping and blocked-state gating", () => {
+    test("an above-boundary blocking failure never gates completion but stays on the repair surface", async () => {
+        const { db } = migrateLazy([{ content: "boundary row" }]);
+        const boundary = getClaimsBackfillStatus(db).boundaryMemoryId;
+        const insertFailure = db.prepare(
+            `INSERT INTO claim_backfill_failures
+                (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
+             VALUES (?, ?, ?, ?, '', 'blocking', 1, 1)`,
+        );
+        insertFailure.run("rows", "memory", String(boundary + 1), "unresolved-project-identity");
+        insertFailure.run(
+            "relationships",
+            "lineage",
+            `memory:${boundary + 2}:relations:${"d".repeat(64)}:merged-from:0`,
+            "dangling-lineage",
+        );
+
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
+
+        const status = getClaimsBackfillStatus(db, { includeProblems: true });
+        expect(status.state).toBe("complete");
+        expect(status.blockingFailures).toBe(2);
+        expect(listClaimsBackfillFailures(db, { dispositions: ["blocking"] })).toHaveLength(2);
+    });
+
+    test("a persistently blocked checkpoint skips the full re-scan while the failure set is unchanged", async () => {
+        const { db } = migrateLazy([{ content: "blocked row", category: "" }]);
+        const first = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(first.status).toBe("blocked");
+        expect(getClaimsBackfillStatus(db).phase).toBe("blocked");
+
+        const second = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(second.status).toBe("blocked");
+        expect(second.batches).toBe(0);
+        expect(second.rowsAdopted).toBe(0);
+        expect(second.phaseAfter).toBe("blocked");
+        expect(second.problems.join("\n")).toContain("unchanged since the last blocked run");
+        expect(getClaimsBackfillStatus(db).phase).toBe("blocked");
+    });
+
+    test("waiving the blocking failure changes the digest and the next start resets and completes", async () => {
+        const { db } = migrateLazy([{ content: "lineage row", mergedFrom: "[999]" }]);
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(
+            "blocked",
+        );
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).batches).toBe(0);
+
+        const [failure] = listClaimsBackfillFailures(db, { dispositions: ["blocking"] });
+        expect(
+            recordClaimsBackfillWarningDisposition(db, failure.id, "legacy source reviewed"),
+        ).toEqual({ updated: true });
+
+        const resumed = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(resumed.status).toBe("complete-with-warnings");
+        expect(resumed.batches).toBeGreaterThan(0);
+        expect(getClaimsBackfillStatus(db).phase).toBe("complete");
+    });
+
+    test("doctor retry forces the reset past an unchanged blocked digest", async () => {
+        const { db, ids } = migrateLazy([{ content: "repairable row", category: "" }]);
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(
+            "blocked",
+        );
+
+        // Repairing the source row leaves the failure surface untouched, so
+        // the automatic start still skips; the operator escape is the forced
+        // doctor retry.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET category = 'CONSTRAINTS' WHERE id = ?").run(ids[0]);
+        });
+        const skipped = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(skipped.status).toBe("blocked");
+        expect(skipped.batches).toBe(0);
+
+        const retry = await doctorRetryClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(retry.summary?.status).toBe("complete");
+        expect(retry.after.state).toBe("complete");
+        expect(listClaimsBackfillFailures(db, { dispositions: ["blocking"] })).toHaveLength(0);
     });
 });
 

@@ -417,9 +417,34 @@ export class MemoryClaimsStatsIntegrityError extends Error {
 }
 
 /**
+ * Prefixes that mark a `memories.project_path` as a canonical claims project
+ * identity. Canonicality requires a nonempty suffix after the prefix: a bare
+ * `git:`/`dir:` carries no identity payload. Single source of truth for
+ * `resolveMemoryClaimProjectInCurrentTransaction` and the SQL twin
+ * `canonicalMemoryProjectPathSql`, so the TS resolver and SQL gates cannot
+ * drift.
+ */
+export const CANONICAL_MEMORY_PROJECT_PATH_PREFIXES = ["git:", "dir:"] as const;
+
+/**
+ * SQL predicate over a `project_path` column expression: true exactly when
+ * the resolver's canonical-shape check accepts the path (known prefix plus a
+ * nonempty suffix). Derived from `CANONICAL_MEMORY_PROJECT_PATH_PREFIXES` —
+ * the same list the TS resolver consumes.
+ */
+export function canonicalMemoryProjectPathSql(column: string): string {
+    const branches = CANONICAL_MEMORY_PROJECT_PATH_PREFIXES.map(
+        (prefix) => `(${column} LIKE '${prefix}%' AND length(${column}) > ${prefix.length})`,
+    );
+    return `(${branches.join(" OR ")})`;
+}
+
+/**
  * Resolve a legacy `project_path` to the numeric claims project. A canonical
  * identity registers on demand; a raw path that never rekeyed stays
- * unresolved (null) and belongs to the v22 repair lane.
+ * unresolved (null) and belongs to the v22 repair lane. The canonical-shape
+ * check derives from `CANONICAL_MEMORY_PROJECT_PATH_PREFIXES`; SQL callers
+ * use `canonicalMemoryProjectPathSql` over the same list.
  */
 export function resolveMemoryClaimProjectInCurrentTransaction(
     db: Database,
@@ -428,8 +453,9 @@ export function resolveMemoryClaimProjectInCurrentTransaction(
     const existing = resolveProjectId(db, projectPath);
     if (existing !== null) return existing;
     if (
-        (projectPath.startsWith("git:") || projectPath.startsWith("dir:")) &&
-        projectPath.length > "git:".length
+        CANONICAL_MEMORY_PROJECT_PATH_PREFIXES.some(
+            (prefix) => projectPath.startsWith(prefix) && projectPath.length > prefix.length,
+        )
     ) {
         return ensureProjectInCurrentTransaction(db, projectPath);
     }
@@ -2127,14 +2153,13 @@ export interface CurrentMemoryClaim {
     sourceType: string;
     expiresAt: number | null;
     metadataJson: string | null;
-    revisionCreatedAt: number;
 }
 
 const CURRENT_MEMORY_CLAIM_SELECT = `
     SELECT lmc.memory_id AS memoryId, lmc.canonical_memory_id AS canonicalMemoryId,
            lmc.claim_id AS claimId, lmc.project_id AS projectId, claims.state AS state,
            rev.id AS revisionId, rev.revision AS revision, rev.content AS content,
-           rev.content_sha256 AS contentSha256, rev.created_at AS revisionCreatedAt,
+           rev.content_sha256 AS contentSha256,
            meta.category AS category, meta.normalized_hash AS normalizedHash,
            meta.importance AS importance, meta.memory_scope AS memoryScope,
            meta.shareable AS shareable, meta.source_type AS sourceType,

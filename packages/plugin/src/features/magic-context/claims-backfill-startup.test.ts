@@ -134,4 +134,36 @@ describe("runClaimsBackfillStartup", () => {
         expect({ v22Runs, claimRuns }).toEqual({ v22Runs: 0, claimRuns: 1 });
         expect(messages.join("\n")).toContain("rows adopted this run: 1");
     });
+
+    test("repeat startups over an unchanged blocked corpus skip the full re-scan", async () => {
+        const db = database(false);
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS schema_migrations_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT OR REPLACE INTO schema_migrations_meta (key, value)
+            VALUES ('v22_legacy_memory_backfill', 'completed');
+        `);
+        // A raw project path never resolves, so the lazy runner blocks.
+        db.prepare(
+            `INSERT INTO memories
+                (project_path, category, content, normalized_hash,
+                 first_seen_at, created_at, updated_at, last_seen_at)
+             VALUES ('raw-legacy-path', 'CONSTRAINTS', 'blocked row', 'blocked-hash', 1, 1, 1, 1)`,
+        ).run();
+        runMigrations(db);
+
+        const first = await runClaimsBackfillStartup(db, { log: () => {} });
+        expect(first.summary?.status).toBe("blocked");
+        expect(first.summary?.batches).toBeGreaterThan(0);
+
+        const messages: string[] = [];
+        const second = await runClaimsBackfillStartup(db, {
+            log: (message) => messages.push(message),
+        });
+        expect(second.summary?.status).toBe("blocked");
+        expect(second.summary?.batches).toBe(0);
+        expect(messages.join("\n")).toContain("--retry-claims-backfill");
+    });
 });

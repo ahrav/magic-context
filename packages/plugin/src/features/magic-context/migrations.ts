@@ -2,6 +2,7 @@ import { extractTiersFromInner } from "../../hooks/magic-context/compartment-par
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
+    CLAIMS_BACKFILL_MODE_REASON_META_KEY,
     decideClaimsBackfillMode,
     hitClaimsMigrationFailpoint,
     runEagerClaimsBackfillInMigrationTransaction,
@@ -3198,6 +3199,10 @@ export const MIGRATIONS: Migration[] = [
             const decision = decideClaimsBackfillMode(db, corpus.count, v22Pending);
             writeMeta.run(CLAIMS_BACKFILL_META_KEYS.mode, decision.mode);
             writeMeta.run(CLAIMS_BACKFILL_META_KEYS.calibrationDigest, decision.calibrationDigest);
+            // The reason persists to meta so the doctor status can surface it
+            // long after the migration log line scrolls away.
+            writeMeta.run(CLAIMS_BACKFILL_MODE_REASON_META_KEY, decision.reason);
+            log(`[migrations] v83: claims backfill mode ${decision.mode}: ${decision.reason}`);
             if (decision.mode === "empty") {
                 // An empty corpus completes synchronously in the migration
                 // (R7): there is nothing to convert, so the completion

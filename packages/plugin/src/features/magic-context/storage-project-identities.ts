@@ -395,13 +395,59 @@ export function applyIdentityMergeToProjectRegistry(
     }
 
     // Only a true two-project merge would repoint children across numeric ids;
-    // that is unsupported while the source owns authoritative history.
-    const ownsChildren = db
-        .prepare(
-            `SELECT EXISTS (SELECT 1 FROM episodes WHERE project_id = ?)
-                 OR EXISTS (SELECT 1 FROM claims WHERE project_id = ?) AS owns`,
-        )
-        .get(sourceId, sourceId) as { owns: number };
+    // that is unsupported while the source owns authoritative history. The
+    // memories-compatibility mirror is not authoritative on its own: claims
+    // referenced by the legacy_memory_claims crosswalk shadow `memories`
+    // rows, which the identity merge relocates itself, and the episodes
+    // minted by that adoption carry only crosswalk root observations and
+    // revision evidence for crosswalked claims. A bare episode (one without
+    // observations, or with an observation outside the crosswalk) and a
+    // non-crosswalked claim are authoritative and still refuse the merge.
+    // Without the crosswalk table every episode or claim is authoritative.
+    const hasCrosswalk = tableExists(db, "legacy_memory_claims");
+    const ownsChildren = (
+        hasCrosswalk
+            ? db.prepare(
+                  `SELECT EXISTS (
+                       SELECT 1 FROM episodes e
+                        WHERE e.project_id = ?
+                          AND (
+                              NOT EXISTS (
+                                  SELECT 1 FROM source_spans s
+                                   JOIN observations o ON o.source_span_id = s.id
+                                  WHERE s.episode_id = e.id
+                              )
+                              OR EXISTS (
+                                  SELECT 1 FROM source_spans s
+                                   JOIN observations o ON o.source_span_id = s.id
+                                  WHERE s.episode_id = e.id
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM legacy_memory_claims lmc
+                                         WHERE lmc.root_observation_id = o.id
+                                    )
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM claim_evidence ce
+                                         JOIN claim_revisions rev ON rev.id = ce.revision_id
+                                         JOIN legacy_memory_claims lmc ON lmc.claim_id = rev.claim_id
+                                        WHERE ce.observation_id = o.id
+                                    )
+                              )
+                          )
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM claims c
+                        WHERE c.project_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM legacy_memory_claims lmc
+                               WHERE lmc.claim_id = c.id
+                          )
+                   ) AS owns`,
+              )
+            : db.prepare(
+                  `SELECT EXISTS (SELECT 1 FROM episodes WHERE project_id = ?)
+                       OR EXISTS (SELECT 1 FROM claims WHERE project_id = ?) AS owns`,
+              )
+    ).get(sourceId, sourceId) as { owns: number };
     if (ownsChildren.owns === 1) {
         throw new Error(
             `Refusing identity merge: source project ${sourceId} (${boundedIdentityList([fromIdentity])}) owns authoritative episodes or claims. Full authoritative project merging is not supported yet.`,
@@ -412,5 +458,35 @@ export function applyIdentityMergeToProjectRegistry(
         targetId,
         sourceId,
     );
-    db.prepare("DELETE FROM projects WHERE id = ?").run(sourceId);
+
+    // Mirror history is immutable at the database boundary — the crosswalk,
+    // episodes, and outbox are append-only and claims.project_id is frozen by
+    // the semantic-freeze trigger — and each of those tables references
+    // projects(id) ON DELETE RESTRICT. A source that owns such history keeps
+    // its projects row as an inert tombstone: every alias now resolves to the
+    // target, so no identity routes new work to the retired numeric id. A
+    // source with no claim-graph rows is deleted outright.
+    const ownsMirrorHistory =
+        hasCrosswalk &&
+        (
+            db
+                .prepare(
+                    `SELECT EXISTS (SELECT 1 FROM episodes WHERE project_id = ?)
+                         OR EXISTS (SELECT 1 FROM claims WHERE project_id = ?)
+                         OR EXISTS (SELECT 1 FROM legacy_memory_claims WHERE project_id = ?)
+                         OR EXISTS (
+                             SELECT 1 FROM claim_merge_lineage
+                              WHERE source_project_id = ? OR target_project_id = ?
+                         )
+                         OR EXISTS (SELECT 1 FROM claim_change_outbox WHERE project_id = ?)
+                         OR EXISTS (SELECT 1 FROM claim_project_generations WHERE project_id = ?)
+                         AS owns`,
+                )
+                .get(sourceId, sourceId, sourceId, sourceId, sourceId, sourceId, sourceId) as {
+                owns: number;
+            }
+        ).owns === 1;
+    if (!ownsMirrorHistory) {
+        db.prepare("DELETE FROM projects WHERE id = ?").run(sourceId);
+    }
 }

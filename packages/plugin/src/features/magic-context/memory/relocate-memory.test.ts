@@ -12,6 +12,7 @@ import {
 import { insertMemory } from "./storage-memory";
 import {
     getCurrentMemoryClaimByLegacyMemoryId,
+    memoryClaimSupersessionExists,
     readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
 } from "./storage-memory-claims";
@@ -266,6 +267,68 @@ describe("relocate-memory claims (v83)", () => {
         expect(database.prepare("SELECT COUNT(*) AS c FROM claim_merge_lineage").get()).toEqual({
             c: 2,
         });
+    });
+
+    test("a cross-project move translates the moved row's inherited lineage", () => {
+        const database = makeDb();
+        const lineageSource = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "lineage source fact",
+        });
+        const moving = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "lineage carrier fact",
+        });
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET merged_from = ? WHERE id = ?")
+                .run(JSON.stringify([lineageSource.id]), moving.id);
+        });
+        // The target numeric project must exist for the authorized move path.
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [moving.id], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const moved = database
+            .prepare(
+                "SELECT id, merged_from FROM memories WHERE project_path = 'git:project-b' AND content = 'lineage carrier fact'",
+            )
+            .get() as { id: number; merged_from: string };
+        expect(moved.merged_from).toBe(JSON.stringify([lineageSource.id]));
+        const movedLink = readMemoryClaimLink(database, moved.id);
+        const lineageLink = readMemoryClaimLink(database, lineageSource.id);
+        if (!movedLink || !lineageLink) throw new Error("expected claim links after the move");
+        expect(
+            database
+                .prepare(
+                    "SELECT merged_from, superseded_by_memory_id FROM claim_memory_relationship_sources WHERE memory_id = ?",
+                )
+                .all(moved.id),
+        ).toEqual([
+            {
+                merged_from: JSON.stringify([lineageSource.id]),
+                superseded_by_memory_id: null,
+            },
+        ]);
+        expect(memoryClaimSupersessionExists(database, lineageLink, movedLink)).toBe(true);
+        // The moved row must be mutable: the relationship guard aborts a
+        // lineage-column change unless a matching relationship source exists.
+        expect(() =>
+            runInMemoryClaimsWriteTransaction(database, () => {
+                database
+                    .prepare("UPDATE memories SET merged_from = NULL WHERE id = ?")
+                    .run(moved.id);
+            }),
+        ).not.toThrow();
     });
 
     test("copying creates a target claim for each fresh row and leaves the source intact", () => {

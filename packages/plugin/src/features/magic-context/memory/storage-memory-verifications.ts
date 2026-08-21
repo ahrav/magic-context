@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
-import { sha256Utf8Hex } from "./storage-claims";
 import {
+    computeClaimRequestDigest,
     hasMemoryClaimsCompatSchema,
     replaceMemoryVerificationFilesWithClaimsInCurrentTransaction,
     runInMemoryClaimsWriteTransaction,
@@ -58,7 +58,7 @@ export function recordMemoryMapping(
                 {
                     producer: "storage-memory-verifications",
                     operationKey: `map:${randomUUID()}`,
-                    requestDigest: sha256Utf8Hex(JSON.stringify({ memoryId, realFiles, now })),
+                    requestDigest: computeClaimRequestDigest({ memoryId, realFiles, now }),
                 },
                 { memoryId, files: realFiles, now, verified: false },
             ),
@@ -95,7 +95,7 @@ export function recordMemoryVerifications(
                 {
                     producer: "storage-memory-verifications",
                     operationKey: `verify:${randomUUID()}`,
-                    requestDigest: sha256Utf8Hex(JSON.stringify({ memoryId, realFiles, now })),
+                    requestDigest: computeClaimRequestDigest({ memoryId, realFiles, now }),
                 },
                 { memoryId, files: realFiles, now, verified: true },
             ),

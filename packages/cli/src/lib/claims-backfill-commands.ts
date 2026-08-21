@@ -65,13 +65,19 @@ export function renderClaimsBackfillStatus(
             `linked=${status.linkedBoundaryRows}/${status.expectedRowCount}; boundary=${status.boundaryMemoryId}; ` +
             `blocking=${status.blockingFailures}; warnings=${status.warningFailures}; v22=${status.v22Takeover}`,
     );
+    harness.log.info(
+        `mode decision: ${status.modeDecisionReason ?? "unrecorded"}; calibration digest: ${status.calibrationDigest ?? "none"}`,
+    );
     if (status.state === "complete" || status.state === "complete-with-warnings") {
         harness.log.info(
             `reconciliation version ${status.reconciliationVersion}; final outbox watermark ${status.finalOutboxWatermark}`,
         );
     }
     for (const problem of status.problems) harness.log.warn(`reconciliation: ${problem}`);
-    if (status.state === "blocked" || status.state === "pending") {
+    // blockingFailures > 0 with a complete state means above-boundary
+    // diagnostics that only live writers can repair: they never gate
+    // completion but must stay visible to the operator.
+    if (status.state === "blocked" || status.state === "pending" || status.blockingFailures > 0) {
         for (const failure of listClaimsBackfillFailures(db, { limit: 10 })) {
             harness.log.warn(
                 `failure #${failure.id} [${failure.disposition}] ${failure.phase}/${failure.itemKind} ${failure.itemKey}: ${failure.reasonCode}`,

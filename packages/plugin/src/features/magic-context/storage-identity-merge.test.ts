@@ -389,53 +389,165 @@ describe("project identity merge", () => {
 });
 
 describe("project identity merge claims (v83)", () => {
-    test("a true two-project merge with claims fails before changing aliases, rows, or generations", () => {
+    function aliasProjectId(database: Database, identity: string): number {
+        return (
+            database
+                .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
+                .get(identity) as { id: number }
+        ).id;
+    }
+
+    test("a true two-project merge relocates memories and keeps mirror claim history consistent", () => {
+        const database = makeDb();
+        const movedSource = insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "source-only fact",
+        });
+        const collidingSource = insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const collidingTarget = insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const sourceProjectId = aliasProjectId(database, "git:source");
+        const targetProjectId = aliasProjectId(database, "git:target");
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 77 });
+
+        // The unique memory moves to the target identity with its claim link
+        // alive; the colliding memory archives in place under the survivor.
+        expect(
+            database
+                .prepare("SELECT project_path, status FROM memories WHERE id = ?")
+                .get(movedSource.id),
+        ).toEqual({ project_path: "git:target", status: "active" });
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(collidingSource.id),
+        ).toEqual({ status: "archived", by: collidingTarget.id });
+
+        // Both identities resolve to the target project.
+        expect(aliasProjectId(database, "git:source")).toBe(targetProjectId);
+        expect(aliasProjectId(database, "git:target")).toBe(targetProjectId);
+
+        // The source projects row survives as the owner of its immutable
+        // mirror history (append-only crosswalk/episodes, frozen claim
+        // project ids), so no claim-graph row dangles.
+        expect(
+            database
+                .prepare("SELECT canonical_identity AS c FROM projects WHERE id = ?")
+                .get(sourceProjectId),
+        ).toEqual({ c: "git:source" });
+        expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claims c
+                      LEFT JOIN projects p ON p.id = c.project_id
+                     WHERE p.id IS NULL`,
+                )
+                .get(),
+        ).toEqual({ count: 0 });
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM legacy_memory_claims lmc
+                      LEFT JOIN projects p ON p.id = lmc.project_id
+                     WHERE p.id IS NULL`,
+                )
+                .get(),
+        ).toEqual({ count: 0 });
+
+        // The moved memory's claim link still resolves to its active claim.
+        const movedClaim = getCurrentMemoryClaimByLegacyMemoryId(database, movedSource.id);
+        expect(movedClaim?.state).toBe("active");
+        expect(movedClaim?.content).toBe("source-only fact");
+
+        // The colliding source claim retires with cross-project lineage.
+        const collidingClaimId = (
+            database
+                .prepare("SELECT claim_id AS id FROM legacy_memory_claims WHERE memory_id = ?")
+                .get(collidingSource.id) as { id: number }
+        ).id;
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(collidingClaimId),
+        ).toEqual({ state: "archived" });
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_merge_lineage
+                      WHERE source_project_id = ? AND target_project_id = ?`,
+                )
+                .get(sourceProjectId, targetProjectId),
+        ).toEqual({ count: 1 });
+    });
+
+    test("still refuses a two-project merge when the source owns an authoritative episode", () => {
         const database = makeDb();
         insertMemoryThroughKernel(database, {
             projectPath: "git:source",
             category: "CONSTRAINTS",
-            content: "source claimed fact",
+            content: "mirrored fact",
         });
         insertMemoryThroughKernel(database, {
             projectPath: "git:target",
             category: "CONSTRAINTS",
-            content: "target claimed fact",
+            content: "target fact",
         });
-        const snapshot = () =>
-            JSON.stringify({
-                aliases: database
-                    .prepare(
-                        "SELECT alias_identity, project_id FROM project_aliases ORDER BY alias_identity",
-                    )
-                    .all(),
-                projects: database
-                    .prepare("SELECT id, canonical_identity FROM projects ORDER BY id")
-                    .all(),
-                memories: database
-                    .prepare("SELECT id, project_path, status FROM memories ORDER BY id")
-                    .all(),
-                generations: database
-                    .prepare(
-                        "SELECT project_id, generation FROM claim_project_generations ORDER BY project_id",
-                    )
-                    .all(),
-                claims: database
-                    .prepare("SELECT id, project_id, state FROM claims ORDER BY id")
-                    .all(),
-            });
-        const before = snapshot();
+        const sourceProjectId = aliasProjectId(database, "git:source");
+        // A bare episode carries no observations, so it cannot be the
+        // memories-compatibility mirror; it is authoritative history even
+        // while mirror claims and adoption episodes coexist beside it.
+        database
+            .prepare("INSERT INTO episodes (project_id, created_at) VALUES (?, 1)")
+            .run(sourceProjectId);
 
         expect(() => mergeProjectIdentities(database, "git:source", "git:target")).toThrow(
             /authoritative episodes or claims/,
         );
 
-        expect(snapshot()).toBe(before);
+        // The rolled-back merge leaves rows and aliases untouched.
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS count FROM memories WHERE project_path = 'git:source'")
+                .get(),
+        ).toEqual({ count: 1 });
+        expect(aliasProjectId(database, "git:source")).toBe(sourceProjectId);
         expect(database.prepare("SELECT COUNT(*) AS count FROM identity_merge_log").get()).toEqual({
             count: 0,
         });
-        expect(
-            database.prepare("SELECT COUNT(*) AS count FROM v22_identity_rekey_map").get(),
-        ).toEqual({ count: 0 });
+    });
+
+    test("still refuses a two-project merge when the source owns a claim outside the crosswalk", () => {
+        const database = makeDb();
+        insertMemoryThroughKernel(database, {
+            projectPath: "git:source",
+            category: "CONSTRAINTS",
+            content: "mirrored fact",
+        });
+        insertMemoryThroughKernel(database, {
+            projectPath: "git:target",
+            category: "CONSTRAINTS",
+            content: "target fact",
+        });
+        const sourceProjectId = aliasProjectId(database, "git:source");
+        database
+            .prepare(
+                `INSERT INTO claims (project_id, subject, predicate, scope, created_at)
+                 VALUES (?, 'edge:1', 'states', 'authoritative', 1)`,
+            )
+            .run(sourceProjectId);
+
+        expect(() => mergeProjectIdentities(database, "git:source", "git:target")).toThrow(
+            /authoritative episodes or claims/,
+        );
+        expect(aliasProjectId(database, "git:source")).toBe(sourceProjectId);
     });
 
     test("in-place dir: to git: adoption retains the numeric project and claims", () => {

@@ -465,6 +465,9 @@ describe("doctor claims backfill commands", () => {
         expect(readonlyFlags).toEqual([true]);
         expect(messages.join("\n")).toContain("claims backfill status: blocked");
         expect(messages.join("\n")).toContain(
+            "mode decision: empty corpus; calibration digest: none",
+        );
+        expect(messages.join("\n")).toContain(
             "Repair with: magic-context doctor --retry-claims-backfill",
         );
         expect(
@@ -497,9 +500,12 @@ describe("doctor claims backfill commands", () => {
 
     it("blocked retry exits 1 and malformed waiver ids are rejected exactly", async () => {
         const database = makeDb();
+        // The boundary meta places failure item 999 inside the boundary
+        // corpus: only boundary-scoped blocking failures gate completion.
         database.exec(`
             UPDATE schema_migrations_meta SET value = 'blocked' WHERE key = 'claims_backfill_phase';
             UPDATE schema_migrations_meta SET value = 'none' WHERE key = 'claims_backfill_v22_takeover';
+            UPDATE schema_migrations_meta SET value = '999' WHERE key = 'claims_backfill_boundary_memory_id';
             INSERT INTO claim_backfill_failures
                 (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
             VALUES ('rows', 'memory', '999', 'unresolved-project-identity', '', 'blocking', 1, 1);

@@ -10,7 +10,10 @@ import {
 } from "./memory/project-identity";
 import { rekeyMemoryRowWithCollisionMerge } from "./memory/relocate-memory";
 import { effectiveSeenCountSql } from "./memory/storage-memory";
-import { withClaimsWriteCapabilityInCurrentTransaction } from "./memory/storage-memory-claims";
+import {
+    hasMemoryClaimsCompatSchema,
+    withClaimsWriteCapabilityInCurrentTransaction,
+} from "./memory/storage-memory-claims";
 import { CLAIMS_BACKFILL_META_KEYS } from "./storage-memory-claims-schema";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 
@@ -79,16 +82,6 @@ function writeMeta(db: Database, key: string, value: string): void {
 function parseCursor(value: string | null): number {
     const parsed = Number.parseInt(value ?? "0", 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-}
-
-function claimsGuarded(db: Database): boolean {
-    return Boolean(
-        db
-            .prepare(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_compatibility_write_state'",
-            )
-            .get(),
-    );
 }
 
 function countFailures(db: Database): number {
@@ -195,7 +188,7 @@ function updateFinalBackfillStatus(db: Database): V22BackfillStatus {
     const status: V22BackfillStatus = failureCount > 0 ? "completed_with_failures" : "completed";
     db.transaction(() => {
         writeMeta(db, BACKFILL_META_KEY, status);
-        if (claimsGuarded(db)) {
+        if (hasMemoryClaimsCompatSchema(db)) {
             writeMeta(
                 db,
                 CLAIMS_BACKFILL_META_KEYS.v22Takeover,
@@ -344,7 +337,7 @@ export async function runDeferredV22Backfill(
 
                 writeMeta(db, BACKFILL_CURSOR_META_KEY, String(finalCursor));
             };
-            if (claimsGuarded(db)) {
+            if (hasMemoryClaimsCompatSchema(db)) {
                 withClaimsWriteCapabilityInCurrentTransaction(db, applyBatch);
             } else {
                 applyBatch();

@@ -63,9 +63,9 @@ import {
 	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
 import type { MemoryClaimOperationIdentity } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
+	computeClaimRequestDigest,
 	hasMemoryClaimsCompatSchema,
 	readMemoryClaimOperationResult,
 	updateMemoryContentWithClaimsInCurrentTransaction,
@@ -298,9 +298,11 @@ function updateMemoryContentInCurrentTransaction(
 						operationIdentity?.operationKey ?? `update:${crypto.randomUUID()}`,
 					requestDigest:
 						operationIdentity?.requestDigest ??
-						sha256Utf8Hex(
-							JSON.stringify({ id: memory.id, content, normalizedHash }),
-						),
+						computeClaimRequestDigest({
+							id: memory.id,
+							content,
+							normalizedHash,
+						}),
 				},
 				{ memoryId: memory.id, content, normalizedHash },
 			);
@@ -431,7 +433,7 @@ export function createCtxMemoryTool(
 					? {
 							producer: "ctx-memory-pi",
 							operationKey: `${toolCallId}:${suffix}`,
-							requestDigest: sha256Utf8Hex(JSON.stringify(request)),
+							requestDigest: computeClaimRequestDigest(request),
 						}
 					: undefined;
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);

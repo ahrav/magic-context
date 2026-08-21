@@ -4,8 +4,8 @@ import { hasMuralCueColumns, hasMuralCueRejectionCountColumn } from "../mural/st
 import { MEMORY_CATEGORY_ORDER_SQL } from "./constants";
 import { invalidateMemory, invalidateProject } from "./embedding-cache";
 import { computeNormalizedHash } from "./normalize-hash";
-import { sha256Utf8Hex } from "./storage-claims";
 import {
+    computeClaimRequestDigest,
     createMemoryWithClaimsInCurrentTransaction,
     deleteMemoryWithClaimsInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
@@ -808,7 +808,7 @@ function storageMemoryClaimEnvelope(
     return {
         producer: identity?.producer ?? "storage-memory",
         operationKey: identity?.operationKey ?? `${operation}:${randomUUID()}`,
-        requestDigest: identity?.requestDigest ?? sha256Utf8Hex(JSON.stringify(request)),
+        requestDigest: identity?.requestDigest ?? computeClaimRequestDigest(request),
     };
 }
 

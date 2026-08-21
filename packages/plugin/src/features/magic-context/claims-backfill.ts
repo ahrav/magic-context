@@ -20,19 +20,25 @@
  * one short immediate transaction. Busy retries cover the whole batch with
  * bounded backoff; exhausted retries leave the work pending (R9).
  *
- * Completion is one immediate reconciliation transaction backed by
- * expected-count and anti-join oracles — a cursor or count alone never
- * authorizes completion (R11).
+ * Completion stays oracle-backed (R11) but the reconciling phase is batched:
+ * lineage re-translation pages through bounded transactions, the read-only
+ * completion oracle runs outside the write lock, and one short final
+ * immediate transaction re-verifies the decisive conditions (phase unchanged,
+ * zero unlinked boundary rows, zero boundary-scoped blocking failures) before
+ * publishing the completion checkpoint — a cursor or count alone never
+ * authorizes completion.
  */
 
 import type { Database } from "../../shared/sqlite";
 import { addVerificationEvent, sha256Utf8Hex } from "./memory/storage-claims";
 import {
+    canonicalMemoryProjectPathSql,
     computeClaimRequestDigest,
     ensureMemoryClaimLinkInCurrentTransaction,
     findMemoryClaimsCompatCorruption,
     hasMemoryClaimsCompatSchema,
     listMemoryRelationshipSources,
+    type MemoryClaimLink,
     memoryClaimAdoptionFailureReason,
     memoryClaimMetadataFailureReason,
     memoryClaimSupersessionExists,
@@ -52,6 +58,8 @@ import { CLAIMS_AND_EVIDENCE_TABLES } from "./storage-claims-schema";
 import {
     CLAIMS_BACKFILL_META_KEYS,
     MEMORY_CLAIMS_COMPAT_TABLES,
+    memoryLineagePresentSql,
+    memoryRelationshipSourceMatchSql,
 } from "./storage-memory-claims-schema";
 
 export const CLAIMS_BACKFILL_PRODUCER = "claims-backfill";
@@ -123,19 +131,47 @@ export interface ClaimsBackfillCalibratedPolicy {
 export const PRODUCTION_CLAIMS_BACKFILL_POLICY: ClaimsBackfillCalibratedPolicy | null = null;
 
 let policyOverride: ClaimsBackfillCalibratedPolicy | null | undefined;
+let cutoffCeilingBypassForMeasurement = false;
 
 /** Test/benchmark seam: pass null to restore the production policy. */
 export function setClaimsBackfillCalibrationForTests(
     policy: ClaimsBackfillCalibratedPolicy | null,
+    options: {
+        /**
+         * Lets the calibration measurement harness force eager conversion at
+         * scales above the ceiling so the ceiling itself stays evidence-backed.
+         * Production reads only the shipped policy and never sets this.
+         */
+        bypassCutoffCeilingForMeasurement?: boolean;
+    } = {},
 ): void {
     policyOverride = policy ?? undefined;
+    cutoffCeilingBypassForMeasurement =
+        policy !== null && options.bypassCutoffCeilingForMeasurement === true;
 }
 
 export function getActiveClaimsBackfillPolicy(): ClaimsBackfillCalibratedPolicy | null {
     return policyOverride ?? PRODUCTION_CLAIMS_BACKFILL_POLICY;
 }
 
-/** A policy may enable eager mode only with a plausible evidence digest. */
+/**
+ * Hard ceiling on any calibrated eager cutoff. The eager path converts the
+ * whole corpus while holding the v83 migration write lock, and the checked-in
+ * calibration evidence (docs/evidence/claims-backfill/v83-threshold.json)
+ * budgets that lock at 2500ms — 2x margin under the 5s sibling busy_timeout.
+ * The evidence measures a 1K-row corpus at ~660ms worst case and a 10K-row
+ * corpus at ~10.8s, so 1000 is the largest measured scale whose slowest run
+ * fits the budget. A policy claiming a larger cutoff is treated as
+ * uncalibrated and the corpus converts lazily.
+ */
+export const CLAIMS_BACKFILL_EAGER_CUTOFF_CEILING = 1000;
+
+/**
+ * A policy may enable eager mode only with a plausible evidence digest and a
+ * cutoff at or below the measured lock-budget ceiling. The measurement
+ * harness alone may lift the ceiling through its seam option; the shipped
+ * production policy is always ceiling-checked.
+ */
 export function claimsBackfillPolicyIsCalibrated(
     policy: ClaimsBackfillCalibratedPolicy | null,
 ): policy is ClaimsBackfillCalibratedPolicy {
@@ -143,6 +179,8 @@ export function claimsBackfillPolicyIsCalibrated(
         policy !== null &&
         Number.isSafeInteger(policy.cutoffRows) &&
         policy.cutoffRows >= 1 &&
+        (cutoffCeilingBypassForMeasurement ||
+            policy.cutoffRows <= CLAIMS_BACKFILL_EAGER_CUTOFF_CEILING) &&
         /^[0-9a-f]{64}$/.test(policy.evidenceDigest)
     );
 }
@@ -176,6 +214,17 @@ function readIntMeta(db: Database, key: string): number {
     return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
 }
 
+// Meta keys owned by this module, beyond the U2-created contract in
+// CLAIMS_BACKFILL_META_KEYS. The `claims_backfill_` prefix keeps them inside
+// the schema module's test-drop cleanup wildcard.
+
+/** Human-readable reason behind the recorded v83 mode decision (doctor status). */
+export const CLAIMS_BACKFILL_MODE_REASON_META_KEY = "claims_backfill_mode_decision_reason";
+/** Digest of the boundary-scoped blocking failure set at the blocked checkpoint. */
+const CLAIMS_BACKFILL_BLOCKED_DIGEST_META_KEY = "claims_backfill_blocked_failure_digest";
+/** Reconciling-phase lineage re-translation cursor (acceleration only; never completion). */
+const CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY = "claims_backfill_reconcile_cursor";
+
 export type ClaimsBackfillMode = "empty" | "eager" | "lazy";
 export type ClaimsBackfillPhase = "rows" | "relationships" | "reconciling" | "complete" | "blocked";
 
@@ -190,6 +239,7 @@ export interface ClaimsBackfillState {
     reconciliationVersion: string | null;
     finalOutboxWatermark: number;
     calibrationDigest: string | null;
+    modeDecisionReason: string | null;
 }
 
 export function readClaimsBackfillState(db: Database): ClaimsBackfillState {
@@ -204,6 +254,7 @@ export function readClaimsBackfillState(db: Database): ClaimsBackfillState {
         reconciliationVersion: readMeta(db, CLAIMS_BACKFILL_META_KEYS.reconciliationVersion),
         finalOutboxWatermark: readIntMeta(db, CLAIMS_BACKFILL_META_KEYS.finalOutboxWatermark),
         calibrationDigest: readMeta(db, CLAIMS_BACKFILL_META_KEYS.calibrationDigest),
+        modeDecisionReason: readMeta(db, CLAIMS_BACKFILL_MODE_REASON_META_KEY),
     };
 }
 
@@ -228,10 +279,16 @@ function countScalar(db: Database, sql: string, ...params: Array<number | string
  * migration transaction, so any such row forces lazy mode.
  */
 function eagerConversionBlockers(db: Database): string | null {
+    // The canonical-shape predicate is the SQL twin of the resolver's TS
+    // check (canonicalMemoryProjectPathSql, derived from
+    // CANONICAL_MEMORY_PROJECT_PATH_PREFIXES): a row this gate passes is a
+    // row resolveMemoryClaimProjectInCurrentTransaction can resolve, so eager
+    // adoption cannot hit unresolved-project-identity and roll the migration
+    // back.
     const noncanonical = countScalar(
         db,
         `SELECT COUNT(*) AS count FROM memories
-          WHERE project_path NOT LIKE 'git:%' AND project_path NOT LIKE 'dir:%'`,
+          WHERE NOT ${canonicalMemoryProjectPathSql("project_path")}`,
     );
     if (noncanonical > 0) return `${noncanonical} row(s) with a noncanonical project path`;
     const emptyContent = countScalar(
@@ -252,9 +309,8 @@ function eagerConversionBlockers(db: Database): string | null {
     );
     const lineageRows = db
         .prepare(
-            `SELECT id, merged_from, superseded_by_memory_id FROM memories
-              WHERE superseded_by_memory_id IS NOT NULL
-                 OR (merged_from IS NOT NULL AND TRIM(merged_from) <> '')`,
+            `SELECT m.id, m.merged_from, m.superseded_by_memory_id FROM memories m
+              WHERE ${memoryLineagePresentSql("m")}`,
         )
         .all() as Array<{
         id: number;
@@ -370,6 +426,86 @@ function sweepResolvedRowFailures(db: Database): void {
     ).run(Date.now());
 }
 
+/**
+ * Failure rows the boundary backfill can never repair: their item identifies
+ * a memory above the recorded high-water boundary, so only a live writer can
+ * clear them. Rows-phase keys are the memory id itself
+ * (`recordMemoryClaimLinkFailure`); relationship-phase keys embed it as
+ * `memory:<id>:relations:<digest>:...`
+ * (`translateMemoryClaimRelationshipsInCurrentTransaction`), so
+ * `substr(item_key, 8)` skips the 7-character 'memory:' prefix and CAST
+ * reads the leading integer. A failure whose key does not positively parse
+ * above the boundary keeps gating (fail closed). Binds the boundary twice.
+ */
+const ABOVE_BOUNDARY_FAILURE_WHERE = `(
+    (phase = 'rows' AND item_kind = 'memory' AND CAST(item_key AS INTEGER) > ?)
+    OR (phase = 'relationships' AND item_key LIKE 'memory:%'
+        AND CAST(substr(item_key, 8) AS INTEGER) > ?)
+)`;
+
+/**
+ * Failures that gate the boundary corpus. Above-boundary failures stay
+ * visible on the repair surface (status counts, doctor listing) but never
+ * gate completion or phase transitions: nothing in the boundary backfill can
+ * repair them, so gating on them would make completion permanently
+ * unreachable.
+ */
+function countBoundaryFailures(
+    db: Database,
+    dispositions: readonly string[],
+    boundary: number,
+    phase?: FailurePhase,
+): number {
+    const placeholders = dispositions.map(() => "?").join(", ");
+    const params: Array<number | string> = [...dispositions];
+    if (phase) params.push(phase);
+    return countScalar(
+        db,
+        `SELECT COUNT(*) AS count FROM claim_backfill_failures
+          WHERE disposition IN (${placeholders})${phase ? " AND phase = ?" : ""}
+            AND NOT ${ABOVE_BOUNDARY_FAILURE_WHERE}`,
+        ...params,
+        boundary,
+        boundary,
+    );
+}
+
+/**
+ * Deterministic digest of the boundary-scoped blocking/retry failure set.
+ * (id, disposition, reason_code) is stable across re-scans that change
+ * nothing: an unchanged failure upserts in place under its (phase,
+ * item_kind, item_key) key, keeping its id and reason, while a repair,
+ * waiver, or new diagnostic changes the set. updated_at is deliberately
+ * excluded — every re-scan bumps it without changing what blocks.
+ */
+function computeBlockedFailureDigest(db: Database, boundary: number): string {
+    const rows = db
+        .prepare(
+            `SELECT id, disposition, reason_code AS reasonCode FROM claim_backfill_failures
+              WHERE disposition IN ('blocking', 'retry')
+                AND NOT ${ABOVE_BOUNDARY_FAILURE_WHERE}
+              ORDER BY id`,
+        )
+        .all(boundary, boundary) as Array<{ id: number; disposition: string; reasonCode: string }>;
+    return sha256Utf8Hex(
+        JSON.stringify(rows.map((row) => [row.id, row.disposition, row.reasonCode])),
+    );
+}
+
+/**
+ * Blocked checkpoint: the phase plus the failure-set digest the next start
+ * compares against, so an unchanged blocked database skips the full-corpus
+ * reset instead of re-scanning on every boot. Caller owns the transaction.
+ */
+function writeBlockedCheckpoint(db: Database, boundary: number): void {
+    writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "blocked");
+    writeMeta(
+        db,
+        CLAIMS_BACKFILL_BLOCKED_DIGEST_META_KEY,
+        computeBlockedFailureDigest(db, boundary),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Row adoption (drives the U2 kernel; R1-R6, R10)
 // ---------------------------------------------------------------------------
@@ -452,19 +588,14 @@ interface LineageRowShape {
     superseded_by_memory_id: number | null;
 }
 
-const LINEAGE_ROWS_WHERE = `id <= ? AND (
-    superseded_by_memory_id IS NOT NULL
-    OR (merged_from IS NOT NULL AND TRIM(merged_from) <> '')
-)`;
-
 function selectLineageRows(
     db: Database,
     boundary: number,
     afterId: number,
     limit: number | null,
 ): LineageRowShape[] {
-    const base = `SELECT id, merged_from, superseded_by_memory_id FROM memories
-         WHERE id > ? AND ${LINEAGE_ROWS_WHERE} ORDER BY id ASC`;
+    const base = `SELECT m.id, m.merged_from, m.superseded_by_memory_id FROM memories m
+         WHERE m.id > ? AND m.id <= ? AND ${memoryLineagePresentSql("m")} ORDER BY m.id ASC`;
     if (limit === null) return db.prepare(base).all(afterId, boundary) as LineageRowShape[];
     return db.prepare(`${base} LIMIT ?`).all(afterId, boundary, limit) as LineageRowShape[];
 }
@@ -479,15 +610,36 @@ export interface ClaimsBackfillReconciliationReport {
     warningCount: number;
 }
 
+/** Anti-join fragment: the aliased memories row has no crosswalk link (R1, R11). */
+function unlinkedBoundaryRowSql(alias: string): string {
+    return `NOT EXISTS (SELECT 1 FROM legacy_memory_claims lmc WHERE lmc.memory_id = ${alias}.id)`;
+}
+
 function countUnlinkedBoundaryRows(db: Database, boundary: number): number {
     return countScalar(
         db,
         `SELECT COUNT(*) AS count FROM memories m
-          WHERE m.id <= ? AND NOT EXISTS (
-              SELECT 1 FROM legacy_memory_claims lmc WHERE lmc.memory_id = m.id
-          )`,
+          WHERE m.id <= ? AND ${unlinkedBoundaryRowSql("m")}`,
         boundary,
     );
+}
+
+/** Next id-ordered batch of boundary rows still missing their crosswalk link. */
+function selectUnlinkedBoundaryRowIds(
+    db: Database,
+    afterId: number,
+    boundary: number,
+    limit: number,
+): number[] {
+    return (
+        db
+            .prepare(
+                `SELECT m.id FROM memories m
+                  WHERE m.id > ? AND m.id <= ? AND ${unlinkedBoundaryRowSql("m")}
+                  ORDER BY m.id ASC LIMIT ?`,
+            )
+            .all(afterId, boundary, limit) as Array<{ id: number }>
+    ).map((row) => row.id);
 }
 
 function countBoundaryCrosswalkRows(db: Database, boundary: number): number {
@@ -509,7 +661,10 @@ function countBoundaryCrosswalkRows(db: Database, boundary: number): number {
  * - every re-derived lineage token is resolved in the graph or carries an
  *   operator warning; an append-only replaced source is terminal only when a
  *   newer source snapshot exists and that current snapshot is fully disposed;
- * - no blocking or retry diagnostic remains anywhere;
+ * - no blocking or retry diagnostic remains within the boundary corpus
+ *   (an above-boundary diagnostic belongs to live writers: it stays visible
+ *   on the repair surface but the boundary backfill can never clear it, so
+ *   it must not gate completion);
  * - v83's adopted v22 identity work is resolved.
  */
 export function inspectClaimsBackfillReconciliation(
@@ -601,13 +756,8 @@ export function inspectClaimsBackfillReconciliation(
         db,
         `SELECT COUNT(*) AS count FROM memories m
           WHERE m.id <= ?
-            AND (m.superseded_by_memory_id IS NOT NULL OR COALESCE(TRIM(m.merged_from), '') <> '')
-            AND NOT EXISTS (
-                SELECT 1 FROM claim_memory_relationship_sources source
-                 WHERE source.memory_id = m.id
-                   AND source.merged_from IS m.merged_from
-                   AND source.superseded_by_memory_id IS m.superseded_by_memory_id
-            )`,
+            AND ${memoryLineagePresentSql("m")}
+            AND NOT ${memoryRelationshipSourceMatchSql("m")}`,
         boundary,
     );
     if (unsnapshottedRelationshipRows > 0) {
@@ -617,6 +767,30 @@ export function inspectClaimsBackfillReconciliation(
     }
 
     let tokensWithoutDisposition = 0;
+    // The token walks below revisit the same crosswalk links and claim pairs
+    // repeatedly, and the imported probes prepare their statements per call.
+    // The oracle is read-only, so one probe per distinct key is sound; the
+    // caches hoist both the statement preparation and the query out of the
+    // loops.
+    const linkCache = new Map<number, MemoryClaimLink | null>();
+    const readLink = (memoryId: number): MemoryClaimLink | null => {
+        let link = linkCache.get(memoryId);
+        if (link === undefined) {
+            link = readMemoryClaimLink(db, memoryId);
+            linkCache.set(memoryId, link);
+        }
+        return link;
+    };
+    const supersessionCache = new Map<string, boolean>();
+    const supersessionExists = (source: MemoryClaimLink, target: MemoryClaimLink): boolean => {
+        const key = `${source.claimId}:${target.claimId}`;
+        let exists = supersessionCache.get(key);
+        if (exists === undefined) {
+            exists = memoryClaimSupersessionExists(db, source, target);
+            supersessionCache.set(key, exists);
+        }
+        return exists;
+    };
     const readDisposition = db.prepare(
         `SELECT disposition, reason_code AS reasonCode FROM claim_backfill_failures
           WHERE phase = 'relationships' AND item_kind = ? AND item_key = ?`,
@@ -642,17 +816,15 @@ export function inspectClaimsBackfillReconciliation(
         );
     };
     const sourceIsDisposed = (source: (typeof relationshipSources)[number]): boolean => {
-        const link = readMemoryClaimLink(db, source.memoryId);
+        const link = readLink(source.memoryId);
         const prefix = `memory:${source.memoryId}:relations:${source.sourceDigest}`;
         if (source.supersededByMemoryId !== null) {
-            const targetLink = readMemoryClaimLink(db, source.supersededByMemoryId);
+            const targetLink = readLink(source.supersededByMemoryId);
             if (
                 !tokenIsDisposed(
                     "supersession",
                     `${prefix}:superseded-by`,
-                    link !== null &&
-                        targetLink !== null &&
-                        memoryClaimSupersessionExists(db, link, targetLink),
+                    link !== null && targetLink !== null && supersessionExists(link, targetLink),
                 )
             ) {
                 return false;
@@ -661,9 +833,8 @@ export function inspectClaimsBackfillReconciliation(
         for (const token of parseMemoryClaimMergedFrom(source.mergedFrom)) {
             let resolvedInGraph = token.kind === "marker";
             if (token.kind === "id" && link !== null) {
-                const sourceLink = readMemoryClaimLink(db, token.id as number);
-                resolvedInGraph =
-                    sourceLink !== null && memoryClaimSupersessionExists(db, sourceLink, link);
+                const sourceLink = readLink(token.id as number);
+                resolvedInGraph = sourceLink !== null && supersessionExists(sourceLink, link);
             }
             if (
                 !tokenIsDisposed(
@@ -682,7 +853,7 @@ export function inspectClaimsBackfillReconciliation(
         currentSourceDisposed.set(memoryId, sourceIsDisposed(source));
     }
     for (const source of relationshipSources) {
-        const link = readMemoryClaimLink(db, source.memoryId);
+        const link = readLink(source.memoryId);
         const prefix = `memory:${source.memoryId}:relations:${source.sourceDigest}`;
         const current = currentSourceByMemory.get(source.memoryId);
         const replacedByDisposedSource =
@@ -690,14 +861,12 @@ export function inspectClaimsBackfillReconciliation(
             current.sourceId > source.sourceId &&
             currentSourceDisposed.get(source.memoryId) === true;
         if (source.supersededByMemoryId !== null) {
-            const targetLink = readMemoryClaimLink(db, source.supersededByMemoryId);
+            const targetLink = readLink(source.supersededByMemoryId);
             if (
                 !tokenIsDisposed(
                     "supersession",
                     `${prefix}:superseded-by`,
-                    link !== null &&
-                        targetLink !== null &&
-                        memoryClaimSupersessionExists(db, link, targetLink),
+                    link !== null && targetLink !== null && supersessionExists(link, targetLink),
                     replacedByDisposedSource,
                 )
             ) {
@@ -707,9 +876,8 @@ export function inspectClaimsBackfillReconciliation(
         for (const token of parseMemoryClaimMergedFrom(source.mergedFrom)) {
             let resolvedInGraph = token.kind === "marker";
             if (token.kind === "id" && link !== null) {
-                const sourceLink = readMemoryClaimLink(db, token.id as number);
-                resolvedInGraph =
-                    sourceLink !== null && memoryClaimSupersessionExists(db, sourceLink, link);
+                const sourceLink = readLink(token.id as number);
+                resolvedInGraph = sourceLink !== null && supersessionExists(sourceLink, link);
             }
             if (
                 !tokenIsDisposed(
@@ -727,8 +895,10 @@ export function inspectClaimsBackfillReconciliation(
         problems.push(`${tokensWithoutDisposition} lineage token(s) without a disposition`);
     }
 
-    const blocking = countFailures(db, ["blocking", "retry"]);
-    if (blocking > 0) problems.push(`${blocking} blocking backfill failure(s) remain`);
+    const blocking = countBoundaryFailures(db, ["blocking", "retry"], boundary);
+    if (blocking > 0) {
+        problems.push(`${blocking} blocking backfill failure(s) remain within the boundary corpus`);
+    }
 
     for (const table of [...CLAIMS_AND_EVIDENCE_TABLES, ...MEMORY_CLAIMS_COMPAT_TABLES]) {
         // pi-lens-ignore: sql-injection
@@ -775,24 +945,21 @@ export function runEagerClaimsBackfillInMigrationTransaction(db: Database): void
 
         let cursor = 0;
         while (true) {
-            const ids = db
-                .prepare(
-                    `SELECT id FROM memories
-                  WHERE id > ? AND id <= ? AND NOT EXISTS (
-                      SELECT 1 FROM legacy_memory_claims lmc WHERE lmc.memory_id = memories.id
-                  )
-                  ORDER BY id ASC LIMIT ?`,
-                )
-                .all(cursor, boundary, CLAIMS_BACKFILL_BATCH_SIZE) as Array<{ id: number }>;
+            const ids = selectUnlinkedBoundaryRowIds(
+                db,
+                cursor,
+                boundary,
+                CLAIMS_BACKFILL_BATCH_SIZE,
+            );
             if (ids.length === 0) break;
-            for (const { id } of ids) {
+            for (const id of ids) {
                 const row = readMemoryProjectionRow(db, id);
                 if (!row) continue;
                 if (!adoptBoundaryMemoryRowInCurrentTransaction(db, row)) {
                     throw new Error(`v83 eager backfill could not adopt memory ${id}`);
                 }
             }
-            cursor = ids[ids.length - 1].id;
+            cursor = ids[ids.length - 1];
         }
         writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, String(boundary));
         hitClaimsMigrationFailpoint("claims-migration.020.rows.after");
@@ -831,6 +998,13 @@ export interface ClaimsBackfillRunOptions {
     retryDelaysMs?: readonly number[];
     sleep?: (delayMs: number) => Promise<void>;
     yieldToEventLoop?: () => Promise<void>;
+    /**
+     * Reset the checkpoint to the rows phase before running, bypassing the
+     * blocked failure-set digest gate. The doctor retry sets this: an
+     * operator-requested re-scan always re-derives from source, even from a
+     * corrupt `complete` checkpoint.
+     */
+    forceReset?: boolean;
 }
 
 export type ClaimsBackfillRunStatus =
@@ -854,6 +1028,8 @@ type BatchStep =
     | { kind: "advance" }
     | { kind: "phase-changed" }
     | { kind: "blocked"; problems: string[] }
+    | { kind: "skip-reset"; problems: string[] }
+    | { kind: "drained" }
     | { kind: "complete"; warnings: number };
 
 /**
@@ -886,7 +1062,8 @@ export async function runClaimsBackfill(
         summary.status = "not-applicable";
         return summary;
     }
-    if (initial.phase === "complete") {
+    const forceReset = options.forceReset === true;
+    if (initial.phase === "complete" && !forceReset) {
         const report = inspectClaimsBackfillReconciliation(db, initial);
         summary.status = report.ok
             ? report.warningCount > 0
@@ -929,16 +1106,12 @@ export async function runClaimsBackfill(
         const phase = readMeta(db, CLAIMS_BACKFILL_META_KEYS.phase);
         if (phase !== "rows") return { kind: "phase-changed" };
         const state = readClaimsBackfillState(db);
-        const cursor = state.rowsCursor;
-        const ids = db
-            .prepare(
-                `SELECT id FROM memories
-                  WHERE id > ? AND id <= ? AND NOT EXISTS (
-                      SELECT 1 FROM legacy_memory_claims lmc WHERE lmc.memory_id = memories.id
-                  )
-                  ORDER BY id ASC LIMIT ?`,
-            )
-            .all(cursor, state.boundaryMemoryId, batchSize) as Array<{ id: number }>;
+        const ids = selectUnlinkedBoundaryRowIds(
+            db,
+            state.rowsCursor,
+            state.boundaryMemoryId,
+            batchSize,
+        );
         if (ids.length === 0) {
             sweepResolvedRowFailures(db);
             const unlinked = countUnlinkedBoundaryRows(db, state.boundaryMemoryId);
@@ -947,7 +1120,7 @@ export async function runClaimsBackfill(
                 writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "relationships");
                 return { kind: "advance" };
             }
-            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "blocked");
+            writeBlockedCheckpoint(db, state.boundaryMemoryId);
             return {
                 kind: "blocked",
                 problems:
@@ -958,12 +1131,12 @@ export async function runClaimsBackfill(
                           ],
             };
         }
-        for (const { id } of ids) {
+        for (const id of ids) {
             const row = readMemoryProjectionRow(db, id);
             if (!row) continue;
             if (adoptBoundaryMemoryRowInCurrentTransaction(db, row)) summary.rowsAdopted += 1;
         }
-        writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, String(ids[ids.length - 1].id));
+        writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, String(ids[ids.length - 1]));
         hitFailpoint("claims-backfill.010.batch.after");
         return { kind: "worked" };
     };
@@ -979,12 +1152,18 @@ export async function runClaimsBackfill(
             batchSize,
         );
         if (rows.length === 0) {
-            const blocking = countFailures(db, ["blocking", "retry"], "relationships");
+            const blocking = countBoundaryFailures(
+                db,
+                ["blocking", "retry"],
+                state.boundaryMemoryId,
+                "relationships",
+            );
             if (blocking === 0) {
                 writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "reconciling");
+                writeMeta(db, CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY, "0");
                 return { kind: "advance" };
             }
-            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "blocked");
+            writeBlockedCheckpoint(db, state.boundaryMemoryId);
             return {
                 kind: "blocked",
                 problems: [`${blocking} relationship failure(s) require repair`],
@@ -1002,19 +1181,55 @@ export async function runClaimsBackfill(
         return { kind: "worked" };
     };
 
-    /** The one final reconciliation transaction (R11). */
-    const reconcileBatch = (): BatchStep => {
+    /**
+     * Reconciling, part one: bounded lineage re-translation. Rows may have
+     * changed after the relationships cursor passed them, so the boundary
+     * lineage set re-derives through the idempotent kernel — one batch per
+     * transaction, so the write lock is held for ~batchSize rows instead of
+     * the whole corpus. `drained` hands control to the completion decision.
+     */
+    const reconcileTranslationBatch = (): BatchStep => {
         const phase = readMeta(db, CLAIMS_BACKFILL_META_KEYS.phase);
         if (phase !== "reconciling") return { kind: "phase-changed" };
         const state = readClaimsBackfillState(db);
-        sweepResolvedRowFailures(db);
-        for (const row of selectLineageRows(db, state.boundaryMemoryId, 0, null)) {
+        const cursor = readIntMeta(db, CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY);
+        const rows = selectLineageRows(db, state.boundaryMemoryId, cursor, batchSize);
+        if (rows.length === 0) {
+            sweepResolvedRowFailures(db);
+            return { kind: "drained" };
+        }
+        for (const row of rows) {
             translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         }
-        const report = inspectClaimsBackfillReconciliation(db, readClaimsBackfillState(db));
+        writeMeta(db, CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY, String(rows[rows.length - 1].id));
+        hitFailpoint("claims-backfill.010.batch.after");
+        return { kind: "worked" };
+    };
+
+    /**
+     * Reconciling, part two: the completion decision (R11). The caller runs
+     * the read-only oracle OUTSIDE the write lock and passes its report in;
+     * this short immediate transaction re-verifies the decisive conditions —
+     * phase unchanged, zero unlinked boundary rows, zero boundary-scoped
+     * blocking failures — so a write racing between the oracle read and this
+     * commit cannot certify a stale state, then publishes the completion
+     * checkpoint.
+     */
+    const finalizeReconciliation = (report: ClaimsBackfillReconciliationReport): BatchStep => {
+        const phase = readMeta(db, CLAIMS_BACKFILL_META_KEYS.phase);
+        if (phase !== "reconciling") return { kind: "phase-changed" };
+        const state = readClaimsBackfillState(db);
         if (!report.ok) {
-            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "blocked");
+            writeBlockedCheckpoint(db, state.boundaryMemoryId);
             return { kind: "blocked", problems: report.problems };
+        }
+        const unlinked = countUnlinkedBoundaryRows(db, state.boundaryMemoryId);
+        const blocking = countBoundaryFailures(db, ["blocking", "retry"], state.boundaryMemoryId);
+        if (unlinked > 0 || blocking > 0) {
+            // The corpus changed between the oracle read and this
+            // transaction; fall back to the rows phase to re-derive.
+            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "rows");
+            return { kind: "advance" };
         }
         writeCompletionCheckpoint(db);
         hitFailpoint("claims-backfill.030.complete.before");
@@ -1023,18 +1238,48 @@ export async function runClaimsBackfill(
 
     // A blocked checkpoint re-derives from source: reset to the rows phase so
     // repaired identities, restored targets, and operator dispositions are
-    // re-observed without a bespoke repair scan.
-    if (initial.phase === "blocked") {
-        const reset = await runBatch(() => {
+    // re-observed without a bespoke repair scan. The reset is gated on the
+    // boundary-scoped blocking failure set having changed since the blocked
+    // checkpoint: a persistently blocked database otherwise re-scans the
+    // whole corpus on every start. forceReset (the doctor retry) bypasses the
+    // gate and re-derives from any phase, including a corrupt `complete`.
+    if (initial.phase === "blocked" || forceReset) {
+        const reset = await runBatch((): BatchStep => {
             const phase = readMeta(db, CLAIMS_BACKFILL_META_KEYS.phase);
-            if (phase !== "blocked") return { kind: "phase-changed" };
+            if (phase === null) return { kind: "phase-changed" };
+            if (!forceReset && phase !== "blocked") return { kind: "phase-changed" };
+            const state = readClaimsBackfillState(db);
+            // Sweep first so a row linked by a live writer since the blocked
+            // checkpoint leaves the blocking set and changes the digest.
+            sweepResolvedRowFailures(db);
+            const digest = computeBlockedFailureDigest(db, state.boundaryMemoryId);
+            if (!forceReset && digest === readMeta(db, CLAIMS_BACKFILL_BLOCKED_DIGEST_META_KEY)) {
+                const blocking = countBoundaryFailures(
+                    db,
+                    ["blocking", "retry"],
+                    state.boundaryMemoryId,
+                );
+                return {
+                    kind: "skip-reset",
+                    problems: [
+                        `${blocking} blocking failure(s) unchanged since the last blocked run; repair or waive them, or force a re-scan with the doctor retry`,
+                    ],
+                };
+            }
+            writeMeta(db, CLAIMS_BACKFILL_BLOCKED_DIGEST_META_KEY, digest);
             writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "rows");
             writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
             writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
+            writeMeta(db, CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY, "0");
             return { kind: "advance" };
         });
         if (reset === "busy") {
             summary.status = "pending";
+            return summary;
+        }
+        if (reset.kind === "skip-reset") {
+            summary.status = "blocked";
+            summary.problems = reset.problems;
             return summary;
         }
     }
@@ -1056,13 +1301,19 @@ export async function runClaimsBackfill(
             summary.status = "blocked";
             return summary;
         }
-        const work =
-            phase === "rows"
-                ? rowsBatch
-                : phase === "relationships"
-                  ? relationshipsBatch
-                  : reconcileBatch;
-        const step = await runBatch(work);
+        let step: BatchStep | "busy";
+        if (phase === "reconciling") {
+            step = await runBatch(reconcileTranslationBatch);
+            if (step !== "busy" && step.kind === "drained") {
+                summary.batches += 1;
+                // The oracle is read-only: run it outside the write lock,
+                // then decide inside one short transaction (R11).
+                const report = inspectClaimsBackfillReconciliation(db);
+                step = await runBatch(() => finalizeReconciliation(report));
+            }
+        } else {
+            step = await runBatch(phase === "rows" ? rowsBatch : relationshipsBatch);
+        }
         if (step === "busy") {
             summary.status = "pending";
             return summary;
@@ -1109,6 +1360,8 @@ export interface ClaimsBackfillStatusReport {
     reconciliationVersion: string | null;
     finalOutboxWatermark: number;
     calibrationDigest: string | null;
+    /** Why the recorded v83 mode was selected; null when the meta row is absent. */
+    modeDecisionReason: string | null;
     /** Reconciliation problems, populated only when requested. */
     problems: string[];
 }
@@ -1132,6 +1385,7 @@ export function getClaimsBackfillStatus(
             reconciliationVersion: null,
             finalOutboxWatermark: 0,
             calibrationDigest: null,
+            modeDecisionReason: null,
             problems: [],
         };
     }
@@ -1166,6 +1420,7 @@ export function getClaimsBackfillStatus(
         reconciliationVersion: state.reconciliationVersion,
         finalOutboxWatermark: state.finalOutboxWatermark,
         calibrationDigest: state.calibrationDigest,
+        modeDecisionReason: state.modeDecisionReason,
         problems,
     };
 }
@@ -1251,8 +1506,9 @@ export interface ClaimsBackfillDoctorRetryResult {
 }
 
 /**
- * Doctor repair: reset the checkpoint to the rows phase so every failed item
- * is re-derived through the kernel, then rerun the lazy runner to a fresh
+ * Doctor repair: rerun the lazy runner with `forceReset`, which resets the
+ * checkpoint to the rows phase — bypassing the blocked failure-set digest
+ * gate — so every failed item is re-derived through the kernel to a fresh
  * completion attempt. Idempotent: already-linked rows and recorded edges are
  * skipped by reselection, and no schema version changes.
  */
@@ -1268,12 +1524,7 @@ export async function doctorRetryClaimsBackfill(
     ) {
         return { before, after: before, summary: null };
     }
-    db.transaction(() => {
-        writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "rows");
-        writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
-        writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
-    }).immediate();
-    const summary = await runClaimsBackfill(db, options);
+    const summary = await runClaimsBackfill(db, { ...options, forceReset: true });
     return {
         before,
         after: getClaimsBackfillStatus(db, { includeProblems: true }),
