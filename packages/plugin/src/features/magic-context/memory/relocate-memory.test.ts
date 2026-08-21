@@ -269,6 +269,79 @@ describe("relocate-memory claims (v84)", () => {
         });
     });
 
+    test("a cross-project move of one shared-claim link keeps the claim live for the surviving sibling and retires it only with the last link", () => {
+        const database = makeDb();
+        const sibling = insertMemory(database, {
+            projectPath: "git:stable",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        // Both identities resolve to the same numeric project, so the second
+        // insert takes the dedup branch and shares the sibling's claim.
+        database
+            .prepare(
+                `INSERT INTO project_aliases (alias_identity, project_id, created_at)
+                 SELECT 'git:alias-of-stable', project_id, 1 FROM project_aliases
+                  WHERE alias_identity = 'git:stable'`,
+            )
+            .run();
+        const moving = insertMemory(database, {
+            projectPath: "git:alias-of-stable",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const sharedLink = readMemoryClaimLink(database, moving.id);
+        expect(sharedLink?.claimId).toBe(readMemoryClaimLink(database, sibling.id)?.claimId ?? -1);
+        // Target numeric projects must exist for the authorized move path.
+        insertMemory(database, {
+            projectPath: "git:project-x",
+            category: "CONSTRAINTS",
+            content: "resident fact x",
+        });
+        insertMemory(database, {
+            projectPath: "git:project-y",
+            category: "CONSTRAINTS",
+            content: "resident fact y",
+        });
+
+        const first = inTransaction(database, () =>
+            moveMemoriesToProject(database, [moving.id], "git:alias-of-stable", "git:project-x"),
+        );
+
+        expect(first).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const movedFirst = database
+            .prepare(
+                "SELECT id FROM memories WHERE project_path = 'git:project-x' AND content = 'shared fact'",
+            )
+            .get() as { id: number };
+        const movedFirstLink = readMemoryClaimLink(database, movedFirst.id);
+        expect(movedFirstLink?.claimId).not.toBe(sharedLink?.claimId);
+        // The sibling still asserts the shared claim, so it stays live and
+        // records no supersession lineage.
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(sharedLink?.claimId ?? 0),
+        ).toEqual({ state: "active" });
+        if (!sharedLink || !movedFirstLink) throw new Error("expected claim links after the move");
+        expect(memoryClaimSupersessionExists(database, sharedLink, movedFirstLink)).toBe(false);
+
+        const second = inTransaction(database, () =>
+            moveMemoriesToProject(database, [sibling.id], "git:stable", "git:project-y"),
+        );
+
+        expect(second).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(sharedLink.claimId),
+        ).toEqual({ state: "archived" });
+        const movedSecond = database
+            .prepare(
+                "SELECT id FROM memories WHERE project_path = 'git:project-y' AND content = 'shared fact'",
+            )
+            .get() as { id: number };
+        const movedSecondLink = readMemoryClaimLink(database, movedSecond.id);
+        if (!movedSecondLink) throw new Error("expected a claim link on the second moved row");
+        expect(memoryClaimSupersessionExists(database, sharedLink, movedSecondLink)).toBe(true);
+    });
+
     test("a cross-project move translates the moved row's inherited lineage", () => {
         const database = makeDb();
         const lineageSource = insertMemory(database, {

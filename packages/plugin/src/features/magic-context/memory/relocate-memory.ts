@@ -367,8 +367,9 @@ function recordSkippedReferrerRepointDiagnostic(
  * second numeric project in place. The move therefore inserts a fresh
  * projection row at the target (carrying stats, embedding, and verification
  * mappings), creates the target claim for it, retires the source claim with
- * cross-project lineage, repoints sibling supersession references, and
- * deletes the source row — whose durable link survives the delete.
+ * cross-project lineage only when no live sibling link remains, repoints
+ * sibling supersession references, and deletes the source row — whose durable
+ * link survives the delete.
  */
 export function moveLinkedMemoryAcrossProjects(
     db: Database,
@@ -474,7 +475,43 @@ export function moveLinkedMemoryAcrossProjects(
                 targetProjectId,
                 RELOCATION_PRODUCER,
             );
-            retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
+            // Shared-claim rule: the source claim holds the max-rank state
+            // across its surviving linked projections. The moved row's link
+            // stays behind on the source claim but its memories row deletes
+            // below, so its next status is archived; a live sibling link
+            // (dedup branch, project-path aliases) keeps the claim live.
+            // Mirrors the status/delete kernels — the supersession recorder
+            // below only suppresses the lineage edge, not this state change.
+            const sourceStateEffects: MemoryClaimEffect[] = [];
+            const desiredSourceState = sharedClaimStateFromLiveLinks(
+                db,
+                sourceLink.claimId,
+                rowId,
+                "archived",
+            );
+            if (
+                readCurrentClaimSemanticState(db, sourceLink.claimId).state !== desiredSourceState
+            ) {
+                if (desiredSourceState === "archived") {
+                    retireMemoryClaimInCurrentTransaction(
+                        db,
+                        sourceLink.claimId,
+                        RELOCATION_PRODUCER,
+                    );
+                } else {
+                    setClaimLifecycleStateInCurrentTransaction(
+                        db,
+                        sourceLink.claimId,
+                        desiredSourceState,
+                    );
+                }
+                sourceStateEffects.push({
+                    effectKey: `memory:${rowId}:lifecycle`,
+                    projectId: sourceLink.projectId,
+                    claimId: sourceLink.claimId,
+                    effectType: "lifecycle",
+                });
+            }
             recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, newLink);
             const effects: MemoryClaimEffect[] = [
                 {
@@ -484,12 +521,7 @@ export function moveLinkedMemoryAcrossProjects(
                     effectType: "upsert",
                 },
                 ...stateEffects,
-                {
-                    effectKey: `memory:${rowId}:lifecycle`,
-                    projectId: sourceLink.projectId,
-                    claimId: sourceLink.claimId,
-                    effectType: "lifecycle",
-                },
+                ...sourceStateEffects,
             ];
             // The inserted copy inherits the source row's merged_from /
             // superseded_by_memory_id under a fresh id, so no relationship
