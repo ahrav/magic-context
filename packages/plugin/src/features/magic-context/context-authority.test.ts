@@ -3302,4 +3302,184 @@ describe("module mirror claims (v84)", () => {
             c: 0,
         });
     });
+
+    test("a placeholder-empty supersession target keeps its pending reference instead of committing a false pair envelope", () => {
+        const database = db();
+        // The target module row 12 arrives only as a sparse snapshot, so the
+        // mirror mints a placeholder-empty context row for it.
+        const sparsePage = page(0, [
+            {
+                feedSeq: 1,
+                op: "insert",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "old fact", "mm-h1", {
+                    superseded_by_memory_id: 12,
+                }),
+            },
+            {
+                feedSeq: 2,
+                op: "insert",
+                moduleRowId: 12,
+                snapshot: {
+                    id: 12,
+                    project_path: MODULE_PROJECT,
+                    category: "CONSTRAINTS",
+                    updated_at: 1,
+                    last_seen_at: 1,
+                },
+            },
+        ]);
+        applyMirrorPage({ db: database, page: sparsePage });
+
+        // The pair is not yet adoptable: the pending reference survives, no
+        // supersede envelope is committed, and the pointer stays untranslated.
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 1 });
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key LIKE 'memories:supersede:%'",
+                )
+                .get(),
+        ).toEqual({ c: 0 });
+        expect(
+            database
+                .prepare(
+                    "SELECT superseded_by_memory_id AS s FROM memories WHERE normalized_hash = 'mm-h1'",
+                )
+                .get(),
+        ).toEqual({ s: null });
+        expect(claimState(database).conflicts).toBe(0);
+
+        // The target's real content arrives: the pair completes — pointer
+        // written, claim supersession edge recorded, pending reference gone.
+        const contentPage = page(2, [
+            {
+                feedSeq: 3,
+                op: "update",
+                moduleRowId: 12,
+                snapshot: moduleSnapshot(12, "new fact", "mm-h2"),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: contentPage });
+        const sourceId = (
+            database.prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-h1'").get() as {
+                id: number;
+            }
+        ).id;
+        const targetId = (
+            database.prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-h2'").get() as {
+                id: number;
+            }
+        ).id;
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ s: targetId });
+        expect(claimState(database).conflicts).toBe(1);
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 0 });
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key = ?")
+                .get(`memories:supersede:${sourceId}:${targetId}`),
+        ).toEqual({ c: 1 });
+        expect(
+            claimState(database).outbox.filter(
+                (effect) => effect.effect_key === `memory:${targetId}:supersede`,
+            ),
+        ).toHaveLength(1);
+        // The relationship-source snapshot reflects the written pointer, so
+        // later relationship mutations on the source row pass the guard.
+        expect(
+            database
+                .prepare(
+                    `SELECT superseded_by_memory_id AS s FROM claim_memory_relationship_sources
+                      WHERE memory_id = ? ORDER BY id DESC LIMIT 1`,
+                )
+                .get(sourceId),
+        ).toEqual({ s: targetId });
+
+        // Replay of both pages converges without duplicate lineage.
+        const before = JSON.stringify(claimState(database));
+        resetCursorForReplay(database);
+        applyMirrorPage({ db: database, page: sparsePage });
+        applyMirrorPage({ db: database, page: contentPage });
+        expect(JSON.stringify(claimState(database))).toBe(before);
+    });
+
+    test("a mapped placeholder target does not translate through the per-row apply path", () => {
+        const database = db();
+        // The placeholder target is minted BEFORE the source row applies, so
+        // the source sees a mapped target identity during its own apply; the
+        // pair must still wait for adoptable content instead of writing a
+        // pointer with no claim edge and no pending row left to retry. The
+        // sparse snapshot carries a hash but no content, so the minted row
+        // stays placeholder-empty without colliding with the source's mint.
+        const sparsePage = page(0, [
+            {
+                feedSeq: 1,
+                op: "insert",
+                moduleRowId: 12,
+                snapshot: {
+                    id: 12,
+                    project_path: MODULE_PROJECT,
+                    category: "CONSTRAINTS",
+                    normalized_hash: "mm-h2",
+                    updated_at: 1,
+                    last_seen_at: 1,
+                },
+            },
+            {
+                feedSeq: 2,
+                op: "insert",
+                moduleRowId: 11,
+                snapshot: moduleSnapshot(11, "old fact", "mm-h1", {
+                    superseded_by_memory_id: 12,
+                }),
+            },
+        ]);
+        applyMirrorPage({ db: database, page: sparsePage });
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 1 });
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key LIKE 'memories:supersede:%'",
+                )
+                .get(),
+        ).toEqual({ c: 0 });
+        expect(
+            database
+                .prepare(
+                    "SELECT superseded_by_memory_id AS s FROM memories WHERE normalized_hash = 'mm-h1'",
+                )
+                .get(),
+        ).toEqual({ s: null });
+
+        applyMirrorPage({
+            db: database,
+            page: page(2, [
+                {
+                    feedSeq: 3,
+                    op: "update",
+                    moduleRowId: 12,
+                    snapshot: moduleSnapshot(12, "new fact", "mm-h2"),
+                },
+            ]),
+        });
+        const rows = database
+            .prepare("SELECT id, superseded_by_memory_id FROM memories ORDER BY id")
+            .all() as Array<{ id: number; superseded_by_memory_id: number | null }>;
+        const source = rows.find((row) => row.superseded_by_memory_id !== null);
+        expect(source?.superseded_by_memory_id).toBe(rows.find((row) => row.id !== source?.id)?.id);
+        expect(claimState(database).conflicts).toBe(1);
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 0 });
+    });
 });

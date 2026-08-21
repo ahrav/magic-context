@@ -601,7 +601,7 @@ function insertRevisionMemoryMetadata(
     );
 }
 
-function claimStateFromMemoryStatus(status: string): ClaimState {
+export function claimStateFromMemoryStatus(status: string): ClaimState {
     return status === "permanent" || status === "archived" ? status : "active";
 }
 
@@ -1905,7 +1905,7 @@ export interface ModuleMemoryDeltaResult {
     removed: boolean;
 }
 
-interface CurrentClaimSemanticState {
+export interface CurrentClaimSemanticState {
     content: string;
     state: ClaimState;
     category: string | null;
@@ -1918,7 +1918,10 @@ interface CurrentClaimSemanticState {
     metadataJson: string | null;
 }
 
-function readCurrentClaimSemanticState(db: Database, claimId: number): CurrentClaimSemanticState {
+export function readCurrentClaimSemanticState(
+    db: Database,
+    claimId: number,
+): CurrentClaimSemanticState {
     const row = db
         .prepare(
             `SELECT rev.content AS content, claims.state AS state,

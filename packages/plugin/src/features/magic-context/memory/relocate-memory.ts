@@ -1,27 +1,31 @@
 import { randomUUID } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
+import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "../claims-backfill";
 import {
     effectiveSeenCountSql,
     hasMemoryStatsTable,
     requireEffectiveSeenCount,
 } from "./storage-memory";
 import {
+    claimStateFromMemoryStatus,
     computeClaimRequestDigest,
     ensureMemoryClaimLinkInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
     type MemoryClaimEffect,
     type MemoryClaimLink,
     type MemoryClaimOperationEnvelope,
+    readCurrentClaimSemanticState,
     readMemoryClaimLink,
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     retireMemoryClaimInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    setClaimLifecycleStateInCurrentTransaction,
     translateMemoryClaimRelationshipsInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./storage-memory-claims";
-import { readMemoryProjectionRow } from "./storage-memory-projection";
+import { type MemoryProjectionRow, readMemoryProjectionRow } from "./storage-memory-projection";
 import type { MemoryStatus } from "./types";
 
 /**
@@ -117,6 +121,53 @@ function requireRelocationTargetProject(db: Database, toIdentity: string): numbe
 }
 
 /**
+ * Adoption reuses whatever canonical claim already owns the (project,
+ * category, hash) tuple — including one archived by a prior delete of the
+ * target-project equivalent. Sync the claim lifecycle from the adopted
+ * projection row so an active row never points at an archived claim, and
+ * carry the row's verified status onto the claim as evidence. Returns the
+ * effects the caller must emit for what actually changed.
+ */
+function syncAdoptedRelocationClaimState(
+    db: Database,
+    row: MemoryProjectionRow,
+    link: MemoryClaimLink,
+    projectId: number,
+): MemoryClaimEffect[] {
+    const effects: MemoryClaimEffect[] = [];
+    const desiredState = claimStateFromMemoryStatus(row.status);
+    if (readCurrentClaimSemanticState(db, link.claimId).state !== desiredState) {
+        if (desiredState === "archived") {
+            retireMemoryClaimInCurrentTransaction(db, link.claimId, RELOCATION_PRODUCER);
+        } else {
+            setClaimLifecycleStateInCurrentTransaction(db, link.claimId, desiredState);
+        }
+        effects.push({
+            effectKey: `memory:${row.id}:lifecycle`,
+            projectId,
+            claimId: link.claimId,
+            effectType: "lifecycle" as const,
+        });
+    }
+    if (
+        recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+            db,
+            row,
+            link.claimId,
+            RELOCATION_PRODUCER,
+        )
+    ) {
+        effects.push({
+            effectKey: `memory:${row.id}:evidence`,
+            projectId,
+            claimId: link.claimId,
+            effectType: "evidence" as const,
+        });
+    }
+    return effects;
+}
+
+/**
  * Claim adoption for a plain rekey. An unlinked row adopts its preimage
  * under the TARGET numeric project — the raw source path is what made it
  * unlinkable — which also satisfies the v84 boundary identity guard before
@@ -134,6 +185,7 @@ function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId:
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, targetProjectId, {
                 kind: "migration",
             });
+            const stateEffects = syncAdoptedRelocationClaimState(db, row, link, targetProjectId);
             const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(
                 db,
                 row,
@@ -147,6 +199,7 @@ function adoptRelocationRekeyClaim(db: Database, rowId: number, targetProjectId:
                         claimId: link.claimId,
                         effectType: "upsert" as const,
                     },
+                    ...stateEffects,
                     ...relationshipEffects,
                 ],
             };
@@ -306,6 +359,12 @@ export function moveLinkedMemoryAcrossProjects(
             const newLink = ensureMemoryClaimLinkInCurrentTransaction(db, newRow, targetProjectId, {
                 kind: "migration",
             });
+            const stateEffects = syncAdoptedRelocationClaimState(
+                db,
+                newRow,
+                newLink,
+                targetProjectId,
+            );
             retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
             recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, newLink);
             const effects: MemoryClaimEffect[] = [
@@ -315,6 +374,7 @@ export function moveLinkedMemoryAcrossProjects(
                     claimId: newLink.claimId,
                     effectType: "upsert",
                 },
+                ...stateEffects,
                 {
                     effectKey: `memory:${rowId}:lifecycle`,
                     projectId: sourceLink.projectId,

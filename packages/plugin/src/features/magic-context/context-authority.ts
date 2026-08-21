@@ -8,12 +8,20 @@ import {
     computeClaimRequestDigest,
     ensureMemoryClaimLinkInCurrentTransaction,
     hasMemoryClaimsCompatSchema,
+    type MemoryClaimLink,
+    memoryClaimAdoptionFailureReason,
+    readMemoryClaimLink,
+    readMemoryClaimOperationResult,
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    translateMemoryClaimRelationshipsInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
-import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
+import {
+    type MemoryProjectionRow,
+    readMemoryProjectionRow,
+} from "./memory/storage-memory-projection";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
@@ -1629,7 +1637,12 @@ function contextMemoryId(
     return contextId;
 }
 
-function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPageStatements): void {
+function applyMemoryRow(
+    db: Database,
+    feed: ChangefeedRow,
+    statements: MirrorPageStatements,
+    claimsActive: boolean,
+): void {
     const row = feed.full_row_snapshot;
     const moduleProject = rowString(row, "project_path");
     if (!moduleProject) throw new Error("memory feed snapshot has no project_path");
@@ -1884,22 +1897,35 @@ function applyMemoryRow(db: Database, feed: ChangefeedRow, statements: MirrorPag
         );
     }
     if (hasSuperseded && typeof row.superseded_by_memory_id === "number") {
-        const translated = mirrorIdentity(
-            db,
-            "memories",
-            moduleProject,
-            row.superseded_by_memory_id,
-            statements,
-        );
-        if (translated) {
-            statements.updateSuperseded.run(translated.context_row_id, contextId);
-            statements.deletePendingReference.run(moduleProject, feed.module_row_id);
-        } else {
+        if (claimsActive) {
+            // Claims mode defers translation to the page-level pending
+            // resolver, which writes the pointer together with the claim
+            // supersession edge once both endpoints carry adoptable content.
+            // Writing the pointer here would strand a placeholder-empty pair
+            // with no claim edge and no pending row left to retry it.
             statements.upsertPendingReference.run(
                 moduleProject,
                 feed.module_row_id,
                 row.superseded_by_memory_id,
             );
+        } else {
+            const translated = mirrorIdentity(
+                db,
+                "memories",
+                moduleProject,
+                row.superseded_by_memory_id,
+                statements,
+            );
+            if (translated) {
+                statements.updateSuperseded.run(translated.context_row_id, contextId);
+                statements.deletePendingReference.run(moduleProject, feed.module_row_id);
+            } else {
+                statements.upsertPendingReference.run(
+                    moduleProject,
+                    feed.module_row_id,
+                    row.superseded_by_memory_id,
+                );
+            }
         }
     } else if (hasSuperseded) {
         statements.deletePendingReference.run(moduleProject, feed.module_row_id);
@@ -2036,6 +2062,9 @@ function contextNoteId(
     return contextId;
 }
 
+/** Bulk projection-only translation for the claims-inactive path: any pending
+ * pair with both identities mapped gets its pointer written and its pending
+ * row cleared, with no claim bookkeeping. */
 function translateMemoryReferences(statements: MirrorPageStatements): void {
     statements.translateMemoryReferences.run();
     statements.clearTranslatedReferences.run();
@@ -2055,7 +2084,7 @@ function applyMemoryRowWithClaims(
     const row = feed.full_row_snapshot;
     const moduleProject = rowString(row, "project_path");
     if (!moduleProject) {
-        applyMemoryRow(db, feed, statements);
+        applyMemoryRow(db, feed, statements, true);
         return;
     }
     const contextId =
@@ -2065,7 +2094,7 @@ function applyMemoryRowWithClaims(
             : contextMemoryId(db, feed.domain, moduleProject, row, feed.module_row_id, statements);
     // An unmapped tombstone touches no context row and therefore no claim.
     if (contextId === null) {
-        applyMemoryRow(db, feed, statements);
+        applyMemoryRow(db, feed, statements, true);
         return;
     }
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
@@ -2082,21 +2111,26 @@ function applyMemoryRowWithClaims(
                 contentHash: feed.content_hash,
             }),
         },
-        { memoryId: contextId, applyProjection: () => applyMemoryRow(db, feed, statements) },
+        { memoryId: contextId, applyProjection: () => applyMemoryRow(db, feed, statements, true) },
     );
 }
 
 interface TranslatedSupersessionPair {
     sourceId: number;
     targetId: number;
+    moduleProject: string;
+    moduleRowId: number;
 }
 
 /** Pending memory references whose source and target identities are both
- * mapped, so `translateMemoryReferences` resolves them. */
+ * mapped, so translation can attempt to resolve them. The pending row's
+ * module coordinates ride along so a resolved pair can clear exactly its own
+ * row while an unresolved pair keeps its row for a later retry. */
 function readTranslatableSupersessionPairs(db: Database): TranslatedSupersessionPair[] {
     return db
         .prepare(
-            `SELECT source.context_row_id AS sourceId, target.context_row_id AS targetId
+            `SELECT source.context_row_id AS sourceId, target.context_row_id AS targetId,
+                    pending.module_project AS moduleProject, pending.module_row_id AS moduleRowId
                FROM mirror_pending_references pending
                JOIN mirror_identity source
                  ON source.domain = pending.domain
@@ -2111,52 +2145,67 @@ function readTranslatableSupersessionPairs(db: Database): TranslatedSupersession
         .all() as TranslatedSupersessionPair[];
 }
 
+/** The claim link a projection row can hold: its existing crosswalk link, or
+ * a fresh adoption when the row satisfies the claim adoption contract. A row
+ * with an unresolvable project or claim-invalid metadata stays unlinked for
+ * the repair lanes. */
+function adoptableMemoryClaimLink(db: Database, row: MemoryProjectionRow): MemoryClaimLink | null {
+    const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
+    if (projectId === null || memoryClaimAdoptionFailureReason(row, projectId) !== null)
+        return null;
+    return ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, { kind: "migration" });
+}
+
 /**
- * A replayed page re-creates and re-resolves the same pending references, so
- * each pair gets a durable envelope key and an idempotent edge recorder —
- * otherwise replay would duplicate the lineage edge.
+ * Resolve pending supersession references under the claims kernel. A pair
+ * translates — projection pointer written, pending row cleared — only when
+ * both endpoints carry real content: a placeholder-empty endpoint (minted
+ * for a module row whose snapshot has not arrived yet) keeps its pending
+ * reference so the next feed page retries the pair. The adoptability probe
+ * runs OUTSIDE the claim envelope: a not-yet-adoptable pair commits no
+ * envelope at all, because the pair-keyed digest would replay a false result
+ * forever and a zero-effect envelope is unprunable.
+ *
+ * The projection side (pointer, pending row, relationship snapshot) runs on
+ * every call, like the module-delta kernel's applyProjection, so a page
+ * replay converges even when the claim envelope replays. The
+ * relationship-source snapshot is refreshed around the pointer write so the
+ * relationship write guard sees the preimage before the write and the
+ * translated state after it.
  */
-function recordTranslatedSupersessionClaims(
-    db: Database,
-    pairs: readonly TranslatedSupersessionPair[],
-): void {
-    for (const pair of pairs) {
-        runMemoryClaimOperationInCurrentTransaction(
-            db,
-            {
-                producer: "module-mirror",
-                operationKey: `memories:supersede:${pair.sourceId}:${pair.targetId}`,
-                requestDigest: computeClaimRequestDigest(pair),
-            },
-            () => {
-                const source = readMemoryProjectionRow(db, pair.sourceId);
-                const target = readMemoryProjectionRow(db, pair.targetId);
-                if (!source || !target || !source.content.length || !target.content.length) {
-                    return { result: false, effects: [] };
-                }
-                const sourceProjectId = resolveMemoryClaimProjectInCurrentTransaction(
-                    db,
-                    source.project_path,
-                );
-                const targetProjectId = resolveMemoryClaimProjectInCurrentTransaction(
-                    db,
-                    target.project_path,
-                );
-                if (sourceProjectId === null || targetProjectId === null) {
-                    return { result: false, effects: [] };
-                }
-                const sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
-                    db,
-                    source,
-                    sourceProjectId,
-                    { kind: "migration" },
-                );
-                const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
-                    db,
-                    target,
-                    targetProjectId,
-                    { kind: "migration" },
-                );
+function translatePendingSupersessionClaims(db: Database, statements: MirrorPageStatements): void {
+    for (const pair of readTranslatableSupersessionPairs(db)) {
+        const source = readMemoryProjectionRow(db, pair.sourceId);
+        const target = readMemoryProjectionRow(db, pair.targetId);
+        if (!source || !target || !source.content.length || !target.content.length) continue;
+
+        const envelope = {
+            producer: "module-mirror",
+            operationKey: `memories:supersede:${pair.sourceId}:${pair.targetId}`,
+            requestDigest: computeClaimRequestDigest({
+                sourceId: pair.sourceId,
+                targetId: pair.targetId,
+            }),
+        };
+        // A replayed envelope must append zero claim rows, so adoption is
+        // gated on the replay probe; the committed first run already linked
+        // both endpoints, and the crosswalk is retained, never deleted.
+        const replayed = readMemoryClaimOperationResult<boolean>(db, envelope) !== null;
+        const sourceLink =
+            readMemoryClaimLink(db, pair.sourceId) ??
+            (replayed ? null : adoptableMemoryClaimLink(db, source));
+        const targetLink =
+            readMemoryClaimLink(db, pair.targetId) ??
+            (replayed ? null : adoptableMemoryClaimLink(db, target));
+
+        // Snapshot the source's current lineage so the pointer write below
+        // matches the guard's preimage requirement (no-op when unlinked).
+        if (sourceLink) translateMemoryClaimRelationshipsInCurrentTransaction(db, source);
+        statements.updateSuperseded.run(pair.targetId, pair.sourceId);
+        statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
+
+        if (sourceLink && targetLink) {
+            runMemoryClaimOperationInCurrentTransaction(db, envelope, () => {
                 const recorded = recordMemoryClaimSupersessionInCurrentTransaction(
                     db,
                     sourceLink,
@@ -2168,15 +2217,22 @@ function recordTranslatedSupersessionClaims(
                         ? [
                               {
                                   effectKey: `memory:${pair.targetId}:supersede`,
-                                  projectId: targetProjectId,
+                                  projectId: targetLink.projectId,
                                   claimId: targetLink.claimId,
                                   effectType: "evidence" as const,
                               },
                           ]
                         : [],
                 };
-            },
-        );
+            });
+        }
+
+        // Refresh the snapshot to the translated pointer so later
+        // relationship mutations on the source row pass the write guard.
+        if (sourceLink) {
+            const post = readMemoryProjectionRow(db, pair.sourceId);
+            if (post) translateMemoryClaimRelationshipsInCurrentTransaction(db, post);
+        }
     }
 }
 
@@ -2354,17 +2410,15 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
                     if (projectPath) touchedProjects.add(projectPath);
                     if (feed.domain === "memories") {
                         if (claimsActive) applyMemoryRowWithClaims(db, feed, statements);
-                        else applyMemoryRow(db, feed, statements);
+                        else applyMemoryRow(db, feed, statements, false);
                     } else applyNoteRow(db, feed, statements);
                     nextCursor = feed.feed_seq;
                 }
                 if (page.domain === "memories") {
-                    const translatablePairs = claimsActive
-                        ? readTranslatableSupersessionPairs(db)
-                        : [];
-                    translateMemoryReferences(statements);
-                    if (translatablePairs.length > 0) {
-                        recordTranslatedSupersessionClaims(db, translatablePairs);
+                    if (claimsActive) {
+                        translatePendingSupersessionClaims(db, statements);
+                    } else {
+                        translateMemoryReferences(statements);
                     }
                     repairNullClobberedMemoryRows(db, statements, claimsActive);
                 }

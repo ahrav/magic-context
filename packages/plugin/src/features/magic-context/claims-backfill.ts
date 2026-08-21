@@ -533,6 +533,34 @@ function readClaimCurrentRevisionId(db: Database, claimId: number): number {
 }
 
 /**
+ * Carry a projection row's verified status onto its adopted claim as one
+ * current-revision verified event. Mapped-only rows (no positive
+ * `verified_at`) record nothing. Shared by the boundary backfill and the
+ * relocation adoption sites; returns true when an event was recorded so
+ * callers can emit a matching evidence effect.
+ */
+export function recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+    db: Database,
+    row: Pick<MemoryProjectionRow, "verification_status" | "verified_at">,
+    claimId: number,
+    verifier: string,
+): boolean {
+    if (
+        row.verification_status !== "verified" ||
+        row.verified_at === null ||
+        row.verified_at <= 0
+    ) {
+        return false;
+    }
+    addVerificationEvent(db, {
+        revisionId: readClaimCurrentRevisionId(db, claimId),
+        outcome: "verified",
+        verifier,
+    });
+    return true;
+}
+
+/**
  * Adopt one boundary memory row: crosswalk plus revision 1 through the
  * kernel, one current-snapshot verification event for a positively verified
  * row (mapped-only rows keep their `memory_verifications` mappings with no
@@ -562,17 +590,12 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, adoptProjectId, {
                 kind: "migration",
             });
-            if (
-                row.verification_status === "verified" &&
-                row.verified_at !== null &&
-                row.verified_at > 0
-            ) {
-                addVerificationEvent(db, {
-                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
-                    outcome: "verified",
-                    verifier: CLAIMS_BACKFILL_PRODUCER,
-                });
-            }
+            recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+                db,
+                row,
+                link.claimId,
+                CLAIMS_BACKFILL_PRODUCER,
+            );
             return {
                 result: { memoryId: row.id, claimId: link.claimId },
                 effects: [

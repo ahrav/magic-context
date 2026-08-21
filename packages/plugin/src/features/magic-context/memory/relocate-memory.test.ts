@@ -9,7 +9,7 @@ import {
     rekeyMemoryRowWithCollisionMerge,
     selectRelocatableMemoryIds,
 } from "./relocate-memory";
-import { insertMemory } from "./storage-memory";
+import { deleteMemory, insertMemory } from "./storage-memory";
 import {
     getCurrentMemoryClaimByLegacyMemoryId,
     memoryClaimSupersessionExists,
@@ -355,6 +355,102 @@ describe("relocate-memory claims (v84)", () => {
         expect(copiedClaim?.state).toBe("active");
         expect(copiedClaim?.claimId).not.toBe(sourceClaim?.claimId);
         expect(copiedClaim?.content).toBe("copied fact");
+    });
+
+    test("copying onto a deleted equivalent reactivates the adopted archived claim", () => {
+        const database = makeDb();
+        const deleted = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "revived fact",
+        });
+        const archivedLink = readMemoryClaimLink(database, deleted.id);
+        deleteMemory(database, deleted.id);
+        expect(
+            database
+                .prepare("SELECT state FROM claims WHERE id = ?")
+                .get(archivedLink?.claimId ?? 0),
+        ).toEqual({ state: "archived" });
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "revived fact",
+        });
+
+        const result = inTransaction(database, () =>
+            copyMemoriesToProject(database, [source.id], "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const copied = database
+            .prepare("SELECT id FROM memories WHERE project_path = 'git:project-b'")
+            .get() as { id: number };
+        const copiedClaim = getCurrentMemoryClaimByLegacyMemoryId(database, copied.id);
+        expect(copiedClaim?.claimId).toBe(archivedLink?.claimId ?? 0);
+        expect(copiedClaim?.state).toBe("active");
+    });
+
+    test("a cross-project move onto a deleted equivalent reactivates the adopted archived claim", () => {
+        const database = makeDb();
+        const deleted = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "migrating fact",
+        });
+        const archivedLink = readMemoryClaimLink(database, deleted.id);
+        deleteMemory(database, deleted.id);
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "migrating fact",
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [source.id], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const moved = database
+            .prepare("SELECT id FROM memories WHERE project_path = 'git:project-b'")
+            .get() as { id: number };
+        const movedClaim = getCurrentMemoryClaimByLegacyMemoryId(database, moved.id);
+        expect(movedClaim?.claimId).toBe(archivedLink?.claimId ?? 0);
+        expect(movedClaim?.state).toBe("active");
+    });
+
+    test("copying a verified memory records verified evidence on the target claim", () => {
+        const database = makeDb();
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "verified fact",
+        });
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+                )
+                .run(source.id);
+        });
+
+        const result = inTransaction(database, () =>
+            copyMemoriesToProject(database, [source.id], "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const copied = database
+            .prepare("SELECT id FROM memories WHERE project_path = 'git:project-b'")
+            .get() as { id: number };
+        const copiedClaim = getCurrentMemoryClaimByLegacyMemoryId(database, copied.id);
+        expect(copiedClaim?.state).toBe("active");
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(copiedClaim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "memory-relocation" }]);
     });
 
     test("a pre-v84 database keeps the plain rekey behavior", () => {
