@@ -4,7 +4,6 @@ import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { resolveProjectIdentity } from "./memory/project-identity";
-import { withImmediateTransaction } from "./memory/storage-claims";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
@@ -88,26 +87,27 @@ function acquireBackfillLease(
     now: number,
 ): "acquired" | "already_completed" | "blocked_by_lease" {
     ensureBackfillStateTable(db);
-    return withImmediateTransaction(db, () => {
-        const current = db
-            .prepare(
-                `SELECT harness, status, holder_id, started_at, lease_expires_at, completed_at
+    return db
+        .transaction((): "acquired" | "already_completed" | "blocked_by_lease" => {
+            const current = db
+                .prepare(
+                    `SELECT harness, status, holder_id, started_at, lease_expires_at, completed_at
                  FROM session_project_backfill_state
                  WHERE harness = ?`,
-            )
-            .get(harness) as SessionProjectBackfillStateRow | null | undefined;
+                )
+                .get(harness) as SessionProjectBackfillStateRow | null | undefined;
 
-        if (current?.status === "completed") return "already_completed";
-        if (
-            current?.status === "running" &&
-            current.lease_expires_at !== null &&
-            current.lease_expires_at > now
-        ) {
-            return "blocked_by_lease";
-        }
+            if (current?.status === "completed") return "already_completed";
+            if (
+                current?.status === "running" &&
+                current.lease_expires_at !== null &&
+                current.lease_expires_at > now
+            ) {
+                return "blocked_by_lease";
+            }
 
-        db.prepare(
-            `INSERT INTO session_project_backfill_state(
+            db.prepare(
+                `INSERT INTO session_project_backfill_state(
                 harness,
                 status,
                 holder_id,
@@ -122,10 +122,11 @@ function acquireBackfillLease(
                 started_at = excluded.started_at,
                 lease_expires_at = excluded.lease_expires_at,
                 completed_at = NULL`,
-        ).run(harness, holderId, now, now + LEASE_TTL_MS);
+            ).run(harness, holderId, now, now + LEASE_TTL_MS);
 
-        return "acquired";
-    });
+            return "acquired";
+        })
+        .immediate();
 }
 
 function renewBackfillLease(db: Database, harness: string, holderId: string, now: number): boolean {

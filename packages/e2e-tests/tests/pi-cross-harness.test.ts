@@ -1,14 +1,10 @@
 /// <reference types="bun-types" />
 
-import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
-import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
-import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { TestHarness } from "../src/harness";
 import { PiTestHarness } from "../src/pi-harness";
-import { openTestDb } from "../src/test-db";
 
 let oc: TestHarness | null = null;
 let pi: PiTestHarness | null = null;
@@ -18,45 +14,43 @@ afterAll(async () => {
     await oc?.dispose();
 });
 
-async function insertMemory(dbPath: string, projectIdentity: string, sessionId: string | null, content: string) {
-    const deadline = Date.now() + 10_000;
-    while (true) {
-        const db = openTestDb(dbPath);
-        try {
-            const now = Date.now();
-            db.prepare(
-                `INSERT INTO memories (
-                    project_path, category, content, normalized_hash,
-                    source_session_id, source_type, seen_count, retrieval_count,
-                    first_seen_at, created_at, updated_at, last_seen_at, status
-                ) VALUES (?, 'WORKFLOW_RULES', ?, ?, ?, 'agent', 1, 0, ?, ?, ?, ?, 'active')`,
-            ).run(projectIdentity, content, computeNormalizedHash(content), sessionId, now, now, now, now);
-            return;
-        } catch (error) {
-            if (!(error instanceof Error) || !error.message.includes("database is locked") || Date.now() > deadline) {
-                throw error;
-            }
-            await Bun.sleep(100);
-        } finally {
-            db.close();
-        }
-    }
+function emitMemoryWriteOnce(mock: TestHarness["mock"], content: string): void {
+    let emitted = false;
+    mock.addMatcher((body) => {
+        if (emitted) return null;
+        const tools = body.tools;
+        if (!Array.isArray(tools)) return null;
+        const memoryTool = tools.find(
+            (tool) =>
+                tool !== null &&
+                typeof tool === "object" &&
+                (tool as { name?: unknown }).name === "ctx_memory",
+        ) as { name: string } | undefined;
+        if (!memoryTool) return null;
+        emitted = true;
+        return {
+            content: [
+                {
+                    type: "tool_use",
+                    id: `toolu_cross_memory_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
+                    name: memoryTool.name,
+                    input: { action: "write", category: "PROJECT_RULES", content },
+                },
+            ],
+            stop_reason: "tool_use",
+            usage: { input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 100 },
+        };
+    });
 }
 
 describe("pi cross harness", () => {
-    // TODO(ci-flake): timing-sensitive on shared GitHub-hosted runners — has
-    // tripped its 300s budget multiple times even though it passes in seconds
-    // locally on macOS. Spins up OpenCode + Pi simultaneously, writes a
-    // memory in OpenCode, then expects Pi's first turn to read it back via
-    // ctx_search. On a 2-core CI runner under load, the two-harness boot
-    // alone can eat most of the budget. Skip on CI until we either widen
-    // the budget further or split the cross-harness lifecycle into a
-    // multi-step setup that doesn't hold the test budget open.
-    it.skipIf(Boolean(process.env.CI))("shares project memories between OpenCode and Pi both directions", async () => {
+    it("shares public-tool project memory writes between OpenCode and Pi both directions", async () => {
         oc = await TestHarness.create();
         const sharedWorkdir = realpathSync(pathResolve(oc.opencode.env.workdir));
-        pi = await PiTestHarness.create({ sharedDataDir: oc.opencode.env.dataDir, workdir: sharedWorkdir });
-        const projectIdentity = resolveProjectIdentity(sharedWorkdir);
+        pi = await PiTestHarness.create({
+            sharedDataDir: oc.opencode.env.dataDir,
+            workdir: sharedWorkdir,
+        });
 
         oc.mock.reset();
         oc.mock.setDefault({
@@ -71,12 +65,11 @@ describe("pi cross harness", () => {
             text: "pi bootstrap",
             usage: { input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 100 },
         });
-        const piTurn = await pi.sendPrompt("bootstrap pi shared db", { timeoutMs: 60_000 });
-        const piProjectIdentity = resolveProjectIdentity(realpathSync(pathResolve(pi.env.workdir)));
+        await pi.sendPrompt("bootstrap pi shared db", { timeoutMs: 60_000 });
 
-        const dbPath = pi.contextDbPath();
         const fromOpenCode = "OpenCode wrote this memory for Pi flagship search";
-        await insertMemory(dbPath, projectIdentity, ocSession, fromOpenCode);
+        emitMemoryWriteOnce(oc.mock, fromOpenCode);
+        await oc.sendPrompt(ocSession, "remember this workflow rule for Pi");
         await pi.newSession();
 
         pi.mock.reset();
@@ -94,7 +87,8 @@ describe("pi cross harness", () => {
         expect(JSON.stringify(pi.mock.lastRequest()!.body)).toContain(fromOpenCode);
 
         const fromPi = "Pi wrote this memory for OpenCode injection";
-        await insertMemory(dbPath, piProjectIdentity, piTurn.sessionId, fromPi);
+        emitMemoryWriteOnce(pi.mock, fromPi);
+        await pi.sendPrompt("remember this workflow rule for OpenCode", { timeoutMs: 60_000 });
 
         oc.mock.reset();
         oc.mock.setDefault({

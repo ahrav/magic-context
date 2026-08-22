@@ -9,6 +9,7 @@ import {
 	getMemoriesByProject,
 	insertMemory,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	getCompartments,
 	getOrCreateSessionMeta,
@@ -84,8 +85,10 @@ describe("workspace memory sharing", () => {
 				category: "CONSTRAINTS",
 				content: "foreign constraint is shared",
 			});
-			db.prepare("UPDATE memories SET shareable = 1 WHERE id = ?").run(
-				shared.id,
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare("UPDATE memories SET shareable = 1 WHERE id = ?")
+					.run(shared.id),
 			);
 			insertMemory(db, {
 				projectPath: "git:foreign",
@@ -1238,9 +1241,13 @@ describe("injectM0M1Pi", () => {
 				renderBudgetIdentity: "",
 			};
 
-			db.prepare(
-				"UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
-			).run(replacement.id, source.id);
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare(
+						"UPDATE memories SET status = 'archived', superseded_by_memory_id = ? WHERE id = ?",
+					)
+					.run(replacement.id, source.id),
+			);
 			queueMemoryMutation(db, {
 				projectPath: state.projectIdentity,
 				mutationType: "superseded",
@@ -1320,9 +1327,13 @@ describe("injectM0M1Pi", () => {
 				undefined,
 				true,
 			);
-			db.prepare(
-				"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-			).run("Reconciled content.", "reconciled-hash", Date.now(), memory.id);
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare(
+						"UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+					)
+					.run("Reconciled content.", "reconciled-hash", Date.now(), memory.id),
+			);
 			queueMemoryMutation(db, {
 				projectPath: state.projectIdentity,
 				mutationType: "update",

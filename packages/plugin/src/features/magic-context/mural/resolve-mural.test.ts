@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { insertMemory, setMemoryClassification } from "../memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "../memory/storage-memory-claims";
 import type { Memory } from "../memory/types";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
@@ -46,6 +47,50 @@ function seedCuedMemory(
 }
 
 describe("resolveMural", () => {
+    test("keeps the claim-backed projection reader shape and bytes unchanged", () => {
+        const db = freshDb();
+        try {
+            const project = "git:u6-mural-reader";
+            const content = "mural projection bytes: café";
+            const memory = seedCuedMemory(db, project, "ARCHITECTURE", content, 73);
+            expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(content);
+
+            const statements: string[] = [];
+            const originalPrepare = db.prepare.bind(db);
+            db.prepare = ((sql: string) => {
+                statements.push(sql);
+                return originalPrepare(sql);
+            }) as typeof db.prepare;
+            let entries: ReturnType<typeof resolveMural>;
+            try {
+                entries = resolveMural(db, project, 1);
+            } finally {
+                db.prepare = originalPrepare;
+            }
+
+            const expected = [
+                {
+                    id: memory.id,
+                    category: "ARCHITECTURE",
+                    importance: 73,
+                    cue: `cue-${memory.id}`,
+                },
+            ];
+            expect(entries).toEqual(expected);
+            expect(Buffer.from(JSON.stringify(entries))).toEqual(
+                Buffer.from(JSON.stringify(expected)),
+            );
+            expect(statements.some((sql) => /\bmemories\b/i.test(sql))).toBeTrue();
+            expect(
+                statements.some((sql) =>
+                    /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql),
+                ),
+            ).toBeFalse();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("selects only the overflow complement of the budget trim", () => {
         const db = freshDb();
         try {

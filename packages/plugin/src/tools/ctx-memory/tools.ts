@@ -28,7 +28,19 @@ import { computeNormalizedHash } from "../../features/magic-context/memory/norma
 import {
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
+    type MemoryClaimOperationIdentity,
 } from "../../features/magic-context/memory/storage-memory";
+import {
+    ClaimOperationKeyReuseError,
+    computeClaimRequestDigest,
+    hasMemoryClaimsCompatSchema,
+    type MemoryClaimOperationEnvelope,
+    readMemoryClaimOperationResult,
+    runMemoryClaimOperationInCurrentTransaction,
+    updateMemoryContentWithClaimsInCurrentTransaction,
+    withClaimsWriteCapabilityInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
+} from "../../features/magic-context/memory/storage-memory-claims";
 import {
     normalizeStoredProjectPath,
     queueMemoryMutation,
@@ -55,7 +67,6 @@ import {
     type CtxMemoryArgs,
     type CtxMemoryToolDeps,
 } from "./types";
-import { runImmediateTransaction } from "./verification-recording";
 
 export { CTX_MEMORY_LIGHT_DESCRIPTION } from "../light-descriptions";
 
@@ -330,12 +341,43 @@ function inactiveMemoryError(id: number, action: "updating" | "merging" | "archi
     return `Error: Memory with ID ${id} is archived or superseded; restore it before ${action}.`;
 }
 
+// Envelopes require a digest; the tool's claim identities always carry one,
+// so the cast only narrows the optional field.
+function toClaimOperationEnvelope(
+    identity: MemoryClaimOperationIdentity,
+): MemoryClaimOperationEnvelope {
+    return {
+        producer: identity.producer,
+        operationKey: identity.operationKey,
+        requestDigest: identity.requestDigest as string,
+    };
+}
+
 function updateMemoryContentInCurrentTransaction(
     db: CtxMemoryToolDeps["db"],
     memory: Memory,
     content: string,
     normalizedHash: string,
-): void {
+    operationIdentity?: MemoryClaimOperationIdentity,
+): boolean {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const outcome = withClaimsWriteCapabilityInCurrentTransaction(db, () => {
+            return updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: operationIdentity?.producer ?? "ctx-memory-opencode",
+                    operationKey:
+                        operationIdentity?.operationKey ?? `update:${crypto.randomUUID()}`,
+                    requestDigest:
+                        operationIdentity?.requestDigest ??
+                        computeClaimRequestDigest({ id: memory.id, content, normalizedHash }),
+                },
+                { memoryId: memory.id, content, normalizedHash },
+            );
+        });
+        invalidateMemory(memory.projectPath, memory.id);
+        return outcome.replayed;
+    }
     db.prepare(
         "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
     ).run(content, normalizedHash, Date.now(), memory.id);
@@ -351,6 +393,7 @@ function updateMemoryContentInCurrentTransaction(
     }
     db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(memory.id);
     invalidateMemory(memory.projectPath, memory.id);
+    return false;
 }
 
 const ctxMemoryArgsShape = {
@@ -390,567 +433,864 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
         description: CTX_MEMORY_DESCRIPTION,
         args: ctxMemoryArgsShape,
         async execute(rawArgs: CtxMemoryArgs, toolContext) {
-            const parsedArgs = ctxMemoryArgsSchema.safeParse(rawArgs);
-            let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxMemoryArgs;
-            args = unwrapImitatedReducedArgs(args, ["action"], {
-                action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
-                content: "string",
-                category: { type: "enum", values: V2_MEMORY_CATEGORIES },
-                ids: { type: "array", items: "number", maxItems: 100 },
-                limit: "number",
-                reason: "string",
-            });
-            // Sidekick consumes untrusted `/ctx-aug` prompt text and is retrieval-only;
-            // fail closed even if a future permission list accidentally exposes this tool.
-            if (toolContext.agent === SIDEKICK_AGENT) {
-                return "Error: ctx_memory is not available to the sidekick agent.";
-            }
-            if (
-                args.action === undefined ||
-                (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action))
-            ) {
-                return `Error: Action '${args.action}' is not allowed in this context.`;
-            }
-
-            // Resolve the session's actual project from `toolContext.directory`
-            // each call. OpenCode's top-level `ctx.directory` (the launch dir)
-            // can differ from the session's working directory when the user
-            // runs `opencode -s <id>` from outside the project.
-            const projectPath = deps.resolveProjectPath(toolContext.directory);
-            if (!projectPath) {
-                return "Error: Could not resolve project identity for memory action.";
-            }
-            await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
-            if (args.action !== "list") {
-                const marker = getAuthorityManagedMarker(deps.db, projectPath);
-                let authorityState: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
-                try {
-                    authorityState =
-                        (await deps.rustToolBackends?.authorityState?.({
-                            projectPath,
-                            projectRoot: toolContext.directory,
-                            domain: "memories",
-                        })) ?? null;
-                } catch (error) {
-                    if (marker) {
-                        return `Error: Rust memory authority is unavailable. ${error instanceof Error ? error.message : String(error)}`;
-                    }
-                }
-                if (authorityState === "MODULE") {
-                    const memoryBackend = deps.rustToolBackends?.memory;
-                    if (!memoryBackend) {
-                        return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
-                    }
-                    try {
-                        const commandId = toolCallIdFromContext(toolContext);
-                        const text = moduleMemoryText(
-                            await memoryBackend({
-                                ...(commandId ? { commandId } : {}),
-                                sessionId: toolContext.sessionID,
-                                projectRoot: toolContext.directory,
-                                projectPath,
-                                memoryProject: projectPath,
-                                action: args.action,
-                                content: args.content,
-                                category: args.category,
-                                ids: args.ids,
-                                reason: args.reason,
-                            }),
-                            args,
-                        );
-                        return (
-                            text ?? "Error: Rust module returned an invalid ctx_memory response."
-                        );
-                    } catch (error) {
-                        if (isRustAuthorityDrainingError(error)) {
-                            return memoryAuthorityRefusal(args);
-                        }
-                        return `Error: Rust module ctx_memory failed. ${error instanceof Error ? error.message : String(error)}`;
-                    }
-                }
-                if (marker || authorityState === "PREPARING" || authorityState === "DRAINING") {
-                    return memoryAuthorityRefusal(args);
-                }
-            }
-            const workspaceIdentitySet = resolveWorkspaceIdentitySet(deps.db, projectPath);
-            const expandedWorkspace = expandWorkspaceIdentitySetWithAliases(
-                deps.db,
-                workspaceIdentitySet.identities,
-            );
-            const workspaceVisibleIdentities =
-                workspaceIdentitySet.identities.length > 1
-                    ? expandedWorkspace.expandedIdentities
-                    : workspaceIdentitySet.identities;
-            const targetIdentityForStoredPath = (rawProjectPath: string) =>
-                workspaceIdentitySet.identities.length > 1
-                    ? (resolveStoredPathWorkspaceIdentity(
-                          rawProjectPath,
-                          workspaceIdentitySet.identities,
-                          expandedWorkspace.canonicalIdentityByStoredPath,
-                      ) ?? projectIdentityForStoredPath(rawProjectPath))
-                    : projectIdentityForStoredPath(rawProjectPath);
-            // The workspace's share-category policy matches the render path.
-            // null means there is no workspace filter; a workspaced caller gets
-            // an explicit list where [] shares no foreign categories.
-            const toolShareCategories =
-                workspaceIdentitySet.identities.length > 1
-                    ? resolveWorkspaceShareCategories(deps.db, projectPath)
-                    : null;
-            // Visibility is the READ contract: own memories are visible in every
-            // category, while foreign workspace memories are visible only in
-            // categories the workspace explicitly shares. Mutations by primary
-            // agents use memoryOwnedByTool below so shared visibility never
-            // grants write access to another project.
-            const memoryVisibleToTool = (memory: Memory): boolean => {
-                if (workspaceIdentitySet.identities.length <= 1) {
-                    return memoryBelongsToProject(memory, projectPath);
+            try {
+                const parsedArgs = ctxMemoryArgsSchema.safeParse(rawArgs);
+                let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxMemoryArgs;
+                args = unwrapImitatedReducedArgs(args, ["action"], {
+                    action: { type: "enum", values: CTX_MEMORY_DREAMER_ACTIONS },
+                    content: "string",
+                    category: { type: "enum", values: V2_MEMORY_CATEGORIES },
+                    ids: { type: "array", items: "number", maxItems: 100 },
+                    limit: "number",
+                    reason: "string",
+                });
+                // Sidekick consumes untrusted `/ctx-aug` prompt text and is retrieval-only;
+                // fail closed even if a future permission list accidentally exposes this tool.
+                if (toolContext.agent === SIDEKICK_AGENT) {
+                    return "Error: ctx_memory is not available to the sidekick agent.";
                 }
                 if (
-                    !storedPathBelongsToWorkspace(
-                        memory.projectPath,
-                        workspaceIdentitySet.identities,
-                        workspaceVisibleIdentities,
-                        expandedWorkspace.canonicalIdentityByStoredPath,
-                    )
+                    args.action === undefined ||
+                    (toolContext.agent !== DREAMER_AGENT && !allowedActions.includes(args.action))
                 ) {
-                    return false;
-                }
-                const isOwn = targetIdentityForStoredPath(memory.projectPath) === projectPath;
-                if (isOwn) return true;
-                return (
-                    (memory.status === "active" || memory.status === "permanent") &&
-                    (memory.expiresAt === null || memory.expiresAt > Date.now()) &&
-                    memory.shareable === 1 &&
-                    ["project", "ecosystem", "universe"].includes(memory.scope) &&
-                    (toolShareCategories?.includes(memory.category) ?? false)
-                );
-            };
-            const memoryOwnedByTool = (memory: Memory): boolean =>
-                workspaceIdentitySet.identities.length > 1
-                    ? targetIdentityForStoredPath(memory.projectPath) === projectPath
-                    : memoryBelongsToProject(memory, projectPath);
-            const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
-            if (
-                embeddingSnapshot
-                    ? !embeddingSnapshot.features.memoryEnabled
-                    : deps.memoryEnabled === false
-            ) {
-                return getDisabledMessage();
-            }
-
-            if (args.action === "write") {
-                const content = args.content?.trim();
-                if (!content) {
-                    return "Error: 'content' is required when action is 'write'.";
+                    return `Error: Action '${args.action}' is not allowed in this context.`;
                 }
 
-                const rawCategory = args.category?.trim();
-                if (!rawCategory) {
-                    return "Error: 'category' is required when action is 'write'.";
+                // Resolve the session's actual project from `toolContext.directory`
+                // each call. OpenCode's top-level `ctx.directory` (the launch dir)
+                // can differ from the session's working directory when the user
+                // runs `opencode -s <id>` from outside the project.
+                const projectPath = deps.resolveProjectPath(toolContext.directory);
+                if (!projectPath) {
+                    return "Error: Could not resolve project identity for memory action.";
                 }
-
-                const category = getValidatedCategory(rawCategory);
-                if (!category) {
-                    return `Error: Unknown memory category '${rawCategory}'.`;
+                const toolCallId = toolCallIdFromContext(toolContext);
+                const claimsSchema = hasMemoryClaimsCompatSchema(deps.db);
+                const claimOperationIdentity = (
+                    suffix: string,
+                    request: unknown,
+                ): MemoryClaimOperationIdentity | undefined =>
+                    toolCallId
+                        ? {
+                              producer: "ctx-memory-opencode",
+                              // claim_operations is UNIQUE(producer, operation_key)
+                              // across the whole DB while tool-call ids are only
+                              // unique within a session; the session prefix keeps
+                              // two sessions from colliding on the same call id.
+                              operationKey: `${toolContext.sessionID}:${toolCallId}:${suffix}`,
+                              requestDigest: computeClaimRequestDigest(request),
+                          }
+                        : undefined;
+                await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
+                if (args.action !== "list") {
+                    const marker = getAuthorityManagedMarker(deps.db, projectPath);
+                    let authorityState: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
+                    try {
+                        authorityState =
+                            (await deps.rustToolBackends?.authorityState?.({
+                                projectPath,
+                                projectRoot: toolContext.directory,
+                                domain: "memories",
+                            })) ?? null;
+                    } catch (error) {
+                        if (marker) {
+                            return `Error: Rust memory authority is unavailable. ${error instanceof Error ? error.message : String(error)}`;
+                        }
+                    }
+                    if (authorityState === "MODULE") {
+                        const memoryBackend = deps.rustToolBackends?.memory;
+                        if (!memoryBackend) {
+                            return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
+                        }
+                        try {
+                            const text = moduleMemoryText(
+                                await memoryBackend({
+                                    ...(toolCallId ? { commandId: toolCallId } : {}),
+                                    sessionId: toolContext.sessionID,
+                                    projectRoot: toolContext.directory,
+                                    projectPath,
+                                    memoryProject: projectPath,
+                                    action: args.action,
+                                    content: args.content,
+                                    category: args.category,
+                                    ids: args.ids,
+                                    reason: args.reason,
+                                }),
+                                args,
+                            );
+                            return (
+                                text ??
+                                "Error: Rust module returned an invalid ctx_memory response."
+                            );
+                        } catch (error) {
+                            if (isRustAuthorityDrainingError(error)) {
+                                return memoryAuthorityRefusal(args);
+                            }
+                            return `Error: Rust module ctx_memory failed. ${error instanceof Error ? error.message : String(error)}`;
+                        }
+                    }
+                    if (marker || authorityState === "PREPARING" || authorityState === "DRAINING") {
+                        return memoryAuthorityRefusal(args);
+                    }
                 }
-
-                const existingMemory = getMemoryByHash(
+                const workspaceIdentitySet = resolveWorkspaceIdentitySet(deps.db, projectPath);
+                const expandedWorkspace = expandWorkspaceIdentitySetWithAliases(
                     deps.db,
-                    projectPath,
-                    category,
-                    computeNormalizedHash(content),
+                    workspaceIdentitySet.identities,
                 );
-                if (existingMemory) {
-                    updateMemorySeenCount(deps.db, existingMemory.id);
-                    requestRustMemorySync(deps, toolContext.sessionID);
-                    return `Memory already exists [ID: ${existingMemory.id}] in ${category} (seen count incremented).`;
+                const workspaceVisibleIdentities =
+                    workspaceIdentitySet.identities.length > 1
+                        ? expandedWorkspace.expandedIdentities
+                        : workspaceIdentitySet.identities;
+                const targetIdentityForStoredPath = (rawProjectPath: string) =>
+                    workspaceIdentitySet.identities.length > 1
+                        ? (resolveStoredPathWorkspaceIdentity(
+                              rawProjectPath,
+                              workspaceIdentitySet.identities,
+                              expandedWorkspace.canonicalIdentityByStoredPath,
+                          ) ?? projectIdentityForStoredPath(rawProjectPath))
+                        : projectIdentityForStoredPath(rawProjectPath);
+                // The workspace's share-category policy matches the render path.
+                // null means there is no workspace filter; a workspaced caller gets
+                // an explicit list where [] shares no foreign categories.
+                const toolShareCategories =
+                    workspaceIdentitySet.identities.length > 1
+                        ? resolveWorkspaceShareCategories(deps.db, projectPath)
+                        : null;
+                // Visibility is the READ contract: own memories are visible in every
+                // category, while foreign workspace memories are visible only in
+                // categories the workspace explicitly shares. Mutations by primary
+                // agents use memoryOwnedByTool below so shared visibility never
+                // grants write access to another project.
+                const memoryVisibleToTool = (memory: Memory): boolean => {
+                    if (workspaceIdentitySet.identities.length <= 1) {
+                        return memoryBelongsToProject(memory, projectPath);
+                    }
+                    if (
+                        !storedPathBelongsToWorkspace(
+                            memory.projectPath,
+                            workspaceIdentitySet.identities,
+                            workspaceVisibleIdentities,
+                            expandedWorkspace.canonicalIdentityByStoredPath,
+                        )
+                    ) {
+                        return false;
+                    }
+                    const isOwn = targetIdentityForStoredPath(memory.projectPath) === projectPath;
+                    if (isOwn) return true;
+                    return (
+                        (memory.status === "active" || memory.status === "permanent") &&
+                        (memory.expiresAt === null || memory.expiresAt > Date.now()) &&
+                        memory.shareable === 1 &&
+                        ["project", "ecosystem", "universe"].includes(memory.scope) &&
+                        (toolShareCategories?.includes(memory.category) ?? false)
+                    );
+                };
+                const memoryOwnedByTool = (memory: Memory): boolean =>
+                    workspaceIdentitySet.identities.length > 1
+                        ? targetIdentityForStoredPath(memory.projectPath) === projectPath
+                        : memoryBelongsToProject(memory, projectPath);
+                const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
+                if (
+                    embeddingSnapshot
+                        ? !embeddingSnapshot.features.memoryEnabled
+                        : deps.memoryEnabled === false
+                ) {
+                    return getDisabledMessage();
                 }
 
-                const insertResult = insertMemoryIdempotent(deps.db, {
-                    projectPath: projectPath,
-                    category,
-                    content,
-                    sourceSessionId: toolContext.sessionID,
-                    sourceType:
-                        toolContext.agent === DREAMER_AGENT ? "dreamer" : getSourceType(deps),
-                });
-                if (!insertResult.inserted) {
-                    return `Memory already exists [ID: ${insertResult.memory.id}] in ${category} (seen count incremented).`;
-                }
+                if (args.action === "write") {
+                    const content = args.content?.trim();
+                    if (!content) {
+                        return "Error: 'content' is required when action is 'write'.";
+                    }
 
-                queueMemoryEmbedding({
-                    deps,
-                    sessionId: toolContext.sessionID,
-                    projectPath,
-                    memoryId: insertResult.memory.id,
-                    content,
-                });
-                requestRustMemorySync(deps, toolContext.sessionID);
+                    const rawCategory = args.category?.trim();
+                    if (!rawCategory) {
+                        return "Error: 'category' is required when action is 'write'.";
+                    }
 
-                return `Saved memory [ID: ${insertResult.memory.id}] in ${category}.`;
-            }
+                    const category = getValidatedCategory(rawCategory);
+                    if (!category) {
+                        return `Error: Unknown memory category '${rawCategory}'.`;
+                    }
 
-            if (args.action === "list") {
-                const limit = normalizeLimit(args.limit);
-                const category = normalizeCategory(args.category);
-                const memories = filterByCategory(
-                    getMemoriesByProject(deps.db, projectPath),
-                    category,
-                ).slice(0, limit);
-
-                return formatMemoryList(memories);
-            }
-
-            if (args.action === "get") {
-                const getIds = args.ids;
-                if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
-                    return "Error: 'ids' must contain at least one integer memory ID when action is 'get'.";
-                }
-                if (getIds.length > GET_MAX_IDS) {
-                    return `Error: 'ids' must contain at most ${GET_MAX_IDS} memory IDs when action is 'get' (got ${getIds.length}).`;
-                }
-                // De-dupe while preserving first-seen order so the output lists
-                // each requested id exactly once and never reflects a row twice.
-                const uniqueIds = [...new Set(getIds)];
-                const fetched = getMemoriesByIds(deps.db, uniqueIds);
-                const memoriesById = new Map<number, Memory>(
-                    fetched
-                        .filter((memory) => memoryVisibleToTool(memory))
-                        .map((memory) => [memory.id, memory]),
-                );
-                return formatGetOutput({
-                    requestedIds: uniqueIds,
-                    memoriesById,
-                });
-            }
-
-            if (args.action === "update") {
-                const updateIds = args.ids;
-                if (updateIds?.length !== 1 || !updateIds.every(Number.isInteger)) {
-                    return "Error: 'ids' must contain exactly one integer memory ID when action is 'update'.";
-                }
-                const updateId = updateIds[0];
-
-                const content = args.content?.trim();
-                if (!content) {
-                    return "Error: 'content' is required when action is 'update'.";
-                }
-
-                const rawProjectPath = projectPathForMemoryId(deps.db, updateId);
-                const memory = getMemoryById(deps.db, updateId);
-                const updateAllowed = memory
-                    ? toolContext.agent === DREAMER_AGENT
-                        ? memoryVisibleToTool(memory)
-                        : memoryOwnedByTool(memory)
-                    : false;
-                if (!memory || !rawProjectPath || !updateAllowed) {
-                    return `Error: Memory with ID ${updateId} was not found.`;
-                }
-                if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {
-                    return inactiveMemoryError(updateId, "updating");
-                }
-
-                const normalizedHash = computeNormalizedHash(content);
-                const duplicate = getMemoryByHash(
-                    deps.db,
-                    targetIdentityForStoredPath(rawProjectPath),
-                    memory.category,
-                    normalizedHash,
-                );
-                if (duplicate && duplicate.id !== memory.id) {
-                    return `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`;
-                }
-
-                const projectIdentity = targetIdentityForStoredPath(rawProjectPath);
-                runImmediateTransaction(deps.db, () => {
-                    updateMemoryContentInCurrentTransaction(
-                        deps.db,
-                        memory,
-                        content,
+                    const normalizedHash = computeNormalizedHash(content);
+                    const writeRequest = {
+                        projectPath,
+                        category,
                         normalizedHash,
-                    );
-                    queueMemoryMutation(deps.db, {
-                        projectPath: projectIdentity,
-                        mutationType: "update",
-                        targetMemoryId: memory.id,
-                        category: memory.category,
-                        newContent: content,
-                    });
-                });
-                queueMemoryEmbedding({
-                    deps,
-                    sessionId: toolContext.sessionID,
-                    projectPath: projectIdentity,
-                    memoryId: memory.id,
-                    content,
-                });
-                requestRustMemorySync(deps, toolContext.sessionID);
-
-                return `Updated memory [ID: ${memory.id}] in ${memory.category}.`;
-            }
-
-            if (args.action === "merge") {
-                const ids = args.ids;
-                if (!ids || ids.length < 2 || !ids.every(Number.isInteger)) {
-                    return "Error: 'ids' must include at least two integer memory IDs when action is 'merge'.";
-                }
-                if (new Set(ids).size !== ids.length) {
-                    return "Error: 'ids' must include at least two distinct memory IDs when action is 'merge'.";
-                }
-
-                const content = args.content?.trim();
-                if (!content) {
-                    return "Error: 'content' is required when action is 'merge'.";
-                }
-
-                const sourceMemories = ids
-                    .map((id) => getMemoryById(deps.db, id))
-                    .filter((memory): memory is Memory => Boolean(memory));
-                if (sourceMemories.length !== ids.length) {
-                    return "Error: One or more source memories were not found.";
-                }
-                // Cross-identity consolidation is a DREAMER-ONLY capability: the
-                // loop below supersedes each source under ITS OWN project identity
-                // and queues a per-project supersede-delta row, so every affected
-                // project's m[1] reconciles. But `merge` is now in the primary
-                // action set too, and a primary agent must not be able to reach
-                // into ANOTHER project's memories. So mirror update/archive: a
-                // non-dreamer caller may only merge memories that all belong to
-                // its own resolved project. The dreamer keeps the cross-identity
-                // path (see the "merging across identities" test).
-                if (toolContext.agent !== DREAMER_AGENT) {
-                    const foreign = sourceMemories.find((memory) => !memoryOwnedByTool(memory));
-                    if (foreign) {
-                        return `Error: Memory with ID ${foreign.id} was not found.`;
+                        content,
+                    };
+                    const writeIdentity = claimOperationIdentity("write", writeRequest);
+                    if (writeIdentity && claimsSchema) {
+                        const envelope = toClaimOperationEnvelope(writeIdentity);
+                        const replay = readMemoryClaimOperationResult<{
+                            memoryId: number;
+                            duplicate?: boolean;
+                        }>(deps.db, envelope);
+                        if (replay) {
+                            return replay.result.duplicate
+                                ? `Memory already exists [ID: ${replay.result.memoryId}] in ${category} (seen count incremented).`
+                                : `Saved memory [ID: ${replay.result.memoryId}] in ${category}.`;
+                        }
+                        // The duplicate short-circuit runs inside the envelope so a
+                        // committed-but-unacked write replays its stored outcome
+                        // instead of re-bumping seen_count; the insert runs under
+                        // its own storage-generated key.
+                        const outcome = deps.db
+                            .transaction(() =>
+                                withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () =>
+                                    runMemoryClaimOperationInCurrentTransaction<{
+                                        memoryId: number;
+                                        duplicate: boolean;
+                                    }>(deps.db, envelope, () => {
+                                        const existing = getMemoryByHash(
+                                            deps.db,
+                                            projectPath,
+                                            category,
+                                            normalizedHash,
+                                        );
+                                        if (existing) {
+                                            updateMemorySeenCount(deps.db, existing.id);
+                                            return {
+                                                result: { memoryId: existing.id, duplicate: true },
+                                                effects: [],
+                                            };
+                                        }
+                                        const inserted = insertMemoryIdempotent(deps.db, {
+                                            projectPath: projectPath,
+                                            category,
+                                            content,
+                                            sourceSessionId: toolContext.sessionID,
+                                            sourceType:
+                                                toolContext.agent === DREAMER_AGENT
+                                                    ? "dreamer"
+                                                    : getSourceType(deps),
+                                        });
+                                        return {
+                                            result: {
+                                                memoryId: inserted.memory.id,
+                                                duplicate: !inserted.inserted,
+                                            },
+                                            effects: [],
+                                        };
+                                    }),
+                                ),
+                            )
+                            .immediate();
+                        if (outcome.result.duplicate) {
+                            if (!outcome.replayed) {
+                                requestRustMemorySync(deps, toolContext.sessionID);
+                            }
+                            return `Memory already exists [ID: ${outcome.result.memoryId}] in ${category} (seen count incremented).`;
+                        }
+                        if (!outcome.replayed) {
+                            queueMemoryEmbedding({
+                                deps,
+                                sessionId: toolContext.sessionID,
+                                projectPath,
+                                memoryId: outcome.result.memoryId,
+                                content,
+                            });
+                            requestRustMemorySync(deps, toolContext.sessionID);
+                        }
+                        return `Saved memory [ID: ${outcome.result.memoryId}] in ${category}.`;
                     }
-                    const inactive = sourceMemories.find(
-                        (memory) => !isPrimaryMutableMemory(memory),
-                    );
-                    if (inactive) {
-                        return inactiveMemoryError(inactive.id, "merging");
-                    }
-                } else if (workspaceIdentitySet.identities.length > 1) {
-                    // The dreamer keeps its cross-PROJECT merge power (#5971) OUTSIDE
-                    // a workspace (the branch above leaves non-workspace dreamer
-                    // merges unrestricted). But INSIDE a workspace, per-category
-                    // sharing is the user's explicit privacy boundary that even the
-                    // system's own consolidation worker honors: a FOREIGN member's
-                    // memory in a non-shared category (or a non-member project's
-                    // memory) is off-limits. memoryVisibleToTool already encodes
-                    // exactly that for the workspace case (own → true,
-                    // foreign-shared-category → true, else → false).
-                    const blocked = sourceMemories.find((memory) => !memoryVisibleToTool(memory));
-                    if (blocked) {
-                        return `Error: Memory with ID ${blocked.id} is in a category not shared with this workspace member and cannot be merged.`;
-                    }
-                }
 
-                // A fact has exactly one category. If sources span categories they
-                // are NOT genuine duplicates — one is miscategorized; archive the
-                // redundant one instead. Merging across categories silently destroys
-                // a distinct fact, so reject it structurally (not a prompt rule).
-                const sourceCategories = new Set(sourceMemories.map((memory) => memory.category));
-                if (sourceCategories.size > 1) {
-                    return `Error: Cannot merge memories from different categories (${[...sourceCategories].join(", ")}). If they are genuine duplicates, one is miscategorized — archive the redundant one instead of merging across categories.`;
-                }
-
-                const category =
-                    getValidatedCategory(args.category) ?? sourceMemories[0]?.category ?? null;
-                if (!category) {
-                    return "Error: A valid category is required when action is 'merge'.";
-                }
-
-                const normalizedHash = computeNormalizedHash(content);
-
-                const mergedFrom = JSON.stringify(
-                    Array.from(
-                        new Set(
-                            sourceMemories.flatMap((memory) => {
-                                let parsed: unknown[];
-                                try {
-                                    parsed = memory.mergedFrom ? JSON.parse(memory.mergedFrom) : [];
-                                } catch {
-                                    parsed = [];
-                                }
-                                return [
-                                    memory.id,
-                                    ...(Array.isArray(parsed)
-                                        ? parsed.filter(
-                                              (value): value is number => typeof value === "number",
-                                          )
-                                        : []),
-                                ];
-                            }),
-                        ),
-                    ).sort((left, right) => left - right),
-                );
-                const mergedSeenCount = sourceMemories.reduce(
-                    (sum, memory) => sum + memory.seenCount,
-                    0,
-                );
-                const mergedRetrievalCount = sourceMemories.reduce(
-                    (sum, memory) => sum + memory.retrievalCount,
-                    0,
-                );
-                const mergedStatus = sourceMemories.some((memory) => memory.status === "permanent")
-                    ? "permanent"
-                    : "active";
-
-                let mergeConflict: string | null = null;
-                const canonicalMemory = runImmediateTransaction(deps.db, () => {
-                    const lockedDuplicate = getMemoryByHash(
+                    const existingMemory = getMemoryByHash(
                         deps.db,
                         projectPath,
                         category,
                         normalizedHash,
                     );
-                    const canonicalExisting =
-                        lockedDuplicate && ids.includes(lockedDuplicate.id)
-                            ? lockedDuplicate
-                            : null;
-                    if (lockedDuplicate && !canonicalExisting) {
-                        mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
-                        return null;
+                    if (existingMemory) {
+                        updateMemorySeenCount(deps.db, existingMemory.id);
+                        requestRustMemorySync(deps, toolContext.sessionID);
+                        return `Memory already exists [ID: ${existingMemory.id}] in ${category} (seen count incremented).`;
                     }
 
-                    const nextCanonical =
-                        canonicalExisting?.id != null
-                            ? canonicalExisting
-                            : insertMemoryIdempotent(deps.db, {
-                                  projectPath: projectPath,
-                                  category,
-                                  content,
-                                  sourceSessionId: toolContext.sessionID,
-                                  sourceType:
-                                      toolContext.agent === DREAMER_AGENT
-                                          ? "dreamer"
-                                          : getSourceType(deps),
-                              }).memory;
-                    const canonicalContentChanged =
-                        nextCanonical.content !== content ||
-                        nextCanonical.normalizedHash !== normalizedHash;
-
-                    if (canonicalContentChanged) {
-                        updateMemoryContentInCurrentTransaction(
-                            deps.db,
-                            nextCanonical,
-                            content,
-                            normalizedHash,
-                        );
-                    }
-
-                    mergeMemoryStats(
+                    const insertResult = insertMemoryIdempotent(
                         deps.db,
-                        nextCanonical.id,
-                        mergedSeenCount,
-                        mergedRetrievalCount,
-                        mergedFrom,
-                        mergedStatus,
-                    );
-
-                    for (const memory of sourceMemories) {
-                        if (memory.id === nextCanonical.id) {
-                            continue;
-                        }
-                        supersededMemory(deps.db, memory.id, nextCanonical.id);
-                        queueMemoryMutation(deps.db, {
-                            projectPath: projectIdentityForStoredPath(memory.projectPath),
-                            mutationType: "superseded",
-                            targetMemoryId: memory.id,
-                            supersededById: nextCanonical.id,
-                        });
-                    }
-
-                    if (canonicalExisting && canonicalContentChanged) {
-                        queueMemoryMutation(deps.db, {
-                            projectPath: projectIdentityForStoredPath(nextCanonical.projectPath),
-                            mutationType: "update",
-                            targetMemoryId: nextCanonical.id,
+                        {
+                            projectPath: projectPath,
                             category,
-                            newContent: content,
-                        });
+                            content,
+                            sourceSessionId: toolContext.sessionID,
+                            sourceType:
+                                toolContext.agent === DREAMER_AGENT
+                                    ? "dreamer"
+                                    : getSourceType(deps),
+                        },
+                        writeIdentity,
+                    );
+                    if (!insertResult.inserted) {
+                        requestRustMemorySync(deps, toolContext.sessionID);
+                        return `Memory already exists [ID: ${insertResult.memory.id}] in ${category} (seen count incremented).`;
                     }
 
-                    return nextCanonical;
-                });
-                if (mergeConflict || !canonicalMemory) {
-                    return mergeConflict ?? "Error: Failed to merge memories.";
+                    queueMemoryEmbedding({
+                        deps,
+                        sessionId: toolContext.sessionID,
+                        projectPath,
+                        memoryId: insertResult.memory.id,
+                        content,
+                    });
+                    requestRustMemorySync(deps, toolContext.sessionID);
+
+                    return `Saved memory [ID: ${insertResult.memory.id}] in ${category}.`;
                 }
 
-                queueMemoryEmbedding({
-                    deps,
-                    sessionId: toolContext.sessionID,
-                    projectPath,
-                    memoryId: canonicalMemory.id,
-                    content,
-                });
-                requestRustMemorySync(deps, toolContext.sessionID);
+                if (args.action === "list") {
+                    const limit = normalizeLimit(args.limit);
+                    const category = normalizeCategory(args.category);
+                    const memories = filterByCategory(
+                        getMemoriesByProject(deps.db, projectPath),
+                        category,
+                    ).slice(0, limit);
 
-                const supersededIds = sourceMemories
-                    .map((memory) => memory.id)
-                    .filter((id) => id !== canonicalMemory.id);
-                return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${canonicalMemory.id}] in ${category}; superseded [${supersededIds.join(", ")}].`;
-            }
-
-            if (args.action === "archive") {
-                const rawArchiveIds = args.ids;
-                if (
-                    !rawArchiveIds ||
-                    rawArchiveIds.length === 0 ||
-                    !rawArchiveIds.every(Number.isInteger)
-                ) {
-                    return "Error: 'ids' must contain at least one integer memory ID when action is 'archive'.";
+                    return formatMemoryList(memories);
                 }
-                // De-dupe (first-seen order) so `ids:[42,42]` archives once and
-                // queues one mutation-log row instead of two.
-                const archiveIds = [...new Set(rawArchiveIds)];
 
-                // Validate the whole batch BEFORE mutating anything so a typo'd
-                // id can't half-archive a batch (all-or-nothing, matching the
-                // single-transaction write below).
-                const targets: Array<{ memoryId: number; projectIdentity: string }> = [];
-                for (const memoryId of archiveIds) {
-                    const rawProjectPath = projectPathForMemoryId(deps.db, memoryId);
-                    const memory = getMemoryById(deps.db, memoryId);
-                    const archiveAllowed = memory
+                if (args.action === "get") {
+                    const getIds = args.ids;
+                    if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
+                        return "Error: 'ids' must contain at least one integer memory ID when action is 'get'.";
+                    }
+                    if (getIds.length > GET_MAX_IDS) {
+                        return `Error: 'ids' must contain at most ${GET_MAX_IDS} memory IDs when action is 'get' (got ${getIds.length}).`;
+                    }
+                    // De-dupe while preserving first-seen order so the output lists
+                    // each requested id exactly once and never reflects a row twice.
+                    const uniqueIds = [...new Set(getIds)];
+                    const fetched = getMemoriesByIds(deps.db, uniqueIds);
+                    const memoriesById = new Map<number, Memory>(
+                        fetched
+                            .filter((memory) => memoryVisibleToTool(memory))
+                            .map((memory) => [memory.id, memory]),
+                    );
+                    return formatGetOutput({
+                        requestedIds: uniqueIds,
+                        memoriesById,
+                    });
+                }
+
+                if (args.action === "update") {
+                    const updateIds = args.ids;
+                    if (updateIds?.length !== 1 || !updateIds.every(Number.isInteger)) {
+                        return "Error: 'ids' must contain exactly one integer memory ID when action is 'update'.";
+                    }
+                    const updateId = updateIds[0];
+
+                    const content = args.content?.trim();
+                    if (!content) {
+                        return "Error: 'content' is required when action is 'update'.";
+                    }
+
+                    const normalizedHash = computeNormalizedHash(content);
+                    const updateIdentity = claimOperationIdentity(`update:${updateId}`, {
+                        id: updateId,
+                        content,
+                        normalizedHash,
+                    });
+                    // Replay before live-row validation: a committed-but-unacked
+                    // update must return its stored result even after the target
+                    // row was archived or removed. The stored result carries the
+                    // category so the message never reads the live row.
+                    if (updateIdentity && claimsSchema) {
+                        const replay = readMemoryClaimOperationResult<{
+                            memoryId: number;
+                            category: string;
+                        }>(deps.db, toClaimOperationEnvelope(updateIdentity));
+                        if (replay) {
+                            return `Updated memory [ID: ${replay.result.memoryId}] in ${replay.result.category}.`;
+                        }
+                    }
+
+                    const rawProjectPath = projectPathForMemoryId(deps.db, updateId);
+                    const memory = getMemoryById(deps.db, updateId);
+                    const updateAllowed = memory
                         ? toolContext.agent === DREAMER_AGENT
                             ? memoryVisibleToTool(memory)
                             : memoryOwnedByTool(memory)
                         : false;
-                    if (!memory || !rawProjectPath || !archiveAllowed) {
-                        return `Error: Memory with ID ${memoryId} was not found.`;
+                    if (!memory || !rawProjectPath || !updateAllowed) {
+                        return `Error: Memory with ID ${updateId} was not found.`;
                     }
                     if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {
-                        // Mirror update/merge: once the primary agent archived or
-                        // superseded this memory, re-archiving it should return the
-                        // same friendly inactive-memory error instead of mutating it.
-                        return inactiveMemoryError(memoryId, "archiving");
+                        return inactiveMemoryError(updateId, "updating");
                     }
-                    targets.push({
-                        memoryId,
-                        projectIdentity: targetIdentityForStoredPath(rawProjectPath),
+
+                    const duplicate = getMemoryByHash(
+                        deps.db,
+                        targetIdentityForStoredPath(rawProjectPath),
+                        memory.category,
+                        normalizedHash,
+                    );
+                    if (duplicate && duplicate.id !== memory.id) {
+                        return `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`;
+                    }
+
+                    const projectIdentity = targetIdentityForStoredPath(rawProjectPath);
+                    let replayed = false;
+                    deps.db
+                        .transaction(() =>
+                            withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
+                                if (updateIdentity && claimsSchema) {
+                                    // The tool owns the envelope so the stored
+                                    // result carries the category; the storage
+                                    // update runs under its own generated key.
+                                    const outcome = runMemoryClaimOperationInCurrentTransaction(
+                                        deps.db,
+                                        toClaimOperationEnvelope(updateIdentity),
+                                        () => {
+                                            updateMemoryContentInCurrentTransaction(
+                                                deps.db,
+                                                memory,
+                                                content,
+                                                normalizedHash,
+                                            );
+                                            queueMemoryMutation(deps.db, {
+                                                projectPath: projectIdentity,
+                                                mutationType: "update",
+                                                targetMemoryId: memory.id,
+                                                category: memory.category,
+                                                newContent: content,
+                                            });
+                                            return {
+                                                result: {
+                                                    memoryId: memory.id,
+                                                    category: memory.category,
+                                                },
+                                                effects: [],
+                                            };
+                                        },
+                                    );
+                                    replayed = outcome.replayed;
+                                    return;
+                                }
+                                replayed = updateMemoryContentInCurrentTransaction(
+                                    deps.db,
+                                    memory,
+                                    content,
+                                    normalizedHash,
+                                    updateIdentity,
+                                );
+                                if (!replayed) {
+                                    queueMemoryMutation(deps.db, {
+                                        projectPath: projectIdentity,
+                                        mutationType: "update",
+                                        targetMemoryId: memory.id,
+                                        category: memory.category,
+                                        newContent: content,
+                                    });
+                                }
+                            }),
+                        )
+                        .immediate();
+                    if (replayed) {
+                        return `Updated memory [ID: ${memory.id}] in ${memory.category}.`;
+                    }
+                    queueMemoryEmbedding({
+                        deps,
+                        sessionId: toolContext.sessionID,
+                        projectPath: projectIdentity,
+                        memoryId: memory.id,
+                        content,
                     });
+                    requestRustMemorySync(deps, toolContext.sessionID);
+
+                    return `Updated memory [ID: ${memory.id}] in ${memory.category}.`;
                 }
 
-                runImmediateTransaction(deps.db, () => {
-                    for (const target of targets) {
-                        archiveMemory(deps.db, target.memoryId, args.reason);
-                        queueMemoryMutation(deps.db, {
-                            projectPath: target.projectIdentity,
-                            mutationType: "archive",
-                            targetMemoryId: target.memoryId,
+                if (args.action === "merge") {
+                    const ids = args.ids;
+                    if (!ids || ids.length < 2 || !ids.every(Number.isInteger)) {
+                        return "Error: 'ids' must include at least two integer memory IDs when action is 'merge'.";
+                    }
+                    if (new Set(ids).size !== ids.length) {
+                        return "Error: 'ids' must include at least two distinct memory IDs when action is 'merge'.";
+                    }
+
+                    const content = args.content?.trim();
+                    if (!content) {
+                        return "Error: 'content' is required when action is 'merge'.";
+                    }
+
+                    const normalizedHash = computeNormalizedHash(content);
+                    // The identity digest uses only source-independent inputs (the
+                    // requested category, not one derived from a live source row),
+                    // so a retry can reconstruct it after every source is deleted.
+                    // The `merge:2` key suffix versions the digest shape: an
+                    // envelope recorded under the old `merge` key carries the old
+                    // digest, and probing it with the new digest would throw
+                    // ClaimOperationKeyReuseError instead of replaying.
+                    const mergeIdentity = claimOperationIdentity("merge:2", {
+                        ids,
+                        content,
+                        requestedCategory: args.category ?? null,
+                        projectPath,
+                    });
+                    // Replay before the source-existence and category checks: a
+                    // source deleted between attempts must not turn a
+                    // committed-but-unacked merge retry into a not-found or
+                    // category error. The stored result carries the category so
+                    // the message never depends on the live sources.
+                    if (mergeIdentity && claimsSchema) {
+                        const replay = readMemoryClaimOperationResult<{
+                            memoryId: number;
+                            category: string;
+                        }>(deps.db, toClaimOperationEnvelope(mergeIdentity));
+                        if (replay) {
+                            const supersededIds = ids.filter((id) => id !== replay.result.memoryId);
+                            return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${replay.result.memoryId}] in ${replay.result.category}; superseded [${supersededIds.join(", ")}].`;
+                        }
+                    }
+                    const sourceMemories = ids
+                        .map((id) => getMemoryById(deps.db, id))
+                        .filter((memory): memory is Memory => Boolean(memory));
+                    const category =
+                        getValidatedCategory(args.category) ?? sourceMemories[0]?.category ?? null;
+                    if (!category) {
+                        // An unresolvable category usually means the sources are
+                        // gone (it falls back to sourceMemories[0]); report the
+                        // real problem instead of a misleading category error.
+                        return sourceMemories.length !== ids.length
+                            ? "Error: One or more source memories were not found."
+                            : "Error: A valid category is required when action is 'merge'.";
+                    }
+                    if (sourceMemories.length !== ids.length) {
+                        return "Error: One or more source memories were not found.";
+                    }
+                    // Cross-identity consolidation is a DREAMER-ONLY capability: the
+                    // loop below supersedes each source under ITS OWN project identity
+                    // and queues a per-project supersede-delta row, so every affected
+                    // project's m[1] reconciles. But `merge` is now in the primary
+                    // action set too, and a primary agent must not be able to reach
+                    // into ANOTHER project's memories. So mirror update/archive: a
+                    // non-dreamer caller may only merge memories that all belong to
+                    // its own resolved project. The dreamer keeps the cross-identity
+                    // path (see the "merging across identities" test).
+                    if (toolContext.agent !== DREAMER_AGENT) {
+                        const foreign = sourceMemories.find((memory) => !memoryOwnedByTool(memory));
+                        if (foreign) {
+                            return `Error: Memory with ID ${foreign.id} was not found.`;
+                        }
+                        const inactive = sourceMemories.find(
+                            (memory) => !isPrimaryMutableMemory(memory),
+                        );
+                        if (inactive) {
+                            return inactiveMemoryError(inactive.id, "merging");
+                        }
+                    } else if (workspaceIdentitySet.identities.length > 1) {
+                        // The dreamer keeps its cross-PROJECT merge power (#5971) OUTSIDE
+                        // a workspace (the branch above leaves non-workspace dreamer
+                        // merges unrestricted). But INSIDE a workspace, per-category
+                        // sharing is the user's explicit privacy boundary that even the
+                        // system's own consolidation worker honors: a FOREIGN member's
+                        // memory in a non-shared category (or a non-member project's
+                        // memory) is off-limits. memoryVisibleToTool already encodes
+                        // exactly that for the workspace case (own → true,
+                        // foreign-shared-category → true, else → false).
+                        const blocked = sourceMemories.find(
+                            (memory) => !memoryVisibleToTool(memory),
+                        );
+                        if (blocked) {
+                            return `Error: Memory with ID ${blocked.id} is in a category not shared with this workspace member and cannot be merged.`;
+                        }
+                    }
+
+                    // A fact has exactly one category. If sources span categories they
+                    // are NOT genuine duplicates — one is miscategorized; archive the
+                    // redundant one instead. Merging across categories silently destroys
+                    // a distinct fact, so reject it structurally (not a prompt rule).
+                    const sourceCategories = new Set(
+                        sourceMemories.map((memory) => memory.category),
+                    );
+                    if (sourceCategories.size > 1) {
+                        return `Error: Cannot merge memories from different categories (${[...sourceCategories].join(", ")}). If they are genuine duplicates, one is miscategorized — archive the redundant one instead of merging across categories.`;
+                    }
+
+                    const mergedFrom = JSON.stringify(
+                        Array.from(
+                            new Set(
+                                sourceMemories.flatMap((memory) => {
+                                    let parsed: unknown[];
+                                    try {
+                                        parsed = memory.mergedFrom
+                                            ? JSON.parse(memory.mergedFrom)
+                                            : [];
+                                    } catch {
+                                        parsed = [];
+                                    }
+                                    return [
+                                        memory.id,
+                                        ...(Array.isArray(parsed)
+                                            ? parsed.filter(
+                                                  (value): value is number =>
+                                                      typeof value === "number",
+                                              )
+                                            : []),
+                                    ];
+                                }),
+                            ),
+                        ).sort((left, right) => left - right),
+                    );
+                    const mergedSeenCount = sourceMemories.reduce(
+                        (sum, memory) => sum + memory.seenCount,
+                        0,
+                    );
+                    const mergedRetrievalCount = sourceMemories.reduce(
+                        (sum, memory) => sum + memory.retrievalCount,
+                        0,
+                    );
+                    const mergedStatus = sourceMemories.some(
+                        (memory) => memory.status === "permanent",
+                    )
+                        ? "permanent"
+                        : "active";
+
+                    let mergeConflict: string | null = null;
+                    let mergeReplayed = false;
+                    const canonicalMemoryId = deps.db
+                        .transaction(() =>
+                            withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
+                                if (mergeIdentity && claimsSchema) {
+                                    const replay = readMemoryClaimOperationResult<{
+                                        memoryId: number;
+                                        category: string;
+                                    }>(deps.db, toClaimOperationEnvelope(mergeIdentity));
+                                    if (replay) {
+                                        mergeReplayed = true;
+                                        return replay.result.memoryId;
+                                    }
+                                }
+                                const lockedDuplicate = getMemoryByHash(
+                                    deps.db,
+                                    projectPath,
+                                    category,
+                                    normalizedHash,
+                                );
+                                const canonicalExisting =
+                                    lockedDuplicate && ids.includes(lockedDuplicate.id)
+                                        ? lockedDuplicate
+                                        : null;
+                                if (lockedDuplicate && !canonicalExisting) {
+                                    mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+                                    return null;
+                                }
+
+                                const nextCanonical =
+                                    canonicalExisting?.id != null
+                                        ? canonicalExisting
+                                        : insertMemoryIdempotent(deps.db, {
+                                              projectPath: projectPath,
+                                              category,
+                                              content,
+                                              sourceSessionId: toolContext.sessionID,
+                                              sourceType:
+                                                  toolContext.agent === DREAMER_AGENT
+                                                      ? "dreamer"
+                                                      : getSourceType(deps),
+                                          }).memory;
+                                const canonicalContentChanged =
+                                    nextCanonical.content !== content ||
+                                    nextCanonical.normalizedHash !== normalizedHash;
+
+                                if (canonicalContentChanged) {
+                                    updateMemoryContentInCurrentTransaction(
+                                        deps.db,
+                                        nextCanonical,
+                                        content,
+                                        normalizedHash,
+                                    );
+                                }
+
+                                mergeMemoryStats(
+                                    deps.db,
+                                    nextCanonical.id,
+                                    mergedSeenCount,
+                                    mergedRetrievalCount,
+                                    mergedFrom,
+                                    mergedStatus,
+                                );
+
+                                for (const memory of sourceMemories) {
+                                    if (memory.id === nextCanonical.id) {
+                                        continue;
+                                    }
+                                    supersededMemory(deps.db, memory.id, nextCanonical.id);
+                                    queueMemoryMutation(deps.db, {
+                                        projectPath: projectIdentityForStoredPath(
+                                            memory.projectPath,
+                                        ),
+                                        mutationType: "superseded",
+                                        targetMemoryId: memory.id,
+                                        supersededById: nextCanonical.id,
+                                    });
+                                }
+
+                                if (canonicalExisting && canonicalContentChanged) {
+                                    queueMemoryMutation(deps.db, {
+                                        projectPath: projectIdentityForStoredPath(
+                                            nextCanonical.projectPath,
+                                        ),
+                                        mutationType: "update",
+                                        targetMemoryId: nextCanonical.id,
+                                        category,
+                                        newContent: content,
+                                    });
+                                }
+
+                                // The tool owns the merge envelope so the stored
+                                // result carries the category the replay message
+                                // needs; the storage-layer writes above run under
+                                // their own generated keys.
+                                if (mergeIdentity && claimsSchema) {
+                                    runMemoryClaimOperationInCurrentTransaction(
+                                        deps.db,
+                                        toClaimOperationEnvelope(mergeIdentity),
+                                        () => ({
+                                            result: { memoryId: nextCanonical.id, category },
+                                            effects: [],
+                                        }),
+                                    );
+                                }
+
+                                return nextCanonical.id;
+                            }),
+                        )
+                        .immediate();
+                    if (mergeConflict || canonicalMemoryId === null) {
+                        return mergeConflict ?? "Error: Failed to merge memories.";
+                    }
+
+                    if (!mergeReplayed) {
+                        queueMemoryEmbedding({
+                            deps,
+                            sessionId: toolContext.sessionID,
+                            projectPath,
+                            memoryId: canonicalMemoryId,
+                            content,
+                        });
+                        requestRustMemorySync(deps, toolContext.sessionID);
+                    }
+
+                    const supersededIds = sourceMemories
+                        .map((memory) => memory.id)
+                        .filter((id) => id !== canonicalMemoryId);
+                    return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${canonicalMemoryId}] in ${category}; superseded [${supersededIds.join(", ")}].`;
+                }
+
+                if (args.action === "archive") {
+                    const rawArchiveIds = args.ids;
+                    if (
+                        !rawArchiveIds ||
+                        rawArchiveIds.length === 0 ||
+                        !rawArchiveIds.every(Number.isInteger)
+                    ) {
+                        return "Error: 'ids' must contain at least one integer memory ID when action is 'archive'.";
+                    }
+                    // De-dupe (first-seen order) so `ids:[42,42]` archives once and
+                    // queues one mutation-log row instead of two.
+                    const archiveIds = [...new Set(rawArchiveIds)];
+                    const archiveIdentity = (
+                        memoryId: number,
+                    ): MemoryClaimOperationIdentity | undefined =>
+                        claimOperationIdentity(
+                            `archive:${memoryId}`,
+                            args.reason?.trim()
+                                ? { id: memoryId, reason: args.reason.trim() }
+                                : { id: memoryId, status: "archived" },
+                        );
+                    const archiveReplay = archiveIds.every((memoryId) => {
+                        const identity = archiveIdentity(memoryId);
+                        return (
+                            identity !== undefined &&
+                            claimsSchema &&
+                            readMemoryClaimOperationResult(
+                                deps.db,
+                                toClaimOperationEnvelope(identity),
+                            ) !== null
+                        );
+                    });
+                    if (archiveReplay) {
+                        const idList = archiveIds.join(", ");
+                        const plural = archiveIds.length > 1 ? "memories" : "memory";
+                        return args.reason?.trim()
+                            ? `Archived ${plural} [ID: ${idList}] (${args.reason.trim()}).`
+                            : `Archived ${plural} [ID: ${idList}].`;
+                    }
+
+                    // Validate the whole batch BEFORE mutating anything so a typo'd
+                    // id can't half-archive a batch (all-or-nothing, matching the
+                    // single-transaction write below).
+                    const targets: Array<{ memoryId: number; projectIdentity: string }> = [];
+                    for (const memoryId of archiveIds) {
+                        const rawProjectPath = projectPathForMemoryId(deps.db, memoryId);
+                        const memory = getMemoryById(deps.db, memoryId);
+                        const archiveAllowed = memory
+                            ? toolContext.agent === DREAMER_AGENT
+                                ? memoryVisibleToTool(memory)
+                                : memoryOwnedByTool(memory)
+                            : false;
+                        if (!memory || !rawProjectPath || !archiveAllowed) {
+                            return `Error: Memory with ID ${memoryId} was not found.`;
+                        }
+                        if (
+                            toolContext.agent !== DREAMER_AGENT &&
+                            !isPrimaryMutableMemory(memory)
+                        ) {
+                            // Mirror update/merge: once the primary agent archived or
+                            // superseded this memory, re-archiving it should return the
+                            // same friendly inactive-memory error instead of mutating it.
+                            return inactiveMemoryError(memoryId, "archiving");
+                        }
+                        targets.push({
+                            memoryId,
+                            projectIdentity: targetIdentityForStoredPath(rawProjectPath),
                         });
                     }
-                });
-                requestRustMemorySync(deps, toolContext.sessionID);
-                const idList = targets.map((t) => t.memoryId).join(", ");
-                const plural = targets.length > 1 ? "memories" : "memory";
-                return args.reason?.trim()
-                    ? `Archived ${plural} [ID: ${idList}] (${args.reason.trim()}).`
-                    : `Archived ${plural} [ID: ${idList}].`;
-            }
 
-            return "Error: Unknown action.";
+                    deps.db
+                        .transaction(() =>
+                            withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
+                                for (const target of targets) {
+                                    const replayed = archiveMemory(
+                                        deps.db,
+                                        target.memoryId,
+                                        args.reason,
+                                        archiveIdentity(target.memoryId),
+                                    );
+                                    if (!replayed) {
+                                        queueMemoryMutation(deps.db, {
+                                            projectPath: target.projectIdentity,
+                                            mutationType: "archive",
+                                            targetMemoryId: target.memoryId,
+                                        });
+                                    }
+                                }
+                            }),
+                        )
+                        .immediate();
+                    requestRustMemorySync(deps, toolContext.sessionID);
+                    const idList = targets.map((t) => t.memoryId).join(", ");
+                    const plural = targets.length > 1 ? "memories" : "memory";
+                    return args.reason?.trim()
+                        ? `Archived ${plural} [ID: ${idList}] (${args.reason.trim()}).`
+                        : `Archived ${plural} [ID: ${idList}].`;
+                }
+
+                return "Error: Unknown action.";
+            } catch (error) {
+                // A digest mismatch on a re-presented tool-call id is caller
+                // error; report it as a tool result instead of throwing out
+                // of execute().
+                if (error instanceof ClaimOperationKeyReuseError) {
+                    return "Error: this tool call id was already committed with different arguments. Retry as a new call.";
+                }
+                throw error;
+            }
         },
     });
 }

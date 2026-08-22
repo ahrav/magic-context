@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import {
     buildCanonicalChunkTextFromFts,
@@ -21,6 +20,10 @@ import { acquireGitSweepLease, releaseGitSweepLease } from "./git-commits/sweep-
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import { SynapseEmbeddingError } from "./memory/embedding-synapse";
 import { insertMemory } from "./memory/storage-memory";
+import {
+    runInMemoryClaimsWriteTransaction,
+    withClaimsWriteCapabilityInCurrentTransaction,
+} from "./memory/storage-memory-claims";
 import {
     getStoredModelId,
     loadAllEmbeddings,
@@ -647,9 +650,11 @@ describe("project embedding registry", () => {
         });
         const inFlight = embedUnembeddedMemoriesForProject(db, projectIdentity, 10);
         await started;
-        db.prepare(
-            "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-        ).run("New memory body", "new-memory-hash", Date.now(), memory.id);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
+            ).run("New memory body", "new-memory-hash", Date.now(), memory.id);
+        });
         release?.();
 
         expect(await inFlight).toBe(0);
@@ -1946,9 +1951,10 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         });
         registerDetailed(db, projectIdentity, host);
         host.resultPages = (_jobId, items) => {
-            db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(
-                "edited mid-flight",
-                first.id,
+            withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+                db
+                    .prepare("UPDATE memories SET content = ? WHERE id = ?")
+                    .run("edited mid-flight", first.id),
             );
             return {
                 result: {

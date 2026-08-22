@@ -1,4 +1,11 @@
+import { randomUUID } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
+import {
+    computeClaimRequestDigest,
+    hasMemoryClaimsCompatSchema,
+    replaceMemoryVerificationFilesWithClaimsInCurrentTransaction,
+    runInMemoryClaimsWriteTransaction,
+} from "./storage-memory-claims";
 
 export const MEMORY_VERIFICATION_SENTINEL = "";
 
@@ -43,6 +50,21 @@ export function recordMemoryMapping(
     now: number,
 ): number {
     const realFiles = uniqueSortedFiles(normalizedFiles);
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "storage-memory-verifications",
+                    operationKey: `map:${randomUUID()}`,
+                    requestDigest: computeClaimRequestDigest({ memoryId, realFiles, now }),
+                    ephemeral: true,
+                },
+                { memoryId, files: realFiles, now, verified: false },
+            ),
+        );
+        return outcome.result.rowsWritten;
+    }
     const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
     db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
     const insert = db.prepare(
@@ -66,6 +88,21 @@ export function recordMemoryVerifications(
     now: number,
 ): number {
     const realFiles = uniqueSortedFiles(normalizedFiles);
+    if (hasMemoryClaimsCompatSchema(db)) {
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "storage-memory-verifications",
+                    operationKey: `verify:${randomUUID()}`,
+                    requestDigest: computeClaimRequestDigest({ memoryId, realFiles, now }),
+                    ephemeral: true,
+                },
+                { memoryId, files: realFiles, now, verified: true },
+            ),
+        );
+        return outcome.result.rowsWritten;
+    }
     const filesToWrite = realFiles.length > 0 ? realFiles : [MEMORY_VERIFICATION_SENTINEL];
     db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
     const insert = db.prepare(
@@ -92,6 +129,25 @@ export function getUnmappedMemoryIds(db: Database, memoryIds: readonly number[])
 }
 
 export function clearMemoryVerifications(db: Database, memoryId: number): void {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        // The claims-active clear rides the same kernel operation as the
+        // record paths above: the side-table replace (empty file set, not
+        // verified) runs inside an operation envelope instead of a raw
+        // capability-scoped DELETE no kernel accounting can observe.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "storage-memory-verifications",
+                    operationKey: `clear:${randomUUID()}`,
+                    requestDigest: computeClaimRequestDigest({ memoryId, clear: true }),
+                    ephemeral: true,
+                },
+                { memoryId, files: [], now: Date.now(), verified: false },
+            ),
+        );
+        return;
+    }
     db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
 }
 

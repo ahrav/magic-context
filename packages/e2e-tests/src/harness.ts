@@ -16,8 +16,8 @@
  */
 
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
 
@@ -368,5 +368,6 @@ export class TestHarness {
         }
         await this.opencode.kill();
         await this.mock.stop();
+        rmSync(dirname(this.opencode.env.configDir), { recursive: true, force: true });
     }
 }

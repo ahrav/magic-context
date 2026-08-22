@@ -16,6 +16,7 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "../../features/magic-context/memory/storage-memory-claims";
 import {
     acquireWrapupInProgress,
     closeDatabase,
@@ -41,6 +42,7 @@ import {
     runCompartmentAgent,
     startCompartmentAgent,
 } from "./compartment-runner";
+import type { ProtectedTailBoundarySnapshot } from "./protected-tail-boundary";
 import {
     hasRunnableCompartmentWindow,
     resolveOpenCodeProtectedTailBoundary,
@@ -84,6 +86,12 @@ afterEach(() => {
     }
 });
 
+function openTestDb() {
+    const db = openDatabase();
+    if (!db) throw new Error("openDatabase returned null in test setup");
+    return db;
+}
+
 describe("executeContextRecomp", () => {
     it("rebuilds from raw history and ignores broken stored compartments as source truth", async () => {
         useTempDataHome("magic-recomp-rebuild-");
@@ -98,7 +106,7 @@ describe("executeContextRecomp", () => {
             { id: "m-8", role: "user", text: "protected 4" },
             { id: "m-9", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         replaceAllCompartments(db, "ses-recomp", [
             {
                 sequence: 0,
@@ -189,7 +197,7 @@ describe("executeContextRecomp", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         getOrCreateSessionMeta(db, sessionId);
 
         const client = {
@@ -254,7 +262,7 @@ describe("executeContextRecomp", () => {
             { id: "m-10", role: "user", text: "protected 4" },
             { id: "m-11", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         replaceAllCompartments(db, "ses-recomp-fail", [
             {
                 sequence: 0,
@@ -357,7 +365,7 @@ describe("executeContextRecomp", () => {
             { id: "m-8", role: "user", text: "protected 4" },
             { id: "m-9", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const prompt = mock(async () => ({}));
         // Two distinct `session.messages` consumers now share this mock:
@@ -456,7 +464,7 @@ describe("executeContextRecomp", () => {
             { id: "m-8", role: "user", text: "protected 4" },
             { id: "m-9", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         let historianFetches = 0;
         const messages = mock(async (input: { query?: { directory?: string } }) => {
             if (!input.query?.directory) return { data: [] };
@@ -511,7 +519,7 @@ describe("executeContextRecomp", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         const client = {
             session: {
                 get: mock(async () => ({ data: { directory: "/tmp/flat-exhausted" } })),
@@ -575,7 +583,7 @@ describe("executeContextRecomp", () => {
             { id: "m-7", role: "user", text: "protected 4" },
             { id: "m-8", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const prompt = mock(async () => ({}));
         // Discriminate historian-output fetches (pass `query.directory`) from
@@ -664,7 +672,7 @@ describe("executeContextRecomp", () => {
             { id: "m-8", role: "user", text: "protected 4" },
             { id: "m-9", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const prompt = mock(async (input: { body?: { noReply?: boolean } }) => {
             if (input.body?.noReply === true) {
@@ -724,7 +732,7 @@ describe("executeContextRecomp", () => {
             { id: "m-10", role: "user", text: "protected 4" },
             { id: "m-11", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         let lastHistorianPrompt = "";
         let historianAttempt = 0;
@@ -824,7 +832,7 @@ describe("executeContextRecomp", () => {
             { id: "m-10", role: "user", text: "protected 4" },
             { id: "m-11", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         let lastHistorianPrompt = "";
         const prompt = mock(
@@ -914,7 +922,7 @@ describe("executeContextRecomp", () => {
             { id: "m-11", role: "user", text: "protected 4" },
             { id: "m-12", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         let lastHistorianPrompt = "";
         const prompt = mock(
@@ -1129,11 +1137,12 @@ function _getHistorianDumpContents(sessionId: string): string[] {
         return [];
     }
 }
+void _getHistorianDumpContents;
 
 describe("runCompartmentAgent", () => {
     it("clears compartment-in-progress when another process holds the lease", () => {
         useTempDataHome("compartment-runner-lease-denied-");
-        const db = openDatabase();
+        const db = openTestDb();
         const holderId = "external-holder";
         expect(acquireCompartmentLease(db, "ses-lease-denied", holderId)).not.toBeNull();
         updateSessionMeta(db, "ses-lease-denied", { compartmentInProgress: true });
@@ -1158,7 +1167,7 @@ describe("runCompartmentAgent", () => {
 
     it("skips trigger-fired compartment starts while /ctx-wrapup is active", () => {
         useTempDataHome("compartment-runner-wrapup-active-");
-        const db = openDatabase();
+        const db = openTestDb();
         const sessionId = "ses-wrapup-active-skip";
         acquireWrapupInProgress(db, sessionId, {
             holderId: "wrapup-holder",
@@ -1201,7 +1210,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         acquireWrapupInProgress(
             db,
             sessionId,
@@ -1267,7 +1276,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         updateSessionMeta(db, "ses-1", {
             timesExecuteThresholdReached: 3,
             compartmentInProgress: true,
@@ -1340,7 +1349,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         const projectDirectory = "/tmp/post-commit-registration";
         const onPublished = mock(() => undefined);
         const ensureProjectRegistered = mock(async () => {
@@ -1393,6 +1402,14 @@ describe("runCompartmentAgent", () => {
                 (memory) => memory.content,
             ),
         ).toContain("Durable fact survives registration outage.");
+        const promoted = db
+            .prepare("SELECT id AS id FROM memories WHERE content = ?")
+            .get("Durable fact survives registration outage.") as { id: number } | undefined;
+        if (!promoted) throw new Error("expected the published fact to be promoted");
+        const promotedClaim = getCurrentMemoryClaimByLegacyMemoryId(db, promoted.id);
+        expect(promotedClaim?.revision).toBe(1);
+        expect(promotedClaim?.state).toBe("active");
+        expect(promotedClaim?.content).toBe("Durable fact survives registration outage.");
         expect(
             db
                 .prepare(
@@ -1413,7 +1430,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         db.exec(
             "CREATE TRIGGER fail_memory_insert BEFORE INSERT ON memories BEGIN SELECT RAISE(ABORT, 'memory insert fail'); END;",
         );
@@ -1476,7 +1493,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const createSession = mock(async () => ({ data: { id: "ses-agent-retry" } }));
         const promptSession = mock(async () => ({}));
@@ -1546,7 +1563,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         const prompt = mock(async () => ({}));
         const client = {
             session: {
@@ -1607,7 +1624,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         const client = {
             session: {
                 get: mock(async () => ({ data: { directory: "/tmp/reasoning-fallback" } })),
@@ -1661,7 +1678,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         const prompt = mock(async () => ({}));
         const client = {
             session: {
@@ -1707,7 +1724,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const promptSession = mock(async () => ({}));
         const messages = mock(async () => {
@@ -1797,7 +1814,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         // Primary (call 0) + repair (call 1) both return invalid output → escalate.
         // First configured fallback "anthropic/claude-sonnet-4-6" (call 2) returns
@@ -1893,7 +1910,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-8", role: "user", text: "protected 4" },
             { id: "m-9", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         replaceAllCompartments(db, "ses-2", [
             {
                 sequence: 0,
@@ -2024,7 +2041,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         const messages = [
             {
                 info: { id: "m-1", role: "user", sessionID: "ses-tag-drops" },
@@ -2093,7 +2110,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-2", role: "user", text: "recent 2" },
             { id: "m-3", role: "user", text: "recent 3" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const createSession = mock(async () => ({ data: { id: "ses-agent" } }));
         const promptSession = mock(async () => ({}));
@@ -2133,7 +2150,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const getSession = mock(async () => ({ data: { directory: "/tmp" } }));
         const createSession = mock(async () => ({ data: { id: "ses-agent-ep" } }));
@@ -2194,7 +2211,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-8", role: "user", text: "protected 4" },
             { id: "m-9", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         replaceAllCompartments(db, "ses-invalid-existing", [
             {
                 sequence: 0,
@@ -2255,7 +2272,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         replaceAllCompartmentState(
             db,
             "ses-invalid-output",
@@ -2313,7 +2330,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         const promptSession = mock(async (input: { body?: { noReply?: boolean } }) => {
             if (input.body?.noReply === true) {
@@ -2358,7 +2375,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-6", role: "user", text: "protected 4" },
             { id: "m-7", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         // Pre-seed prior failures so this run crosses the persistent threshold.
         incrementHistorianFailure(db, "ses-persistent-failure", "earlier failure");
         incrementHistorianFailure(db, "ses-persistent-failure", "earlier failure");
@@ -2409,7 +2426,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-11", role: "user", text: "protected 4" },
             { id: "m-12", role: "user", text: "protected 5" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
         const prompt = mock(async () => ({}));
         let historianFetches = 0;
         const messages = mock(async (input: { query?: { directory?: string } }) => {
@@ -2463,7 +2480,7 @@ describe("runCompartmentAgent", () => {
         const historianPrompts = prompt.mock.calls
             .map(
                 (call) =>
-                    call[0] as {
+                    (call as unknown[])[0] as {
                         body?: { noReply?: boolean; parts?: Array<{ text?: string }> };
                     },
             )
@@ -2493,7 +2510,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-2", role: "assistant", text: `eligible head two ${"detail ".repeat(150)}` },
             { id: "m-3", role: "user", text: `tail ${"context ".repeat(3000)}` },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         // Tag the eligible head so a successful publish also queues drop ops —
         // proving the stale→refresh→publish chain that feeds drop application.
@@ -2593,7 +2610,7 @@ describe("runCompartmentAgent", () => {
             { id: "m-2", role: "user", text: "only protected 2" },
             { id: "m-3", role: "user", text: "only protected 3" },
         ]);
-        const db = openDatabase();
+        const db = openTestDb();
 
         // protectedTailStart === offset (1) → "nothing to compact" no-op, which
         // returns synchronously before any await. Empty fingerprint skips the
@@ -2746,7 +2763,7 @@ it("rolls back protected-tail drain reservation when publish throws after histor
         { id: "m-2", role: "assistant", text: "second" },
         { id: "m-3", role: "user", text: "tail ".repeat(3000) },
     ]);
-    const db = openDatabase();
+    const db = openTestDb();
     db.exec(
         "CREATE TRIGGER fail_compartment_insert BEFORE INSERT ON compartments BEGIN SELECT RAISE(ABORT, 'append fail'); END;",
     );
@@ -2772,7 +2789,7 @@ it("rolls back protected-tail drain reservation when publish throws after histor
         trueRawEligibleTokens: 500,
         oversizeAtomicUnit: false,
         boundaryReason: "size-walk",
-    };
+    } as unknown as ProtectedTailBoundarySnapshot;
 
     const client = {
         session: {

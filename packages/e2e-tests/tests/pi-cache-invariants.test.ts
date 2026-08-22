@@ -11,12 +11,14 @@
  * to one definition of a cache bust.
  */
 
-import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
+import { insertMemory, updateMemoryContent } from "../../plugin/src/features/magic-context/memory";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
+import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
+import { Database } from "../../plugin/src/shared/sqlite";
 import {
     extractM0,
     extractM1,
@@ -26,7 +28,6 @@ import {
 } from "../src/cache-analysis";
 import type { CapturedRequest, MockUsage } from "../src/mock-provider/server";
 import { PiTestHarness } from "../src/pi-harness";
-import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const MODEL_LIMIT = 100_000;
@@ -147,7 +148,7 @@ function projectIdentity(h: PiTestHarness): string {
 }
 
 function writeDb<T>(h: PiTestHarness, fn: (db: Database) => T): T {
-    const db = openTestDb(h.contextDbPath(), { readwrite: true });
+    const db = new Database(h.contextDbPath());
     try {
         return fn(db);
     } finally {
@@ -155,21 +156,21 @@ function writeDb<T>(h: PiTestHarness, fn: (db: Database) => T): T {
     }
 }
 
-/** Seed an active project-scoped memory directly. Returns its row id. */
-function seedMemory(h: PiTestHarness, content: string, category = "PROJECT_RULES"): number {
-    return writeDb(h, (db) => {
-        const now = Date.now();
-        const info = db
-            .prepare(
-                `INSERT INTO memories (
-                    project_path, category, content, normalized_hash,
-                    source_session_id, source_type, seen_count, retrieval_count,
-                    first_seen_at, created_at, updated_at, last_seen_at, status
-                ) VALUES (?, ?, ?, ?, NULL, 'historian', 5, 0, ?, ?, ?, ?, 'active')`,
-            )
-            .run(projectIdentity(h), category, content, computeNormalizedHash(content), now, now, now, now);
-        return Number(info.lastInsertRowid);
-    });
+function seedMemory(
+    h: PiTestHarness,
+    content: string,
+    category: Memory["category"] = "PROJECT_RULES",
+): number {
+    return writeDb(
+        h,
+        (db) =>
+            insertMemory(db, {
+                projectPath: projectIdentity(h),
+                category,
+                content,
+                sourceType: "historian",
+            }).id,
+    );
 }
 
 /** Queue the memory-update record used when a memory is replaced, archived, or deleted. */
@@ -180,12 +181,7 @@ function queueMemoryUpdate(h: PiTestHarness, targetId: number, newContent: strin
                 (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
              VALUES (?, 'update', ?, NULL, NULL, ?, ?)`,
         ).run(projectIdentity(h), targetId, newContent, Date.now());
-        db.prepare("UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?").run(
-            newContent,
-            computeNormalizedHash(newContent),
-            Date.now(),
-            targetId,
-        );
+        updateMemoryContent(db, targetId, newContent, computeNormalizedHash(newContent));
     });
 }
 

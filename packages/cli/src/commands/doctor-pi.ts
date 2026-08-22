@@ -26,6 +26,10 @@ import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
+    type ClaimsBackfillCommandArgs,
+    runClaimsBackfillCommands,
+} from "../lib/claims-backfill-commands";
+import {
     hasUserConfigLocationMigrationRefusal,
     migrateConfigLocationsForCli,
 } from "../lib/config-location-migration";
@@ -113,7 +117,7 @@ interface DoctorDeps {
     spawnSync: typeof spawnSync;
 }
 
-export interface RunDoctorOptions extends V22BackfillCommandArgs {
+export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfillCommandArgs {
     force?: boolean;
     issue?: boolean;
     help?: boolean;
@@ -161,6 +165,15 @@ function printDoctorHelp(): void {
     );
     console.log(
         "    magic-context-pi doctor --rekey-v22-dir-identity <path>  Re-key legacy dir identity rows",
+    );
+    console.log(
+        "    magic-context-pi doctor --check-claims-backfill  Show v84 claims backfill status",
+    );
+    console.log(
+        "    magic-context-pi doctor --retry-claims-backfill  Repair and resume the v84 claims backfill",
+    );
+    console.log(
+        '    magic-context-pi doctor --waive-claims-backfill-failure <id> --rationale "<why>"  Waive a reviewed lineage failure',
     );
     console.log("    magic-context-pi doctor --help   Show this help");
     console.log("");
@@ -1053,6 +1066,8 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         return runIssueFlow({ cwd, prompts, deps });
     }
 
+    let sharedCommandExitCode: number | null = null;
+
     let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
     const v22Result = await runV22BackfillCommands(
         {
@@ -1073,8 +1088,32 @@ export async function runDoctor(options: RunDoctorOptions = {}): Promise<number>
         options,
     );
     if (v22Result.handled) {
-        return v22Result.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, v22Result.exitCode);
     }
+
+    let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
+    const claimsResult = await runClaimsBackfillCommands(
+        {
+            name: "Pi",
+            openDatabase: (readonly = true) => {
+                const dbPath = join(getMagicContextStorageDir(), "context.db");
+                claimsDb = readonly
+                    ? openExistingContextDatabase(dbPath, { readonly: true })
+                    : openExistingContextDatabaseForMutation(dbPath);
+                return claimsDb;
+            },
+            closeDatabase: () => {
+                claimsDb?.close();
+                claimsDb = null;
+            },
+            log: prompts.log,
+        },
+        options,
+    );
+    if (claimsResult.handled) {
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, claimsResult.exitCode);
+    }
+    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
 
     prompts.intro("Magic Context for Pi Doctor");
     const first = await runHealthChecks({
@@ -1128,6 +1167,8 @@ function valueAfter(args: string[], flag: string): string | null {
 
 export function parseDoctorArgs(args: string[]): RunDoctorOptions {
     const rekeyV22DirIdentity = valueAfter(args, "--rekey-v22-dir-identity");
+    const waiveClaimsBackfillFailure = valueAfter(args, "--waive-claims-backfill-failure");
+    const waiveRationale = valueAfter(args, "--rationale");
     return {
         force: args.includes("--force"),
         issue: args.includes("--issue"),
@@ -1135,6 +1176,10 @@ export function parseDoctorArgs(args: string[]): RunDoctorOptions {
         checkV22Backfill: args.includes("--check-v22-backfill"),
         retryV22Backfill: args.includes("--retry-v22-backfill"),
         ...(rekeyV22DirIdentity !== null ? { rekeyV22DirIdentity } : {}),
+        checkClaimsBackfill: args.includes("--check-claims-backfill"),
+        retryClaimsBackfill: args.includes("--retry-claims-backfill"),
+        ...(args.includes("--waive-claims-backfill-failure") ? { waiveClaimsBackfillFailure } : {}),
+        ...(waiveRationale !== null ? { waiveRationale } : {}),
     };
 }
 

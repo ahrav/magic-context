@@ -15,6 +15,11 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { getInstalledAdapters } from "../adapters";
 import type { HarnessAdapter } from "../adapters/types";
 import {
+    type ClaimsBackfillCommandArgs,
+    hasClaimsBackfillCommand,
+    runClaimsBackfillCommands,
+} from "../lib/claims-backfill-commands";
+import {
     openExistingContextDatabase,
     openExistingContextDatabaseForMutation,
 } from "../lib/database-access";
@@ -29,7 +34,7 @@ import { runDoctor as runOmpDoctor } from "./doctor-omp";
 import { runDoctor as runOpenCodeDoctor } from "./doctor-opencode";
 import { doctor as runPiDoctor } from "./doctor-pi";
 
-export interface RunDoctorOptions extends V22BackfillCommandArgs {
+export interface RunDoctorOptions extends V22BackfillCommandArgs, ClaimsBackfillCommandArgs {
     force?: boolean;
     issue?: boolean;
     clear?: boolean;
@@ -39,23 +44,17 @@ export interface RunDoctorOptions extends V22BackfillCommandArgs {
 export async function runDoctor(options: RunDoctorOptions): Promise<number> {
     if (options.clear) return runClear();
 
-    const argv = options.argv ?? [];
-    const adapters = await resolveAdaptersForCommand(argv, {
-        allowMulti: true,
-        verb: "diagnose",
-    });
+    let sharedCommandExitCode: number | null = null;
 
-    if (adapters.length === 0) {
-        log.warn("No harness selected.");
-        return 0;
-    }
-
-    // The v22 backfill commands operate on the SHARED cortexkit DB (harness-
-    // agnostic — there is no per-harness shard for backfill state). Run them
-    // exactly ONCE here, not once per adapter: dispatching to both an OpenCode
-    // and a Pi adapter would run the same rekey/retry/check against the same
-    // physical DB twice, producing confusing doubled output (e.g. the second
-    // pass reports "Re-keyed 0 row(s)" because the first already moved them).
+    // The v22 and claims backfill commands operate on the SHARED cortexkit DB
+    // (harness-agnostic — the DB path takes no adapter input), so they run
+    // before adapter resolution: resolution prompts interactively and exits 0
+    // on cancel, an empty selection, or a headless host, which would skip the
+    // requested repair while reporting success. Run them exactly ONCE here,
+    // not once per adapter: dispatching to both an OpenCode and a Pi adapter
+    // would run the same rekey/retry/check against the same physical DB
+    // twice, producing confusing doubled output (e.g. the second pass reports
+    // "Re-keyed 0 row(s)" because the first already moved them).
     if (hasV22Command(options)) {
         let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
         const result = await runV22BackfillCommands(
@@ -76,7 +75,42 @@ export async function runDoctor(options: RunDoctorOptions): Promise<number> {
             },
             options,
         );
-        if (result.handled) return result.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, result.exitCode);
+    }
+
+    if (hasClaimsBackfillCommand(options)) {
+        let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
+        const result = await runClaimsBackfillCommands(
+            {
+                name: "Magic Context",
+                openDatabase: (readonly = true) => {
+                    const dbPath = join(getMagicContextStorageDir(), "context.db");
+                    claimsDb = readonly
+                        ? openExistingContextDatabase(dbPath, { readonly: true })
+                        : openExistingContextDatabaseForMutation(dbPath);
+                    return claimsDb;
+                },
+                closeDatabase: () => {
+                    claimsDb?.close();
+                    claimsDb = null;
+                },
+                log,
+            },
+            options,
+        );
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, result.exitCode);
+    }
+    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
+
+    const argv = options.argv ?? [];
+    const adapters = await resolveAdaptersForCommand(argv, {
+        allowMulti: true,
+        verb: "diagnose",
+    });
+
+    if (adapters.length === 0) {
+        log.warn("No harness selected.");
+        return 0;
     }
 
     // Reconcile interrupted cross-harness session migrations. The journal lives

@@ -3,6 +3,10 @@ import {
     AUTHORITY_DOMAINS,
     type AuthorityState,
 } from "@magic-context/core/features/magic-context/context-authority";
+import { insertMemory as insertMemoryThroughKernel } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
+import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 
 import {
@@ -635,5 +639,107 @@ describe("applyMigrateSession — memory actions", () => {
             .prepare("SELECT project_path FROM session_projects WHERE session_id = ?")
             .get(SID) as { project_path: string };
         expect(ownership.project_path).toBe(FROM);
+    });
+});
+
+describe("applyMigrateSession — claims (v84)", () => {
+    it("routes a session-relocation move through claim-aware identity adoption", () => {
+        const oc = makeOpencodeDb();
+        const ctx = new Database(":memory:");
+        databases.push(ctx);
+        ctx.exec("PRAGMA foreign_keys=ON");
+        initializeDatabase(ctx);
+        runMigrations(ctx);
+        oc.prepare(
+            "INSERT INTO session (id, project_id, directory, path) VALUES (?, 'global', '/old/dir', 'old/dir')",
+        ).run(SID);
+        ctx.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
+        ).run(SID, FROM);
+        const moving = insertMemoryThroughKernel(ctx, {
+            projectPath: FROM,
+            category: "CONSTRAINTS",
+            content: "session-scoped fact",
+            sourceSessionId: SID,
+        });
+        // Registers the target as its own numeric project before the move.
+        insertMemoryThroughKernel(ctx, {
+            projectPath: TO,
+            category: "CONSTRAINTS",
+            content: "target resident fact",
+        });
+        const sourceClaimBefore = getCurrentMemoryClaimByLegacyMemoryId(ctx, moving.id);
+        expect(sourceClaimBefore?.state).toBe("active");
+
+        const deps = makeDeps(oc, ctx);
+        const plan = planMigrateSession(SID, "/home/u/benchmarks", deps);
+        const result = applyMigrateSession(plan, "move-originated", deps);
+
+        expect(result.memoriesRelocated).toBe(1);
+        const movedRow = ctx
+            .prepare(
+                "SELECT id FROM memories WHERE project_path = ? AND content = 'session-scoped fact'",
+            )
+            .get(TO) as { id: number };
+        expect(movedRow).toBeDefined();
+        const movedClaim = getCurrentMemoryClaimByLegacyMemoryId(ctx, movedRow.id);
+        expect(movedClaim?.state).toBe("active");
+        expect(movedClaim?.content).toBe("session-scoped fact");
+        // The source claim retired through the authorized move; its durable
+        // crosswalk link survives the projection removal.
+        expect(
+            ctx
+                .prepare("SELECT state FROM claims WHERE id = ?")
+                .get(sourceClaimBefore?.claimId ?? 0),
+        ).toEqual({ state: "archived" });
+        expect(
+            ctx
+                .prepare("SELECT COUNT(*) AS c FROM legacy_memory_claims WHERE memory_id = ?")
+                .get(moving.id),
+        ).toEqual({ c: 1 });
+        expect(ctx.prepare("SELECT COUNT(*) AS c FROM claim_merge_lineage").get()).toEqual({
+            c: 1,
+        });
+        expect(
+            ctx.prepare("SELECT project_path FROM session_projects WHERE session_id = ?").get(SID),
+        ).toEqual({ project_path: TO });
+    });
+
+    it("copy-originated creates target claims and leaves source rows and claims intact", () => {
+        const oc = makeOpencodeDb();
+        const ctx = new Database(":memory:");
+        databases.push(ctx);
+        ctx.exec("PRAGMA foreign_keys=ON");
+        initializeDatabase(ctx);
+        runMigrations(ctx);
+        oc.prepare(
+            "INSERT INTO session (id, project_id, directory, path) VALUES (?, 'global', '/old/dir', 'old/dir')",
+        ).run(SID);
+        ctx.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
+        ).run(SID, FROM);
+        const source = insertMemoryThroughKernel(ctx, {
+            projectPath: FROM,
+            category: "CONSTRAINTS",
+            content: "copyable fact",
+            sourceSessionId: SID,
+        });
+
+        const deps = makeDeps(oc, ctx);
+        const plan = planMigrateSession(SID, "/home/u/benchmarks", deps);
+        const result = applyMigrateSession(plan, "copy-originated", deps);
+
+        expect(result.memoriesRelocated).toBe(1);
+        expect(
+            ctx.prepare("SELECT COUNT(*) AS c FROM memories WHERE id = ?").get(source.id),
+        ).toEqual({ c: 1 });
+        const sourceClaim = getCurrentMemoryClaimByLegacyMemoryId(ctx, source.id);
+        expect(sourceClaim?.state).toBe("active");
+        const copied = ctx.prepare("SELECT id FROM memories WHERE project_path = ?").get(TO) as {
+            id: number;
+        };
+        const copiedClaim = getCurrentMemoryClaimByLegacyMemoryId(ctx, copied.id);
+        expect(copiedClaim?.state).toBe("active");
+        expect(copiedClaim?.claimId).not.toBe(sourceClaim?.claimId);
     });
 });

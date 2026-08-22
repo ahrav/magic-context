@@ -704,7 +704,6 @@ fn test_update_memory_category_invalid() {
     assert_eq!(category, "CONSTRAINTS");
 }
 
-
 #[test]
 fn managed_memory_update_is_rejected_by_the_database_guard() {
     let dir = tempdir().expect("tempdir");
@@ -748,4 +747,87 @@ fn managed_memory_update_is_rejected_by_the_database_guard() {
     let mut conn = db::open_readwrite(&path).expect("open managed context db");
     let error = db::update_memory_content(&mut conn, 1, "new").expect_err("guard must reject");
     assert!(error.to_string().contains("managed by the Rust module"));
+}
+
+/// Text the write fence surfaces through commands.rs's `.to_string()` — the
+/// dashboard's UI toast shows exactly this string.
+const CLAIMS_FENCE_MESSAGE: &str = "This Magic Context database uses the v84 claims schema. \
+     Memory editing requires an updated dashboard. Reads remain available.";
+
+/// Mirrors the capability table the plugin's claims migration creates; the
+/// fence keys off the table's existence alone (the plugin's
+/// `hasMemoryClaimsCompatSchema` sentinel).
+fn install_claims_sentinel(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE claim_compatibility_write_state (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             enabled INTEGER NOT NULL DEFAULT 0
+         );",
+    )
+    .expect("create claims sentinel table");
+}
+
+#[test]
+fn semantic_memory_writes_are_fenced_on_a_claims_schema_db() {
+    // A claims-schema DB guards `memories` with triggers that abort any
+    // INSERT/UPDATE/DELETE whose transaction lacks the claims-write
+    // capability. The dashboard never holds it, so every semantic write entry
+    // point must refuse up front with the actionable fence message instead of
+    // aborting mid-transaction on a raw trigger error.
+    let mut conn = make_db();
+    install_claims_sentinel(&conn);
+    let id = insert_memory(&conn, "git:project-a", "active");
+    seed_project_state(&conn, "git:project-a", 9, 0);
+
+    let errors = vec![
+        db::update_memory_status(&mut conn, id, "archived").expect_err("status fenced"),
+        db::update_memory_content(&mut conn, id, "edited body").expect_err("content fenced"),
+        db::update_memory_category(&mut conn, id, "NAMING").expect_err("category fenced"),
+        db::delete_memory(&mut conn, id).expect_err("delete fenced"),
+        db::bulk_update_memory_status(&mut conn, &[id], "archived")
+            .expect_err("bulk status fenced"),
+        db::bulk_delete_memory(&mut conn, &[id]).expect_err("bulk delete fenced"),
+    ];
+    for error in errors {
+        assert_eq!(error.to_string(), CLAIMS_FENCE_MESSAGE);
+    }
+
+    // The fence fires before any mutation: row untouched, nothing queued,
+    // no epoch bump.
+    let (status, content, category): (String, String, String) = conn
+        .query_row(
+            "SELECT status, content, category FROM memories WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("row still present");
+    assert_eq!(status, "active");
+    assert!(content.starts_with("memory for"));
+    assert_eq!(category, "CONSTRAINTS");
+    assert!(mutation_log_rows(&conn).is_empty());
+    assert_eq!(memory_epoch(&conn, "git:project-a"), 9);
+}
+
+#[test]
+fn semantic_memory_writes_proceed_without_the_claims_sentinel() {
+    // Companion to the fence test: a DB without
+    // `claim_compatibility_write_state` (pre-claims schema) is not blocked.
+    let mut conn = make_db();
+    let id = insert_memory(&conn, "git:project-a", "active");
+
+    db::update_memory_status(&mut conn, id, "archived").expect("archive proceeds");
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM memories WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("read status");
+    assert_eq!(status, "archived");
+
+    db::delete_memory(&mut conn, id).expect("delete proceeds");
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+        .expect("count memories");
+    assert_eq!(remaining, 0);
 }

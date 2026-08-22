@@ -201,19 +201,56 @@ afterEach(() => {
 });
 
 describe("Pi doctor", () => {
-    it("parses v22 backfill flags", () => {
+    it("parses v22 and claims backfill flags", () => {
         expect(
             parseDoctorArgs([
                 "--check-v22-backfill",
                 "--retry-v22-backfill",
                 "--rekey-v22-dir-identity",
                 "/tmp/project",
+                "--check-claims-backfill",
+                "--retry-claims-backfill",
+                "--waive-claims-backfill-failure",
+                "7",
+                "--rationale",
+                "reviewed source",
             ]),
         ).toMatchObject({
             checkV22Backfill: true,
             retryV22Backfill: true,
             rekeyV22DirIdentity: "/tmp/project",
+            checkClaimsBackfill: true,
+            retryClaimsBackfill: true,
+            waiveClaimsBackfillFailure: "7",
+            waiveRationale: "reviewed source",
         });
+    });
+
+    it("preserves malformed or missing waiver ids for exact command rejection", () => {
+        for (const args of [
+            ["--waive-claims-backfill-failure"],
+            ["--waive-claims-backfill-failure", "--force"],
+            ["--waive-claims-backfill-failure", "7junk"],
+        ]) {
+            const parsed = parseDoctorArgs(args);
+            expect(Object.hasOwn(parsed, "waiveClaimsBackfillFailure")).toBeTrue();
+            expect(parsed.waiveClaimsBackfillFailure).toBe(
+                args[1] && !args[1].startsWith("--") ? args[1] : null,
+            );
+        }
+    });
+
+    it("runs mixed v22 and claims commands sequentially with one combined exit", () => {
+        const source = readFileSync(new URL("./doctor-pi.ts", import.meta.url), "utf8");
+        expect(source.indexOf("runV22BackfillCommands(")).toBeLessThan(
+            source.indexOf("runClaimsBackfillCommands("),
+        );
+        expect(source).toContain(
+            "if (sharedCommandExitCode !== null) return sharedCommandExitCode",
+        );
+        expect(
+            source.match(/Math\.max\(sharedCommandExitCode \?\? 0, \w+Result\.exitCode\)/g),
+        ).toHaveLength(2);
     });
 
     it("passes Phase 1 with a healthy mocked environment", async () => {

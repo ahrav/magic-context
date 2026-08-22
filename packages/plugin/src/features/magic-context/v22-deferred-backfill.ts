@@ -9,17 +9,25 @@ import {
     resolveProjectIdentityStrict,
 } from "./memory/project-identity";
 import { rekeyMemoryRowWithCollisionMerge } from "./memory/relocate-memory";
+import { effectiveSeenCountSql } from "./memory/storage-memory";
 import {
-    effectiveSeenCountSql,
-    hasMemoryStatsTable,
-    requireEffectiveSeenCount,
-} from "./memory/storage-memory";
+    hasMemoryClaimsCompatSchema,
+    withClaimsWriteCapabilityInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
+} from "./memory/storage-memory-claims";
+import { CLAIMS_BACKFILL_META_KEYS } from "./storage-memory-claims-schema";
 import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 
 export const BATCH_SIZE = 25;
 export const YIELD_EVERY_N_ROWS = 5;
 
-const BACKFILL_META_KEY = "v22_legacy_memory_backfill";
+/**
+ * `schema_migrations_meta` status key for the v22 legacy memory backfill:
+ * seeded 'pending' by the v22 migration, driven to its terminal status by
+ * this runner, and read by v84 to decide whether remaining v22 identity
+ * work is adopted as a claims takeover.
+ */
+export const V22_BACKFILL_META_KEY = "v22_legacy_memory_backfill";
 const BACKFILL_CURSOR_META_KEY = "v22_legacy_memory_backfill_cursor";
 const MEMORIES_TABLE = "memories";
 
@@ -182,10 +190,23 @@ function bumpProjectMemoryEpochInTransaction(db: Database, identity: string, now
     ).run(identity, now);
 }
 
+/**
+ * The claims takeover key derives from the v22 failure surface: remaining
+ * failures keep the claims backfill gated on v22 identity work; a clean
+ * corpus releases it. No-op on a database without the claims compat schema.
+ */
+function syncClaimsTakeoverMeta(db: Database, failureCount: number): void {
+    if (!hasMemoryClaimsCompatSchema(db)) return;
+    writeMeta(db, CLAIMS_BACKFILL_META_KEYS.v22Takeover, failureCount > 0 ? "pending" : "none");
+}
+
 function updateFinalBackfillStatus(db: Database): V22BackfillStatus {
     const failureCount = countFailures(db);
     const status: V22BackfillStatus = failureCount > 0 ? "completed_with_failures" : "completed";
-    writeMeta(db, BACKFILL_META_KEY, status);
+    db.transaction(() => {
+        writeMeta(db, V22_BACKFILL_META_KEY, status);
+        syncClaimsTakeoverMeta(db, failureCount);
+    }).immediate();
     return status;
 }
 
@@ -195,7 +216,7 @@ export function getV22BackfillStatus(db: Database): {
     cursor: number;
     maxLegacyMemoryId: number;
 } {
-    const status = readMeta(db, BACKFILL_META_KEY) as V22BackfillStatus | null;
+    const status = readMeta(db, V22_BACKFILL_META_KEY) as V22BackfillStatus | null;
     const maxLegacyRow = db
         .prepare(
             `SELECT COALESCE(MAX(id), 0) AS m
@@ -216,14 +237,20 @@ export async function runDeferredV22Backfill(
     db: Database,
     options: DeferredV22BackfillOptions = {},
 ): Promise<V22BackfillSummary> {
-    const initialStatus = readMeta(db, BACKFILL_META_KEY);
+    const initialStatus = readMeta(db, V22_BACKFILL_META_KEY);
     if (initialStatus === "completed" || initialStatus === "skipped") {
+        const failureCount = countFailures(db);
+        // A runner without the claims compat schema reaches this terminal
+        // status without ever writing the takeover key, so a key the v84
+        // migration stamped `pending` re-derives from the failure surface
+        // here; otherwise it gates the claims backfill forever.
+        syncClaimsTakeoverMeta(db, failureCount);
         return {
             status: initialStatus,
             processedRows: 0,
             changedRows: 0,
             failedRows: 0,
-            failureCount: countFailures(db),
+            failureCount,
             lastCursor: parseCursor(readMeta(db, BACKFILL_CURSOR_META_KEY)),
         };
     }
@@ -248,7 +275,6 @@ export async function runDeferredV22Backfill(
 
     await yieldToEventLoop();
 
-    const statsBacked = hasMemoryStatsTable(db);
     const seenCountSql = effectiveSeenCountSql(db);
 
     while (true) {
@@ -289,105 +315,92 @@ export async function runDeferredV22Backfill(
         const changedIdentities = new Set<string>();
 
         db.transaction(() => {
-            const now = Date.now();
-            const updateMemory = db.prepare(
-                "UPDATE memories SET project_path = ? WHERE id = ? AND project_path = ?",
-            );
-            const verifyMemory = db.prepare(
-                "SELECT project_path FROM memories WHERE id = ? AND project_path = ?",
-            );
-            // Detect a row that already lives under the target identity with the
-            // same (category, normalized_hash). Rekeying onto it would violate
-            // UNIQUE(project_path, category, normalized_hash) and abort the whole
-            // batch transaction. This is reachable when one project's memories were
-            // written under multiple raw legacy paths (e.g. symlinked / pre-identity
-            // paths) that all resolve to the same git:/dir: identity.
-            const findCollision = db.prepare(
-                `SELECT id, ${seenCountSql} FROM memories
-                 WHERE project_path = ? AND category = ? AND normalized_hash = ?
-                 LIMIT 1`,
-            );
-            const bumpSeenCount = statsBacked
-                ? db.prepare("UPDATE memory_stats SET seen_count = ? WHERE memory_id = ?")
-                : db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?");
-            // Preserve an embedding on the surviving target BEFORE the source row's
-            // embedding FK-cascades away on DELETE. Same fix as the live
-            // collision-merge path (rekeyMemoryRowWithCollisionMerge): the two rows
-            // are content-equivalent (same category + normalized_hash), so either
-            // vector is valid; INSERT OR IGNORE keeps the target's if it has one,
-            // adopts the source's otherwise — so a merged row never loses its vector.
-            const preserveEmbedding = db.prepare(
-                `INSERT OR IGNORE INTO memory_embeddings (memory_id, embedding, model_id)
-                 SELECT ?, embedding, model_id FROM memory_embeddings WHERE memory_id = ?`,
-            );
-            const deleteMemoryRow = db.prepare("DELETE FROM memories WHERE id = ?");
+            const applyBatch = (): void => {
+                const now = Date.now();
+                const verifyMemory = db.prepare(
+                    "SELECT project_path FROM memories WHERE id = ? AND project_path = ?",
+                );
+                // Per-row savepoint with a nested generation scope: a residual
+                // throw from the rekey rolls back exactly that row's writes
+                // (including its speculative generation allocations) while the
+                // enclosing batch transaction keeps its cursor, failure rows,
+                // and the other rows' work.
+                const rekeyRowInSavepoint = db.transaction((row: ResolvedBackfillRow) =>
+                    withMemoryClaimGenerationContextInCurrentTransaction(db, () =>
+                        rekeyMemoryRowWithCollisionMerge(
+                            db,
+                            row.id,
+                            row.project_path,
+                            row.identity,
+                        ),
+                    ),
+                );
 
-            for (const row of resolvedRows) {
-                const collision = findCollision.get(
-                    row.identity,
-                    row.category,
-                    row.normalized_hash,
-                ) as { id: number; seen_count: number | null } | undefined;
-                if (collision && collision.id !== row.id) {
-                    // Merge into the surviving target: keep the larger seen_count,
-                    // delete the source legacy row. The embedding row FK-cascades on
-                    // delete. The mutation log is unaffected (no render-visible
-                    // change — both rows held identical content).
-                    // requireEffectiveSeenCount aborts the batch transaction when a
-                    // v80 stats read is NULL (a missing stats row is corruption),
-                    // before the merge substitutes a default count and deletes the
-                    // source row. The check lives inside the merge branch so rows
-                    // that only need a project_path rekey do not stall the cursor.
-                    const sourceSeen = requireEffectiveSeenCount(db, row.id, row.seen_count);
-                    const targetSeen = requireEffectiveSeenCount(
-                        db,
-                        collision.id,
-                        collision.seen_count,
-                    );
-                    const mergedSeen = Math.max(targetSeen, sourceSeen);
-                    if (mergedSeen !== targetSeen) {
-                        bumpSeenCount.run(mergedSeen, collision.id);
+                for (const row of resolvedRows) {
+                    let changed = false;
+                    try {
+                        changed = rekeyRowInSavepoint(row);
+                    } catch (error) {
+                        // The failure surface doctor --retry-v22-backfill
+                        // drains: a throw poisons only this row, never the
+                        // batch, so the cursor still advances and startup
+                        // reruns stay idempotent.
+                        recordFailure(db, { ...row, ...classifyBackfillError(error) }, now);
+                        failedRows += 1;
+                        continue;
                     }
-                    preserveEmbedding.run(collision.id, row.id);
-                    deleteMemoryRow.run(row.id);
-                    changedRows += 1;
-                    changedIdentities.add(row.identity);
-                    upsertRekeyMap(db, row.project_path, row.identity, now);
-                    const legacyRustIdentity = computeLegacyRustDirIdentity(row.project_path);
-                    if (legacyRustIdentity !== row.identity) {
-                        upsertRekeyMap(db, legacyRustIdentity, row.identity, now);
+                    if (changed) {
+                        changedRows += 1;
+                        changedIdentities.add(row.identity);
+                        upsertRekeyMap(db, row.project_path, row.identity, now);
+                        const legacyRustIdentity = computeLegacyRustDirIdentity(row.project_path);
+                        if (legacyRustIdentity !== row.identity) {
+                            upsertRekeyMap(db, legacyRustIdentity, row.identity, now);
+                        }
+                        deleteFailure(db, row.id);
+                    } else if (verifyMemory.get(row.id, row.project_path)) {
+                        // The rekey declined the row (claim-invalid metadata
+                        // or a blocked collision merge) and left it in place;
+                        // record it on the v22 failure surface so the doctor
+                        // retry can drain it after repair.
+                        recordFailure(
+                            db,
+                            {
+                                ...row,
+                                errorClass: "unknown",
+                                errorMessage:
+                                    "row was skipped by the collision-aware rekey; see claim_backfill_failures for the blocking reason",
+                            },
+                            now,
+                        );
+                        failedRows += 1;
                     }
-                    deleteFailure(db, row.id);
-                    continue;
                 }
-                const result = updateMemory.run(row.identity, row.id, row.project_path) as {
-                    changes?: number;
-                };
-                if ((result.changes ?? 0) > 0) {
-                    changedRows += 1;
-                    changedIdentities.add(row.identity);
-                    upsertRekeyMap(db, row.project_path, row.identity, now);
-                    const legacyRustIdentity = computeLegacyRustDirIdentity(row.project_path);
-                    if (legacyRustIdentity !== row.identity) {
-                        upsertRekeyMap(db, legacyRustIdentity, row.identity, now);
+
+                for (const failure of failedBatchRows) {
+                    const stillSame = verifyMemory.get(failure.id, failure.project_path);
+                    if (stillSame) {
+                        recordFailure(db, failure, now);
+                        failedRows += 1;
                     }
-                    deleteFailure(db, row.id);
                 }
-            }
 
-            for (const failure of failedBatchRows) {
-                const stillSame = verifyMemory.get(failure.id, failure.project_path);
-                if (stillSame) {
-                    recordFailure(db, failure, now);
-                    failedRows += 1;
+                for (const identity of changedIdentities) {
+                    bumpProjectMemoryEpochInTransaction(db, identity, now);
                 }
-            }
 
-            for (const identity of changedIdentities) {
-                bumpProjectMemoryEpochInTransaction(db, identity, now);
+                writeMeta(db, BACKFILL_CURSOR_META_KEY, String(finalCursor));
+            };
+            if (hasMemoryClaimsCompatSchema(db)) {
+                // The shared generation context spans the per-row kernel
+                // operations, so one transaction allocates one claim project
+                // generation per touched project (KTD7).
+                withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+                    withMemoryClaimGenerationContextInCurrentTransaction(db, applyBatch),
+                );
+            } else {
+                applyBatch();
             }
-
-            writeMeta(db, BACKFILL_CURSOR_META_KEY, String(finalCursor));
         }).immediate();
 
         processedRows += batch.length;
@@ -519,25 +532,39 @@ export async function doctorRekeyV22DirIdentity(
     let changedRows = 0;
 
     db.transaction(() => {
-        const now = Date.now();
-        // Per-row collision-aware rekey: a bulk
-        // `UPDATE ... WHERE project_path = oldIdentity` aborts the whole
-        // transaction on UNIQUE(project_path, category, normalized_hash) when
-        // some rows collide with memories already under newIdentity. Iterate so
-        // colliding rows merge instead of poisoning the batch.
-        const rowIds = (
-            db.prepare("SELECT id FROM memories WHERE project_path = ?").all(oldIdentity) as Array<{
-                id: number;
-            }>
-        ).map((r) => r.id);
-        upsertRekeyMap(db, oldIdentity, newIdentity, now);
-        for (const rowId of rowIds) {
-            if (rekeyMemoryRowWithCollisionMerge(db, rowId, oldIdentity, newIdentity)) {
-                changedRows += 1;
+        const applyRekeys = (): void => {
+            const now = Date.now();
+            // Per-row collision-aware rekey: a bulk
+            // `UPDATE ... WHERE project_path = oldIdentity` aborts the whole
+            // transaction on UNIQUE(project_path, category, normalized_hash) when
+            // some rows collide with memories already under newIdentity. Iterate so
+            // colliding rows merge instead of poisoning the batch.
+            const rowIds = (
+                db
+                    .prepare("SELECT id FROM memories WHERE project_path = ?")
+                    .all(oldIdentity) as Array<{
+                    id: number;
+                }>
+            ).map((r) => r.id);
+            upsertRekeyMap(db, oldIdentity, newIdentity, now);
+            for (const rowId of rowIds) {
+                if (rekeyMemoryRowWithCollisionMerge(db, rowId, oldIdentity, newIdentity)) {
+                    changedRows += 1;
+                }
             }
-        }
-        if (changedRows > 0) {
-            bumpProjectMemoryEpochInTransaction(db, newIdentity, now);
+            if (changedRows > 0) {
+                bumpProjectMemoryEpochInTransaction(db, newIdentity, now);
+            }
+        };
+        if (hasMemoryClaimsCompatSchema(db)) {
+            // The shared generation context spans the per-row kernel
+            // operations, so one transaction allocates one claim project
+            // generation per touched project (KTD7).
+            withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+                withMemoryClaimGenerationContextInCurrentTransaction(db, applyRekeys),
+            );
+        } else {
+            applyRekeys();
         }
     })();
 

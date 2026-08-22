@@ -34,6 +34,7 @@ import type {
 	MagicContextConfig,
 	SidekickConfig,
 } from "@magic-context/core/config/schema/magic-context";
+import { runClaimsBackfillStartup } from "@magic-context/core/features/magic-context/claims-backfill-startup";
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
@@ -64,7 +65,6 @@ import {
 	getOverflowState,
 	recordOverflowDetected,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { runDeferredV22Backfill } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
 import { setCtxReduceRegisteredGlobally } from "@magic-context/core/hooks/magic-context/ctx-reduce-availability";
 import {
 	deriveHistorianChunkTokens,
@@ -467,10 +467,20 @@ export const __test = {
 	isPiMagicContextActiveInProcess,
 	markPiMagicContextActive,
 	clearPiMagicContextActive,
+	scheduleStartupBackfills,
 };
 
 function formatTokens(value: number): string {
 	return value.toLocaleString();
+}
+
+function scheduleStartupBackfills(
+	db: ContextDatabase,
+	run = runClaimsBackfillStartup,
+): Promise<unknown> {
+	return run(db, { log: warn }).catch((err) => {
+		warn(`[claims-backfill] background runner failed: ${err}`);
+	});
 }
 
 function getPiMessageModel(message: unknown): {
@@ -858,15 +868,6 @@ async function startPiMagicContextRuntime(
 ): Promise<void> {
 	const db = database;
 
-	// v22 deferred legacy-memory identity backfill. openDatabase() has already
-	// run migrations; the runner is fire-and-forget and logs failures without
-	// blocking Pi startup.
-	scheduleAfterBootQuiet(() => {
-		runDeferredV22Backfill(db).catch((err) => {
-			warn(`[v22-backfill] background runner failed: ${err}`);
-		});
-	});
-
 	scheduleAfterBootQuiet(() => {
 		void (async () => {
 			try {
@@ -976,6 +977,13 @@ async function startPiMagicContextRuntime(
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
+
+	// Behind the enabled gate: the claims backfill mutates the shared DB, so a
+	// disabled plugin must not schedule it (same gating the OpenCode plugin
+	// applies before runClaimsBackfillStartup).
+	scheduleAfterBootQuiet(() => {
+		scheduleStartupBackfills(db);
+	});
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
 	info(

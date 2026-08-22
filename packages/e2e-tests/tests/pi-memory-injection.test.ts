@@ -1,13 +1,7 @@
 /// <reference types="bun-types" />
 
-import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { realpathSync } from "node:fs";
-import { resolve as pathResolve } from "node:path";
-import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
-import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { PiTestHarness } from "../src/pi-harness";
-import { openTestDb } from "../src/test-db";
 
 let h: PiTestHarness;
 
@@ -31,28 +25,33 @@ function countCompartments(sessionId: string): number {
     }
 }
 
-function seedMemory(content: string): void {
-    const db = openTestDb(h.contextDbPath(), { readwrite: true });
-    try {
-        const now = Date.now();
-        db.prepare(
-            `INSERT INTO memories (
-                project_path, category, content, normalized_hash,
-                source_session_id, source_type, seen_count, retrieval_count,
-                first_seen_at, created_at, updated_at, last_seen_at, status
-            ) VALUES (?, 'USER_DIRECTIVES', ?, ?, NULL, 'historian', 1, 0, ?, ?, ?, ?, 'active')`,
-        ).run(
-            resolveProjectIdentity(realpathSync(pathResolve(h.env.workdir))),
-            content,
-            computeNormalizedHash(content),
-            now,
-            now,
-            now,
-            now,
-        );
-    } finally {
-        db.close();
-    }
+function emitMemoryWriteOnce(content: string): void {
+    let emitted = false;
+    h.mock.addMatcher((body) => {
+        if (emitted) return null;
+        const tools = body.tools;
+        if (!Array.isArray(tools)) return null;
+        const memoryTool = tools.find(
+            (tool) =>
+                tool !== null &&
+                typeof tool === "object" &&
+                (tool as { name?: unknown }).name === "ctx_memory",
+        ) as { name: string } | undefined;
+        if (!memoryTool) return null;
+        emitted = true;
+        return {
+            content: [
+                {
+                    type: "tool_use",
+                    id: `toolu_pi_memory_${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`,
+                    name: memoryTool.name,
+                    input: { action: "write", category: "PROJECT_RULES", content },
+                },
+            ],
+            stop_reason: "tool_use",
+            usage: { input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 100 },
+        };
+    });
 }
 
 describe("pi memory injection", () => {
@@ -66,7 +65,8 @@ describe("pi memory injection", () => {
         expect(bootstrap.exitCode).toBeNull();
 
         const directive = "pi seeded directive: prefer stable cross-harness memory checks";
-        seedMemory(directive);
+        emitMemoryWriteOnce(directive);
+        await h.sendPrompt("remember the project memory directive", { timeoutMs: 60_000 });
         await h.newSession();
 
         h.mock.reset();

@@ -4115,11 +4115,53 @@ pub fn invalidate_all_memory_block_caches(conn: &Connection) -> Result<usize, ru
     )
 }
 
+// ── v84 claims-schema write fence ────────────────────────────
+
+/// User-facing refusal for semantic memory writes on a claims-guarded DB.
+const CLAIMS_SCHEMA_WRITE_ERROR_MESSAGE: &str =
+    "This Magic Context database uses the v84 claims schema. \
+     Memory editing requires an updated dashboard. Reads remain available.";
+
+/// True when the plugin's claims migration has installed the
+/// `claim_compatibility_write_state` capability table — the same sentinel the
+/// plugin probes via `hasMemoryClaimsCompatSchema`. Its presence means BEFORE
+/// INSERT/UPDATE/DELETE triggers on `memories` (and `memory_verifications`)
+/// abort any transaction that does not hold the transaction-scoped
+/// claims-write capability.
+fn claims_write_guard_installed(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let installed: i64 = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'claim_compatibility_write_state'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(installed != 0)
+}
+
+/// Fails closed before any semantic `memories` write when the claims write
+/// guard is installed. The dashboard does not implement the claims-write
+/// kernel, so without this fence a guarded UPDATE/DELETE aborts
+/// mid-transaction with a raw trigger error instead of an actionable message.
+/// SqliteFailure(_, Some(msg)) Displays as exactly `msg`, so commands.rs's
+/// `.to_string()` surfaces this text (not a raw SQLite error) in the UI toast.
+fn ensure_memories_semantically_writable(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if claims_write_guard_installed(conn)? {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(CLAIMS_SCHEMA_WRITE_ERROR_MESSAGE.to_string()),
+        ));
+    }
+    Ok(())
+}
+
 pub fn update_memory_status(
     conn: &mut Connection,
     memory_id: i64,
     new_status: &str,
 ) -> Result<(), rusqlite::Error> {
+    ensure_memories_semantically_writable(conn)?;
     // Reject any status outside the canonical set before touching the DB. A
     // malformed call setting status="archive" (vs "archived") or any free string
     // would make the memory vanish from active/permanent/archived logic with no
@@ -4190,6 +4232,7 @@ pub fn update_memory_content(
     memory_id: i64,
     new_content: &str,
 ) -> Result<(), rusqlite::Error> {
+    ensure_memories_semantically_writable(conn)?;
     // Phase A: resolve the target row before opening a write transaction.
     let target = lookup_memory_mutation_target(conn, memory_id)?;
     let new_hash = normalize_hash(new_content);
@@ -4265,6 +4308,7 @@ pub fn update_memory_category(
     memory_id: i64,
     new_category: &str,
 ) -> Result<(), rusqlite::Error> {
+    ensure_memories_semantically_writable(conn)?;
     const VALID_CATEGORIES: [&str; 5] = [
         "PROJECT_RULES",
         "ARCHITECTURE",
@@ -4348,6 +4392,7 @@ pub fn update_memory_category(
 }
 
 pub fn delete_memory(conn: &mut Connection, memory_id: i64) -> Result<(), rusqlite::Error> {
+    ensure_memories_semantically_writable(conn)?;
     // Phase A: resolve the target row before opening a write transaction.
     let target = lookup_memory_mutation_target(conn, memory_id)?;
 
@@ -4383,6 +4428,7 @@ pub fn bulk_update_memory_status(
     if memory_ids.is_empty() {
         return Ok(0);
     }
+    ensure_memories_semantically_writable(conn)?;
 
     // Phase A: one read round-trip for all target rows, then identity normalization lock-free.
     let phase_a_targets = fetch_memory_mutation_targets(conn, memory_ids)?;
@@ -4467,6 +4513,7 @@ pub fn bulk_delete_memory(
     if memory_ids.is_empty() {
         return Ok(0);
     }
+    ensure_memories_semantically_writable(conn)?;
 
     // Phase A: one read round-trip for all target rows, then identity normalization lock-free.
     let phase_a_targets = fetch_memory_mutation_targets(conn, memory_ids)?;

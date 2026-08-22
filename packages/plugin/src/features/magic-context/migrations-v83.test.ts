@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { withClaimsWriteCapabilityInCurrentTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import {
@@ -91,13 +92,18 @@ function insertLegacyLedgerRow(
 }
 
 function insertMemoryEmbedding(db: Database, modelId: string): number {
-    const memoryId = Number(
-        db
-            .prepare(
-                `INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
-                 VALUES ('/repo', 'CONSTRAINTS', 'content-${modelId}', 'hash-${modelId}', 1, 1, 1, 1)`,
-            )
-            .run().lastInsertRowid,
+    // The capability wrapper stands in for the claims-write kernel: this
+    // fixture only needs a memories anchor row for the embedding, and the
+    // v84 semantic-write guard rejects bare INSERTs.
+    const memoryId = withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+        Number(
+            db
+                .prepare(
+                    `INSERT INTO memories (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES ('/repo', 'CONSTRAINTS', 'content-${modelId}', 'hash-${modelId}', 1, 1, 1, 1)`,
+                )
+                .run().lastInsertRowid,
+        ),
     );
     db.prepare(
         "INSERT INTO memory_embeddings (memory_id, embedding, model_id) VALUES (?, ?, ?)",

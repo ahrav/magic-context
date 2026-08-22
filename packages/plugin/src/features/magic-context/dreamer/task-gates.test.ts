@@ -4,6 +4,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { insertMemory, recordMemoryVerifications, setMemoryClassification } from "../memory";
+import {
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+} from "../memory/storage-memory-claims";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
@@ -24,6 +28,41 @@ function freshDb(): Database {
 }
 
 describe("dream task backlog probes", () => {
+    test("keeps claim-backed backlog probes on legacy memory shapes", () => {
+        const database = freshDb();
+        db = database;
+        const projectIdentity = "git:u6-dreamer-reader";
+        const content = "dreamer projection bytes: café";
+        const memory = insertMemory(database, {
+            projectPath: projectIdentity,
+            category: "PROJECT_RULES",
+            content,
+        });
+        expect(getCurrentMemoryClaimByLegacyMemoryId(database, memory.id)?.content).toBe(content);
+
+        const statements: string[] = [];
+        const originalPrepare = database.prepare.bind(database);
+        database.prepare = ((sql: string) => {
+            statements.push(sql);
+            return originalPrepare(sql);
+        }) as typeof database.prepare;
+        let backlog: ReturnType<typeof getDreamTaskBacklog>;
+        try {
+            backlog = getDreamTaskBacklog(database, projectIdentity, "classify-memories");
+        } finally {
+            database.prepare = originalPrepare;
+        }
+
+        expect(backlog).toEqual({ pending: 1, total: 1 });
+        expect(Buffer.from(JSON.stringify(backlog))).toEqual(
+            Buffer.from('{"pending":1,"total":1}'),
+        );
+        expect(statements.some((sql) => /\bmemories\b/i.test(sql))).toBeTrue();
+        expect(
+            statements.some((sql) => /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql)),
+        ).toBeFalse();
+    });
+
     test("map and classify probes match seeded candidate counts", () => {
         db = freshDb();
         const projectIdentity = "/repo/project";
@@ -70,9 +109,11 @@ describe("dream task backlog probes", () => {
         });
         recordMemoryVerifications(db, pending.id, ["src/pending.ts"], Date.now());
         recordMemoryVerifications(db, verified.id, ["src/verified.ts"], Date.now());
-        db.prepare("UPDATE memory_verifications SET verified_at = ? WHERE memory_id = ?").run(
-            0,
-            pending.id,
+        const database = db;
+        runInMemoryClaimsWriteTransaction(database, () =>
+            database
+                .prepare("UPDATE memory_verifications SET verified_at = ? WHERE memory_id = ?")
+                .run(0, pending.id),
         );
 
         expect(getDreamTaskBacklog(db, projectIdentity, "verify")).toEqual({

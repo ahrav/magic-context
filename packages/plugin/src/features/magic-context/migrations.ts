@@ -2,10 +2,23 @@ import { extractTiersFromInner } from "../../hooks/magic-context/compartment-par
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import {
+    CLAIMS_BACKFILL_MODE_REASON_META_KEY,
+    decideClaimsBackfillMode,
+    hitClaimsMigrationFailpoint,
+    runEagerClaimsBackfillInMigrationTransaction,
+} from "./claims-backfill";
+import {
     assertClaimsSchemaForeignKeys,
     CLAIMS_AND_EVIDENCE_TABLES,
     createClaimsAndEvidenceSchema,
 } from "./storage-claims-schema";
+import {
+    assertMemoryClaimsSchemaForeignKeys,
+    CLAIMS_BACKFILL_META_KEYS,
+    createMemoryClaimsCompatSchema,
+    installMemoryClaimsWriteGuards,
+    MEMORY_CLAIMS_COMPAT_TABLES,
+} from "./storage-memory-claims-schema";
 import {
     assertProjectRegistrySeed,
     resolveProjectIdentitySeed,
@@ -19,6 +32,7 @@ import {
     synapseBatchLedgerDdl,
     synapseBatchLedgerIndexDdl,
 } from "./storage-schema-helpers";
+import { V22_BACKFILL_META_KEY } from "./v22-deferred-backfill";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
 /** First version reserved for downstream migrations; upstream versions stay below it. */
@@ -1213,8 +1227,8 @@ export const MIGRATIONS: Migration[] = [
             }
 
             db.prepare(
-                "INSERT OR IGNORE INTO schema_migrations_meta (key, value) VALUES ('v22_legacy_memory_backfill', 'pending')",
-            ).run();
+                "INSERT OR IGNORE INTO schema_migrations_meta (key, value) VALUES (?, 'pending')",
+            ).run(V22_BACKFILL_META_KEY);
         },
     },
     {
@@ -3217,6 +3231,84 @@ export const MIGRATIONS: Migration[] = [
             db.exec("DROP TABLE synapse_batch_ledger_legacy_v81");
         },
     },
+    {
+        version: 84,
+        description:
+            "memories-to-claims compatibility contract: crosswalk, revision metadata, operation envelope, outbox, generations, and semantic write guards",
+        up(db: Database): void {
+            // A replayed v84 must no-op over its own published schema, but a
+            // partial or foreign `legacy_memory_claims` table is corruption.
+            if (tableExists(db, "legacy_memory_claims")) {
+                const missing = MEMORY_CLAIMS_COMPAT_TABLES.filter(
+                    (table) => !tableExists(db, table),
+                );
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v84 replay guard: legacy_memory_claims exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                return;
+            }
+            createMemoryClaimsCompatSchema(db);
+            hitClaimsMigrationFailpoint("claims-migration.010.ddl.after");
+
+            // Sparse legacy databases that never ran v22 lack the meta table.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS schema_migrations_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            `);
+            const writeMeta = db.prepare(
+                `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            );
+            const hasMemories = tableExists(db, "memories");
+            const corpus = hasMemories
+                ? (db
+                      .prepare(
+                          "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS boundary FROM memories",
+                      )
+                      .get() as { count: number; boundary: number })
+                : { count: 0, boundary: 0 };
+            // Record the high-water boundary and expected link count BEFORE the
+            // guards install: the boundary guard triggers read this meta row.
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.boundaryMemoryId, String(corpus.boundary));
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.expectedRowCount, String(corpus.count));
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
+            const v22Status = db
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(V22_BACKFILL_META_KEY) as { value: string } | null | undefined;
+            const v22Pending =
+                v22Status != null &&
+                (v22Status.value === "pending" || v22Status.value === "completed_with_failures");
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.v22Takeover, v22Pending ? "pending" : "none");
+            const decision = decideClaimsBackfillMode(db, corpus.count, v22Pending);
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.mode, decision.mode);
+            writeMeta.run(CLAIMS_BACKFILL_META_KEYS.calibrationDigest, decision.calibrationDigest);
+            // The reason persists to meta so the doctor status can surface it
+            // long after the migration log line scrolls away.
+            writeMeta.run(CLAIMS_BACKFILL_MODE_REASON_META_KEY, decision.reason);
+            log(`[migrations] v84: claims backfill mode ${decision.mode}: ${decision.reason}`);
+            if (decision.mode === "empty") {
+                // An empty corpus completes synchronously in the migration
+                // (R7): there is nothing to convert, so the completion
+                // checkpoint and U8 watermark publish here.
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.phase, "complete");
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.reconciliationVersion, "1");
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.finalOutboxWatermark, "0");
+            } else {
+                writeMeta.run(CLAIMS_BACKFILL_META_KEYS.phase, "rows");
+            }
+
+            if (hasMemories) installMemoryClaimsWriteGuards(db);
+            if (decision.mode === "eager") {
+                runEagerClaimsBackfillInMigrationTransaction(db);
+            }
+            assertMemoryClaimsSchemaForeignKeys(db);
+        },
+    },
 ];
 
 /**
@@ -3387,11 +3479,17 @@ export function runMigrations(db: Database): void {
                     db.prepare(
                         "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
                     ).run(migration.version, migration.description, Date.now());
+                    if (migration.version === 84) {
+                        hitClaimsMigrationFailpoint("claims-migration.040.version.after");
+                    }
                     return true;
                 })
                 .immediate();
 
             if (!applied || !migration) break;
+            if (migration.version === 84) {
+                hitClaimsMigrationFailpoint("claims-migration.050.commit.after");
+            }
             if (migration.version <= 61) touchedLegacyAuthorityBatch = true;
             log(`[migrations] applied v${migration.version}: ${migration.description}`);
         } catch (error) {

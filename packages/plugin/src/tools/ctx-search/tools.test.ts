@@ -376,9 +376,9 @@ describe("createCtxSearchTools", () => {
 
     it("invokes normal search exactly once when every requested id is missing or hidden", async () => {
         const hidden = insertMemory(db, {
-            projectPath: "/repo/project",
+            projectPath: "/repo/other",
             category: "ARCHITECTURE_DECISIONS",
-            content: "Hidden because it is already rendered.",
+            content: "Hidden because it belongs to another project.",
         });
         let calls = 0;
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => {
@@ -411,10 +411,6 @@ describe("createCtxSearchTools", () => {
             expect(calls).toBe(1);
 
             // A row outside the project scope is as invisible as a missing one.
-            db.prepare("UPDATE memories SET project_path = ? WHERE id = ?").run(
-                "/repo/other",
-                hidden.id,
-            );
             const hiddenResult = await tools.ctx_search.execute(
                 { query: `#${hidden.id}` },
                 toolContext(),

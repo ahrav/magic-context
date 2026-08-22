@@ -23,6 +23,10 @@ import {
     matchesPluginEntry,
 } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
+import {
+    type ClaimsBackfillCommandArgs,
+    runClaimsBackfillCommands,
+} from "../lib/claims-backfill-commands";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
 import {
     openExistingContextDatabase,
@@ -609,13 +613,16 @@ function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[
 }
 
 export async function runDoctor(
-    options: { force?: boolean; issue?: boolean } & V22BackfillCommandArgs = {},
+    options: { force?: boolean; issue?: boolean } & V22BackfillCommandArgs &
+        ClaimsBackfillCommandArgs = {},
 ): Promise<number> {
     migrateConfigLocationsForCli(process.cwd(), log);
 
     if (options.issue) {
         return runIssueFlow();
     }
+
+    let sharedCommandExitCode: number | null = null;
 
     let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
     const v22Result = await runV22BackfillCommands(
@@ -637,8 +644,32 @@ export async function runDoctor(
         options,
     );
     if (v22Result.handled) {
-        return v22Result.exitCode;
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, v22Result.exitCode);
     }
+
+    let claimsDb: ReturnType<typeof openExistingContextDatabase> = null;
+    const claimsResult = await runClaimsBackfillCommands(
+        {
+            name: "OpenCode",
+            openDatabase: (readonly = true) => {
+                const dbPath = join(getMagicContextStorageDir(), "context.db");
+                claimsDb = readonly
+                    ? openExistingContextDatabase(dbPath, { readonly: true })
+                    : openExistingContextDatabaseForMutation(dbPath);
+                return claimsDb;
+            },
+            closeDatabase: () => {
+                claimsDb?.close();
+                claimsDb = null;
+            },
+            log,
+        },
+        options,
+    );
+    if (claimsResult.handled) {
+        sharedCommandExitCode = Math.max(sharedCommandExitCode ?? 0, claimsResult.exitCode);
+    }
+    if (sharedCommandExitCode !== null) return sharedCommandExitCode;
 
     intro("Magic Context Doctor");
 

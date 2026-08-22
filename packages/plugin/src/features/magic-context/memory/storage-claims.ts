@@ -4,7 +4,8 @@
  * spans, observations, claims, immutable claim revisions, evidence links,
  * revision-scoped conflicts, and verification events.
  *
- * Write protocol: every multi-row writer runs under BEGIN IMMEDIATE, claims
+ * Write protocol: every multi-row writer runs inside an immediate
+ * transaction or a caller-held one, claims
  * the caller's expected current-revision pointer before inserting anything,
  * and finishes with a compare-and-swap whose change count must be exactly one.
  * A stale writer therefore rolls back its revision and evidence rows and gets
@@ -16,7 +17,12 @@
  * small project-registry lookup is not imported from
  * `storage-project-identities.ts`.
  *
- * Callers must not hold an open transaction: writers own BEGIN IMMEDIATE.
+ * Transaction ownership is split in two layers: `...InCurrentTransaction`
+ * primitives assume the caller already holds a write transaction and never
+ * issue BEGIN/COMMIT themselves, while the standalone public writers wrap
+ * them in `db.transaction(fn).immediate()` — BEGIN IMMEDIATE at the top
+ * level, a stacked savepoint when the caller already holds a transaction —
+ * so a nested call composes instead of failing on a nested BEGIN.
  */
 
 import { createHash } from "node:crypto";
@@ -37,28 +43,6 @@ export class ClaimGraphCorruptionError extends Error {
 /** Exact bytes-of-record hash: UTF-8 SHA-256, never the normalized memory MD5. */
 export function sha256Utf8Hex(text: string): string {
     return createHash("sha256").update(text, "utf8").digest("hex");
-}
-
-/**
- * Run `fn` inside BEGIN IMMEDIATE. The caller must not hold an open
- * transaction: the immediate lock is acquired up front so writers serialize
- * at entry, and a nested call fails loudly instead of degrading to a
- * savepoint without the reserved lock.
- */
-export function withImmediateTransaction<T>(db: Database, fn: () => T): T {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-        const result = fn();
-        db.exec("COMMIT");
-        return result;
-    } catch (error) {
-        try {
-            db.exec("ROLLBACK");
-        } catch {
-            // Connection-level failures leave nothing to roll back.
-        }
-        throw error;
-    }
 }
 
 function toRowId(result: unknown): number {
@@ -85,37 +69,49 @@ export function resolveProjectId(db: Database, identity: string): number | null 
     return typeof row?.project_id === "number" ? row.project_id : null;
 }
 
-/**
- * Resolve or register the numeric project for a canonical `git:`/`dir:`
- * identity. Idempotent across racing connections: a unique-key loser re-reads
- * the inserted project row. The prefix predicate mirrors
- * `isCanonicalProjectIdentity` in storage-project-identities.ts; keep the two
- * in sync.
- */
-export function ensureProject(db: Database, canonicalIdentity: string): number {
+// The prefix predicate mirrors `isCanonicalProjectIdentity` in
+// storage-project-identities.ts; keep the two in sync. commentlint: allow(JUDGE)
+function assertCanonicalProjectIdentity(canonicalIdentity: string): void {
     if (
         !(canonicalIdentity.startsWith("git:") || canonicalIdentity.startsWith("dir:")) ||
         canonicalIdentity.length <= "git:".length
     ) {
         throw new Error(`not a canonical git:/dir: project identity: ${canonicalIdentity}`);
     }
+}
+
+/**
+ * Transaction-local `ensureProject`: requires the caller to hold a write
+ * transaction.
+ */
+export function ensureProjectInCurrentTransaction(db: Database, canonicalIdentity: string): number {
+    assertCanonicalProjectIdentity(canonicalIdentity);
     const existing = resolveProjectId(db, canonicalIdentity);
     if (existing !== null) return existing;
     const now = Date.now();
+    const projectId = toRowId(
+        db
+            .prepare("INSERT INTO projects (canonical_identity, created_at) VALUES (?, ?)")
+            .run(canonicalIdentity, now),
+    );
+    db.prepare(
+        "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, ?)",
+    ).run(canonicalIdentity, projectId, now);
+    return projectId;
+}
+
+/**
+ * Idempotent across racing connections: a unique-key loser re-reads the
+ * inserted project row.
+ */
+export function ensureProject(db: Database, canonicalIdentity: string): number {
+    assertCanonicalProjectIdentity(canonicalIdentity);
+    const existing = resolveProjectId(db, canonicalIdentity);
+    if (existing !== null) return existing;
     try {
-        return withImmediateTransaction(db, () => {
-            const raced = resolveProjectId(db, canonicalIdentity);
-            if (raced !== null) return raced;
-            const projectId = toRowId(
-                db
-                    .prepare("INSERT INTO projects (canonical_identity, created_at) VALUES (?, ?)")
-                    .run(canonicalIdentity, now),
-            );
-            db.prepare(
-                "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, ?)",
-            ).run(canonicalIdentity, projectId, now);
-            return projectId;
-        });
+        return db
+            .transaction(() => ensureProjectInCurrentTransaction(db, canonicalIdentity))
+            .immediate();
     } catch (error) {
         const raced = resolveProjectId(db, canonicalIdentity);
         if (raced !== null) return raced;
@@ -328,66 +324,70 @@ export interface CreateClaimInput {
     sourceSessionId?: string | null;
 }
 
+/** Transaction-local `createClaim`: requires a caller-held write transaction. */
+export function createClaimInCurrentTransaction(
+    db: Database,
+    input: CreateClaimInput,
+): ClaimWriteOutcome {
+    const now = Date.now();
+    const validated = normalizeEvidence(db, input.projectId, input.evidence);
+    if (!validated.ok) return { status: "invalid", reason: validated.reason };
+
+    const scope = input.scope ?? "";
+    const duplicate = db
+        .prepare(
+            "SELECT id FROM claims WHERE project_id = ? AND subject = ? AND predicate = ? AND scope = ?",
+        )
+        .get(input.projectId, input.subject, input.predicate, scope) as { id: number } | undefined;
+    if (duplicate) {
+        return {
+            status: "invalid",
+            reason: `claim ${duplicate.id} already owns this semantic key; append a revision instead`,
+        };
+    }
+
+    const claimId = toRowId(
+        db
+            .prepare(
+                `INSERT INTO claims
+                    (project_id, subject, predicate, scope, state, current_revision_id, created_at)
+                 VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+            )
+            .run(
+                input.projectId,
+                input.subject,
+                input.predicate,
+                scope,
+                input.state ?? "active",
+                now,
+            ),
+    );
+    const revisionId = insertRevisionWithEvidence(db, {
+        claimId,
+        revision: 1,
+        content: input.content,
+        sourceSessionId: input.sourceSessionId ?? null,
+        evidence: validated.evidence,
+        now,
+    });
+    const published = changeCount(
+        db
+            .prepare(
+                "UPDATE claims SET current_revision_id = ? WHERE id = ? AND current_revision_id IS NULL",
+            )
+            .run(revisionId, claimId),
+    );
+    if (published !== 1) {
+        throw new Error(
+            `claim ${claimId} bootstrap pointer publish changed ${published} rows; expected exactly 1`,
+        );
+    }
+    return { status: "applied", claimId, revisionId, revision: 1 };
+}
+
 /** Create a claim, its revision 1, and its evidence links atomically. */
 export function createClaim(db: Database, input: CreateClaimInput): ClaimWriteOutcome {
-    const now = Date.now();
-    return withImmediateTransaction(db, (): ClaimWriteOutcome => {
-        const validated = normalizeEvidence(db, input.projectId, input.evidence);
-        if (!validated.ok) return { status: "invalid", reason: validated.reason };
-
-        const scope = input.scope ?? "";
-        const duplicate = db
-            .prepare(
-                "SELECT id FROM claims WHERE project_id = ? AND subject = ? AND predicate = ? AND scope = ?",
-            )
-            .get(input.projectId, input.subject, input.predicate, scope) as
-            | { id: number }
-            | undefined;
-        if (duplicate) {
-            return {
-                status: "invalid",
-                reason: `claim ${duplicate.id} already owns this semantic key; append a revision instead`,
-            };
-        }
-
-        const claimId = toRowId(
-            db
-                .prepare(
-                    `INSERT INTO claims
-                        (project_id, subject, predicate, scope, state, current_revision_id, created_at)
-                     VALUES (?, ?, ?, ?, ?, NULL, ?)`,
-                )
-                .run(
-                    input.projectId,
-                    input.subject,
-                    input.predicate,
-                    scope,
-                    input.state ?? "active",
-                    now,
-                ),
-        );
-        const revisionId = insertRevisionWithEvidence(db, {
-            claimId,
-            revision: 1,
-            content: input.content,
-            sourceSessionId: input.sourceSessionId ?? null,
-            evidence: validated.evidence,
-            now,
-        });
-        const published = changeCount(
-            db
-                .prepare(
-                    "UPDATE claims SET current_revision_id = ? WHERE id = ? AND current_revision_id IS NULL",
-                )
-                .run(revisionId, claimId),
-        );
-        if (published !== 1) {
-            throw new Error(
-                `claim ${claimId} bootstrap pointer publish changed ${published} rows; expected exactly 1`,
-            );
-        }
-        return { status: "applied", claimId, revisionId, revision: 1 };
-    });
+    return db.transaction(() => createClaimInCurrentTransaction(db, input)).immediate();
 }
 
 export interface AppendClaimRevisionInput {
@@ -400,85 +400,91 @@ export interface AppendClaimRevisionInput {
 }
 
 /**
- * Append an immutable revision. The transaction validates the caller's
- * expected pointer before inserting a revision, then advances the pointer
- * with a final CAS. BEGIN IMMEDIATE provides the cross-process serialization;
- * the pointer read is the staleness check, not a row lock.
+ * Transaction-local `appendClaimRevision`: requires a caller-held write
+ * transaction. The caller's expected pointer is validated before inserting a
+ * revision, then advanced with a final CAS. The surrounding immediate
+ * transaction provides the cross-process serialization; the pointer read is
+ * the staleness check, not a row lock.
  */
-export function appendClaimRevision(
+export function appendClaimRevisionInCurrentTransaction(
     db: Database,
     input: AppendClaimRevisionInput,
 ): ClaimWriteOutcome {
     const now = Date.now();
-    return withImmediateTransaction(db, (): ClaimWriteOutcome => {
-        // BEGIN IMMEDIATE serializes writers, so one read of the pointer is the
-        // staleness check; the closing CAS re-asserts the same predicate. The
-        // claim_id equality mirrors the composite pointer FK for connections
-        // running with foreign keys off.
-        const current = db
-            .prepare(
-                `SELECT claims.project_id AS projectId, pointed.revision AS revision
-                   FROM claims
-                   JOIN claim_revisions AS pointed
-                     ON pointed.id = claims.current_revision_id
-                    AND pointed.claim_id = claims.id
-                  WHERE claims.id = ? AND claims.current_revision_id = ?`,
-            )
-            .get(input.claimId, input.expectedCurrentRevisionId) as
-            | { projectId: number; revision: number }
-            | undefined;
-        if (!current) {
-            const claim = db
-                .prepare("SELECT current_revision_id AS pointer FROM claims WHERE id = ?")
-                .get(input.claimId) as { pointer: number | null } | undefined;
-            if (!claim) return { status: "not_found" };
-            if (claim.pointer === input.expectedCurrentRevisionId) {
-                throw new ClaimGraphCorruptionError(
-                    `claim ${input.claimId} current pointer ${input.expectedCurrentRevisionId} has no revision row`,
-                );
-            }
-            return { status: "stale" };
-        }
-
-        const validated = normalizeEvidence(db, current.projectId, input.evidence);
-        if (!validated.ok) return { status: "invalid", reason: validated.reason };
-
-        // A pointer repointed backward by direct SQL still passes the CAS
-        // (the caller read the corrupted pointer), but the next revision
-        // number would collide with existing history. Surface that as
-        // corruption instead of a raw append-only trigger error.
-        const maxRevision = db
-            .prepare("SELECT MAX(revision) AS max FROM claim_revisions WHERE claim_id = ?")
-            .get(input.claimId) as { max: number | null };
-        if (maxRevision.max !== current.revision) {
+    // The immediate write lock serializes writers, so one read of the pointer
+    // is the staleness check; the closing CAS re-asserts the same predicate.
+    // The claim_id equality mirrors the composite pointer FK when foreign
+    // keys are off.
+    const current = db
+        .prepare(
+            `SELECT claims.project_id AS projectId, pointed.revision AS revision
+               FROM claims
+               JOIN claim_revisions AS pointed
+                 ON pointed.id = claims.current_revision_id
+                AND pointed.claim_id = claims.id
+              WHERE claims.id = ? AND claims.current_revision_id = ?`,
+        )
+        .get(input.claimId, input.expectedCurrentRevisionId) as
+        | { projectId: number; revision: number }
+        | undefined;
+    if (!current) {
+        const claim = db
+            .prepare("SELECT current_revision_id AS pointer FROM claims WHERE id = ?")
+            .get(input.claimId) as { pointer: number | null } | undefined;
+        if (!claim) return { status: "not_found" };
+        if (claim.pointer === input.expectedCurrentRevisionId) {
             throw new ClaimGraphCorruptionError(
-                `claim ${input.claimId} pointer targets revision ${current.revision} but history reaches ${String(maxRevision.max)}; direct-SQL corruption`,
+                `claim ${input.claimId} current pointer ${input.expectedCurrentRevisionId} has no revision row`,
             );
         }
+        return { status: "stale" };
+    }
 
-        const revision = current.revision + 1;
-        const revisionId = insertRevisionWithEvidence(db, {
-            claimId: input.claimId,
-            revision,
-            content: input.content,
-            sourceSessionId: input.sourceSessionId ?? null,
-            evidence: validated.evidence,
-            now,
-        });
-        const advanced = changeCount(
-            db
-                .prepare(
-                    "UPDATE claims SET current_revision_id = ? WHERE id = ? AND current_revision_id = ?",
-                )
-                .run(revisionId, input.claimId, input.expectedCurrentRevisionId),
+    const validated = normalizeEvidence(db, current.projectId, input.evidence);
+    if (!validated.ok) return { status: "invalid", reason: validated.reason };
+
+    // A pointer repointed backward by direct SQL still passes the CAS
+    // (the caller read the corrupted pointer), but the next revision
+    // number would collide with existing history. Surface that as
+    // corruption instead of a raw append-only trigger error.
+    const maxRevision = db
+        .prepare("SELECT MAX(revision) AS max FROM claim_revisions WHERE claim_id = ?")
+        .get(input.claimId) as { max: number | null };
+    if (maxRevision.max !== current.revision) {
+        throw new ClaimGraphCorruptionError(
+            `claim ${input.claimId} pointer targets revision ${current.revision} but history reaches ${String(maxRevision.max)}; direct-SQL corruption`,
         );
-        if (advanced !== 1) {
-            throw new Error(
-                `claim ${input.claimId} pointer CAS changed ${advanced} rows; expected exactly 1`,
-            );
-        }
-        return { status: "applied", claimId: input.claimId, revisionId, revision };
+    }
+
+    const revision = current.revision + 1;
+    const revisionId = insertRevisionWithEvidence(db, {
+        claimId: input.claimId,
+        revision,
+        content: input.content,
+        sourceSessionId: input.sourceSessionId ?? null,
+        evidence: validated.evidence,
+        now,
     });
+    const advanced = changeCount(
+        db
+            .prepare(
+                "UPDATE claims SET current_revision_id = ? WHERE id = ? AND current_revision_id = ?",
+            )
+            .run(revisionId, input.claimId, input.expectedCurrentRevisionId),
+    );
+    if (advanced !== 1) {
+        throw new Error(
+            `claim ${input.claimId} pointer CAS changed ${advanced} rows; expected exactly 1`,
+        );
+    }
+    return { status: "applied", claimId: input.claimId, revisionId, revision };
+}
+
+export function appendClaimRevision(
+    db: Database,
+    input: AppendClaimRevisionInput,
+): ClaimWriteOutcome {
+    return db.transaction(() => appendClaimRevisionInCurrentTransaction(db, input)).immediate();
 }
 
 // ---------------------------------------------------------------------------
@@ -492,33 +498,38 @@ export interface ClaimConflictInput {
 }
 
 /**
- * Record a revision-scoped conflict. Contradiction is symmetric, so its
- * endpoints are canonically ordered and a reverse duplicate returns the
- * existing row. Supersession keeps the caller's direction. Distinct-claim,
- * same-project, and reverse-supersession rules are enforced by the database
- * guards.
+ * Transaction-local `addClaimConflict`: requires a caller-held write
+ * transaction. Contradiction is symmetric, so its endpoints are canonically
+ * ordered and a reverse duplicate returns the existing row. Supersession
+ * keeps the caller's direction. Distinct-claim, same-project, and
+ * reverse-supersession rules are enforced by the database guards.
  */
-export function addClaimConflict(db: Database, input: ClaimConflictInput): number {
+export function addClaimConflictInCurrentTransaction(
+    db: Database,
+    input: ClaimConflictInput,
+): number {
     let { leftRevisionId, rightRevisionId } = input;
     if (input.relation === "contradicts" && leftRevisionId > rightRevisionId) {
         [leftRevisionId, rightRevisionId] = [rightRevisionId, leftRevisionId];
     }
-    return withImmediateTransaction(db, () => {
-        const existing = db
+    const existing = db
+        .prepare(
+            "SELECT id FROM claim_conflicts WHERE relation = ? AND left_revision_id = ? AND right_revision_id = ?",
+        )
+        .get(input.relation, leftRevisionId, rightRevisionId) as { id: number } | undefined;
+    if (existing) return existing.id;
+    return toRowId(
+        db
             .prepare(
-                "SELECT id FROM claim_conflicts WHERE relation = ? AND left_revision_id = ? AND right_revision_id = ?",
+                `INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at)
+                 VALUES (?, ?, ?, ?)`,
             )
-            .get(input.relation, leftRevisionId, rightRevisionId) as { id: number } | undefined;
-        if (existing) return existing.id;
-        return toRowId(
-            db
-                .prepare(
-                    `INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at)
-                     VALUES (?, ?, ?, ?)`,
-                )
-                .run(input.relation, leftRevisionId, rightRevisionId, Date.now()),
-        );
-    });
+            .run(input.relation, leftRevisionId, rightRevisionId, Date.now()),
+    );
+}
+
+export function addClaimConflict(db: Database, input: ClaimConflictInput): number {
+    return db.transaction(() => addClaimConflictInCurrentTransaction(db, input)).immediate();
 }
 
 export interface VerificationEventInput {

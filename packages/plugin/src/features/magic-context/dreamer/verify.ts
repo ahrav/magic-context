@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
@@ -26,6 +26,13 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
+import {
+    computeClaimRequestDigest,
+    hasMemoryClaimsCompatSchema,
+    runInMemoryClaimsWriteTransaction,
+    updateMemoryContentWithClaimsInCurrentTransaction,
+    withMemoryClaimGenerationContextInCurrentTransaction,
+} from "../memory/storage-memory-claims";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
@@ -465,32 +472,37 @@ export async function applyVerifyManifest(
         return { verified, updated, archived };
     }
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
-        for (const w of writes) {
-            const memory = getMemoryById(args.db, w.id);
-            if (!isPrimaryMutable(memory)) continue;
-            if (w.kind === "verify") {
-                recordMemoryVerifications(args.db, w.id, w.files, now);
-                verified += 1;
-            } else if (w.kind === "update") {
-                rewriteMemoryContent(args.db, memory, w.content, w.hash);
-                queueMemoryMutation(args.db, {
-                    projectPath: args.projectIdentity,
-                    mutationType: "update",
-                    targetMemoryId: w.id,
-                    category: memory.category,
-                    newContent: w.content,
-                });
-                updated += 1;
-            } else {
-                archiveMemory(args.db, w.id, w.reason);
-                queueMemoryMutation(args.db, {
-                    projectPath: args.projectIdentity,
-                    mutationType: "archive",
-                    targetMemoryId: w.id,
-                });
-                archived += 1;
+        // The shared generation context spans the per-item claim writes, so
+        // one lease-guarded transaction allocates one claim project
+        // generation per touched project (KTD7).
+        withMemoryClaimGenerationContextInCurrentTransaction(args.db, () => {
+            for (const w of writes) {
+                const memory = getMemoryById(args.db, w.id);
+                if (!isPrimaryMutable(memory)) continue;
+                if (w.kind === "verify") {
+                    recordMemoryVerifications(args.db, w.id, w.files, now);
+                    verified += 1;
+                } else if (w.kind === "update") {
+                    rewriteMemoryContent(args.db, memory, w.content, w.hash);
+                    queueMemoryMutation(args.db, {
+                        projectPath: args.projectIdentity,
+                        mutationType: "update",
+                        targetMemoryId: w.id,
+                        category: memory.category,
+                        newContent: w.content,
+                    });
+                    updated += 1;
+                } else {
+                    archiveMemory(args.db, w.id, w.reason);
+                    queueMemoryMutation(args.db, {
+                        projectPath: args.projectIdentity,
+                        mutationType: "archive",
+                        targetMemoryId: w.id,
+                    });
+                    archived += 1;
+                }
             }
-        }
+        });
     });
     return { verified, updated, archived };
 }
@@ -516,6 +528,29 @@ function isPrimaryMutable(memory: Memory | null): memory is Memory {
  *  new content + hash, reset shareable + classified_at (re-scored later by
  *  classify), drop stale embeddings/cache, and clear old file mappings. */
 function rewriteMemoryContent(db: Database, memory: Memory, content: string, hash: string): void {
+    if (hasMemoryClaimsCompatSchema(db)) {
+        runInMemoryClaimsWriteTransaction(db, () => {
+            // The update verdict declared the previous verification wrong, so
+            // the kernel clears the side table and suppresses the verified
+            // carry inside the same claims transaction.
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "dreamer-verify",
+                    operationKey: `update:${randomUUID()}`,
+                    requestDigest: computeClaimRequestDigest({ id: memory.id, content, hash }),
+                },
+                {
+                    memoryId: memory.id,
+                    content,
+                    normalizedHash: hash,
+                    clearsVerification: true,
+                },
+            );
+        });
+        invalidateMemory(memory.projectPath, memory.id);
+        return;
+    }
     db.prepare(
         "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
     ).run(content, hash, Date.now(), memory.id);

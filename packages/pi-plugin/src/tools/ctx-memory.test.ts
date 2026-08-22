@@ -1,13 +1,81 @@
 import { describe, expect, it } from "bun:test";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import {
+	deleteMemory,
 	getMemoryById,
 	insertMemory,
-} from "@magic-context/core/features/magic-context/memory/storage-memory";
-import { getMemoryMutationsForRender } from "@magic-context/core/features/magic-context/storage";
-import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+} from "../../../plugin/src/features/magic-context/memory/storage-memory";
+import {
+	getCurrentMemoryClaimByLegacyMemoryId,
+	runInMemoryClaimsWriteTransaction,
+} from "../../../plugin/src/features/magic-context/memory/storage-memory-claims";
+import { getMemoryMutationsForRender } from "../../../plugin/src/features/magic-context/storage";
+import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
+import { Database } from "../../../plugin/src/shared/sqlite";
+import { closeQuietly } from "../../../plugin/src/shared/sqlite-helpers";
 import { createTestDb, fakeContext } from "../test-utils.test";
-import { createCtxMemoryTool } from "./ctx-memory";
+import { createCtxMemoryTool as createCtxMemoryToolRuntime } from "./ctx-memory";
+
+interface TestToolResult {
+	content: Array<{ text?: string }>;
+	isError?: boolean;
+}
+
+interface TestMemoryTool {
+	execute(
+		toolCallId: string,
+		params: Record<string, unknown>,
+		signal: AbortSignal,
+		onUpdate: unknown,
+		context: unknown,
+	): Promise<TestToolResult>;
+}
+
+const createCtxMemoryTool = createCtxMemoryToolRuntime as unknown as (
+	deps: Parameters<typeof createCtxMemoryToolRuntime>[0],
+) => TestMemoryTool;
+
+function hideFirstClaimOperationRead(
+	database: ReturnType<typeof createTestDb>,
+): ReturnType<typeof createTestDb> {
+	let hidden = false;
+	return new Proxy(database, {
+		get(target, property) {
+			if (property === "prepare") {
+				return (sql: string) => {
+					const statement = target.prepare(sql);
+					if (
+						!hidden &&
+						sql.includes(
+							"SELECT request_digest AS requestDigest, result_json AS resultJson FROM claim_operations",
+						)
+					) {
+						hidden = true;
+						return new Proxy(statement, {
+							get(statementTarget, statementProperty) {
+								if (statementProperty === "get") return () => undefined;
+								const value = Reflect.get(
+									statementTarget,
+									statementProperty,
+									statementTarget,
+								);
+								return typeof value === "function"
+									? value.bind(statementTarget)
+									: value;
+							},
+						});
+					}
+					return statement;
+				};
+			}
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as ReturnType<typeof createTestDb>;
+}
 
 describe("createCtxMemoryTool", () => {
 	it("rejects list for primary agents and allows it for dreamer agents", async () => {
@@ -804,8 +872,10 @@ describe("createCtxMemoryTool", () => {
 				category: "CONSTRAINTS",
 				content: "Use bun for tests.",
 			});
-			db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-				archived.id,
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+					.run(archived.id),
 			);
 
 			const update = await primary.execute(
@@ -850,8 +920,10 @@ describe("createCtxMemoryTool", () => {
 				category: "CONSTRAINTS",
 				content: "Use bun for scripts.",
 			});
-			db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-				archived.id,
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+					.run(archived.id),
 			);
 
 			const archivedAgain = await primary.execute(
@@ -893,8 +965,10 @@ describe("createCtxMemoryTool", () => {
 				category: "CONSTRAINTS",
 				content: "Use bun for tests.",
 			});
-			db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-				archived.id,
+			runInMemoryClaimsWriteTransaction(db, () =>
+				db
+					.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+					.run(archived.id),
 			);
 
 			const result = await dreamer.execute(
@@ -970,8 +1044,10 @@ describe("createCtxMemoryTool", () => {
 					category: "KNOWN_ISSUES",
 					content: "Retired issue the user just referenced.",
 				});
-				db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(
-					memory.id,
+				runInMemoryClaimsWriteTransaction(db, () =>
+					db
+						.prepare("UPDATE memories SET status = 'archived' WHERE id = ?")
+						.run(memory.id),
 				);
 				const primary = createCtxMemoryTool({
 					db,
@@ -1110,5 +1186,618 @@ describe("createCtxMemoryTool", () => {
 				closeQuietly(db);
 			}
 		});
+	});
+});
+
+describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 parity)", () => {
+	function countRows(
+		db: ReturnType<typeof createTestDb>,
+		table: string,
+		where = "1=1",
+	): number {
+		return (
+			db
+				.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`)
+				.get() as { count: number }
+		).count;
+	}
+
+	function claimRevisionContents(
+		db: ReturnType<typeof createTestDb>,
+		memoryId: number,
+	): string[] {
+		const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+		if (!claim) return [];
+		return (
+			db
+				.prepare(
+					"SELECT content FROM claim_revisions WHERE claim_id = ? ORDER BY revision",
+				)
+				.all(claim.claimId) as Array<{ content: string }>
+		).map((row) => row.content);
+	}
+
+	async function run(
+		tool: ReturnType<typeof createCtxMemoryTool>,
+		params: Record<string, unknown>,
+		call = "call-claims",
+	) {
+		return tool.execute(
+			call,
+			params as never,
+			new AbortController().signal,
+			undefined,
+			fakeContext("ses-claims") as never,
+		);
+	}
+
+	it("writing the same content twice keeps one projection row and one revision while telemetry increments (Pi parity)", async () => {
+		const db = createTestDb();
+		try {
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const first = await run(tool, {
+				action: "write",
+				category: "CONSTRAINTS",
+				content: "Use bun for scripts.",
+			});
+			expect(first.content[0]?.text).toContain("Saved memory [ID:");
+			const idMatch = first.content[0]?.text?.match(/ID:\s*(\d+)/);
+			const memoryId = Number(idMatch?.[1]);
+
+			const second = await run(
+				tool,
+				{
+					action: "write",
+					category: "CONSTRAINTS",
+					content: "Use bun for scripts.",
+				},
+				"call-claims-distinct-repeat",
+			);
+			expect(second.content[0]?.text).toContain(
+				`Memory already exists [ID: ${memoryId}] in CONSTRAINTS (seen count incremented).`,
+			);
+
+			expect(getMemoryById(db, memoryId)?.seenCount).toBe(2);
+			expect(claimRevisionContents(db, memoryId)).toEqual([
+				"Use bun for scripts.",
+			]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("updating an unlinked pre-v84 row adopts the preimage as revision 1 and the new content as revision 2 (Pi parity)", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			let unlinkedId = 0;
+			runInMemoryClaimsWriteTransaction(db, () => {
+				const inserted = db
+					.prepare(
+						`INSERT INTO memories (project_path, category, content, normalized_hash,
+							seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+						 VALUES (?, 'CONSTRAINTS', 'Old unlinked fact.', 'hash:old-unlinked', 1, 0, 1, 1, 1, 1)`,
+					)
+					.run(projectIdentity);
+				unlinkedId = Number(inserted.lastInsertRowid);
+			});
+			expect(getCurrentMemoryClaimByLegacyMemoryId(db, unlinkedId)).toBeNull();
+
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const result = await run(tool, {
+				action: "update",
+				ids: [unlinkedId],
+				content: "Corrected unlinked fact.",
+			});
+			expect(result.isError).toBeUndefined();
+
+			expect(claimRevisionContents(db, unlinkedId)).toEqual([
+				"Old unlinked fact.",
+				"Corrected unlinked fact.",
+			]);
+			expect(getMemoryById(db, unlinkedId)?.content).toBe(
+				"Corrected unlinked fact.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("same Pi tool-call id replays a lost acknowledgement without duplicate tuple effects", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi lost acknowledgement original.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "update",
+				ids: [memory.id],
+				content: "Pi lost acknowledgement corrected.",
+			};
+
+			const first = await run(tool, args, "pi-lost-ack");
+			const tables = [
+				"claim_revisions",
+				"claim_operations",
+				"claim_change_outbox",
+				"claim_project_generations",
+				"memory_mutation_log",
+			];
+			const afterFirst = tables.map((table) => countRows(db, table));
+			const second = await run(tool, args, "pi-lost-ack");
+
+			expect(second.content[0]?.text).toBe(first.content[0]?.text);
+			expect(tables.map((table) => countRows(db, table))).toEqual(afterFirst);
+			expect(claimRevisionContents(db, memory.id)).toEqual([
+				"Pi lost acknowledgement original.",
+				"Pi lost acknowledgement corrected.",
+			]);
+			expect(
+				countRows(
+					db,
+					"claim_operations",
+					`producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:pi-lost-ack:update:${memory.id}'`,
+				),
+			).toBe(1);
+			expect(
+				countRows(
+					db,
+					"memory_mutation_log",
+					`mutation_type = 'update' AND target_memory_id = ${memory.id}`,
+				),
+			).toBe(1);
+
+			// A reused tool-call id with a different digest surfaces as a tool
+			// result instead of an unhandled throw.
+			const reused = await run(
+				tool,
+				{ ...args, content: "Different Pi request under reused id." },
+				"pi-lost-ack",
+			);
+			expect(reused.isError).toBe(true);
+			expect(reused.content[0]?.text).toBe(
+				"Error: this tool call id was already committed with different arguments. Retry as a new call.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("whitespace-only archive reason is dropped from the reply", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Archive me without a reason.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+
+			const result = await run(tool, {
+				action: "archive",
+				ids: [memory.id],
+				reason: "  ",
+			});
+
+			expect(result.content[0]?.text).toBe(
+				`Archived memory [ID: ${memory.id}].`,
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("two connections replay stable merges before mutating existing or fresh canonicals (Pi parity)", async () => {
+		for (const existingCanonical of [true, false]) {
+			const dir = mkdtempSync(join(tmpdir(), "pi-ctx-memory-merge-race-"));
+			const path = join(dir, "context.db");
+			const db = createTestDb(path);
+			const peer = createTestDb(path);
+			try {
+				db.exec("PRAGMA busy_timeout=1000");
+				peer.exec("PRAGMA busy_timeout=1000");
+				const projectIdentity = resolveProjectIdentity(process.cwd());
+				const first = insertMemory(db, {
+					projectPath: projectIdentity,
+					category: "CONSTRAINTS",
+					content: `Pi stable merge first ${existingCanonical}`,
+				});
+				const second = insertMemory(db, {
+					projectPath: projectIdentity,
+					category: "CONSTRAINTS",
+					content: `Pi stable merge second ${existingCanonical}`,
+				});
+				const content = existingCanonical
+					? first.content
+					: `Pi stable merge fresh canonical ${existingCanonical}`;
+				const args = {
+					action: "merge",
+					ids: [first.id, second.id],
+					category: "CONSTRAINTS",
+					content,
+				};
+				const callId = `pi-stable-merge-${existingCanonical}`;
+				const winnerTool = createCtxMemoryTool({
+					db: peer,
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: true,
+				});
+				const winner = await run(winnerTool, args, callId);
+				const tables = [
+					"claim_revisions",
+					"claim_operations",
+					"claim_change_outbox",
+					"claim_project_generations",
+					"memory_mutation_log",
+				];
+				const afterWinner = tables.map((table) => countRows(db, table));
+				const staleTool = createCtxMemoryTool({
+					db: hideFirstClaimOperationRead(db),
+					memoryEnabled: true,
+					embeddingEnabled: false,
+					allowDreamerActions: true,
+				});
+
+				const replay = await run(staleTool, args, callId);
+
+				expect(replay.content[0]?.text).toBe(winner.content[0]?.text);
+				expect(tables.map((table) => countRows(db, table))).toEqual(
+					afterWinner,
+				);
+				expect(
+					countRows(
+						db,
+						"claim_operations",
+						`producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:${callId}:merge:2'`,
+					),
+				).toBe(1);
+				const mismatch = await run(
+					staleTool,
+					{ ...args, content: `${content} digest mismatch` },
+					callId,
+				);
+				expect(mismatch.isError).toBe(true);
+				expect(mismatch.content[0]?.text).toBe(
+					"Error: this tool call id was already committed with different arguments. Retry as a new call.",
+				);
+			} finally {
+				closeQuietly(peer);
+				closeQuietly(db);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("archive commits claim retirement, projection, and archive event together (Pi parity)", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "KNOWN_ISSUES",
+				content: "Old issue entry.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+
+			const result = await run(tool, {
+				action: "archive",
+				ids: [memory.id],
+				reason: "Subsystem removed",
+			});
+			expect(result.content[0]?.text).toContain("Archived memory");
+
+			const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+			expect(claim?.state).toBe("archived");
+			expect(getMemoryById(db, memory.id)?.status).toBe("archived");
+			expect(getMemoryById(db, memory.id)?.metadataJson).toContain(
+				"Subsystem removed",
+			);
+			expect(
+				countRows(
+					db,
+					"verification_events",
+					`outcome = 'archive' AND revision_id = ${claim?.revisionId}`,
+				),
+			).toBe(1);
+			expect(
+				countRows(db, "claim_change_outbox", "effect_type = 'lifecycle'"),
+			).toBeGreaterThanOrEqual(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("archive with a tool-call id skips the replay probe on a pre-v84 database", async () => {
+		// Base schema only — no v84 claims tables, so an unguarded
+		// readMemoryClaimOperationResult would throw "no such table:
+		// claim_operations" before validation even runs.
+		const db = new Database(":memory:") as ReturnType<typeof createTestDb>;
+		try {
+			initializeDatabase(db);
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pre-v84 archive target.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+
+			const result = await run(tool, {
+				action: "archive",
+				ids: [memory.id],
+			});
+
+			expect(result.isError).toBeUndefined();
+			expect(result.content[0]?.text).toBe(
+				`Archived memory [ID: ${memory.id}].`,
+			);
+			expect(getMemoryById(db, memory.id)?.status).toBe("archived");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("same-project merge preserves stats policy, records supersession, and returns the same result shape as OpenCode", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Use bun for scripts",
+			});
+			const second = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Use bun for all scripts in this repo",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: true,
+			});
+
+			const result = await run(tool, {
+				action: "merge",
+				ids: [first.id, second.id],
+				content: "Use bun for all scripts in this repository.",
+			});
+			const text = result.content[0]?.text ?? "";
+			const canonicalMatch = text.match(/canonical memory \[ID: (\d+)\]/);
+			const canonicalId = Number(canonicalMatch?.[1]);
+			expect(text).toBe(
+				`Merged memories [${first.id}, ${second.id}] into canonical memory [ID: ${canonicalId}] in CONSTRAINTS; superseded [${first.id}, ${second.id}].`,
+			);
+
+			expect(getMemoryById(db, canonicalId)?.seenCount).toBe(2);
+			expect(getMemoryById(db, canonicalId)?.mergedFrom).toBe(
+				JSON.stringify([first.id, second.id]),
+			);
+			const canonicalClaim = getCurrentMemoryClaimByLegacyMemoryId(
+				db,
+				canonicalId,
+			);
+			expect(canonicalClaim?.state).toBe("active");
+			for (const sourceId of [first.id, second.id]) {
+				const sourceClaim = getCurrentMemoryClaimByLegacyMemoryId(db, sourceId);
+				expect(sourceClaim?.state).toBe("archived");
+				expect(
+					countRows(
+						db,
+						"claim_conflicts",
+						`relation = 'supersedes' AND right_revision_id = ${sourceClaim?.revisionId}`,
+					),
+				).toBe(1);
+			}
+			expect(countRows(db, "claim_merge_lineage")).toBe(0);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("a duplicate write with a tool-call id persists an envelope and replays without a second seen-count bump", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi duplicate write original.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "write",
+				category: "CONSTRAINTS",
+				content: "Pi duplicate write original.",
+			};
+
+			const first = await run(tool, args, "pi-dup-write");
+			expect(first.content[0]?.text).toBe(
+				`Memory already exists [ID: ${memory.id}] in CONSTRAINTS (seen count incremented).`,
+			);
+			expect(getMemoryById(db, memory.id)?.seenCount).toBe(2);
+			expect(
+				countRows(
+					db,
+					"claim_operations",
+					"producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:pi-dup-write:write'",
+				),
+			).toBe(1);
+
+			const replay = await run(tool, args, "pi-dup-write");
+			expect(replay.content[0]?.text).toBe(first.content[0]?.text);
+			expect(getMemoryById(db, memory.id)?.seenCount).toBe(2);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("update replay returns the stored result after the target row is archived", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi replay update original.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "update",
+				ids: [memory.id],
+				content: "Pi replay update corrected.",
+			};
+
+			const first = await run(tool, args, "pi-replay-update");
+			expect(first.content[0]?.text).toBe(
+				`Updated memory [ID: ${memory.id}] in CONSTRAINTS.`,
+			);
+
+			const archived = await run(
+				tool,
+				{ action: "archive", ids: [memory.id] },
+				"pi-replay-update-archive",
+			);
+			expect(archived.content[0]?.text).toContain("Archived memory");
+
+			const operationsBefore = countRows(db, "claim_operations");
+			const replay = await run(tool, args, "pi-replay-update");
+			expect(replay.content[0]?.text).toBe(first.content[0]?.text);
+			expect(countRows(db, "claim_operations")).toBe(operationsBefore);
+			expect(getMemoryById(db, memory.id)?.status).toBe("archived");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("merge replay returns the stored result after a source memory is deleted", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay source one.",
+			});
+			const second = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay source two.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const args = {
+				action: "merge",
+				ids: [first.id, second.id],
+				category: "CONSTRAINTS",
+				content: "Pi merge replay canonical.",
+			};
+
+			const merged = await run(tool, args, "pi-replay-merge");
+			expect(merged.content[0]?.text).toContain("Merged memories");
+
+			deleteMemory(db, first.id);
+			expect(getMemoryById(db, first.id)).toBeNull();
+
+			const replay = await run(tool, args, "pi-replay-merge");
+			expect(replay.content[0]?.text).toBe(merged.content[0]?.text);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("merge replay works without a category argument after every source is hard-deleted", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const first = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay derived-category source one.",
+			});
+			const second = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Pi merge replay derived-category source two.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			// No `category`: the first run derives it from the sources; the
+			// replay identity must not depend on that derivation.
+			const args = {
+				action: "merge",
+				ids: [first.id, second.id],
+				content: "Pi merge replay derived-category canonical.",
+			};
+
+			const merged = await run(tool, args, "pi-replay-merge-derived");
+			expect(merged.content[0]?.text).toContain("Merged memories");
+			expect(merged.content[0]?.text).toContain("in CONSTRAINTS");
+
+			deleteMemory(db, first.id);
+			deleteMemory(db, second.id);
+			expect(getMemoryById(db, first.id)).toBeNull();
+			expect(getMemoryById(db, second.id)).toBeNull();
+
+			const replay = await run(tool, args, "pi-replay-merge-derived");
+			expect(replay.content[0]?.text).toBe(merged.content[0]?.text);
+		} finally {
+			closeQuietly(db);
+		}
 	});
 });

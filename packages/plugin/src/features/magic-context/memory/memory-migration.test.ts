@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDatabase, openDatabase } from "../storage";
+import { getProjectState } from "../storage-project-state";
 import {
     applyMemoryMigration,
     buildMemoryMigrationPrompt,
@@ -15,6 +16,8 @@ import {
     getMemoriesByProject,
     insertMemory,
 } from "./storage-memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "./storage-memory-claims";
+import { recordMemoryMapping } from "./storage-memory-verifications";
 import type { Memory } from "./types";
 
 let prevDataHome: string | undefined;
@@ -44,6 +47,12 @@ function fakeMemory(category: string, content: string): Memory {
         sourceType: "historian",
         status: "active",
     } as Memory;
+}
+
+function openTestDb() {
+    const db = openDatabase();
+    if (!db) throw new Error("openDatabase returned null in test setup");
+    return db;
 }
 
 describe("memory migration (E3.2)", () => {
@@ -108,7 +117,7 @@ describe("memory migration (E3.2)", () => {
 
     describe("applyMemoryMigration", () => {
         it("replaces the project's memories with the re-categorized set", () => {
-            const db = openDatabase();
+            const db = openTestDb();
             const projectPath = "git:testproject";
             // Seed legacy memories.
             insertMemory(db, { projectPath, category: "ARCHITECTURE_DECISIONS", content: "old A" });
@@ -126,6 +135,7 @@ describe("memory migration (E3.2)", () => {
                     { category: "CONSTRAINTS", content: "external limit" },
                 ],
                 userObservations: ["routed elsewhere"],
+                parsed: true,
             });
 
             expect(counts.removed).toBe(3);
@@ -136,7 +146,7 @@ describe("memory migration (E3.2)", () => {
         });
 
         it("does not touch a different project's memories", () => {
-            const db = openDatabase();
+            const db = openTestDb();
             insertMemory(db, {
                 projectPath: "git:other",
                 category: "ARCHITECTURE",
@@ -151,6 +161,7 @@ describe("memory migration (E3.2)", () => {
             applyMemoryMigration(db, "git:target", {
                 memories: [{ category: "ARCHITECTURE", content: "rebuilt" }],
                 userObservations: [],
+                parsed: true,
             });
 
             expect(getMemoriesByProject(db, "git:other")).toHaveLength(1);
@@ -160,7 +171,7 @@ describe("memory migration (E3.2)", () => {
         it("REFUSES to wipe the pool when the result has 0 recognized v2 memories", () => {
             // Root-cause regression (dogfood 2026-05-31): a parsed-but-empty
             // <migrated> result must NOT hard-delete the active pool.
-            const db = openDatabase();
+            const db = openTestDb();
             const projectPath = "git:emptyresult";
             insertMemory(db, {
                 projectPath,
@@ -172,6 +183,7 @@ describe("memory migration (E3.2)", () => {
             const counts = applyMemoryMigration(db, projectPath, {
                 memories: [], // degenerate / truncated model output
                 userObservations: ["something"],
+                parsed: true,
             });
 
             expect(counts).toEqual({ removed: 0, inserted: 0 });
@@ -181,7 +193,7 @@ describe("memory migration (E3.2)", () => {
         it("deletes EXPIRED active memories too (no expired-survivor partial wipe)", () => {
             // Root-cause regression: migration must operate on ALL active rows,
             // not just unexpired ones, or expired actives are stranded.
-            const db = openDatabase();
+            const db = openTestDb();
             const projectPath = "git:expired";
             const past = Date.now() - 86_400_000; // 1 day ago
             insertMemory(db, {
@@ -199,6 +211,7 @@ describe("memory migration (E3.2)", () => {
             const counts = applyMemoryMigration(db, projectPath, {
                 memories: [{ category: "ARCHITECTURE", content: "rebuilt" }],
                 userObservations: [],
+                parsed: true,
             });
 
             // BOTH the expired and unexpired rows were removed (not just unexpired).
@@ -207,11 +220,93 @@ describe("memory migration (E3.2)", () => {
             // No stranded expired row: only the 1 rebuilt memory remains.
             expect(getAllActiveMemoriesForMigration(db, projectPath)).toHaveLength(1);
         });
+
+        it("retires each removed row's claim and creates a claim per replacement, with the epoch bump (U3)", () => {
+            const db = openTestDb();
+            const projectPath = "git:claims-migration";
+            const oldA = insertMemory(db, {
+                projectPath,
+                category: "ARCHITECTURE_DECISIONS",
+                content: "old A",
+            });
+            const oldB = insertMemory(db, {
+                projectPath,
+                category: "KNOWN_ISSUES",
+                content: "old B",
+            });
+            recordMemoryMapping(db, oldA.id, ["src/a.ts"], 1_000);
+            const epochBefore = getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0;
+
+            const counts = applyMemoryMigration(db, projectPath, {
+                memories: [{ category: "ARCHITECTURE", content: "rebuilt fact" }],
+                userObservations: [],
+                parsed: true,
+            });
+            expect(counts).toEqual({ removed: 2, inserted: 1 });
+
+            // Removed rows retain archived claims after their projections are deleted.
+            for (const removed of [oldA, oldB]) {
+                const claim = getCurrentMemoryClaimByLegacyMemoryId(db, removed.id);
+                expect(claim?.state).toBe("archived");
+                expect(claim?.content).toBe(removed.content);
+                const projectionRow = db
+                    .prepare("SELECT 1 AS present FROM memories WHERE id = ?")
+                    .get(removed.id);
+                expect(projectionRow).toBeFalsy();
+            }
+            const mappingRows = db
+                .prepare("SELECT COUNT(*) AS count FROM memory_verifications WHERE memory_id = ?")
+                .get(oldA.id) as { count: number };
+            expect(mappingRows.count).toBe(0);
+
+            const rebuilt = getMemoriesByProject(db, projectPath)[0];
+            const rebuiltClaim = getCurrentMemoryClaimByLegacyMemoryId(db, rebuilt.id);
+            expect(rebuiltClaim?.state).toBe("active");
+            expect(rebuiltClaim?.revision).toBe(1);
+            expect(rebuiltClaim?.content).toBe("rebuilt fact");
+
+            const epochAfter = getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0;
+            expect(epochAfter).toBeGreaterThan(epochBefore);
+        });
+
+        it("shares one claim project generation across the whole delete+reinsert batch", () => {
+            const db = openTestDb();
+            const projectPath = "git:generation-batch";
+            insertMemory(db, {
+                projectPath,
+                category: "ARCHITECTURE_DECISIONS",
+                content: "old A",
+            });
+            insertMemory(db, { projectPath, category: "KNOWN_ISSUES", content: "old B" });
+            const beforeMax = (
+                db.prepare("SELECT COALESCE(MAX(id), 0) AS max FROM claim_change_outbox").get() as {
+                    max: number;
+                }
+            ).max;
+
+            applyMemoryMigration(db, projectPath, {
+                memories: [
+                    { category: "ARCHITECTURE", content: "new A" },
+                    { category: "CONSTRAINTS", content: "new B" },
+                ],
+                userObservations: [],
+                parsed: true,
+            });
+
+            // Every claim operation in the batch (2 deletes + 2 inserts) shares
+            // the generation allocated once for the migration transaction.
+            const generations = db
+                .prepare(
+                    "SELECT DISTINCT generation FROM claim_change_outbox WHERE id > ? ORDER BY generation",
+                )
+                .all(beforeMax) as Array<{ generation: number }>;
+            expect(generations).toHaveLength(1);
+        });
     });
 
     describe("once-per-project guard", () => {
         it("flips done and is idempotent", () => {
-            const db = openDatabase();
+            const db = openTestDb();
             expect(isMemoryMigrationDone(db, "git:x")).toBe(false);
             markMemoryMigrationDone(db, "git:x");
             expect(isMemoryMigrationDone(db, "git:x")).toBe(true);
@@ -225,7 +320,7 @@ describe("memory migration (E3.2)", () => {
 
     describe("runMemoryMigration — fallback escalation", () => {
         it("escalates to a configured fallback model when the primary returns empty output", async () => {
-            const db = openDatabase();
+            const db = openTestDb();
             const dir = process.cwd();
             // resolveProjectIdentity(dir) is the project path; seed one active memory.
             const { resolveProjectIdentity } = await import("./project-identity");
@@ -235,7 +330,6 @@ describe("memory migration (E3.2)", () => {
                 category: "ARCHITECTURE_DECISIONS" as Memory["category"],
                 content: "Old fact in legacy taxonomy.",
                 sourceType: "historian",
-                status: "active",
             });
 
             const validXml =

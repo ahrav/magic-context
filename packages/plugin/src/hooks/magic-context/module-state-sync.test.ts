@@ -5,6 +5,8 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
+import { insertMemory } from "../../features/magic-context/memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "../../features/magic-context/memory/storage-memory-claims";
 import { runMigrations } from "../../features/magic-context/migrations";
 import {
     addProcessedImageStrippedIds,
@@ -714,12 +716,15 @@ describe("module state sync section deltas", () => {
 describe("module state authority direction", () => {
     it("omits module-owned memory sections from the TypeScript sender payload", async () => {
         const db = createContextDb();
-        db.prepare(
-            `INSERT INTO memories
-                (project_path, category, content, normalized_hash, first_seen_at, created_at,
-                 updated_at, last_seen_at, classified_at)
-             VALUES (?, 'CONSTRAINTS', 'module-owned fact', 'hash', 0, 0, 0, 0, 1234)`,
-        ).run("/tmp/project");
+        const projectPath = "git:u6-module-authority";
+        const memory = insertMemory(db, {
+            projectPath,
+            category: "CONSTRAINTS",
+            content: "module-owned fact",
+        });
+        expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(
+            "module-owned fact",
+        );
         const calls: unknown[] = [];
         const state = syncState();
 
@@ -734,7 +739,7 @@ describe("module state authority direction", () => {
             pass: {
                 db,
                 sessionId: "ses-authority-direction",
-                projectPath: "/tmp/project",
+                projectPath,
                 nowMs: 1,
             },
             projectRoot: "/tmp/project",
@@ -949,6 +954,81 @@ describe("module compartment ordinal serialization", () => {
 });
 
 describe("module incremental and paged assembly", () => {
+    it("serializes claim-backed memories with unchanged legacy wire bytes", async () => {
+        const db = createContextDb();
+        const projectPath = "git:u6-module-wire";
+        const memory = insertMemory(db, {
+            projectPath,
+            category: "CONSTRAINTS",
+            content: "module wire bytes: café",
+            sourceSessionId: "ses-u6-module-wire",
+            sourceType: "agent",
+        });
+        expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(memory.content);
+
+        const statements: string[] = [];
+        const originalPrepare = db.prepare.bind(db);
+        db.prepare = ((sql: string) => {
+            statements.push(sql);
+            return originalPrepare(sql);
+        }) as typeof db.prepare;
+        let payload: Awaited<ReturnType<typeof buildModuleStateSyncPayload>>;
+        try {
+            payload = await buildModuleStateSyncPayload({
+                state: syncState(),
+                pass: {
+                    db,
+                    sessionId: "ses-u6-module-wire",
+                    projectPath,
+                    nowMs: Date.now(),
+                },
+                force: true,
+                seedId: "u6-fixed-seed",
+            });
+        } finally {
+            db.prepare = originalPrepare;
+        }
+        if (!payload || typeof payload === "string") throw new Error("expected state-sync payload");
+
+        const serialized = payload.params.memories;
+        const expected = [
+            {
+                id: memory.id,
+                project_path: memory.projectPath,
+                category: memory.category,
+                content: memory.content,
+                normalized_hash: memory.normalizedHash,
+                importance: memory.importance,
+                scope: memory.scope,
+                shareable: memory.shareable,
+                source_session_id: memory.sourceSessionId,
+                source_type: memory.sourceType,
+                seen_count: memory.seenCount,
+                retrieval_count: memory.retrievalCount,
+                first_seen_at: memory.firstSeenAt,
+                created_at: memory.createdAt,
+                updated_at: memory.updatedAt,
+                last_seen_at: memory.lastSeenAt,
+                last_retrieved_at: memory.lastRetrievedAt,
+                status: memory.status,
+                expires_at: memory.expiresAt,
+                verification_status: memory.verificationStatus,
+                verified_at: memory.verifiedAt,
+                superseded_by_memory_id: memory.supersededByMemoryId,
+                merged_from: memory.mergedFrom,
+                metadata_json: memory.metadataJson,
+            },
+        ];
+        expect(serialized).toEqual(expected);
+        expect(Buffer.from(JSON.stringify(serialized))).toEqual(
+            Buffer.from(JSON.stringify(expected)),
+        );
+        expect(statements.some((sql) => /FROM memories\b/i.test(sql))).toBeTrue();
+        expect(
+            statements.some((sql) => /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql)),
+        ).toBeFalse();
+    });
+
     it("packs pages linearly and preserves item order under the wire cap", () => {
         createContextDb();
         const watermarks = {

@@ -10,7 +10,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { runMigrations } from "../../../plugin/src/features/magic-context/migrations";
+import { initializeDatabase } from "../../../plugin/src/features/magic-context/storage-db";
+import { Database } from "../../../plugin/src/shared/sqlite";
 import {
     buildHermeticBinaries,
     detectRustModePrereqs,
@@ -29,6 +32,19 @@ const REPO_ROOT = resolve(import.meta.dir, "../../../..");
 const PLUGIN_DIST_ENTRY = join(REPO_ROOT, "packages/plugin/dist/index.js");
 const PLUGIN_SRC_ENTRY = join(REPO_ROOT, "packages/plugin/src/index.ts");
 const PLUGIN_ENTRY = existsSync(PLUGIN_DIST_ENTRY) ? PLUGIN_DIST_ENTRY : PLUGIN_SRC_ENTRY;
+
+function initializeIsolatedContextDb(dataDir: string): void {
+    const path = join(dataDir, "cortexkit", "magic-context", "context.db");
+    if (existsSync(path)) return;
+    mkdirSync(dirname(path), { recursive: true });
+    const db = new Database(path);
+    try {
+        initializeDatabase(db);
+        runMigrations(db);
+    } finally {
+        db.close();
+    }
+}
 
 export interface IsolatedEnv {
     configDir: string;
@@ -342,6 +358,10 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
     const env = resolvedOpts.existingEnv ?? createIsolatedEnv();
     const port = resolvedOpts.port ?? (await pickFreePort());
 
+    const compaction = resolvedOpts.openCodeConfigExtra?.compaction as
+        | { auto?: unknown }
+        | undefined;
+    if (compaction?.auto !== true) initializeIsolatedContextDb(env.dataDir);
     writeConfigs(env, resolvedOpts.mockProviderURL, resolvedOpts);
 
     // Explicitly strip any inherited OPENCODE_SERVER_PASSWORD from the parent shell —

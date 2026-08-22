@@ -28,6 +28,7 @@ import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
 function isHistorianRequest(body: Record<string, unknown>): boolean {
+    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
     const system = body.system;
     if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
     if (Array.isArray(system)) {
@@ -157,23 +158,11 @@ describe("emergency >=95%", () => {
                 return;
             }
 
-            // Give historian's async fire a moment to land.
-            await h.waitFor(
-                () => {
-                    return (
-                        h.mock.requests().filter((r) => isHistorianRequest(r.body)).length >= 1
-                    );
-                },
-                { timeoutMs: 15_000, label: "at least one historian request" },
-            );
-
-            const historianRequests = h.mock
-                .requests()
-                .filter((r) => isHistorianRequest(r.body));
-            console.log(
-                `[TEST] historian requests captured: ${historianRequests.length}`,
-            );
-            expect(historianRequests.length).toBeGreaterThanOrEqual(1);
+            await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
+                timeoutMs: 30_000,
+                label: "emergency historian compartment",
+            });
+            expect(h.countCompartments(sessionId)).toBeGreaterThanOrEqual(1);
 
             // The shared pressure observation above also proves the plugin saw
             // the high-pressure turn before the follow-up rewrote its usage.

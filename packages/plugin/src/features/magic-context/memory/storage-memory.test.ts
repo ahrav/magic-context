@@ -3,8 +3,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { runMigrations } from "../migrations";
 import { countingDatabase } from "../sql-counters";
 import { initializeDatabase } from "../storage-db";
+import { dropMemoryClaimsCompatObjectsForTests } from "../storage-memory-claims-schema";
 import {
     archiveMemory,
     clearEmbeddingsForProject,
@@ -17,15 +19,23 @@ import {
     getMemoryByHash,
     getMemoryById,
     getMemoryCount,
+    getMemoryVerifications,
     getProjectEmbeddings,
     getStoredModelId,
     insertMemory,
+    insertMemoryIdempotent,
     loadAllEmbeddings,
+    MemoryStatsIntegrityError,
+    mergeMemoryStats,
     readNewMemoriesForM1Union,
+    recordMemoryMapping,
+    recordMemoryVerifications,
     resetEmbeddingCacheForTests,
     saveEmbedding,
     searchMemoriesFTS,
     searchMemoriesFTSUnion,
+    setMemoryClassification,
+    supersededMemory,
     updateMemoryContent,
     updateMemoryRetrievalCount,
     updateMemorySeenCount,
@@ -33,6 +43,11 @@ import {
     updateMemoryVerification,
 } from "./index";
 import { computeNormalizedHash } from "./normalize-hash";
+import { rekeyMemoryRowWithCollisionMerge } from "./relocate-memory";
+import {
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+} from "./storage-memory-claims";
 
 let db: Database;
 
@@ -716,5 +731,488 @@ describe("getMemoriesByRequestedIds", () => {
         const detail = plan.map((row) => row.detail).join(" | ");
         expect(detail).toContain("USING INTEGER PRIMARY KEY");
         expect(detail).not.toContain("SCAN memories");
+    });
+});
+
+// ---------------------------------------------------------------------------
+// U1 characterization: the pre-v84 memory mutation inventory over the REAL
+// migrated v82 schema. These tests lock in the exact current base-row, stats,
+// FTS, embedding, and side-table effects of every legacy semantic writer so
+// the v84 claims kernel (U2-U6) can be proven behavior-preserving. Do not
+// "fix" a surprising assertion here — it is the contract being preserved.
+// ---------------------------------------------------------------------------
+describe("migrated-v82 mutation inventory characterization", () => {
+    let migrated: Database;
+
+    function migratedDb(): Database {
+        const database = new Database(":memory:");
+        database.exec("PRAGMA foreign_keys=ON");
+        initializeDatabase(database);
+        runMigrations(database);
+        return database;
+    }
+
+    function baseRow(database: Database, id: number): Record<string, unknown> | null {
+        return (database.prepare("SELECT * FROM memories WHERE id = ?").get(id) ?? null) as Record<
+            string,
+            unknown
+        > | null;
+    }
+
+    function statsRow(database: Database, id: number): Record<string, unknown> | null {
+        return (database.prepare("SELECT * FROM memory_stats WHERE memory_id = ?").get(id) ??
+            null) as Record<string, unknown> | null;
+    }
+
+    afterEach(() => {
+        if (migrated) closeQuietly(migrated);
+    });
+
+    it("insert: one base row with defaults, one trigger-created stats row, FTS visibility", () => {
+        migrated = migratedDb();
+        const memory = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "CONSTRAINTS",
+            content: "Inserted characterization fact",
+            sourceSessionId: "ses-charter",
+            nowMs: 1_000,
+        });
+
+        expect(baseRow(migrated, memory.id)).toEqual({
+            id: memory.id,
+            project_path: "git:v82-charter",
+            category: "CONSTRAINTS",
+            content: "Inserted characterization fact",
+            normalized_hash: computeNormalizedHash("Inserted characterization fact"),
+            importance: 50,
+            scope: "project",
+            shareable: 0,
+            source_session_id: "ses-charter",
+            source_type: "historian",
+            seen_count: 1,
+            retrieval_count: 0,
+            first_seen_at: 1_000,
+            created_at: 1_000,
+            updated_at: 1_000,
+            last_seen_at: 1_000,
+            last_retrieved_at: null,
+            status: "active",
+            expires_at: null,
+            verification_status: "unverified",
+            verified_at: null,
+            classified_at: null,
+            superseded_by_memory_id: null,
+            merged_from: null,
+            metadata_json: null,
+            mural_cue: null,
+            mural_cue_hash: null,
+            mural_cue_at: null,
+            mural_cue_rejection_count: 0,
+        });
+        expect(statsRow(migrated, memory.id)).toEqual({
+            memory_id: memory.id,
+            seen_count: 1,
+            retrieval_count: 0,
+            last_seen_at: 1_000,
+            last_retrieved_at: null,
+            updated_at: 1_000,
+        });
+        expect(
+            searchMemoriesFTS(migrated, "git:v82-charter", "characterization").map((m) => m.id),
+        ).toEqual([memory.id]);
+    });
+
+    it("duplicate: idempotent re-insert bumps stats seen_count only; direct insert throws UNIQUE", () => {
+        migrated = migratedDb();
+        const first = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "NAMING",
+            content: "Duplicate FACT wording",
+            nowMs: 1_000,
+        });
+        const baseBefore = JSON.stringify(baseRow(migrated, first.id));
+
+        const dup = insertMemoryIdempotent(migrated, {
+            projectPath: "git:v82-charter",
+            category: "NAMING",
+            // Same normalized hash: case and whitespace differences collapse.
+            content: "duplicate   fact WORDING",
+            nowMs: 2_000,
+        });
+
+        expect(dup.inserted).toBeFalse();
+        expect(dup.memory.id).toBe(first.id);
+        expect(dup.memory.seenCount).toBe(2);
+        // The base row is byte-identical: telemetry lives in memory_stats.
+        expect(JSON.stringify(baseRow(migrated, first.id))).toBe(baseBefore);
+        expect(statsRow(migrated, first.id)?.seen_count).toBe(2);
+        expect((statsRow(migrated, first.id)?.last_seen_at as number) > 1_000).toBeTrue();
+
+        expect(() =>
+            insertMemory(migrated, {
+                projectPath: "git:v82-charter",
+                category: "NAMING",
+                content: "duplicate fact wording",
+            }),
+        ).toThrow(/UNIQUE/);
+        expect(getMemoryCount(migrated, "git:v82-charter")).toBe(1);
+    });
+
+    it("update: content rewrite resets shareable/classified_at/mural cue and embedding, keeps verification", () => {
+        migrated = migratedDb();
+        const memory = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "CONFIG_DEFAULTS",
+            content: "cache_ttl=5m",
+            nowMs: 1_000,
+        });
+        saveEmbedding(migrated, memory.id, new Float32Array([0.5, 0.25]), "local:model-a");
+        // Fixture seeding of pre-existing semantic state must hold the v84
+        // claims-write capability; the guards reject bare semantic UPDATEs.
+        runInMemoryClaimsWriteTransaction(migrated, () => {
+            migrated
+                .prepare(
+                    `UPDATE memories SET shareable = 1, classified_at = 111, verification_status = 'verified',
+                        verified_at = 222, mural_cue = 'cue', mural_cue_hash = 'cuehash', mural_cue_at = 333,
+                        mural_cue_rejection_count = 2
+                      WHERE id = ?`,
+                )
+                .run(memory.id);
+        });
+
+        updateMemoryContent(
+            migrated,
+            memory.id,
+            "cache_ttl=10m",
+            computeNormalizedHash("cache_ttl=10m"),
+        );
+
+        const row = baseRow(migrated, memory.id);
+        expect(row?.content).toBe("cache_ttl=10m");
+        expect(row?.normalized_hash).toBe(computeNormalizedHash("cache_ttl=10m"));
+        expect((row?.updated_at as number) > 1_000).toBeTrue();
+        // Classification judgements were made against the OLD content: reset.
+        expect(row?.shareable).toBe(0);
+        expect(row?.classified_at).toBeNull();
+        expect(row?.mural_cue).toBeNull();
+        expect(row?.mural_cue_hash).toBeNull();
+        expect(row?.mural_cue_at).toBeNull();
+        expect(row?.mural_cue_rejection_count).toBe(0);
+        // Verification state is NOT reset by a content update in v82.
+        expect(row?.verification_status).toBe("verified");
+        expect(row?.verified_at).toBe(222);
+        // The stale vector is dropped; stats stay untouched.
+        expect(loadAllEmbeddings(migrated, "git:v82-charter", "local:model-a")).toEqual(new Map());
+        expect(statsRow(migrated, memory.id)?.seen_count).toBe(1);
+        expect(statsRow(migrated, memory.id)?.updated_at).toBe(1_000);
+    });
+
+    it("archive: status-only without a reason, metadata archive_reason merge with one", () => {
+        migrated = migratedDb();
+        const plain = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "KNOWN_ISSUES",
+            content: "archive me plain",
+            nowMs: 1_000,
+        });
+        const reasoned = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "KNOWN_ISSUES",
+            content: "archive me with reason",
+            metadataJson: JSON.stringify({ origin: "fixture" }),
+            nowMs: 1_000,
+        });
+
+        archiveMemory(migrated, plain.id);
+        archiveMemory(migrated, reasoned.id, "  superseded by pipeline  ");
+
+        const plainRow = baseRow(migrated, plain.id);
+        expect(plainRow?.status).toBe("archived");
+        expect(plainRow?.metadata_json).toBeNull();
+        const reasonedRow = baseRow(migrated, reasoned.id);
+        expect(reasonedRow?.status).toBe("archived");
+        // Reason is trimmed and merged into existing metadata keys.
+        expect(JSON.parse(reasonedRow?.metadata_json as string)).toEqual({
+            origin: "fixture",
+            archive_reason: "superseded by pipeline",
+        });
+        // Archiving a missing id is a silent no-op in both shapes.
+        archiveMemory(migrated, 424_242);
+        archiveMemory(migrated, 424_242, "reason");
+    });
+
+    it("status: repeated unkeyed writes on an unadoptable row persist no claim operations; a keyed write does", () => {
+        migrated = migratedDb();
+        const memory = insertMemory(migrated, {
+            projectPath: "/legacy/raw-ephemeral",
+            category: "CONSTRAINTS",
+            content: "raw path fact",
+            nowMs: 1_000,
+        });
+        const operations = () =>
+            (
+                migrated.prepare("SELECT COUNT(*) AS count FROM claim_operations").get() as {
+                    count: number;
+                }
+            ).count;
+        // The unadoptable insert itself is zero-effect, so its random-key
+        // envelope persists no operation row.
+        expect(operations()).toBe(0);
+
+        updateMemoryStatus(migrated, memory.id, "permanent");
+        updateMemoryStatus(migrated, memory.id, "active");
+        expect(operations()).toBe(0);
+
+        // A caller-supplied durable key keeps the replay contract.
+        updateMemoryStatus(migrated, memory.id, "archived", {
+            producer: "storage-memory",
+            operationKey: "status-keyed-1",
+        });
+        expect(operations()).toBe(1);
+    });
+
+    it("delete: removes base row, cascades stats/embeddings/verifications, clears FTS", () => {
+        migrated = migratedDb();
+        const memory = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "ENVIRONMENT",
+            content: "delete cascade target",
+            nowMs: 1_000,
+        });
+        saveEmbedding(migrated, memory.id, new Float32Array([1, 2]), "local:model-a");
+        recordMemoryVerifications(migrated, memory.id, ["src/a.ts"], 2_000);
+
+        deleteMemory(migrated, memory.id);
+
+        expect(baseRow(migrated, memory.id)).toBeNull();
+        expect(statsRow(migrated, memory.id)).toBeNull();
+        expect(loadAllEmbeddings(migrated, "git:v82-charter", "local:model-a")).toEqual(new Map());
+        expect(getMemoryVerifications(migrated, [memory.id]).size).toBe(0);
+        expect(searchMemoriesFTS(migrated, "git:v82-charter", "cascade")).toEqual([]);
+    });
+
+    it("merge: supersededMemory archives with a pointer; mergeMemoryStats SETS counters and is stats-atomic", () => {
+        migrated = migratedDb();
+        const canonical = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "PROJECT_RULES",
+            content: "canonical merged wording",
+            nowMs: 1_000,
+        });
+        const source = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "PROJECT_RULES",
+            content: "source wording",
+            nowMs: 1_000,
+        });
+
+        supersededMemory(migrated, source.id, canonical.id);
+        const sourceRow = baseRow(migrated, source.id);
+        expect(sourceRow?.status).toBe("archived");
+        expect(sourceRow?.superseded_by_memory_id).toBe(canonical.id);
+
+        mergeMemoryStats(migrated, canonical.id, 7, 3, JSON.stringify([source.id]), "permanent");
+        const canonicalRow = baseRow(migrated, canonical.id);
+        expect(canonicalRow?.merged_from).toBe(JSON.stringify([source.id]));
+        expect(canonicalRow?.status).toBe("permanent");
+        // Counters are assigned (the caller pre-computes the merged totals),
+        // and last-seen/retrieved event timestamps stay untouched.
+        expect(statsRow(migrated, canonical.id)).toEqual({
+            memory_id: canonical.id,
+            seen_count: 7,
+            retrieval_count: 3,
+            last_seen_at: 1_000,
+            last_retrieved_at: null,
+            updated_at: statsRow(migrated, canonical.id)?.updated_at,
+        });
+
+        // A base row without a stats row is v80 corruption: the base write
+        // must roll back rather than committing a merged marker alone.
+        migrated.prepare("DELETE FROM memory_stats WHERE memory_id = ?").run(canonical.id);
+        const beforeFailure = JSON.stringify(baseRow(migrated, canonical.id));
+        expect(() => mergeMemoryStats(migrated, canonical.id, 9, 9, "[999]", "active")).toThrow(
+            MemoryStatsIntegrityError,
+        );
+        expect(JSON.stringify(baseRow(migrated, canonical.id))).toBe(beforeFailure);
+    });
+
+    it("mapping vs verification: mapped-only rows keep verified_at=0; verify stamps it; base column is separate", () => {
+        migrated = migratedDb();
+        const memory = insertMemory(migrated, {
+            projectPath: "git:v82-charter",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "mapping target",
+            nowMs: 1_000,
+        });
+
+        // MAP: files known, NOT content-verified (verified_at stays 0).
+        expect(
+            recordMemoryMapping(migrated, memory.id, ["src/b.ts", "src/a.ts", "src/a.ts"], 5_000),
+        ).toBe(2);
+        let state = getMemoryVerifications(migrated, [memory.id]).get(memory.id);
+        expect(state).toEqual({
+            files: ["src/a.ts", "src/b.ts"],
+            hasSentinel: false,
+            verifiedAt: 0,
+            mappedAt: 5_000,
+        });
+
+        // MAP with no real files writes the "" sentinel row.
+        expect(recordMemoryMapping(migrated, memory.id, [], 6_000)).toBe(1);
+        state = getMemoryVerifications(migrated, [memory.id]).get(memory.id);
+        expect(state).toEqual({ files: [], hasSentinel: true, verifiedAt: 0, mappedAt: 6_000 });
+
+        // VERIFY replaces the side-table rows and stamps verified_at.
+        expect(recordMemoryVerifications(migrated, memory.id, ["src/a.ts"], 7_000)).toBe(1);
+        state = getMemoryVerifications(migrated, [memory.id]).get(memory.id);
+        expect(state).toEqual({
+            files: ["src/a.ts"],
+            hasSentinel: false,
+            verifiedAt: 7_000,
+            mappedAt: 7_000,
+        });
+
+        // The base-column status is a separate surface: verified stamps
+        // verified_at; a later non-verified status keeps the old stamp.
+        updateMemoryVerification(migrated, memory.id, "verified");
+        const verifiedAt = baseRow(migrated, memory.id)?.verified_at as number;
+        expect(verifiedAt).toBeGreaterThan(0);
+        updateMemoryVerification(migrated, memory.id, "stale");
+        expect(baseRow(migrated, memory.id)?.verification_status).toBe("stale");
+        expect(baseRow(migrated, memory.id)?.verified_at).toBe(verifiedAt);
+    });
+
+    it("classification builds exact metadata for pre-v84 and v84 no-op/all-field updates", () => {
+        const preV84 = migratedDb();
+        dropMemoryClaimsCompatObjectsForTests(preV84);
+        migrated = migratedDb();
+        try {
+            const legacy = insertMemory(preV84, {
+                projectPath: "git:classification-parity",
+                category: "CONSTRAINTS",
+                content: "legacy classification fact",
+            });
+            const claims = insertMemory(migrated, {
+                projectPath: "git:classification-parity",
+                category: "CONSTRAINTS",
+                content: "claims classification fact",
+            });
+            const v84CountsBefore = {
+                revisions: (
+                    migrated.prepare("SELECT COUNT(*) AS count FROM claim_revisions").get() as {
+                        count: number;
+                    }
+                ).count,
+                outbox: (
+                    migrated.prepare("SELECT COUNT(*) AS count FROM claim_change_outbox").get() as {
+                        count: number;
+                    }
+                ).count,
+            };
+
+            expect(
+                setMemoryClassification(preV84, legacy.id, {
+                    importance: 50,
+                    scope: "project",
+                    shareable: false,
+                }),
+            ).toBeFalse();
+            expect(
+                setMemoryClassification(migrated, claims.id, {
+                    importance: 50,
+                    scope: "project",
+                    shareable: false,
+                }),
+            ).toBeFalse();
+            expect(migrated.prepare("SELECT COUNT(*) AS count FROM claim_revisions").get()).toEqual(
+                { count: v84CountsBefore.revisions },
+            );
+            expect(
+                migrated.prepare("SELECT COUNT(*) AS count FROM claim_change_outbox").get(),
+            ).toEqual({ count: v84CountsBefore.outbox });
+
+            const allFields = {
+                importance: 91,
+                scope: "ecosystem" as const,
+                shareable: true,
+            };
+            expect(setMemoryClassification(preV84, legacy.id, allFields)).toBeTrue();
+            expect(setMemoryClassification(migrated, claims.id, allFields)).toBeTrue();
+            for (const [database, id] of [
+                [preV84, legacy.id],
+                [migrated, claims.id],
+            ] as const) {
+                expect(
+                    database
+                        .prepare("SELECT importance, scope, shareable FROM memories WHERE id = ?")
+                        .get(id),
+                ).toEqual({ importance: 91, scope: "ecosystem", shareable: 1 });
+            }
+            expect(getCurrentMemoryClaimByLegacyMemoryId(migrated, claims.id)).toMatchObject({
+                revision: 2,
+                importance: 91,
+                memoryScope: "ecosystem",
+                shareable: 1,
+            });
+        } finally {
+            closeQuietly(preV84);
+        }
+    });
+
+    it("identity repair: rekey moves project_path in place; a collision merges stats and deletes the source", () => {
+        migrated = migratedDb();
+        const plain = insertMemory(migrated, {
+            projectPath: "/legacy/raw-path",
+            category: "CONSTRAINTS",
+            content: "plain rekey row",
+            nowMs: 1_000,
+        });
+        const source = insertMemory(migrated, {
+            projectPath: "/legacy/raw-path",
+            category: "NAMING",
+            content: "collision wording",
+            nowMs: 1_000,
+        });
+        const target = insertMemory(migrated, {
+            projectPath: "git:canonical",
+            category: "NAMING",
+            content: "Collision   WORDING",
+            nowMs: 1_000,
+        });
+        migrated
+            .prepare("UPDATE memory_stats SET seen_count = 5 WHERE memory_id = ?")
+            .run(source.id);
+        saveEmbedding(migrated, source.id, new Float32Array([9, 9]), "local:model-a");
+
+        migrated.transaction(() => {
+            // Plain rekey: same row id, new identity, everything else intact.
+            expect(
+                rekeyMemoryRowWithCollisionMerge(
+                    migrated,
+                    plain.id,
+                    "/legacy/raw-path",
+                    "git:canonical",
+                ),
+            ).toBeTrue();
+            // Collision merge: target keeps the larger seen_count, adopts the
+            // orphaned embedding, and the source row is deleted.
+            expect(
+                rekeyMemoryRowWithCollisionMerge(
+                    migrated,
+                    source.id,
+                    "/legacy/raw-path",
+                    "git:canonical",
+                ),
+            ).toBeTrue();
+        })();
+
+        const plainRow = baseRow(migrated, plain.id);
+        expect(plainRow?.project_path).toBe("git:canonical");
+        expect(plainRow?.content).toBe("plain rekey row");
+        expect(baseRow(migrated, source.id)).toBeNull();
+        expect(statsRow(migrated, target.id)?.seen_count).toBe(5);
+        const adopted = loadAllEmbeddings(migrated, "git:canonical", "local:model-a");
+        expect(Array.from(adopted.keys())).toEqual([target.id]);
+        expect(getMemoryCount(migrated, "/legacy/raw-path")).toBe(0);
     });
 });

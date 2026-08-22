@@ -1869,29 +1869,6 @@ function parsePiFallbackToolOwnerId(
 	return { timestamp, role: match[2] ?? "" };
 }
 
-function databaseIsInTransaction(db: ContextDatabase): boolean {
-	const state = db as unknown as {
-		inTransaction?: unknown;
-		isTransaction?: unknown;
-	};
-	return state.inTransaction === true || state.isTransaction === true;
-}
-
-function runImmediateTransaction<T>(db: ContextDatabase, fn: () => T): T {
-	if (databaseIsInTransaction(db)) {
-		return db.transaction(fn)();
-	}
-	db.exec("BEGIN IMMEDIATE");
-	try {
-		const result = fn();
-		db.exec("COMMIT");
-		return result;
-	} catch (error) {
-		db.exec("ROLLBACK");
-		throw error;
-	}
-}
-
 interface AdoptPiFallbackTagsOptions {
 	messages?: readonly PiAgentMessage[];
 	resolveStableId?: (msg: unknown, index: number) => string | undefined;
@@ -1946,7 +1923,9 @@ function adoptPiFallbackTags(
 	);
 	if (!shouldRunMessageMigration && !shouldRunToolOwnerMigration) return;
 
-	runImmediateTransaction(db, () => {
+	// db.transaction() uses a savepoint when the caller is already in a
+	// transaction, so no manual BEGIN/COMMIT bookkeeping is needed here.
+	db.transaction(() => {
 		if (shouldRunMessageMigration) {
 			for (const [realMessageId, fingerprint] of fingerprintById) {
 				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
@@ -2047,7 +2026,7 @@ function adoptPiFallbackTags(
 				}
 			}
 		}
-	});
+	}).immediate();
 }
 
 /**
@@ -5385,6 +5364,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// renderCompartmentInjection pair (transform.ts:587-616 + ~960).
 	let injectionResult: PiInjectionResult | null = null;
 	if (args.injection) {
+		if (!piM0State)
+			throw new Error("memory injection requires hard-signal state");
 		try {
 			const tInjection = performance.now();
 			// NOTE: do NOT clear the m[0]/m[1] cache on a cache-busting pass. A new
@@ -5396,7 +5377,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// HARD triggers (model/system/ttl/epoch/upgrade/mutation) still
 			// re-materialize inside mustMaterializePi when genuinely needed.
 			const wireInjectionResult = injectM0M1PiForRun(
-				piM0State!,
+				piM0State,
 				args.db,
 				args.messages as Parameters<typeof injectM0M1Pi>[2],
 				args.entryIds,

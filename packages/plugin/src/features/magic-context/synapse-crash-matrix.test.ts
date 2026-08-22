@@ -7,6 +7,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import type { DetailedEmbedItem, EmbeddingPageReceipt } from "./memory/embedding-provider";
 import { insertMemory } from "./memory/storage-memory";
+import { withClaimsWriteCapabilityInCurrentTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { contentSha256 } from "./project-embedding-registry";
 import { initializeDatabase } from "./storage-db";
@@ -366,9 +367,13 @@ describe("synapse crash matrix (file-backed)", () => {
         const host = new DetailedSynapseTestHost();
         const ready = await embedToReceipts(db, host, memoryItems(memories));
 
-        db.prepare("UPDATE memories SET content = ? WHERE id = ?").run(
-            "edited while embedding",
-            memories[0].id,
+        // Simulates a concurrent claims-kernel writer editing the source
+        // mid-flight; the capability opens the v84 semantic-write guard the
+        // way the kernel would.
+        withClaimsWriteCapabilityInCurrentTransaction(db, () =>
+            db
+                .prepare("UPDATE memories SET content = ? WHERE id = ?")
+                .run("edited while embedding", memories[0].id),
         );
         expect(() => applyMemoryReceipts(db, ready.receipts)).toThrow(SynapseLedgerConflictError);
         expect(memoryVectorIds(db)).toEqual([]);

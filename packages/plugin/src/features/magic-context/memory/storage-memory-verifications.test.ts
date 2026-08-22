@@ -12,6 +12,7 @@ import {
     updateMemoryContent,
     updateMemoryVerification,
 } from "./storage-memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "./storage-memory-claims";
 import {
     clearMemoryVerifications,
     getMemoryVerifications,
@@ -56,8 +57,33 @@ describe("memory verification side-table helpers", () => {
                 .get(memory.id);
             expect(after).toEqual(before);
 
+            const eventsBefore = (
+                db.prepare("SELECT COUNT(*) AS count FROM verification_events").get() as {
+                    count: number;
+                }
+            ).count;
             clearMemoryVerifications(db, memory.id);
-            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(false);
+            // The claims-active clear is a kernel replace to the no-file
+            // sentinel: mapped (known to be backed by no files), not
+            // verified, and no verification event (KTD5 mapped-only rule).
+            const cleared = getMemoryVerifications(db, [memory.id]).get(memory.id);
+            expect(cleared?.files).toEqual([]);
+            expect(cleared?.hasSentinel).toBe(true);
+            expect(cleared?.verifiedAt).toBe(0);
+            expect(
+                (
+                    db.prepare("SELECT COUNT(*) AS count FROM verification_events").get() as {
+                        count: number;
+                    }
+                ).count,
+            ).toBe(eventsBefore);
+            expect(
+                db
+                    .prepare(
+                        "SELECT verification_status, verified_at, updated_at FROM memories WHERE id=?",
+                    )
+                    .get(memory.id),
+            ).toEqual(before);
         } finally {
             closeQuietly(db);
         }
@@ -150,9 +176,103 @@ describe("memory verification side-table helpers", () => {
             expect(state?.hasSentinel).toBe(true);
             expect(state?.verifiedAt).toBe(2000);
 
-            updateMemoryVerification(db, memory.id, "verified", 3000);
+            updateMemoryVerification(db, memory.id, "verified");
             const stillSideTable = getMemoryVerifications(db, [memory.id]).get(memory.id);
             expect(stillSideTable?.verifiedAt).toBe(2000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+function countRows(db: Database, table: string, where = "1=1"): number {
+    return (
+        db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`).get() as {
+            count: number;
+        }
+    ).count;
+}
+
+function claimEventOutcomes(db: Database, memoryId: number): string[] {
+    const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+    if (!claim) return [];
+    return (
+        db
+            .prepare(
+                `SELECT ve.outcome AS outcome FROM verification_events ve
+                   JOIN claim_revisions rev ON rev.id = ve.revision_id
+                  WHERE rev.claim_id = ? ORDER BY ve.id`,
+            )
+            .all(claim.claimId) as Array<{ outcome: string }>
+    ).map((row) => row.outcome);
+}
+
+describe("verification claim effects on a migrated v84 database (KTD5)", () => {
+    test("a mapped-only file snapshot adds NO verification event and no outbox effect", () => {
+        const db = freshDb();
+        try {
+            const memory = insertMemory(db, {
+                projectPath: "git:test",
+                category: "ARCHITECTURE",
+                content: "X lives in src/x.ts.",
+                sourceSessionId: "ses",
+            });
+            const eventsBefore = countRows(db, "verification_events");
+            const outboxBefore = countRows(db, "claim_change_outbox");
+
+            recordMemoryMapping(db, memory.id, ["src/x.ts"], 5000);
+
+            expect(countRows(db, "verification_events")).toBe(eventsBefore);
+            expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore);
+            // The mapping itself is durable in the side table.
+            expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.mappedAt).toBe(5000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a positive verification adds exactly one current-snapshot verified event and one evidence effect", () => {
+        const db = freshDb();
+        try {
+            const memory = insertMemory(db, {
+                projectPath: "git:test",
+                category: "ARCHITECTURE",
+                content: "X lives in src/x.ts.",
+                sourceSessionId: "ses",
+            });
+            const outboxBefore = countRows(db, "claim_change_outbox");
+
+            recordMemoryVerifications(db, memory.id, ["src/x.ts"], 9000);
+
+            expect(claimEventOutcomes(db, memory.id)).toEqual(["verified"]);
+            expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore + 1);
+            expect(
+                countRows(db, "claim_change_outbox", "effect_type = 'evidence'"),
+            ).toBeGreaterThanOrEqual(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("verified, stale, and flagged status changes append one event each; unverified appends none", () => {
+        const db = freshDb();
+        try {
+            const memory = insertMemory(db, {
+                projectPath: "git:test",
+                category: "CONSTRAINTS",
+                content: "Provider rate limit is 10 rps.",
+                sourceSessionId: "ses",
+            });
+            updateMemoryVerification(db, memory.id, "verified");
+            updateMemoryVerification(db, memory.id, "stale");
+            updateMemoryVerification(db, memory.id, "flagged");
+            updateMemoryVerification(db, memory.id, "unverified");
+
+            expect(claimEventOutcomes(db, memory.id)).toEqual(["verified", "stale", "flagged"]);
+            const projection = db
+                .prepare("SELECT verification_status FROM memories WHERE id = ?")
+                .get(memory.id) as { verification_status: string };
+            expect(projection.verification_status).toBe("unverified");
         } finally {
             closeQuietly(db);
         }

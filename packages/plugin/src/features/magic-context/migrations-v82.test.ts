@@ -17,6 +17,7 @@ import {
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
 import { APPEND_ONLY_CLAIMS_TABLES, CLAIMS_AND_EVIDENCE_TABLES } from "./storage-claims-schema";
 import { closeDatabase, initializeDatabase, openDatabase } from "./storage-db";
+import { dropMemoryClaimsCompatObjectsForTests } from "./storage-memory-claims-schema";
 
 function migratedDb(): Database {
     const db = new Database(":memory:");
@@ -26,13 +27,14 @@ function migratedDb(): Database {
     return db;
 }
 
-/** Migration state through v81 with the v82 objects and version row removed. */
+/** Migration state through v81 with the v82+ objects and version rows removed. */
 function v81Database(): Database {
     const db = new Database(":memory:");
     db.exec("PRAGMA foreign_keys=ON");
     initializeDatabase(db);
     runMigrations(db);
     db.exec("DELETE FROM schema_migrations WHERE version >= 82");
+    dropMemoryClaimsCompatObjectsForTests(db);
     dropV82Objects(db);
     return db;
 }

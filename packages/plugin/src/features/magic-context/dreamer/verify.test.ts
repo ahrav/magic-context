@@ -16,6 +16,7 @@ import {
     saveEmbedding,
 } from "../memory";
 import { getMemoryById } from "../memory/storage-memory";
+import { getCurrentMemoryClaimByLegacyMemoryId } from "../memory/storage-memory-claims";
 import {
     getMemoryVerifications,
     recordMemoryVerifications,
@@ -426,6 +427,56 @@ describe("applyVerifyManifest", () => {
         }
     });
 
+    test("an update verdict on a side-table-verified row does not carry the verification onto the new revision", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Old value lives in src/old.ts.",
+                sourceSessionId: "ses",
+            });
+            // Positive side-table verification for the OLD content — the very
+            // claim the update verdict is about to declare wrong.
+            recordMemoryVerifications(db, memory.id, ["src/old.ts"], 1_000);
+
+            const result = await applyVerifyManifest(
+                verifyArgs(db, dir, projectIdentity),
+                [
+                    {
+                        id: memory.id,
+                        category: memory.category,
+                        content: memory.content,
+                        mappedFiles: ["src/old.ts"],
+                    },
+                ],
+                `<verify><update id="${memory.id}" files="src/new.ts">New value lives in src/new.ts.</update></verify>`,
+            );
+            expect(result).toEqual({ verified: 0, updated: 1, archived: 0 });
+
+            const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+            expect(claim?.revision).toBe(2);
+            expect(claim?.content).toBe("New value lives in src/new.ts.");
+            // The rejected content's verification carries onto nothing: the
+            // new current revision has no verified event (revision 1 keeps
+            // the event that verified the OLD content), and the side table is
+            // cleared inside the same transaction.
+            expect(
+                db
+                    .prepare(
+                        `SELECT COUNT(*) AS c FROM verification_events ve
+                          WHERE ve.revision_id = ? AND ve.outcome = 'verified'`,
+                    )
+                    .get(claim?.revisionId),
+            ).toEqual({ c: 0 });
+            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("rejects conflicting terminal verdicts for the same memory id", async () => {
         const db = freshDb();
         try {
@@ -495,6 +546,127 @@ describe("applyVerifyManifest", () => {
             const state = getMemoryVerifications(db, [memory.id]).get(memory.id);
             expect(state?.files).toEqual(["src/old.ts"]);
             expect(state?.verifiedAt).toBe(1_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("verify, update, and archive outcomes commit the matching claim state (U3/KTD5)", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test";
+            const dir = tempProject();
+            const seed = (content: string) =>
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content,
+                    sourceSessionId: "ses",
+                });
+            const verifiedMemory = seed("Verified fact lives in src/old.ts.");
+            const updatedMemory = seed("Old value lives in src/old.ts.");
+            const archivedMemory = seed("Removed thing lived in src/old.ts.");
+            const items = [verifiedMemory, updatedMemory, archivedMemory].map((memory) => ({
+                id: memory.id,
+                category: memory.category,
+                content: memory.content,
+                mappedFiles: ["src/old.ts"],
+            }));
+
+            const result = await applyVerifyManifest(
+                verifyArgs(db, dir, projectIdentity),
+                items,
+                `<verify>` +
+                    `<verified id="${verifiedMemory.id}" files="src/old.ts"/>` +
+                    `<update id="${updatedMemory.id}" files="src/new.ts">New value lives in src/new.ts.</update>` +
+                    `<archive id="${archivedMemory.id}" reason="stale"/>` +
+                    `</verify>`,
+            );
+            expect(result).toEqual({ verified: 1, updated: 1, archived: 1 });
+
+            const eventOutcomes = (memoryId: number): string[] => {
+                const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+                if (!claim) return [];
+                return (
+                    db
+                        .prepare(
+                            `SELECT ve.outcome AS outcome FROM verification_events ve
+                               JOIN claim_revisions rev ON rev.id = ve.revision_id
+                              WHERE rev.claim_id = ? ORDER BY ve.id`,
+                        )
+                        .all(claim.claimId) as Array<{ outcome: string }>
+                ).map((row) => row.outcome);
+            };
+
+            const verifiedClaim = getCurrentMemoryClaimByLegacyMemoryId(db, verifiedMemory.id);
+            expect(verifiedClaim?.state).toBe("active");
+            expect(verifiedClaim?.revision).toBe(1);
+            expect(eventOutcomes(verifiedMemory.id)).toEqual(["verified"]);
+
+            const updatedClaim = getCurrentMemoryClaimByLegacyMemoryId(db, updatedMemory.id);
+            expect(updatedClaim?.revision).toBe(2);
+            expect(updatedClaim?.content).toBe("New value lives in src/new.ts.");
+            expect(eventOutcomes(updatedMemory.id)).toEqual([]);
+
+            const archivedClaim = getCurrentMemoryClaimByLegacyMemoryId(db, archivedMemory.id);
+            expect(archivedClaim?.state).toBe("archived");
+            expect(eventOutcomes(archivedMemory.id)).toEqual(["archive"]);
+            expect(getMemoryById(db, archivedMemory.id)?.status).toBe("archived");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("one manifest transaction shares a single claim generation across items (KTD7)", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:test";
+            const dir = tempProject();
+            const seed = (content: string) =>
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content,
+                    sourceSessionId: "ses",
+                });
+            const verifiedMemory = seed("Verified fact lives in src/old.ts.");
+            const updatedMemory = seed("Old value lives in src/old.ts.");
+            const archivedMemory = seed("Removed thing lived in src/old.ts.");
+            const items = [verifiedMemory, updatedMemory, archivedMemory].map((memory) => ({
+                id: memory.id,
+                category: memory.category,
+                content: memory.content,
+                mappedFiles: ["src/old.ts"],
+            }));
+            const generationBefore = (
+                db
+                    .prepare(
+                        "SELECT COALESCE(MAX(generation), 0) AS generation FROM claim_project_generations",
+                    )
+                    .get() as { generation: number }
+            ).generation;
+
+            const result = await applyVerifyManifest(
+                verifyArgs(db, dir, projectIdentity),
+                items,
+                `<verify>` +
+                    `<verified id="${verifiedMemory.id}" files="src/old.ts"/>` +
+                    `<update id="${updatedMemory.id}" files="src/new.ts">New value lives in src/new.ts.</update>` +
+                    `<archive id="${archivedMemory.id}" reason="stale"/>` +
+                    `</verify>`,
+            );
+            expect(result).toEqual({ verified: 1, updated: 1, archived: 1 });
+
+            // All three items commit inside one lease-guarded transaction, so
+            // the project generation advances by exactly one.
+            const generationAfter = (
+                db
+                    .prepare(
+                        "SELECT COALESCE(MAX(generation), 0) AS generation FROM claim_project_generations",
+                    )
+                    .get() as { generation: number }
+            ).generation;
+            expect(generationAfter).toBe(generationBefore + 1);
         } finally {
             closeQuietly(db);
         }

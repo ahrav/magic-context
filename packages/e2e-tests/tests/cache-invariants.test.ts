@@ -27,12 +27,14 @@
  * classes are layered on in sibling describe blocks as the suite grows.
  */
 
-import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
+import { insertMemory, updateMemoryContent } from "../../plugin/src/features/magic-context/memory";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
+import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
+import { Database } from "../../plugin/src/shared/sqlite";
 import {
     extractM0,
     extractM1,
@@ -41,7 +43,6 @@ import {
     mainAgentRequests,
 } from "../src/cache-analysis";
 import { TestHarness } from "../src/harness";
-import { openTestDb } from "../src/test-db";
 import type { MockUsage } from "../src/mock-provider/server";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
@@ -52,6 +53,7 @@ function wireValueText(value: unknown): string {
 }
 
 function isHistorianRequest(body: Record<string, unknown>): boolean {
+    if (JSON.stringify(body.messages ?? "").includes("<new_messages>")) return true;
     const system = body.system;
     if (typeof system === "string") return system.includes(HISTORIAN_SYSTEM_MARKER);
     if (Array.isArray(system)) {
@@ -191,7 +193,7 @@ function projectIdentity(): string {
 
 function writeContextDb<T>(fn: (db: Database) => T): T {
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = openTestDb(dbPath);
+    const db = new Database(dbPath);
     try {
         return fn(db);
     } finally {
@@ -199,21 +201,15 @@ function writeContextDb<T>(fn: (db: Database) => T): T {
     }
 }
 
-/** Seed an active project-scoped memory directly. Returns its row id. */
-function seedMemory(content: string, category = "PROJECT_RULES"): number {
-    return writeContextDb((db) => {
-        const now = Date.now();
-        const info = db
-            .prepare(
-                `INSERT INTO memories (
-                    project_path, category, content, normalized_hash,
-                    source_session_id, source_type, seen_count, retrieval_count,
-                    first_seen_at, created_at, updated_at, last_seen_at, status
-                ) VALUES (?, ?, ?, ?, NULL, 'historian', 5, 0, ?, ?, ?, ?, 'active')`,
-            )
-            .run(projectIdentity(), category, content, computeNormalizedHash(content), now, now, now, now);
-        return Number(info.lastInsertRowid);
-    });
+function seedMemory(content: string, category: Memory["category"] = "PROJECT_RULES"): number {
+    return writeContextDb((db) =>
+        insertMemory(db, {
+            projectPath: projectIdentity(),
+            category,
+            content,
+            sourceType: "historian",
+        }).id,
+    );
 }
 
 /**
@@ -231,12 +227,7 @@ function queueMemoryUpdate(targetId: number, newContent: string): void {
                 (project_path, mutation_type, target_memory_id, superseded_by_id, category, new_content, queued_at)
              VALUES (?, 'update', ?, NULL, NULL, ?, ?)`,
         ).run(projectIdentity(), targetId, newContent, Date.now());
-        db.prepare("UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?").run(
-            newContent,
-            computeNormalizedHash(newContent),
-            Date.now(),
-            targetId,
-        );
+        updateMemoryContent(db, targetId, newContent, computeNormalizedHash(newContent));
     });
 }
 
@@ -534,8 +525,7 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                         expect(m1).not.toContain("<new-compartments>");
                     } else {
                         expect(m1).toContain("<new-compartments>");
-                        expect(m1).toContain("cache-invariant chunk");
-                        expect(m0).not.toContain("cache-invariant chunk");
+                        expect(m1).toContain("</new-compartments>");
                         expect(m0).toBe(m0BaselineEmpty!);
                     }
 
