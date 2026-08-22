@@ -1167,6 +1167,76 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         ).toEqual({ status: "archived", superseded_by_memory_id: targetId });
     });
 
+    test("superseding onto an unlinked side-table-verified target carries the verification onto the adopted claim", () => {
+        const db = track(migratedDb());
+        const source = createSeedMemory(
+            db,
+            "verified-target-supersede",
+            "old verified-target fact",
+        );
+        // Pre-v84 TypeScript verification: positive verified_at lives only in
+        // memory_verifications; the projection columns stay unverified.
+        let targetId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            targetId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT, "new verified-target fact", "hash:new verified-target fact")
+                    .lastInsertRowid,
+            );
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/target.ts', 123, 100)`,
+            ).run(targetId);
+        });
+        expect(readMemoryClaimLink(db, targetId)).toBeNull();
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("verified-target-supersede-1", { id: source.memoryId }),
+                { memoryId: source.memoryId, supersededByMemoryId: targetId },
+            ),
+        );
+
+        const targetLink = readMemoryClaimLink(db, targetId);
+        expect(targetLink).not.toBeNull();
+        expect(
+            db
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(targetLink?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
+        // One evidence effect per outbox key: the verified carry shares the
+        // target's evidence key with the supersession record.
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${targetId}:evidence' AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'verified-target-supersede-1')`,
+            ),
+        ).toBe(1);
+        expect(
+            db
+                .prepare(
+                    "SELECT expected_effect_count AS count FROM claim_operations WHERE operation_key = 'verified-target-supersede-1'",
+                )
+                .get(),
+        ).toEqual({
+            count: count(
+                db,
+                "claim_change_outbox",
+                "operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'verified-target-supersede-1')",
+            ),
+        });
+    });
+
     test("a cross-project supersession records audit-only merge lineage instead of a conflict", () => {
         const db = track(migratedDb());
         const source = createSeedMemory(db, "xp-source", "cross project source", "git:project-a");
@@ -1752,6 +1822,66 @@ describe("memory/claims kernel: unresolved identity fallback", () => {
             reason_code: "invalid-scope",
             disposition: "blocking",
         });
+    });
+
+    test("a module tombstone on an unlinked unadoptable boundary row retains the projection without committing the envelope, and a redelivery after repair completes it", () => {
+        const db = track(v82DatabaseWithRows(["boundary tombstone fact"]));
+        const memoryId = (db.prepare("SELECT id FROM memories").get() as { id: number }).id;
+        // Schema-legal but claim-invalid: the boundary row stays unadoptable,
+        // so the preimage adoption cannot link it before the tombstone.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET scope = '' WHERE id = ?").run(memoryId);
+        });
+        const env = envelope("module-tombstone-guarded", { id: memoryId });
+        const applyProjection = (): void => {
+            db.prepare("DELETE FROM memories WHERE id = ?").run(memoryId);
+        };
+
+        const retained = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(db, env, {
+                memoryId,
+                applyProjection,
+            }),
+        );
+        // The boundary delete guard aborted only the projection delete: the
+        // row survives with a blocking diagnostic, and the envelope stays
+        // uncommitted so a later delivery of the same feed identity retries.
+        expect(retained.result).toEqual({
+            memoryId,
+            claimId: null,
+            revisionId: null,
+            removed: false,
+        });
+        expect(db.prepare("SELECT 1 FROM memories WHERE id = ?").get(memoryId)).toBeTruthy();
+        expect(
+            db
+                .prepare(
+                    "SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(memoryId)),
+        ).toEqual({ reason_code: "invalid-scope", disposition: "blocking" });
+        expect(count(db, "claim_operations", "operation_key = 'module-tombstone-guarded'")).toBe(0);
+        expect(count(db, "claims")).toBe(0);
+
+        // Doctor-style metadata repair, then the redelivered tombstone adopts
+        // the preimage, passes the guard, and retires the claim normally.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET scope = 'project' WHERE id = ?").run(memoryId);
+        });
+        const completed = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(db, env, {
+                memoryId,
+                applyProjection,
+            }),
+        );
+        expect(completed.result.removed).toBeTrue();
+        expect(completed.result.claimId).not.toBeNull();
+        expect(db.prepare("SELECT 1 FROM memories WHERE id = ?").get(memoryId)).toBeFalsy();
+        expect(count(db, "legacy_memory_claims", `memory_id = ${memoryId}`)).toBe(1);
+        expect(
+            db.prepare("SELECT state FROM claims WHERE id = ?").get(completed.result.claimId),
+        ).toEqual({ state: "archived" });
+        expect(count(db, "claim_operations", "operation_key = 'module-tombstone-guarded'")).toBe(1);
     });
 });
 

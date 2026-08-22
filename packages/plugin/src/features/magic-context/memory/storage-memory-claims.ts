@@ -19,6 +19,7 @@
  */
 
 import { type Database, hasClaimCompatibilityWriteState } from "../../../shared/sqlite.ts";
+import { CLAIMS_BACKFILL_META_KEYS } from "../storage-memory-claims-schema.ts";
 import {
     addClaimConflictInCurrentTransaction,
     addVerificationEvent,
@@ -2105,6 +2106,29 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                         effectType: "evidence" as const,
                     });
                 }
+                if (!targetWasLinked && memoryRowHasPositiveVerification(db, target)) {
+                    // Side-table-only verification never sets the projection
+                    // columns, so the target's first adoption owes one
+                    // verified event for its pre-existing verified state —
+                    // the ordinary-kernel twin of the module delta's target
+                    // carry. The evidence effect dedups against the
+                    // supersession record above: outbox effect keys are
+                    // unique per operation.
+                    addVerificationEvent(db, {
+                        revisionId: readClaimCurrentRevisionId(db, targetLink.claimId),
+                        outcome: "verified",
+                        verifier: envelope.producer,
+                    });
+                    const evidenceKey = `memory:${target.id}:evidence`;
+                    if (!effects.some((effect) => effect.effectKey === evidenceKey)) {
+                        effects.push({
+                            effectKey: evidenceKey,
+                            projectId: targetProjectId,
+                            claimId: targetLink.claimId,
+                            effectType: "evidence" as const,
+                        });
+                    }
+                }
             }
             // A shared canonical claim retires only with its last live link;
             // the superseded projection flips to archived below, so only
@@ -2519,6 +2543,27 @@ function claimSemanticStateDiffers(
 }
 
 /**
+ * Mirror of the memories_claims_boundary_delete_guard predicate (the
+ * delete-side twin of storage-identity-merge's
+ * rekeyTripsBoundaryIdentityGuard): true when deleting this row would abort
+ * because the row is unlinked at or below the recorded claims-backfill
+ * boundary.
+ */
+function unlinkedRowDeleteTripsBoundaryGuard(db: Database, memoryId: number): boolean {
+    return Boolean(
+        db
+            .prepare(
+                `SELECT 1 FROM memories m
+                  WHERE m.id = ?
+                    AND m.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
+                                           WHERE key = '${CLAIMS_BACKFILL_META_KEYS.boundaryMemoryId}'), 0)
+                    AND NOT EXISTS (SELECT 1 FROM legacy_memory_claims WHERE memory_id = m.id)`,
+            )
+            .get(memoryId),
+    );
+}
+
+/**
  * Apply one module changefeed memory delta with its claim-side effects in the
  * caller's privileged mirror-page transaction (R15). The envelope key is the
  * durable feed identity (module project + row id + feed sequence), so an
@@ -2586,7 +2631,50 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
         }
     }
 
-    input.applyProjection();
+    // A projection delete of an unlinked boundary row aborts on the
+    // memories_claims_boundary_delete_guard. When the preimage stayed
+    // unlinked (unadoptable), a module tombstone trips it and the RAISE
+    // would roll back the whole mirror page, pinning the feed cursor on
+    // this delta. The abort is statement-scoped — the page transaction
+    // survives — so the kernel catches exactly that shape, records the
+    // blocking repair diagnostic, and retains the projection row for the
+    // repair lanes. The envelope stays uncommitted: the retained run
+    // performs zero claim mutations, and a committed result would replay
+    // as final — skipping claim retirement even after the repair lanes
+    // link the row and a redelivered delete succeeds. Like the
+    // pending-pair unadoptable path, no claim write happens outside an
+    // envelope, and a later delivery of the same feed identity re-attempts
+    // the tombstone whole.
+    if (pre && !preLink && unlinkedRowDeleteTripsBoundaryGuard(db, pre.id)) {
+        try {
+            input.applyProjection();
+        } catch (error) {
+            if (
+                !(
+                    error instanceof Error &&
+                    error.message.includes("claim crosswalk link before delete")
+                )
+            ) {
+                throw error;
+            }
+            recordMemoryClaimAdoptionFailure(
+                db,
+                pre,
+                resolveMemoryClaimProjectInCurrentTransaction(db, pre.project_path),
+            );
+            return {
+                result: {
+                    memoryId: input.memoryId,
+                    claimId: null,
+                    revisionId: null,
+                    removed: false,
+                },
+                replayed: false,
+            };
+        }
+    } else {
+        input.applyProjection();
+    }
     hitMemoryClaimFailpoint("memory-claim.020.projection.after");
 
     return runMemoryClaimOperationInCurrentTransaction<ModuleMemoryDeltaResult>(
