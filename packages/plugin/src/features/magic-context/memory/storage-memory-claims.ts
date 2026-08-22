@@ -1455,7 +1455,7 @@ function memoryRowHasPositiveVerification(
  * `syncAdoptedClaimLifecycleState`: importing it here would form an import
  * cycle (relocate-memory imports this module).
  */
-function syncClaimLifecycleAfterAdoption(
+export function syncClaimLifecycleAfterAdoption(
     db: Database,
     row: MemoryProjectionRow,
     link: MemoryClaimLink,
@@ -2358,6 +2358,12 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
                 kind: "migration",
             });
+            // The link above can dedup-adopt an archived canonical claim, so
+            // the claim's state re-derives from its live links; the helper
+            // no-ops when the state already matches.
+            const effects: MemoryClaimEffect[] = [
+                ...syncClaimLifecycleAfterAdoption(db, row, link, projectId, envelope.producer),
+            ];
             addVerificationEvent(db, {
                 revisionId: readClaimCurrentRevisionId(db, link.claimId),
                 outcome: "verified",
@@ -2372,16 +2378,15 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
                 input.now,
             );
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
+            effects.push({
+                effectKey: `memory:${row.id}:evidence`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "evidence" as const,
+            });
             return {
                 result: { memoryId: row.id, claimId: link.claimId, rowsWritten },
-                effects: [
-                    {
-                        effectKey: `memory:${row.id}:evidence`,
-                        projectId,
-                        claimId: link.claimId,
-                        effectType: "evidence" as const,
-                    },
-                ],
+                effects,
             };
         },
     );

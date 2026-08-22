@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { log } from "../../shared/logger";
 import type { Database, Statement } from "../../shared/sqlite";
 import { withPrivilegedWriter } from "../../shared/sqlite";
+import { recordAdoptedMemoryVerifiedEventInCurrentTransaction } from "./claims-backfill";
 import { hasMemoryStatsTable, MemoryStatsIntegrityError } from "./memory/storage-memory";
 import {
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
@@ -18,6 +19,7 @@ import {
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    syncClaimLifecycleAfterAdoption,
     translateMemoryClaimRelationshipsInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./memory/storage-memory-claims";
@@ -2220,6 +2222,20 @@ function supersededPointerWriteTripsRelationshipGuard(
  */
 function translatePendingSupersessionClaims(db: Database, statements: MirrorPageStatements): void {
     for (const pair of readTranslatableSupersessionPairs(db)) {
+        // A row cannot supersede itself: a self-referential pair is malformed
+        // module data, and adopting its single endpoint twice would collide
+        // on the pair envelope's upsert effect key and abort the whole page.
+        // Clear the pending row with no pointer write and no claim work so
+        // the malformed reference cannot wedge the cursor.
+        if (pair.sourceId === pair.targetId) {
+            log("mirror: dropping self-referential pending supersession", {
+                moduleProject: pair.moduleProject,
+                moduleRowId: pair.moduleRowId,
+                contextRowId: pair.sourceId,
+            });
+            statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
+            continue;
+        }
         const source = readMemoryProjectionRow(db, pair.sourceId);
         const target = readMemoryProjectionRow(db, pair.targetId);
         if (!source || !target || !source.content.length || !target.content.length) continue;
@@ -2256,6 +2272,37 @@ function translatePendingSupersessionClaims(db: Database, statements: MirrorPage
                         claimId: link.claimId,
                         effectType: "upsert" as const,
                     });
+                    // The link can dedup-adopt an archived canonical claim,
+                    // so the claim's state re-derives from its live links;
+                    // the helper no-ops when the state already matches.
+                    effects.push(
+                        ...syncClaimLifecycleAfterAdoption(
+                            db,
+                            probe.row,
+                            link,
+                            link.projectId,
+                            envelope.producer,
+                        ),
+                    );
+                    // A verified endpoint carries its positive verification
+                    // onto the adopted claim here: the backfill skips linked
+                    // rows, so an eventless adoption would leave verified
+                    // compat state with no claim evidence permanently.
+                    if (
+                        recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+                            db,
+                            probe.row,
+                            link.claimId,
+                            envelope.producer,
+                        )
+                    ) {
+                        effects.push({
+                            effectKey: `memory:${probe.row.id}:evidence`,
+                            projectId: link.projectId,
+                            claimId: link.claimId,
+                            effectType: "evidence" as const,
+                        });
+                    }
                     return link;
                 };
                 const sourceLink = adopt(sourceProbe);

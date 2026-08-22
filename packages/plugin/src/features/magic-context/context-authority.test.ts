@@ -23,6 +23,9 @@ import {
 import { getMemoriesByProjects, insertMemory, isMemoryRow } from "./memory/storage-memory";
 import {
     clearMemoryClaimFailpoints,
+    computeClaimRequestDigest,
+    createMemoryWithClaimsInCurrentTransaction,
+    deleteMemoryWithClaimsInCurrentTransaction,
     readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
     setMemoryClaimFailpoint,
@@ -3666,7 +3669,9 @@ describe("module mirror claims (v84)", () => {
     /** Pre-v84 mirrored corpus shape: two boundary rows (inserted before the
      * migration chain, so they never linked) mapped in mirror_identity with a
      * pending supersession reference between them. */
-    function v82MirroredPendingPairDb(options: { targetScope?: string } = {}): {
+    function v82MirroredPendingPairDb(
+        options: { targetScope?: string; sourceVerified?: boolean } = {},
+    ): {
         database: Database;
         sourceId: number;
         targetId: number;
@@ -3675,11 +3680,18 @@ describe("module mirror claims (v84)", () => {
         initializeDatabase(database);
         const insert = database.prepare(
             `INSERT INTO memories (project_path, category, content, normalized_hash, scope,
-                first_seen_at, created_at, updated_at, last_seen_at)
-             VALUES (?, 'CONSTRAINTS', ?, ?, ?, 1, 1, 1, 1)`,
+                verification_status, verified_at, first_seen_at, created_at, updated_at, last_seen_at)
+             VALUES (?, 'CONSTRAINTS', ?, ?, ?, ?, ?, 1, 1, 1, 1)`,
         );
         const sourceId = Number(
-            insert.run(MODULE_PROJECT, "old boundary fact", "mm-pp-h1", "project").lastInsertRowid,
+            insert.run(
+                MODULE_PROJECT,
+                "old boundary fact",
+                "mm-pp-h1",
+                "project",
+                options.sourceVerified ? "verified" : "unverified",
+                options.sourceVerified ? 5 : null,
+            ).lastInsertRowid,
         );
         const targetId = Number(
             insert.run(
@@ -3687,6 +3699,8 @@ describe("module mirror claims (v84)", () => {
                 "new boundary fact",
                 "mm-pp-h2",
                 options.targetScope ?? "project",
+                "unverified",
+                null,
             ).lastInsertRowid,
         );
         runMigrations(database);
@@ -3810,5 +3824,211 @@ describe("module mirror claims (v84)", () => {
                 .prepare("SELECT COUNT(*) AS c FROM claim_backfill_failures WHERE item_key = ?")
                 .get(String(sourceId)),
         ).toEqual({ c: 0 });
+    });
+
+    test("a pair adoption carries a verified endpoint's verification onto its claim as a verified event", () => {
+        const { database, sourceId, targetId } = v82MirroredPendingPairDb({
+            sourceVerified: true,
+        });
+        applyMirrorPage({
+            db: database,
+            page: page(0, [
+                {
+                    feedSeq: 1,
+                    op: "insert",
+                    moduleRowId: 99,
+                    snapshot: moduleSnapshot(99, "unrelated fact", "mm-pp-h99"),
+                },
+            ]),
+        });
+
+        const sourceLink = readMemoryClaimLink(database, sourceId);
+        const targetLink = readMemoryClaimLink(database, targetId);
+        expect(sourceLink).not.toBeNull();
+        expect(targetLink).not.toBeNull();
+        // The verified source claim carries one verified event; the
+        // unverified target records none — the boundary backfill skips
+        // linked rows, so this envelope is the only carrier.
+        const verifiedEvents = (claimId: number | undefined) =>
+            (
+                database
+                    .prepare(
+                        `SELECT COUNT(*) AS c FROM verification_events ev
+                          JOIN claim_revisions rev ON rev.id = ev.revision_id
+                         WHERE rev.claim_id = ? AND ev.outcome = 'verified'`,
+                    )
+                    .get(claimId ?? -1) as { c: number }
+            ).c;
+        expect(verifiedEvents(sourceLink?.claimId)).toBe(1);
+        expect(verifiedEvents(targetLink?.claimId)).toBe(0);
+        const operation = database
+            .prepare("SELECT id FROM claim_operations WHERE operation_key = ?")
+            .get(`memories:supersede:${sourceId}:${targetId}`) as { id: number } | undefined;
+        const effectKeys = (
+            database
+                .prepare("SELECT effect_key FROM claim_change_outbox WHERE operation_id = ?")
+                .all(operation?.id) as Array<{ effect_key: string }>
+        ).map((row) => row.effect_key);
+        expect(effectKeys).toContain(`memory:${sourceId}:evidence`);
+        expect(effectKeys).not.toContain(`memory:${targetId}:evidence`);
+    });
+
+    test("a pair endpoint that dedup-adopts an archived canonical reactivates the claim with a lifecycle effect", () => {
+        const database = new Database(":memory:");
+        initializeDatabase(database);
+        runMigrations(database);
+        // Archived canonical owning the target's (category, hash): created
+        // and deleted through the kernel before the boundary rows exist.
+        const created = runInMemoryClaimsWriteTransaction(database, () =>
+            createMemoryWithClaimsInCurrentTransaction(
+                database,
+                {
+                    producer: "test",
+                    operationKey: "pair-revive-seed",
+                    requestDigest: computeClaimRequestDigest("pair-revive-seed"),
+                },
+                {
+                    projectPath: MODULE_PROJECT,
+                    category: "CONSTRAINTS",
+                    content: "new boundary fact",
+                    normalizedHash: "mm-pr-h2",
+                    nowMs: 1_000,
+                },
+            ),
+        );
+        runInMemoryClaimsWriteTransaction(database, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                database,
+                {
+                    producer: "test",
+                    operationKey: "pair-revive-delete",
+                    requestDigest: computeClaimRequestDigest("pair-revive-delete"),
+                },
+                { memoryId: created.result.memoryId },
+            ),
+        );
+        const archivedClaimId = created.result.claimId as number;
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(archivedClaimId),
+        ).toEqual({ state: "archived" });
+
+        // Unlinked boundary endpoints; the target shares the archived
+        // canonical's (category, hash).
+        let sourceId = 0;
+        let targetId = 0;
+        runInMemoryClaimsWriteTransaction(database, () => {
+            const insert = database.prepare(
+                `INSERT INTO memories (project_path, category, content, normalized_hash, scope,
+                    first_seen_at, created_at, updated_at, last_seen_at)
+                 VALUES (?, 'CONSTRAINTS', ?, ?, 'project', 1, 1, 1, 1)`,
+            );
+            sourceId = Number(
+                insert.run(MODULE_PROJECT, "old boundary fact", "mm-pr-h1").lastInsertRowid,
+            );
+            targetId = Number(
+                insert.run(MODULE_PROJECT, "new boundary fact", "mm-pr-h2").lastInsertRowid,
+            );
+        });
+        withPrivilegedWriter(database, () => {
+            const identity = database.prepare(
+                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+            );
+            identity.run(MODULE_PROJECT, 11, sourceId);
+            identity.run(MODULE_PROJECT, 12, targetId);
+            database
+                .prepare(
+                    "INSERT INTO mirror_pending_references(domain, module_project, module_row_id, target_module_row_id) VALUES ('memories', ?, 11, 12)",
+                )
+                .run(MODULE_PROJECT);
+        });
+        applyMirrorPage({
+            db: database,
+            page: page(0, [
+                {
+                    feedSeq: 1,
+                    op: "insert",
+                    moduleRowId: 99,
+                    snapshot: moduleSnapshot(99, "unrelated fact", "mm-pr-h99"),
+                },
+            ]),
+        });
+
+        // The active target dedup-adopted the archived canonical: the claim
+        // re-derives to active with a lifecycle effect in the pair envelope.
+        const targetLink = readMemoryClaimLink(database, targetId);
+        expect(targetLink?.claimId).toBe(archivedClaimId);
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(archivedClaimId),
+        ).toEqual({ state: "active" });
+        const operation = database
+            .prepare("SELECT id FROM claim_operations WHERE operation_key = ?")
+            .get(`memories:supersede:${sourceId}:${targetId}`) as { id: number } | undefined;
+        const effectKeys = (
+            database
+                .prepare("SELECT effect_key FROM claim_change_outbox WHERE operation_id = ?")
+                .all(operation?.id) as Array<{ effect_key: string }>
+        ).map((row) => row.effect_key);
+        expect(effectKeys).toContain(`memory:${targetId}:lifecycle`);
+    });
+
+    test("a self-referential pending pair clears without a pointer write or claim work", () => {
+        const database = new Database(":memory:");
+        initializeDatabase(database);
+        const rowId = Number(
+            database
+                .prepare(
+                    `INSERT INTO memories (project_path, category, content, normalized_hash, scope,
+                        first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (?, 'CONSTRAINTS', 'boundary fact', 'mm-sp-h1', 'project', 1, 1, 1, 1)`,
+                )
+                .run(MODULE_PROJECT).lastInsertRowid,
+        );
+        runMigrations(database);
+        withPrivilegedWriter(database, () => {
+            database
+                .prepare(
+                    "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 11, ?)",
+                )
+                .run(MODULE_PROJECT, rowId);
+            // Module row referencing itself: source and target coordinates
+            // collapse onto one context row.
+            database
+                .prepare(
+                    "INSERT INTO mirror_pending_references(domain, module_project, module_row_id, target_module_row_id) VALUES ('memories', ?, 11, 11)",
+                )
+                .run(MODULE_PROJECT);
+        });
+        applyMirrorPage({
+            db: database,
+            page: page(0, [
+                {
+                    feedSeq: 1,
+                    op: "insert",
+                    moduleRowId: 99,
+                    snapshot: moduleSnapshot(99, "unrelated fact", "mm-sp-h99"),
+                },
+            ]),
+        });
+
+        // The malformed pair is dropped, not translated: the page commits,
+        // the pending row clears, no self-pointer and no claim work exist,
+        // and the row stays unlinked boundary work for the backfill.
+        expect(getMirrorCursor(database, "memories")).toBe(1);
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 0 });
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(rowId),
+        ).toEqual({ s: null });
+        expect(
+            database
+                .prepare(
+                    "SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key LIKE 'memories:supersede:%'",
+                )
+                .get(),
+        ).toEqual({ c: 0 });
+        expect(readMemoryClaimLink(database, rowId)).toBeNull();
     });
 });

@@ -1962,6 +1962,53 @@ describe("memory/claims kernel: canonical claim reuse", () => {
         ).toBe(1);
     });
 
+    test("a verified file snapshot adopting an unlinked row onto an archived canonical reactivates the claim", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "verify-revive-seed", "verify revive fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-revive-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+
+        // Adoptable but unlinked row on the archived canonical's (category, hash).
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', 'verify revive fact', 'hash:verify revive fact', 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT).lastInsertRowid,
+            );
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-revive-verify", { id: memoryId }),
+                { memoryId, files: ["src/a.ts"], now: 2_000, verified: true },
+            ),
+        );
+
+        expect(outcome.result.claimId).toBe(seeded.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "active",
+        });
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${memoryId}:lifecycle'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'verify-revive-verify')`,
+            ),
+        ).toBe(1);
+    });
+
     test("an ordinary supersession target that dedup-adopts an archived canonical reactivates the target claim", () => {
         const db = track(migratedDb());
         const source = createSeedMemory(db, "supersede-revive-source", "supersede revive source");
