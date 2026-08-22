@@ -193,6 +193,31 @@ pub(crate) fn job_input_bytes(key: &str, items: &[BatchItem]) -> usize {
     bytes
 }
 
+/// Charges detached from the table but not yet released. Releasing a permit
+/// takes the byte budget's own waiter lock and wakes whoever is queued on it,
+/// so it must happen after the table guard falls — never underneath it, where
+/// it would nest a host-wide lock inside the one that serializes admission,
+/// polling, publication, and shutdown. Dropping a `Job` here also frees its
+/// retained vectors outside the lock, for the same reason `publish_ready`
+/// builds them outside it.
+#[derive(Default)]
+struct Released {
+    jobs: Vec<Job>,
+    charges: Vec<ByteCharge>,
+}
+
+impl Released {
+    fn job(&mut self, job: Option<Job>) {
+        self.jobs.extend(job);
+    }
+
+    fn charge(&mut self, charge: ByteCharge) {
+        if charge.bytes() > 0 {
+            self.charges.push(charge);
+        }
+    }
+}
+
 fn result_bytes(item_count: usize, dimensions: usize, metadata_bytes: usize) -> Option<u64> {
     let vector_bytes = item_count
         .checked_mul(dimensions)?
@@ -259,12 +284,26 @@ impl JobTable {
 
     /// Whether `key` currently names a retained job.
     pub fn key_is_retained(&self, key: &str) -> bool {
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
         let mut jobs = self.inner.lock().expect("job table lock");
-        self.sweep_expired(&mut jobs);
+        self.sweep_expired(&mut jobs, &mut released);
         jobs.by_key.contains_key(key)
     }
 
-    pub fn admit(&self, key: String, items: Vec<BatchItem>, dimensions: usize) -> AdmitOutcome {
+    /// Admission with **no resident charge** — the job owns its key, queued
+    /// item texts, and metadata copies with zero accounting, so nothing is
+    /// ever released for them. Test-only: the host must never call this,
+    /// because an uncharged job is precisely the untracked request-input
+    /// ownership that [`JobTable::admit_charged`] exists to close.
+    #[doc(hidden)]
+    pub fn admit_uncharged_for_tests(
+        &self,
+        key: String,
+        items: Vec<BatchItem>,
+        dimensions: usize,
+    ) -> AdmitOutcome {
         self.admit_charged(key, items, dimensions, &mut ByteCharge::none())
     }
 
@@ -284,11 +323,14 @@ impl JobTable {
         let text_bytes: u64 = items.iter().map(|item| item.text.len() as u64).sum();
         let result_bytes = admitted_result_bytes(&items, dimensions);
         let input_bytes = job_input_bytes(&key, &items);
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
         let mut jobs = self.inner.lock().expect("job table lock");
         if jobs.closed {
             return AdmitOutcome::Closed;
         }
-        self.sweep_expired(&mut jobs);
+        self.sweep_expired(&mut jobs, &mut released);
 
         if let Some(seq) = jobs.by_key.get(&key).copied() {
             let job = jobs.by_seq.get(&seq).expect("keyed job exists");
@@ -370,6 +412,9 @@ impl JobTable {
         // outside the global job-table lock so large inference results do not
         // block admission, polling, or shutdown bookkeeping.
         let vectors: Vec<Arc<[f32]>> = vectors.into_iter().map(Arc::from).collect();
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
         let mut jobs = self.inner.lock().expect("job table lock");
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
@@ -385,6 +430,7 @@ impl JobTable {
                 seq,
                 "artifact_invalid".to_owned(),
                 "inference returned a different item count".to_owned(),
+                &mut released,
             );
             return;
         }
@@ -394,6 +440,7 @@ impl JobTable {
                 seq,
                 "artifact_invalid".to_owned(),
                 "inference returned a different vector dimension".to_owned(),
+                &mut released,
             );
             return;
         }
@@ -409,15 +456,20 @@ impl JobTable {
         job.result_bytes = result_bytes;
         job.completed_at = Some(Instant::now());
         // The queued texts died with the worker's items; only the retained
-        // key and metadata stay charged.
+        // key and metadata stay charged. The freed permits leave the lock
+        // with `released` rather than being handed back underneath it.
         let retained = job.retained_input_bytes();
-        job.charge.shrink_to(retained);
+        let excess = job.charge.split_excess(retained);
+        released.charge(excess);
         jobs.queued_text_bytes -= text_bytes;
         jobs.retained_result_bytes += result_bytes;
-        self.enforce_retention(&mut jobs, Some(seq));
+        self.enforce_retention(&mut jobs, Some(seq), &mut released);
     }
 
     pub fn publish_failed(&self, seq: u64, code: String, message: String) {
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
         // `AbandonGuard::drop` calls this, possibly while unwinding from a
         // panic raised under this same mutex further down the stack. An
         // `.expect()` on the poisoned lock would panic inside a `Drop`
@@ -428,14 +480,21 @@ impl JobTable {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.fail_job(&mut jobs, seq, code, message);
+        self.fail_job(&mut jobs, seq, code, message, &mut released);
     }
 
     /// Terminal-failure bookkeeping shared by every failure path: queued
     /// text is released, the retention clock starts, and eviction runs.
     /// Idempotent on an already-completed job so a late abandonment guard
     /// cannot clobber a published result or its byte accounting.
-    fn fail_job(&self, jobs: &mut Jobs, seq: u64, code: String, message: String) {
+    fn fail_job(
+        &self,
+        jobs: &mut Jobs,
+        seq: u64,
+        code: String,
+        message: String,
+        released: &mut Released,
+    ) {
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
@@ -449,14 +508,18 @@ impl JobTable {
         // Queued items (if the worker never started) and worker-owned texts
         // are both dead at this transition.
         let retained = job.retained_input_bytes();
-        job.charge.shrink_to(retained);
+        let excess = job.charge.split_excess(retained);
+        released.charge(excess);
         jobs.queued_text_bytes -= text_bytes;
-        self.enforce_retention(jobs, Some(seq));
+        self.enforce_retention(jobs, Some(seq), released);
     }
 
     pub fn poll(&self, job_id: &str, key: &str, cursor: Option<&str>) -> PollOutcome {
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
         let mut jobs = self.inner.lock().expect("job table lock");
-        self.sweep_expired(&mut jobs);
+        self.sweep_expired(&mut jobs, &mut released);
         let Some(seq) = self.parse_job_id(job_id) else {
             return PollOutcome::Restarted;
         };
@@ -573,18 +636,22 @@ impl JobTable {
         boundaries
     }
 
-    /// Releases every expired retained job and its charge. Runs before the
-    /// parse reservation in the request path: every other sweep site
-    /// (admission, poll, key lookup) sits after the reservation, so without
-    /// this pass charges past their retention period could hold the ingress
-    /// pool below the minimum reservation and make every request fail
-    /// `queue_full` — including the ones that would have swept.
+    /// Releases every expired retained job and its charge. The request path
+    /// calls this when a resident reservation fails: every other sweep site
+    /// (admission, poll, key lookup) sits after the reservation and is
+    /// unreachable once the pool is exhausted, so without a pass here a
+    /// charge already past its retention period could hold the pool below
+    /// the minimum reservation and fail every request `queue_full` —
+    /// including the ones that would have swept it.
     pub fn sweep(&self) {
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
         let mut jobs = self.inner.lock().expect("job table lock");
-        self.sweep_expired(&mut jobs);
+        self.sweep_expired(&mut jobs, &mut released);
     }
 
-    fn sweep_expired(&self, jobs: &mut Jobs) {
+    fn sweep_expired(&self, jobs: &mut Jobs, released: &mut Released) {
         let now = Instant::now();
         let expired: Vec<u64> = jobs
             .by_seq
@@ -596,14 +663,14 @@ impl JobTable {
             .map(|job| job.seq)
             .collect();
         for seq in expired {
-            Self::remove(jobs, seq);
+            released.job(Self::remove(jobs, seq));
         }
     }
 
     /// Evicts oldest-completed jobs until the just-published job fits the
     /// retained count and byte caps. The publishing job itself is exempt
     /// until something newer displaces it.
-    fn enforce_retention(&self, jobs: &mut Jobs, keep: Option<u64>) {
+    fn enforce_retention(&self, jobs: &mut Jobs, keep: Option<u64>, released: &mut Released) {
         loop {
             let retained = jobs
                 .by_seq
@@ -625,26 +692,30 @@ impl JobTable {
                 // Only the protected job remains; drop the protection so an
                 // oversized single result cannot pin the caps forever.
                 let Some(seq) = keep else { return };
-                Self::remove(jobs, seq);
+                released.job(Self::remove(jobs, seq));
                 return;
             };
-            Self::remove(jobs, seq);
+            released.job(Self::remove(jobs, seq));
         }
     }
 
-    fn remove(jobs: &mut Jobs, seq: u64) {
-        let Some(job) = jobs.by_seq.remove(&seq) else {
-            return;
-        };
+    fn remove(jobs: &mut Jobs, seq: u64) -> Option<Job> {
+        let job = jobs.by_seq.remove(&seq)?;
         jobs.queued_text_bytes -= job.text_bytes;
         jobs.retained_result_bytes -= job.result_bytes;
         jobs.by_key.remove(&job.key);
+        Some(job)
     }
 
     /// Shutdown: closes admission and drops every queued (not yet started)
     /// job. Running jobs finish under the incarnation tracker; completed
     /// retention is released by [`JobTable::clear`] afterwards.
     pub fn close_admission(&self) {
+        // Declared before the guard so it drops after it: shutdown can drop
+        // a full table of charged jobs, and every one of those releases
+        // would otherwise take the byte budget's waiter lock while this
+        // lock is held.
+        let mut released = Released::default();
         let mut jobs = self.inner.lock().expect("job table lock");
         jobs.closed = true;
         let queued: Vec<u64> = jobs
@@ -654,13 +725,19 @@ impl JobTable {
             .map(|job| job.seq)
             .collect();
         for seq in queued {
-            Self::remove(&mut jobs, seq);
+            released.job(Self::remove(&mut jobs, seq));
         }
     }
 
     pub fn clear(&self) {
+        // Declared before the guard so it drops after it: the drained jobs
+        // carry both their charges and their retained vectors, and freeing
+        // either under the table lock is what this ordering avoids.
+        let mut released = Released::default();
         let mut jobs = self.inner.lock().expect("job table lock");
-        jobs.by_seq.clear();
+        released
+            .jobs
+            .extend(jobs.by_seq.drain().map(|(_, job)| job));
         jobs.by_key.clear();
         jobs.queued_text_bytes = 0;
         jobs.retained_result_bytes = 0;
@@ -888,7 +965,7 @@ mod tests {
             text: "alpha".to_owned(),
         }];
         let AdmitOutcome::Admitted { job_id, seq } =
-            jobs.admit("key".to_owned(), batch, 256 * 1024)
+            jobs.admit_uncharged_for_tests("key".to_owned(), batch, 256 * 1024)
         else {
             panic!("job is admitted");
         };
@@ -931,7 +1008,7 @@ mod tests {
         };
 
         let AdmitOutcome::Admitted { job_id, seq } =
-            jobs.admit("exact".to_owned(), item("a"), dimensions)
+            jobs.admit_uncharged_for_tests("exact".to_owned(), item("a"), dimensions)
         else {
             panic!("exact result is admitted");
         };
@@ -943,7 +1020,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            jobs.admit("oversize".to_owned(), item("ab"), dimensions),
+            jobs.admit_uncharged_for_tests("oversize".to_owned(), item("ab"), dimensions),
             AdmitOutcome::ResultTooLarge
         ));
         assert!(!jobs.key_is_retained("oversize"));

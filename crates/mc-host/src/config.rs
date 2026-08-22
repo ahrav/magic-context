@@ -10,14 +10,40 @@ use std::time::Duration;
 
 use crate::wire::MAX_BODY_LEN;
 
-/// One maximum inbound body and one maximum encoded outbound frame must coexist:
-/// a handler can stream before releasing its request body.
-pub const MIN_RESIDENT_BYTES: u64 = (MAX_BODY_LEN as u64 * 2) + subc_protocol::HEADER_LEN as u64;
+/// One maximum inbound body, one maximum encoded outbound frame, and one
+/// maximum request-scratch reservation must coexist: a handler can stream
+/// before releasing its request body, and it can hold request-derived inputs
+/// while other connections are still admitting frames. Stated as the sum of
+/// the three pools so the admission pool is exactly one maximum body at the
+/// floor.
+pub const MIN_RESIDENT_BYTES: u64 =
+    MAX_BODY_LEN as u64 + EGRESS_RESERVED_BYTES + SCRATCH_RESERVED_BYTES;
 
 /// Capacity reserved exclusively for encoded output, preventing an admitted
 /// request from consuming the permits its own terminal needs.
 pub(crate) const EGRESS_RESERVED_BYTES: u64 =
     MAX_BODY_LEN as u64 + subc_protocol::HEADER_LEN as u64;
+
+/// Capacity reserved exclusively for request scratch and request-derived
+/// ownership: parser transients, query text held by a worker, queued batch
+/// items, retained job key and item metadata, and the id/hash copies a
+/// result page holds while its response encodes.
+///
+/// Separate from the ingress pool because these holders and frame admission
+/// have incompatible lifetimes and failure modes. Frame admission is the
+/// only *blocking* consumer — `read_frame` waits on it bounded by the frame
+/// deadline, and losing that race retires the generation with no error frame
+/// — while a retained job charge can live for the whole retention window.
+/// Sharing one pool let a 15-minute holder time out a blameless connection's
+/// frame read. Reserving separately keeps the limit classes independent, so
+/// exhausting request scratch can only ever produce a typed rejection on the
+/// request that asked for it.
+///
+/// Sized for a component whose own body cap is half the frame limit holding
+/// a three-times-body scratch peak, plus per-item and envelope headroom.
+/// `synapse::protocol` pins its worst-case reservation against this constant
+/// in a unit test, so the two cannot drift apart.
+pub(crate) const SCRATCH_RESERVED_BYTES: u64 = (MAX_BODY_LEN as u64 * 3 / 2) + (64 * 1024);
 
 /// Upper bound for every configured deadline and period. `Instant + Duration`
 /// panics on overflow, so unbounded values such as `Duration::MAX` must be
@@ -47,8 +73,15 @@ pub struct HostLimits {
     /// bodies, parser scratch, request-derived input ownership (Synapse
     /// query text, queued batch items, retained job metadata), encoded
     /// frames, and writer queues. An accounting cap over named logical
-    /// payloads, not an exact process-RSS claim. Must be at least
-    /// [`MIN_RESIDENT_BYTES`].
+    /// payloads, not an exact process-RSS claim.
+    ///
+    /// Split into three independent pools: [`EGRESS_RESERVED_BYTES`] for
+    /// encoded output, [`SCRATCH_RESERVED_BYTES`] for request scratch and
+    /// request-derived ownership, and the remainder (less the resident
+    /// catalog) for inbound frame admission. Raising this raises only the
+    /// admission pool, so a deployment that needs larger request scratch
+    /// than the reserved slice must be served by a component whose own
+    /// limits fit it. Must be at least [`MIN_RESIDENT_BYTES`].
     pub max_resident_bytes: u64,
     /// Encoded frames queued per connection writer.
     pub writer_queue_frames: usize,
@@ -381,6 +414,44 @@ mod tests {
         assert_eq!(
             limits.validate(),
             Err(ConfigError::ZeroLimit { name: "max_routes" })
+        );
+    }
+
+    /// `max_resident_bytes` splits into three pools that never draw on each
+    /// other. Frame admission is the only blocking consumer, so a request
+    /// scratch or retained-input holder must never be able to reduce it —
+    /// that is what "all limits are independent gates" means here, and the
+    /// floor exists to keep the admission pool at one maximum body even when
+    /// the other two are fully reserved.
+    #[test]
+    fn the_resident_cap_splits_into_three_non_overlapping_pools() {
+        let frame = MAX_BODY_LEN as u64;
+        assert_eq!(
+            MIN_RESIDENT_BYTES,
+            frame + EGRESS_RESERVED_BYTES + SCRATCH_RESERVED_BYTES,
+            "the floor must be exactly the sum of the three pools"
+        );
+        // At the floor the admission pool is exactly one maximum body: the
+        // interop guarantee survives carving the scratch slice out.
+        let admission_at_floor =
+            MIN_RESIDENT_BYTES - EGRESS_RESERVED_BYTES - SCRATCH_RESERVED_BYTES;
+        assert_eq!(admission_at_floor, frame);
+        // Raising the cap grows only the admission pool; the reserved slices
+        // are fixed, so the largest servable request never varies with
+        // deployment tuning.
+        let defaults = HostLimits::default();
+        assert!(defaults.max_resident_bytes >= MIN_RESIDENT_BYTES);
+        let admission_at_default =
+            defaults.max_resident_bytes - EGRESS_RESERVED_BYTES - SCRATCH_RESERVED_BYTES;
+        assert!(
+            admission_at_default > frame,
+            "the default must leave admission headroom above the floor"
+        );
+        // The catalog is subtracted from admission only (runtime.rs), so it
+        // can never eat the scratch or egress guarantees.
+        assert!(
+            admission_at_default - frame > 0,
+            "catalog headroom comes out of admission, not the reserved slices"
         );
     }
 

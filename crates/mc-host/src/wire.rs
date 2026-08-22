@@ -33,13 +33,27 @@ pub const MAX_CONTROL_BODY_LEN: u32 = 65_536;
 #[derive(Clone)]
 pub struct ByteBudget {
     semaphore: Arc<Semaphore>,
+    /// Permits the budget was created with. Retained because the semaphore
+    /// reports only what is currently available, and distinguishing "cannot
+    /// be satisfied right now" from "can never be satisfied" needs the
+    /// ceiling: the second case is a permanent rejection, not backpressure.
+    capacity: usize,
 }
 
 impl ByteBudget {
     pub fn new(max_bytes: u64) -> Self {
+        let capacity = max_bytes as usize;
         Self {
-            semaphore: Arc::new(Semaphore::new(max_bytes as usize)),
+            semaphore: Arc::new(Semaphore::new(capacity)),
+            capacity,
         }
+    }
+
+    /// The ceiling an acquisition is measured against. A request for more
+    /// than this can never succeed no matter how much traffic drains, so
+    /// callers must report it as permanent rather than retryable.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Waits for `bytes` of budget. Callers must bound the wait (deadline or
@@ -124,10 +138,21 @@ impl ByteCharge {
     /// budget immediately. A request to grow (bytes above the held count)
     /// is a no-op — a charge can never be inflated after acquisition.
     pub(crate) fn shrink_to(&mut self, bytes: usize) {
+        drop(self.split_excess(bytes));
+    }
+
+    /// Monotonic shrink that hands the released permits back instead of
+    /// dropping them, so a caller holding a lock can defer the release
+    /// until after the guard falls. Releasing a permit takes the budget's
+    /// own waiter lock and wakes queued waiters, which must not happen
+    /// underneath an unrelated mutex.
+    pub(crate) fn split_excess(&mut self, bytes: usize) -> ByteCharge {
         let excess = self.bytes().saturating_sub(bytes);
-        if excess > 0 {
-            drop(self.split(excess));
+        if excess == 0 {
+            return ByteCharge::none();
         }
+        // `excess` is at most the held count, so the split cannot fail.
+        self.split(excess).unwrap_or_else(ByteCharge::none)
     }
 }
 
@@ -868,6 +893,30 @@ mod tests {
             next,
             ReadEvent::Frame(InboundFrame { header, .. }) if header.ty == FrameType::Goodbye
         ));
+    }
+
+    #[test]
+    fn capacity_separates_permanent_from_transient_exhaustion() {
+        let budget = ByteBudget::new(100);
+        assert_eq!(budget.capacity(), 100);
+        // Above the ceiling: no drain can ever satisfy it, so a caller must
+        // report this permanently rather than as retryable backpressure.
+        assert!(budget.try_charge(101).is_none());
+        assert_eq!(
+            budget.available(),
+            budget.capacity(),
+            "a request above the ceiling consumes nothing"
+        );
+        // Within the ceiling but currently held: the same `None`, and only
+        // `capacity` distinguishes it from the permanent case.
+        let held = budget.try_charge(80).expect("fits");
+        assert!(budget.try_charge(40).is_none());
+        assert!(
+            40 <= budget.capacity(),
+            "this request is transiently blocked, not impossible"
+        );
+        drop(held);
+        assert!(budget.try_charge(40).is_some(), "capacity reopened");
     }
 
     #[test]

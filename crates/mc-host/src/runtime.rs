@@ -96,7 +96,12 @@ pub struct HostShared<H> {
     pub targets: crate::control::TargetIndex,
     pub catalog: crate::control::CatalogCache,
     pub registry: RouteRegistry,
+    /// Admits inbound frame bodies. The only budget with a blocking
+    /// consumer, so nothing whose lifetime outlives a request may draw on it.
     pub ingress_budget: ByteBudget,
+    /// Funds request scratch and request-derived ownership, whose holders can
+    /// outlive the request that created them.
+    pub scratch_budget: ByteBudget,
     pub egress_budget: ByteBudget,
     pub pending_permits: Arc<Semaphore>,
     pub task_permits: Arc<Semaphore>,
@@ -674,8 +679,10 @@ pub async fn run<H: McHostHandler>(
         ingress_budget: ByteBudget::new(
             config.limits.max_resident_bytes
                 - crate::config::EGRESS_RESERVED_BYTES
+                - crate::config::SCRATCH_RESERVED_BYTES
                 - catalog_resident,
         ),
+        scratch_budget: ByteBudget::new(crate::config::SCRATCH_RESERVED_BYTES),
         egress_budget: ByteBudget::new(crate::config::EGRESS_RESERVED_BYTES),
         pending_permits: Arc::new(Semaphore::new(config.limits.max_pending_requests)),
         task_permits: Arc::new(Semaphore::new(config.limits.max_handler_tasks)),

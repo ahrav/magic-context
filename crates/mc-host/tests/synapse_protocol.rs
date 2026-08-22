@@ -840,14 +840,15 @@ fn an_unknown_top_level_field_is_rejected_without_reading_its_value() {
         "the payload must stay under the body cap so the schema is the rejecting rule"
     );
 
-    let error = protocol::parse_request(&body, false, &lane, &limits)
+    let error = protocol::parse_request_unreserved(&body, false, &lane, &limits)
         .expect_err("a field outside the request envelope is refused");
     assert_eq!(error.code, "schema_violation");
 
     // The identical request without that field still parses, so the rejection
     // is the unknown field and not the request shape.
-    let accepted = protocol::parse_request(br#"{"method":"models.list"}"#, false, &lane, &limits)
-        .expect("the envelope without out-of-schema fields is accepted");
+    let accepted =
+        protocol::parse_request_unreserved(br#"{"method":"models.list"}"#, false, &lane, &limits)
+            .expect("the envelope without out-of-schema fields is accepted");
     assert_eq!(accepted, protocol::Request::ModelsList);
 }
 
@@ -897,11 +898,13 @@ async fn a_routed_depth_nine_request_is_a_schema_violation() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// A protocol-valid request whose parse reservation exceeds the resident
-/// budget returns `queue_full`, makes no engine call or job, and leaves
-/// capacity for later requests.
+/// A protocol-valid request whose body plus parse reservation exceeds the
+/// host's whole resident capacity can never be served at this configuration,
+/// so it is refused as a permanent size violation rather than the retryable
+/// `queue_full` a client would resubmit forever. No engine call, no job, and
+/// capacity is untouched for later requests.
 #[tokio::test]
-async fn resident_exhaustion_is_queue_full_with_no_state_and_capacity_reopens() {
+async fn a_body_above_resident_capacity_is_a_permanent_size_violation() {
     let engine = DeterministicEngine::new();
     let limits = SynapseLimits {
         // Make a ~30 MiB query protocol-valid so the resident reservation is
@@ -922,7 +925,17 @@ async fn resident_exhaustion_is_queue_full_with_no_state_and_capacity_reopens() 
     let mut params = constraints(&lane);
     params["text"] = "x".repeat(30 * 1024 * 1024).into();
     let frame = call(&mut client, channel, epoch, "embed.query", params).await;
-    assert_eq!(frame.error_code(), "queue_full");
+    // Permanent, not retryable: draining traffic can never free enough,
+    // because the requirement is above the pool's ceiling, not its level.
+    assert_eq!(frame.error_code(), "schema_violation");
+    let message = frame.json()["message"]
+        .as_str()
+        .expect("error message")
+        .to_owned();
+    assert!(
+        message.contains("resident bytes") && message.contains("resident capacity"),
+        "the rejection must name what it needed and the ceiling it exceeded: {message}"
+    );
     assert_eq!(
         engine.calls.load(std::sync::atomic::Ordering::SeqCst),
         0,

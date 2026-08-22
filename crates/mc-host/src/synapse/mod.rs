@@ -319,9 +319,15 @@ struct AbandonGuard {
 impl Drop for AbandonGuard {
     fn drop(&mut self) {
         if self.armed {
+            // A worker that exits without publishing is a host task
+            // failure, not a lane fault: the bundle is fine and every other
+            // job on this lane still works. `artifact_invalid` would be read
+            // as a permanent lane fault and take the whole component down
+            // with it, so this stays the host-generic task-failure code
+            // (protocol §7.4) that leaves the lane serving.
             self.inner.jobs.publish_failed(
                 self.seq,
-                "artifact_invalid".to_owned(),
+                "internal_error".to_owned(),
                 "batch worker exited before publication".to_owned(),
             );
         }
@@ -330,12 +336,12 @@ impl Drop for AbandonGuard {
 
 const RESPONSE_SCRATCH_BYTES: usize = 256;
 
-/// Shrinks the parse charge to the post-decode owned size and verifies the
+/// Shrinks a resident charge to the size actually owned and verifies the
 /// reservation dominated it. `ByteCharge::shrink_to` cannot grow a charge
 /// and `split_or_take` falls back to "take what is left" rather than
 /// erroring, so proceeding with a short charge would silently under-charge
-/// the job — the bug class the resident budget exists to close. After
-/// `shrink_to(owned)` the charge holds `min(reservation, owned)`, so holding
+/// the request — the bug class the resident budget exists to close. After
+/// `shrink_to(owned)` the charge holds `min(reserved, owned)`, so holding
 /// fewer than `owned` bytes proves the reservation formula no longer
 /// dominates real usage: loud in debug builds, a `queue_full` rejection
 /// (no state created) in release builds.
@@ -356,6 +362,36 @@ fn shrink_covered(
         ));
     }
     Ok(())
+}
+
+/// Post-decode resident bytes the handler still owns for one decoded
+/// request: the strings moved out of the borrowed parse, plus the scratch a
+/// response body needs while the charge is held. This is the single source
+/// for both the runtime coverage gate in `handle` and the
+/// reservation-dominance test, so a term added here is covered by both at
+/// once and the two can never drift apart.
+pub(crate) fn owned_input_bytes(request: &Request) -> usize {
+    let owned = match request {
+        // Answered from lane info; the charge is released before responding.
+        Request::ModelsList => 0,
+        Request::EmbedQuery { text, .. } => text.capacity(),
+        Request::EmbedBatch {
+            request_key,
+            canonical_key,
+            items,
+        } => jobs::job_input_bytes(request_key, items)
+            .saturating_add(request_key.capacity())
+            .saturating_add(canonical_key.capacity()),
+        Request::EmbedResult {
+            job_id,
+            request_key,
+            cursor,
+        } => job_id
+            .capacity()
+            .saturating_add(request_key.capacity())
+            .saturating_add(cursor.as_ref().map_or(0, String::capacity)),
+    };
+    owned.saturating_add(RESPONSE_SCRATCH_BYTES)
 }
 
 fn request_error(error: RequestError) -> RequestOutcome {
@@ -689,14 +725,18 @@ impl SynapseComponent {
             PollOutcome::Page(page) => {
                 // Ids are validated to MAX_ITEM_ID_BYTES, hashes are fixed
                 // 64-hex, and a page holds at most max_page_vectors items,
-                // so the bound covers the clones by construction.
+                // so the bound covers the clones by construction. Checked at
+                // runtime through the same gate as the parse reservation: a
+                // bound that stops dominating must reject, not silently
+                // under-charge, in release builds too.
                 let meta_bytes: usize = page
                     .vectors
                     .iter()
                     .map(|(id, hash, _)| id.len() + hash.len())
                     .sum();
-                debug_assert!(meta_bytes <= page_meta_bound);
-                meta_charge.shrink_to(meta_bytes);
+                if let Err(outcome) = shrink_covered(&mut meta_charge, meta_bytes) {
+                    return outcome;
+                }
                 let items: Vec<protocol::VectorItemView<'_>> = page
                     .vectors
                     .iter()
@@ -753,12 +793,33 @@ impl CompositeComponent for SynapseComponent {
         else {
             return app_error("queue_full", "the parse reservation bound is unsatisfiable");
         };
-        // Expired retained charges are released before reserving so they
-        // can never wedge the pool: every other sweep site runs after the
-        // reservation and is unreachable once the pool is exhausted.
-        self.inner.jobs.sweep();
-        // The handler reserves resident capacity before decoding.
-        let Some(mut charge) = ctx.try_reserve_resident(reservation_bytes) else {
+        // The body's own charge stays held for the whole handler run, so the
+        // pool must cover it and the reservation at once. When that total is
+        // above the ceiling no amount of draining can ever admit this body,
+        // and reporting the permanent condition as `queue_full` would have
+        // clients retry it forever — so it is a size rejection instead.
+        let required = reservation_bytes.saturating_add(ctx.body.len());
+        let capacity = ctx.resident_capacity();
+        if required > capacity {
+            return request_error(protocol::unservable_body_error(
+                ctx.body.len(),
+                required,
+                capacity,
+            ));
+        }
+        // Reserve first, sweep only if that fails. Expired retained charges
+        // must never be able to wedge the pool, and every other sweep site
+        // runs after the reservation, so a failed reservation is the one
+        // place obliged to force a pass — which keeps the job-table lock and
+        // its expiry scan off every successful request.
+        let reserved = match ctx.try_reserve_resident(reservation_bytes) {
+            Some(charge) => Some(charge),
+            None => {
+                self.inner.jobs.sweep();
+                ctx.try_reserve_resident(reservation_bytes)
+            }
+        };
+        let Some(mut charge) = reserved else {
             return app_error(
                 "queue_full",
                 "resident capacity for request parsing is exhausted",
@@ -771,16 +832,17 @@ impl CompositeComponent for SynapseComponent {
                 return request_error(error);
             }
         };
+        // One coverage gate for every arm, sized by the single owned-bytes
+        // source so no arm can grow a term the reservation does not cover.
+        if let Err(outcome) = shrink_covered(&mut charge, owned_input_bytes(&request)) {
+            return outcome;
+        }
         match request {
             Request::ModelsList => {
                 drop(charge);
                 respond(&ctx, protocol::models_list_body(&lane.lane)).await
             }
             Request::EmbedQuery { text, deadline_ms } => {
-                let owned = text.capacity() + RESPONSE_SCRATCH_BYTES;
-                if let Err(outcome) = shrink_covered(&mut charge, owned) {
-                    return outcome;
-                }
                 let text_charge = charge.split_or_take(text.capacity());
                 let _handler_charge = charge;
                 self.handle_query(&ctx, lane, text, deadline_ms, text_charge)
@@ -791,13 +853,6 @@ impl CompositeComponent for SynapseComponent {
                 canonical_key,
                 items,
             } => {
-                let owned = jobs::job_input_bytes(&request_key, &items)
-                    .saturating_add(request_key.capacity())
-                    .saturating_add(canonical_key.capacity())
-                    .saturating_add(RESPONSE_SCRATCH_BYTES);
-                if let Err(outcome) = shrink_covered(&mut charge, owned) {
-                    return outcome;
-                }
                 self.handle_batch(&ctx, lane, request_key, canonical_key, items, charge)
                     .await
             }
@@ -806,14 +861,6 @@ impl CompositeComponent for SynapseComponent {
                 request_key,
                 cursor,
             } => {
-                let owned = job_id
-                    .capacity()
-                    .saturating_add(request_key.capacity())
-                    .saturating_add(cursor.as_ref().map_or(0, String::capacity))
-                    .saturating_add(RESPONSE_SCRATCH_BYTES);
-                if let Err(outcome) = shrink_covered(&mut charge, owned) {
-                    return outcome;
-                }
                 let _handler_charge = charge;
                 self.handle_result(&ctx, lane, job_id, request_key, cursor)
                     .await

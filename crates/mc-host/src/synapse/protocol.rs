@@ -515,40 +515,62 @@ fn decode_batch<'a>(body: &'a [u8], max_items: usize) -> Result<BatchParams<'a>,
 /// syntax, UTF-8, duplicate keys, and schema stay with serde.
 fn depth_exceeds(body: &[u8], max_depth: usize) -> bool {
     let mut open = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for &byte in body {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
+    let mut index = 0usize;
+    while index < body.len() {
+        match body[index] {
             b'{' | b'[' => {
                 open += 1;
                 if open > max_depth {
                     return true;
                 }
+                index += 1;
             }
-            b'}' | b']' => open = open.saturating_sub(1),
+            b'}' | b']' => {
+                open = open.saturating_sub(1);
+                index += 1;
+            }
             b'"' => {
                 if open >= max_depth {
                     return true;
                 }
-                in_string = true;
+                index += 1;
+                // Skip the string body in bulk. Only a quote can end it and
+                // only a backslash can escape, so searching for those two
+                // bytes keeps item text — the bulk of every batch body —
+                // off the per-byte dispatch path.
+                let closed = loop {
+                    let Some(offset) = body[index..]
+                        .iter()
+                        .position(|&byte| byte == b'"' || byte == b'\\')
+                    else {
+                        break false;
+                    };
+                    let byte = body[index + offset];
+                    index += offset + 1;
+                    if byte == b'"' {
+                        break true;
+                    }
+                    // A backslash escapes exactly one following byte, so
+                    // that byte cannot close the string. Consuming it here
+                    // is what yields backslash parity.
+                    if index >= body.len() {
+                        break false;
+                    }
+                    index += 1;
+                };
+                if !closed {
+                    // Unterminated string: serde reports the syntax error.
+                    return false;
+                }
             }
-            b',' | b':' | b' ' | b'\t' | b'\n' | b'\r' => {}
+            b',' | b':' | b' ' | b'\t' | b'\n' | b'\r' => index += 1,
             // Any other byte outside a string starts or continues a scalar
             // token (number, true, false, null, or garbage serde rejects).
             _ => {
                 if open >= max_depth {
                     return true;
                 }
+                index += 1;
             }
         }
     }
@@ -605,7 +627,16 @@ pub(crate) fn decode_request(
     }
 }
 
-pub fn parse_request(
+/// Preflight plus typed decode with **no resident reservation and no
+/// coverage check** — the two gates the host applies between these stages.
+/// Test-only: the host must never call this, because parsing a body this
+/// way leaves every parser allocation outside `max_resident_bytes`, which
+/// is exactly the hole the reserved path closes. Production composes
+/// [`preflight`], [`parse_reservation_bytes`], the reservation, and
+/// [`decode_request`] itself so the reservation lands between the bounds
+/// check and the first deserializer byte.
+#[doc(hidden)]
+pub fn parse_request_unreserved(
     body: &[u8],
     binary: bool,
     lane: &LaneInfo,
@@ -613,6 +644,22 @@ pub fn parse_request(
 ) -> Result<Request, RequestError> {
     preflight(body, binary)?;
     decode_request(body, lane, limits)
+}
+
+/// A body this host can never serve at its configured resident capacity:
+/// the parse reservation plus the body's own still-held charge exceed the
+/// whole pool, so no amount of draining or retrying frees enough. Reported
+/// as a permanent size rejection rather than transient `queue_full`, which
+/// clients retry.
+pub(crate) fn unservable_body_error(
+    body_len: usize,
+    required: usize,
+    capacity: usize,
+) -> RequestError {
+    schema(format!(
+        "request body of {body_len} bytes needs {required} resident bytes, \
+         above this host's {capacity}-byte resident capacity"
+    ))
 }
 
 /// Per-item headroom in the parse reservation, beyond the item's share of
@@ -1111,8 +1158,9 @@ mod tests {
         let deep_params_first =
             br#"{"params":{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}},"method":"models.list"}"#;
         assert!(depth_exceeds(deep_params_first, MAX_BODY_DEPTH));
-        let error = parse_request(deep_params_first, false, &lane(), &SynapseLimits::default())
-            .expect_err("depth nine is rejected before typed decode");
+        let error =
+            parse_request_unreserved(deep_params_first, false, &lane(), &SynapseLimits::default())
+                .expect_err("depth nine is rejected before typed decode");
         assert_eq!(error.code, "schema_violation");
         assert!(error.message.contains("deeply nested"), "{}", error.message);
     }
@@ -1196,7 +1244,7 @@ mod tests {
             item_json("b", "two"),
             "x".repeat(4096),
         );
-        let error = parse_request(&batch_body(&lane, &overflow), false, &lane, &limits)
+        let error = parse_request_unreserved(&batch_body(&lane, &overflow), false, &lane, &limits)
             .expect_err("the third element exceeds the bound");
         assert_eq!(error.code, "schema_violation");
         assert!(
@@ -1212,7 +1260,8 @@ mod tests {
             .expect("utf8")
             .replace(&"0".repeat(64), &key)
             .into_bytes();
-        let request = parse_request(&body, false, &lane, &limits).expect("exact bound parses");
+        let request =
+            parse_request_unreserved(&body, false, &lane, &limits).expect("exact bound parses");
         let Request::EmbedBatch { items, .. } = request else {
             panic!("expected a batch");
         };
@@ -1271,7 +1320,7 @@ mod tests {
                 body
             }),
         ] {
-            let error = parse_request(&body, false, &lane, &limits).expect_err(case);
+            let error = parse_request_unreserved(&body, false, &lane, &limits).expect_err(case);
             assert_eq!(error.code, "schema_violation", "{case}: {}", error.message);
         }
     }
@@ -1301,7 +1350,8 @@ mod tests {
             },
         }))
         .expect("body serializes");
-        let request = parse_request(&body, false, &lane, &limits).expect("escaped batch parses");
+        let request =
+            parse_request_unreserved(&body, false, &lane, &limits).expect("escaped batch parses");
         let Request::EmbedBatch { items, .. } = request else {
             panic!("expected a batch");
         };
@@ -1314,7 +1364,7 @@ mod tests {
         let lane = lane();
         let long_field = "k".repeat(1024 * 1024);
         let body = format!("{{\"method\":\"models.list\",\"{long_field}\":1}}").into_bytes();
-        let error = parse_request(&body, false, &lane, &limits)
+        let error = parse_request_unreserved(&body, false, &lane, &limits)
             .expect_err("unknown top-level field is refused");
         assert_eq!(error.code, "schema_violation");
         assert!(error.message.len() <= MAX_DIAGNOSTIC_BYTES);
@@ -1326,27 +1376,34 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn the_maximum_default_reservation_fits_the_default_ingress_pool() {
-        // The ingress pool built at startup (runtime.rs) is
-        // max_resident_bytes - EGRESS_RESERVED_BYTES - catalog_resident.
-        // The resident catalog is deployment-dependent (bounded only by the
-        // frame limit), so this pins the default limits against a named
-        // allowance rather than the theoretical catalog maximum. A
-        // deployment whose catalog or tuned-down max_resident_bytes eats
-        // past this allowance lowers the largest admittable request rather
-        // than wedging the host: smaller bodies reserve proportionally
-        // less and still admit.
-        const CATALOG_ALLOWANCE_BYTES: u64 = 1 << 20;
+    fn the_maximum_reservation_fits_the_scratch_pool_at_every_legal_config() {
+        // Request scratch draws on `SCRATCH_RESERVED_BYTES` (runtime.rs), a
+        // fixed slice of `max_resident_bytes` rather than a remainder, so
+        // this bound holds at EVERY config that validates — not just at the
+        // defaults — and is independent of the resident catalog. That is the
+        // whole point of reserving the slice: the largest servable request
+        // no longer varies with deployment tuning or catalog size.
         let bound = parse_reservation_bytes(MAX_BODY_BYTES, &SynapseLimits::default())
             .expect("the default bound is computable");
-        let limits = crate::config::HostLimits::default();
-        let ingress = limits.max_resident_bytes
-            - crate::config::EGRESS_RESERVED_BYTES
-            - CATALOG_ALLOWANCE_BYTES;
-        // One maximum body charge plus its parse reservation must fit.
+        let scratch = crate::config::SCRATCH_RESERVED_BYTES;
         assert!(
-            (bound + MAX_BODY_BYTES) as u64 <= ingress,
-            "bound {bound} does not fit the default ingress pool {ingress}"
+            bound as u64 <= scratch,
+            "the worst-case reservation {bound} does not fit the reserved \
+             scratch pool {scratch}; SCRATCH_RESERVED_BYTES must cover \
+             RESERVE_BODY_FACTOR * MAX_BODY_BYTES plus per-item and \
+             envelope headroom"
+        );
+        // The body itself is charged against the admission pool, which the
+        // floor guarantees is one maximum frame body, so the two pools
+        // together admit a maximum-size request at the minimum legal config.
+        let limits = crate::config::HostLimits::default();
+        assert!(
+            limits.max_resident_bytes >= crate::config::MIN_RESIDENT_BYTES,
+            "the default config must satisfy its own floor"
+        );
+        assert!(
+            MAX_BODY_BYTES as u64 <= crate::wire::MAX_BODY_LEN as u64,
+            "the protocol body cap must fit one frame body"
         );
     }
 
@@ -1374,6 +1431,32 @@ mod tests {
         assert!(large > small);
     }
 
+    /// The body-derived item bound must reach the seed's pre-allocation,
+    /// not just the reservation arithmetic: an absurd configured
+    /// `max_batch_items` must neither pre-allocate configuration-sized
+    /// capacity nor overflow `Vec::with_capacity`, and a valid small batch
+    /// must still decode under it.
+    #[test]
+    fn an_absurd_item_cap_still_decodes_a_small_batch() {
+        let limits = SynapseLimits {
+            max_batch_items: usize::MAX,
+            ..SynapseLimits::default()
+        };
+        let lane = lane();
+        let exact = format!("[{},{}]", item_json("a", "one"), item_json("b", "two"));
+        let key = canonical_request_key(&lane, &[item("a", "one"), item("b", "two")]);
+        let body = String::from_utf8(batch_body(&lane, &exact))
+            .expect("utf8")
+            .replace(&"0".repeat(64), &key)
+            .into_bytes();
+        let request =
+            parse_request_unreserved(&body, false, &lane, &limits).expect("small batch parses");
+        let Request::EmbedBatch { items, .. } = request else {
+            panic!("expected a batch");
+        };
+        assert_eq!(items.len(), 2);
+    }
+
     /// The resident-byte guarantee rests on `parse_reservation_bytes`
     /// dominating the post-decode owned bytes the handler shrinks to:
     /// `ByteCharge::shrink_to` cannot grow a charge and `split_or_take`
@@ -1384,14 +1467,29 @@ mod tests {
     /// `String` keeps) and item metadata at its size limits.
     #[test]
     fn the_parse_reservation_dominates_post_decode_owned_bytes() {
-        const RESPONSE_SCRATCH_BYTES: usize = super::super::RESPONSE_SCRATCH_BYTES;
         let limits = SynapseLimits::default();
         let lane = lane();
 
-        // Query path: owned = text.capacity() + response scratch.
-        for text_json in [
-            "\\\"".repeat(4096),    // two body bytes per decoded byte
-            "\\u0041".repeat(1024), // six body bytes per decoded byte
+        // Both sides come from production: `parse_reservation_bytes` is what
+        // the host acquires and `owned_input_bytes` is what it shrinks to, so
+        // a term added to either is covered here the moment it lands.
+        let dominates = |body: &[u8], case: &str| {
+            let reservation =
+                parse_reservation_bytes(body.len(), &limits).expect("bound is computable");
+            let request =
+                parse_request_unreserved(body, false, &lane, &limits).expect("body parses");
+            let owned = super::super::owned_input_bytes(&request);
+            assert!(
+                reservation >= owned,
+                "{case}: reservation {reservation} does not dominate owned bytes {owned}"
+            );
+        };
+
+        // Query: escape-heavy text, where serde's decode scratch capacity —
+        // not the decoded length — is what the owned `String` keeps.
+        for (case, text_json) in [
+            ("query quote escapes", "\\\"".repeat(4096)), // two body bytes per decoded byte
+            ("query unicode escapes", "\\u0041".repeat(1024)), // six body bytes per decoded byte
         ] {
             let body = format!(
                 concat!(
@@ -1403,50 +1501,51 @@ mod tests {
                 lane.model, lane.fingerprint, lane.table_epoch, text_json,
             )
             .into_bytes();
-            let reservation =
-                parse_reservation_bytes(body.len(), &limits).expect("bound is computable");
-            let Request::EmbedQuery { text, .. } =
-                parse_request(&body, false, &lane, &limits).expect("query parses")
-            else {
-                panic!("expected a query");
-            };
-            let owned = text.capacity() + RESPONSE_SCRATCH_BYTES;
-            assert!(
-                reservation >= owned,
-                "reservation {reservation} does not dominate query owned bytes {owned}"
-            );
+            dominates(&body, case);
         }
 
-        // Batch path: owned exactly as `handle` sizes the shrink — the
-        // job's input bytes plus both key capacities and response scratch.
-        let items_json: Vec<String> = (0..8)
+        // Batch at the configured bounds rather than hand-picked literals:
+        // every item slot filled, ids at their cap, text escape-heavy.
+        let items_json: Vec<String> = (0..limits.max_batch_items)
             .map(|index| {
                 let decoded = "\"".repeat(512);
                 format!(
-                    "{{\"id\":\"{index:0>256}\",\"text\":\"{}\",\"content_sha256\":\"{}\"}}",
+                    "{{\"id\":\"{index:0>width$}\",\"text\":\"{}\",\"content_sha256\":\"{}\"}}",
                     "\\\"".repeat(512),
                     sha256_hex(decoded.as_bytes()),
+                    width = MAX_ITEM_ID_BYTES,
                 )
             })
             .collect();
-        let body = batch_body(&lane, &format!("[{}]", items_json.join(",")));
-        let reservation =
-            parse_reservation_bytes(body.len(), &limits).expect("bound is computable");
-        let Request::EmbedBatch {
-            request_key,
-            canonical_key,
-            items,
-        } = parse_request(&body, false, &lane, &limits).expect("batch parses")
-        else {
-            panic!("expected a batch");
-        };
-        let owned = super::super::jobs::job_input_bytes(&request_key, &items)
-            + request_key.capacity()
-            + canonical_key.capacity()
-            + RESPONSE_SCRATCH_BYTES;
-        assert!(
-            reservation >= owned,
-            "reservation {reservation} does not dominate batch owned bytes {owned}"
+        dominates(
+            &batch_body(&lane, &format!("[{}]", items_json.join(","))),
+            "batch at the item and id bounds",
         );
+        // The smallest body that still owns a job: fixed per-item and
+        // envelope headroom has the least body-proportional slack here.
+        dominates(
+            &batch_body(&lane, &format!("[{}]", item_json("a", "one"))),
+            "minimal batch",
+        );
+
+        // Result: job_id and cursor at their caps.
+        let result_body = serde_json::to_vec(&serde_json::json!({
+            "method": "embed.result",
+            "params": {
+                "model": lane.model,
+                "required_fingerprint": lane.fingerprint,
+                "required_epoch": lane.table_epoch,
+                "allow_equivalent": false,
+                "accept_declared": false,
+                "job_id": "j".repeat(MAX_JOB_ID_BYTES),
+                "request_key": "0".repeat(64),
+                "cursor": "c".repeat(MAX_CURSOR_BYTES),
+            },
+        }))
+        .expect("body serializes");
+        dominates(&result_body, "result at the id and cursor caps");
+
+        // The smallest body of all still has to cover the response scratch.
+        dominates(br#"{"method":"models.list"}"#, "models.list");
     }
 }

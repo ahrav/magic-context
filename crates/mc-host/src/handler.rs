@@ -329,8 +329,10 @@ pub struct RequestCtx {
     pub binary: bool,
     pub(crate) cancel: CancellationToken,
     pub(crate) stream: crate::dispatch::StreamSink,
-    /// Ingress pool that charged `body`.
-    pub(crate) ingress: crate::wire::ByteBudget,
+    /// Pool funding request scratch and request-derived ownership. Separate
+    /// from the pool that charged `body`, so holding these bytes can never
+    /// stall another connection's frame admission.
+    pub(crate) scratch: crate::wire::ByteBudget,
 }
 
 impl RequestCtx {
@@ -354,7 +356,14 @@ impl RequestCtx {
     }
 
     pub(crate) fn try_reserve_resident(&self, bytes: usize) -> Option<crate::wire::ByteCharge> {
-        self.ingress.try_charge(bytes)
+        self.scratch.try_charge(bytes)
+    }
+
+    /// The resident ceiling `try_reserve_resident` is measured against. A
+    /// reservation above this can never be acquired, so callers report it
+    /// as a permanent rejection instead of retryable backpressure.
+    pub(crate) fn resident_capacity(&self) -> usize {
+        self.scratch.capacity()
     }
 
     /// Queues one nonterminal `StreamData` item, in order. Returns `Err` once
