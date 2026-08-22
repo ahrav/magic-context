@@ -1104,6 +1104,59 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         ).toEqual({ verification_status: "stale" });
     });
 
+    test("clearing a positive verification records a stale event; a no-op unverified write records nothing", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "verify-withdraw-seed", "verify withdraw fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-withdraw-verify", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId, verificationStatus: "verified", nowMs: 5_000 },
+            ),
+        );
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(1);
+
+        // verified → unverified withdraws positive evidence: one stale event
+        // plus its evidence effect.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-withdraw-clear", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId, verificationStatus: "unverified", nowMs: 6_000 },
+            ),
+        );
+        expect(count(db, "verification_events", "outcome = 'stale'")).toBe(1);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'evidence' AND operation_id = (
+                    SELECT id FROM claim_operations WHERE operation_key = 'verify-withdraw-clear')`,
+            ),
+        ).toBe(1);
+
+        // unverified → unverified on a never-verified row transitions
+        // nothing: no event, no evidence effect.
+        const fresh = createSeedMemory(db, "verify-noop-seed", "verify noop fact");
+        const eventsBefore = count(db, "verification_events");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-noop-1", { id: fresh.memoryId }),
+                { memoryId: fresh.memoryId, verificationStatus: "unverified", nowMs: 7_000 },
+            ),
+        );
+        expect(count(db, "verification_events")).toBe(eventsBefore);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `operation_id = (
+                    SELECT id FROM claim_operations WHERE operation_key = 'verify-noop-1')`,
+            ),
+        ).toBe(0);
+    });
+
     test("ephemeral zero-effect envelopes persist nothing; effect-bearing ones insert normally", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "ephemeral-seed", "ephemeral fact");
@@ -1777,6 +1830,49 @@ describe("memory/claims kernel: relationship and session-attribution effects", (
         expect(expectedEffectCount(db, "module-supersede-target-1")).toBe(keys.length);
     });
 
+    test("a module delta supersession target that dedup-adopts an archived canonical reactivates the target claim", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "module-revive-seed", "module revive fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("module-revive-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "archived",
+        });
+        // An unlinked active twin of the deleted row: the supersession target
+        // whose adoption dedups onto the archived canonical claim.
+        const targetId = insertUnlinkedRow(db, "module revive fact", "[]");
+        const sourceId = insertUnlinkedRow(db, "module revive source", "[]");
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("module-revive-1", { key: "module-revive" }),
+                {
+                    memoryId: sourceId,
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?",
+                        ).run(targetId, sourceId);
+                    },
+                },
+            ),
+        );
+
+        const targetLink = readMemoryClaimLink(db, targetId);
+        expect(targetLink?.claimId).toBe(seeded.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "active",
+        });
+        const keys = operationOutbox(db, "module-revive-1").map((row) => row.effectKey);
+        expect(keys).toContain(`memory:${targetId}:lifecycle`);
+        expect(expectedEffectCount(db, "module-revive-1")).toBe(keys.length);
+    });
+
     test("a module delta changing only source_session_id appends a revision carrying the new session id", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "session-reattr-seed", "session reattribution fact");
@@ -1903,6 +1999,51 @@ describe("memory/claims kernel: shared-claim lifecycle rank", () => {
             }),
         );
     }
+
+    test("editing one of two live shared-claim siblings records the diagnostic and the divergence oracle counts it", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "shared-edit-seed", "shared edit fact");
+        const siblingId = insertAliasSibling(db, "shared edit fact");
+        setStatus(db, "shared-edit-link", siblingId, "active");
+        expect(count(db, "legacy_memory_claims", `claim_id = ${survivor.claimId}`)).toBe(2);
+        expect(inspectClaimsBackfillReconciliation(db).contentDivergences).toBe(0);
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("shared-edit-1", { id: survivor.memoryId }),
+                {
+                    memoryId: survivor.memoryId,
+                    content: "rewritten shared fact",
+                    normalizedHash: "hash:rewritten shared fact",
+                },
+            ),
+        );
+
+        // The append proceeded; the edited row carries the fail-visible
+        // diagnostic for the sibling it diverged from.
+        expect(
+            db.prepare("SELECT content FROM memories WHERE id = ?").get(survivor.memoryId),
+        ).toEqual({ content: "rewritten shared fact" });
+        expect(
+            db
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(String(survivor.memoryId)),
+        ).toEqual({
+            phase: "rows",
+            item_kind: "memory",
+            reason_code: "shared-claim-content-edit",
+            disposition: "blocking",
+        });
+        // The sibling's projection hash no longer matches the claim's current
+        // revision; the reconciliation oracle counts it as a warning.
+        const report = inspectClaimsBackfillReconciliation(db);
+        expect(report.contentDivergences).toBe(1);
+        expect(report.warningCount).toBeGreaterThanOrEqual(1);
+    });
 
     test("an unknown status quarantined to archived rank still emits the archive event", () => {
         const db = track(migratedDb());

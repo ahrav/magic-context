@@ -441,6 +441,14 @@ function mergeMemoryRow(
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
+        // Adoption derives the canonical claim's lifecycle from the target
+        // row's status, and a NULL status derives archived. The survivor is
+        // live by contract, so the status normalizes to 'active' before the
+        // adoption pass — activating it afterwards would flip the projection
+        // active while the claim stays archived, outside the kernel.
+        db.prepare("UPDATE memories SET status = COALESCE(status, 'active') WHERE id = ?").run(
+            targetId,
+        );
         // An unadoptable collision target cannot anchor the canonical claim,
         // so the merge is skipped for this row (fail-visible diagnostic,
         // source row preserved) before any stats or verification mutation.
@@ -525,13 +533,8 @@ function mergeMemoryRow(
                 mergedSeen,
                 targetId,
             );
-            db.prepare("UPDATE memories SET status = COALESCE(status, 'active') WHERE id = ?").run(
-                targetId,
-            );
         } else {
-            db.prepare(
-                "UPDATE memories SET seen_count = ?, status = COALESCE(status, 'active') WHERE id = ?",
-            ).run(mergedSeen, targetId);
+            db.prepare("UPDATE memories SET seen_count = ? WHERE id = ?").run(mergedSeen, targetId);
         }
         db.prepare(
             `UPDATE memories

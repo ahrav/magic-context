@@ -699,6 +699,10 @@ export interface ClaimsBackfillReconciliationReport {
     /** Lifecycle-oracle mismatches folded into `warningCount`; broken out so
      *  the status surface can name the warning that has no failure row. */
     lifecycleMismatches: number;
+    /** Live crosswalk rows whose projection hash diverges from the claim's
+     *  current-revision hash metadata (shared-claim sibling edits); folded
+     *  into `warningCount` and broken out like `lifecycleMismatches`. */
+    contentDivergences: number;
 }
 
 /** Anti-join fragment: the aliased memories row has no crosswalk link (R1, R11). */
@@ -997,18 +1001,20 @@ export function inspectClaimsBackfillReconciliation(
 
     if (state.v22Takeover === "pending") problems.push("pending v22 identity work");
 
-    // Warning-class lifecycle oracle: a boundary claim whose stored state
+    // Warning-class lifecycle oracle: a linked claim whose stored state
     // diverges from the max-rank state derived from its linked projections —
     // the SQL twin of `sharedClaimStateFromLiveLinks` with no substituted
     // row (a claim with no surviving projection rows derives archived).
-    // Warning disposition: any later kernel write on a linked row repairs
-    // the state, so a mismatch never gates completion.
+    // Deliberately unscoped by the boundary: above-boundary drift belongs to
+    // live writers, and this is the only oracle that can see it. Warning
+    // disposition: any later kernel write on a linked row repairs the state,
+    // so a mismatch never gates completion.
     const lifecycleMismatches = countScalar(
         db,
         `SELECT COUNT(*) AS count FROM claims c
           WHERE EXISTS (
                 SELECT 1 FROM legacy_memory_claims b
-                 WHERE b.claim_id = c.id AND b.memory_id <= ?
+                 WHERE b.claim_id = c.id
             )
             AND c.state <> (
                 SELECT CASE COALESCE(MAX(CASE m.status
@@ -1020,14 +1026,38 @@ export function inspectClaimsBackfillReconciliation(
                   JOIN memories m ON m.id = lmc.memory_id
                  WHERE lmc.claim_id = c.id
             )`,
-        boundary,
+    );
+
+    // Warning-class content-coherence oracle: a live projection row whose
+    // normalized_hash no longer matches its claim's current-revision hash
+    // metadata — the shape two live siblings sharing one canonical claim
+    // take when one sibling's content is edited. An empty-content row is
+    // excluded: it cannot form a revision, so its claim retains the last
+    // good content by design and the row already carries the empty-content
+    // diagnostic lane. One scan of the crosswalk table with primary-key
+    // point lookups per row (memories.id, claims.id,
+    // claim_revision_memory_metadata.revision_id), the same cost class as
+    // the lifecycle oracle above.
+    const contentDivergences = countScalar(
+        db,
+        `SELECT COUNT(*) AS count FROM legacy_memory_claims lmc
+           JOIN memories m ON m.id = lmc.memory_id
+           JOIN claims c ON c.id = lmc.claim_id
+           JOIN claim_revision_memory_metadata meta ON meta.revision_id = c.current_revision_id
+          WHERE m.status IN ('active', 'permanent')
+            AND m.content <> ''
+            AND m.normalized_hash <> meta.normalized_hash`,
     );
 
     return {
         ok: problems.length === 0,
         problems,
-        warningCount: countBoundaryFailures(db, ["warning"], boundary) + lifecycleMismatches,
+        warningCount:
+            countBoundaryFailures(db, ["warning"], boundary) +
+            lifecycleMismatches +
+            contentDivergences,
         lifecycleMismatches,
+        contentDivergences,
     };
 }
 
@@ -1546,7 +1576,14 @@ export function getClaimsBackfillStatus(
         // Lifecycle mismatches have no claim_backfill_failures row, so the
         // warning is only observable through this line.
         problems.push(
-            `warning: ${reconciliation.lifecycleMismatches} claim lifecycle state mismatch(es) within the boundary corpus`,
+            `warning: ${reconciliation.lifecycleMismatches} claim lifecycle state mismatch(es) across the linked corpus`,
+        );
+    }
+    if (reconciliation && reconciliation.contentDivergences > 0) {
+        // Same surface rule as lifecycle mismatches: no failure row exists
+        // for a projection/claim content divergence found by the oracle.
+        problems.push(
+            `warning: ${reconciliation.contentDivergences} projection/claim content divergence(s) across the linked corpus`,
         );
     }
     return {

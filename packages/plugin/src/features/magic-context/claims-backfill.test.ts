@@ -817,6 +817,32 @@ describe("claims backfill reconciliation", () => {
         expect(status.problems.join("\n")).toContain("1 claim lifecycle state mismatch(es)");
     });
 
+    test("above-boundary lifecycle drift is visible to the oracle as a warning", async () => {
+        const { db } = migrateLazy([{ content: "boundary row" }]);
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(
+            "complete",
+        );
+
+        // A live-writer row above the boundary drifts via a raw projection
+        // write that bypasses the kernel; the unscoped lifecycle oracle is
+        // the only surface that can see it.
+        const above = insertMemory(db, {
+            projectPath: "git:claims-backfill-a",
+            category: "CONSTRAINTS",
+            content: "above boundary drift row",
+        });
+        expect(above.id).toBeGreaterThan(getClaimsBackfillStatus(db).boundaryMemoryId);
+        expect(inspectClaimsBackfillReconciliation(db).lifecycleMismatches).toBe(0);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(above.id);
+        });
+
+        const report = inspectClaimsBackfillReconciliation(db);
+        expect(report.ok).toBeTrue();
+        expect(report.lifecycleMismatches).toBe(1);
+        expect(report.warningCount).toBe(1);
+    });
+
     test("deleting a still-unlinked failed row resolves its blocking failure on the next sweep", async () => {
         const { db } = migrateLazy([{ content: "boundary row" }]);
         // A live writer records an above-boundary blocking failure (raw

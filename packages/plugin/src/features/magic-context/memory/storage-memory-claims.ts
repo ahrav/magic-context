@@ -406,7 +406,8 @@ export type MemoryClaimLinkFailureReason =
     | "invalid-scope"
     | "invalid-shareable"
     | "empty-source-session-id"
-    | "empty-source-type";
+    | "empty-source-type"
+    | "shared-claim-content-edit";
 
 export class MemoryClaimsStatsIntegrityError extends Error {
     readonly memoryId: number;
@@ -1581,6 +1582,18 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             content: input.content,
             provenance: liveProvenance(envelope, sessionId),
         });
+        if (
+            input.normalizedHash !== row.normalized_hash &&
+            claimHasOtherLiveMemoryLink(db, link.claimId, row.id)
+        ) {
+            // Another live projection shares this canonical claim, so the
+            // hash-changing append below makes the claim's current revision
+            // diverge from that sibling's projection (and strands its hash
+            // dedup lookup). The append still proceeds — no oracle-level
+            // split or unlink exists — so the divergence is recorded as a
+            // fail-visible diagnostic on the edited row.
+            recordMemoryClaimLinkFailure(db, row.id, row.project_path, "shared-claim-content-edit");
+        }
         // The content update resets shareable in the projection; the revision
         // metadata mirrors that post-state.
         const revisionId = appendMemoryClaimRevision(db, {
@@ -2062,8 +2075,10 @@ const VERIFICATION_EVENT_OUTCOMES: Record<string, VerificationOutcome> = {
 
 /**
  * Verification status change: one verification event for verified/stale/
- * flagged outcomes (`unverified` stays the absence of events, KTD5) plus the
- * projection verification columns.
+ * flagged outcomes plus the projection verification columns. A fresh
+ * `unverified` write stays the absence of events (KTD5), but an `unverified`
+ * that withdraws a positive verification records 'stale'; a write that
+ * transitions nothing emits no event and no evidence effect.
  */
 export function updateMemoryVerificationWithClaimsInCurrentTransaction(
     db: Database,
@@ -2084,27 +2099,52 @@ export function updateMemoryVerificationWithClaimsInCurrentTransaction(
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
+        const nowMs = input.nowMs ?? Date.now();
         const outcome = VERIFICATION_EVENT_OUTCOMES[input.verificationStatus];
-        if (outcome) {
+        // Mirror of the module path's transition guard: an event (and its
+        // evidence effect) lands only for an actual transition — a status
+        // flip or a re-verify that advances verified_at — so a no-op write
+        // (unverified → unverified) emits nothing.
+        const statusChanged = input.verificationStatus !== row.verification_status;
+        const positiveAdvanced = outcome === "verified" && nowMs > (row.verified_at ?? 0);
+        let eventRecorded = false;
+        if (outcome && (statusChanged || positiveAdvanced)) {
             addVerificationEvent(db, {
                 revisionId: readClaimCurrentRevisionId(db, link.claimId),
                 outcome,
                 verifier: envelope.producer,
             });
+            eventRecorded = true;
+        } else if (
+            input.verificationStatus === "unverified" &&
+            memoryRowHasPositiveVerification(db, row)
+        ) {
+            // 'unverified' has no event outcome of its own, but clearing a
+            // positive verification withdraws evidence: the claim's current
+            // revision records 'stale' instead of silently losing its
+            // verified standing.
+            addVerificationEvent(db, {
+                revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                outcome: "stale",
+                verifier: envelope.producer,
+            });
+            eventRecorded = true;
         }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
-        updateMemoryProjectionVerification(db, row.id, input.verificationStatus, input.nowMs);
+        updateMemoryProjectionVerification(db, row.id, input.verificationStatus, nowMs);
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
         return {
             result: { memoryId: row.id, claimId: link.claimId, revisionId: null, found: true },
-            effects: [
-                {
-                    effectKey: `memory:${row.id}:evidence`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "evidence" as const,
-                },
-            ],
+            effects: eventRecorded
+                ? [
+                      {
+                          effectKey: `memory:${row.id}:evidence`,
+                          projectId,
+                          claimId: link.claimId,
+                          effectType: "evidence" as const,
+                      },
+                  ]
+                : [],
         };
     });
 }
@@ -2568,6 +2608,20 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                         target,
                         targetProjectId,
                         { kind: "migration" },
+                    );
+                    // The link above can dedup-adopt a canonical claim
+                    // archived by a prior delete, so the target claim's state
+                    // re-derives from its live links; the helper no-ops when
+                    // the state already matches, so a pre-linked target with
+                    // a healthy claim emits nothing here.
+                    effects.push(
+                        ...syncClaimLifecycleAfterAdoption(
+                            db,
+                            target,
+                            targetLink,
+                            targetProjectId,
+                            envelope.producer,
+                        ),
                     );
                     if (recordMemoryClaimSupersessionInCurrentTransaction(db, link, targetLink)) {
                         effects.push({

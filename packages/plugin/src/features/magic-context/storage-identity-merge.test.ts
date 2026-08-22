@@ -1127,6 +1127,30 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("a collision merge onto a NULL-status target activates the claim with the projection", () => {
+        const database = makeDb();
+        const targetId = insertMemory(database, "git:new", "null status fact", "null-h1");
+        const sourceId = insertMemory(database, "dir:old", "null status fact", "null-h1");
+        // Schema-legal drift: memories.status has a DEFAULT but no NOT NULL,
+        // and adoption derives the canonical claim's state from this column.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database.prepare("UPDATE memories SET status = NULL WHERE id = ?").run(targetId);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 80 });
+
+        expect(database.prepare("SELECT status FROM memories WHERE id = ?").get(targetId)).toEqual({
+            status: "active",
+        });
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ status: "archived", by: targetId });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(survivorClaim?.state).toBe("active");
+    });
+
     test("a claim-invalid unlinked row is diagnosed without rolling back the rest of the merge", () => {
         const database = makeDb();
         const healthyId = insertMemory(database, "dir:old", "healthy fact", "healthy-h1");
