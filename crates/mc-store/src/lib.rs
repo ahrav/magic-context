@@ -4522,6 +4522,17 @@ pub struct NoteEvalClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One selection decision produced by the caller's closure inside the
+/// acquisition transaction. `NoWork` carries its cause so the durable
+/// ledger can replay the full decision after response loss: a spent
+/// cursor (`cycle_exhausted`) tells the client to poll again, while a
+/// plain empty answer ends the drain.
+pub enum NoteEvalSelection {
+    Claim { note_id: i64, phase: String },
+    NoWork { cycle_exhausted: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum NoteEvalAcquireOutcome {
     Claim {
@@ -4531,6 +4542,9 @@ pub enum NoteEvalAcquireOutcome {
     },
     NoWork {
         replayed: bool,
+        /// The selection cursor, not the queue, ended this pass. Durable in
+        /// the acquisition ledger so response-loss replays re-announce it.
+        cycle_exhausted: bool,
     },
     /// The acquisition identity replays an expired decision.
     Expired,
@@ -16936,9 +16950,11 @@ fn collect_note_eval_ledgers_tx(
 
 impl McStore {
     /// Acquire one durable evaluation claim or a replayable `no_work` decision.
-    /// `select` receives the pending, unclaimed smart notes and picks (note, phase);
-    /// the decision commits atomically under (project, acquisition_id) uniqueness so
-    /// the same acquisition ID always returns the same decision after response loss.
+    /// `select` receives the pending, unclaimed smart notes and returns either a
+    /// (note, phase) claim or a classified `no_work`; the decision — including a
+    /// `no_work`'s `cycle_exhausted` cause — commits atomically under
+    /// (project, acquisition_id) uniqueness so the same acquisition ID always
+    /// returns the same decision after response loss.
     #[allow(clippy::too_many_arguments)]
     pub fn acquire_note_evaluation(
         &self,
@@ -16947,7 +16963,7 @@ impl McStore {
         evaluator_instance: &str,
         evaluator_slot: i64,
         registration_generation: i64,
-        select: impl FnOnce(&[NoteEvalCandidate]) -> Option<(i64, String)>,
+        select: impl FnOnce(&[NoteEvalCandidate]) -> NoteEvalSelection,
         now_ms: i64,
     ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
         self.acquire_note_evaluation_with_cap(
@@ -16970,7 +16986,7 @@ impl McStore {
         evaluator_instance: &str,
         evaluator_slot: i64,
         registration_generation: i64,
-        select: impl FnOnce(&[NoteEvalCandidate]) -> Option<(i64, String)>,
+        select: impl FnOnce(&[NoteEvalCandidate]) -> NoteEvalSelection,
         now_ms: i64,
         ledger_cap: i64,
     ) -> Result<NoteEvalAcquireOutcome, McStoreError> {
@@ -17026,7 +17042,14 @@ impl McStore {
                 return Ok(if decision.is_empty() {
                     NoteEvalAcquireOutcome::Expired
                 } else {
-                    NoteEvalAcquireOutcome::NoWork { replayed: true }
+                    // Replay the full recorded decision: a client only sees a
+                    // replay after losing the original response, so the
+                    // exhaustion cause must survive or the worker mistakes a
+                    // reset cursor for a drained queue.
+                    NoteEvalAcquireOutcome::NoWork {
+                        replayed: true,
+                        cycle_exhausted: decision == "no_work_exhausted",
+                    }
                 });
             }
             let Some((authority_generation, protocol_epoch)) =
@@ -17068,28 +17091,39 @@ impl McStore {
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
-            let Some((note_id, phase)) = select(&candidates) else {
-                let live: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM mc_note_eval_acquisitions
-                      WHERE project = ?1 AND decision <> ''",
-                    params![project],
-                    |row| row.get(0),
-                )?;
-                if live >= ledger_cap {
-                    return Ok(NoteEvalAcquireOutcome::Busy);
+            let (note_id, phase) = match select(&candidates) {
+                NoteEvalSelection::Claim { note_id, phase } => (note_id, phase),
+                NoteEvalSelection::NoWork { cycle_exhausted } => {
+                    let live: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM mc_note_eval_acquisitions
+                          WHERE project = ?1 AND decision <> ''",
+                        params![project],
+                        |row| row.get(0),
+                    )?;
+                    if live >= ledger_cap {
+                        return Ok(NoteEvalAcquireOutcome::Busy);
+                    }
+                    tx.execute(
+                        "INSERT INTO mc_note_eval_acquisitions(
+                             project, acquisition_id, decision, created_at_ms, expires_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            project,
+                            acquisition_id,
+                            if cycle_exhausted {
+                                "no_work_exhausted"
+                            } else {
+                                "no_work"
+                            },
+                            now_ms,
+                            now_ms + NOTE_EVAL_NO_WORK_RETENTION_MS
+                        ],
+                    )?;
+                    return Ok(NoteEvalAcquireOutcome::NoWork {
+                        replayed: false,
+                        cycle_exhausted,
+                    });
                 }
-                tx.execute(
-                    "INSERT INTO mc_note_eval_acquisitions(
-                         project, acquisition_id, decision, created_at_ms, expires_at)
-                     VALUES (?1, ?2, 'no_work', ?3, ?4)",
-                    params![
-                        project,
-                        acquisition_id,
-                        now_ms,
-                        now_ms + NOTE_EVAL_NO_WORK_RETENTION_MS
-                    ],
-                )?;
-                return Ok(NoteEvalAcquireOutcome::NoWork { replayed: false });
             };
             if !matches!(phase.as_str(), "compile" | "due" | "liveness" | "fallback") {
                 return Ok(NoteEvalAcquireOutcome::Invalid);
@@ -25149,8 +25183,22 @@ mod tests {
             .unwrap()
     }
 
-    fn pick_first(notes: &[NoteEvalCandidate]) -> Option<(i64, String)> {
-        notes.first().map(|note| (note.id, "due".to_string()))
+    fn pick_first(notes: &[NoteEvalCandidate]) -> NoteEvalSelection {
+        match notes.first() {
+            Some(note) => NoteEvalSelection::Claim {
+                note_id: note.id,
+                phase: "due".to_string(),
+            },
+            None => NoteEvalSelection::NoWork {
+                cycle_exhausted: false,
+            },
+        }
+    }
+
+    fn pick_none(_: &[NoteEvalCandidate]) -> NoteEvalSelection {
+        NoteEvalSelection::NoWork {
+            cycle_exhausted: false,
+        }
     }
 
     fn eval_reduced(note: &StoredNote, status: &str, now_ms: i64) -> NoteEvalReducedState {
@@ -25309,18 +25357,27 @@ mod tests {
                 1,
                 |notes| {
                     assert!(notes.is_empty());
-                    None
+                    pick_none(notes)
                 },
                 100,
             )
             .unwrap();
-        assert_eq!(outcome, NoteEvalAcquireOutcome::NoWork { replayed: false });
+        assert_eq!(
+            outcome,
+            NoteEvalAcquireOutcome::NoWork {
+                replayed: false,
+                cycle_exhausted: false
+            }
+        );
         eval_note(&store, "new work");
         assert_eq!(
             store
                 .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 1, pick_first, 200)
                 .unwrap(),
-            NoteEvalAcquireOutcome::NoWork { replayed: true },
+            NoteEvalAcquireOutcome::NoWork {
+                replayed: true,
+                cycle_exhausted: false
+            },
             "the durable decision wins over newly available work"
         );
         assert!(matches!(
@@ -25332,6 +25389,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn note_eval_exhausted_no_work_decision_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = note_eval_store(dir.path());
+        eval_note(&store, "hidden by a spent cursor");
+        // The caller classifies this pass as cursor-spent, not queue-empty.
+        let outcome = store
+            .acquire_note_evaluation(
+                EVAL_PROJECT,
+                "acq-1",
+                "eval-a",
+                0,
+                1,
+                |_| NoteEvalSelection::NoWork {
+                    cycle_exhausted: true,
+                },
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            NoteEvalAcquireOutcome::NoWork {
+                replayed: false,
+                cycle_exhausted: true
+            }
+        );
+        // A response-loss retry must reproduce the exhaustion cause, or the
+        // worker mistakes the reset cursor for a drained queue and strands the
+        // work the spent cursor hid.
+        assert_eq!(
+            store
+                .acquire_note_evaluation(EVAL_PROJECT, "acq-1", "eval-a", 0, 1, pick_first, 200)
+                .unwrap(),
+            NoteEvalAcquireOutcome::NoWork {
+                replayed: true,
+                cycle_exhausted: true
+            }
+        );
     }
 
     #[test]
@@ -25395,7 +25492,7 @@ mod tests {
         // One no-work acquisition, then one terminal claim.
         let idle_at = 1_000;
         store
-            .acquire_note_evaluation(EVAL_PROJECT, "idle-1", "eval-a", 0, 1, |_| None, idle_at)
+            .acquire_note_evaluation(EVAL_PROJECT, "idle-1", "eval-a", 0, 1, pick_none, idle_at)
             .unwrap();
         let claim = eval_claim(&store, "acq-1", 0, idle_at);
         store
@@ -25442,7 +25539,7 @@ mod tests {
                 "eval-a",
                 0,
                 1,
-                |_| None,
+                pick_none,
                 after_retention,
             )
             .unwrap();
@@ -25488,7 +25585,7 @@ mod tests {
                     "eval-a",
                     0,
                     1,
-                    |_| None,
+                    pick_none,
                     at,
                 )
                 .unwrap();
@@ -25656,12 +25753,15 @@ mod tests {
                     1,
                     |notes| {
                         assert!(notes.is_empty());
-                        None
+                        pick_none(notes)
                     },
                     300,
                 )
                 .unwrap(),
-            NoteEvalAcquireOutcome::NoWork { replayed: false }
+            NoteEvalAcquireOutcome::NoWork {
+                replayed: false,
+                cycle_exhausted: false
+            }
         );
     }
 
@@ -25986,12 +26086,15 @@ mod tests {
                     "eval-b",
                     0,
                     1,
-                    |_| None,
+                    pick_none,
                     20,
                     1
                 )
                 .unwrap(),
-            NoteEvalAcquireOutcome::NoWork { replayed: false }
+            NoteEvalAcquireOutcome::NoWork {
+                replayed: false,
+                cycle_exhausted: false
+            }
         );
         assert_eq!(
             store
@@ -26001,7 +26104,7 @@ mod tests {
                     "eval-b",
                     0,
                     1,
-                    |_| None,
+                    pick_none,
                     30,
                     1
                 )
@@ -26018,12 +26121,15 @@ mod tests {
                     "eval-b",
                     0,
                     1,
-                    |_| None,
+                    pick_none,
                     after_retention,
                     1
                 )
                 .unwrap(),
-            NoteEvalAcquireOutcome::NoWork { replayed: false },
+            NoteEvalAcquireOutcome::NoWork {
+                replayed: false,
+                cycle_exhausted: false
+            },
             "tombstoning the expired decision frees ledger capacity"
         );
         assert_eq!(
@@ -26034,7 +26140,7 @@ mod tests {
                     "eval-b",
                     0,
                     1,
-                    |_| None,
+                    pick_none,
                     after_retention + 1,
                     1
                 )

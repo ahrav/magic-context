@@ -1344,10 +1344,15 @@ mod tests {
                     0,
                     1,
                     |notes| {
-                        notes
-                            .iter()
-                            .find(|note| note.id == note_id)
-                            .map(|note| (note.id, "due".to_string()))
+                        notes.iter().find(|note| note.id == note_id).map_or(
+                            mc_store::NoteEvalSelection::NoWork {
+                                cycle_exhausted: false,
+                            },
+                            |note| mc_store::NoteEvalSelection::Claim {
+                                note_id: note.id,
+                                phase: "due".to_string(),
+                            },
+                        )
                     },
                     10,
                 )

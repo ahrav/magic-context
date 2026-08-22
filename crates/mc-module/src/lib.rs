@@ -77,11 +77,12 @@ use mc_store::{
     ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
     NoteCasOutcome, NoteConditionCompile, NoteEvalAbandonOutcome, NoteEvalAcquireOutcome,
     NoteEvalCandidate, NoteEvalClaim, NoteEvalCompleteOutcome, NoteEvalReducedState,
-    NoteEvalRenewOutcome, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
-    PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
-    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
-    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
-    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
+    NoteEvalRenewOutcome, NoteEvalSelection, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput,
+    PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
+    RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
+    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
+    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
+    LATEST_MIGRATION_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -11248,12 +11249,6 @@ impl McHandler {
         };
         let cycle = slot_cycle.clone();
         let mut proposed_cycle: Option<SmartNoteSelectionCycle> = None;
-        // Set when this poll found no work under the carried cursor but a fresh
-        // cursor over the same snapshot would have. That separates "this pass is
-        // spent" from "the queue is empty", which the caller cannot otherwise
-        // tell apart: a cursor left mid-cycle by a deadline-truncated drain
-        // would otherwise report the next drain's first poll as a drained queue.
-        let mut cycle_exhausted = false;
         match store.acquire_note_evaluation(
             &project,
             acquisition_id,
@@ -11270,21 +11265,28 @@ impl McHandler {
                 // and belong to the scheduled full-budget drain.
                 let selection =
                     select_smart_note_evaluation_cycle(&snapshots, now, retina_handoff, &cycle);
-                if selection.is_none() {
-                    // Selection is pure, so re-running it against a fresh cycle
-                    // only classifies this empty answer.
-                    cycle_exhausted = select_smart_note_evaluation_cycle(
-                        &snapshots,
-                        now,
-                        retina_handoff,
-                        &SmartNoteSelectionCycle::new(mode),
-                    )
-                    .is_some();
+                match selection {
+                    Some((note_id, phase, next_cycle)) => {
+                        proposed_cycle = Some(next_cycle);
+                        NoteEvalSelection::Claim { note_id, phase }
+                    }
+                    // An empty answer has two causes the caller cannot tell
+                    // apart: this pass is spent, or the queue is empty. A
+                    // cursor left mid-cycle by a deadline-truncated drain would
+                    // otherwise report the next drain's first poll as a drained
+                    // queue. Selection is pure, so re-running it against a
+                    // fresh cycle only classifies this empty answer; the store
+                    // persists the cause so a response-loss replay repeats it.
+                    None => NoteEvalSelection::NoWork {
+                        cycle_exhausted: select_smart_note_evaluation_cycle(
+                            &snapshots,
+                            now,
+                            retina_handoff,
+                            &SmartNoteSelectionCycle::new(mode),
+                        )
+                        .is_some(),
+                    },
                 }
-                selection.map(|(note_id, phase, next_cycle)| {
-                    proposed_cycle = Some(next_cycle);
-                    (note_id, phase)
-                })
             },
             now,
         ) {
@@ -11312,18 +11314,14 @@ impl McHandler {
                             *slot_cycle = next_cycle;
                         }
                     }
-                    NoteEvalAcquireOutcome::NoWork { replayed: false } => {
+                    NoteEvalAcquireOutcome::NoWork {
+                        replayed: false, ..
+                    } => {
+                        // A fresh no_work resets this mode's cursor; when the
+                        // decision carries cycle_exhausted the response tells
+                        // the client to poll again and reach the work the
+                        // spent cursor hid.
                         *slot_cycle = SmartNoteSelectionCycle::new(mode);
-                        if cycle_exhausted {
-                            // The reset above already installed a fresh cursor,
-                            // so the client may poll again and reach the work
-                            // this spent cursor hid.
-                            return respond(json!({
-                                "result": "no_work",
-                                "replayed": false,
-                                "cycle_exhausted": true,
-                            }));
-                        }
                     }
                     _ => {}
                 }
@@ -13828,8 +13826,18 @@ fn note_evaluation_acquire_response(outcome: NoteEvalAcquireOutcome) -> HandlerO
                 "check_false_since_at": note.check_false_since_at,
             },
         })),
-        NoteEvalAcquireOutcome::NoWork { replayed } => {
-            respond(json!({ "result": "no_work", "replayed": replayed }))
+        NoteEvalAcquireOutcome::NoWork {
+            replayed,
+            cycle_exhausted,
+        } => {
+            let mut body = json!({ "result": "no_work", "replayed": replayed });
+            if cycle_exhausted {
+                // The cursor, not the queue, ended this pass; the client may
+                // poll again. Durable in the acquisition ledger, so replays
+                // repeat it to clients that lost the original response.
+                body["cycle_exhausted"] = json!(true);
+            }
+            respond(body)
         }
         NoteEvalAcquireOutcome::Expired => respond(json!({ "result": "expired" })),
         NoteEvalAcquireOutcome::Terminal { kind, response } => respond(json!({
@@ -23489,8 +23497,11 @@ mod tests {
         assert_eq!(recovered["phase"], "due");
         assert_eq!(recovered["note_id"], json!(due_notes[10].id));
 
-        // A replay of the exhausted decision stays a plain replayed no_work: it
-        // must not re-announce a reset the client already consumed.
+        // The exhaustion cause is durable: a client only replays an
+        // acquisition after losing the original response, so the replay must
+        // repeat cycle_exhausted or the worker mistakes the reset cursor for a
+        // drained queue. Repeated cycle_exhausted answers are safe — the drain
+        // consumes at most one before claiming.
         let replayed = call_dispatch_request(
             &handler,
             note_evaluation_next_body(&token, generation, "eval-a", "acq-spent"),
@@ -23498,7 +23509,7 @@ mod tests {
         .await;
         assert_eq!(replayed["result"], "no_work");
         assert_eq!(replayed["replayed"], json!(true));
-        assert_eq!(replayed["cycle_exhausted"], Value::Null);
+        assert_eq!(replayed["cycle_exhausted"], json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]
