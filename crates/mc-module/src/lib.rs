@@ -59,9 +59,9 @@ use mc_store::MEMORY_VISIBILITY_MUTATION_CATEGORY;
 use tokio::sync::Notify;
 
 use crate::smart_note_evaluation::{
-    is_valid_smart_note_cron, reduce_smart_note_evaluation, select_next_smart_note_evaluation,
-    select_nonbillable_smart_note_evaluation, CheckOutcome, CompileOutcome, CompiledCheckArtifact,
-    FallbackOutcome, SmartNoteEvaluationOutcome, SmartNoteLifecycleState,
+    is_valid_smart_note_cron, reduce_smart_note_evaluation, select_smart_note_evaluation_cycle,
+    CheckOutcome, CompileOutcome, CompiledCheckArtifact, FallbackOutcome, SmartNoteCycleMode,
+    SmartNoteEvaluationOutcome, SmartNoteLifecycleState, SmartNoteSelectionCycle,
     SmartNoteSelectionSnapshot,
 };
 use chrono::{Local, TimeZone};
@@ -3085,6 +3085,39 @@ struct NoteEvaluatorRegistration {
     retina_handoff: bool,
     wake_owned: bool,
     expires_at: i64,
+    /// Boot-ephemeral fair-selection cycles, one pair per evaluator slot,
+    /// shared through `Arc` so cloned validation results observe one live
+    /// state. The allocation disappears with the registration entry
+    /// (unregister, expiry, replacement, route teardown, process restart), so
+    /// scheduling state never outlives the registration that owns it.
+    slot_cycles: Arc<Vec<Mutex<NoteEvaluatorSlotCycles>>>,
+}
+
+/// Independent full and nonbillable selection cycles for one evaluator slot.
+/// The per-slot mutex serializes conflicting `next` requests for that slot
+/// across proposal, store outcome, and commit; other slots and registrations
+/// stay independent, and the guard is never held across an `.await`.
+#[derive(Debug)]
+struct NoteEvaluatorSlotCycles {
+    full: SmartNoteSelectionCycle,
+    nonbillable: SmartNoteSelectionCycle,
+}
+
+impl NoteEvaluatorSlotCycles {
+    fn new() -> Self {
+        Self {
+            full: SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full),
+            nonbillable: SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable),
+        }
+    }
+}
+
+fn new_note_evaluator_slot_cycles(capacity: i64) -> Arc<Vec<Mutex<NoteEvaluatorSlotCycles>>> {
+    Arc::new(
+        (0..capacity)
+            .map(|_| Mutex::new(NoteEvaluatorSlotCycles::new()))
+            .collect(),
+    )
 }
 
 #[async_trait]
@@ -11003,6 +11036,7 @@ impl McHandler {
                 retina_handoff,
                 wake_owned,
                 expires_at,
+                slot_cycles: new_note_evaluator_slot_cycles(capacity),
             });
         }
         respond(json!({
@@ -11196,6 +11230,24 @@ impl McHandler {
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
         };
+        // Fair-cycle ownership (KTD2/KTD3): hold only this slot's lock across
+        // the synchronous store acquisition so conflicting polls for one slot
+        // serialize while other slots and registrations proceed. The cycle
+        // advances only on fresh durable outcomes classified below.
+        let mode = if exclude_billable {
+            SmartNoteCycleMode::Nonbillable
+        } else {
+            SmartNoteCycleMode::Full
+        };
+        let mut slot_cycles = registration.slot_cycles[evaluator_slot as usize]
+            .lock()
+            .expect("note evaluator slot cycle mutex");
+        let slot_cycle = match mode {
+            SmartNoteCycleMode::Full => &mut slot_cycles.full,
+            SmartNoteCycleMode::Nonbillable => &mut slot_cycles.nonbillable,
+        };
+        let cycle = slot_cycle.clone();
+        let mut proposed_cycle: Option<SmartNoteSelectionCycle> = None;
         match store.acquire_note_evaluation(
             &project,
             acquisition_id,
@@ -11207,19 +11259,40 @@ impl McHandler {
                     .iter()
                     .map(smart_note_selection_snapshot)
                     .collect();
-                if exclude_billable {
-                    // The per-tick maintenance drain runs only sandbox
-                    // phases; handing it a compile or fallback claim would
-                    // force a claim-and-abandon round per tick and block
-                    // liveness behind the strict phase priority.
-                    select_nonbillable_smart_note_evaluation(&snapshots, now, retina_handoff)
-                } else {
-                    select_next_smart_note_evaluation(&snapshots, now, retina_handoff)
-                }
+                // The nonbillable cycle exposes only the sandbox phases (due,
+                // liveness); compile and fallback claims launch LLM prompts
+                // and belong to the scheduled full-budget drain.
+                select_smart_note_evaluation_cycle(&snapshots, now, retina_handoff, &cycle).map(
+                    |(note_id, phase, next_cycle)| {
+                        proposed_cycle = Some(next_cycle);
+                        (note_id, phase)
+                    },
+                )
             },
             now,
         ) {
-            Ok(outcome) => note_evaluation_acquire_response(outcome),
+            Ok(outcome) => {
+                // Commit the tentative cursor only after the store commits a
+                // fresh decision: a fresh claim installs the proposal and a
+                // fresh no_work resets this mode's cycle. Replayed claims,
+                // recovered slot claims, replayed no_work, busy, expiry,
+                // terminal replay, invalid identity, and authority change all
+                // leave both cycles untouched.
+                match &outcome {
+                    NoteEvalAcquireOutcome::Claim {
+                        replayed: false, ..
+                    } => {
+                        if let Some(next_cycle) = proposed_cycle {
+                            *slot_cycle = next_cycle;
+                        }
+                    }
+                    NoteEvalAcquireOutcome::NoWork { replayed: false } => {
+                        *slot_cycle = SmartNoteSelectionCycle::new(mode);
+                    }
+                    _ => {}
+                }
+                note_evaluation_acquire_response(outcome)
+            }
             Err(error) => HandlerOutcome::Error {
                 code: "note_store_failed".to_string(),
                 message: error.to_string(),
@@ -13668,6 +13741,7 @@ fn smart_note_selection_snapshot(note: &NoteEvalCandidate) -> SmartNoteSelection
         compile_status: note.compile_status.clone(),
         created_at: note.created_at_ms,
         has_compiled_check: note.has_compiled_check,
+        last_checked_at: note.last_checked_at,
         check_status: note
             .check_status
             .clone()
@@ -23034,6 +23108,506 @@ mod tests {
         .await;
         assert_eq!(claim["result"], "claim");
         assert_eq!(claim["note_id"], json!(note.id));
+    }
+
+    /// Compiled, on-policy, already-due staging for the cycle tests. The
+    /// distinct `check_next_due_at` values order due selection by insertion.
+    fn stage_due_note(store: &McStore, project: &str, route_root: &str, due_at: i64) -> StoredNote {
+        let note = insert_conditioned_note(store, project, route_root, "when evaluated", None);
+        store
+            .execute_tag_sql_for_test(&format!(
+                "UPDATE mc_notes SET compiled_check = 'function check() {{}}',
+                    manifest_json = '{{}}', check_hash = 'hash', check_status = 'compiled',
+                    check_version = 1, policy_version = 1, check_next_due_at = {due_at},
+                    compiled_source_revision = source_revision,
+                    compiled_project_path = project_path
+                  WHERE id = {}",
+                note.id
+            ))
+            .unwrap();
+        note
+    }
+
+    /// Fallback staging. A far-future `check_next_due_at` mirrors the backoff
+    /// a third compilation failure records and keeps this artifact-less row
+    /// out of the compile predicate.
+    fn stage_fallback_note(
+        store: &McStore,
+        project: &str,
+        route_root: &str,
+        last_checked_at: Option<i64>,
+    ) -> StoredNote {
+        let note = insert_conditioned_note(store, project, route_root, "when evaluated", None);
+        let last_checked = last_checked_at
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "NULL".to_string());
+        store
+            .execute_tag_sql_for_test(&format!(
+                "UPDATE mc_notes SET check_status = 'fallback', check_failure_count = 3,
+                    check_next_due_at = 9999999999999, last_checked_at = {last_checked}
+                  WHERE id = {}",
+                note.id
+            ))
+            .unwrap();
+        note
+    }
+
+    async fn complete_note_claim(
+        handler: &McHandler,
+        token: &str,
+        generation: i64,
+        claim_id: &str,
+        phase: &str,
+    ) -> Value {
+        call_dispatch_request(
+            handler,
+            json!({
+                "method": "note.evaluation.complete",
+                "v": 2,
+                "token": token,
+                "registration_generation": generation,
+                "evaluator_instance": "eval-a",
+                "evaluator_slot": 0,
+                "claim_id": claim_id,
+                "completion_id": format!("comp-{claim_id}"),
+                "outcome": { "phase": phase, "kind": "false" },
+            }),
+        )
+        .await
+    }
+
+    /// Live full and nonbillable cycle state for one registration slot.
+    fn note_evaluator_slot_cycles(
+        handler: &McHandler,
+        project: &str,
+        instance: &str,
+        slot: usize,
+    ) -> (SmartNoteSelectionCycle, SmartNoteSelectionCycle) {
+        let registrations = handler
+            .note_evaluator_registrations
+            .lock()
+            .expect("note evaluator registrations mutex");
+        let entry = registrations
+            .get(project)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.evaluator_instance == instance)
+            })
+            .expect("live registration");
+        let cycles = entry.slot_cycles[slot]
+            .lock()
+            .expect("note evaluator slot cycle mutex");
+        (cycles.full.clone(), cycles.nonbillable.clone())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_full_cycle_bounds_due_claims_before_compile() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        let due_notes: Vec<StoredNote> = (0..12)
+            .map(|i| stage_due_note(&store, &identity, &route_root, i + 1))
+            .collect();
+        let compile_note =
+            insert_conditioned_note(&store, &identity, &route_root, "when evaluated", None);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        // Ten fresh due claims consume the due quota in due order; the 11th
+        // fresh opportunity reaches compile even though due work remains.
+        for (i, expected) in due_notes.iter().take(10).enumerate() {
+            let claim = call_dispatch_request(
+                &handler,
+                note_evaluation_next_body(&token, generation, "eval-a", &format!("acq-{i}")),
+            )
+            .await;
+            assert_eq!(claim["result"], "claim", "due claim {i}");
+            assert_eq!(claim["phase"], "due", "due claim {i}");
+            assert_eq!(claim["note_id"], json!(expected.id), "due claim {i}");
+            let completed = complete_note_claim(
+                &handler,
+                &token,
+                generation,
+                claim["claim_id"].as_str().unwrap(),
+                "due",
+            )
+            .await;
+            assert_eq!(completed["result"], "applied", "due completion {i}");
+        }
+        let eleventh = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-10"),
+        )
+        .await;
+        assert_eq!(eleventh["result"], "claim");
+        assert_eq!(eleventh["phase"], "compile");
+        assert_eq!(eleventh["note_id"], json!(compile_note.id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_replayed_and_recovered_claims_leave_cycles_unchanged() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        stage_due_note(&store, &identity, &route_root, 1);
+        stage_due_note(&store, &identity, &route_root, 2);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let fresh = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(fresh["result"], "claim");
+        assert_eq!(fresh["replayed"], json!(false));
+        let after_fresh = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
+        assert_ne!(
+            after_fresh.0,
+            SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full),
+            "a fresh claim advances the full cycle"
+        );
+
+        // Replaying the same acquisition returns the same claim and does not
+        // consume a second quota position.
+        let replay = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(replay["result"], "claim");
+        assert_eq!(replay["replayed"], json!(true));
+        assert_eq!(replay["claim_id"], fresh["claim_id"]);
+        assert_eq!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
+            after_fresh
+        );
+
+        // A new acquisition on the same slot recovers the active claim
+        // instead of selecting fresh work; the cycle stays put.
+        let recovered = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
+        )
+        .await;
+        assert_eq!(recovered["result"], "claim");
+        assert_eq!(recovered["replayed"], json!(true));
+        assert_eq!(recovered["claim_id"], fresh["claim_id"]);
+        assert_eq!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
+            after_fresh
+        );
+
+        // A billable claim recovered by a nonbillable poll must not charge
+        // the nonbillable cycle either; the worker abandons it client-side.
+        let mut nonbillable = note_evaluation_next_body(&token, generation, "eval-a", "acq-3");
+        nonbillable["exclude_billable"] = json!(true);
+        let cross_mode = call_dispatch_request(&handler, nonbillable).await;
+        assert_eq!(cross_mode["result"], "claim");
+        assert_eq!(cross_mode["replayed"], json!(true));
+        assert_eq!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
+            after_fresh
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_fresh_no_work_resets_and_replayed_no_work_does_not() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        stage_due_note(&store, &identity, &route_root, 1);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(claim["result"], "claim");
+        complete_note_claim(
+            &handler,
+            &token,
+            generation,
+            claim["claim_id"].as_str().unwrap(),
+            "due",
+        )
+        .await;
+
+        // The queue is now empty, so a fresh durable no_work ends the cycle
+        // and resets it to the initial full profile.
+        let no_work = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
+        )
+        .await;
+        assert_eq!(no_work["result"], "no_work");
+        assert_eq!(no_work["replayed"], json!(false));
+        let (full, nonbillable) = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
+        assert_eq!(full, SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full));
+        assert_eq!(
+            nonbillable,
+            SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable)
+        );
+
+        // Advance the new cycle by one fresh claim, then replay the earlier
+        // no_work decision: the replay must not reset the advanced cycle.
+        stage_due_note(&store, &identity, &route_root, 2);
+        let next_claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-3"),
+        )
+        .await;
+        assert_eq!(next_claim["result"], "claim");
+        assert_eq!(next_claim["replayed"], json!(false));
+        let advanced = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
+        let replayed_no_work = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
+        )
+        .await;
+        assert_eq!(replayed_no_work["result"], "no_work");
+        assert_eq!(replayed_no_work["replayed"], json!(true));
+        assert_eq!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
+            advanced
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_cycles_are_independent_per_slot_and_mode() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        for i in 0..3 {
+            stage_due_note(&store, &identity, &route_root, i + 1);
+        }
+        // The registration helper registers capacity 2, so slot 1 is live.
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let full_claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-full"),
+        )
+        .await;
+        assert_eq!(full_claim["result"], "claim");
+        complete_note_claim(
+            &handler,
+            &token,
+            generation,
+            full_claim["claim_id"].as_str().unwrap(),
+            "due",
+        )
+        .await;
+        let (full, nonbillable) = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
+        assert_ne!(full, SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full));
+        assert_eq!(
+            nonbillable,
+            SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable),
+            "a full claim leaves the nonbillable cycle untouched"
+        );
+
+        let mut nonbillable_body =
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-nb");
+        nonbillable_body["exclude_billable"] = json!(true);
+        let nonbillable_claim = call_dispatch_request(&handler, nonbillable_body).await;
+        assert_eq!(nonbillable_claim["result"], "claim");
+        assert_eq!(nonbillable_claim["replayed"], json!(false));
+        let (full_after, nonbillable_after) =
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
+        assert_eq!(
+            full_after, full,
+            "a nonbillable claim leaves the full cycle untouched"
+        );
+        assert_ne!(
+            nonbillable_after,
+            SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable)
+        );
+
+        let slot_one = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 1);
+        assert_eq!(
+            slot_one,
+            (
+                SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full),
+                SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable)
+            ),
+            "slot 1 owns its own initial cycles"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_replacement_registration_discards_cycle_state() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        stage_due_note(&store, &identity, &route_root, 1);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(claim["result"], "claim");
+        assert_ne!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0).0,
+            SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full)
+        );
+
+        // A replacement registration starts from the initial profile, and the
+        // durable claim recovered on it replays without charging that fresh
+        // cycle.
+        let (new_generation, new_token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+        let initial = (
+            SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full),
+            SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable),
+        );
+        assert_eq!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
+            initial
+        );
+        let recovered = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&new_token, new_generation, "eval-a", "acq-2"),
+        )
+        .await;
+        assert_eq!(recovered["result"], "claim");
+        assert_eq!(recovered["replayed"], json!(true));
+        assert_eq!(recovered["claim_id"], claim["claim_id"]);
+        assert_eq!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
+            initial
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_authority_change_leaves_cycles_unchanged() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        stage_due_note(&store, &identity, &route_root, 1);
+        stage_due_note(&store, &identity, &route_root, 2);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        let claim = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-1"),
+        )
+        .await;
+        assert_eq!(claim["result"], "claim");
+        complete_note_claim(
+            &handler,
+            &token,
+            generation,
+            claim["claim_id"].as_str().unwrap(),
+            "due",
+        )
+        .await;
+        let advanced = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
+
+        store
+            .authority_begin_drain("ctx-eval", &identity, "notes", "lease", 1_000_000, now_ms())
+            .unwrap();
+        // Draining authority rejects the poll, leaving the cycle unchanged.
+        let handover = handler
+            .dispatch_value(
+                7,
+                note_evaluation_next_body(&token, generation, "eval-a", "acq-2"),
+            )
+            .await;
+        assert_eq!(error_code(handover), "authority_draining");
+        assert_eq!(
+            note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
+            advanced,
+            "an authority handover neither advances nor resets the cycle"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_fallback_rotates_before_reclaiming_checked_notes() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        let checked = stage_fallback_note(&store, &identity, &route_root, Some(5_000));
+        let unchecked_a = stage_fallback_note(&store, &identity, &route_root, None);
+        let unchecked_b = stage_fallback_note(&store, &identity, &route_root, None);
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        // Unchecked notes come first (id order), then the checked note; false
+        // completions keep every note eligible, so this sequence proves both
+        // the last_checked_at projection and the in-cycle exclusion.
+        for (i, expected) in [&unchecked_a, &unchecked_b, &checked].iter().enumerate() {
+            let claim = call_dispatch_request(
+                &handler,
+                note_evaluation_next_body(&token, generation, "eval-a", &format!("acq-{i}")),
+            )
+            .await;
+            assert_eq!(claim["result"], "claim", "fallback claim {i}");
+            assert_eq!(claim["phase"], "fallback", "fallback claim {i}");
+            assert_eq!(claim["note_id"], json!(expected.id), "fallback claim {i}");
+            let completed = complete_note_claim(
+                &handler,
+                &token,
+                generation,
+                claim["claim_id"].as_str().unwrap(),
+                "fallback",
+            )
+            .await;
+            assert_eq!(completed["result"], "applied", "fallback completion {i}");
+        }
+
+        // Every note is still eligible, but the fallback quota is spent:
+        // quota exhaustion now yields authority-side no_work instead of an
+        // over-cap claim the worker would have to abandon.
+        let exhausted = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-3"),
+        )
+        .await;
+        assert_eq!(exhausted["result"], "no_work");
+        assert_eq!(exhausted["replayed"], json!(false));
     }
 
     #[tokio::test(flavor = "current_thread")]

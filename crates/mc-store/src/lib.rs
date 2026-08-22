@@ -16714,7 +16714,7 @@ const NOTE_EVAL_CLAIM_COLUMNS: &str = "claim_id, note_id, phase, acquisition_id,
 /// the single note that wins selection.
 const NOTE_EVAL_CANDIDATE_COLUMNS: &str = "id, status, compile_status, created_at_ms, \
     compiled_check IS NOT NULL, check_status, check_quarantined_until, check_next_due_at, \
-    check_false_since_at, check_last_liveness_at, policy_version";
+    check_false_since_at, check_last_liveness_at, policy_version, last_checked_at";
 
 /// One pending smart note as seen by the work selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16730,6 +16730,7 @@ pub struct NoteEvalCandidate {
     pub check_false_since_at: Option<i64>,
     pub check_last_liveness_at: Option<i64>,
     pub policy_version: Option<i64>,
+    pub last_checked_at: Option<i64>,
 }
 
 fn note_eval_candidate_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteEvalCandidate> {
@@ -16745,6 +16746,7 @@ fn note_eval_candidate_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteE
         check_false_since_at: r.get(8)?,
         check_last_liveness_at: r.get(9)?,
         policy_version: r.get(10)?,
+        last_checked_at: r.get(11)?,
     })
 }
 

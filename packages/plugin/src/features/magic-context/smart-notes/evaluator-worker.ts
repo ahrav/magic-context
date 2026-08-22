@@ -352,6 +352,13 @@ export class SmartNoteEvaluatorWorker {
      * Zero-wait drain: poll for Rust-selected work until the authority reports
      * no_work, the deadline passes, or the signal aborts.
      *
+     * Normal phase fairness lives in the authority: each (registration, slot,
+     * mode) owns a bounded selection cycle (full 10/5/3/3 across
+     * due/compile/liveness/fallback; nonbillable 10/10 across due/liveness),
+     * and a fresh `no_work` marks that cycle's boundary rather than a globally
+     * empty queue. The client-side caps below are defensive backstops for
+     * recovered claims and malformed authorities, not the fairness mechanism.
+     *
      * `excludeBillable` asks the authority for sandbox-only phases (due,
      * liveness); compile and fallback claims launch LLM prompts and belong to
      * the scheduled full-budget drain. `maxCompilePerRun`/`maxFallbackPerRun`
@@ -398,16 +405,16 @@ export class SmartNoteEvaluatorWorker {
         if (!this.registration) {
             if (!(await this.register(args.signal))) return result;
         }
-        // A false fallback confirmation leaves the note pending with
-        // check_status='fallback', and fallback selection has no next-due gate,
-        // so the authority re-selects the same note on the very next poll. One
-        // confirmation prompt per note per drain bounds the billable loop.
+        // The authority's fallback cycle already excludes notes it claimed in
+        // this cycle, so a healthy drain never sees a repeat. A repeat can
+        // still arrive from a recovered claim or a malformed authority; one
+        // confirmation prompt per note per drain bounds that billable loop.
         const fallbackAttempted = new Set<number>();
-        // The authority's per-poll selection caps only truncate one candidate
-        // list; each subsequent poll admits the next note. Enforce the same
-        // caps across the whole drain so one pass launches at most
+        // Authority-side quota exhaustion returns no_work before these caps
+        // bind; they survive as backstops so a recovered billable claim or a
+        // malformed authority still cannot launch more than
         // MAX_COMPILE_PER_RUN compiler prompts and MAX_FALLBACK_PER_RUN
-        // confirmation prompts, matching the legacy sweep's per-run bounds.
+        // confirmation prompts in one pass.
         let compileClaims = 0;
         let fallbackClaims = 0;
         const maxCompile = args.maxCompilePerRun ?? MAX_COMPILE_PER_RUN;
@@ -416,6 +423,8 @@ export class SmartNoteEvaluatorWorker {
             if (this.disposed || args.signal?.aborted || Date.now() >= args.deadline) break;
             const next = await this.next(args.signal, args.excludeBillable === true);
             if (next === "no_work") {
+                // A fresh no_work is this mode's cycle boundary, not proof the
+                // global queue is empty; the next drain starts a new cycle.
                 result.drained = true;
                 break;
             }
@@ -448,10 +457,10 @@ export class SmartNoteEvaluatorWorker {
                 }
             }
             if (next.snapshot.phase === "fallback") {
-                // Re-selection of an already-attempted note ends the drain (the
-                // authority's fallback selection is deterministic, so releasing
-                // and polling again would hand the same note back forever); it
-                // must not consume a fallback budget slot first.
+                // Re-selection of an already-attempted note within one drain
+                // means the authority is not honoring its in-cycle fallback
+                // exclusion (or a recovered claim replayed); end the drain
+                // without consuming a fallback budget slot.
                 if (fallbackAttempted.has(next.noteId)) {
                     this.lastAbandonReleased = await this.abandon(
                         next.claimId,
