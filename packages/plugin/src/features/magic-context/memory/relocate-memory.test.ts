@@ -4,17 +4,19 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { inspectClaimsBackfillReconciliation } from "../claims-backfill";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { computeNormalizedHash } from "./normalize-hash";
 import {
     copyMemoriesToProject,
     moveMemoriesToProject,
     rekeyMemoryRowWithCollisionMerge,
     selectRelocatableMemoryIds,
 } from "./relocate-memory";
-import { deleteMemory, insertMemory } from "./storage-memory";
+import { deleteMemory, insertMemory, updateMemoryContent } from "./storage-memory";
 import {
     computeClaimRequestDigest,
     getCurrentMemoryClaimByLegacyMemoryId,
     memoryClaimSupersessionExists,
+    readCurrentClaimSemanticState,
     readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
     setMemoryStatusWithClaimsInCurrentTransaction,
@@ -471,13 +473,150 @@ describe("relocate-memory claims (v84)", () => {
                     `SELECT phase, item_kind, reason_code, disposition
                        FROM claim_backfill_failures WHERE item_key = ?`,
                 )
-                .get(`memory:${unadoptable}:supersession-repoint:${source.id}`),
+                .get(`memory:${unadoptable}:relations:repoint:${source.id}`),
         ).toEqual({
             phase: "relationships",
             item_kind: "supersession",
             reason_code: "empty-content",
             disposition: "blocking",
         });
+    });
+
+    test("a stranded repoint diagnostic resolves once the repaired referrer is linked and translated", () => {
+        const database = makeDb();
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "moving fact",
+        });
+        const unadoptable = insertUnlinkedMemory(database, "git:project-a", "", "empty-h1");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?")
+                .run(source.id, unadoptable);
+        });
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+        inTransaction(database, () =>
+            moveMemoriesToProject(database, [source.id], "git:project-a", "git:project-b"),
+        );
+        const diagnosticKey = `memory:${unadoptable}:relations:repoint:${source.id}`;
+        expect(
+            database
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(diagnosticKey),
+        ).toEqual({ disposition: "blocking" });
+
+        // The content rewrite repairs the empty referrer, so the kernel
+        // adopts it inside the same operation.
+        updateMemoryContent(
+            database,
+            unadoptable,
+            "repaired pointing fact",
+            computeNormalizedHash("repaired pointing fact"),
+        );
+        expect(readMemoryClaimLink(database, unadoptable)).not.toBeNull();
+        // The next relationship translation of the linked referrer snapshots
+        // its lineage and resolves every stale key under the row's
+        // `relations:` namespace — the repoint diagnostic included.
+        runInMemoryClaimsWriteTransaction(database, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                database,
+                {
+                    producer: "relocate-test",
+                    operationKey: "touch-referrer",
+                    requestDigest: computeClaimRequestDigest({ unadoptable }),
+                },
+                { memoryId: unadoptable, status: "active" },
+            ),
+        );
+        expect(
+            database
+                .prepare(
+                    "SELECT disposition, reason_code AS reasonCode FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(diagnosticKey),
+        ).toEqual({ disposition: "resolved", reasonCode: "relationship-source-replaced" });
+    });
+
+    test("a referrer first adopted by the repoint loop reactivates an archived canonical claim and carries verification", () => {
+        const database = makeDb();
+        // Archive the canonical claim owning the referrer's
+        // (project, category, hash) tuple via a claims delete.
+        const equivalent = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "pointing fact",
+        });
+        deleteMemory(database, equivalent.id);
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "moving fact",
+        });
+        const referrer = insertUnlinkedMemory(
+            database,
+            "git:project-a",
+            "pointing fact",
+            computeNormalizedHash("pointing fact"),
+        );
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?")
+                .run(source.id, referrer);
+            // Pre-v84 TypeScript verification writes only the side table.
+            database
+                .prepare(
+                    "INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, 'src/x.ts', 5, 5)",
+                )
+                .run(referrer);
+        });
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+
+        inTransaction(database, () =>
+            moveMemoriesToProject(database, [source.id], "git:project-a", "git:project-b"),
+        );
+
+        const link = readMemoryClaimLink(database, referrer);
+        if (!link) throw new Error("expected the repoint loop to adopt the referrer");
+        // Dedup adoption reuses the equivalent's archived canonical claim;
+        // the adopted-claim sync re-derives the state from the live referrer
+        // row and carries its verification onto the claim as evidence.
+        expect(readCurrentClaimSemanticState(database, link.claimId).state).toBe("active");
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS c FROM verification_events ve
+                      JOIN claim_revisions cr ON cr.id = ve.revision_id
+                     WHERE cr.claim_id = ? AND ve.outcome = 'verified'`,
+                )
+                .get(link.claimId),
+        ).toEqual({ c: 1 });
+        expect(
+            database
+                .prepare(
+                    `SELECT effect_key AS effectKey, effect_type AS effectType
+                       FROM claim_change_outbox
+                      WHERE effect_key IN (?, ?, ?)
+                      ORDER BY effect_key`,
+                )
+                .all(
+                    `memory:${referrer}:upsert`,
+                    `memory:${referrer}:lifecycle`,
+                    `memory:${referrer}:evidence`,
+                ),
+        ).toEqual([
+            { effectKey: `memory:${referrer}:evidence`, effectType: "evidence" },
+            { effectKey: `memory:${referrer}:lifecycle`, effectType: "lifecycle" },
+            { effectKey: `memory:${referrer}:upsert`, effectType: "upsert" },
+        ]);
     });
 
     test("a boundary referrer first adopted by the repoint loop gets its upsert outbox effect", () => {

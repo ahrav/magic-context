@@ -1338,6 +1338,53 @@ describe("project identity merge claims (v84)", () => {
         });
     });
 
+    test("a collision merge skips an unlinked lineage-bearing claim-invalid source instead of aborting", () => {
+        const database = makeDb();
+        const targetId = insertMemory(database, "git:new", "colliding target fact", "coll-h1");
+        const sourceId = insertMemory(database, "dir:old", "colliding source fact", "coll-h1");
+        const healthyId = insertMemory(database, "dir:old", "healthy fact", "healthy-coll-h1");
+        // Schema-legal but claim-invalid (`memories` has no CHECK on
+        // importance) plus lineage: the collision archive would rewrite the
+        // source's lineage columns with no relationship snapshot to satisfy
+        // the v84 relationship guard, aborting the whole merge.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET importance = 0, merged_from = 'legacy' WHERE id = ?")
+                .run(sourceId);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 70 });
+
+        // The healthy row rekeys and links; the colliding source stays live
+        // under the source identity with a blocking diagnostic instead of
+        // being archived into the unadoptable-shaped merge.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(healthyId),
+        ).toEqual({ project_path: "git:new" });
+        expect(readMemoryClaimLink(database, healthyId)).not.toBeNull();
+        expect(
+            database
+                .prepare(
+                    "SELECT project_path, status, superseded_by_memory_id AS s FROM memories WHERE id = ?",
+                )
+                .get(sourceId),
+        ).toEqual({ project_path: "dir:old", status: "active", s: null });
+        expect(readMemoryClaimLink(database, sourceId)).toBeNull();
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${sourceId}:collision-merge:${targetId}`),
+        ).toEqual({
+            phase: "relationships",
+            item_kind: "merge",
+            reason_code: "invalid-importance",
+            disposition: "blocking",
+        });
+    });
+
     test("a generic rekey routes an unadoptable lineage-bearing row to a diagnostic instead of aborting", () => {
         const database = makeDb();
         const adoptableId = insertMemory(database, "dir:old", "movable fact", "move-h1");

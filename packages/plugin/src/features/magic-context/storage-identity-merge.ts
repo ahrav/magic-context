@@ -265,6 +265,20 @@ function adoptIdentityMergeRowClaims(
         recordSkippedCollisionMergeDiagnostic(db, sourceId, collisionTargetId, targetFailure);
         return false;
     }
+    if (
+        sourceFailure !== null &&
+        readMemoryClaimLink(db, sourceId) === null &&
+        rekeyTripsRelationshipGuard(db, sourceId)
+    ) {
+        // The caller's collision archive rewrites the source row's lineage
+        // columns, and the v84 relationship guard demands a snapshot of the
+        // pre-archive lineage. An unlinked unadoptable source can never
+        // acquire the crosswalk link relationship translation requires, so
+        // the snapshot cannot exist and the archive UPDATE would abort the
+        // whole merge. Skip the row with a blocking diagnostic instead.
+        recordSkippedCollisionMergeDiagnostic(db, sourceId, collisionTargetId, sourceFailure);
+        return false;
+    }
     // Adoption derives the canonical claim's lifecycle from the target row's
     // status, and a NULL status derives archived. The survivor is live by
     // contract, so the status normalizes to 'active' — after the adoption

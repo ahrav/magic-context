@@ -1359,6 +1359,77 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         ]);
     });
 
+    test("a no-op status write adopting an unlinked boundary row still emits its first-adoption upsert", () => {
+        const db = track(v82DatabaseWithRows(["boundary status fact"]));
+        const memoryId = (db.prepare("SELECT id FROM memories LIMIT 1").get() as { id: number }).id;
+        expect(readMemoryClaimLink(db, memoryId)).toBeNull();
+
+        // active → active transitions nothing, but the adoption below
+        // creates the claim and crosswalk inside this operation — a commit
+        // with zero outbox rows would leave the crosswalk permanently
+        // unreconciled.
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("status-boundary-noop", { id: memoryId }),
+                { memoryId, status: "active", nowMs: 8_000 },
+            ),
+        );
+
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(readMemoryClaimLink(db, memoryId)?.claimId).toBe(outcome.result.claimId as number);
+        expect(count(db, "verification_events")).toBe(0);
+        expect(
+            db
+                .prepare(
+                    `SELECT effect_key AS effectKey, effect_type AS effectType
+                       FROM claim_change_outbox
+                      WHERE operation_id = (
+                          SELECT id FROM claim_operations WHERE operation_key = 'status-boundary-noop')`,
+                )
+                .all(),
+        ).toEqual([{ effectKey: `memory:${memoryId}:upsert`, effectType: "upsert" }]);
+        expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([
+            "pending v22 identity work",
+        ]);
+    });
+
+    test("a no-op status write adopting a verified boundary row carries the verification onto the claim", () => {
+        const db = track(v82DatabaseWithRows(["boundary verified status fact"]));
+        const memoryId = (db.prepare("SELECT id FROM memories LIMIT 1").get() as { id: number }).id;
+        // Pre-v84 TypeScript verification writes only the side table.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, 'src/x.ts', 5, 5)",
+            ).run(memoryId);
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("status-boundary-verified-noop", { id: memoryId }),
+                { memoryId, status: "active", nowMs: 8_000 },
+            ),
+        );
+
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(1);
+        expect(
+            db
+                .prepare(
+                    `SELECT effect_key AS effectKey, effect_type AS effectType
+                       FROM claim_change_outbox
+                      WHERE operation_id = (
+                          SELECT id FROM claim_operations WHERE operation_key = 'status-boundary-verified-noop')
+                      ORDER BY effect_key`,
+                )
+                .all(),
+        ).toEqual([
+            { effectKey: `memory:${memoryId}:evidence`, effectType: "evidence" },
+            { effectKey: `memory:${memoryId}:upsert`, effectType: "upsert" },
+        ]);
+    });
+
     test("ephemeral zero-effect envelopes persist nothing; effect-bearing ones insert normally", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "ephemeral-seed", "ephemeral fact");

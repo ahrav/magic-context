@@ -410,8 +410,13 @@ function adoptRelocationMergeClaims(
  * Blocking relationships-phase diagnostic for a supersession edge the move
  * cannot repoint: the referrer is unadoptable, so no claim link — and
  * therefore no relationship snapshot — can authorize rewriting its lineage
- * columns. Mirrors the kernel's relationships-phase failure rows so the
- * repair lane surfaces the stranded edge.
+ * columns. The item key lives under the referrer's `relations:` namespace
+ * so the first relationship translation of the linked referrer resolves it:
+ * translation snapshots the referrer's lineage and records (or re-diagnoses
+ * under digest-scoped keys) the stranded edge, which is exactly the state
+ * this diagnostic reports as missing. A `repoint` segment stands where a
+ * translation key carries its hex source digest, so the two key families
+ * never collide.
  */
 function recordSkippedReferrerRepointDiagnostic(
     db: Database,
@@ -428,7 +433,7 @@ function recordSkippedReferrerRepointDiagnostic(
          DO UPDATE SET reason_code = excluded.reason_code, detail = excluded.detail,
                        disposition = 'blocking', updated_at = excluded.updated_at`,
     ).run(
-        `memory:${referencingId}:supersession-repoint:${supersededById}`,
+        `memory:${referencingId}:relations:repoint:${supersededById}`,
         reason,
         JSON.stringify({ supersededByMemoryId: supersededById }),
         now,
@@ -466,7 +471,11 @@ export function moveLinkedMemoryAcrossProjects(
             .all(rowId) as Array<{ id: number }>
     ).map((row) => row.id);
     const repointableIds: number[] = [];
-    const adoptedReferrerLinks: MemoryClaimLink[] = [];
+    const adoptedReferrers: Array<{
+        row: MemoryProjectionRow;
+        link: MemoryClaimLink;
+        projectId: number;
+    }> = [];
     for (const referencingId of referencingIds) {
         const referencingRow = readMemoryProjectionRow(db, referencingId);
         if (!referencingRow) continue;
@@ -496,7 +505,9 @@ export function moveLinkedMemoryAcrossProjects(
             projectId,
             { kind: "migration" },
         );
-        if (!referrerWasLinked) adoptedReferrerLinks.push(referrerLink);
+        if (!referrerWasLinked) {
+            adoptedReferrers.push({ row: referencingRow, link: referrerLink, projectId });
+        }
         translateMemoryClaimRelationshipsInCurrentTransaction(db, referencingRow);
         repointableIds.push(referencingId);
     }
@@ -617,14 +628,27 @@ export function moveLinkedMemoryAcrossProjects(
             // boundary reconciliation oracle would flag its crosswalk row as
             // missing an outbox effect forever (the row is linked, so the
             // backfill skips it). Emit the first-adoption upsert here, inside
-            // the move envelope.
-            for (const adopted of adoptedReferrerLinks) {
+            // the move envelope, and run the full adopted-claim sync:
+            // adoption can dedup onto a canonical claim archived by a prior
+            // delete of the referrer's equivalent, so the claim state
+            // re-derives from the live referrer row and the row's verified
+            // status carries onto the claim as evidence.
+            for (const adopted of adoptedReferrers) {
                 effects.push({
-                    effectKey: `memory:${adopted.memoryId}:upsert`,
+                    effectKey: `memory:${adopted.link.memoryId}:upsert`,
                     projectId: adopted.projectId,
-                    claimId: adopted.claimId,
+                    claimId: adopted.link.claimId,
                     effectType: "upsert",
                 });
+                effects.push(
+                    ...syncAdoptedRelocationClaimState(
+                        db,
+                        adopted.row,
+                        adopted.link,
+                        adopted.projectId,
+                        RELOCATION_PRODUCER,
+                    ),
+                );
             }
             for (const referencingId of referencingIds) {
                 const referencingRow = readMemoryProjectionRow(db, referencingId);

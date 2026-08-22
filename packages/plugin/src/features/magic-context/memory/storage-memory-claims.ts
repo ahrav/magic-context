@@ -1836,6 +1836,12 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return { result: unlinkableResult(row.id), effects: [] };
         }
+        // The ensure below can create the claim and crosswalk rows inside
+        // this operation, and a first adoption owes the outbox its upsert
+        // effect: a no-op transition (unchanged status, no metadata
+        // replacement) otherwise commits the fresh crosswalk with zero
+        // outbox rows and the reconciliation oracle flags it forever.
+        const wasLinked = readMemoryClaimLink(db, row.id) !== null;
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
@@ -1863,11 +1869,42 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                 effectType: "upsert" as const,
             });
         }
+        if (!wasLinked) {
+            // The metadata branch above already emits the upsert when it
+            // appends a revision; a first adoption without one still owes it.
+            if (revisionId === null) {
+                effects.push({
+                    effectKey: `memory:${row.id}:upsert`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "upsert" as const,
+                });
+            }
+            // A verified preimage carries its verified status onto the
+            // adopted claim as evidence — the fresh (or dedup-reused) claim
+            // has no verified event for this row yet.
+            if (memoryRowHasPositiveVerification(db, row)) {
+                addVerificationEvent(db, {
+                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                    outcome: "verified",
+                    verifier: envelope.producer,
+                });
+                effects.push({
+                    effectKey: `memory:${row.id}:evidence`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "evidence" as const,
+                });
+            }
+        }
         // A shared canonical claim (several crosswalk rows, one claim, via
         // the dedup branch) holds the max-rank state across its surviving
         // linked projections, so one projection's transition can neither
         // downgrade a permanent sibling nor strand a stale permanent state.
         // An unchanged state writes nothing and emits no lifecycle effect.
+        // Adoption reuses this comparison as its lifecycle sync: dedup onto
+        // a canonical claim archived by a prior delete re-derives the state
+        // from the live row instead of leaving it archived.
         const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, input.status);
         if (readCurrentClaimSemanticState(db, link.claimId).state !== nextState) {
             setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
