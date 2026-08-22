@@ -11248,6 +11248,12 @@ impl McHandler {
         };
         let cycle = slot_cycle.clone();
         let mut proposed_cycle: Option<SmartNoteSelectionCycle> = None;
+        // Set when this poll found no work under the carried cursor but a fresh
+        // cursor over the same snapshot would have. That separates "this pass is
+        // spent" from "the queue is empty", which the caller cannot otherwise
+        // tell apart: a cursor left mid-cycle by a deadline-truncated drain
+        // would otherwise report the next drain's first poll as a drained queue.
+        let mut cycle_exhausted = false;
         match store.acquire_note_evaluation(
             &project,
             acquisition_id,
@@ -11262,12 +11268,23 @@ impl McHandler {
                 // The nonbillable cycle exposes only the sandbox phases (due,
                 // liveness); compile and fallback claims launch LLM prompts
                 // and belong to the scheduled full-budget drain.
-                select_smart_note_evaluation_cycle(&snapshots, now, retina_handoff, &cycle).map(
-                    |(note_id, phase, next_cycle)| {
-                        proposed_cycle = Some(next_cycle);
-                        (note_id, phase)
-                    },
-                )
+                let selection =
+                    select_smart_note_evaluation_cycle(&snapshots, now, retina_handoff, &cycle);
+                if selection.is_none() {
+                    // Selection is pure, so re-running it against a fresh cycle
+                    // only classifies this empty answer.
+                    cycle_exhausted = select_smart_note_evaluation_cycle(
+                        &snapshots,
+                        now,
+                        retina_handoff,
+                        &SmartNoteSelectionCycle::new(mode),
+                    )
+                    .is_some();
+                }
+                selection.map(|(note_id, phase, next_cycle)| {
+                    proposed_cycle = Some(next_cycle);
+                    (note_id, phase)
+                })
             },
             now,
         ) {
@@ -11288,6 +11305,16 @@ impl McHandler {
                     }
                     NoteEvalAcquireOutcome::NoWork { replayed: false } => {
                         *slot_cycle = SmartNoteSelectionCycle::new(mode);
+                        if cycle_exhausted {
+                            // The reset above already installed a fresh cursor,
+                            // so the client may poll again and reach the work
+                            // this spent cursor hid.
+                            return respond(json!({
+                                "result": "no_work",
+                                "replayed": false,
+                                "cycle_exhausted": true,
+                            }));
+                        }
                     }
                     _ => {}
                 }
@@ -23360,6 +23387,9 @@ mod tests {
         .await;
         assert_eq!(no_work["result"], "no_work");
         assert_eq!(no_work["replayed"], json!(false));
+        // An empty queue is not an exhausted cursor: a fresh cycle would not
+        // have found work either, so the drain may treat this as drained.
+        assert_eq!(no_work["cycle_exhausted"], Value::Null);
         let (full, nonbillable) = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
         assert_eq!(full, SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full));
         assert_eq!(
@@ -23389,6 +23419,77 @@ mod tests {
             note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0),
             advanced
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn note_evaluation_spent_cycle_no_work_reports_cycle_exhausted() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let route_root = project.to_str().unwrap().to_string();
+        let identity = activate_notes_module_authority_via_finish_prepare(&store, &route_root);
+        // Twelve due notes and no other phase work: spending the 10-claim due
+        // quota leaves the cursor spent while two due notes are still eligible.
+        let due_notes: Vec<StoredNote> = (0..12)
+            .map(|i| stage_due_note(&store, &identity, &route_root, i + 1))
+            .collect();
+        let (generation, token) =
+            register_note_evaluator(&handler, 7, "eval-a", false, false).await;
+
+        for i in 0..10 {
+            let claim = call_dispatch_request(
+                &handler,
+                note_evaluation_next_body(&token, generation, "eval-a", &format!("acq-{i}")),
+            )
+            .await;
+            assert_eq!(claim["result"], "claim", "due claim {i}");
+            complete_note_claim(
+                &handler,
+                &token,
+                generation,
+                claim["claim_id"].as_str().unwrap(),
+                "due",
+            )
+            .await;
+        }
+
+        // The cursor, not the queue, ended this pass: the response says so and
+        // the cursor is already reset.
+        let exhausted = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-spent"),
+        )
+        .await;
+        assert_eq!(exhausted["result"], "no_work");
+        assert_eq!(exhausted["replayed"], json!(false));
+        assert_eq!(exhausted["cycle_exhausted"], json!(true));
+        let (full, _) = note_evaluator_slot_cycles(&handler, &identity, "eval-a", 0);
+        assert_eq!(full, SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full));
+
+        // Because the reset already landed, the very next poll reaches the work
+        // the spent cursor hid instead of costing a whole drain.
+        let recovered = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-after-reset"),
+        )
+        .await;
+        assert_eq!(recovered["result"], "claim");
+        assert_eq!(recovered["phase"], "due");
+        assert_eq!(recovered["note_id"], json!(due_notes[10].id));
+
+        // A replay of the exhausted decision stays a plain replayed no_work: it
+        // must not re-announce a reset the client already consumed.
+        let replayed = call_dispatch_request(
+            &handler,
+            note_evaluation_next_body(&token, generation, "eval-a", "acq-spent"),
+        )
+        .await;
+        assert_eq!(replayed["result"], "no_work");
+        assert_eq!(replayed["replayed"], json!(true));
+        assert_eq!(replayed["cycle_exhausted"], Value::Null);
     }
 
     #[tokio::test(flavor = "current_thread")]

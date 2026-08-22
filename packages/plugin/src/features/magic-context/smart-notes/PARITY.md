@@ -38,9 +38,16 @@ selection cycles scoped to one `(registration, slot, mode)`:
   replayed `no_work`, `busy`, expiry, terminal replay, invalid identity,
   authority change, and store failures leave it unchanged, so acquisition
   replay stays idempotent.
-- A fresh `no_work` therefore means "this mode's cycle is spent or nothing is
-  eligible right now", not "the global queue is empty"; the worker treats it
-  as a pass boundary and the next drain starts a new cycle.
+- A fresh `no_work` distinguishes its two causes so the client never mistakes a
+  spent cursor for an empty queue. When the carried cursor found nothing but a
+  fresh cursor over the same snapshot would have, the response carries
+  `cycle_exhausted: true` and the cursor has already been reset; otherwise
+  nothing is eligible for that mode right now. A drain treats only the plain
+  answer as a drained queue, and consumes one `cycle_exhausted` before it has
+  claimed anything — so a cursor left spent or mid-cycle by a deadline-truncated
+  drain costs the next drain one poll rather than its whole pass, while a drain
+  that spent its own cycle still stops at that boundary instead of collecting a
+  second set of phase quotas.
 - Fallback selection is deterministic in both authorities: unchecked notes
   first, then oldest `last_checked_at`, then note ID, and a cycle never claims
   the same fallback note twice (bounded in-cycle exclusion). Together these

@@ -354,9 +354,13 @@ export class SmartNoteEvaluatorWorker {
      *
      * Normal phase fairness lives in the authority: each (registration, slot,
      * mode) owns a bounded selection cycle (full 10/5/3/3 across
-     * due/compile/liveness/fallback; nonbillable 10/10 across due/liveness),
-     * and a fresh `no_work` marks that cycle's boundary rather than a globally
-     * empty queue. The client-side caps below are defensive backstops for
+     * due/compile/liveness/fallback; nonbillable 10/10 across due/liveness).
+     * The authority separates the two reasons it can report no work: a spent
+     * cycle answers `cycle_exhausted` (and resets that cycle), while an empty
+     * queue answers plain `no_work`. Only the latter is a drained queue. This
+     * drain consumes one `cycle_exhausted` before it claims anything, so a
+     * cursor left spent by an earlier truncated drain costs one poll instead of
+     * this whole pass. The client-side caps below are defensive backstops for
      * recovered claims and malformed authorities, not the fairness mechanism.
      *
      * `excludeBillable` asks the authority for sandbox-only phases (due,
@@ -417,14 +421,29 @@ export class SmartNoteEvaluatorWorker {
         // confirmation prompts in one pass.
         let compileClaims = 0;
         let fallbackClaims = 0;
+        // A cursor left spent by an earlier truncated drain answers this pass's
+        // first poll with `cycle_exhausted`. Consuming that answer once, before
+        // this pass has claimed anything, lets the pass run against the cursor
+        // the authority just reset. Once this pass has claimed work the cursor
+        // is its own, so exhaustion is a real pass boundary and the phase
+        // quotas must not be handed out twice.
+        let cycleResetConsumed = false;
         const maxCompile = args.maxCompilePerRun ?? MAX_COMPILE_PER_RUN;
         const maxFallback = args.maxFallbackPerRun ?? MAX_FALLBACK_PER_RUN;
         for (let i = 0; i < MAX_CLAIMS_PER_DRAIN; i++) {
             if (this.disposed || args.signal?.aborted || Date.now() >= args.deadline) break;
             const next = await this.next(args.signal, args.excludeBillable === true);
+            if (next === "cycle_exhausted") {
+                if (result.claimed === 0 && !cycleResetConsumed) {
+                    cycleResetConsumed = true;
+                    continue;
+                }
+                // This pass spent its own cycle: a real pass boundary.
+                result.drained = true;
+                break;
+            }
             if (next === "no_work") {
-                // A fresh no_work is this mode's cycle boundary, not proof the
-                // global queue is empty; the next drain starts a new cycle.
+                // Nothing is eligible for this mode right now.
                 result.drained = true;
                 break;
             }
@@ -515,7 +534,7 @@ export class SmartNoteEvaluatorWorker {
     private async next(
         signal: AbortSignal | undefined,
         excludeBillable: boolean,
-    ): Promise<ClaimResponse | "no_work" | "retry" | "stop"> {
+    ): Promise<ClaimResponse | "no_work" | "cycle_exhausted" | "retry" | "stop"> {
         const acquisitionId = this.pendingAcquisitionId ?? randomUUID();
         this.pendingAcquisitionId = acquisitionId;
         let response: Record<string, unknown>;
@@ -579,7 +598,12 @@ export class SmartNoteEvaluatorWorker {
             // The authority recorded (or replayed) a durable decision for this
             // acquisition; it is consumed.
             this.pendingAcquisitionId = null;
-            return "no_work";
+            // `cycle_exhausted` means the answer came from a spent selection
+            // cursor, not an empty queue, and the authority has already reset
+            // that cursor. Reporting it as a drained queue would let a drain
+            // truncated by its deadline silently cost the next drain its whole
+            // pass. Older authorities omit the field and stay on the plain path.
+            return response.cycle_exhausted === true ? "cycle_exhausted" : "no_work";
         }
         if (result === "expired") {
             // The replayed decision aged out of the authority's retention
