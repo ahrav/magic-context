@@ -208,10 +208,18 @@ impl InstanceGuard {
 }
 
 /// Exclusive cross-process lifecycle transaction lock, held on the secured
-/// lifecycle-root directory inode. Path replacement cannot create a second
-/// owner for the same anchored namespace: a successor that recreates the
-/// path locks a different inode, and every mutation stays anchored to the
-/// descriptor that was locked (plan KTD2).
+/// lifecycle-root directory inode (plan KTD2).
+///
+/// The lock inode is a mutual-exclusion token, not an evidence anchor: the
+/// runtime evidence lives in the sibling `run` directory, and this type
+/// exposes no descriptor-relative evidence operations. If the lifecycle
+/// path is replaced while a holder is live, a second caller can lock a
+/// fresh inode and transactions overlap on the same evidence; the evidence
+/// itself stays safe through its own fences (the instance lock plus
+/// atomic, identity-fenced writes), which is why probes also tolerate
+/// running without this lock at all. Serializing mutators across path
+/// replacement requires anchoring mutations to a locked evidence
+/// descriptor.
 pub struct LifecycleRootLock {
     _dir: OwnedFd,
     dir_path: PathBuf,
