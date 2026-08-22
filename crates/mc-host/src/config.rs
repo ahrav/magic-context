@@ -40,10 +40,23 @@ pub(crate) const EGRESS_RESERVED_BYTES: u64 =
 /// request that asked for it.
 ///
 /// Sized for a component whose own body cap is half the frame limit holding
-/// a three-times-body scratch peak, plus per-item and envelope headroom.
-/// `synapse::protocol` pins its worst-case reservation against this constant
-/// in a unit test, so the two cannot drift apart.
-pub(crate) const SCRATCH_RESERVED_BYTES: u64 = (MAX_BODY_LEN as u64 * 3 / 2) + (64 * 1024);
+/// a three-times-body scratch peak, plus per-item and envelope headroom,
+/// plus [`RETAINED_METADATA_RESERVED_BYTES`] so a full retention set can
+/// coexist with a worst-case reservation. `synapse::protocol` pins its
+/// worst-case reservation against the remainder in a unit test, so the two
+/// cannot drift apart.
+pub(crate) const SCRATCH_RESERVED_BYTES: u64 =
+    (MAX_BODY_LEN as u64 * 3 / 2) + (64 * 1024) + RETAINED_METADATA_RESERVED_BYTES;
+
+/// Slice of [`SCRATCH_RESERVED_BYTES`] carved out for retained job metadata,
+/// which lives for the whole retention window. Parse and page reservations
+/// are validated against the pool minus this slice, so a full retention set
+/// can never starve the worst-case request the limits advertise — without
+/// it, a completed maximum batch's retained keys and metadata held the pool
+/// a few hundred bytes short of an identical replay's reservation until
+/// expiry. `validate_serving_limits` rejects configurations whose worst
+/// retention set exceeds this slice.
+pub(crate) const RETAINED_METADATA_RESERVED_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Upper bound for every configured deadline and period. `Instant + Duration`
 /// panics on overflow, so unbounded values such as `Duration::MAX` must be

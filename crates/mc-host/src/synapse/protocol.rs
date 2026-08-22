@@ -1385,13 +1385,17 @@ mod tests {
         // no longer varies with deployment tuning or catalog size.
         let bound = parse_reservation_bytes(MAX_BODY_BYTES, &SynapseLimits::default())
             .expect("the default bound is computable");
-        let scratch = crate::config::SCRATCH_RESERVED_BYTES;
+        // Retained job metadata owns its slice of the pool; reservations
+        // must fit the remainder so a full retention set can coexist with
+        // the worst-case request.
+        let scratch =
+            crate::config::SCRATCH_RESERVED_BYTES - crate::config::RETAINED_METADATA_RESERVED_BYTES;
         assert!(
             bound as u64 <= scratch,
-            "the worst-case reservation {bound} does not fit the reserved \
-             scratch pool {scratch}; SCRATCH_RESERVED_BYTES must cover \
-             RESERVE_BODY_FACTOR * MAX_BODY_BYTES plus per-item and \
-             envelope headroom"
+            "the worst-case reservation {bound} does not fit the reservable \
+             scratch {scratch}; SCRATCH_RESERVED_BYTES must cover \
+             RESERVE_BODY_FACTOR * MAX_BODY_BYTES plus per-item, envelope, \
+             and retained-metadata headroom"
         );
         // The body itself is charged against the admission pool, which the
         // floor guarantees is one maximum frame body, so the two pools
