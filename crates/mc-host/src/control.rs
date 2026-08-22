@@ -20,6 +20,8 @@ pub const CODE_INTERNAL_ERROR: &str = "internal_error";
 
 pub const OP_ROUTE_OPEN: &str = subc_control::ops::ROUTE_OPEN;
 pub const OP_CATALOG_LIST: &str = subc_control::ops::CATALOG_LIST;
+/// `subc_control` does not publish this operation.
+pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
 
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
 /// pairs.
@@ -70,6 +72,7 @@ pub enum ControlAction {
         target: RouteTarget,
         identity: RouteIdentity,
     },
+    HostShutdown,
     /// Semantic rejection with a trustworthy correlation; one terminal.
     Reject {
         code: &'static str,
@@ -122,6 +125,7 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
     match op {
         OP_CATALOG_LIST => parse_catalog_list(&fields),
         OP_ROUTE_OPEN => parse_route_open(&fields, targets),
+        OP_HOST_SHUTDOWN => ControlAction::HostShutdown,
         _ => ControlAction::Reject {
             code: CODE_UNSUPPORTED_OPERATION,
             message: "operation is not supported by this host".to_owned(),
@@ -431,7 +435,7 @@ fn serialize_catalog_response(
         op: &'static str,
         generation: u64,
         modules: &'a [CatalogModule<'a>],
-        subc_ops: [&'static str; 2],
+        subc_ops: [&'static str; 3],
     }
 
     let modules: Vec<CatalogModule<'_>> = manifests
@@ -453,7 +457,7 @@ fn serialize_catalog_response(
             op: OP_CATALOG_LIST,
             generation: CATALOG_GENERATION,
             modules: &modules,
-            subc_ops: [OP_ROUTE_OPEN, OP_CATALOG_LIST],
+            subc_ops: [OP_ROUTE_OPEN, OP_CATALOG_LIST, OP_HOST_SHUTDOWN],
         },
     )
     .map_err(|_| ())?;
@@ -468,6 +472,10 @@ pub fn route_open_response_json(channel: u16, epoch: u32) -> Vec<u8> {
         route_epoch: epoch,
     })
     .expect("route response serialization cannot fail")
+}
+
+pub fn host_shutdown_response_json() -> Vec<u8> {
+    br#"{"op":"host.shutdown"}"#.to_vec()
 }
 
 /// Strict JSON parsing: UTF-8 only (serde_json enforces), rejects duplicate
@@ -816,6 +824,24 @@ mod tests {
     }
 
     #[test]
+    fn host_shutdown_parses_and_binary_is_rejected() {
+        assert_eq!(
+            parse(&serde_json::json!({"op": "host.shutdown"})),
+            ControlAction::HostShutdown
+        );
+        // Unknown fields are ignored for forward compatibility.
+        assert_eq!(
+            parse(&serde_json::json!({"op": "host.shutdown", "future": {"a": 1}})),
+            ControlAction::HostShutdown
+        );
+        let action = parse_control(br#"{"op":"host.shutdown"}"#, true, &two_target_index());
+        assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
+        let duplicate = br#"{"op":"host.shutdown","op":"host.shutdown"}"#;
+        let action = parse_control(duplicate, false, &two_target_index());
+        assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
+    }
+
+    #[test]
     fn catalog_filters() {
         assert_eq!(
             parse(&serde_json::json!({"op": "catalog.list"})),
@@ -888,7 +914,7 @@ mod tests {
         );
         assert_eq!(
             unfiltered["subc_ops"],
-            serde_json::json!(["route.open", "catalog.list"])
+            serde_json::json!(["route.open", "catalog.list", "host.shutdown"])
         );
         // wake.create must stay absent until implemented (protocol AE10).
         assert!(!unfiltered.to_string().contains("wake.create"));

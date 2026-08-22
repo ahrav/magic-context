@@ -203,22 +203,29 @@ describe("surface-condition compiler", () => {
     test("refuses a provider-fenced path while preserving the authoring operation", async () => {
         const home = mkdtempSync(join(tmpdir(), "condition-compiler-home-"));
         temporaryDirectories.push(home);
-        const result = await compileSurfaceCondition(
-            "when path ~/.local/share/cortexkit/plexus/store.db exists",
-            {
-                projectPath: home,
-                homeDirectory: home,
-                now: () => 123,
-            },
-        );
+        const previousDataHome = process.env.XDG_DATA_HOME;
+        process.env.XDG_DATA_HOME = join(home, ".local", "share");
+        try {
+            const result = await compileSurfaceCondition(
+                "when path ~/.local/share/cortexkit/plexus/store.db exists",
+                {
+                    projectPath: home,
+                    homeDirectory: home,
+                    now: () => 123,
+                },
+            );
 
-        expect(result).toEqual({ status: "refused", reason: "fenced path" });
-        expect(conditionCompileStorageFields(result)).toEqual({
-            compiledProvider: null,
-            compiledConfig: null,
-            compiledAt: null,
-            compileStatus: "refused",
-        });
+            expect(result).toEqual({ status: "refused", reason: "fenced path" });
+            expect(conditionCompileStorageFields(result)).toEqual({
+                compiledProvider: null,
+                compiledConfig: null,
+                compiledAt: null,
+                compileStatus: "refused",
+            });
+        } finally {
+            if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = previousDataHome;
+        }
     });
 
     test("turns provider schema validation failures into refused compilation", async () => {
