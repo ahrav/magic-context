@@ -7,6 +7,7 @@ import {
 import {
     moveLinkedMemoryAcrossProjects,
     recordSkippedCollisionMergeDiagnostic,
+    syncAdoptedClaimLifecycleState,
     syncAdoptedRelocationClaimState,
 } from "./memory/relocate-memory";
 import { hasMemoryStatsTable, requireEffectiveSeenCount } from "./memory/storage-memory";
@@ -283,6 +284,21 @@ function adoptIdentityMergeRowClaims(
                     effectType: "upsert" as const,
                 });
             }
+            // Lifecycle half only: adoption can reuse a canonical claim
+            // archived by a prior delete of the target-project equivalent,
+            // and the sync reactivates it from the survivor's status. The
+            // verification funnel below owns the survivor's verified event
+            // (source transfer and fresh adoption share it), so the full
+            // sync would double-record that event.
+            effects.push(
+                ...syncAdoptedClaimLifecycleState(
+                    db,
+                    targetRow,
+                    targetLink,
+                    projectId,
+                    "identity-merge",
+                ),
+            );
             // Pre-v84 TypeScript verification writes a positive verified_at
             // only to the memory_verifications side table, so each side's
             // side-table maximum stands in when its projection columns are

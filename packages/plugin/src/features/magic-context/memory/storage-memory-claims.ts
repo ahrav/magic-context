@@ -885,25 +885,36 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
     };
 }
 
+/** Why a supersession recording did — or deliberately did not — write an edge. */
+export type MemoryClaimSupersessionOutcome =
+    | "recorded"
+    | "exists"
+    | "same-claim"
+    | "sibling-suppressed";
+
 /**
  * Record one supersession edge between two linked memories' current
  * revisions: same-project pairs use `claim_conflicts` (supersedes), distinct
  * projects use the audit-only `claim_merge_lineage` relation (KTD8). A
- * source claim with another live crosswalk link records nothing: the sibling
- * projection still asserts the claim, so an edge would mark the survivor's
- * claim superseded. Both paths are idempotent, so page replay or a doctor
- * retry cannot duplicate lineage. Returns true only when a new edge was
- * recorded.
+ * source claim with another live crosswalk link records nothing
+ * ("sibling-suppressed"): the sibling projection still asserts the claim, so
+ * an edge would mark the survivor's claim superseded. Both paths are
+ * idempotent ("exists"), so page replay or a doctor retry cannot duplicate
+ * lineage. The discriminated outcome lets callers separate a new edge from
+ * the reasons no edge exists — the disposition oracle must not demand an
+ * edge the sibling-liveness rule forbids.
  */
-export function recordMemoryClaimSupersessionInCurrentTransaction(
+export function recordMemoryClaimSupersessionOutcomeInCurrentTransaction(
     db: Database,
     source: MemoryClaimLink,
     target: MemoryClaimLink,
-): boolean {
+): MemoryClaimSupersessionOutcome {
     // A duplicate link shares its canonical claim; a claim cannot supersede
     // itself.
-    if (source.claimId === target.claimId) return false;
-    if (claimHasOtherLiveMemoryLink(db, source.claimId, source.memoryId)) return false;
+    if (source.claimId === target.claimId) return "same-claim";
+    if (claimHasOtherLiveMemoryLink(db, source.claimId, source.memoryId)) {
+        return "sibling-suppressed";
+    }
     const sourceRevisionId = readClaimCurrentRevisionId(db, source.claimId);
     const targetRevisionId = readClaimCurrentRevisionId(db, target.claimId);
     if (source.projectId === target.projectId) {
@@ -912,26 +923,37 @@ export function recordMemoryClaimSupersessionInCurrentTransaction(
                 "SELECT 1 FROM claim_conflicts WHERE relation = 'supersedes' AND left_revision_id = ? AND right_revision_id = ?",
             )
             .get(targetRevisionId, sourceRevisionId);
-        if (existing) return false;
+        if (existing) return "exists";
         addClaimConflictInCurrentTransaction(db, {
             relation: "supersedes",
             leftRevisionId: targetRevisionId,
             rightRevisionId: sourceRevisionId,
         });
-        return true;
+        return "recorded";
     }
     const existing = db
         .prepare(
             "SELECT 1 FROM claim_merge_lineage WHERE source_revision_id = ? AND target_revision_id = ?",
         )
         .get(sourceRevisionId, targetRevisionId);
-    if (existing) return false;
+    if (existing) return "exists";
     db.prepare(
         `INSERT INTO claim_merge_lineage
             (source_revision_id, source_project_id, target_revision_id, target_project_id, created_at)
          VALUES (?, ?, ?, ?, ?)`,
     ).run(sourceRevisionId, source.projectId, targetRevisionId, target.projectId, Date.now());
-    return true;
+    return "recorded";
+}
+
+/** Boolean view of the outcome recorder: true only when a new edge was recorded. */
+export function recordMemoryClaimSupersessionInCurrentTransaction(
+    db: Database,
+    source: MemoryClaimLink,
+    target: MemoryClaimLink,
+): boolean {
+    return (
+        recordMemoryClaimSupersessionOutcomeInCurrentTransaction(db, source, target) === "recorded"
+    );
 }
 
 export interface MemoryClaimLineageToken {
@@ -1122,14 +1144,24 @@ export function translateMemoryClaimRelationshipsInCurrentTransaction(
         const itemKey = `${prefix}:superseded-by`;
         const target = readMemoryClaimLink(db, row.superseded_by_memory_id);
         if (target) {
-            const recorded = memoryClaimSupersessionExists(db, link, target)
-                ? false
-                : recordMemoryClaimSupersessionInCurrentTransaction(db, link, target);
+            const outcome: MemoryClaimSupersessionOutcome = memoryClaimSupersessionExists(
+                db,
+                link,
+                target,
+            )
+                ? "exists"
+                : recordMemoryClaimSupersessionOutcomeInCurrentTransaction(db, link, target);
             upsertMemoryRelationshipDisposition(
                 db,
                 "supersession",
                 itemKey,
-                "translated-supersession",
+                // A sibling-suppressed edge is deliberately absent from the
+                // graph: the source claim keeps a live sibling link. Its own
+                // reason code keeps the reconciliation oracle from demanding
+                // the edge the sibling-liveness rule forbids.
+                outcome === "sibling-suppressed"
+                    ? "sibling-suppressed-supersession"
+                    : "translated-supersession",
                 memoryRelationshipTokenDetail({
                     ordinal: 0,
                     raw: String(row.superseded_by_memory_id),
@@ -1137,7 +1169,7 @@ export function translateMemoryClaimRelationshipsInCurrentTransaction(
                 }),
                 true,
             );
-            if (recorded) {
+            if (outcome === "recorded") {
                 effects.push({
                     effectKey: `${prefix}:supersession`,
                     projectId: target.projectId,
@@ -1177,18 +1209,27 @@ export function translateMemoryClaimRelationshipsInCurrentTransaction(
         if (token.kind === "id") {
             const source = readMemoryClaimLink(db, token.id as number);
             if (source) {
-                const recorded = memoryClaimSupersessionExists(db, source, link)
-                    ? false
-                    : recordMemoryClaimSupersessionInCurrentTransaction(db, source, link);
+                const outcome: MemoryClaimSupersessionOutcome = memoryClaimSupersessionExists(
+                    db,
+                    source,
+                    link,
+                )
+                    ? "exists"
+                    : recordMemoryClaimSupersessionOutcomeInCurrentTransaction(db, source, link);
                 upsertMemoryRelationshipDisposition(
                     db,
                     "lineage",
                     itemKey,
-                    "translated-lineage",
+                    // Same sibling-liveness suppression as the superseded-by
+                    // branch: the merged-from source claim stays asserted by
+                    // a live sibling, so no lineage edge may exist.
+                    outcome === "sibling-suppressed"
+                        ? "sibling-suppressed-supersession"
+                        : "translated-lineage",
                     memoryRelationshipTokenDetail(token),
                     true,
                 );
-                if (recorded) {
+                if (outcome === "recorded") {
                     effects.push({
                         effectKey: `${prefix}:lineage:${token.ordinal}`,
                         projectId: link.projectId,
@@ -2268,21 +2309,39 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
             const post = readMemoryProjectionRow(db, input.memoryId);
             const effects: MemoryClaimEffect[] = [...preRelationshipEffects];
             if (!post) {
-                // Tombstone removed the projection row: retire the claim, keep
-                // the crosswalk (retention, not erasure).
+                // Tombstone removed the projection row; the crosswalk is
+                // retained (retention, not erasure). Shared-claim rule: the
+                // claim holds the max-rank state across its surviving linked
+                // projections, so a live sibling link keeps the claim
+                // untouched and only the last link retires it — with the
+                // archive event reserved for an actual archive transition.
                 if (preLink) {
-                    setClaimLifecycleStateInCurrentTransaction(db, preLink.claimId, "archived");
-                    addVerificationEvent(db, {
-                        revisionId: readClaimCurrentRevisionId(db, preLink.claimId),
-                        outcome: "archive",
-                        verifier: envelope.producer,
-                    });
-                    effects.push({
-                        effectKey: `memory:${input.memoryId}:lifecycle`,
-                        projectId: preLink.projectId,
-                        claimId: preLink.claimId,
-                        effectType: "lifecycle" as const,
-                    });
+                    const desiredState = sharedClaimStateFromLiveLinks(
+                        db,
+                        preLink.claimId,
+                        input.memoryId,
+                        "archived",
+                    );
+                    if (readCurrentClaimSemanticState(db, preLink.claimId).state !== desiredState) {
+                        setClaimLifecycleStateInCurrentTransaction(
+                            db,
+                            preLink.claimId,
+                            desiredState,
+                        );
+                        if (desiredState === "archived") {
+                            addVerificationEvent(db, {
+                                revisionId: readClaimCurrentRevisionId(db, preLink.claimId),
+                                outcome: "archive",
+                                verifier: envelope.producer,
+                            });
+                        }
+                        effects.push({
+                            effectKey: `memory:${input.memoryId}:lifecycle`,
+                            projectId: preLink.projectId,
+                            claimId: preLink.claimId,
+                            effectType: "lifecycle" as const,
+                        });
+                    }
                 }
                 hitMemoryClaimFailpoint("memory-claim.010.claim.after");
                 return {

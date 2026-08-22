@@ -127,16 +127,16 @@ function requireRelocationTargetProject(db: Database, toIdentity: string): numbe
 }
 
 /**
- * Adoption reuses whatever canonical claim already owns the (project,
- * category, hash) tuple — including one archived by a prior delete of the
- * target-project equivalent. Sync the claim lifecycle from the adopted
- * projection row so an active row never points at an archived claim, and
- * carry the row's verified status onto the claim as evidence. The producer
- * stamps the lifecycle and verification events with the adopting operation's
- * identity. Returns the effects the caller must emit for what actually
- * changed.
+ * Lifecycle half of the adopted-claim sync: adoption reuses whatever
+ * canonical claim already owns the (project, category, hash) tuple —
+ * including one archived by a prior delete of the target-project
+ * equivalent — so the claim state is re-derived from the adopted projection
+ * row and an active row never points at an archived claim. Exported
+ * separately for callers that own their verification recording and must not
+ * double-record the row's verified event. Returns the effects the caller
+ * must emit for what actually changed.
  */
-export function syncAdoptedRelocationClaimState(
+export function syncAdoptedClaimLifecycleState(
     db: Database,
     row: MemoryProjectionRow,
     link: MemoryClaimLink,
@@ -161,6 +161,24 @@ export function syncAdoptedRelocationClaimState(
             effectType: "lifecycle" as const,
         });
     }
+    return effects;
+}
+
+/**
+ * Full adopted-claim sync: the lifecycle re-derivation above plus the row's
+ * verified status carried onto the claim as evidence. The producer stamps
+ * the lifecycle and verification events with the adopting operation's
+ * identity. Returns the effects the caller must emit for what actually
+ * changed.
+ */
+export function syncAdoptedRelocationClaimState(
+    db: Database,
+    row: MemoryProjectionRow,
+    link: MemoryClaimLink,
+    projectId: number,
+    producer: string,
+): MemoryClaimEffect[] {
+    const effects = syncAdoptedClaimLifecycleState(db, row, link, projectId, producer);
     if (recordAdoptedMemoryVerifiedEventInCurrentTransaction(db, row, link.claimId, producer)) {
         effects.push({
             effectKey: `memory:${row.id}:evidence`,
@@ -259,11 +277,15 @@ export function recordSkippedCollisionMergeDiagnostic(
  * bytes stay retained on the duplicate link's root observation, so the
  * canonical claim keeps reflecting the surviving projection row.
  *
- * Returns false — merge must not proceed — when the target row is
- * unadoptable: no canonical claim can exist for it, so the source link the
- * boundary delete guard demands cannot anchor anywhere, and the merge would
- * delete the source while the unadoptable target keeps its (empty) bytes.
- * That skip records a blocking diagnostic instead of losing data.
+ * Returns false — merge must not proceed — when either row is unadoptable:
+ * an unadoptable target can anchor no canonical claim, so the source link
+ * the boundary delete guard demands cannot anchor anywhere, and the merge
+ * would delete the source while the unadoptable target keeps its (empty)
+ * bytes; an unlinked unadoptable source (empty content, claim-invalid
+ * metadata) can never acquire the crosswalk link that must outlive its
+ * delete, so proceeding would either abort the transaction or silently
+ * discard the row's lineage. Each skip records a blocking diagnostic
+ * instead of losing data.
  */
 function adoptRelocationMergeClaims(
     db: Database,
@@ -280,6 +302,17 @@ function adoptRelocationMergeClaims(
         return false;
     }
     const sourceRow = readMemoryProjectionRow(db, sourceId);
+    if (sourceRow && !readMemoryClaimLink(db, sourceId)) {
+        const sourceFailure = memoryClaimAdoptionFailureReason(sourceRow, targetProjectId);
+        if (sourceFailure !== null) {
+            // The merge deletes the source row, so an unlinked source must be
+            // able to adopt its duplicate crosswalk link first — unlike
+            // identity-merge, which archives the source in place and can
+            // proceed past a diagnosed link failure.
+            recordSkippedCollisionMergeDiagnostic(db, sourceId, targetId, sourceFailure);
+            return false;
+        }
+    }
     runMemoryClaimOperationInCurrentTransaction(
         db,
         relocationEnvelope("merge", { sourceId, targetId, toIdentity }),
@@ -300,8 +333,21 @@ function adoptRelocationMergeClaims(
                     effectType: "upsert" as const,
                 });
             }
+            // Adoption can reuse a canonical claim archived by a prior delete
+            // of the target-project equivalent; the sync reactivates it from
+            // the surviving row's status and carries the row's verified state
+            // onto the claim as evidence.
+            effects.push(
+                ...syncAdoptedRelocationClaimState(
+                    db,
+                    targetRow,
+                    targetLink,
+                    targetProjectId,
+                    RELOCATION_PRODUCER,
+                ),
+            );
             let sourceLink = readMemoryClaimLink(db, sourceId);
-            if (!sourceLink && sourceRow && sourceRow.content.length > 0) {
+            if (!sourceLink && sourceRow) {
                 sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
                     db,
                     sourceRow,
@@ -582,9 +628,10 @@ function rekeyMemoryRowWithCollisionMergeInner(
     if (collision && collision.id !== rowId) {
         // The canonical claim and both crosswalk links must exist BEFORE the
         // source row deletes: the v84 boundary guard refuses to delete an
-        // unlinked boundary row. An unadoptable target cannot anchor those
-        // links, so the merge is skipped there (fail-visible diagnostic,
-        // source row preserved) before any stats or embedding mutation.
+        // unlinked boundary row. An unadoptable target — or an unlinked
+        // unadoptable source — cannot anchor those links, so the merge is
+        // skipped there (fail-visible diagnostic, source row preserved)
+        // before any stats or embedding mutation.
         if (claimsActive && !adoptRelocationMergeClaims(db, rowId, collision.id, toIdentity)) {
             return false;
         }

@@ -530,6 +530,211 @@ describe("relocate-memory claims (v84)", () => {
         });
     });
 
+    test("a collision merge from a claim-invalid source skips with a diagnostic and leaves sibling rows moving", () => {
+        const database = makeDb();
+        const target = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const sourceId = insertUnlinkedMemory(
+            database,
+            "git:project-a",
+            "shared fact",
+            target.normalizedHash,
+        );
+        const siblingId = insertUnlinkedMemory(database, "git:project-a", "healthy fact", "cm-h2");
+        // Importance outside 1..100 is schema-legal on memories but
+        // claim-invalid, so the unlinked source can never acquire the
+        // crosswalk link the merge-delete demands.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database.prepare("UPDATE memories SET importance = 0 WHERE id = ?").run(sourceId);
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(
+                database,
+                [sourceId, siblingId],
+                "git:project-a",
+                "git:project-b",
+            ),
+        );
+
+        // The invalid source is skipped fail-visible while the healthy
+        // sibling still relocates in the same batch.
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(sourceId),
+        ).toEqual({ project_path: "git:project-a" });
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(siblingId),
+        ).toEqual({ project_path: "git:project-b" });
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${sourceId}:collision-merge:${target.id}`),
+        ).toEqual({
+            phase: "relationships",
+            item_kind: "merge",
+            reason_code: "invalid-importance",
+            disposition: "blocking",
+        });
+    });
+
+    test("a collision merge from an empty-content source skips with a diagnostic instead of silently deleting it", () => {
+        const database = makeDb();
+        const target = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const sourceId = insertUnlinkedMemory(database, "git:project-a", "", target.normalizedHash);
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [sourceId], "git:project-a", "git:project-b"),
+        );
+
+        // A non-boundary empty source previously deleted silently with its
+        // lineage record lost; the skip preserves it fail-visible.
+        expect(result).toEqual({ relocated: 0, merged: 0, skipped: 0 });
+        expect(
+            database
+                .prepare("SELECT project_path, content FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ project_path: "git:project-a", content: "" });
+        expect(
+            database
+                .prepare(
+                    `SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${sourceId}:collision-merge:${target.id}`),
+        ).toEqual({ reason_code: "empty-content", disposition: "blocking" });
+    });
+
+    test("a collision merge from an empty-content boundary source skips instead of tripping the delete guard", () => {
+        const database = makeDb();
+        const target = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        const sourceId = insertUnlinkedMemory(database, "git:project-a", "", target.normalizedHash);
+        // A v84 boundary row: deleting it without a crosswalk link aborts on
+        // memories_claims_boundary_delete_guard.
+        database
+            .prepare(
+                `INSERT OR REPLACE INTO schema_migrations_meta (key, value)
+                 VALUES ('claims_backfill_boundary_memory_id', ?)`,
+            )
+            .run(String(sourceId));
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [sourceId], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 0, merged: 0, skipped: 0 });
+        expect(
+            database
+                .prepare("SELECT project_path, content FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ project_path: "git:project-a", content: "" });
+        expect(
+            database
+                .prepare(
+                    `SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${sourceId}:collision-merge:${target.id}`),
+        ).toEqual({ reason_code: "empty-content", disposition: "blocking" });
+    });
+
+    test("a collision merge onto a claims-deleted equivalent reactivates the target's adopted claim", () => {
+        const database = makeDb();
+        const deleted = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "revived fact",
+        });
+        const archivedLink = readMemoryClaimLink(database, deleted.id);
+        deleteMemory(database, deleted.id);
+        expect(
+            database
+                .prepare("SELECT state FROM claims WHERE id = ?")
+                .get(archivedLink?.claimId ?? 0),
+        ).toEqual({ state: "archived" });
+        // A re-added unlinked twin of the deleted row: the merge target that
+        // dedups onto the archived canonical claim.
+        const targetId = insertUnlinkedMemory(
+            database,
+            "git:project-b",
+            "revived fact",
+            deleted.normalizedHash,
+        );
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "revived fact",
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [source.id], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 0, merged: 1, skipped: 0 });
+        const targetClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(targetClaim?.claimId).toBe(archivedLink?.claimId ?? 0);
+        expect(targetClaim?.state).toBe("active");
+    });
+
+    test("a side-table-verified collision target records a verified event on its adopted claim", () => {
+        const database = makeDb();
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "shared fact",
+        });
+        // The target numeric project must exist for the claims-active merge path.
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+        const targetId = insertUnlinkedMemory(
+            database,
+            "git:project-b",
+            "shared fact",
+            source.normalizedHash,
+        );
+        // Pre-v84 TypeScript verification: positive verified_at lives only in
+        // memory_verifications; the projection columns stay unverified.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 123, 100)`,
+                )
+                .run(targetId);
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [source.id], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 0, merged: 1, skipped: 0 });
+        const targetClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(targetClaim?.state).toBe("active");
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(targetClaim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "memory-relocation" }]);
+    });
+
     test("copying creates a target claim for each fresh row and leaves the source intact", () => {
         const database = makeDb();
         const source = insertMemory(database, {

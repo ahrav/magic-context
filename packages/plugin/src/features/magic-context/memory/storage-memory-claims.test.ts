@@ -911,7 +911,7 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
                       WHERE phase = 'relationships' AND item_kind = 'supersession'`,
                 )
                 .all(),
-        ).toEqual([{ reason_code: "translated-supersession", disposition: "resolved" }]);
+        ).toEqual([{ reason_code: "sibling-suppressed-supersession", disposition: "resolved" }]);
         // The reconciliation oracle reads the same supersession-exists probe;
         // the gated edge must not surface as an undisposed token or blocking
         // failure (migratedDb always reports pending v22 identity work).
@@ -1766,6 +1766,66 @@ describe("memory/claims kernel: shared-claim lifecycle rank", () => {
         expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
             state: "permanent",
         });
+    });
+
+    test("a module tombstone on one shared-claim link archives the claim only with its last live link", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "rank-tombstone-seed", "rank tombstone fact");
+        const siblingId = insertAliasSibling(db, "rank tombstone fact");
+        setStatus(db, "rank-tombstone-link", siblingId, "active");
+        expect(count(db, "legacy_memory_claims", `claim_id = ${survivor.claimId}`)).toBe(2);
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("rank-tombstone-sibling", { id: siblingId }),
+                {
+                    memoryId: siblingId,
+                    applyProjection: () => {
+                        db.prepare("DELETE FROM memories WHERE id = ?").run(siblingId);
+                    },
+                },
+            ),
+        );
+        // The survivor's live link still asserts the shared claim: no state
+        // change, no archive event, no lifecycle effect.
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(0);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'lifecycle' AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'rank-tombstone-sibling')`,
+            ),
+        ).toBe(0);
+
+        // Tombstoning the survivor removes the last live link: the claim
+        // archives with one archive event and one lifecycle effect.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("rank-tombstone-survivor", { id: survivor.memoryId }),
+                {
+                    memoryId: survivor.memoryId,
+                    applyProjection: () => {
+                        db.prepare("DELETE FROM memories WHERE id = ?").run(survivor.memoryId);
+                    },
+                },
+            ),
+        );
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "archived",
+        });
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(1);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'lifecycle' AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'rank-tombstone-survivor')`,
+            ),
+        ).toBe(1);
     });
 });
 

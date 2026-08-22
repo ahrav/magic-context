@@ -1088,6 +1088,45 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("a collision merge onto a claims-deleted equivalent reactivates the survivor's claim", () => {
+        const database = makeDb();
+        const deleted = insertMemoryThroughKernel(database, {
+            projectPath: "git:new",
+            category: "CONSTRAINTS",
+            content: "revived fact",
+        });
+        const archivedLink = readMemoryClaimLink(database, deleted.id);
+        deleteMemory(database, deleted.id);
+        expect(
+            database
+                .prepare("SELECT state FROM claims WHERE id = ?")
+                .get(archivedLink?.claimId ?? 0),
+        ).toEqual({ state: "archived" });
+        // A re-added unlinked twin of the deleted row: the collision survivor
+        // that dedups onto the archived canonical claim.
+        const targetId = insertMemory(database, "git:new", "revived fact", deleted.normalizedHash);
+        const sourceId = insertMemory(database, "dir:old", "revived fact", deleted.normalizedHash);
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 60 });
+
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ status: "archived", by: targetId });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(survivorClaim?.claimId).toBe(archivedLink?.claimId ?? 0);
+        expect(survivorClaim?.state).toBe("active");
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'lifecycle'`,
+                )
+                .get(`memory:${targetId}:lifecycle`),
+        ).toEqual({ count: 1 });
+    });
+
     test("a claim-invalid unlinked row is diagnosed without rolling back the rest of the merge", () => {
         const database = makeDb();
         const healthyId = insertMemory(database, "dir:old", "healthy fact", "healthy-h1");

@@ -1061,7 +1061,13 @@ describe("claims backfill dedup adoption lifecycle", () => {
         ids: number[];
     } {
         const fixture = prepareLegacyDb(rows);
-        fixture.db.exec(`
+        seedRekeyedAlias(fixture.db);
+        runMigrations(fixture.db);
+        return fixture;
+    }
+
+    function seedRekeyedAlias(db: Database): void {
+        db.exec(`
             CREATE TABLE IF NOT EXISTS v22_identity_rekey_map (
                 old_project_path TEXT PRIMARY KEY,
                 new_project_path TEXT NOT NULL,
@@ -1070,9 +1076,25 @@ describe("claims backfill dedup adoption lifecycle", () => {
             INSERT INTO v22_identity_rekey_map (old_project_path, new_project_path, rekeyed_at)
             VALUES ('dir:/rekeyed-checkout', 'git:claims-backfill-a', 1);
         `);
-        runMigrations(fixture.db);
-        return fixture;
     }
+
+    /**
+     * One shared canonical claim (a dir: alias twin dedups onto its git: twin)
+     * whose alias link is superseded by a third, unrelated row. The recorder
+     * suppresses the edge — the twin's live link still asserts the claim — so
+     * the token can only reconcile through its sibling-suppressed disposition.
+     */
+    const SUPPRESSED_SUPERSESSION_FIXTURE: LegacyRow[] = [
+        {
+            projectPath: "dir:/rekeyed-checkout",
+            content: "shared fact",
+            hash: "hash:shared",
+            status: "archived",
+            supersededBy: 3,
+        },
+        { content: "shared fact", hash: "hash:shared" },
+        { content: "replacement fact", hash: "hash:replacement" },
+    ];
 
     function linkedClaimState(db: Database, memoryId: number): { claimId: number; state: string } {
         return db
@@ -1128,5 +1150,40 @@ describe("claims backfill dedup adoption lifecycle", () => {
         expect(summary.status).toBe("complete");
         expect(linkedClaimState(db, ids[0]).state).toBe("archived");
         expect(inspectClaimsBackfillReconciliation(db).warningCount).toBe(0);
+    });
+
+    test("a supersession suppressed by a live shared-claim sibling still reconciles", async () => {
+        const { db, ids } = migrateLazyWithRekeyedAlias(SUPPRESSED_SUPERSESSION_FIXTURE);
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        // The edge stays absent — the twin's live link forbids it — and the
+        // token is terminal through its sibling-suppressed disposition.
+        expect(db.prepare("SELECT COUNT(*) AS c FROM claim_conflicts").get()).toEqual({ c: 0 });
+        expect(
+            db
+                .prepare(
+                    `SELECT reason_code, disposition FROM claim_backfill_failures
+                      WHERE phase = 'relationships' AND item_kind = 'supersession'`,
+                )
+                .all(),
+        ).toEqual([{ reason_code: "sibling-suppressed-supersession", disposition: "resolved" }]);
+        expect(linkedClaimState(db, ids[0]).state).toBe("active");
+        expect(linkedClaimState(db, ids[0]).claimId).toBe(linkedClaimState(db, ids[1]).claimId);
+        expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([]);
+    });
+
+    test("an eager migration with a sibling-suppressed supersession completes", () => {
+        const fixture = prepareLegacyDb(SUPPRESSED_SUPERSESSION_FIXTURE);
+        seedRekeyedAlias(fixture.db);
+        setClaimsBackfillCalibrationForTests({
+            cutoffRows: SUPPRESSED_SUPERSESSION_FIXTURE.length,
+            evidenceDigest: "a".repeat(64),
+        });
+        runMigrations(fixture.db);
+        setClaimsBackfillCalibrationForTests(null);
+        const status = getClaimsBackfillStatus(fixture.db);
+        expect(status.mode).toBe("eager");
+        expect(status.state).toBe("complete");
+        expect(inspectClaimsBackfillReconciliation(fixture.db).problems).toEqual([]);
     });
 });

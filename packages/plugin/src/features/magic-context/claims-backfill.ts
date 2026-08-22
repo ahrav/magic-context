@@ -891,6 +891,11 @@ export function inspectClaimsBackfillReconciliation(
             disposition?.disposition === "warning" ||
             (disposition?.disposition === "resolved" &&
                 (resolvedInGraph ||
+                    // A sibling-suppressed supersession edge is deliberately
+                    // absent from the graph — the source claim keeps a live
+                    // sibling link — so the resolved disposition is terminal
+                    // without a graph edge.
+                    disposition.reasonCode === "sibling-suppressed-supersession" ||
                     (disposition.reasonCode === "relationship-source-replaced" &&
                         replacedByDisposedSource)))
         );
