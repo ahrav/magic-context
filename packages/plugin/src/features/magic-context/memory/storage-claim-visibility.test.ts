@@ -1,0 +1,253 @@
+/// <reference types="bun-types" />
+
+import { describe, expect, test } from "bun:test";
+import { Database } from "../../../shared/sqlite";
+import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { runMigrations } from "../migrations";
+import { resolveMemoriesByIdsForSearch, unifiedSearch } from "../search";
+import { initializeDatabase } from "../storage-db";
+import {
+    recordDispositionEventInCurrentTransaction,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "./storage-claim-policy";
+import {
+    decideMemoryPolicy,
+    filterMemoriesByPolicy,
+    readMemoryPolicyRows,
+} from "./storage-claim-visibility";
+import { sha256Utf8Hex } from "./storage-claims";
+import { getMemoriesByProject } from "./storage-memory";
+import {
+    createMemoryWithClaimsInCurrentTransaction,
+    readMemoryClaimLink,
+    runInMemoryClaimsWriteTransaction,
+    updateMemoryVerificationWithClaimsInCurrentTransaction,
+} from "./storage-memory-claims";
+
+const PROJECT = "git:visibility-surfaces";
+
+function migratedDb(): Database {
+    const db = new Database(":memory:");
+    db.exec("PRAGMA foreign_keys=ON");
+    initializeDatabase(db);
+    runMigrations(db);
+    return db;
+}
+
+function seedMemory(
+    db: Database,
+    key: string,
+    content: string,
+    sourceType = "agent",
+): { memoryId: number; claimId: number; revisionId: number; projectId: number } {
+    const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+        createMemoryWithClaimsInCurrentTransaction(
+            db,
+            { producer: "vis-test", operationKey: key, requestDigest: sha256Utf8Hex(key) },
+            {
+                projectPath: PROJECT,
+                category: "CONSTRAINTS",
+                content,
+                normalizedHash: `hash:${content}`,
+                importance: 60,
+                sourceSessionId: "ses-vis",
+                sourceType,
+                nowMs: 1_000,
+            },
+        ),
+    );
+    const memoryId = outcome.result.memoryId;
+    const link = readMemoryClaimLink(db, memoryId);
+    if (!link) throw new Error("seed memory did not link");
+    return {
+        memoryId,
+        claimId: link.claimId,
+        revisionId: outcome.result.revisionId as number,
+        projectId: link.projectId,
+    };
+}
+
+function verify(db: Database, memoryId: number): void {
+    runInMemoryClaimsWriteTransaction(db, () =>
+        updateMemoryVerificationWithClaimsInCurrentTransaction(
+            db,
+            {
+                producer: "vis-test",
+                operationKey: `verify:${memoryId}`,
+                requestDigest: sha256Utf8Hex(`verify:${memoryId}`),
+            },
+            { memoryId, verificationStatus: "verified", nowMs: 2_000 },
+        ),
+    );
+}
+
+function quarantine(db: Database, revisionId: number, projectId: number): void {
+    runInMemoryClaimsWriteTransaction(db, () => {
+        recordDispositionEventInCurrentTransaction(db, {
+            revisionId,
+            projectId,
+            disposition: "quarantined",
+            action: "assert",
+            actor: "host",
+        });
+        refreshEffectivePolicyInCurrentTransaction(db, revisionId);
+        return undefined;
+    });
+}
+
+describe("claim policy surface enforcement", () => {
+    test("a quarantined memory returns uniform absence on every agent surface", async () => {
+        const db = migratedDb();
+        try {
+            const seed = seedMemory(db, "quarantine-1", "quarantined secret guidance");
+            verify(db, seed.memoryId);
+            const before = await unifiedSearch(db, "ses-vis", PROJECT, "quarantined secret", {
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                sources: ["memory"],
+            });
+            expect(before.some((r) => r.source === "memory")).toBeTrue();
+
+            quarantine(db, seed.revisionId, seed.projectId);
+
+            // Loaded-list filter: automatic and explicit surfaces both hide.
+            const memories = getMemoriesByProject(db, PROJECT);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).not.toContain(seed.memoryId);
+            expect(
+                filterMemoriesByPolicy(db, memories, "explicit_search").memories.map((m) => m.id),
+            ).not.toContain(seed.memoryId);
+
+            // Explicit text search: absent, without any label or trace.
+            const results = await unifiedSearch(db, "ses-vis", PROJECT, "quarantined secret", {
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                sources: ["memory"],
+            });
+            expect(results.filter((r) => r.source === "memory")).toEqual([]);
+            expect(JSON.stringify(results)).not.toContain("quarantined secret");
+
+            // Direct-ID lookup: the null fallback sentinel, not a labeled row.
+            expect(
+                resolveMemoriesByIdsForSearch({
+                    db,
+                    projectPath: PROJECT,
+                    ids: [seed.memoryId],
+                    limit: 5,
+                }),
+            ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a candidate memory is auto-hidden but labeled in explicit surfaces", async () => {
+        const db = migratedDb();
+        try {
+            const seed = seedMemory(db, "candidate-1", "candidate exploratory fact");
+            const memories = getMemoriesByProject(db, PROJECT);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).not.toContain(seed.memoryId);
+            const explicit = filterMemoriesByPolicy(db, memories, "explicit_search");
+            expect(explicit.memories.map((m) => m.id)).toContain(seed.memoryId);
+            expect(explicit.labels.get(seed.memoryId)).toContain("candidate");
+
+            const results = await unifiedSearch(db, "ses-vis", PROJECT, "candidate exploratory", {
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                sources: ["memory"],
+            });
+            const hit = results.find((r) => r.source === "memory" && r.memoryId === seed.memoryId);
+            expect(hit).toBeDefined();
+            expect((hit as { policyLabel?: string }).policyLabel).toContain("candidate");
+
+            verify(db, seed.memoryId);
+            expect(
+                filterMemoriesByPolicy(
+                    db,
+                    getMemoriesByProject(db, PROJECT),
+                    "auto_inject",
+                ).memories.map((m) => m.id),
+            ).toContain(seed.memoryId);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a quarantine committed between candidate load and merge is dropped by the recheck", async () => {
+        const db = migratedDb();
+        try {
+            const seed = seedMemory(db, "midflight-1", "midflight quarantine target");
+            verify(db, seed.memoryId);
+            let fired = false;
+            const originalPrepare = db.prepare.bind(db);
+            db.prepare = ((sql: string) => {
+                // The FTS candidate query runs after the pre-limit policy
+                // filter and before the post-merge recheck.
+                if (!fired && /memories_fts/i.test(sql)) {
+                    fired = true;
+                    db.prepare = originalPrepare;
+                    quarantine(db, seed.revisionId, seed.projectId);
+                }
+                return originalPrepare(sql);
+            }) as typeof db.prepare;
+            let results: Awaited<ReturnType<typeof unifiedSearch>>;
+            try {
+                results = await unifiedSearch(db, "ses-vis", PROJECT, "midflight quarantine", {
+                    limit: 10,
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    sources: ["memory"],
+                });
+            } finally {
+                db.prepare = originalPrepare;
+            }
+            expect(fired).toBeTrue();
+            expect(results.filter((r) => r.source === "memory")).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("labels built from stored rows carry no locators, digests, or conflict details", () => {
+        const db = migratedDb();
+        try {
+            const seed = seedMemory(db, "label-1", "labeled candidate with provenance");
+            const rows = readMemoryPolicyRows(db, [seed.memoryId]);
+            const decision = decideMemoryPolicy(rows.get(seed.memoryId), "explicit_search");
+            expect(decision.eligible).toBeTrue();
+            const label = decision.label ?? "";
+            expect(label.length).toBeGreaterThan(0);
+            expect(label).not.toMatch(/[0-9a-f]{16,}/);
+            expect(label).not.toContain("operation://");
+            expect(label).not.toContain(PROJECT);
+            expect(label).not.toContain(String(seed.revisionId));
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a future policy version fails closed on automatic surfaces", () => {
+        const db = migratedDb();
+        try {
+            const seed = seedMemory(db, "future-1", "future policy version row");
+            verify(db, seed.memoryId);
+            db.prepare(
+                "UPDATE claim_effective_policy SET policy_version = 999 WHERE revision_id = ?",
+            ).run(seed.revisionId);
+            const memories = getMemoriesByProject(db, PROJECT);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).not.toContain(seed.memoryId);
+            const explicit = filterMemoriesByPolicy(db, memories, "explicit_search");
+            expect(explicit.labels.get(seed.memoryId)).toContain("policy:unknown");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});

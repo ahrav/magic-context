@@ -616,6 +616,10 @@ export function refreshEffectivePolicyInCurrentTransaction(
     const identity = readRevisionIdentity(db, revisionId);
     if (!identity) throw new Error(`claim revision ${revisionId} does not exist`);
     const decision = computePolicyDecisionForRevision(db, revisionId);
+    // A revision without a frozen subject stays absent from the projection:
+    // absence is the fail-closed contract, and writing a row would need a
+    // fabricated taint value the CHECK constraint has no word for.
+    if (readPolicySubject(db, revisionId) == null) return decision;
     updateEffectivePolicyProjectionInCurrentTransaction(
         db,
         identity,

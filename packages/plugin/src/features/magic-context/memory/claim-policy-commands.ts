@@ -13,7 +13,6 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Database } from "../../../shared/sqlite";
 import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
-import { bumpProjectMemoryEpoch } from "../storage-project-state";
 import {
     appendMaturityAssertionInCurrentTransaction,
     currentApprovalActionId,
@@ -56,7 +55,11 @@ export interface ClaimCommandDeps {
     nowMs?: number;
     /** Injectable artifact evaluator; the default runs `bun test` for test
      * artifacts and rejects other kinds. */
-    evaluateArtifact?: (canonicalPath: string, kind: EnforcementArtifactKind) => ArtifactEvaluation;
+    evaluateArtifact?: (
+        canonicalPath: string,
+        kind: EnforcementArtifactKind,
+        projectRoot: string,
+    ) => ArtifactEvaluation;
 }
 
 interface PendingConfirmation {
@@ -72,10 +75,6 @@ const pendingByKey = new Map<string, PendingConfirmation>();
 
 export function clearClaimCommandConfirmationsForTests(): void {
     pendingByKey.clear();
-}
-
-function confirmationKey(deps: ClaimCommandDeps, command: string): string {
-    return `${deps.host}:${deps.sessionId}:${command}`;
 }
 
 interface ResolvedTarget {
@@ -132,35 +131,6 @@ function resolveTarget(
     };
 }
 
-function takeConfirmedNonce(
-    deps: ClaimCommandDeps,
-    command: string,
-    argsKey: string,
-    target: ResolvedTarget,
-): string | null {
-    const key = confirmationKey(deps, command);
-    const pending = pendingByKey.get(key);
-    const now = deps.nowMs ?? Date.now();
-    if (
-        pending &&
-        now - pending.timestamp < CONFIRMATION_WINDOW_MS &&
-        pending.argsKey === argsKey &&
-        pending.revisionId === target.revisionId &&
-        pending.digest === target.digest
-    ) {
-        pendingByKey.delete(key);
-        return pending.nonce;
-    }
-    pendingByKey.set(key, {
-        timestamp: now,
-        argsKey,
-        revisionId: target.revisionId,
-        digest: target.digest,
-        nonce: randomUUID(),
-    });
-    return null;
-}
-
 function confirmationText(
     command: string,
     action: string,
@@ -174,10 +144,96 @@ function confirmationText(
         `- Memory: ${target.memoryId} (claim ${target.claimId}, revision ${target.revisionId})`,
         `- Content digest: \`${target.digest}\``,
         "",
-        "> " + target.preview.replaceAll("\n", "\n> "),
+        `> ${target.preview.replaceAll("\n", "\n> ")}`,
         "",
         `**To confirm, run \`${command}\` again within 60 seconds.**`,
     ].join("\n");
+}
+
+interface ConfirmedMutationArgs<T> {
+    command: "ctx-approve" | "ctx-enforce";
+    argsKey: string;
+    target: ResolvedTarget;
+    producer: string;
+    operationKey: (nonce: string) => string;
+    request: (nonce: string) => unknown;
+    /** Runs inside the write transaction after the stale-safe recheck. */
+    mutate: (nonce: string) => { result: T; effects: MemoryClaimEffect[] };
+}
+
+/**
+ * Shared two-step confirmed mutation: the first invocation stores a nonce
+ * bound to session, args, revision, and digest and returns `pending`; a
+ * matching repeat within the window rechecks the target inside the write
+ * transaction, runs the mutation under the idempotent operation envelope,
+ * and bumps the project-memory epoch in the same transaction so no stale m0
+ * cache keeps serving the old decision (R27).
+ */
+function runConfirmedClaimMutation<T>(
+    deps: ClaimCommandDeps,
+    args: ConfirmedMutationArgs<T>,
+): { pending: true } | { pending: false; result: T } {
+    const key = `${deps.host}:${deps.sessionId}:${args.command}`;
+    const pendingBefore = pendingByKey.get(key);
+    const now = deps.nowMs ?? Date.now();
+    const confirmed =
+        pendingBefore != null &&
+        now - pendingBefore.timestamp < CONFIRMATION_WINDOW_MS &&
+        pendingBefore.argsKey === args.argsKey &&
+        pendingBefore.revisionId === args.target.revisionId &&
+        pendingBefore.digest === args.target.digest;
+    if (!confirmed) {
+        pendingByKey.set(key, {
+            timestamp: now,
+            argsKey: args.argsKey,
+            revisionId: args.target.revisionId,
+            digest: args.target.digest,
+            nonce: randomUUID(),
+        });
+        return { pending: true };
+    }
+    pendingByKey.delete(key);
+    const nonce = pendingBefore.nonce;
+    const outcome = runInMemoryClaimsWriteTransaction(deps.db, () =>
+        withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
+            const operation = runMemoryClaimOperationInCurrentTransaction(
+                deps.db,
+                {
+                    producer: args.producer,
+                    operationKey: args.operationKey(nonce),
+                    requestDigest: sha256Utf8Hex(JSON.stringify(args.request(nonce))),
+                },
+                () => {
+                    // Stale-safe recheck inside the write transaction (R10).
+                    const current = resolveTarget(deps, args.target.memoryId);
+                    if ("error" in current) throw new Error(current.error);
+                    if (
+                        current.revisionId !== args.target.revisionId ||
+                        current.digest !== args.target.digest
+                    ) {
+                        throw new Error("the memory changed since confirmation; rerun the command");
+                    }
+                    return args.mutate(nonce);
+                },
+            );
+            bumpProjectMemoryEpochInCurrentTransaction(deps);
+            return operation;
+        }),
+    );
+    return { pending: false, result: outcome.result };
+}
+
+function bumpProjectMemoryEpochInCurrentTransaction(deps: ClaimCommandDeps): void {
+    deps.db
+        .prepare(
+            `INSERT INTO project_state
+                (project_path, project_memory_epoch, project_user_profile_version, updated_at)
+             VALUES (?, 1, 0, ?)
+             ON CONFLICT(project_path) DO UPDATE SET
+                project_memory_epoch = project_memory_epoch + 1,
+                updated_at = excluded.updated_at`,
+        )
+        .run(deps.projectPath, deps.nowMs ?? Date.now());
 }
 
 const APPROVE_USAGE = [
@@ -215,8 +271,63 @@ export function executeClaimApprovalCommand(
             level: "info",
         };
     }
-    const nonce = takeConfirmedNonce(deps, "ctx-approve", `${action}:${memoryId}`, target);
-    if (nonce === null) {
+    let outcome: ReturnType<typeof runConfirmedClaimMutation<{ actionId: number }>>;
+    try {
+        outcome = runConfirmedClaimMutation(deps, {
+            command: "ctx-approve",
+            argsKey: `${action}:${memoryId}`,
+            target,
+            producer: `claim-approval:${deps.host}`,
+            operationKey: (nonce) => `${action}:${target.revisionId}:${nonce}`,
+            request: (nonce) => ({
+                action,
+                revisionId: target.revisionId,
+                digest: target.digest,
+                nonce,
+            }),
+            mutate: (nonce) => {
+                const recorded = recordApprovalActionInCurrentTransaction(deps.db, {
+                    revisionId: target.revisionId,
+                    projectId: target.projectId,
+                    action,
+                    host: deps.host,
+                    sessionId: deps.sessionId,
+                    userCommandEvent: `command:${deps.host}:ctx-approve:${nonce}`,
+                    commandIdentity: `${action}:${target.revisionId}:${nonce}`,
+                    confirmationNonce: nonce,
+                    nowMs: deps.nowMs,
+                });
+                if (action === "approve") {
+                    appendMaturityAssertionInCurrentTransaction(deps.db, {
+                        revisionId: target.revisionId,
+                        projectId: target.projectId,
+                        maturity: "APPROVED",
+                        actor: `user-command:${deps.host}`,
+                        approvalActionId: recorded.actionId,
+                        nowMs: deps.nowMs,
+                    });
+                }
+                refreshEffectivePolicyInCurrentTransaction(deps.db, target.revisionId, {
+                    nowMs: deps.nowMs,
+                });
+                const effects: MemoryClaimEffect[] = [
+                    {
+                        effectKey: `policy:${target.revisionId}:approval`,
+                        projectId: target.projectId,
+                        claimId: target.claimId,
+                        effectType: "lifecycle",
+                    },
+                ];
+                return { result: { actionId: recorded.actionId }, effects };
+            },
+        });
+    } catch (error) {
+        return {
+            text: `## Claim Approval — Failed\n\n${error instanceof Error ? error.message : String(error)}`,
+            level: "error",
+        };
+    }
+    if (outcome.pending) {
         return {
             text: confirmationText(
                 `/ctx-approve ${memoryId}${revoke ? " --revoke" : ""}`,
@@ -227,68 +338,6 @@ export function executeClaimApprovalCommand(
             level: "warning",
         };
     }
-
-    const operationKey = `${action}:${target.revisionId}:${nonce}`;
-    const request = { action, revisionId: target.revisionId, digest: target.digest, nonce };
-    runInMemoryClaimsWriteTransaction(deps.db, () =>
-        withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () =>
-            runMemoryClaimOperationInCurrentTransaction(
-                deps.db,
-                {
-                    producer: `claim-approval:${deps.host}`,
-                    operationKey,
-                    requestDigest: sha256Utf8Hex(JSON.stringify(request)),
-                },
-                () => {
-                    // Stale-safe recheck inside the write transaction (R10).
-                    const current = resolveTarget(deps, memoryId);
-                    if ("error" in current) throw new Error(current.error);
-                    if (
-                        current.revisionId !== target.revisionId ||
-                        current.digest !== target.digest
-                    ) {
-                        throw new Error("the memory changed since confirmation; rerun the command");
-                    }
-                    const recorded = recordApprovalActionInCurrentTransaction(deps.db, {
-                        revisionId: target.revisionId,
-                        projectId: target.projectId,
-                        action,
-                        host: deps.host,
-                        sessionId: deps.sessionId,
-                        userCommandEvent: `command:${deps.host}:ctx-approve:${nonce}`,
-                        commandIdentity: operationKey,
-                        confirmationNonce: nonce,
-                        nowMs: deps.nowMs,
-                    });
-                    if (action === "approve") {
-                        appendMaturityAssertionInCurrentTransaction(deps.db, {
-                            revisionId: target.revisionId,
-                            projectId: target.projectId,
-                            maturity: "APPROVED",
-                            actor: `user-command:${deps.host}`,
-                            approvalActionId: recorded.actionId,
-                            nowMs: deps.nowMs,
-                        });
-                    }
-                    refreshEffectivePolicyInCurrentTransaction(deps.db, target.revisionId, {
-                        nowMs: deps.nowMs,
-                    });
-                    const effects: MemoryClaimEffect[] = [
-                        {
-                            effectKey: `policy:${target.revisionId}:approval`,
-                            projectId: target.projectId,
-                            claimId: target.claimId,
-                            effectType: "lifecycle",
-                        },
-                    ];
-                    return { result: { actionId: recorded.actionId }, effects };
-                },
-            ),
-        ),
-    );
-    // A policy transition changes automatic visibility: force project-memory
-    // rematerialization so no stale m0 cache keeps serving the old decision.
-    bumpProjectMemoryEpoch(deps.db, deps.projectPath, deps.nowMs);
     const head = readMaturityHead(deps.db, target.revisionId);
     return {
         text: [
@@ -311,6 +360,7 @@ const ENFORCE_USAGE = [
 function defaultEvaluateArtifact(
     canonicalPath: string,
     kind: EnforcementArtifactKind,
+    projectRoot: string,
 ): ArtifactEvaluation {
     if (kind !== "test") {
         return {
@@ -321,6 +371,7 @@ function defaultEvaluateArtifact(
         };
     }
     const run = spawnSync("bun", ["test", canonicalPath], {
+        cwd: projectRoot,
         timeout: 120_000,
         encoding: "utf8",
     });
@@ -353,6 +404,10 @@ function canonicalizeArtifactPath(
     }
     if (!statSync(real).isFile()) return { error: "Artifact must be a regular file." };
     return { canonicalPath: rel.split(sep).join("/"), absolutePath: real };
+}
+
+function sha256Bytes(path: string): string {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 export function executeClaimEnforceCommand(
@@ -389,13 +444,90 @@ export function executeClaimEnforceCommand(
     if ("error" in canonical) {
         return { text: `## Claim Enforcement — Failed\n\n${canonical.error}`, level: "error" };
     }
-    const nonce = takeConfirmedNonce(
-        deps,
-        "ctx-enforce",
-        `${memoryId}:${canonical.canonicalPath}:${kind}`,
-        target,
-    );
-    if (nonce === null) {
+
+    let evaluation: ArtifactEvaluation | null = null;
+    let bytesDigest = "";
+    let enforced = false;
+    let outcome: ReturnType<
+        typeof runConfirmedClaimMutation<{ artifactId: number; enforced: boolean }>
+    >;
+    try {
+        outcome = runConfirmedClaimMutation(deps, {
+            command: "ctx-enforce",
+            argsKey: `${memoryId}:${canonical.canonicalPath}:${kind}`,
+            target,
+            producer: `claim-enforcement:${deps.host}`,
+            operationKey: (nonce) => `enforce:${target.revisionId}:${nonce}`,
+            request: (nonce) => ({
+                revisionId: target.revisionId,
+                digest: target.digest,
+                canonicalPath: canonical.canonicalPath,
+                kind,
+                nonce,
+            }),
+            mutate: () => {
+                const approvalId = currentApprovalActionId(deps.db, target.revisionId);
+                if (approvalId == null) {
+                    throw new Error("the approval was revoked since confirmation");
+                }
+                const subject = readPolicySubject(deps.db, target.revisionId);
+                if (!subject) {
+                    throw new Error("the revision has no policy subject yet; retry after seeding");
+                }
+                const digestBefore = sha256Bytes(canonical.absolutePath);
+                const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
+                evaluation = evaluate(canonical.absolutePath, kind, deps.projectRoot);
+                // The recorded digest must be the bytes the evaluator actually
+                // ran: a concurrent rewrite between hash and evaluation would
+                // otherwise bind a result to bytes that never passed (KTD6).
+                bytesDigest = sha256Bytes(canonical.absolutePath);
+                if (bytesDigest !== digestBefore) {
+                    throw new Error("the artifact changed during evaluation; rerun the command");
+                }
+                const artifactId = recordEnforcementArtifactInCurrentTransaction(deps.db, {
+                    revisionId: target.revisionId,
+                    projectId: target.projectId,
+                    artifactKind: kind,
+                    canonicalPath: canonical.canonicalPath,
+                    bytesDigest,
+                    evaluator: evaluation.evaluator,
+                    evaluatorVersion: evaluation.evaluatorVersion,
+                    evaluatorResult: evaluation.result,
+                    nowMs: deps.nowMs,
+                });
+                if (evaluation.result === "pass") {
+                    appendMaturityAssertionInCurrentTransaction(deps.db, {
+                        revisionId: target.revisionId,
+                        projectId: target.projectId,
+                        maturity: "ENFORCED",
+                        actor: `user-command:${deps.host}`,
+                        approvalActionId: approvalId,
+                        artifactId,
+                        nowMs: deps.nowMs,
+                    });
+                    enforced = true;
+                }
+                refreshEffectivePolicyInCurrentTransaction(deps.db, target.revisionId, {
+                    nowMs: deps.nowMs,
+                });
+                const effects: MemoryClaimEffect[] = [
+                    {
+                        effectKey: `policy:${target.revisionId}:enforcement`,
+                        projectId: target.projectId,
+                        claimId: target.claimId,
+                        effectType: "lifecycle",
+                    },
+                ];
+                return { result: { artifactId, enforced }, effects };
+            },
+        });
+    } catch (error) {
+        return {
+            text: `## Claim Enforcement — Failed\n\n${error instanceof Error ? error.message : String(error)}`,
+            level: "error",
+        };
+    }
+    if (outcome.pending) {
         return {
             text: confirmationText(
                 `/ctx-enforce ${memoryId} ${artifactInput}${kind === "test" ? "" : ` --kind ${kind}`}`,
@@ -406,97 +538,15 @@ export function executeClaimEnforceCommand(
             level: "warning",
         };
     }
-
-    const bytes = readFileSync(canonical.absolutePath);
-    const bytesDigest = createHash("sha256").update(bytes).digest("hex");
-    const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
-    const evaluation = evaluate(canonical.absolutePath, kind);
-
-    const operationKey = `enforce:${target.revisionId}:${nonce}`;
-    const request = {
-        revisionId: target.revisionId,
-        digest: target.digest,
-        bytesDigest,
-        canonicalPath: canonical.canonicalPath,
-        kind,
-        nonce,
-    };
-    let enforced = false;
-    runInMemoryClaimsWriteTransaction(deps.db, () =>
-        withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () =>
-            runMemoryClaimOperationInCurrentTransaction(
-                deps.db,
-                {
-                    producer: `claim-enforcement:${deps.host}`,
-                    operationKey,
-                    requestDigest: sha256Utf8Hex(JSON.stringify(request)),
-                },
-                () => {
-                    const current = resolveTarget(deps, memoryId);
-                    if ("error" in current) throw new Error(current.error);
-                    if (
-                        current.revisionId !== target.revisionId ||
-                        current.digest !== target.digest
-                    ) {
-                        throw new Error("the memory changed since confirmation; rerun the command");
-                    }
-                    const approvalId = currentApprovalActionId(deps.db, target.revisionId);
-                    if (approvalId == null) {
-                        throw new Error("the approval was revoked since confirmation");
-                    }
-                    const subject = readPolicySubject(deps.db, target.revisionId);
-                    if (!subject) {
-                        throw new Error(
-                            "the revision has no policy subject yet; retry after seeding",
-                        );
-                    }
-                    const artifactId = recordEnforcementArtifactInCurrentTransaction(deps.db, {
-                        revisionId: target.revisionId,
-                        projectId: target.projectId,
-                        artifactKind: kind,
-                        canonicalPath: canonical.canonicalPath,
-                        bytesDigest,
-                        evaluator: evaluation.evaluator,
-                        evaluatorVersion: evaluation.evaluatorVersion,
-                        evaluatorResult: evaluation.result,
-                        nowMs: deps.nowMs,
-                    });
-                    if (evaluation.result === "pass") {
-                        appendMaturityAssertionInCurrentTransaction(deps.db, {
-                            revisionId: target.revisionId,
-                            projectId: target.projectId,
-                            maturity: "ENFORCED",
-                            actor: `user-command:${deps.host}`,
-                            approvalActionId: approvalId,
-                            artifactId,
-                            nowMs: deps.nowMs,
-                        });
-                        enforced = true;
-                    }
-                    refreshEffectivePolicyInCurrentTransaction(deps.db, target.revisionId, {
-                        nowMs: deps.nowMs,
-                    });
-                    const effects: MemoryClaimEffect[] = [
-                        {
-                            effectKey: `policy:${target.revisionId}:enforcement`,
-                            projectId: target.projectId,
-                            claimId: target.claimId,
-                            effectType: "lifecycle",
-                        },
-                    ];
-                    return { result: { artifactId, enforced }, effects };
-                },
-            ),
-        ),
-    );
-    bumpProjectMemoryEpoch(deps.db, deps.projectPath, deps.nowMs);
+    enforced = outcome.result.enforced;
     if (!enforced) {
+        const detail = (evaluation as ArtifactEvaluation | null)?.detail;
         return {
             text: [
                 "## Claim Enforcement — Artifact Failed",
                 "",
                 `The ${kind} artifact \`${canonical.canonicalPath}\` did not pass; no ENFORCED decision was recorded.`,
-                evaluation.detail ? `\n\`\`\`\n${evaluation.detail}\n\`\`\`` : "",
+                detail ? `\n\`\`\`\n${detail}\n\`\`\`` : "",
             ].join("\n"),
             level: "error",
         };

@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { executeClaimEnforceCommand } from "@magic-context/core/features/magic-context/memory/claim-policy-commands";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { resolveSessionId, sendCtxStatusMessage } from "./pi-command-utils";
 
@@ -24,6 +25,15 @@ export function registerCtxEnforceCommand(
 					title: "/ctx-enforce",
 					text: "## Claim Enforcement\n\nNo active Pi session is available.",
 					level: "error",
+				});
+				return;
+			}
+			const sessionMeta = getOrCreateSessionMeta(deps.db, sessionId);
+			if (sessionMeta.isSubagent) {
+				sendCtxStatusMessage(pi, {
+					title: "/ctx-enforce",
+					text: "## Claim Enforcement — Refused\n\nApproval commands are user-only and unavailable to subagent sessions.",
+					level: "warning",
 				});
 				return;
 			}

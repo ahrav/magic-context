@@ -177,6 +177,7 @@ function formatMemoryList(memories: Memory[], policyLabels?: Map<number, string>
             headers.verification.length,
             ...rows.map((row) => row.verification.length),
         ),
+        trust: Math.max(headers.trust.length, ...rows.map((row) => row.trust.length)),
         updated: Math.max(headers.updated.length, ...rows.map((row) => row.updated.length)),
     };
     const formatRow = (row: (typeof rows)[number] | typeof headers) =>
@@ -185,6 +186,7 @@ function formatMemoryList(memories: Memory[], policyLabels?: Map<number, string>
             row.category.padEnd(widths.category),
             row.status.padEnd(widths.status),
             row.verification.padEnd(widths.verification),
+            row.trust.padEnd(widths.trust),
             row.updated.padEnd(widths.updated),
             row.content,
         ].join(" | ");
@@ -198,6 +200,7 @@ function formatMemoryList(memories: Memory[], policyLabels?: Map<number, string>
             "-".repeat(widths.category),
             "-".repeat(widths.status),
             "-".repeat(widths.verification),
+            "-".repeat(widths.trust),
             "-".repeat(widths.updated),
             "-------",
         ].join("-+-"),

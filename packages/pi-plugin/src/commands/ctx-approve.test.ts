@@ -6,6 +6,7 @@ import {
 	runInMemoryClaimsWriteTransaction,
 } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
+import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { registerCtxApproveCommand } from "./ctx-approve";
@@ -105,6 +106,37 @@ describe("/ctx-approve (pi)", () => {
 			)
 			.get() as { host: string; action: string; sessionId: string };
 		expect(row).toEqual({ host: "pi", action: "approve", sessionId: "ses-pi" });
+		db.close();
+	});
+
+	it("refuses subagent sessions before any confirmation detail", async () => {
+		const db = createDb();
+		const memoryId = seedMemory(db);
+		getOrCreateSessionMeta(db, "ses-pi-sub");
+		db.prepare(
+			"UPDATE session_meta SET is_subagent = 1 WHERE session_id = 'ses-pi-sub'",
+		).run();
+		const mock = createMockPi();
+		registerCtxApproveCommand(mock.pi as never, {
+			db,
+			projectDir: "/tmp",
+			projectIdentity: PROJECT,
+		});
+		const handler = mock.handlers.get("ctx-approve");
+		await handler?.(String(memoryId), {
+			cwd: "/tmp",
+			sessionManager: { getSessionId: () => "ses-pi-sub" },
+		});
+		expect(mock.sent[0]?.data.text).toContain("user-only");
+		expect(
+			(
+				db
+					.prepare("SELECT COUNT(*) AS count FROM claim_approval_actions")
+					.get() as {
+					count: number;
+				}
+			).count,
+		).toBe(0);
 		db.close();
 	});
 

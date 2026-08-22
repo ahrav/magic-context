@@ -14,12 +14,12 @@
 
 import type { Database } from "../../shared/sqlite.ts";
 import { classifyFineTaint, TAINT_CLASSIFIER_METHOD } from "./memory/claim-policy.ts";
+import { supportedMaturity } from "./memory/claim-visibility-policy.ts";
 import {
     appendMaturityAssertionInCurrentTransaction,
-    countIndependentEvidenceGroups,
     createPolicySubjectInCurrentTransaction,
     hasClaimPolicySchema,
-    hasExplicitUserEvidence,
+    readPolicySupport,
     refreshEffectivePolicyInCurrentTransaction,
 } from "./memory/storage-claim-policy.ts";
 import type { SourceTrustClass } from "./storage-claim-applicability-schema.ts";
@@ -98,18 +98,6 @@ interface SeedRevisionRow {
     metadataSourceType: string | null;
 }
 
-/** Latest verification outcome among verified/stale/flagged is 'verified'. */
-function revisionHasEffectiveVerification(db: Database, revisionId: number): boolean {
-    const row = db
-        .prepare(
-            `SELECT outcome FROM verification_events
-             WHERE revision_id = ? AND outcome IN ('verified', 'stale', 'flagged')
-             ORDER BY id DESC LIMIT 1`,
-        )
-        .get(revisionId) as { outcome: string } | null | undefined;
-    return row?.outcome === "verified";
-}
-
 function seedTaint(row: SeedRevisionRow): FineTaint {
     // Retained raw `user` provenance predates the v85 trust column; the v85
     // contract keeps it exactly so a later policy can re-derive channel
@@ -124,14 +112,7 @@ function seedTaint(row: SeedRevisionRow): FineTaint {
 }
 
 function seedMaturity(db: Database, row: SeedRevisionRow): MaturityLevel {
-    if (
-        revisionHasEffectiveVerification(db, row.revisionId) ||
-        hasExplicitUserEvidence(db, row.revisionId)
-    ) {
-        return "VERIFIED";
-    }
-    if (countIndependentEvidenceGroups(db, row.revisionId) >= 2) return "CORROBORATED";
-    return "CANDIDATE";
+    return supportedMaturity(readPolicySupport(db, row.revisionId));
 }
 
 function selectUnseededBatch(
@@ -144,18 +125,16 @@ function selectUnseededBatch(
             `SELECT
                 claim_revisions.id AS revisionId,
                 claims.project_id AS projectId,
-                origin.observation_id AS originObservationId,
+                origin_observation.id AS originObservationId,
                 origin_observation.source_trust_class AS sourceTrustClass,
                 origin_observation.extractor AS extractor,
                 metadata.source_type AS metadataSourceType
              FROM claim_revisions
              JOIN claims ON claims.id = claim_revisions.claim_id
-             LEFT JOIN (
-                 SELECT revision_id, MIN(observation_id) AS observation_id
-                 FROM claim_evidence WHERE relation = 'supports' GROUP BY revision_id
-             ) origin ON origin.revision_id = claim_revisions.id
-             LEFT JOIN observations origin_observation
-                 ON origin_observation.id = origin.observation_id
+             LEFT JOIN observations origin_observation ON origin_observation.id = (
+                 SELECT MIN(observation_id) FROM claim_evidence
+                 WHERE revision_id = claim_revisions.id AND relation = 'supports'
+             )
              LEFT JOIN claim_revision_memory_metadata metadata
                  ON metadata.revision_id = claim_revisions.id
              WHERE claim_revisions.id > ?

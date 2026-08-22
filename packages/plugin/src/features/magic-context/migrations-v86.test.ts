@@ -392,16 +392,28 @@ describe("migration v86: claim trust policy authority", () => {
                     )
                     .run(streamId, headId),
             ).toThrow(/strictly increase/);
-            // Reused predecessor.
+            // Reused predecessor: valid next seq and rung, stale predecessor
+            // only, so exactly the predecessor guard must reject it.
             expect(() =>
                 db
                     .prepare(
                         `INSERT INTO claim_maturity_assertions
                             (stream_id, seq, predecessor_id, maturity, actor, policy_version, recorded_at)
-                         VALUES (?, 3, ?, 'ENFORCED', 'test', 1, 1)`,
+                         VALUES (?, 3, ?, 'CORROBORATED', 'test', 1, 1)`,
                     )
                     .run(streamId, assertionId),
-            ).toThrow(/append-only|previous sequence/);
+            ).toThrow(/previous sequence|key collisions/);
+            // Consuming an already-consumed predecessor at ITS successor seq
+            // trips the unique-predecessor collision arm specifically.
+            expect(() =>
+                db
+                    .prepare(
+                        `INSERT INTO claim_maturity_assertions
+                            (stream_id, seq, predecessor_id, maturity, actor, policy_version, recorded_at)
+                         VALUES (?, 2, ?, 'CORROBORATED', 'test', 1, 1)`,
+                    )
+                    .run(streamId, assertionId),
+            ).toThrow(/key collisions cannot replace rows/);
         } finally {
             closeQuietly(db);
         }

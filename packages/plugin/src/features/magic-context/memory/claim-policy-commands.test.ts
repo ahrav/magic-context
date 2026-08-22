@@ -351,6 +351,34 @@ describe("claim enforcement command workflow", () => {
         }
     });
 
+    test("an artifact rewritten during evaluation is rejected and records nothing", () => {
+        const db = migratedDb();
+        try {
+            const commandDeps = deps(db);
+            const seed = approvedSeed(db, commandDeps, "enf-mutate");
+            const artifactPath = join(commandDeps.projectRoot, "gate.test.ts");
+            writeFileSync(artifactPath, "original bytes");
+            commandDeps.evaluateArtifact = () => {
+                writeFileSync(artifactPath, "swapped bytes");
+                return passEvaluator();
+            };
+            executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
+            const second = executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
+            expect(second.level).toBe("error");
+            expect(second.text).toContain("changed during evaluation");
+            expect(
+                (
+                    db
+                        .prepare("SELECT COUNT(*) AS count FROM claim_enforcement_artifacts")
+                        .get() as { count: number }
+                ).count,
+            ).toBe(0);
+            expect(effectiveMaturityOf(db, seed.revisionId)).not.toBe("ENFORCED");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("an approval revocation between confirmation and repeat blocks enforcement", () => {
         const db = migratedDb();
         try {

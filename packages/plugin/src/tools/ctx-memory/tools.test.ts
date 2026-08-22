@@ -2054,6 +2054,52 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
         ).map((row) => row.content);
     }
 
+    it("hides quarantined memories from get and list and labels sub-verified rows", async () => {
+        const write = await tools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Quarantine target fact." },
+            toolContext(),
+        );
+        expect(write).toContain("Saved memory [ID:");
+        const [memory] = getMemoriesByProject(db, OWN_PROJECT);
+
+        // A fresh agent-written memory is CANDIDATE: visible with a trust label.
+        const fetched = await tools.ctx_memory.execute(
+            { action: "get", ids: [memory.id] },
+            toolContext(),
+        );
+        expect(fetched).toContain("Quarantine target fact.");
+        expect(fetched).toContain("candidate");
+
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+        if (!claim) throw new Error("expected claim link");
+        const {
+            recordDispositionEventInCurrentTransaction,
+            refreshEffectivePolicyInCurrentTransaction,
+        } = await import("../../features/magic-context/memory/storage-claim-policy");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: claim.revisionId,
+                projectId: claim.projectId,
+                disposition: "quarantined",
+                action: "assert",
+                actor: "host",
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
+            return undefined;
+        });
+
+        const got = await tools.ctx_memory.execute(
+            { action: "get", ids: [memory.id] },
+            toolContext(),
+        );
+        expect(got).not.toContain("Quarantine target fact.");
+        const relisted = await tools.ctx_memory.execute(
+            { action: "list" },
+            toolContext("ses-memory", DREAMER_AGENT),
+        );
+        expect(relisted).not.toContain("Quarantine target fact.");
+    });
+
     it("writing the same content twice keeps one projection row and one revision while telemetry increments", async () => {
         const write = await tools.ctx_memory.execute(
             { action: "write", category: "CONSTRAINTS", content: "Use bun for scripts." },

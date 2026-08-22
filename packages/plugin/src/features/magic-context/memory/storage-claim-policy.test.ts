@@ -481,6 +481,9 @@ describe("claim policy storage kernel", () => {
             expect(() =>
                 advanceProjectorWatermarkInCurrentTransaction(fx.db, "native", fx.projectId, 6, 3),
             ).toThrow(/cannot regress/);
+            expect(() =>
+                advanceProjectorWatermarkInCurrentTransaction(fx.db, "native", fx.projectId, 8, 2),
+            ).toThrow(/cannot regress/);
         } finally {
             closeQuietly(fx.db);
         }

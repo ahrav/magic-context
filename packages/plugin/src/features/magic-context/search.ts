@@ -26,6 +26,7 @@ import {
     decideMemoryPolicy,
     filterMemoriesByPolicy,
     hasClaimEffectivePolicy,
+    type MemoryPolicyRow,
     type MemoryPolicySurface,
     readMemoryPolicyRows,
 } from "./memory/storage-claim-visibility";
@@ -923,14 +924,21 @@ async function searchMemories(args: {
     });
     // Policy recheck before results leave the lane: a transition committed
     // during scoring must not publish newly hidden content.
-    const recheckRows = readMemoryPolicyRows(
-        args.db,
-        merged.map((result) => result.memoryId),
-    );
+    const hasPolicy = hasClaimEffectivePolicy(args.db);
+    const recheckRows = hasPolicy
+        ? readMemoryPolicyRows(
+              args.db,
+              merged.map((result) => result.memoryId),
+          )
+        : new Map<number, MemoryPolicyRow>();
     const rechecked: MemorySearchResult[] = [];
     for (const result of merged) {
+        if (!hasPolicy) {
+            rechecked.push(result);
+            continue;
+        }
         const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);
-        if (!decision.eligible && hasClaimEffectivePolicy(args.db)) continue;
+        if (!decision.eligible) continue;
         rechecked.push(decision.label ? { ...result, policyLabel: decision.label } : result);
     }
     // The lane's terminal span: the unified fusion span depends on it so
