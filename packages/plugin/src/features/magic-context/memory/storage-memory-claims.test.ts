@@ -938,6 +938,68 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         });
     });
 
+    test("superseding onto an unlinked hash-equal target keeps the dedup-shared claim live", () => {
+        const db = track(migratedDb());
+        const source = createSeedMemory(db, "same-claim-supersede", "same claim fact");
+        // An unlinked hash-equal row under an aliased path: the supersede's
+        // target adoption dedups it onto the source's canonical claim, so the
+        // sibling-liveness retire gate must see the just-adopted live target.
+        const aliasPath = "git:kernel-project-alias";
+        const projectId = (
+            db
+                .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
+                .get(PROJECT) as { id: number }
+        ).id;
+        db.prepare(
+            "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, 1)",
+        ).run(aliasPath, projectId);
+        let targetId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            targetId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(aliasPath, "same claim fact", "hash:same claim fact").lastInsertRowid,
+            );
+        });
+        expect(readMemoryClaimLink(db, targetId)).toBeNull();
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("same-claim-supersede-1", { id: source.memoryId }),
+                { memoryId: source.memoryId, supersededByMemoryId: targetId },
+            ),
+        );
+
+        // The target dedup-adopted onto the source's claim as a live sibling:
+        // the claim stays active and no self-supersession edge exists.
+        const targetLink = readMemoryClaimLink(db, targetId);
+        expect(targetLink?.claimId).toBe(source.claimId);
+        expect(outcome.result.supersededByClaimId).toBe(source.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(source.claimId)).toEqual({
+            state: "active",
+        });
+        expect(count(db, "claim_conflicts")).toBe(0);
+        expect(count(db, "claim_merge_lineage")).toBe(0);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                "effect_type = 'lifecycle' AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'same-claim-supersede-1')",
+            ),
+        ).toBe(0);
+        // The row-level pointer still records the supersession.
+        expect(
+            db
+                .prepare("SELECT status, superseded_by_memory_id FROM memories WHERE id = ?")
+                .get(source.memoryId),
+        ).toEqual({ status: "archived", superseded_by_memory_id: targetId });
+    });
+
     test("a cross-project supersession records audit-only merge lineage instead of a conflict", () => {
         const db = track(migratedDb());
         const source = createSeedMemory(db, "xp-source", "cross project source", "git:project-a");

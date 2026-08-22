@@ -437,6 +437,7 @@ export function moveLinkedMemoryAcrossProjects(
             .all(rowId) as Array<{ id: number }>
     ).map((row) => row.id);
     const repointableIds: number[] = [];
+    const adoptedReferrerLinks: MemoryClaimLink[] = [];
     for (const referencingId of referencingIds) {
         const referencingRow = readMemoryProjectionRow(db, referencingId);
         if (!referencingRow) continue;
@@ -459,9 +460,14 @@ export function moveLinkedMemoryAcrossProjects(
             );
             continue;
         }
-        ensureMemoryClaimLinkInCurrentTransaction(db, referencingRow, projectId, {
-            kind: "migration",
-        });
+        const referrerWasLinked = readMemoryClaimLink(db, referencingId) !== null;
+        const referrerLink = ensureMemoryClaimLinkInCurrentTransaction(
+            db,
+            referencingRow,
+            projectId,
+            { kind: "migration" },
+        );
+        if (!referrerWasLinked) adoptedReferrerLinks.push(referrerLink);
         translateMemoryClaimRelationshipsInCurrentTransaction(db, referencingRow);
         repointableIds.push(referencingId);
     }
@@ -576,6 +582,21 @@ export function moveLinkedMemoryAcrossProjects(
             // mutation or delete) and re-links the lineage edges to the
             // target claim.
             effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, newRow));
+            // A referrer first adopted by the repoint loop above holds a
+            // fresh claim with no outbox effect of its own — the relationship
+            // translations attach their effects to the TARGET claims — so the
+            // boundary reconciliation oracle would flag its crosswalk row as
+            // missing an outbox effect forever (the row is linked, so the
+            // backfill skips it). Emit the first-adoption upsert here, inside
+            // the move envelope.
+            for (const adopted of adoptedReferrerLinks) {
+                effects.push({
+                    effectKey: `memory:${adopted.memoryId}:upsert`,
+                    projectId: adopted.projectId,
+                    claimId: adopted.claimId,
+                    effectType: "upsert",
+                });
+            }
             for (const referencingId of referencingIds) {
                 const referencingRow = readMemoryProjectionRow(db, referencingId);
                 if (referencingRow) {

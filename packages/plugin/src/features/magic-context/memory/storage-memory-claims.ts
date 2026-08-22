@@ -1906,19 +1906,7 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                 row,
             );
 
-            // A shared canonical claim retires only with its last live link;
-            // the superseded projection flips to archived below, so only
-            // sibling crosswalk rows count.
-            const retireClaim = !claimHasOtherLiveMemoryLink(db, link.claimId, row.id);
             const effects: MemoryClaimEffect[] = [...relationshipEffects];
-            if (retireClaim) {
-                effects.push({
-                    effectKey: `memory:${row.id}:lifecycle`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "lifecycle" as const,
-                });
-            }
             let supersededByClaimId: number | null = null;
             const target = readMemoryProjectionRow(db, input.supersededByMemoryId);
             const targetProjectId = target
@@ -1945,7 +1933,20 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                     });
                 }
             }
-            if (retireClaim) {
+            // A shared canonical claim retires only with its last live link;
+            // the superseded projection flips to archived below, so only
+            // sibling crosswalk rows count. The check runs after the target
+            // adoption: an unlinked hash-equal target dedup-adopts onto this
+            // same claim, and that live sibling must keep the claim active
+            // (the recorder above already returns "same-claim" for the pair,
+            // so no self-supersession edge exists either).
+            if (!claimHasOtherLiveMemoryLink(db, link.claimId, row.id)) {
+                effects.push({
+                    effectKey: `memory:${row.id}:lifecycle`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "lifecycle" as const,
+                });
                 setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
             }
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");

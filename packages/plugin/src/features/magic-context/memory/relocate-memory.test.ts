@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { inspectClaimsBackfillReconciliation } from "../claims-backfill";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import {
@@ -11,10 +12,12 @@ import {
 } from "./relocate-memory";
 import { deleteMemory, insertMemory } from "./storage-memory";
 import {
+    computeClaimRequestDigest,
     getCurrentMemoryClaimByLegacyMemoryId,
     memoryClaimSupersessionExists,
     readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
+    setMemoryStatusWithClaimsInCurrentTransaction,
 } from "./storage-memory-claims";
 
 let db: Database | null = null;
@@ -475,6 +478,68 @@ describe("relocate-memory claims (v84)", () => {
             reason_code: "empty-content",
             disposition: "blocking",
         });
+    });
+
+    test("a boundary referrer first adopted by the repoint loop gets its upsert outbox effect", () => {
+        // Pre-v84 rows below the high-water boundary: inserted before
+        // migrations run, so the referrer starts as an unlinked boundary row
+        // the reconciliation oracle covers.
+        const database = new Database(":memory:");
+        db = database;
+        database.exec("PRAGMA foreign_keys=ON");
+        initializeDatabase(database);
+        const insert = database.prepare(
+            `INSERT INTO memories (project_path, category, content, normalized_hash,
+                seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+             VALUES ('git:project-a', 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+        );
+        const sourceId = Number(insert.run("moving fact", "hash:moving fact").lastInsertRowid);
+        const referrerId = Number(
+            insert.run("pointing fact", "hash:pointing fact").lastInsertRowid,
+        );
+        runMigrations(database);
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?")
+                .run(sourceId, referrerId);
+        });
+        // Link the source (the cross-project move branch requires a linked
+        // row); the referrer stays unlinked until the repoint loop adopts it.
+        runInMemoryClaimsWriteTransaction(database, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                database,
+                {
+                    producer: "relocate-test",
+                    operationKey: "touch-source",
+                    requestDigest: computeClaimRequestDigest({ sourceId }),
+                },
+                { memoryId: sourceId, status: "active" },
+            ),
+        );
+        expect(readMemoryClaimLink(database, referrerId)).toBeNull();
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [sourceId], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const referrerLink = readMemoryClaimLink(database, referrerId);
+        if (!referrerLink) throw new Error("expected the repoint loop to adopt the referrer");
+        // The first adoption emits its upsert effect inside the move
+        // envelope, so the referrer's fresh claim has an outbox effect and
+        // the boundary reconciliation oracle does not flag its crosswalk row.
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS c FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'upsert'
+                        AND claim_id = ? AND project_id = ?`,
+                )
+                .get(`memory:${referrerId}:upsert`, referrerLink.claimId, referrerLink.projectId),
+        ).toEqual({ c: 1 });
+        expect(inspectClaimsBackfillReconciliation(database).problems).toEqual([
+            "pending v22 identity work",
+        ]);
     });
 
     test("a collision merge into an empty-content target skips with a diagnostic instead of deleting the source", () => {
