@@ -11299,6 +11299,15 @@ impl McHandler {
                     NoteEvalAcquireOutcome::Claim {
                         replayed: false, ..
                     } => {
+                        // The store returns a fresh claim only after the
+                        // selection closure produced a candidate, which also
+                        // sets `proposed_cycle`. A `None` here means the quota
+                        // stopped decrementing and fair rotation silently
+                        // starves, so surface the broken invariant in tests.
+                        debug_assert!(
+                            proposed_cycle.is_some(),
+                            "fresh claim committed without a proposed cycle update"
+                        );
                         if let Some(next_cycle) = proposed_cycle {
                             *slot_cycle = next_cycle;
                         }
