@@ -1754,6 +1754,7 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
         };
         const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
         if (failure !== null || projectId === null) {
+            const existingLink = readMemoryClaimLink(db, row.id);
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             updateMemoryProjectionClassification(db, row.id, projectionUpdate, input.nowMs);
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -1774,6 +1775,31 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
                     projectId,
                     liveProvenance(envelope, post.source_session_id),
                 );
+                if (existingLink) {
+                    // A row linked before this repair gets its stale link
+                    // back from the ensure's early return, so the repaired
+                    // classification must append its own same-content
+                    // revision here — otherwise the claim keeps the
+                    // pre-repair metadata and the upsert effect announces a
+                    // claim that never changed.
+                    const observationId = createMemoryObservation(db, {
+                        projectId,
+                        memoryId: row.id,
+                        content: post.content,
+                        provenance: liveProvenance(envelope, post.source_session_id),
+                    });
+                    appendMemoryClaimRevision(db, {
+                        claimId: link.claimId,
+                        content: post.content,
+                        observationId,
+                        metadata: metadataFromProjectionRow(post),
+                        sourceSessionId: post.source_session_id,
+                    });
+                    // The ensure's early return skips its resolve call, so
+                    // the blocker recorded by the invalidating write clears
+                    // here.
+                    resolveMemoryClaimLinkFailure(db, row.id);
+                }
                 const effects: MemoryClaimEffect[] = [
                     {
                         effectKey: `memory:${row.id}:upsert`,

@@ -549,6 +549,68 @@ describe("memory/claims kernel: content and classification updates", () => {
         ).toBe(1);
     });
 
+    test("an already-linked row invalidated and then classification-repaired appends the repaired revision and clears the blocker", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "linked-importance-seed", "linked classified");
+
+        // A module delta zeroes importance in the projection, making the
+        // linked row claim-invalid; the blocking diagnostic records it.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("linked-importance-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    applyProjection: () => {
+                        db.prepare("UPDATE memories SET importance = 0 WHERE id = ?").run(
+                            seeded.memoryId,
+                        );
+                    },
+                },
+            ),
+        );
+        expect(
+            db
+                .prepare(
+                    "SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(seeded.memoryId)),
+        ).toEqual({ reason_code: "invalid-importance", disposition: "blocking" });
+
+        const repaired = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryClassificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("linked-importance-2", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId, importance: 55 },
+            ),
+        );
+
+        // The repair appends the repaired classification onto the EXISTING
+        // claim as a new same-content revision (the ensure early-returns the
+        // stale link without appending), emits the upsert for that real
+        // change, and resolves the invalid-importance blocker.
+        expect(repaired.result.claimId).toBe(seeded.claimId);
+        expect(repaired.result.revisionId).not.toBe(seeded.revisionId);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, seeded.memoryId);
+        expect(claim?.claimId).toBe(seeded.claimId);
+        expect(claim?.content).toBe("linked classified");
+        expect(claim?.importance).toBe(55);
+        expect(count(db, "claim_revisions", `claim_id = ${seeded.claimId}`)).toBe(2);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'upsert' AND effect_key = 'memory:${seeded.memoryId}:upsert'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'linked-importance-2')`,
+            ),
+        ).toBe(1);
+        expect(
+            db
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(String(seeded.memoryId)),
+        ).toEqual({ disposition: "resolved" });
+    });
+
     test("a classification-only change appends a same-content revision with new metadata; a seen-count bump touches only memory_stats", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "classify-seed", "classified fact");
