@@ -1501,14 +1501,16 @@ mod tests {
     }
 
     /// Lifecycle temps must be reclaimable: they share the publication's temp
-    /// shape, so the stale sweep has to cover both canonical names.
+    /// shape, so the acquire-time stale sweep has to cover both canonical
+    /// names — including for an incarnation that never reaches publish.
     #[test]
     fn stale_lifecycle_temps_are_swept() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
-        let stale = guard
-            .dir_path()
-            .join(format!(".{LIFECYCLE_RECORD_NAME}.99999.deadbeef.tmp"));
+        let dir_path = {
+            let guard = InstanceGuard::acquire(Some(root.path())).expect("first acquire");
+            guard.dir_path().to_path_buf()
+        };
+        let stale = dir_path.join(format!(".{LIFECYCLE_RECORD_NAME}.99999.deadbeef.tmp"));
         std::fs::write(&stale, b"orphaned mid-write").expect("plant temp");
         let long_ago = SystemTime::now() - Duration::from_secs(60 * 60 * 24);
         std::fs::File::open(&stale)
@@ -1516,7 +1518,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(long_ago))
             .expect("age temp");
 
-        guard.publish(43123, "mc-host/test").expect("publish");
+        let _guard = InstanceGuard::acquire(Some(root.path())).expect("acquire sweeps");
         assert!(
             !stale.exists(),
             "a stale lifecycle temp must be swept like a publication temp"

@@ -167,6 +167,10 @@ impl InstanceGuard {
         let dir_path = runtime_dir_path(data_dir_override)?;
         let dir = secure_runtime_dir(&dir_path)?;
         lock_instance(&dir, &dir_path)?;
+        // Sweep under the freshly held lock rather than at publish: an
+        // incarnation that crash-loops before ever publishing still reclaims
+        // its predecessors' stale temp files on each start.
+        sweep_stale_temps(&dir, &dir_path);
 
         let mut key = [0u8; KEY_LEN];
         getrandom::getrandom(&mut key).map_err(|_| InstanceError::Random)?;
@@ -210,8 +214,6 @@ impl InstanceGuard {
     /// over the canonical name both stay relative to the pinned directory
     /// descriptor, so the swap cannot cross filesystems or follow links.
     pub fn publish(&mut self, port: u16, daemon_ver: &str) -> Result<(), InstanceError> {
-        sweep_stale_temps(&self.dir, &self.dir_path);
-
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: Some(subc_protocol::PROTOCOL_VERSION),
@@ -609,7 +611,7 @@ pub(crate) const ATOMIC_WRITE_NAMES: [&str; 2] = [
 /// Candidates and metadata come from a path-based directory iterator with
 /// metadata fetched per entry, while deletion is descriptor-relative; the
 /// metadata check and unlink are not atomic. Age is the sole predicate,
-/// failures do not prevent publication (protocol §4.2). The scan examines at
+/// failures do not prevent startup (protocol §4.2). The scan examines at
 /// most 1024 successfully read entries.
 fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
     const MAX_SWEEP_ENTRIES: usize = 1024;
@@ -1030,8 +1032,12 @@ mod tests {
     #[test]
     fn stale_temps_are_swept_and_fresh_ones_spared() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
-        let dir = guard.dir_path().to_path_buf();
+        // A first incarnation creates the runtime directory, then "crashes"
+        // (drop releases the lock), stranding the temps a predecessor would.
+        let dir = {
+            let guard = InstanceGuard::acquire(Some(root.path())).expect("first acquire");
+            guard.dir_path().to_path_buf()
+        };
 
         let stale = dir.join(format!(".{CONNECTION_FILE_NAME}.99999.deadbeef.tmp"));
         std::fs::write(&stale, b"stranded").expect("write stale");
@@ -1054,11 +1060,14 @@ mod tests {
             .set_modified(SystemTime::now() - Duration::from_secs(3600))
             .expect("backdate");
 
-        guard.publish(9999, "mc-host/test").expect("publish");
+        // The successor sweeps at lock acquisition — before any publish — so
+        // a crash-loop that never reaches publish still reclaims temps.
+        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
 
         assert!(!stale.exists(), "a stale temp must be swept");
         assert!(fresh.exists(), "an in-flight temp must be spared");
         assert!(unrelated.exists(), "age alone must not condemn other files");
+        guard.publish(9999, "mc-host/test").expect("publish");
         assert!(published(&guard).exists(), "publication must still land");
     }
 
