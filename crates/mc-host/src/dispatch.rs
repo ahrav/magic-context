@@ -689,6 +689,7 @@ pub async fn dispatch_request<H: McHostHandler>(
             binary,
             cancel: cancel.clone(),
             stream: sink,
+            scratch: shared_task.scratch_budget.clone(),
         };
         let handler = Arc::clone(&shared_task.handler);
         let inner = shared_task.spawn_tracked(handler_fence.track_future(async move {

@@ -13,9 +13,10 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use super::SynapseLimits;
+use crate::wire::ByteCharge;
 
 pub(crate) const MAX_ITEM_ID_BYTES: usize = 256;
-const CONTENT_SHA256_BYTES: usize = 64;
+pub(crate) const CONTENT_SHA256_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchItem {
@@ -97,9 +98,26 @@ struct Job {
     result_bytes: u64,
     state: JobState,
     completed_at: Option<Instant>,
+    /// Resident-byte charge for this job's request inputs. Sized by
+    /// [`job_input_bytes`] at admission, shrunk to [`Job::retained_input_bytes`]
+    /// when the texts die, and released by dropping the job on removal,
+    /// eviction, expiry, or clear.
+    charge: ByteCharge,
 }
 
 impl Job {
+    /// Logical request-input bytes still owned after the item texts die:
+    /// both key copies and the id/hash metadata. String contents only;
+    /// struct and hash-bucket overhead stay outside the accounting claim.
+    fn retained_input_bytes(&self) -> usize {
+        let meta: usize = self
+            .item_meta
+            .iter()
+            .map(|(id, hash)| id.len() + hash.len())
+            .sum();
+        2 * self.key.len() + meta
+    }
+
     fn status(&self) -> &'static str {
         match self.state {
             JobState::Queued { .. } => "queued",
@@ -142,6 +160,23 @@ pub(crate) fn escaped_string_bytes(s: &str) -> usize {
         .expect("serialized JSON string includes quotes")
 }
 
+/// Whether a stored failure code's retry disposition is permanent
+/// (protocol §7.5.1): an identical re-submission would deterministically
+/// re-fail, so admission replays the stored failure instead of re-running
+/// inference. Every other code is retryable or caller-policy, and an
+/// identical re-submission replaces the failed job with a fresh attempt.
+fn failure_is_permanent(code: &str) -> bool {
+    matches!(
+        code,
+        "artifact_invalid"
+            | "substitution_rejected"
+            | "schema_violation"
+            | "not_certified"
+            | "probe_required"
+            | "idempotency_conflict"
+    )
+}
+
 fn digest_payload(key: &str, items: &[BatchItem]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     let mut update = |bytes: &[u8]| {
@@ -155,6 +190,49 @@ fn digest_payload(key: &str, items: &[BatchItem]) -> [u8; 32] {
         update(item.text.as_bytes());
     }
     hasher.finalize().into()
+}
+
+/// Logical request-input bytes a newly admitted job owns while queued: both
+/// key copies (job field and table index), the queued item strings at their
+/// allocated capacities, and the id/hash metadata copies. String contents
+/// only; struct and hash-bucket overhead stay outside the accounting claim.
+pub(crate) fn job_input_bytes(key: &str, items: &[BatchItem]) -> usize {
+    let mut bytes = 2usize.saturating_mul(key.len());
+    for item in items {
+        bytes = bytes
+            .saturating_add(item.id.capacity())
+            .saturating_add(item.content_sha256.capacity())
+            .saturating_add(item.text.capacity())
+            // The admission-time metadata copies.
+            .saturating_add(item.id.len())
+            .saturating_add(item.content_sha256.len());
+    }
+    bytes
+}
+
+/// Charges detached from the table but not yet released. Releasing a permit
+/// takes the byte budget's own waiter lock and wakes whoever is queued on it,
+/// so it must happen after the table guard falls — never underneath it, where
+/// it would nest a host-wide lock inside the one that serializes admission,
+/// polling, publication, and shutdown. Dropping a `Job` here also frees its
+/// retained vectors outside the lock, for the same reason `publish_ready`
+/// builds them outside it.
+#[derive(Default)]
+struct Released {
+    jobs: Vec<Job>,
+    charges: Vec<ByteCharge>,
+}
+
+impl Released {
+    fn job(&mut self, job: Option<Job>) {
+        self.jobs.extend(job);
+    }
+
+    fn charge(&mut self, charge: ByteCharge) {
+        if charge.bytes() > 0 {
+            self.charges.push(charge);
+        }
+    }
 }
 
 fn result_bytes(item_count: usize, dimensions: usize, metadata_bytes: usize) -> Option<u64> {
@@ -182,6 +260,22 @@ fn admitted_result_bytes(items: &[BatchItem], dimensions: usize) -> Option<u64> 
 }
 
 impl JobTable {
+    /// Acquires the table lock, recovering from poisoning. A panic while
+    /// the lock is held would otherwise brick the whole route: `sweep`
+    /// runs at the top of every request, so one poisoned acquisition
+    /// becomes a panic on every subsequent request until restart, and
+    /// `AbandonGuard::drop` re-entering a poisoned lock during unwind
+    /// would double-panic and abort the process. Recovered state may
+    /// reflect a partially applied mutation from the panicking call;
+    /// every operation on `Jobs` is defensive against missing or
+    /// already-completed entries, and the expiry sweep bounds how long
+    /// an inconsistent entry survives.
+    fn lock_jobs(&self) -> std::sync::MutexGuard<'_, Jobs> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn new(limits: SynapseLimits) -> Self {
         let mut nonce = [0u8; 8];
         // The incarnation fence must be unpredictable across restarts, or a
@@ -223,30 +317,83 @@ impl JobTable {
 
     /// Whether `key` currently names a retained job.
     pub fn key_is_retained(&self, key: &str) -> bool {
-        let mut jobs = self.inner.lock().expect("job table lock");
-        self.sweep_expired(&mut jobs);
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
+        self.sweep_expired(&mut jobs, &mut released);
         jobs.by_key.contains_key(key)
     }
 
-    pub fn admit(&self, key: String, items: Vec<BatchItem>, dimensions: usize) -> AdmitOutcome {
+    /// Admission with **no resident charge** — the job owns its key, queued
+    /// item texts, and metadata copies with zero accounting, so nothing is
+    /// ever released for them. Test-only: the host must never call this,
+    /// because an uncharged job is precisely the untracked request-input
+    /// ownership that [`JobTable::admit_charged`] exists to close.
+    #[doc(hidden)]
+    pub fn admit_uncharged_for_tests(
+        &self,
+        key: String,
+        items: Vec<BatchItem>,
+        dimensions: usize,
+    ) -> AdmitOutcome {
+        self.admit_charged(key, items, dimensions, &mut ByteCharge::none())
+    }
+
+    /// Admission that transfers a job-sized portion of `charge` into the new
+    /// job under the same table lock that inserts it. Every non-`Admitted`
+    /// outcome leaves `charge` with the caller, so a rejected, replayed,
+    /// conflicting, full, or closed candidate never alters a retained job's
+    /// charge.
+    pub(crate) fn admit_charged(
+        &self,
+        key: String,
+        items: Vec<BatchItem>,
+        dimensions: usize,
+        charge: &mut ByteCharge,
+    ) -> AdmitOutcome {
         let digest = digest_payload(&key, &items);
         let text_bytes: u64 = items.iter().map(|item| item.text.len() as u64).sum();
         let result_bytes = admitted_result_bytes(&items, dimensions);
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let input_bytes = job_input_bytes(&key, &items);
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
         if jobs.closed {
             return AdmitOutcome::Closed;
         }
-        self.sweep_expired(&mut jobs);
+        self.sweep_expired(&mut jobs, &mut released);
 
+        // A failed same-digest job a retry below may replace. Eviction is
+        // deferred until every admission check has passed: a retry that
+        // bounces off a full table (or an oversized result) must leave the
+        // stored failure pollable rather than losing it to a rejection.
+        let mut failed_replay = None;
         if let Some(seq) = jobs.by_key.get(&key).copied() {
             let job = jobs.by_seq.get(&seq).expect("keyed job exists");
-            if job.payload_digest == digest {
-                return AdmitOutcome::Existing(JobDescriptor {
-                    job_id: self.job_id(seq),
-                    status: job.status(),
-                });
+            if job.payload_digest != digest {
+                return AdmitOutcome::Conflict;
             }
-            return AdmitOutcome::Conflict;
+            // A retryably-failed job is not a result worth replaying: the
+            // retained failure exists so a poll can read the error, but an
+            // identical re-submission is a retry, and returning `Existing`
+            // would hold the key hostage until expiry and make the
+            // protocol's retryable disposition a lie within the retention
+            // window. A permanently-coded failure is the opposite case:
+            // re-running the same payload deterministically re-fails, so
+            // the stored failure replays instead of burning inference.
+            match &job.state {
+                JobState::Failed { code, .. } if !failure_is_permanent(code) => {
+                    failed_replay = Some(seq);
+                }
+                _ => {
+                    return AdmitOutcome::Existing(JobDescriptor {
+                        job_id: self.job_id(seq),
+                        status: job.status(),
+                    });
+                }
+            }
         }
 
         let Some(result_bytes) = result_bytes else {
@@ -270,6 +417,13 @@ impl JobTable {
             return AdmitOutcome::Full;
         }
 
+        // Every check passed: the retry replaces the failed job. Removed
+        // before the insert below so the key's index entry is never
+        // clobbered for a job that still lives in the table.
+        if let Some(seq) = failed_replay {
+            released.job(Self::remove(&mut jobs, seq));
+        }
+
         let seq = jobs.next_seq;
         jobs.next_seq += 1;
         let item_meta = items
@@ -291,6 +445,7 @@ impl JobTable {
                 result_bytes: 0,
                 state: JobState::Queued { items },
                 completed_at: None,
+                charge: charge.split_or_take(input_bytes),
             },
         );
         AdmitOutcome::Admitted {
@@ -302,7 +457,7 @@ impl JobTable {
     /// Claims the queued inputs for inference. `None` means the job was
     /// cancelled by shutdown before its worker started.
     pub fn start(&self, seq: u64) -> Option<Vec<BatchItem>> {
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         let job = jobs.by_seq.get_mut(&seq)?;
         let JobState::Queued { items } = &mut job.state else {
             return None;
@@ -317,7 +472,10 @@ impl JobTable {
         // outside the global job-table lock so large inference results do not
         // block admission, polling, or shutdown bookkeeping.
         let vectors: Vec<Arc<[f32]>> = vectors.into_iter().map(Arc::from).collect();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
@@ -332,6 +490,7 @@ impl JobTable {
                 seq,
                 "artifact_invalid".to_owned(),
                 "inference returned a different item count".to_owned(),
+                &mut released,
             );
             return;
         }
@@ -341,6 +500,7 @@ impl JobTable {
                 seq,
                 "artifact_invalid".to_owned(),
                 "inference returned a different vector dimension".to_owned(),
+                &mut released,
             );
             return;
         }
@@ -355,33 +515,62 @@ impl JobTable {
         };
         job.result_bytes = result_bytes;
         job.completed_at = Some(Instant::now());
+        // The queued texts died with the worker's items; only the retained
+        // key and metadata stay charged. The freed permits leave the lock
+        // with `released` rather than being handed back underneath it.
+        let retained = job.retained_input_bytes();
+        let excess = job.charge.split_excess(retained);
+        released.charge(excess);
         jobs.queued_text_bytes -= text_bytes;
         jobs.retained_result_bytes += result_bytes;
-        self.enforce_retention(&mut jobs, Some(seq));
+        self.enforce_retention(&mut jobs, Some(seq), &mut released);
     }
 
     pub fn publish_failed(&self, seq: u64, code: String, message: String) {
-        let mut jobs = self.inner.lock().expect("job table lock");
-        self.fail_job(&mut jobs, seq, code, message);
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
+        self.fail_job(&mut jobs, seq, code, message, &mut released);
     }
 
     /// Terminal-failure bookkeeping shared by every failure path: queued
     /// text is released, the retention clock starts, and eviction runs.
-    fn fail_job(&self, jobs: &mut Jobs, seq: u64, code: String, message: String) {
+    /// Idempotent on an already-completed job so a late abandonment guard
+    /// cannot clobber a published result or its byte accounting.
+    fn fail_job(
+        &self,
+        jobs: &mut Jobs,
+        seq: u64,
+        code: String,
+        message: String,
+        released: &mut Released,
+    ) {
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
+        if job.is_completed() {
+            return;
+        }
         let text_bytes = job.text_bytes;
         job.text_bytes = 0;
         job.state = JobState::Failed { code, message };
         job.completed_at = Some(Instant::now());
+        // Queued items (if the worker never started) and worker-owned texts
+        // are both dead at this transition.
+        let retained = job.retained_input_bytes();
+        let excess = job.charge.split_excess(retained);
+        released.charge(excess);
         jobs.queued_text_bytes -= text_bytes;
-        self.enforce_retention(jobs, Some(seq));
+        self.enforce_retention(jobs, Some(seq), released);
     }
 
     pub fn poll(&self, job_id: &str, key: &str, cursor: Option<&str>) -> PollOutcome {
-        let mut jobs = self.inner.lock().expect("job table lock");
-        self.sweep_expired(&mut jobs);
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
+        self.sweep_expired(&mut jobs, &mut released);
         let Some(seq) = self.parse_job_id(job_id) else {
             return PollOutcome::Restarted;
         };
@@ -498,7 +687,22 @@ impl JobTable {
         boundaries
     }
 
-    fn sweep_expired(&self, jobs: &mut Jobs) {
+    /// Releases every expired retained job and its charge. The request path
+    /// calls this when a resident reservation fails: every other sweep site
+    /// (admission, poll, key lookup) sits after the reservation and is
+    /// unreachable once the pool is exhausted, so without a pass here a
+    /// charge already past its retention period could hold the pool below
+    /// the minimum reservation and fail every request `queue_full` —
+    /// including the ones that would have swept it.
+    pub fn sweep(&self) {
+        // Declared before the guard so it drops after it: permits release
+        // outside the table lock.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
+        self.sweep_expired(&mut jobs, &mut released);
+    }
+
+    fn sweep_expired(&self, jobs: &mut Jobs, released: &mut Released) {
         let now = Instant::now();
         let expired: Vec<u64> = jobs
             .by_seq
@@ -510,14 +714,14 @@ impl JobTable {
             .map(|job| job.seq)
             .collect();
         for seq in expired {
-            Self::remove(jobs, seq);
+            released.job(Self::remove(jobs, seq));
         }
     }
 
     /// Evicts oldest-completed jobs until the just-published job fits the
     /// retained count and byte caps. The publishing job itself is exempt
     /// until something newer displaces it.
-    fn enforce_retention(&self, jobs: &mut Jobs, keep: Option<u64>) {
+    fn enforce_retention(&self, jobs: &mut Jobs, keep: Option<u64>, released: &mut Released) {
         loop {
             let retained = jobs
                 .by_seq
@@ -539,27 +743,31 @@ impl JobTable {
                 // Only the protected job remains; drop the protection so an
                 // oversized single result cannot pin the caps forever.
                 let Some(seq) = keep else { return };
-                Self::remove(jobs, seq);
+                released.job(Self::remove(jobs, seq));
                 return;
             };
-            Self::remove(jobs, seq);
+            released.job(Self::remove(jobs, seq));
         }
     }
 
-    fn remove(jobs: &mut Jobs, seq: u64) {
-        let Some(job) = jobs.by_seq.remove(&seq) else {
-            return;
-        };
+    fn remove(jobs: &mut Jobs, seq: u64) -> Option<Job> {
+        let job = jobs.by_seq.remove(&seq)?;
         jobs.queued_text_bytes -= job.text_bytes;
         jobs.retained_result_bytes -= job.result_bytes;
         jobs.by_key.remove(&job.key);
+        Some(job)
     }
 
     /// Shutdown: closes admission and drops every queued (not yet started)
     /// job. Running jobs finish under the incarnation tracker; completed
     /// retention is released by [`JobTable::clear`] afterwards.
     pub fn close_admission(&self) {
-        let mut jobs = self.inner.lock().expect("job table lock");
+        // Declared before the guard so it drops after it: shutdown can drop
+        // a full table of charged jobs, and every one of those releases
+        // would otherwise take the byte budget's waiter lock while this
+        // lock is held.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
         jobs.closed = true;
         let queued: Vec<u64> = jobs
             .by_seq
@@ -568,13 +776,19 @@ impl JobTable {
             .map(|job| job.seq)
             .collect();
         for seq in queued {
-            Self::remove(&mut jobs, seq);
+            released.job(Self::remove(&mut jobs, seq));
         }
     }
 
     pub fn clear(&self) {
-        let mut jobs = self.inner.lock().expect("job table lock");
-        jobs.by_seq.clear();
+        // Declared before the guard so it drops after it: the drained jobs
+        // carry both their charges and their retained vectors, and freeing
+        // either under the table lock is what this ordering avoids.
+        let mut released = Released::default();
+        let mut jobs = self.lock_jobs();
+        released
+            .jobs
+            .extend(jobs.by_seq.drain().map(|(_, job)| job));
         jobs.by_key.clear();
         jobs.queued_text_bytes = 0;
         jobs.retained_result_bytes = 0;
@@ -584,6 +798,284 @@ impl JobTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::ByteBudget;
+
+    fn charged_item(id: &str, text: &str) -> BatchItem {
+        BatchItem {
+            id: id.to_owned(),
+            content_sha256: "0".repeat(64),
+            text: text.to_owned(),
+        }
+    }
+
+    fn retained_bytes(key: &str, items: &[BatchItem]) -> usize {
+        let meta: usize = items
+            .iter()
+            .map(|item| item.id.len() + item.content_sha256.len())
+            .sum();
+        2 * key.len() + meta
+    }
+
+    #[test]
+    fn a_charged_job_transfers_shrinks_and_releases_exact_permits() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let jobs = JobTable::new(SynapseLimits::default());
+        let items = vec![charged_item("a", "alpha"), charged_item("b", "beta")];
+        let key = "k".repeat(64);
+        let job_bytes = job_input_bytes(&key, &items);
+        let retained = retained_bytes(&key, &items);
+        assert!(job_bytes > retained);
+
+        let mut candidate = budget.try_charge(job_bytes + 500).expect("candidate");
+        let AdmitOutcome::Admitted { seq, .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut candidate)
+        else {
+            panic!("admitted");
+        };
+        assert_eq!(
+            candidate.bytes(),
+            500,
+            "admission takes exactly the job-sized portion"
+        );
+        drop(candidate);
+        assert_eq!(budget.available(), POOL - job_bytes);
+
+        let taken = jobs.start(seq).expect("starts");
+        assert_eq!(
+            budget.available(),
+            POOL - job_bytes,
+            "the job keeps the whole charge while the worker owns the items"
+        );
+
+        jobs.publish_ready(seq, vec![vec![0.0; 4]; taken.len()]);
+        assert_eq!(
+            budget.available(),
+            POOL - retained,
+            "publication shrinks the charge to retained metadata"
+        );
+
+        jobs.clear();
+        assert_eq!(budget.available(), POOL);
+    }
+
+    #[test]
+    fn non_admitted_outcomes_leave_the_candidate_charge_with_the_caller() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let jobs = JobTable::new(SynapseLimits::default());
+        let key = "k".repeat(64);
+        let items = vec![charged_item("a", "alpha")];
+        let job_bytes = job_input_bytes(&key, &items);
+
+        let mut first = budget.try_charge(job_bytes).expect("first");
+        let AdmitOutcome::Admitted { .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut first)
+        else {
+            panic!("admitted");
+        };
+
+        let mut replay = budget.try_charge(job_bytes).expect("replay");
+        assert!(matches!(
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut replay),
+            AdmitOutcome::Existing(_)
+        ));
+        assert_eq!(
+            replay.bytes(),
+            job_bytes,
+            "replay keeps its candidate charge"
+        );
+        drop(replay);
+
+        let other = vec![charged_item("b", "different")];
+        let mut conflict = budget.try_charge(1_000).expect("conflict");
+        assert!(matches!(
+            jobs.admit_charged(key.clone(), other, 4, &mut conflict),
+            AdmitOutcome::Conflict
+        ));
+        assert_eq!(
+            conflict.bytes(),
+            1_000,
+            "conflict keeps its candidate charge"
+        );
+        drop(conflict);
+
+        jobs.close_admission();
+        let mut closed = budget.try_charge(1_000).expect("closed");
+        assert!(matches!(
+            jobs.admit_charged(
+                "x".repeat(64),
+                vec![charged_item("c", "gamma")],
+                4,
+                &mut closed
+            ),
+            AdmitOutcome::Closed
+        ));
+        assert_eq!(closed.bytes(), 1_000, "closed keeps its candidate charge");
+        drop(closed);
+
+        assert_eq!(
+            budget.available(),
+            POOL,
+            "close_admission dropped the queued job and its whole charge"
+        );
+    }
+
+    #[test]
+    fn failure_eviction_and_expiry_release_their_charges() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let limits = SynapseLimits {
+            max_retained_jobs: 1,
+            ..SynapseLimits::default()
+        };
+        let jobs = JobTable::new(limits);
+
+        let admit = |key: String, items: Vec<BatchItem>| {
+            let bytes = job_input_bytes(&key, &items);
+            let mut charge = budget.try_charge(bytes).expect("charge");
+            let AdmitOutcome::Admitted { seq, .. } = jobs.admit_charged(key, items, 4, &mut charge)
+            else {
+                panic!("admitted");
+            };
+            seq
+        };
+
+        let first_key = "f".repeat(64);
+        let first_items = vec![charged_item("a", "alpha")];
+        let first = admit(first_key.clone(), first_items.clone());
+        jobs.publish_failed(first, "artifact_invalid".to_owned(), "boom".to_owned());
+        assert_eq!(
+            budget.available(),
+            POOL - retained_bytes(&first_key, &first_items),
+            "a failed job that never started still shrinks to retained metadata"
+        );
+
+        jobs.publish_failed(first, "artifact_invalid".to_owned(), "late".to_owned());
+        assert_eq!(
+            budget.available(),
+            POOL - retained_bytes(&first_key, &first_items),
+            "a late abandonment settlement cannot alter completed accounting"
+        );
+
+        let second_key = "e".repeat(64);
+        let second_items = vec![charged_item("b", "beta")];
+        let second = admit(second_key.clone(), second_items.clone());
+        jobs.start(second).expect("starts");
+        jobs.publish_ready(second, vec![vec![0.0; 4]]);
+        assert_eq!(
+            budget.available(),
+            POOL - retained_bytes(&second_key, &second_items),
+            "eviction of the oldest retained job released its remaining charge"
+        );
+
+        jobs.clear();
+        assert_eq!(budget.available(), POOL);
+    }
+
+    /// `sweep` alone must release expired charges: it is the only sweep
+    /// site that runs before the parse reservation, so it is what keeps
+    /// expired retained charges from wedging the ingress pool into a
+    /// permanent `queue_full`.
+    #[test]
+    fn sweep_releases_expired_charges_without_a_request_path() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let limits = SynapseLimits {
+            retention: std::time::Duration::ZERO,
+            ..SynapseLimits::default()
+        };
+        let jobs = JobTable::new(limits);
+
+        let key = "s".repeat(64);
+        let items = vec![charged_item("a", "alpha")];
+        let mut charge = budget
+            .try_charge(job_input_bytes(&key, &items))
+            .expect("charge");
+        let AdmitOutcome::Admitted { seq, .. } = jobs.admit_charged(key, items, 4, &mut charge)
+        else {
+            panic!("admitted");
+        };
+        jobs.publish_failed(seq, "artifact_invalid".to_owned(), "boom".to_owned());
+        assert!(budget.available() < POOL, "the retained charge is held");
+
+        jobs.sweep();
+        assert_eq!(
+            budget.available(),
+            POOL,
+            "sweep released the expired job's charge"
+        );
+    }
+
+    /// An identical re-submission of a failed payload is a retry, not a
+    /// replay of the stored failure: the failed job is evicted (releasing
+    /// its retained charge) and the retry admitted fresh, so a retryable
+    /// failure is not terminal within the retention window.
+    #[test]
+    fn an_identical_retry_replaces_a_failed_job() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let jobs = JobTable::new(SynapseLimits::default());
+        let key = "r".repeat(64);
+        let items = vec![charged_item("a", "alpha")];
+        let job_bytes = job_input_bytes(&key, &items);
+
+        let mut first = budget.try_charge(job_bytes).expect("charge");
+        let AdmitOutcome::Admitted { seq, .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut first)
+        else {
+            panic!("admitted");
+        };
+        jobs.publish_failed(seq, "internal_error".to_owned(), "worker died".to_owned());
+
+        // A retry that fails admission must not consume the stored failure:
+        // the same payload at an absurd dimension count is ResultTooLarge,
+        // and the failed job stays pollable under its key afterwards.
+        let mut rejected = budget.try_charge(job_bytes).expect("rejected charge");
+        assert!(matches!(
+            jobs.admit_charged(key.clone(), items.clone(), usize::MAX, &mut rejected),
+            AdmitOutcome::ResultTooLarge
+        ));
+        drop(rejected);
+        assert!(
+            jobs.key_is_retained(&key),
+            "a bounced retry leaves the failed job retained"
+        );
+
+        let mut second = budget.try_charge(job_bytes).expect("recharge");
+        let AdmitOutcome::Admitted { seq: retry_seq, .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut second)
+        else {
+            panic!("retry admitted");
+        };
+        assert_ne!(seq, retry_seq, "the retry is a new job");
+        assert_eq!(
+            budget.available(),
+            POOL - job_bytes,
+            "the failed job's retained charge was released with its eviction"
+        );
+
+        // A permanently-coded failure deterministically re-fails, so an
+        // identical re-submission replays the stored failure instead of
+        // re-running inference.
+        jobs.publish_failed(
+            retry_seq,
+            "schema_violation".to_owned(),
+            "bad input".to_owned(),
+        );
+        let mut third = budget.try_charge(job_bytes).expect("third charge");
+        assert!(
+            matches!(
+                jobs.admit_charged(key.clone(), items.clone(), 4, &mut third),
+                AdmitOutcome::Existing(descriptor) if descriptor.status == "failed"
+            ),
+            "a permanent failure replays rather than re-running"
+        );
+        drop(third);
+
+        jobs.clear();
+        assert_eq!(budget.available(), POOL);
+    }
 
     #[test]
     fn ready_polls_share_the_retained_vector_allocation() {
@@ -594,7 +1086,7 @@ mod tests {
             text: "alpha".to_owned(),
         }];
         let AdmitOutcome::Admitted { job_id, seq } =
-            jobs.admit("key".to_owned(), batch, 256 * 1024)
+            jobs.admit_uncharged_for_tests("key".to_owned(), batch, 256 * 1024)
         else {
             panic!("job is admitted");
         };
@@ -637,7 +1129,7 @@ mod tests {
         };
 
         let AdmitOutcome::Admitted { job_id, seq } =
-            jobs.admit("exact".to_owned(), item("a"), dimensions)
+            jobs.admit_uncharged_for_tests("exact".to_owned(), item("a"), dimensions)
         else {
             panic!("exact result is admitted");
         };
@@ -649,7 +1141,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            jobs.admit("oversize".to_owned(), item("ab"), dimensions),
+            jobs.admit_uncharged_for_tests("oversize".to_owned(), item("ab"), dimensions),
             AdmitOutcome::ResultTooLarge
         ));
         assert!(!jobs.key_is_retained("oversize"));

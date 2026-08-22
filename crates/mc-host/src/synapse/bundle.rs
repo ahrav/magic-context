@@ -374,6 +374,99 @@ fn validate_serving_limits(
             limits.max_retained_result_bytes
         )));
     }
+
+    // Retained job metadata (keys plus id/hash copies) lives for the whole
+    // retention window inside the scratch pool, in a slice reserved for it;
+    // reservations are validated against the pool minus that slice. Checked
+    // after the more specific reservation checks so their diagnostics win
+    // when a configuration trips several.
+    let reservable_scratch =
+        crate::config::SCRATCH_RESERVED_BYTES - crate::config::RETAINED_METADATA_RESERVED_BYTES;
+
+    // The result-page metadata reservation is a fixed function of these
+    // limits, taken from the scratch pool on every `embed.result` — while
+    // that request still holds its own decoded charge: up to twice the
+    // validated job-id and cursor lengths plus the 64-byte request key
+    // (decode scratch can retain up to double the decoded length as
+    // capacity) and the response scratch. A combined maximum above the
+    // pool's ceiling would make every poll fail `queue_full` forever even
+    // on an idle host — a permanent, config-induced outage that must
+    // reject at startup instead of surfacing one request at a time.
+    let page_meta_bytes = limits
+        .page_item_bound()
+        .saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
+    let result_request_bytes = 2
+        * (super::protocol::MAX_JOB_ID_BYTES + super::protocol::MAX_CURSOR_BYTES + 64)
+        + super::RESPONSE_SCRATCH_BYTES;
+    let result_worst_case = page_meta_bytes.saturating_add(result_request_bytes);
+    if result_worst_case as u64 > reservable_scratch {
+        return Err(err(format!(
+            "worst-case result-page metadata plus its request charge ({result_worst_case} \
+             bytes) exceeds the reservable scratch ({} bytes); lower max_page_vectors \
+             or max_batch_items",
+            reservable_scratch
+        )));
+    }
+
+    // The parse reservation is method-independent (the method cannot be
+    // decoded before reserving without unaccounted allocations), so its
+    // per-item term applies to every request. A body that decodes into a
+    // valid request under these limits is bounded by what they advertise:
+    // JSON escaping expands one text byte to at most six (`\u00XX`), and
+    // each batch item adds at most an escaped id, its hash, and the field
+    // skeleton — all capped by the preflight body maximum. If the worst
+    // advertised body's reservation exceeds the scratch pool, a request
+    // within advertised limits is permanently unservable, so the
+    // configuration rejects here instead of one request at a time.
+    const ESCAPED_BYTE_FACTOR: usize = 6;
+    const ITEM_BODY_ENVELOPE_BYTES: usize = 2048;
+    const BODY_ENVELOPE_BYTES: usize = 4096;
+    let worst_query_body = super::protocol::MAX_BODY_BYTES.min(
+        limits
+            .max_text_bytes
+            .saturating_mul(ESCAPED_BYTE_FACTOR)
+            .saturating_add(BODY_ENVELOPE_BYTES),
+    );
+    let worst_batch_body = super::protocol::MAX_BODY_BYTES.min(
+        limits
+            .max_batch_text_bytes
+            .saturating_mul(ESCAPED_BYTE_FACTOR)
+            .saturating_add(
+                limits
+                    .max_batch_items
+                    .saturating_mul(ITEM_BODY_ENVELOPE_BYTES),
+            )
+            .saturating_add(BODY_ENVELOPE_BYTES),
+    );
+    for worst_body in [worst_query_body, worst_batch_body] {
+        let reservation = super::protocol::parse_reservation_bytes(worst_body, limits)
+            .ok_or_else(|| err("the worst-case parse reservation overflows"))?;
+        if reservation as u64 > reservable_scratch {
+            return Err(err(format!(
+                "the parse reservation for a maximal advertised request ({reservation} bytes \
+                 for a {worst_body}-byte body) exceeds the reservable scratch ({} bytes); \
+                 lower max_batch_items or the text limits",
+                reservable_scratch
+            )));
+        }
+    }
+
+    // A full retention set that overflowed its reserved slice would starve
+    // the worst advertised request until expiry — the same permanent-outage
+    // class, reached by nothing more than completing batches.
+    let retained_worst = (limits.max_retained_jobs as u64).saturating_mul(
+        128u64.saturating_add(
+            (limits.max_batch_items as u64)
+                .saturating_mul((jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES) as u64),
+        ),
+    );
+    if retained_worst > crate::config::RETAINED_METADATA_RESERVED_BYTES {
+        return Err(err(format!(
+            "worst-case retained job metadata ({retained_worst} bytes) exceeds its reserved \
+             slice of the scratch pool ({} bytes); lower max_retained_jobs or max_batch_items",
+            crate::config::RETAINED_METADATA_RESERVED_BYTES
+        )));
+    }
     Ok(())
 }
 
@@ -755,6 +848,93 @@ mod tests {
         let error = validate_serving_limits(&manifest, &limits)
             .expect_err("one byte below the maximum result is invalid");
         assert!(error.0.contains("maximum batch result"));
+    }
+
+    /// A page-metadata bound that (together with the poll request's own
+    /// decoded charge) exceeds the fixed scratch pool would fail every
+    /// `embed.result` with `queue_full` forever — a permanent
+    /// config-induced outage — so the configuration must reject at
+    /// startup.
+    #[test]
+    fn a_page_bound_above_the_scratch_pool_is_rejected() {
+        let manifest = manifest();
+        let per_item = (jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES) as u64;
+        // Fits the pool by itself, but not alongside the request's own
+        // charge — the boundary a page-only check would wave through.
+        let boundary = (crate::config::SCRATCH_RESERVED_BYTES / per_item) as usize;
+        let limits = SynapseLimits {
+            max_page_vectors: boundary,
+            max_batch_items: boundary,
+            max_retained_result_bytes: u64::MAX,
+            ..SynapseLimits::default()
+        };
+        let error = validate_serving_limits(&manifest, &limits)
+            .expect_err("a page bound above the scratch pool is a permanent outage");
+        assert!(error.0.contains("result-page metadata"));
+
+        // The bound is clamped by max_batch_items, so an oversized
+        // max_page_vectors alone stays valid.
+        let limits = SynapseLimits {
+            max_page_vectors: boundary,
+            ..SynapseLimits::default()
+        };
+        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+    }
+
+    /// A configuration whose advertised limits permit a request the fixed
+    /// scratch pool can never fund — the method-independent per-item
+    /// headroom applied to a large advertised body — must reject at
+    /// startup, not one `schema_violation` at a time.
+    #[test]
+    fn an_unservable_advertised_request_is_rejected_at_startup() {
+        let manifest = manifest();
+        let limits = SynapseLimits {
+            max_text_bytes: 8 * 1024 * 1024,
+            max_batch_items: 131_073,
+            max_retained_result_bytes: u64::MAX,
+            ..SynapseLimits::default()
+        };
+        let error = validate_serving_limits(&manifest, &limits)
+            .expect_err("an unservable advertised request is a permanent outage");
+        assert!(error.0.contains("parse reservation"));
+
+        // A large advertised query alone (default item cap) stays valid:
+        // the reservation's item term is what overflows the pool.
+        let limits = SynapseLimits {
+            max_text_bytes: 8 * 1024 * 1024,
+            ..SynapseLimits::default()
+        };
+        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+    }
+
+    /// A retention set whose worst metadata overflows its reserved slice
+    /// of the scratch pool would starve the worst advertised request until
+    /// expiry — reached by nothing more than completing batches — so the
+    /// configuration must reject at startup.
+    #[test]
+    fn an_oversized_retention_set_is_rejected_at_startup() {
+        let manifest = manifest();
+        // Small text limits keep the advertised-request check satisfied so
+        // the retained check is the one that fires.
+        let limits = SynapseLimits {
+            max_batch_items: 150,
+            max_batch_text_bytes: 1024 * 1024,
+            max_retained_result_bytes: u64::MAX,
+            ..SynapseLimits::default()
+        };
+        let error = validate_serving_limits(&manifest, &limits)
+            .expect_err("an oversized retention set is a permanent outage");
+        assert!(error.0.contains("retained job metadata"));
+
+        // Halving the retention count restores validity at the same item cap.
+        let limits = SynapseLimits {
+            max_batch_items: 150,
+            max_batch_text_bytes: 1024 * 1024,
+            max_retained_result_bytes: u64::MAX,
+            max_retained_jobs: 32,
+            ..SynapseLimits::default()
+        };
+        assert!(validate_serving_limits(&manifest, &limits).is_ok());
     }
 
     #[test]

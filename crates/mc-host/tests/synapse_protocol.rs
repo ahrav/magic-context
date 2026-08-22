@@ -840,13 +840,135 @@ fn an_unknown_top_level_field_is_rejected_without_reading_its_value() {
         "the payload must stay under the body cap so the schema is the rejecting rule"
     );
 
-    let error = protocol::parse_request(&body, false, &lane, &limits)
+    let error = protocol::parse_request_unreserved(&body, false, &lane, &limits)
         .expect_err("a field outside the request envelope is refused");
     assert_eq!(error.code, "schema_violation");
 
     // The identical request without that field still parses, so the rejection
     // is the unknown field and not the request shape.
-    let accepted = protocol::parse_request(br#"{"method":"models.list"}"#, false, &lane, &limits)
-        .expect("the envelope without out-of-schema fields is accepted");
+    let accepted =
+        protocol::parse_request_unreserved(br#"{"method":"models.list"}"#, false, &lane, &limits)
+            .expect("the envelope without out-of-schema fields is accepted");
     assert_eq!(accepted, protocol::Request::ModelsList);
+}
+
+/// A routed request nested nine levels deep — with `params` preceding
+/// `method` and delimiters hidden inside strings — is refused at the depth
+/// preflight, while string content never counts toward depth.
+#[tokio::test]
+async fn a_routed_depth_nine_request_is_a_schema_violation() {
+    let engine = DeterministicEngine::new();
+    let host = SynapseHost::start(ready_component(engine.clone(), SynapseLimits::default())).await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let lane = test_lane();
+
+    let depth9: &[u8] =
+        br#"{"params":{"a":"}}}}{{{{","b":{"c":{"d":{"e":{"f":{"g":1}}}}}},"method":"embed.query"}"#;
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            support::raw_client::TY_REQUEST,
+            support::raw_client::FLAGS_INTERACTIVE,
+            channel,
+            epoch,
+            corr,
+            depth9,
+        )
+        .await
+        .expect("send depth-nine request");
+    let (_, frame) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("terminal");
+    assert_eq!(frame.error_code(), "schema_violation");
+
+    // The same structural characters inside a string are payload, not depth:
+    // an equivalent query with a delimiter-heavy text still embeds.
+    let mut params = constraints(&lane);
+    params["text"] = "}}}}}}}}{{{{[[[[]]]]".into();
+    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
+    assert_eq!(frame.json()["result"]["done"], true);
+
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the depth-nine request must never reach inference"
+    );
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// A protocol-valid request whose body plus parse reservation exceeds the
+/// host's whole resident capacity can never be served at this configuration,
+/// so it is refused as a permanent size violation rather than the retryable
+/// `queue_full` a client would resubmit forever. No engine call, no job, and
+/// capacity is untouched for later requests.
+#[tokio::test]
+async fn a_body_above_resident_capacity_is_a_permanent_size_violation() {
+    let engine = DeterministicEngine::new();
+    let limits = SynapseLimits {
+        // The scratch pool funds only the parse reservation (the body is
+        // charged to the ingress pool), so a body is unservable only when
+        // its reservation alone exceeds the fixed scratch ceiling. At
+        // default limits that can never happen — the worst-case reservation
+        // is sized to fit — so this config inflates the per-item term: an
+        // absurd item cap lets the body-derived item bound (~one item per
+        // 64 body bytes at 640 bytes of headroom each) push a ~12 MiB
+        // body's reservation past the ~96 MiB scratch pool.
+        max_batch_items: 10_000_000,
+        max_text_bytes: 30 * 1024 * 1024,
+        ..SynapseLimits::default()
+    };
+    let host = SynapseHost::start_with(ready_component(engine.clone(), limits), |config| {
+        // The extra 1 MiB lets the linked catalog fit.
+        config.limits.max_resident_bytes = mc_host::config::MIN_RESIDENT_BYTES + (1 << 20);
+        config.timing.frame_deadline = std::time::Duration::from_secs(30);
+    })
+    .await;
+    let mut client = host.client().await;
+    let (channel, epoch) = open_synapse_route(&mut client).await;
+    let lane = test_lane();
+
+    let mut params = constraints(&lane);
+    params["text"] = "x".repeat(12 * 1024 * 1024).into();
+    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
+    // Permanent, not retryable: draining traffic can never free enough,
+    // because the requirement is above the pool's ceiling, not its level.
+    assert_eq!(frame.error_code(), "schema_violation");
+    let message = frame.json()["message"]
+        .as_str()
+        .expect("error message")
+        .to_owned();
+    assert!(
+        message.contains("resident bytes") && message.contains("resident capacity"),
+        "the rejection must name what it needed and the ceiling it exceeded: {message}"
+    );
+    assert_eq!(
+        engine.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a capacity-rejected request must not reach inference"
+    );
+
+    // No charge leaked: a non-query operation and then a small query both
+    // succeed on the same lane.
+    let frame = call(
+        &mut client,
+        channel,
+        epoch,
+        "models.list",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        frame.json()["result"]["models"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let mut params = constraints(&lane);
+    params["text"] = "small query".into();
+    let frame = call(&mut client, channel, epoch, "embed.query", params).await;
+    assert_eq!(frame.json()["result"]["done"], true);
+    assert_eq!(engine.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    host.shutdown().await.expect("graceful shutdown");
 }

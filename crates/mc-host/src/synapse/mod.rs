@@ -51,6 +51,19 @@ pub struct SynapseLimits {
     pub retry_after_ms: u64,
 }
 
+impl SynapseLimits {
+    /// The most items one result page can attainably hold: a job never
+    /// holds more than `max_batch_items` items so no page can either, and
+    /// the pager always places at least one item per page. Shared by the
+    /// runtime page reservation and its startup validation so the two
+    /// cannot drift apart.
+    pub(crate) fn page_item_bound(&self) -> usize {
+        self.max_page_vectors
+            .max(1)
+            .min(self.max_batch_items.max(1))
+    }
+}
+
 impl Default for SynapseLimits {
     fn default() -> Self {
         let max_batch_items = 64;
@@ -307,6 +320,93 @@ enum QueryFault {
     Engine(InferenceError),
 }
 
+/// Fails a started batch job on drop unless disarmed by publication, so a
+/// worker task that unwinds after `start` cannot leave the job pinned in a
+/// Running state with its charge held.
+struct AbandonGuard {
+    inner: Arc<SynapseInner>,
+    seq: u64,
+    armed: bool,
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // A worker that exits without publishing is a host task
+            // failure, not a lane fault: the bundle is fine and every other
+            // job on this lane still works. `artifact_invalid` would be read
+            // as a permanent lane fault and take the whole component down
+            // with it, so this stays the host-generic task-failure code
+            // (protocol §7.4) that leaves the lane serving.
+            self.inner.jobs.publish_failed(
+                self.seq,
+                "internal_error".to_owned(),
+                "batch worker exited before publication".to_owned(),
+            );
+        }
+    }
+}
+
+const RESPONSE_SCRATCH_BYTES: usize = 256;
+
+/// Shrinks a resident charge to the size actually owned and verifies the
+/// reservation dominated it. `ByteCharge::shrink_to` cannot grow a charge
+/// and `split_or_take` falls back to "take what is left" rather than
+/// erroring, so proceeding with a short charge would silently under-charge
+/// the request — the bug class the resident budget exists to close. After
+/// `shrink_to(owned)` the charge holds `min(reserved, owned)`, so holding
+/// fewer than `owned` bytes proves the reservation formula no longer
+/// dominates real usage: loud in debug builds, a `queue_full` rejection
+/// (no state created) in release builds.
+fn shrink_covered(
+    charge: &mut crate::wire::ByteCharge,
+    owned: usize,
+) -> Result<(), RequestOutcome> {
+    charge.shrink_to(owned);
+    if charge.bytes() < owned {
+        debug_assert!(
+            false,
+            "parse reservation ({} bytes) is smaller than the post-decode owned bytes ({owned})",
+            charge.bytes(),
+        );
+        return Err(app_error(
+            "queue_full",
+            "the parse reservation did not cover the decoded request",
+        ));
+    }
+    Ok(())
+}
+
+/// Post-decode resident bytes the handler still owns for one decoded
+/// request: the strings moved out of the borrowed parse, plus the scratch a
+/// response body needs while the charge is held. This is the single source
+/// for both the runtime coverage gate in `handle` and the
+/// reservation-dominance test, so a term added here is covered by both at
+/// once and the two can never drift apart.
+pub(crate) fn owned_input_bytes(request: &Request) -> usize {
+    let owned = match request {
+        // Answered from lane info; the charge is released before responding.
+        Request::ModelsList => 0,
+        Request::EmbedQuery { text, .. } => text.capacity(),
+        Request::EmbedBatch {
+            request_key,
+            canonical_key,
+            items,
+        } => jobs::job_input_bytes(request_key, items)
+            .saturating_add(request_key.capacity())
+            .saturating_add(canonical_key.capacity()),
+        Request::EmbedResult {
+            job_id,
+            request_key,
+            cursor,
+        } => job_id
+            .capacity()
+            .saturating_add(request_key.capacity())
+            .saturating_add(cursor.as_ref().map_or(0, String::capacity)),
+    };
+    owned.saturating_add(RESPONSE_SCRATCH_BYTES)
+}
+
 fn request_error(error: RequestError) -> RequestOutcome {
     RequestOutcome::Error {
         code: error.code.to_owned(),
@@ -370,6 +470,7 @@ impl SynapseComponent {
         lane: Arc<ReadyLane>,
         text: String,
         deadline_ms: Option<u64>,
+        text_charge: crate::wire::ByteCharge,
     ) -> RequestOutcome {
         if self.inner.closing.is_cancelled() {
             return app_error("cancelled", "the host is shutting down");
@@ -393,6 +494,7 @@ impl SynapseComponent {
         // without orphaning inference.
         self.inner.tracker.spawn(async move {
             let _query_permit = worker_query_permit;
+            let _text_charge = text_charge;
             let mut tx = tx;
             let permit = tokio::select! {
                 biased;
@@ -477,6 +579,7 @@ impl SynapseComponent {
         request_key: String,
         canonical_key: String,
         items: Vec<jobs::BatchItem>,
+        mut charge: crate::wire::ByteCharge,
     ) -> RequestOutcome {
         if request_key != canonical_key {
             // A retained key resent with a different payload is the
@@ -497,7 +600,7 @@ impl SynapseComponent {
         match self
             .inner
             .jobs
-            .admit(request_key.clone(), items, lane.lane.dims)
+            .admit_charged(request_key.clone(), items, lane.lane.dims, &mut charge)
         {
             AdmitOutcome::Existing(descriptor) => {
                 respond(
@@ -556,6 +659,13 @@ impl SynapseComponent {
             let Some(items) = inner.jobs.start(seq) else {
                 return;
             };
+            // `fail_job` is idempotent, so a normal publication wins even if
+            // the guard also fires.
+            let mut settle_guard = AbandonGuard {
+                inner: Arc::clone(&inner),
+                seq,
+                armed: true,
+            };
             let lane_blocking = Arc::clone(&lane);
             let joined = tokio::task::spawn_blocking(move || {
                 let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
@@ -575,6 +685,7 @@ impl SynapseComponent {
                         .publish_failed(seq, "artifact_invalid".to_owned(), reason);
                 }
             }
+            settle_guard.armed = false;
         });
     }
 
@@ -586,6 +697,35 @@ impl SynapseComponent {
         request_key: String,
         cursor: Option<String>,
     ) -> RequestOutcome {
+        // The ready-page branch clones every page item's id and hash out of
+        // the job table, and those copies live until the response encoder
+        // finishes. Their worst case is reserved before polling and shrunk
+        // to the real page after, mirroring the parse-reservation pattern;
+        // `page_item_bound` keeps this reservation and its startup
+        // validation on one formula.
+        let page_meta_bound = self
+            .inner
+            .limits
+            .page_item_bound()
+            .saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
+        // Reserve first, sweep only if that fails — the same fallback the
+        // parse reservation uses. Retained job charges live in this pool,
+        // so expired jobs can starve this second reservation while the
+        // smaller parse reservation keeps succeeding, and the sweep sites
+        // behind `poll` are never reached from here.
+        let reserved = match ctx.try_reserve_resident(page_meta_bound) {
+            Some(charge) => Some(charge),
+            None => {
+                self.inner.jobs.sweep();
+                ctx.try_reserve_resident(page_meta_bound)
+            }
+        };
+        let Some(mut meta_charge) = reserved else {
+            return app_error(
+                "queue_full",
+                "resident capacity for the result page is exhausted",
+            );
+        };
         match self
             .inner
             .jobs
@@ -610,6 +750,20 @@ impl SynapseComponent {
                 .await
             }
             PollOutcome::Page(page) => {
+                // Ids are validated to MAX_ITEM_ID_BYTES, hashes are fixed
+                // 64-hex, and a page holds at most max_page_vectors items,
+                // so the bound covers the clones by construction. Checked at
+                // runtime through the same gate as the parse reservation: a
+                // bound that stops dominating must reject, not silently
+                // under-charge, in release builds too.
+                let meta_bytes: usize = page
+                    .vectors
+                    .iter()
+                    .map(|(id, hash, _)| id.len() + hash.len())
+                    .sum();
+                if let Err(outcome) = shrink_covered(&mut meta_charge, meta_bytes) {
+                    return outcome;
+                }
                 let items: Vec<protocol::VectorItemView<'_>> = page
                     .vectors
                     .iter()
@@ -619,14 +773,16 @@ impl SynapseComponent {
                         vector,
                     })
                     .collect();
-                respond_vectors(
+                let outcome = respond_vectors(
                     ctx,
                     &lane.lane,
                     &items,
                     page.done,
                     page.next_cursor.as_deref(),
                 )
-                .await
+                .await;
+                drop(meta_charge);
+                outcome
             }
         }
     }
@@ -656,22 +812,75 @@ impl CompositeComponent for SynapseComponent {
         let Some(lane) = self.ready_lane() else {
             return app_error("artifact_invalid", "the synapse lane is unavailable");
         };
-        let request =
-            match protocol::parse_request(&ctx.body, ctx.binary, &lane.lane, &self.inner.limits) {
-                Ok(request) => request,
-                Err(error) => return request_error(error),
-            };
+        if let Err(error) = protocol::preflight(&ctx.body, ctx.binary) {
+            return request_error(error);
+        }
+        let Some(reservation_bytes) =
+            protocol::parse_reservation_bytes(ctx.body.len(), &self.inner.limits)
+        else {
+            return app_error("queue_full", "the parse reservation bound is unsatisfiable");
+        };
+        // The scratch pool funds only the parse reservation — the body's own
+        // charge lives in the ingress pool, held since frame admission — so
+        // the reservation alone is measured against this ceiling. When it
+        // exceeds the ceiling no amount of draining can ever admit this
+        // body, and reporting the permanent condition as `queue_full` would
+        // have clients retry it forever — so it is a size rejection instead.
+        let capacity = ctx.resident_capacity();
+        if reservation_bytes > capacity {
+            return request_error(protocol::unservable_body_error(
+                ctx.body.len(),
+                reservation_bytes,
+                capacity,
+            ));
+        }
+        // Reserve first, sweep only if that fails. Expired retained charges
+        // must never be able to wedge the pool, and every other sweep site
+        // runs after the reservation, so a failed reservation is the one
+        // place obliged to force a pass — which keeps the job-table lock and
+        // its expiry scan off every successful request.
+        let reserved = match ctx.try_reserve_resident(reservation_bytes) {
+            Some(charge) => Some(charge),
+            None => {
+                self.inner.jobs.sweep();
+                ctx.try_reserve_resident(reservation_bytes)
+            }
+        };
+        let Some(mut charge) = reserved else {
+            return app_error(
+                "queue_full",
+                "resident capacity for request parsing is exhausted",
+            );
+        };
+        let request = match protocol::decode_request(&ctx.body, &lane.lane, &self.inner.limits) {
+            Ok(request) => request,
+            Err(error) => {
+                drop(charge);
+                return request_error(error);
+            }
+        };
+        // One coverage gate for every arm, sized by the single owned-bytes
+        // source so no arm can grow a term the reservation does not cover.
+        if let Err(outcome) = shrink_covered(&mut charge, owned_input_bytes(&request)) {
+            return outcome;
+        }
         match request {
-            Request::ModelsList => respond(&ctx, protocol::models_list_body(&lane.lane)).await,
+            Request::ModelsList => {
+                drop(charge);
+                respond(&ctx, protocol::models_list_body(&lane.lane)).await
+            }
             Request::EmbedQuery { text, deadline_ms } => {
-                self.handle_query(&ctx, lane, text, deadline_ms).await
+                let text_charge = charge.split_or_take(text.capacity());
+                let _handler_charge = charge;
+                self.handle_query(&ctx, lane, text, deadline_ms, text_charge)
+                    .await
             }
             Request::EmbedBatch {
                 request_key,
                 canonical_key,
                 items,
             } => {
-                self.handle_batch(&ctx, lane, request_key, canonical_key, items)
+                self.handle_batch(&ctx, lane, request_key, canonical_key, items, charge)
                     .await
             }
             Request::EmbedResult {
@@ -679,6 +888,7 @@ impl CompositeComponent for SynapseComponent {
                 request_key,
                 cursor,
             } => {
+                let _handler_charge = charge;
                 self.handle_result(&ctx, lane, job_id, request_key, cursor)
                     .await
             }

@@ -373,11 +373,11 @@ Routed requests on the `synapse/management_surface` route are UTF-8 JSON objects
 
 #### 7.5.1 Validation, bounds, and error codes
 
-Every request body is parsed strictly: duplicate object keys, non-object roots, invalid UTF-8, unknown `method` values, wrong field types, and out-of-bound sizes are rejected before hashing or inference. Whole-body nesting is bounded (8 levels); no valid request needs more than 5. The application error vocabulary is closed:
+Every request body is parsed strictly: duplicate object keys, non-object roots, invalid UTF-8, unknown `method` values, wrong field types, and out-of-bound sizes are rejected before hashing or inference. Whole-body nesting is bounded at 8 levels, counted so that each open object or array is one level and a scalar or key is one more level below its container: at most 7 nested containers may hold a value, an empty 8th container is accepted, and a value nested inside 8 containers is rejected before typed decoding. So `{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}` is valid and `{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":1}}}}}}}}` is not; no valid request needs more than 5 levels. JSON delimiters inside strings never count toward depth. `embed.batch` accepts between one and `max_batch_items` elements inclusive, and rejects the element after the maximum before decoding any of its fields. The host's resident-byte cap (`max_resident_bytes`) additionally covers Synapse request parser scratch and request-owned inputs (query text, queued batch items, retained job key and item metadata, and the id/hash copies a ready result page holds while its response is encoded) as named logical payloads — it is an accounting boundary, not an exact process-RSS claim. Those payloads draw on a reserved slice of the cap that is separate from the pool admitting inbound frames, so Synapse parse scratch and retained job inputs can never delay or fail another connection's frame admission, and the Synapse queue and retained-result limits below remain separate, independent gates. A body whose parse reservation exceeds that reserved slice can never be served by this host and is rejected as `schema_violation`, not `queue_full`, so a client does not retry a permanently unservable size. The application error vocabulary is closed:
 
 | Code | Meaning | Retry disposition |
 | --- | --- | --- |
-| `queue_full` | admission capacity (job count, aggregate queued request bytes, or query-lane slot) exhausted before admission | bounded client-side retry; the error body carries no `retry_after_ms` and no state was created |
+| `queue_full` | admission capacity (job count, aggregate queued request bytes, or query-lane slot) exhausted before admission, or the fail-fast resident-byte reservation for request parsing and input ownership could not be acquired; in every case no state was created | bounded client-side retry; the error body carries no `retry_after_ms` |
 | `model_loading` | reserved; not emitted by the current host — initialization completes before publication, so loading faults surface as bind-time `artifact_invalid` | bounded retry |
 | `timeout` | request-scoped deadline expired host-side | caller policy |
 | `artifact_invalid` | bundle missing/invalid (bind rejection) or response identity guard failed | permanent; no retry |
@@ -385,11 +385,11 @@ Every request body is parsed strictly: duplicate object keys, non-object roots, 
 | `not_certified` | reserved; not emitted by the current host — certification faults surface as bind-time `artifact_invalid` | permanent |
 | `probe_required` | reserved; not emitted by the current host — probe faults surface as bind-time `artifact_invalid` | permanent for this incarnation |
 | `idempotency_conflict` | retained `request_key` reused with a conflicting payload | permanent |
-| `schema_violation` | malformed request, hash/key mismatch, bad cursor, bound violation | permanent |
+| `schema_violation` | malformed request, hash/key mismatch, bad cursor, bound violation, or a body whose resident requirement exceeds the host's entire resident capacity | permanent |
 | `module_restarted` | job unknown to this host incarnation (restart, expiry, or eviction) | resubmit the same page once from cursor `null` |
 | `cancelled` | client `Cancel` (Section 9.2) or host shutdown cancellation won | no generic retry |
 
-The host-generic `internal_error` (Section 7.4) additionally covers response construction or task failure on a routed synapse correlation.
+The host-generic `internal_error` (Section 7.4) additionally covers response construction or task failure on a routed synapse correlation, including a batch worker that exits without publishing: that is a host task failure, not a lane fault, so the lane keeps serving and the code stays retryable.
 
 Every capacity is finite and host-owned; request fields can never select capacities, models, or filesystem paths. Defaults: 1 concurrent CPU inference, 64 admitted jobs, 64 MiB aggregate queued request text, 64 retained completed jobs, 64 MiB retained vector bytes, 64 items and 8 MiB total text per batch, 1 MiB text per item or query, 16 vectors or 2 MiB encoded output per result page, 15-minute completed-job retention.
 
@@ -474,6 +474,9 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | target matrix and catalog (Section 7.2, 7.3) | `crates/mc-host/tests/composite_routing.rs` |
 | bundle identity, offline CPU inference, degraded isolation | `crates/mc-host/tests/synapse_bundle.rs` |
 | request validation, bounds, idempotency, cursors, restart fencing | `crates/mc-host/tests/synapse_protocol.rs`, `crates/mc-host/tests/synapse_jobs.rs` |
+| depth boundary (7 containers holding a value valid, 8 rejected, strings inert) | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `crates/mc-host/tests/synapse_protocol.rs` |
+| batch item bound rejected before decoding the extra element | `crates/mc-host/src/synapse/protocol.rs` (unit tests) |
+| resident reservation: reserved scratch pool independent of frame admission, fail-fast `queue_full`, permanent rejection above the slice, no state, exact release | `crates/mc-host/src/config.rs` (pool-split unit test), `crates/mc-host/src/wire.rs`, `crates/mc-host/src/synapse/jobs.rs` (unit tests), `crates/mc-host/tests/synapse_protocol.rs` |
 | four operations over a real authenticated route, shutdown cleanup | `crates/mc-host/tests/synapse_roundtrip.rs` |
 | request-key golden vectors | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` (matching TypeScript golden test) |
 | durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v83.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |

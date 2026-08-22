@@ -522,7 +522,8 @@ fn a_vector_shape_that_disagrees_with_the_job_fails_only_that_job() {
         }]
     };
 
-    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-1".to_owned(), batch("item:0"), 2)
+    let AdmitOutcome::Admitted { job_id, seq } =
+        jobs.admit_uncharged_for_tests("key-1".to_owned(), batch("item:0"), 2)
     else {
         panic!("the first job is admitted");
     };
@@ -544,7 +545,8 @@ fn a_vector_shape_that_disagrees_with_the_job_fails_only_that_job() {
         ),
     }
 
-    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-2".to_owned(), batch("item:1"), 2)
+    let AdmitOutcome::Admitted { job_id, seq } =
+        jobs.admit_uncharged_for_tests("key-2".to_owned(), batch("item:1"), 2)
     else {
         panic!("the second job is admitted");
     };
@@ -566,7 +568,8 @@ fn a_vector_shape_that_disagrees_with_the_job_fails_only_that_job() {
 
     // The table and its result-byte bookkeeping survive both failures: a later
     // job still admits, publishes, and serves.
-    let AdmitOutcome::Admitted { job_id, seq } = jobs.admit("key-3".to_owned(), batch("item:2"), 2)
+    let AdmitOutcome::Admitted { job_id, seq } =
+        jobs.admit_uncharged_for_tests("key-3".to_owned(), batch("item:2"), 2)
     else {
         panic!("the third job is admitted");
     };
