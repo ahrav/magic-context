@@ -374,6 +374,25 @@ fn validate_serving_limits(
             limits.max_retained_result_bytes
         )));
     }
+
+    // The result-page metadata reservation is a fixed function of these
+    // limits, taken from the scratch pool on every `embed.result`. A bound
+    // above the pool's ceiling would make every poll fail `queue_full`
+    // forever — a permanent, config-induced outage that must reject at
+    // startup instead of surfacing one request at a time.
+    let page_items = limits
+        .max_page_vectors
+        .max(1)
+        .min(limits.max_batch_items.max(1));
+    let page_meta_bytes =
+        page_items.saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
+    if page_meta_bytes as u64 > crate::config::SCRATCH_RESERVED_BYTES {
+        return Err(err(format!(
+            "worst-case result-page metadata ({page_meta_bytes} bytes) exceeds the reserved \
+             scratch pool ({} bytes); lower max_page_vectors or max_batch_items",
+            crate::config::SCRATCH_RESERVED_BYTES
+        )));
+    }
     Ok(())
 }
 
@@ -755,6 +774,33 @@ mod tests {
         let error = validate_serving_limits(&manifest, &limits)
             .expect_err("one byte below the maximum result is invalid");
         assert!(error.0.contains("maximum batch result"));
+    }
+
+    /// A page-metadata bound above the fixed scratch pool would fail every
+    /// `embed.result` with `queue_full` forever — a permanent config-induced
+    /// outage — so the configuration must reject at startup.
+    #[test]
+    fn a_page_bound_above_the_scratch_pool_is_rejected() {
+        let manifest = manifest();
+        let per_item = (jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES) as u64;
+        let over = (crate::config::SCRATCH_RESERVED_BYTES / per_item + 1) as usize;
+        let limits = SynapseLimits {
+            max_page_vectors: over,
+            max_batch_items: over,
+            max_retained_result_bytes: u64::MAX,
+            ..SynapseLimits::default()
+        };
+        let error = validate_serving_limits(&manifest, &limits)
+            .expect_err("a page bound above the scratch pool is a permanent outage");
+        assert!(error.0.contains("result-page metadata"));
+
+        // The bound is clamped by max_batch_items, so an oversized
+        // max_page_vectors alone stays valid.
+        let limits = SynapseLimits {
+            max_page_vectors: over,
+            ..SynapseLimits::default()
+        };
+        assert!(validate_serving_limits(&manifest, &limits).is_ok());
     }
 
     #[test]

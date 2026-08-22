@@ -160,6 +160,18 @@ pub(crate) fn escaped_string_bytes(s: &str) -> usize {
         .expect("serialized JSON string includes quotes")
 }
 
+/// Whether a stored failure code's retry disposition is permanent
+/// (protocol §7.5.1): an identical re-submission would deterministically
+/// re-fail, so admission replays the stored failure instead of re-running
+/// inference. Every other code is retryable or caller-policy, and an
+/// identical re-submission replaces the failed job with a fresh attempt.
+fn failure_is_permanent(code: &str) -> bool {
+    matches!(
+        code,
+        "artifact_invalid" | "substitution_rejected" | "schema_violation" | "not_certified"
+    )
+}
+
 fn digest_payload(key: &str, items: &[BatchItem]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     let mut update = |bytes: &[u8]| {
@@ -348,7 +360,7 @@ impl JobTable {
         }
         self.sweep_expired(&mut jobs, &mut released);
 
-        // A failed same-digest job the retry below replaces. Eviction is
+        // A failed same-digest job a retry below may replace. Eviction is
         // deferred until every admission check has passed: a retry that
         // bounces off a full table (or an oversized result) must leave the
         // stored failure pollable rather than losing it to a rejection.
@@ -358,18 +370,24 @@ impl JobTable {
             if job.payload_digest != digest {
                 return AdmitOutcome::Conflict;
             }
-            // A failed job is not a result worth replaying: the retained
-            // failure exists so a poll can read the error, but an identical
-            // re-submission is a retry. Returning `Existing` here would
-            // hold the key hostage until expiry and make every retryable
-            // failure terminal within the retention window.
-            if matches!(job.state, JobState::Failed { .. }) {
-                failed_replay = Some(seq);
-            } else {
-                return AdmitOutcome::Existing(JobDescriptor {
-                    job_id: self.job_id(seq),
-                    status: job.status(),
-                });
+            // A retryably-failed job is not a result worth replaying: the
+            // retained failure exists so a poll can read the error, but an
+            // identical re-submission is a retry, and returning `Existing`
+            // would hold the key hostage until expiry and make the
+            // protocol's retryable disposition a lie within the retention
+            // window. A permanently-coded failure is the opposite case:
+            // re-running the same payload deterministically re-fails, so
+            // the stored failure replays instead of burning inference.
+            match &job.state {
+                JobState::Failed { code, .. } if !failure_is_permanent(code) => {
+                    failed_replay = Some(seq);
+                }
+                _ => {
+                    return AdmitOutcome::Existing(JobDescriptor {
+                        job_id: self.job_id(seq),
+                        status: job.status(),
+                    });
+                }
             }
         }
 
@@ -1031,6 +1049,24 @@ mod tests {
             POOL - job_bytes,
             "the failed job's retained charge was released with its eviction"
         );
+
+        // A permanently-coded failure deterministically re-fails, so an
+        // identical re-submission replays the stored failure instead of
+        // re-running inference.
+        jobs.publish_failed(
+            retry_seq,
+            "schema_violation".to_owned(),
+            "bad input".to_owned(),
+        );
+        let mut third = budget.try_charge(job_bytes).expect("third charge");
+        assert!(
+            matches!(
+                jobs.admit_charged(key.clone(), items.clone(), 4, &mut third),
+                AdmitOutcome::Existing(descriptor) if descriptor.status == "failed"
+            ),
+            "a permanent failure replays rather than re-running"
+        );
+        drop(third);
 
         jobs.clear();
         assert_eq!(budget.available(), POOL);

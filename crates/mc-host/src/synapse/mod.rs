@@ -698,10 +698,23 @@ impl SynapseComponent {
             .inner
             .limits
             .max_page_vectors
-            .clamp(1, self.inner.limits.max_batch_items);
+            .max(1)
+            .min(self.inner.limits.max_batch_items.max(1));
         let page_meta_bound =
             page_items.saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
-        let Some(mut meta_charge) = ctx.try_reserve_resident(page_meta_bound) else {
+        // Reserve first, sweep only if that fails — the same fallback the
+        // parse reservation uses. Retained job charges live in this pool,
+        // so expired jobs can starve this second reservation while the
+        // smaller parse reservation keeps succeeding, and the sweep sites
+        // behind `poll` are never reached from here.
+        let reserved = match ctx.try_reserve_resident(page_meta_bound) {
+            Some(charge) => Some(charge),
+            None => {
+                self.inner.jobs.sweep();
+                ctx.try_reserve_resident(page_meta_bound)
+            }
+        };
+        let Some(mut meta_charge) = reserved else {
             return app_error(
                 "queue_full",
                 "resident capacity for the result page is exhausted",
