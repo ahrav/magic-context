@@ -402,6 +402,49 @@ fn validate_serving_limits(
             crate::config::SCRATCH_RESERVED_BYTES
         )));
     }
+
+    // The parse reservation is method-independent (the method cannot be
+    // decoded before reserving without unaccounted allocations), so its
+    // per-item term applies to every request. A body that decodes into a
+    // valid request under these limits is bounded by what they advertise:
+    // JSON escaping expands one text byte to at most six (`\u00XX`), and
+    // each batch item adds at most an escaped id, its hash, and the field
+    // skeleton — all capped by the preflight body maximum. If the worst
+    // advertised body's reservation exceeds the scratch pool, a request
+    // within advertised limits is permanently unservable, so the
+    // configuration rejects here instead of one request at a time.
+    const ESCAPED_BYTE_FACTOR: usize = 6;
+    const ITEM_BODY_ENVELOPE_BYTES: usize = 2048;
+    const BODY_ENVELOPE_BYTES: usize = 4096;
+    let worst_query_body = super::protocol::MAX_BODY_BYTES.min(
+        limits
+            .max_text_bytes
+            .saturating_mul(ESCAPED_BYTE_FACTOR)
+            .saturating_add(BODY_ENVELOPE_BYTES),
+    );
+    let worst_batch_body = super::protocol::MAX_BODY_BYTES.min(
+        limits
+            .max_batch_text_bytes
+            .saturating_mul(ESCAPED_BYTE_FACTOR)
+            .saturating_add(
+                limits
+                    .max_batch_items
+                    .saturating_mul(ITEM_BODY_ENVELOPE_BYTES),
+            )
+            .saturating_add(BODY_ENVELOPE_BYTES),
+    );
+    for worst_body in [worst_query_body, worst_batch_body] {
+        let reservation = super::protocol::parse_reservation_bytes(worst_body, limits)
+            .ok_or_else(|| err("the worst-case parse reservation overflows"))?;
+        if reservation as u64 > crate::config::SCRATCH_RESERVED_BYTES {
+            return Err(err(format!(
+                "the parse reservation for a maximal advertised request ({reservation} bytes \
+                 for a {worst_body}-byte body) exceeds the reserved scratch pool ({} bytes); \
+                 lower max_batch_items or the text limits",
+                crate::config::SCRATCH_RESERVED_BYTES
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -811,6 +854,32 @@ mod tests {
         // max_page_vectors alone stays valid.
         let limits = SynapseLimits {
             max_page_vectors: boundary,
+            ..SynapseLimits::default()
+        };
+        assert!(validate_serving_limits(&manifest, &limits).is_ok());
+    }
+
+    /// A configuration whose advertised limits permit a request the fixed
+    /// scratch pool can never fund — the method-independent per-item
+    /// headroom applied to a large advertised body — must reject at
+    /// startup, not one `schema_violation` at a time.
+    #[test]
+    fn an_unservable_advertised_request_is_rejected_at_startup() {
+        let manifest = manifest();
+        let limits = SynapseLimits {
+            max_text_bytes: 8 * 1024 * 1024,
+            max_batch_items: 131_073,
+            max_retained_result_bytes: u64::MAX,
+            ..SynapseLimits::default()
+        };
+        let error = validate_serving_limits(&manifest, &limits)
+            .expect_err("an unservable advertised request is a permanent outage");
+        assert!(error.0.contains("parse reservation"));
+
+        // A large advertised query alone (default item cap) stays valid:
+        // the reservation's item term is what overflows the pool.
+        let limits = SynapseLimits {
+            max_text_bytes: 8 * 1024 * 1024,
             ..SynapseLimits::default()
         };
         assert!(validate_serving_limits(&manifest, &limits).is_ok());

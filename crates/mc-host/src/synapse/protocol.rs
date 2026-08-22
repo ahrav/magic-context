@@ -11,7 +11,7 @@ use super::LaneInfo;
 use super::SynapseLimits;
 use crate::control::check_string;
 
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Whole-body structural depth cap (protocol §7.5.1): level eight is valid,
 /// level nine is not.
 const MAX_BODY_DEPTH: usize = 8;
