@@ -2355,15 +2355,28 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
                 hitMemoryClaimFailpoint("memory-claim.020.projection.after");
                 return { result: { memoryId: row.id, claimId: null, rowsWritten }, effects: [] };
             }
+            // A first adoption owes the outbox its upsert: the evidence
+            // effect below only refreshes verification columns, so without
+            // the upsert the adopted claim would never materialize downstream.
+            const wasLinked = readMemoryClaimLink(db, row.id) !== null;
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
                 kind: "migration",
             });
+            const effects: MemoryClaimEffect[] = [];
+            if (!wasLinked) {
+                effects.push({
+                    effectKey: `memory:${row.id}:upsert`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "upsert" as const,
+                });
+            }
             // The link above can dedup-adopt an archived canonical claim, so
             // the claim's state re-derives from its live links; the helper
             // no-ops when the state already matches.
-            const effects: MemoryClaimEffect[] = [
+            effects.push(
                 ...syncClaimLifecycleAfterAdoption(db, row, link, projectId, envelope.producer),
-            ];
+            );
             addVerificationEvent(db, {
                 revisionId: readClaimCurrentRevisionId(db, link.claimId),
                 outcome: "verified",

@@ -2009,6 +2009,54 @@ describe("memory/claims kernel: canonical claim reuse", () => {
         ).toBe(1);
     });
 
+    test("a verified file snapshot first-adopting an unlinked row emits the adoption upsert", () => {
+        const db = track(migratedDb());
+
+        // Adoptable but unlinked row: no crosswalk exists before the snapshot.
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', 'verify adopt fact', 'hash:verify adopt fact', 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT).lastInsertRowid,
+            );
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-adopt-1", { id: memoryId }),
+                { memoryId, files: ["src/a.ts"], now: 2_000, verified: true },
+            ),
+        );
+
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${memoryId}:upsert'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'verify-adopt-1')`,
+            ),
+        ).toBe(1);
+
+        // An already-linked row re-verifying does not repeat the upsert.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-adopt-2", { id: memoryId }),
+                { memoryId, files: ["src/a.ts", "src/b.ts"], now: 3_000, verified: true },
+            ),
+        );
+        expect(count(db, "claim_change_outbox", `effect_key = 'memory:${memoryId}:upsert'`)).toBe(
+            1,
+        );
+    });
+
     test("an ordinary supersession target that dedup-adopts an archived canonical reactivates the target claim", () => {
         const db = track(migratedDb());
         const source = createSeedMemory(db, "supersede-revive-source", "supersede revive source");
