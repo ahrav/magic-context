@@ -1086,6 +1086,51 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("an identity-only rekey of an already-linked verified row records no new verified event", () => {
+        const database = makeDb();
+        const memory = insertMemoryThroughKernel(database, {
+            projectPath: "dir:old-checkout",
+            category: "CONSTRAINTS",
+            content: "durable verified fact",
+        });
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+                )
+                .run(memory.id);
+        });
+        const link = readMemoryClaimLink(database, memory.id);
+        const countEvents = () =>
+            (
+                database
+                    .prepare(
+                        `SELECT COUNT(*) AS count FROM verification_events
+                          WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)
+                            AND verifier = 'identity-merge'`,
+                    )
+                    .get(link?.claimId ?? 0) as { count: number }
+            ).count;
+
+        // Two identity-only rekeys between aliases of the same numeric
+        // project: the row is already linked, so the claim already owns its
+        // verified evidence and neither rekey may append another event.
+        mergeProjectIdentities(database, "dir:old-checkout", "git:new-identity", { now: 50 });
+        mergeProjectIdentities(database, "git:new-identity", "git:renamed", { now: 60 });
+
+        expect(countEvents()).toBe(0);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${memory.id}:evidence`),
+        ).toEqual({ count: 0 });
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(database, memory.id);
+        expect(claim?.state).toBe("active");
+    });
+
     test("a non-collision merge onto a claims-deleted equivalent reactivates the adopted claim", () => {
         const database = makeDb();
         const deleted = insertMemoryThroughKernel(database, {

@@ -239,16 +239,16 @@ function adoptIdentityMergeRowClaims(
                 }
                 // Adoption can reuse a canonical claim archived by a prior
                 // delete of the target-project equivalent; the sync
-                // reactivates it from the row's status and carries the row's
-                // verified state onto the claim as evidence.
+                // reactivates it from the row's status. Only first adoption
+                // carries the row's verified state onto the claim as
+                // evidence — an already-linked row's claim holds that event
+                // from its own adoption, so the full sync would append a
+                // duplicate verified event per rekey.
+                const syncAdoptedClaimState = wasLinked
+                    ? syncAdoptedClaimLifecycleState
+                    : syncAdoptedRelocationClaimState;
                 effects.push(
-                    ...syncAdoptedRelocationClaimState(
-                        db,
-                        sourceRow,
-                        link,
-                        projectId,
-                        "identity-merge",
-                    ),
+                    ...syncAdoptedClaimState(db, sourceRow, link, projectId, "identity-merge"),
                 );
                 return { result: link.claimId, effects };
             },
