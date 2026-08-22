@@ -750,4 +750,61 @@ describe("migration v85: claim applicability, git anchors, and source trust", ()
             closeQuietly(db);
         }
     });
+
+    test("a NULL known_from gap does not leave a superseded assertion knowledge-open", () => {
+        const db = migratedDb();
+        try {
+            const seed = seedClaimGraph(db);
+            db.prepare(
+                `INSERT INTO claim_revision_applicability_streams
+                    (revision_id, project_id, owner_kind, stream_key, key_protocol, source_digest, created_at)
+                 VALUES (?, 1, 'source', 'view-gap:v1', 'p1', ?, 1)`,
+            ).run(seed.revisionId, "0".repeat(64));
+            const streamId = Number(
+                (
+                    db
+                        .prepare("SELECT MAX(id) AS id FROM claim_revision_applicability_streams")
+                        .get() as { id: number }
+                ).id,
+            );
+            const insert = db.prepare(
+                `INSERT INTO claim_revision_applicability_assertions
+                    (stream_id, seq, predecessor_id, state, known_from, recorded_at, paths_state)
+                 VALUES (?, ?, ?, 'unknown', ?, ?, 'unknown')`,
+            );
+            const lastId = (): number =>
+                Number(
+                    (
+                        db
+                            .prepare(
+                                "SELECT MAX(id) AS id FROM claim_revision_applicability_assertions",
+                            )
+                            .get() as { id: number }
+                    ).id,
+                );
+            insert.run(streamId, 1, null, 100, 10);
+            const first = lastId();
+            insert.run(streamId, 2, first, null, 20);
+            const second = lastId();
+            insert.run(streamId, 3, second, 400, 30);
+            const intervals = db
+                .prepare(
+                    `SELECT seq, known_from AS knownFrom, known_until AS knownUntil
+                       FROM claim_revision_applicability_intervals
+                      WHERE stream_id = ? ORDER BY seq`,
+                )
+                .all(streamId) as Array<Record<string, unknown>>;
+            // seq 1 is closed by the NEAREST LATER non-NULL knowledge time
+            // (seq 3), not left open by seq 2's NULL gap: two open knowledge
+            // intervals in one stream would let an as-of-knowledge-time query
+            // return the stale state as current.
+            expect(intervals).toEqual([
+                { seq: 1, knownFrom: 100, knownUntil: 400 },
+                { seq: 2, knownFrom: null, knownUntil: 400 },
+                { seq: 3, knownFrom: 400, knownUntil: null },
+            ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });

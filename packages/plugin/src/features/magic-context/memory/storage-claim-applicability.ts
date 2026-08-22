@@ -17,12 +17,12 @@
 import { createHash } from "node:crypto";
 import type { Database } from "../../../shared/sqlite.ts";
 import {
-    APPLICABILITY_BASELINE_STREAM_KEY,
     APPLICABILITY_STREAM_KEY_PROTOCOL,
+    type ApplicabilityOwnerKind,
+    type ApplicabilityPathKind,
+    type ApplicabilityPathsState,
     type ApplicabilityState,
 } from "../storage-claim-applicability-schema.ts";
-
-export type ApplicabilityOwnerKind = "source" | "evaluation";
 
 export class ApplicabilityWriteError extends Error {
     constructor(message: string) {
@@ -31,15 +31,25 @@ export class ApplicabilityWriteError extends Error {
     }
 }
 
+/**
+ * Positive schema probes memoized per connection: the v85 tables are never
+ * dropped outside test fixtures, so `true` is stable for a connection's
+ * lifetime. A negative probe re-checks so a migration completing later in
+ * the same process is observed.
+ */
+const applicabilitySchemaPresent = new WeakSet<Database>();
+
 /** Whether this database migrated to v85. */
 export function hasClaimApplicabilitySchema(db: Database): boolean {
-    return (
+    if (applicabilitySchemaPresent.has(db)) return true;
+    const present =
         db
             .prepare(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_revision_applicability_streams'",
             )
-            .get() != null
-    );
+            .get() != null;
+    if (present) applicabilitySchemaPresent.add(db);
+    return present;
 }
 
 /** Canonical SHA-256 digest over a JSON-serializable source description. */
@@ -159,8 +169,12 @@ export function ensureApplicabilityStreamInCurrentTransaction(
 // ---------------------------------------------------------------------------
 
 export type ApplicabilityPathsInput =
-    | { state: "unknown" }
-    | { state: "known"; exact?: readonly string[]; glob?: readonly string[] };
+    | { state: Extract<ApplicabilityPathsState, "unknown"> }
+    | {
+          state: Extract<ApplicabilityPathsState, "known">;
+          exact?: readonly string[];
+          glob?: readonly string[];
+      };
 
 export interface ApplicabilitySymbolInput {
     protocol: string;
@@ -373,7 +387,7 @@ export function writeRevisionApplicabilityInCurrentTransaction(
 // ---------------------------------------------------------------------------
 
 export interface ApplicabilityPathRecord {
-    kind: "exact" | "glob";
+    kind: ApplicabilityPathKind;
     value: string;
 }
 
@@ -396,7 +410,7 @@ export interface ApplicabilityAssertionRecord {
     evaluatedAgainstAnchorId: number | null;
     knownFrom: number | null;
     recordedAt: number;
-    pathsState: "unknown" | "known";
+    pathsState: ApplicabilityPathsState;
     dependencyFingerprint: string | null;
     dependencyProtocol: string | null;
     verifierSpec: string | null;
@@ -467,7 +481,7 @@ export interface ApplicabilityIntervalRecord {
     knownUntil: number | null;
     recordedAt: number;
     recordedUntil: number | null;
-    pathsState: "unknown" | "known";
+    pathsState: ApplicabilityPathsState;
 }
 
 export function readApplicabilityIntervals(
@@ -491,11 +505,21 @@ export function readApplicabilityIntervals(
         .all(revisionId) as ApplicabilityIntervalRecord[];
 }
 
-export { APPLICABILITY_BASELINE_STREAM_KEY, APPLICABILITY_STREAM_KEY_PROTOCOL };
-
 // ---------------------------------------------------------------------------
 // Legacy-memory lineage helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Known path state from a raw file list. Single owner of the `""` no-file
+ * sentinel exclusion rule: a sentinel-only (or empty) list reads as
+ * known-empty (file-independent). Both the write-time mapping snapshot and
+ * the `memory_verifications` read-time derivation go through here so the
+ * two sides of a `pathsStateEquals` comparison can never drift.
+ */
+export function knownPathsStateFromFiles(files: readonly string[]): ApplicabilityPathsInput {
+    const exact = [...new Set(files.filter((file) => file.length > 0))].sort();
+    return { state: "known", exact };
+}
 
 /**
  * Path knowledge for one legacy memory, derived from its
@@ -517,8 +541,7 @@ export function readMemoryVerificationPathsState(
         .prepare("SELECT file_path FROM memory_verifications WHERE memory_id = ?")
         .all(memoryId) as Array<{ file_path: string }>;
     if (rows.length === 0) return { state: "unknown" };
-    const exact = [...new Set(rows.map((row) => row.file_path).filter((path) => path.length > 0))];
-    return { state: "known", exact: exact.sort() };
+    return knownPathsStateFromFiles(rows.map((row) => row.file_path));
 }
 
 export interface LegacyMemoryApplicabilitySource {
@@ -576,7 +599,9 @@ function pathsStateEquals(
  * Append a successor assertion carrying the memory's current side-table path
  * knowledge onto the revision's legacy-memory source stream — only when that
  * knowledge differs from the stream head, so a replayed or no-op mapping
- * write appends nothing.
+ * write appends nothing. Callers supply the desired path state and knowledge
+ * time explicitly; a regressing knowledge time is clamped forward to the
+ * stream maximum.
  */
 export function syncMemoryApplicabilityPathsInCurrentTransaction(
     db: Database,
@@ -584,11 +609,10 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
         revisionId: number;
         projectId: number;
         memoryId: number;
-        paths?: ApplicabilityPathsInput;
-        knownFrom?: number | null;
+        paths: ApplicabilityPathsInput;
+        knownFrom: number;
     },
 ): { appended: boolean } {
-    const paths = args.paths ?? readMemoryVerificationPathsState(db, args.memoryId);
     const stream = ensureApplicabilityStreamInCurrentTransaction(db, {
         revisionId: args.revisionId,
         projectId: args.projectId,
@@ -602,15 +626,14 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
     });
     const heads = readCurrentApplicabilityAssertions(db, args.revisionId);
     const head = heads.find((candidate) => candidate.streamId === stream.streamId);
-    if (head && pathsStateEquals(head, paths)) return { appended: false };
-    const requestedKnownFrom = args.knownFrom ?? Date.now();
+    if (head && pathsStateEquals(head, args.paths)) return { appended: false };
     const maxKnownFrom = maxStreamKnownFrom(db, stream.streamId);
     const knownFrom =
-        maxKnownFrom != null ? Math.max(requestedKnownFrom, maxKnownFrom) : requestedKnownFrom;
+        maxKnownFrom != null ? Math.max(args.knownFrom, maxKnownFrom) : args.knownFrom;
     appendApplicabilityAssertionInCurrentTransaction(db, {
         streamId: stream.streamId,
         state: head?.state ?? "unknown",
-        paths,
+        paths: args.paths,
         knownFrom,
     });
     return { appended: true };

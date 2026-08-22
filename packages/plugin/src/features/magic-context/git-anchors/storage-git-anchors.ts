@@ -11,7 +11,10 @@
  */
 
 import type { Database } from "../../../shared/sqlite";
-import type { GitAnchorRepresentationKind } from "../storage-claim-applicability-schema.ts";
+import {
+    GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS,
+    type GitAnchorRepresentationKind,
+} from "../storage-claim-applicability-schema.ts";
 import type { GitAnchorCapture } from "./git-anchor-reader.ts";
 
 /** Versioned protocol tag for raw git OID and path representations. */
@@ -36,14 +39,27 @@ function assertFullOid(value: string, objectFormat: "sha1" | "sha256", label: st
     }
 }
 
-function representationKey(representation: GitAnchorRepresentationInput): string {
+/**
+ * Identity values of one representation in
+ * `GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS` order, after the leading
+ * `anchor_id`. Shared by the in-batch dedup key and the idempotency
+ * pre-check so both always agree with the DDL UNIQUE constraint and the
+ * append-only collision trigger derived from the same column list.
+ */
+function representationIdentityValues(
+    representation: GitAnchorRepresentationInput,
+): [string, string, string, string, string] {
     return [
         representation.kind,
         representation.objectFormat ?? "",
         representation.protocol,
         representation.namespace ?? "",
         representation.value,
-    ].join("\x1f");
+    ];
+}
+
+function representationKey(representation: GitAnchorRepresentationInput): string {
+    return representationIdentityValues(representation).join("\x1f");
 }
 
 function insertRepresentation(
@@ -124,22 +140,14 @@ export function appendGitAnchorRepresentationsInCurrentTransaction(
     const nowMs = Date.now();
     const existsStmt = db.prepare(
         `SELECT 1 FROM git_anchor_representations
-         WHERE anchor_id = ? AND kind = ? AND object_format = ? AND protocol = ?
-           AND namespace = ? AND value = ?`,
+         WHERE ${GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS.map((column) => `${column} = ?`).join(" AND ")}`,
     );
     const seen = new Set<string>();
     for (const representation of representations) {
         const key = representationKey(representation);
         if (seen.has(key)) continue;
         seen.add(key);
-        const exists = existsStmt.get(
-            anchorId,
-            representation.kind,
-            representation.objectFormat ?? "",
-            representation.protocol,
-            representation.namespace ?? "",
-            representation.value,
-        );
+        const exists = existsStmt.get(anchorId, ...representationIdentityValues(representation));
         if (exists !== undefined && exists !== null) continue;
         insertRepresentation(db, anchorId, anchor.project_id, representation, nowMs);
     }

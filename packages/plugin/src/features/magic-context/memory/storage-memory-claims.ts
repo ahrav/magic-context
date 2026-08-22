@@ -28,6 +28,7 @@ import { trustClassForLegacyMemorySource } from "./source-trust.ts";
 import {
     type ApplicabilityPathsInput,
     hasClaimApplicabilitySchema,
+    knownPathsStateFromFiles,
     legacyMemorySourceApplicability,
     type RevisionApplicabilityInput,
     syncMemoryApplicabilityPathsInCurrentTransaction,
@@ -1690,12 +1691,13 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
         // revision defaults to the row's session (like every other revision
         // path); an explicit input session still wins.
         const sessionId = input.sourceSessionId ?? row.source_session_id;
+        const contentProvenance = liveProvenance(envelope, sessionId);
         const observationId = createMemoryObservation(db, {
             projectId,
             memoryId: row.id,
             content: input.content,
             sourceType: row.source_type,
-            provenance: liveProvenance(envelope, sessionId),
+            provenance: contentProvenance,
         });
         if (
             input.normalizedHash !== row.normalized_hash &&
@@ -1720,6 +1722,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                 shareable: 0,
             }),
             sourceSessionId: sessionId,
+            applicability: memorySourceApplicability(db, row, contentProvenance),
         });
         const effects: MemoryClaimEffect[] = [
             {
@@ -2605,10 +2608,7 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
             const failure = input.verified
                 ? recordMemoryClaimAdoptionFailure(db, row, projectId)
                 : null;
-            const snapshotPaths: ApplicabilityPathsInput = {
-                state: "known",
-                exact: input.files.filter((file) => file.length > 0),
-            };
+            const snapshotPaths: ApplicabilityPathsInput = knownPathsStateFromFiles(input.files);
             const syncApplicabilityEffect = (
                 claimId: number,
                 effectProjectId: number,

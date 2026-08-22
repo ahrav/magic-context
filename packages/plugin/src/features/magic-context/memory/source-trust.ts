@@ -1,6 +1,5 @@
 import type { SourceTrustClass } from "../storage-claim-applicability-schema.ts";
 
-export type { SourceTrustClass } from "../storage-claim-applicability-schema.ts";
 export { SOURCE_TRUST_CLASSES } from "../storage-claim-applicability-schema.ts";
 
 export function trustClassForLegacyMemorySource(

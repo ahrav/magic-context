@@ -293,6 +293,55 @@ describe("memory/claims kernel: content and classification updates", () => {
         ).toBe(2);
     });
 
+    test("a content update carries the memory's applicability lineage onto the new revision", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "applicability-update-seed", "lineage wording");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/lineage.ts', 123, 100)`,
+            ).run(seeded.memoryId);
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("applicability-update-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    content: "lineage wording revised",
+                    normalizedHash: "hash:lineage wording revised",
+                },
+            ),
+        );
+
+        // The new revision opens the legacy-memory source stream (not the
+        // `baseline:v1` writer default) and its assertion carries the
+        // still-live memory_verifications path knowledge instead of
+        // downgrading the current revision to paths_state = 'unknown'.
+        const streams = db
+            .prepare(
+                `SELECT stream_key AS streamKey FROM claim_revision_applicability_streams
+                  WHERE revision_id = ? ORDER BY stream_key`,
+            )
+            .all(outcome.result.revisionId as number) as Array<{ streamKey: string }>;
+        expect(streams).toEqual([{ streamKey: `legacy-memory:${seeded.memoryId}:v1` }]);
+        const head = db
+            .prepare(
+                `SELECT a.paths_state AS pathsState, p.value AS path
+                   FROM claim_revision_applicability_streams s
+                   JOIN claim_revision_applicability_assertions a ON a.stream_id = s.id
+                   LEFT JOIN claim_revision_applicability_paths p ON p.assertion_id = a.id
+                  WHERE s.revision_id = ?
+                  ORDER BY a.seq DESC LIMIT 1`,
+            )
+            .get(outcome.result.revisionId as number) as {
+            pathsState: string;
+            path: string | null;
+        };
+        expect(head).toEqual({ pathsState: "known", path: "src/lineage.ts" });
+    });
+
     test("a content update on a verified memory records a verified event on the new revision", () => {
         const db = track(migratedDb());
         const projectionSeed = createSeedMemory(db, "verified-update-seed", "projection verified");

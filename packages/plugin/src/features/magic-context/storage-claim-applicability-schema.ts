@@ -70,8 +70,40 @@ export const GIT_ANCHOR_REPRESENTATION_KINDS = [
 ] as const;
 export type GitAnchorRepresentationKind = (typeof GIT_ANCHOR_REPRESENTATION_KINDS)[number];
 
+/**
+ * Identity tuple of one anchor representation row. Single source for the DDL
+ * UNIQUE constraint, the append-only collision trigger, and the
+ * application-side idempotency pre-check in `storage-git-anchors.ts`: a
+ * divergent spelling would make the pre-check skip an insert the trigger
+ * ABORTs (or vice versa).
+ */
+export const GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS = [
+    "anchor_id",
+    "kind",
+    "object_format",
+    "protocol",
+    "namespace",
+    "value",
+] as const;
+
+/** Stream owner kinds: source lineage vs evaluation lineage (KTD3, R5). */
+export const APPLICABILITY_OWNER_KINDS = ["source", "evaluation"] as const;
+export type ApplicabilityOwnerKind = (typeof APPLICABILITY_OWNER_KINDS)[number];
+
+/** Path knowledge dispositions on an assertion (R6, KTD4). */
+export const APPLICABILITY_PATHS_STATES = ["unknown", "known"] as const;
+export type ApplicabilityPathsState = (typeof APPLICABILITY_PATHS_STATES)[number];
+
+/** Path selector kinds (R6). */
+export const APPLICABILITY_PATH_KINDS = ["exact", "glob"] as const;
+export type ApplicabilityPathKind = (typeof APPLICABILITY_PATH_KINDS)[number];
+
 const sqlList = (values: readonly string[]): string =>
     values.map((value) => `'${value}'`).join(", ");
+
+const representationIdentityMatch = GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS.map(
+    (column) => `${column} = NEW.${column}`,
+).join(" AND ");
 
 /**
  * Add the constrained observation trust column (KTD7). ALTER TABLE ADD COLUMN
@@ -129,7 +161,7 @@ export function createClaimApplicabilitySchema(db: Database): void {
         ),
         value TEXT NOT NULL CHECK (length(value) > 0),
         created_at INTEGER NOT NULL,
-        UNIQUE (anchor_id, kind, object_format, protocol, namespace, value)
+        UNIQUE (${GIT_ANCHOR_REPRESENTATION_IDENTITY_COLUMNS.join(", ")})
     );
     CREATE UNIQUE INDEX idx_git_anchor_representations_commit_unique
         ON git_anchor_representations(project_id, object_format, protocol, value)
@@ -147,7 +179,7 @@ export function createClaimApplicabilitySchema(db: Database): void {
         id INTEGER PRIMARY KEY,
         revision_id INTEGER NOT NULL REFERENCES claim_revisions(id) ON DELETE RESTRICT,
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
-        owner_kind TEXT NOT NULL CHECK (owner_kind IN ('source', 'evaluation')),
+        owner_kind TEXT NOT NULL CHECK (owner_kind IN (${sqlList(APPLICABILITY_OWNER_KINDS)})),
         stream_key TEXT NOT NULL CHECK (length(stream_key) > 0),
         key_protocol TEXT NOT NULL CHECK (length(key_protocol) > 0),
         source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
@@ -187,7 +219,7 @@ export function createClaimApplicabilitySchema(db: Database): void {
         -- Path knowledge disposition (R6, KTD4): 'unknown' forbids child path
         -- rows; 'known' with zero child rows means file-independent
         -- (known-empty).
-        paths_state TEXT NOT NULL CHECK (paths_state IN ('unknown', 'known')),
+        paths_state TEXT NOT NULL CHECK (paths_state IN (${sqlList(APPLICABILITY_PATHS_STATES)})),
         dependency_fingerprint TEXT CHECK (
             dependency_fingerprint IS NULL OR length(dependency_fingerprint) > 0
         ),
@@ -207,13 +239,18 @@ export function createClaimApplicabilitySchema(db: Database): void {
     CREATE UNIQUE INDEX idx_claim_applicability_assertions_predecessor
         ON claim_revision_applicability_assertions(predecessor_id)
         WHERE predecessor_id IS NOT NULL;
+    -- Stream-max knowledge-time lookups (the time-guard trigger and the
+    -- typed-layer maxStreamKnownFrom) resolve via an index max instead of
+    -- scanning every assertion in the stream on each append.
+    CREATE INDEX idx_claim_applicability_assertions_known_from
+        ON claim_revision_applicability_assertions(stream_id, known_from);
 
     -- Affected path selectors (R6, KTD4). WITHOUT ROWID closes the
     -- INSERT OR REPLACE bypass (the claim_evidence precedent).
     CREATE TABLE claim_revision_applicability_paths (
         assertion_id INTEGER NOT NULL
             REFERENCES claim_revision_applicability_assertions(id) ON DELETE RESTRICT,
-        kind TEXT NOT NULL CHECK (kind IN ('exact', 'glob')),
+        kind TEXT NOT NULL CHECK (kind IN (${sqlList(APPLICABILITY_PATH_KINDS)})),
         value TEXT NOT NULL CHECK (length(value) > 0),
         PRIMARY KEY (assertion_id, kind, value)
     ) WITHOUT ROWID;
@@ -228,9 +265,14 @@ export function createClaimApplicabilitySchema(db: Database): void {
     ) WITHOUT ROWID;
 
     -- Read shape with derived interval ends (KTD2): partitioned only by
-    -- stream and sequence. recorded_until always derives from the successor;
-    -- known_until derives from the successor's knowledge time, which the
-    -- write guards keep non-regressing.
+    -- stream and sequence. recorded_until always derives from the immediate
+    -- successor. known_until derives from the nearest LATER same-stream
+    -- assertion carrying a non-NULL knowledge time — not the immediate
+    -- successor verbatim — so a NULL known_from gap cannot leave a superseded
+    -- assertion reading as knowledge-open once a later assertion closes it
+    -- (two open knowledge intervals in one stream would let an as-of-
+    -- knowledge-time query return a stale state as current). The write
+    -- guards keep known_from non-regressing, so MIN() is that nearest value.
     CREATE VIEW claim_revision_applicability_intervals AS
     SELECT
         assertion.id AS assertion_id,
@@ -242,7 +284,13 @@ export function createClaimApplicabilitySchema(db: Database): void {
         assertion.valid_until_anchor_id AS valid_until_anchor_id,
         assertion.evaluated_against_anchor_id AS evaluated_against_anchor_id,
         assertion.known_from AS known_from,
-        successor.known_from AS known_until,
+        (
+            SELECT MIN(later.known_from)
+            FROM claim_revision_applicability_assertions AS later
+            WHERE later.stream_id = assertion.stream_id
+              AND later.seq > assertion.seq
+              AND later.known_from IS NOT NULL
+        ) AS known_until,
         assertion.recorded_at AS recorded_at,
         successor.recorded_at AS recorded_until,
         assertion.paths_state AS paths_state
@@ -254,6 +302,8 @@ export function createClaimApplicabilitySchema(db: Database): void {
         AND successor.seq = assertion.seq + 1;
     `);
 
+    // Interpolation is a compile-time const allowlist, not caller input.
+    // pi-lens-ignore: sql-injection
     db.exec(`
     CREATE TRIGGER git_anchors_append_only_update BEFORE UPDATE ON git_anchors
     BEGIN SELECT RAISE(ABORT, 'git_anchors is append-only: updates are not allowed'); END;
@@ -273,11 +323,7 @@ export function createClaimApplicabilitySchema(db: Database): void {
     BEFORE INSERT ON git_anchor_representations
     WHEN EXISTS (
         SELECT 1 FROM git_anchor_representations
-        WHERE id = NEW.id OR (
-            anchor_id = NEW.anchor_id AND kind = NEW.kind
-            AND object_format = NEW.object_format AND protocol = NEW.protocol
-            AND namespace = NEW.namespace AND value = NEW.value
-        )
+        WHERE id = NEW.id OR (${representationIdentityMatch})
     )
     BEGIN SELECT RAISE(ABORT, 'git_anchor_representations is append-only: key collisions cannot replace rows'); END;
 
@@ -352,8 +398,8 @@ export function createClaimApplicabilitySchema(db: Database): void {
     -- Recorded time never regresses behind the predecessor, and knowledge
     -- time never regresses behind ANY earlier assertion in the stream: a
     -- NULL known_from gap must not reopen the door to an older knowledge
-    -- time (R2). A NULL successor known_from stays allowed and simply
-    -- derives no known_until.
+    -- time (R2). A NULL known_from stays allowed; the interval view closes
+    -- earlier assertions with the nearest later non-NULL knowledge time.
     CREATE TRIGGER claim_applicability_assertions_time_guard
     BEFORE INSERT ON claim_revision_applicability_assertions
     WHEN NEW.predecessor_id IS NOT NULL AND (
