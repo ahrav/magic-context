@@ -208,7 +208,7 @@ function claimEventOutcomes(db: Database, memoryId: number): string[] {
 }
 
 describe("verification claim effects on a migrated v84 database (KTD5)", () => {
-    test("a mapped-only file snapshot adds NO verification event and no outbox effect", () => {
+    test("a mapped-only file snapshot adds NO verification event; the path-state change adds one applicability effect", () => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
@@ -223,7 +223,14 @@ describe("verification claim effects on a migrated v84 database (KTD5)", () => {
             recordMemoryMapping(db, memory.id, ["src/x.ts"], 5000);
 
             expect(countRows(db, "verification_events")).toBe(eventsBefore);
-            expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore);
+            expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore + 1);
+            expect(
+                countRows(
+                    db,
+                    "claim_change_outbox",
+                    `effect_key = 'memory:${memory.id}:applicability'`,
+                ),
+            ).toBe(1);
             // The mapping itself is durable in the side table.
             expect(getMemoryVerifications(db, [memory.id]).get(memory.id)?.mappedAt).toBe(5000);
         } finally {
@@ -231,7 +238,7 @@ describe("verification claim effects on a migrated v84 database (KTD5)", () => {
         }
     });
 
-    test("a positive verification adds exactly one current-snapshot verified event and one evidence effect", () => {
+    test("a positive verification adds one verified event, one evidence effect, and one applicability effect for the path-state change", () => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
@@ -245,10 +252,17 @@ describe("verification claim effects on a migrated v84 database (KTD5)", () => {
             recordMemoryVerifications(db, memory.id, ["src/x.ts"], 9000);
 
             expect(claimEventOutcomes(db, memory.id)).toEqual(["verified"]);
-            expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore + 1);
+            expect(countRows(db, "claim_change_outbox")).toBe(outboxBefore + 2);
             expect(
                 countRows(db, "claim_change_outbox", "effect_type = 'evidence'"),
             ).toBeGreaterThanOrEqual(1);
+            expect(
+                countRows(
+                    db,
+                    "claim_change_outbox",
+                    `effect_key = 'memory:${memory.id}:applicability'`,
+                ),
+            ).toBe(1);
         } finally {
             closeQuietly(db);
         }

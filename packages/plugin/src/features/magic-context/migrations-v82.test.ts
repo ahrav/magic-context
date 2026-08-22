@@ -15,6 +15,7 @@ import {
     ensureProject,
 } from "./memory/storage-claims";
 import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
+import { dropClaimApplicabilityObjectsForTests } from "./storage-claim-applicability-schema";
 import { APPEND_ONLY_CLAIMS_TABLES, CLAIMS_AND_EVIDENCE_TABLES } from "./storage-claims-schema";
 import { closeDatabase, initializeDatabase, openDatabase } from "./storage-db";
 import { dropMemoryClaimsCompatObjectsForTests } from "./storage-memory-claims-schema";
@@ -34,6 +35,7 @@ function v81Database(): Database {
     initializeDatabase(db);
     runMigrations(db);
     db.exec("DELETE FROM schema_migrations WHERE version >= 82");
+    dropClaimApplicabilityObjectsForTests(db);
     dropMemoryClaimsCompatObjectsForTests(db);
     dropV82Objects(db);
     return db;

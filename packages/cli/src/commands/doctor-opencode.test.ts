@@ -491,7 +491,7 @@ describe("doctor claims backfill commands", () => {
         expect(output).toContain("before: phase=complete; linked=0/0");
         expect(output).toContain("after:  phase=complete; linked=0/0");
         expect(output).toContain("claims backfill complete");
-        expect(output).toContain("schema: v84 → v84");
+        expect(output).toContain("schema: v85 → v85");
         expect(output).toContain("restart it before creating new sessions");
         expect(
             database.prepare("SELECT MAX(version) AS version FROM schema_migrations").get(),

@@ -293,6 +293,55 @@ describe("memory/claims kernel: content and classification updates", () => {
         ).toBe(2);
     });
 
+    test("a content update carries the memory's applicability lineage onto the new revision", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "applicability-update-seed", "lineage wording");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/lineage.ts', 123, 100)`,
+            ).run(seeded.memoryId);
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("applicability-update-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    content: "lineage wording revised",
+                    normalizedHash: "hash:lineage wording revised",
+                },
+            ),
+        );
+
+        // The new revision opens the legacy-memory source stream (not the
+        // `baseline:v1` writer default) and its assertion carries the
+        // still-live memory_verifications path knowledge instead of
+        // downgrading the current revision to paths_state = 'unknown'.
+        const streams = db
+            .prepare(
+                `SELECT stream_key AS streamKey FROM claim_revision_applicability_streams
+                  WHERE revision_id = ? ORDER BY stream_key`,
+            )
+            .all(outcome.result.revisionId as number) as Array<{ streamKey: string }>;
+        expect(streams).toEqual([{ streamKey: `legacy-memory:${seeded.memoryId}:v1` }]);
+        const head = db
+            .prepare(
+                `SELECT a.paths_state AS pathsState, p.value AS path
+                   FROM claim_revision_applicability_streams s
+                   JOIN claim_revision_applicability_assertions a ON a.stream_id = s.id
+                   LEFT JOIN claim_revision_applicability_paths p ON p.assertion_id = a.id
+                  WHERE s.revision_id = ?
+                  ORDER BY a.seq DESC LIMIT 1`,
+            )
+            .get(outcome.result.revisionId as number) as {
+            pathsState: string;
+            path: string | null;
+        };
+        expect(head).toEqual({ pathsState: "known", path: "src/lineage.ts" });
+    });
+
     test("a content update on a verified memory records a verified event on the new revision", () => {
         const db = track(migratedDb());
         const projectionSeed = createSeedMemory(db, "verified-update-seed", "projection verified");
@@ -1783,24 +1832,33 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         ]);
     });
 
-    test("ephemeral zero-effect envelopes persist nothing; effect-bearing ones insert normally", () => {
+    test("mapping snapshots append applicability effects only when path state changes; no-op maps persist nothing", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "ephemeral-seed", "ephemeral fact");
         const operationsBefore = count(db, "claim_operations");
-        const outboxBefore = count(db, "claim_change_outbox");
-        const generationBefore = db
-            .prepare("SELECT generation FROM claim_project_generations")
-            .get() as { generation: number };
 
-        // Mapped-only snapshots always yield zero effects: their random-key
-        // envelopes must not accumulate in claim_operations.
+        // A mapped-only snapshot performs no verification-event write, but a
+        // path-state change appends one applicability assertion and one
+        // upsert effect.
         recordMemoryMapping(db, seeded.memoryId, ["src/a.ts"], 5_000);
         recordMemoryMapping(db, seeded.memoryId, ["src/b.ts"], 6_000);
-        expect(count(db, "claim_operations")).toBe(operationsBefore);
-        expect(count(db, "claim_change_outbox")).toBe(outboxBefore);
-        expect(db.prepare("SELECT generation FROM claim_project_generations").get()).toEqual(
-            generationBefore,
-        );
+        expect(count(db, "claim_operations")).toBe(operationsBefore + 2);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${seeded.memoryId}:applicability'`,
+            ),
+        ).toBe(2);
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(0);
+
+        // An identical remap changes no path state: its random-key ephemeral
+        // envelope creates no claim_operations or claim_change_outbox rows.
+        const outboxAfterMaps = count(db, "claim_change_outbox");
+        recordMemoryMapping(db, seeded.memoryId, ["src/b.ts"], 6_500);
+        expect(count(db, "claim_operations")).toBe(operationsBefore + 2);
+        expect(count(db, "claim_change_outbox")).toBe(outboxAfterMaps);
+
         // The side-table snapshot itself still applies.
         expect(
             db
@@ -1808,10 +1866,27 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
                 .all(seeded.memoryId),
         ).toEqual([{ file_path: "src/b.ts" }]);
 
+        recordMemoryMapping(db, seeded.memoryId, [], 6_600);
+        const emptyHead = db
+            .prepare(
+                `SELECT a.paths_state AS pathsState,
+                        (SELECT COUNT(*) FROM claim_revision_applicability_paths p
+                          WHERE p.assertion_id = a.id) AS pathCount
+                   FROM claim_revision_applicability_streams s
+                   JOIN claim_revision_applicability_assertions a ON a.stream_id = s.id
+                  WHERE s.stream_key = 'legacy-memory:' || ? || ':v1'
+                  ORDER BY a.seq DESC LIMIT 1`,
+            )
+            .get(seeded.memoryId) as { pathsState: string; pathCount: number };
+        expect(emptyHead).toEqual({ pathsState: "known", pathCount: 0 });
+        const opsAfterClear = count(db, "claim_operations");
+        recordMemoryMapping(db, seeded.memoryId, [], 6_700);
+        expect(count(db, "claim_operations")).toBe(opsAfterClear);
+
         // A verified snapshot carries an evidence effect, so its ephemeral
         // envelope inserts with the full outbox contract.
         recordMemoryVerifications(db, seeded.memoryId, ["src/a.ts"], 7_000);
-        expect(count(db, "claim_operations")).toBe(operationsBefore + 1);
+        expect(count(db, "claim_operations")).toBe(opsAfterClear + 1);
         expect(
             count(
                 db,

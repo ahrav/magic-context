@@ -471,10 +471,16 @@ export function applyIdentityMergeToProjectRegistry(
     // Mirror history is immutable at the database boundary — the crosswalk,
     // episodes, and outbox are append-only and claims.project_id is frozen by
     // the semantic-freeze trigger — and each of those tables references
-    // projects(id) ON DELETE RESTRICT. A source that owns such history keeps
-    // its projects row as an inert tombstone: every alias now resolves to the
-    // target, so no identity routes new work to the retired numeric id. A
-    // source with no claim-graph rows is deleted outright.
+    // projects(id) ON DELETE RESTRICT. Git anchors are append-only and
+    // project-scoped the same way (their representations share the anchor's
+    // project by trigger, so anchors alone decide ownership). A source that
+    // owns such history keeps its projects row as an inert tombstone: every
+    // alias now resolves to the target, so no identity routes new work to
+    // the retired numeric id. A source with no claim-graph rows is deleted
+    // outright.
+    const anchorsClause = tableExists(db, "git_anchors")
+        ? " OR EXISTS (SELECT 1 FROM git_anchors WHERE project_id = ?)"
+        : "";
     const ownsMirrorHistory =
         hasCrosswalk &&
         (
@@ -488,10 +494,10 @@ export function applyIdentityMergeToProjectRegistry(
                               WHERE source_project_id = ? OR target_project_id = ?
                          )
                          OR EXISTS (SELECT 1 FROM claim_change_outbox WHERE project_id = ?)
-                         OR EXISTS (SELECT 1 FROM claim_project_generations WHERE project_id = ?)
+                         OR EXISTS (SELECT 1 FROM claim_project_generations WHERE project_id = ?)${anchorsClause}
                          AS owns`,
                 )
-                .get(sourceId, sourceId, sourceId, sourceId, sourceId, sourceId, sourceId) as {
+                .get(...Array<number>(anchorsClause ? 8 : 7).fill(sourceId)) as {
                 owns: number;
             }
         ).owns === 1;
