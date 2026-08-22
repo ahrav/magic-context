@@ -1962,11 +1962,28 @@ export function deleteMemoryWithClaimsInCurrentTransaction(
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return { result: unlinkableResult(row.id), effects: [] };
         }
+        // The ensure below can create the claim and crosswalk rows inside
+        // this operation, and a first adoption owes the outbox its upsert
+        // effect: with a live sibling holding the claim, the retirement
+        // branch below emits nothing, and the projection row is gone after
+        // this delete — so no later write can ever announce the crosswalk.
+        const wasLinked = readMemoryClaimLink(db, row.id) !== null;
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
         const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         const effects: MemoryClaimEffect[] = [];
+        if (!wasLinked) {
+            // Upsert only — no verified carry: the row leaves the corpus and
+            // the claim retires (or stays with its live sibling), matching
+            // the supersede kernel's source side and the module tombstone.
+            effects.push({
+                effectKey: `memory:${row.id}:upsert`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "upsert" as const,
+            });
+        }
         // A shared canonical claim retires only with its last live link;
         // deleting one projection while a sibling stays live leaves the
         // claim and its lifecycle stream untouched.
@@ -2212,11 +2229,25 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return { result: unlinkableResult(row.id), effects: [] };
         }
+        // The ensure below can create the claim and crosswalk rows inside
+        // this operation, and a first adoption owes the outbox its upsert
+        // effect — an unchanged state below otherwise commits the fresh
+        // crosswalk with zero effects and the reconciliation oracle flags
+        // it forever.
+        const wasLinked = readMemoryClaimLink(db, row.id) !== null;
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
         const relationshipEffects = translateMemoryClaimRelationshipsInCurrentTransaction(db, row);
         const effects: MemoryClaimEffect[] = [];
+        if (!wasLinked) {
+            effects.push({
+                effectKey: `memory:${row.id}:upsert`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "upsert" as const,
+            });
+        }
         // Shared-claim rule: the claim holds the max-rank state across its
         // surviving linked projections; an unchanged state writes nothing.
         const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, input.status);
@@ -2227,6 +2258,23 @@ export function mergeMemoryStatsWithClaimsInCurrentTransaction(
                 projectId,
                 claimId: link.claimId,
                 effectType: "lifecycle" as const,
+            });
+        }
+        if (!wasLinked && memoryRowHasPositiveVerification(db, row)) {
+            // Side-table-only verification never sets the projection columns,
+            // so the row's first adoption owes one verified event for its
+            // pre-existing verified state — the merge-kernel twin of the
+            // status kernel's first-adoption carry.
+            addVerificationEvent(db, {
+                revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                outcome: "verified",
+                verifier: envelope.producer,
+            });
+            effects.push({
+                effectKey: `memory:${row.id}:evidence`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "evidence" as const,
             });
         }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
@@ -2691,6 +2739,20 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 // untouched and only the last link retires it — with the
                 // archive event reserved for an actual archive transition.
                 if (preLink) {
+                    // The preimage adoption above committed the claim and
+                    // crosswalk rows, and the projection row is gone — no
+                    // later write can announce them — so a first adoption
+                    // owes the outbox its upsert even when the shared-claim
+                    // rule below transitions nothing. Upsert only, no
+                    // verified carry: the delete-kernel twin of this branch.
+                    if (preimageAdopted) {
+                        effects.push({
+                            effectKey: `memory:${input.memoryId}:upsert`,
+                            projectId: preLink.projectId,
+                            claimId: preLink.claimId,
+                            effectType: "upsert" as const,
+                        });
+                    }
                     const desiredState = sharedClaimStateFromLiveLinks(
                         db,
                         preLink.claimId,

@@ -3191,6 +3191,7 @@ describe("module mirror claims (v84)", () => {
                 .all(link.claim_id),
         ).toEqual([{ content: "preimage fact" }]);
         expect(claimState(database).outbox).toEqual([
+            { effect_key: `memory:${memoryId}:upsert`, effect_type: "upsert", generation: 1 },
             { effect_key: `memory:${memoryId}:lifecycle`, effect_type: "lifecycle", generation: 1 },
         ]);
         expect(getMirrorCursor(database, "memories")).toBe(1);

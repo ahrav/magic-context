@@ -7,6 +7,7 @@ import {
 import {
     moveLinkedMemoryAcrossProjects,
     recordSkippedCollisionMergeDiagnostic,
+    resolveSkippedCollisionMergeDiagnostic,
     syncAdoptedClaimLifecycleState,
     syncAdoptedRelocationClaimState,
 } from "./memory/relocate-memory";
@@ -446,6 +447,10 @@ function adoptIdentityMergeRowClaims(
             return { result: targetLink.claimId, effects };
         },
     );
+    // A prior run of this same collision may have skipped with a blocking
+    // diagnostic while an endpoint was claim-invalid; the completed merge is
+    // the terminal resolution for that key.
+    resolveSkippedCollisionMergeDiagnostic(db, sourceId, collisionTargetId);
     return true;
 }
 

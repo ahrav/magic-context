@@ -2868,3 +2868,179 @@ describe("claim state from memory status", () => {
         expect(claimStateFromMemoryStatus(null)).toBe("archived");
     });
 });
+
+describe("memory/claims kernel: removal-path first-adoption announcements", () => {
+    /** Register a second path string aliased to the seed project so the
+     *  unique (path, category, hash) projection index admits a duplicate
+     *  row that dedups onto the survivor's canonical claim. */
+    function registerAliasPath(db: Database, aliasPath: string): void {
+        const projectId = (
+            db
+                .prepare("SELECT project_id AS id FROM project_aliases WHERE alias_identity = ?")
+                .get(PROJECT) as { id: number }
+        ).id;
+        db.prepare(
+            "INSERT INTO project_aliases (alias_identity, project_id, created_at) VALUES (?, ?, 1)",
+        ).run(aliasPath, projectId);
+    }
+
+    /** Direct projection insert without a claim crosswalk link. */
+    function insertUnlinkedRow(db: Database, projectPath: string, content: string): number {
+        return runInMemoryClaimsWriteTransaction(db, () =>
+            Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(projectPath, content, `hash:${content}`).lastInsertRowid,
+            ),
+        );
+    }
+
+    function operationEffects(
+        db: Database,
+        operationKey: string,
+    ): Array<{ effectKey: string; effectType: string }> {
+        return db
+            .prepare(
+                `SELECT effect_key AS effectKey, effect_type AS effectType
+                   FROM claim_change_outbox
+                  WHERE operation_id = (
+                      SELECT id FROM claim_operations WHERE operation_key = ?)
+                  ORDER BY effect_key`,
+            )
+            .all(operationKey) as Array<{ effectKey: string; effectType: string }>;
+    }
+
+    test("deleting an unlinked row that dedups onto a live sibling's claim emits its first-adoption upsert", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "del-adopt-seed", "del adopt fact");
+        registerAliasPath(db, "git:kernel-project-alias");
+        const rawId = insertUnlinkedRow(db, "git:kernel-project-alias", "del adopt fact");
+        expect(readMemoryClaimLink(db, rawId)).toBeNull();
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(db, envelope("del-adopt-1", { rawId }), {
+                memoryId: rawId,
+            }),
+        );
+
+        // The live sibling suppresses retirement, but the crosswalk created
+        // inside this delete still reaches the outbox — the projection row
+        // is gone, so no later write could announce it.
+        expect(readMemoryClaimLink(db, rawId)?.claimId).toBe(survivor.claimId);
+        expect(operationEffects(db, "del-adopt-1")).toEqual([
+            { effectKey: `memory:${rawId}:upsert`, effectType: "upsert" },
+        ]);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+    });
+
+    test("deleting an unlinked last-link row emits the upsert alongside its retirement lifecycle effect", () => {
+        const db = track(migratedDb());
+        createSeedMemory(db, "del-lastlink-anchor", "del anchor fact");
+        const rawId = insertUnlinkedRow(db, PROJECT, "del last-link fact");
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(db, envelope("del-lastlink-1", { rawId }), {
+                memoryId: rawId,
+            }),
+        );
+
+        expect(operationEffects(db, "del-lastlink-1")).toEqual([
+            { effectKey: `memory:${rawId}:lifecycle`, effectType: "lifecycle" },
+            { effectKey: `memory:${rawId}:upsert`, effectType: "upsert" },
+        ]);
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(1);
+    });
+
+    test("a module tombstone removing an unlinked row deduped onto a live sibling's claim emits its first-adoption upsert", () => {
+        const db = track(migratedDb());
+        const survivor = createSeedMemory(db, "tomb-adopt-seed", "tomb adopt fact");
+        registerAliasPath(db, "git:kernel-project-alias");
+        const rawId = insertUnlinkedRow(db, "git:kernel-project-alias", "tomb adopt fact");
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("tomb-adopt-1", { rawId }),
+                {
+                    memoryId: rawId,
+                    applyProjection: () => {
+                        db.prepare("DELETE FROM memories WHERE id = ?").run(rawId);
+                    },
+                },
+            ),
+        );
+
+        expect(readMemoryClaimLink(db, rawId)?.claimId).toBe(survivor.claimId);
+        expect(operationEffects(db, "tomb-adopt-1")).toEqual([
+            { effectKey: `memory:${rawId}:upsert`, effectType: "upsert" },
+        ]);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(survivor.claimId)).toEqual({
+            state: "active",
+        });
+    });
+
+    test("a module tombstone removing an unlinked last-link row emits the upsert alongside its retirement lifecycle effect", () => {
+        const db = track(migratedDb());
+        createSeedMemory(db, "tomb-lastlink-anchor", "tomb anchor fact");
+        const rawId = insertUnlinkedRow(db, PROJECT, "tomb last-link fact");
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("tomb-lastlink-1", { rawId }),
+                {
+                    memoryId: rawId,
+                    applyProjection: () => {
+                        db.prepare("DELETE FROM memories WHERE id = ?").run(rawId);
+                    },
+                },
+            ),
+        );
+
+        expect(operationEffects(db, "tomb-lastlink-1")).toEqual([
+            { effectKey: `memory:${rawId}:lifecycle`, effectType: "lifecycle" },
+            { effectKey: `memory:${rawId}:upsert`, effectType: "upsert" },
+        ]);
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(1);
+    });
+
+    test("a merge-stats write adopting an unlinked side-table-verified row emits its upsert and verified carry", () => {
+        const db = track(migratedDb());
+        createSeedMemory(db, "merge-adopt-anchor", "merge anchor fact");
+        const rawId = insertUnlinkedRow(db, PROJECT, "merge adopt fact");
+        // Pre-v84 TypeScript verification writes only the side table.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at) VALUES (?, 'src/x.ts', 5, 5)",
+            ).run(rawId);
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            mergeMemoryStatsWithClaimsInCurrentTransaction(
+                db,
+                envelope("merge-adopt-1", { rawId }),
+                {
+                    memoryId: rawId,
+                    seenCount: 2,
+                    retrievalCount: 0,
+                    mergedFrom: "[]",
+                    status: "active",
+                },
+            ),
+        );
+
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(readMemoryClaimLink(db, rawId)?.claimId).toBe(outcome.result.claimId as number);
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(1);
+        expect(operationEffects(db, "merge-adopt-1")).toEqual([
+            { effectKey: `memory:${rawId}:evidence`, effectType: "evidence" },
+            { effectKey: `memory:${rawId}:upsert`, effectType: "upsert" },
+        ]);
+    });
+});

@@ -20,6 +20,7 @@ import {
     readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
     setMemoryStatusWithClaimsInCurrentTransaction,
+    updateMemoryVerificationWithClaimsInCurrentTransaction,
 } from "./storage-memory-claims";
 
 let db: Database | null = null;
@@ -1298,5 +1299,95 @@ describe("relocate-memory claims (v84)", () => {
             database.prepare("SELECT project_path FROM memories WHERE id = ?").get(memory.id),
         ).toEqual({ project_path: "git:origin" });
         expect(database.prepare("SELECT COUNT(*) AS c FROM memories").get()).toEqual({ c: 1 });
+    });
+});
+
+describe("relocate-memory collision-merge retries (v84)", () => {
+    test("a skipped collision merge's diagnostic resolves once the repaired merge succeeds", () => {
+        const database = makeDb();
+        // The target numeric project must exist for the claims-active merge path.
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+        // Empty-content target: unadoptable, so the first merge attempt skips.
+        const targetId = insertUnlinkedMemory(database, "git:project-b", "", "retry-h1");
+        const sourceId = insertUnlinkedMemory(database, "git:project-a", "retry fact", "retry-h1");
+
+        const first = inTransaction(database, () =>
+            moveMemoriesToProject(database, [sourceId], "git:project-a", "git:project-b"),
+        );
+        expect(first).toEqual({ relocated: 0, merged: 0, skipped: 0 });
+        const diagnosticKey = `memory:${sourceId}:collision-merge:${targetId}`;
+        const readDisposition = () =>
+            database
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(diagnosticKey);
+        expect(readDisposition()).toEqual({ disposition: "blocking" });
+
+        // Repair the very reason the merge skipped (the empty content), then
+        // retry the same (source, target) collision.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET content = 'retry fact' WHERE id = ?")
+                .run(targetId);
+        });
+        const second = inTransaction(database, () =>
+            moveMemoriesToProject(database, [sourceId], "git:project-a", "git:project-b"),
+        );
+
+        // The completed merge is the diagnostic's repair: leaving it
+        // blocking would pin reconciliation forever with nothing left to fix.
+        expect(second).toEqual({ relocated: 0, merged: 1, skipped: 0 });
+        expect(database.prepare("SELECT id FROM memories WHERE id = ?").get(sourceId)).toBeNull();
+        expect(readDisposition()).toEqual({ disposition: "resolved" });
+    });
+
+    test("repeated equivalent merges into an already-linked verified target record no duplicate verified events", () => {
+        const database = makeDb();
+        const target = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "steady fact",
+        });
+        // The linked target's claim already owns its verified event.
+        runInMemoryClaimsWriteTransaction(database, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                database,
+                {
+                    producer: "relocate-test",
+                    operationKey: "steady-verify",
+                    requestDigest: computeClaimRequestDigest({ id: target.id }),
+                },
+                { memoryId: target.id, verificationStatus: "verified", nowMs: 9_000 },
+            ),
+        );
+        const verifiedEvents = () =>
+            (
+                database
+                    .prepare(
+                        "SELECT COUNT(*) AS c FROM verification_events WHERE outcome = 'verified'",
+                    )
+                    .get() as { c: number }
+            ).c;
+        expect(verifiedEvents()).toBe(1);
+
+        for (const sourceProject of ["git:project-a", "git:project-c"]) {
+            const source = insertMemory(database, {
+                projectPath: sourceProject,
+                category: "CONSTRAINTS",
+                content: "steady fact",
+            });
+            const result = inTransaction(database, () =>
+                moveMemoriesToProject(database, [source.id], sourceProject, "git:project-b"),
+            );
+            expect(result).toEqual({ relocated: 0, merged: 1, skipped: 0 });
+        }
+
+        // The already-linked target takes the lifecycle-only sync: no
+        // duplicate verified event lands per equivalent merge.
+        expect(verifiedEvents()).toBe(1);
+        expect(getCurrentMemoryClaimByLegacyMemoryId(database, target.id)?.state).toBe("active");
     });
 });

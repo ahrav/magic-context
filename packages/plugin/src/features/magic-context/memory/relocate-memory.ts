@@ -270,6 +270,25 @@ export function recordSkippedCollisionMergeDiagnostic(
 }
 
 /**
+ * Flip a skipped collision merge's blocking/retry diagnostic to resolved once
+ * the same (source, target) merge completes — the merge twin of
+ * `resolveMemoryClaimLinkFailure`. Nothing sweeps the `merge` item kind, so
+ * without this the diagnostic outlives the repaired-and-retried merge and
+ * pins reconciliation forever. Warnings stay visible on the repair surface.
+ */
+export function resolveSkippedCollisionMergeDiagnostic(
+    db: Database,
+    sourceId: number,
+    targetId: number,
+): void {
+    db.prepare(
+        `UPDATE claim_backfill_failures SET disposition = 'resolved', updated_at = ?
+          WHERE phase = 'relationships' AND item_kind = 'merge' AND item_key = ?
+            AND disposition IN ('blocking', 'retry')`,
+    ).run(Date.now(), `memory:${sourceId}:collision-merge:${targetId}`);
+}
+
+/**
  * Claim canonicalization for a collision merge: the surviving target row
  * owns (or adopts) the canonical claim, the deleted source row records its
  * link to that canonical claim (duplicate crosswalk link), and a source that
@@ -335,16 +354,27 @@ function adoptRelocationMergeClaims(
             }
             // Adoption can reuse a canonical claim archived by a prior delete
             // of the target-project equivalent; the sync reactivates it from
-            // the surviving row's status and carries the row's verified state
-            // onto the claim as evidence.
+            // the surviving row's status. Only a first adoption carries the
+            // row's verified state onto the claim as evidence — an
+            // already-linked target's claim carries its own verified event,
+            // and the unconditional carry would append a duplicate per
+            // equivalent merge.
             effects.push(
-                ...syncAdoptedRelocationClaimState(
-                    db,
-                    targetRow,
-                    targetLink,
-                    targetProjectId,
-                    RELOCATION_PRODUCER,
-                ),
+                ...(targetWasLinked
+                    ? syncAdoptedClaimLifecycleState(
+                          db,
+                          targetRow,
+                          targetLink,
+                          targetProjectId,
+                          RELOCATION_PRODUCER,
+                      )
+                    : syncAdoptedRelocationClaimState(
+                          db,
+                          targetRow,
+                          targetLink,
+                          targetProjectId,
+                          RELOCATION_PRODUCER,
+                      )),
             );
             let sourceLink = readMemoryClaimLink(db, sourceId);
             if (!sourceLink && sourceRow) {
@@ -403,6 +433,9 @@ function adoptRelocationMergeClaims(
             return { result: targetLink.claimId, effects };
         },
     );
+    // A prior attempt at this same (source, target) pair may have skipped
+    // with a blocking diagnostic; the completed merge is its repair.
+    resolveSkippedCollisionMergeDiagnostic(db, sourceId, targetId);
     return true;
 }
 
