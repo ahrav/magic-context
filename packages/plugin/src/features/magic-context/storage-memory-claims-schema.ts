@@ -177,8 +177,12 @@ export function createMemoryClaimsCompatSchema(db: Database): void {
 
     -- Durable local semantic/lifecycle effects for U8 (KTD7). U7 never
     -- acknowledges delivery; there is no ack state here by contract.
+    -- AUTOINCREMENT: the consumer's high-watermark cursor and the prune
+    -- triggers compare against ids, so an id must never be reused — a plain
+    -- rowid restarts at 1 after a full prune empties the table, landing new
+    -- effects at or below the durable consumed watermark.
     CREATE TABLE claim_change_outbox (
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         operation_id INTEGER NOT NULL REFERENCES claim_operations(id) ON DELETE RESTRICT,
         effect_key TEXT NOT NULL CHECK (length(effect_key) > 0),
         project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,

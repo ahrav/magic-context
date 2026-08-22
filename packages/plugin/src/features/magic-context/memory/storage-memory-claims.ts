@@ -1772,6 +1772,10 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
                 claimId: link.claimId,
                 effectType: "upsert" as const,
             },
+            // The link above can dedup-adopt an archived canonical claim, so
+            // the lifecycle re-derivation runs after the revision append and
+            // any archive event lands on the new current revision.
+            ...syncClaimLifecycleAfterAdoption(db, row, link, projectId, envelope.producer),
         ];
         // The projection keeps its verified columns across a classification
         // change, so the appended revision needs its own verified event —
@@ -2043,6 +2047,19 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                         effectType: "upsert" as const,
                     });
                 }
+                // The link above can dedup-adopt a canonical claim archived
+                // by a prior delete, so the target claim's state re-derives
+                // from its live links; the helper no-ops when the state
+                // already matches.
+                effects.push(
+                    ...syncClaimLifecycleAfterAdoption(
+                        db,
+                        target,
+                        targetLink,
+                        targetProjectId,
+                        envelope.producer,
+                    ),
+                );
                 if (recordMemoryClaimSupersessionInCurrentTransaction(db, link, targetLink)) {
                     effects.push({
                         effectKey: `memory:${target.id}:evidence`,
@@ -2184,7 +2201,9 @@ const VERIFICATION_EVENT_OUTCOMES: Record<string, VerificationOutcome> = {
  * flagged outcomes plus the projection verification columns. A fresh
  * `unverified` write stays the absence of events (KTD5), but an `unverified`
  * that withdraws a positive verification records 'stale'; a write that
- * transitions nothing emits no event and no evidence effect.
+ * transitions nothing emits no event and no evidence effect. A first
+ * adoption still emits its upsert (and any lifecycle re-derivation)
+ * independent of the event gate.
  */
 export function updateMemoryVerificationWithClaimsInCurrentTransaction(
     db: Database,
@@ -2202,9 +2221,28 @@ export function updateMemoryVerificationWithClaimsInCurrentTransaction(
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
             return { result: unlinkableResult(row.id), effects: [] };
         }
+        // A first adoption owes the outbox its upsert even when the write
+        // below transitions nothing — committing a new crosswalk with zero
+        // effects would strand it unreconciled.
+        const wasLinked = readMemoryClaimLink(db, row.id) !== null;
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
+        const effects: MemoryClaimEffect[] = [];
+        if (!wasLinked) {
+            effects.push({
+                effectKey: `memory:${row.id}:upsert`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "upsert" as const,
+            });
+        }
+        // The link above can dedup-adopt an archived canonical claim, so the
+        // claim's state re-derives from its live links; the helper no-ops
+        // when the state already matches.
+        effects.push(
+            ...syncClaimLifecycleAfterAdoption(db, row, link, projectId, envelope.producer),
+        );
         const nowMs = input.nowMs ?? Date.now();
         const outcome = VERIFICATION_EVENT_OUTCOMES[input.verificationStatus];
         // Mirror of the module path's transition guard: an event (and its
@@ -2236,21 +2274,20 @@ export function updateMemoryVerificationWithClaimsInCurrentTransaction(
             });
             eventRecorded = true;
         }
+        if (eventRecorded) {
+            effects.push({
+                effectKey: `memory:${row.id}:evidence`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "evidence" as const,
+            });
+        }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         updateMemoryProjectionVerification(db, row.id, input.verificationStatus, nowMs);
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
         return {
             result: { memoryId: row.id, claimId: link.claimId, revisionId: null, found: true },
-            effects: eventRecorded
-                ? [
-                      {
-                          effectKey: `memory:${row.id}:evidence`,
-                          projectId,
-                          claimId: link.claimId,
-                          effectType: "evidence" as const,
-                      },
-                  ]
-                : [],
+            effects,
         };
     });
 }

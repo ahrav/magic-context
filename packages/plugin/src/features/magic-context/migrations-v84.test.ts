@@ -763,6 +763,57 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
         }
     });
 
+    test("outbox ids never fall back below the consumed watermark after a full prune", () => {
+        const db = migratedDb();
+        try {
+            const seed = (key: string, content: string) =>
+                runInMemoryClaimsWriteTransaction(db, () =>
+                    createMemoryWithClaimsInCurrentTransaction(
+                        db,
+                        {
+                            producer: "v84-prune",
+                            operationKey: key,
+                            requestDigest: "d".repeat(64),
+                        },
+                        {
+                            projectPath: "git:v84-prune-reuse",
+                            category: "CONSTRAINTS",
+                            content,
+                            normalizedHash: `hash:${content}`,
+                        },
+                    ),
+                );
+            seed("reuse-seed-1", "reuse seed one");
+            const prunedMax = (
+                db.prepare("SELECT MAX(id) AS max FROM claim_change_outbox").get() as {
+                    max: number;
+                }
+            ).max;
+            db.transaction(() =>
+                pruneClaimChangeLogInCurrentTransaction(db, prunedMax),
+            ).immediate();
+            expect(db.prepare("SELECT COUNT(*) AS count FROM claim_change_outbox").get()).toEqual({
+                count: 0,
+            });
+            // AUTOINCREMENT keeps ids monotonic across the emptied table: a
+            // reused id would sit at or below the durable consumed watermark,
+            // so the consumer's cursor would skip it and the prune trigger
+            // would let it be deleted unconsumed.
+            seed("reuse-seed-2", "reuse seed two");
+            const newIds = (
+                db.prepare("SELECT id FROM claim_change_outbox ORDER BY id").all() as Array<{
+                    id: number;
+                }>
+            ).map((row) => row.id);
+            expect(newIds.length).toBeGreaterThan(0);
+            for (const id of newIds) {
+                expect(id).toBeGreaterThan(prunedMax);
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("a zero-effect operation envelope refuses deletion even with the prune capability held", () => {
         const db = migratedDb();
         try {

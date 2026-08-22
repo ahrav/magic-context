@@ -1324,6 +1324,41 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         ).toBe(0);
     });
 
+    test("a no-op verification write adopting an unlinked boundary row still emits its first-adoption upsert", () => {
+        const db = track(v82DatabaseWithRows(["boundary verify fact"]));
+        const memoryId = (db.prepare("SELECT id FROM memories LIMIT 1").get() as { id: number }).id;
+        expect(readMemoryClaimLink(db, memoryId)).toBeNull();
+
+        // unverified → unverified transitions nothing, but the adoption
+        // below creates the claim and crosswalk inside this operation — a
+        // commit with zero outbox rows would leave the crosswalk
+        // permanently unreconciled.
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("verify-boundary-noop", { id: memoryId }),
+                { memoryId, verificationStatus: "unverified", nowMs: 8_000 },
+            ),
+        );
+
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(readMemoryClaimLink(db, memoryId)?.claimId).toBe(outcome.result.claimId as number);
+        expect(count(db, "verification_events")).toBe(0);
+        expect(
+            db
+                .prepare(
+                    `SELECT effect_key AS effectKey, effect_type AS effectType
+                       FROM claim_change_outbox
+                      WHERE operation_id = (
+                          SELECT id FROM claim_operations WHERE operation_key = 'verify-boundary-noop')`,
+                )
+                .all(),
+        ).toEqual([{ effectKey: `memory:${memoryId}:upsert`, effectType: "upsert" }]);
+        expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([
+            "pending v22 identity work",
+        ]);
+    });
+
     test("ephemeral zero-effect envelopes persist nothing; effect-bearing ones insert normally", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "ephemeral-seed", "ephemeral fact");
@@ -1875,6 +1910,104 @@ describe("memory/claims kernel: canonical claim reuse", () => {
                 "claim_change_outbox",
                 `effect_key = 'memory:${memoryId}:lifecycle'
                  AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'update-revive-update')`,
+            ),
+        ).toBe(1);
+    });
+
+    test("a classification update adopting an unlinked row onto an archived canonical reactivates the claim", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "classify-revive-seed", "classify revive fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("classify-revive-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+
+        // Adoptable but unlinked row on the archived canonical's (category, hash).
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT, "classify revive fact", "hash:classify revive fact")
+                    .lastInsertRowid,
+            );
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryClassificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("classify-revive-update", { id: memoryId }),
+                { memoryId, importance: 90 },
+            ),
+        );
+
+        expect(outcome.result.claimId).toBe(seeded.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "active",
+        });
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${memoryId}:lifecycle'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'classify-revive-update')`,
+            ),
+        ).toBe(1);
+    });
+
+    test("an ordinary supersession target that dedup-adopts an archived canonical reactivates the target claim", () => {
+        const db = track(migratedDb());
+        const source = createSeedMemory(db, "supersede-revive-source", "supersede revive source");
+        const seeded = createSeedMemory(db, "supersede-revive-seed", "supersede revive fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("supersede-revive-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+
+        // An unlinked active twin of the deleted row: the supersession target
+        // whose adoption dedups onto the archived canonical claim.
+        let targetId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            targetId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT, "supersede revive fact", "hash:supersede revive fact")
+                    .lastInsertRowid,
+            );
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("supersede-revive-1", { id: source.memoryId }),
+                { memoryId: source.memoryId, supersededByMemoryId: targetId },
+            ),
+        );
+
+        expect(outcome.result.supersededByClaimId).toBe(seeded.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "active",
+        });
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${targetId}:lifecycle'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'supersede-revive-1')`,
             ),
         ).toBe(1);
     });
