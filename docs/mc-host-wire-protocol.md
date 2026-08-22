@@ -144,7 +144,9 @@ Lifecycle state is derived from lock ownership plus this evidence, never from PI
 | held | `running` record and publication with the same daemon ID | `running` |
 | held | `running` record with a missing or daemon-ID-mismatched publication | `wedged` |
 | held | fresh `stopping` record, with or without a predecessor's leftover publication | `stopping` |
-| held | missing, corrupt, insecure, or expired evidence | `wedged` |
+| held | missing, corrupt, insecure, or expired *record*, or a corrupt or insecure *publication* (any phase) | `wedged` |
+
+A missing publication is `wedged` only under a `running` record (the row above); `starting` and `stopping` require no publication at all.
 
 A publication whose daemon ID differs from the record's is crash residue during `starting` and `stopping`: a killed incarnation leaves its publication behind, and its successor writes a `starting` record before its own publication overwrites the file (symmetrically, an incarnation that fails before publishing demotes to `stopping` without ever owning the leftover). Only the `running` claim requires the publication to match the record; the freshness windows still age a hung start or stop to `wedged`.
 

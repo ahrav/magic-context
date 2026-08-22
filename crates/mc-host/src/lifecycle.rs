@@ -504,7 +504,14 @@ fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
     info.validate_wire_version(subc_protocol::PROTOCOL_VERSION)
         .ok()?;
     let endpoint = info.endpoints.first()?;
-    if endpoint.host != "127.0.0.1" || endpoint.port == 0 || info.daemon_ver.is_empty() {
+    // `validate()` accepts any key of at least the minimum length; this
+    // profile and its clients (protocol §4.1) require exactly KEY_LEN bytes,
+    // so a longer key is a publication no conforming client would accept.
+    if endpoint.host != "127.0.0.1"
+        || endpoint.port == 0
+        || info.daemon_ver.is_empty()
+        || info.key.len() != subc_transport::KEY_LEN
+    {
         return None;
     }
     Some(PublicationSummary {
