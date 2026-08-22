@@ -839,7 +839,7 @@ Every scenario has one required outcome. These are review vectors; executable fi
 
 ### 14.1 Downstream fixture oracle
 
-Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V44 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
+Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V47 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
 
 ## 15. Consumer traceability
 
@@ -860,7 +860,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 | --- | --- | --- |
 | R1 single normative owner | 1, 17 | AE1-AE13 |
 | R2 terms, authority, verified/private distinction | 1-3, 18 | AE1, AE4, AE7 |
-| R3 byte/JSON examples and scenario tables | 4-7, 13-14 | AE1-AE13, V1-V44 |
+| R3 byte/JSON examples and scenario tables | 4-7, 13-14 | AE1-AE13, V1-V47 |
 | R4 no executable fixtures/implementation | 1, 17 | AE1-AE13 |
 | R5 discovery schema/endpoints | 4.1 | AE1, AE7, V1-V4 |
 | R6 publication/cleanup/redaction | 4.2, 12 | AE7, AE13, V5-V7, V24 |
