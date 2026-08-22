@@ -1677,6 +1677,64 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             updateMemoryProjectionClassification(db, row.id, projectionUpdate, input.nowMs);
             hitMemoryClaimFailpoint("memory-claim.020.projection.after");
+            // The classification write can repair the very reason the
+            // preimage was unadoptable (an invalid importance / scope /
+            // shareable given a valid replacement), so the repaired postimage
+            // adopts inside the same operation; committing the projection
+            // alone would strand a now-adoptable row unlinked.
+            const post = readMemoryProjectionRow(db, row.id);
+            if (
+                post &&
+                projectId !== null &&
+                memoryClaimAdoptionFailureReason(post, projectId) === null
+            ) {
+                const link = ensureMemoryClaimLinkInCurrentTransaction(
+                    db,
+                    post,
+                    projectId,
+                    liveProvenance(envelope, post.source_session_id),
+                );
+                const effects: MemoryClaimEffect[] = [
+                    {
+                        effectKey: `memory:${row.id}:upsert`,
+                        projectId,
+                        claimId: link.claimId,
+                        effectType: "upsert" as const,
+                    },
+                    ...syncClaimLifecycleAfterAdoption(
+                        db,
+                        post,
+                        link,
+                        projectId,
+                        envelope.producer,
+                    ),
+                ];
+                // Adoption reads the projection's verified columns and side
+                // table, so the adopted claim's current revision needs its
+                // own verified event when the row is positively verified.
+                if (memoryRowHasPositiveVerification(db, post)) {
+                    addVerificationEvent(db, {
+                        revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                        outcome: "verified",
+                        verifier: envelope.producer,
+                    });
+                    effects.push({
+                        effectKey: `memory:${row.id}:evidence`,
+                        projectId,
+                        claimId: link.claimId,
+                        effectType: "evidence" as const,
+                    });
+                }
+                return {
+                    result: {
+                        memoryId: row.id,
+                        claimId: link.claimId,
+                        revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                        found: true,
+                    },
+                    effects,
+                };
+            }
             return { result: unlinkableResult(row.id), effects: [] };
         }
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
@@ -1911,6 +1969,14 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                     effects: [],
                 };
             }
+            // The ensure calls below can create the claim and crosswalk rows
+            // inside this operation, and a first adoption owes the outbox its
+            // upsert effect — committing a crosswalk without one would strand
+            // it unreconciled (the both-endpoints-unlinked exact-hash shape
+            // otherwise commits with zero effects: the target dedup-adopts
+            // onto the source's new claim, the recorder suppresses the
+            // same-claim edge, and the live sibling keeps the claim active).
+            const sourceWasLinked = readMemoryClaimLink(db, row.id) !== null;
             const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
                 kind: "migration",
             });
@@ -1920,6 +1986,14 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
             );
 
             const effects: MemoryClaimEffect[] = [...relationshipEffects];
+            if (!sourceWasLinked) {
+                effects.push({
+                    effectKey: `memory:${row.id}:upsert`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "upsert" as const,
+                });
+            }
             let supersededByClaimId: number | null = null;
             const target = readMemoryProjectionRow(db, input.supersededByMemoryId);
             const targetProjectId = target
@@ -1930,6 +2004,7 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                 targetProjectId !== null &&
                 memoryClaimAdoptionFailureReason(target, targetProjectId) === null
             ) {
+                const targetWasLinked = readMemoryClaimLink(db, target.id) !== null;
                 const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
                     db,
                     target,
@@ -1937,6 +2012,14 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
                     { kind: "migration" },
                 );
                 supersededByClaimId = targetLink.claimId;
+                if (!targetWasLinked) {
+                    effects.push({
+                        effectKey: `memory:${target.id}:upsert`,
+                        projectId: targetProjectId,
+                        claimId: targetLink.claimId,
+                        effectType: "upsert" as const,
+                    });
+                }
                 if (recordMemoryClaimSupersessionInCurrentTransaction(db, link, targetLink)) {
                     effects.push({
                         effectKey: `memory:${target.id}:evidence`,

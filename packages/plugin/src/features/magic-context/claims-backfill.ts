@@ -650,12 +650,21 @@ export function adoptBoundaryMemoryRowInCurrentTransaction(
                     effectType: "lifecycle" as const,
                 });
             }
-            recordAdoptedMemoryVerifiedEventInCurrentTransaction(
-                db,
-                row,
-                link.claimId,
-                CLAIMS_BACKFILL_PRODUCER,
-            );
+            if (
+                recordAdoptedMemoryVerifiedEventInCurrentTransaction(
+                    db,
+                    row,
+                    link.claimId,
+                    CLAIMS_BACKFILL_PRODUCER,
+                )
+            ) {
+                effects.push({
+                    effectKey: `memory:${row.id}:evidence`,
+                    projectId: adoptProjectId,
+                    claimId: link.claimId,
+                    effectType: "evidence" as const,
+                });
+            }
             return {
                 result: { memoryId: row.id, claimId: link.claimId },
                 effects,

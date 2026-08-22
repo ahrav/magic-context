@@ -28,6 +28,7 @@ import {
     computeClaimRequestDigest,
     parseMemoryClaimMergedFrom,
     runInMemoryClaimsWriteTransaction,
+    supersedeMemoryWithClaimsInCurrentTransaction,
 } from "./memory/storage-memory-claims";
 import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
 import { runMigrations } from "./migrations";
@@ -1121,6 +1122,14 @@ describe("claims backfill lazy preimage adoption effects", () => {
                 )
                 .get(),
         ).toEqual({ count: 1 });
+        // The verified event travels with a matching evidence effect in the
+        // adopting operation's outbox; the mapped-only row emits none.
+        const verifiedKeys = operationOutbox(db, `row:${ids[0]}`).map((row) => row.effectKey);
+        expect(verifiedKeys).toContain(`memory:${ids[0]}:evidence`);
+        expect(expectedEffectCount(db, `row:${ids[0]}`)).toBe(verifiedKeys.length);
+        const mappedOnlyKeys = operationOutbox(db, `row:${ids[1]}`).map((row) => row.effectKey);
+        expect(mappedOnlyKeys).toEqual([`memory:${ids[1]}:upsert`]);
+        expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
     });
 });
 
@@ -1259,5 +1268,47 @@ describe("claims backfill dedup adoption lifecycle", () => {
         expect(status.mode).toBe("eager");
         expect(status.state).toBe("complete");
         expect(inspectClaimsBackfillReconciliation(fixture.db).problems).toEqual([]);
+    });
+
+    test("a supersede that adopts both unlinked exact-hash endpoints emits their adoption upserts and reconciles", () => {
+        const { db, ids } = migrateLazyWithRekeyedAlias([
+            { content: "shared fact", hash: "hash:shared" },
+            {
+                projectPath: "dir:/rekeyed-checkout",
+                content: "shared fact",
+                hash: "hash:shared",
+            },
+        ]);
+        const [sourceId, targetId] = ids;
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            supersedeMemoryWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "kernel-test",
+                    operationKey: "both-unlinked-supersede-1",
+                    requestDigest: computeClaimRequestDigest({ id: sourceId }),
+                },
+                { memoryId: sourceId, supersededByMemoryId: targetId },
+            ),
+        );
+
+        // The target dedup-adopts onto the source's newly created claim: no
+        // supersession edge, no lifecycle change — but each first adoption
+        // still owes the outbox its upsert effect.
+        expect(outcome.result.claimId).toBe(outcome.result.supersededByClaimId as number);
+        expect(linkedClaimState(db, sourceId).claimId).toBe(linkedClaimState(db, targetId).claimId);
+        const outbox = db
+            .prepare(
+                `SELECT effect_key AS effectKey, effect_type AS effectType FROM claim_change_outbox
+                  WHERE operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'both-unlinked-supersede-1')
+                  ORDER BY effect_key`,
+            )
+            .all() as Array<{ effectKey: string; effectType: string }>;
+        expect(outbox).toEqual([
+            { effectKey: `memory:${sourceId}:upsert`, effectType: "upsert" },
+            { effectKey: `memory:${targetId}:upsert`, effectType: "upsert" },
+        ]);
+        expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([]);
     });
 });

@@ -403,6 +403,88 @@ describe("memory/claims kernel: content and classification updates", () => {
         ).toEqual({ disposition: "resolved" });
     });
 
+    test("a classification update that repairs an invalid-importance row adopts the repaired postimage in the same operation", () => {
+        const db = track(migratedDb());
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash, importance,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', 'repairable classification', 'hash:repairable classification', 0, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT).lastInsertRowid,
+            );
+            // Pre-v84 TypeScript verification: positive verified_at lives only
+            // in memory_verifications; the projection columns stay unverified.
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/compat.ts', 123, 100)`,
+            ).run(memoryId);
+        });
+        // A prior claims-aware write records the blocking invalid-importance failure.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("repair-importance-0", { id: memoryId }),
+                { memoryId, status: "active" },
+            ),
+        );
+        expect(
+            db
+                .prepare(
+                    "SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(memoryId)),
+        ).toEqual({ reason_code: "invalid-importance", disposition: "blocking" });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryClassificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("repair-importance-1", { id: memoryId }),
+                { memoryId, importance: 50 },
+            ),
+        );
+
+        // The repaired postimage links inside the same operation: real claim
+        // and revision ids, an upsert effect, and the failure resolves.
+        expect(outcome.result.claimId).not.toBeNull();
+        expect(outcome.result.revisionId).not.toBeNull();
+        expect(readMemoryClaimLink(db, memoryId)?.claimId).toBe(outcome.result.claimId as number);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memoryId);
+        expect(claim?.content).toBe("repairable classification");
+        expect(claim?.importance).toBe(50);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'upsert' AND effect_key = 'memory:${memoryId}:upsert'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'repair-importance-1')`,
+            ),
+        ).toBe(1);
+        expect(
+            db
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(String(memoryId)),
+        ).toEqual({ disposition: "resolved" });
+        // The side-table verification carries onto the adopted claim as one
+        // verified event with a matching evidence effect.
+        expect(
+            db
+                .prepare("SELECT outcome, verifier FROM verification_events WHERE revision_id = ?")
+                .all(outcome.result.revisionId),
+        ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'evidence' AND effect_key = 'memory:${memoryId}:evidence'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'repair-importance-1')`,
+            ),
+        ).toBe(1);
+    });
+
     test("a classification-only change appends a same-content revision with new metadata; a seen-count bump touches only memory_stats", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "classify-seed", "classified fact");
@@ -1781,8 +1863,10 @@ describe("memory/claims kernel: relationship and session-attribution effects", (
         ).toBeTrue();
         expect(keys).toContain(`memory:${memoryId}:lifecycle`);
         expect(keys).toContain(`memory:${target.memoryId}:evidence`);
-        expect(outbox).toHaveLength(3);
-        expect(expectedEffectCount(db, "supersede-lineage-1")).toBe(3);
+        // The unlinked source's first adoption owes the outbox its upsert.
+        expect(keys).toContain(`memory:${memoryId}:upsert`);
+        expect(outbox).toHaveLength(4);
+        expect(expectedEffectCount(db, "supersede-lineage-1")).toBe(4);
     });
 
     test("a module delta adopting its supersession target carries the target's side-table verification", () => {
