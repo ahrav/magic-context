@@ -22,6 +22,13 @@ import {
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
+import {
+    decideMemoryPolicy,
+    filterMemoriesByPolicy,
+    hasClaimEffectivePolicy,
+    type MemoryPolicySurface,
+    readMemoryPolicyRows,
+} from "./memory/storage-claim-visibility";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
@@ -193,6 +200,7 @@ export interface UnifiedSearchOptions {
     /** `candidateDepth` sets the per-lane candidate count; `limit` controls
      *  returned results. */
     candidateDepth?: number;
+    memoryPolicySurface?: "auto_search" | "explicit_search";
 }
 
 export interface MemorySearchResult {
@@ -203,6 +211,7 @@ export interface MemorySearchResult {
     category: string;
     matchType: "semantic" | "fts" | "hybrid";
     sourceName?: string;
+    policyLabel?: string;
 }
 
 export interface MessageSearchResult {
@@ -784,6 +793,7 @@ async function searchMemories(args: {
     /** The unified filter span; the lane's first span depends on it so the
      *  causal chain includes filter and workspace-resolution cost. */
     filterSpanId?: number | null;
+    policySurface: MemoryPolicySurface;
 }): Promise<{ results: MemorySearchResult[]; laneSpanId: number | null }> {
     if (!args.memoryEnabled) {
         return { results: [], laneSpanId: null };
@@ -796,7 +806,7 @@ async function searchMemories(args: {
             parent: rootSpanId,
             dependsOn: args.filterSpanId != null ? [args.filterSpanId] : [],
         }) ?? null;
-    const memories = args.workspace?.isWorkspaced
+    const loaded = args.workspace?.isWorkspaced
         ? getMemoriesByProjects(
               args.db,
               args.workspace.expandedIdentities,
@@ -806,6 +816,10 @@ async function searchMemories(args: {
               args.workspace.shareCategories,
           )
         : getMemoriesByProject(args.db, args.projectPath);
+    // Policy eligibility applies before candidate limits and scoring, so an
+    // ineligible row never consumes a result slot.
+    const policyFilter = filterMemoriesByPolicy(args.db, loaded, args.policySurface);
+    const memories = policyFilter.memories;
     hydrationSpan?.end("ok", { rows: memories.length });
     if (memories.length === 0) {
         return { results: [], laneSpanId: hydrationSpan?.id ?? null };
@@ -907,9 +921,21 @@ async function searchMemories(args: {
         // identity only, not an executed lane bound).
         effectiveK: args.candidateLimit ?? args.limit,
     });
+    // Policy recheck before results leave the lane: a transition committed
+    // during scoring must not publish newly hidden content.
+    const recheckRows = readMemoryPolicyRows(
+        args.db,
+        merged.map((result) => result.memoryId),
+    );
+    const rechecked: MemorySearchResult[] = [];
+    for (const result of merged) {
+        const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);
+        if (!decision.eligible && hasClaimEffectivePolicy(args.db)) continue;
+        rechecked.push(decision.label ? { ...result, policyLabel: decision.label } : result);
+    }
     // The lane's terminal span: the unified fusion span depends on it so
     // critical-path analysis can follow the memory lane.
-    return { results: merged, laneSpanId: topKSpan?.id ?? null };
+    return { results: rechecked, laneSpanId: topKSpan?.id ?? null };
 }
 
 /** Linear decay message scoring.
@@ -1970,8 +1996,11 @@ export function resolveMemoriesByIdsForSearch(args: {
         ownIdentities: workspace.isWorkspaced ? workspace.ownIdentities : undefined,
         shareCategories: workspace.isWorkspaced ? workspace.shareCategories : null,
     });
+    // Direct-ID lookup routes through the same explicit-surface decision as
+    // text search: hard-hidden rows return uniform absence.
+    const policyFilter = filterMemoriesByPolicy(args.db, fetched, "explicit_search");
     const ordered: Memory[] = [];
-    for (const memory of fetched) {
+    for (const memory of policyFilter.memories) {
         if (args.visibleMemoryIds?.has(memory.id)) continue;
         ordered.push(memory);
         if (ordered.length >= args.limit) break;
@@ -1979,7 +2008,7 @@ export function resolveMemoriesByIdsForSearch(args: {
     if (ordered.length === 0) {
         return null;
     }
-    return memoriesToIdLookupResults({
+    const results = memoriesToIdLookupResults({
         memories: ordered,
         limit: args.limit,
         sourceNameByMemoryId: sourceNamesForSearchMemories({
@@ -1987,6 +2016,10 @@ export function resolveMemoriesByIdsForSearch(args: {
             projectPath: args.projectPath,
             workspace,
         }),
+    });
+    return results.map((result) => {
+        const label = policyFilter.labels.get(result.memoryId);
+        return label ? { ...result, policyLabel: label } : result;
     });
 }
 
@@ -2394,6 +2427,7 @@ async function executeUnifiedSearch(args: {
                   rootSpanId: rootId,
                   semanticGateSpanId: semanticDeps.length > 0 ? semanticDeps[0] : null,
                   filterSpanId: workspaceSpan?.id ?? filterSpan?.id ?? null,
+                  policySurface: options.memoryPolicySurface ?? "explicit_search",
               })
             : Promise.resolve({
                   results: [] as MemorySearchResult[],

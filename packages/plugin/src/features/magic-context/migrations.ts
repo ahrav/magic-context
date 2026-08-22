@@ -17,6 +17,13 @@ import {
     seedApplicabilityBaselines,
 } from "./storage-claim-applicability-schema";
 import {
+    assertClaimPolicySchemaForeignKeys,
+    CLAIM_POLICY_SEED_META_KEYS,
+    CLAIM_POLICY_TABLES,
+    createClaimPolicySchema,
+    missingClaimPolicySchemaObjects,
+} from "./storage-claim-policy-schema";
+import {
     assertClaimsSchemaForeignKeys,
     CLAIMS_AND_EVIDENCE_TABLES,
     createClaimsAndEvidenceSchema,
@@ -2487,6 +2494,8 @@ export const MIGRATIONS: Migration[] = [
             // connection must not inherit permission to write module-owned rows.
             const memoriesPresent = tableExists(db, "memories");
             const notesPresent = tableExists(db, "notes");
+            // SAFETY: the cast only exposes optional driver methods; typeof
+            // checks determine availability before any use.
             const native = db as unknown as {
                 function?: unknown;
                 createFunction?: unknown;
@@ -3359,6 +3368,104 @@ export const MIGRATIONS: Migration[] = [
             createClaimApplicabilitySchema(db);
             seedApplicabilityBaselines(db, Date.now());
             assertClaimApplicabilitySchemaForeignKeys(db);
+        },
+    },
+    {
+        version: 86,
+        description:
+            "claim trust policy: revision policy subjects, maturity ledger, dispositions, approvals, enforcement artifacts, and the effective-policy projection",
+        up(db: Database): void {
+            // A replayed v86 must no-op over its own published schema, but a
+            // partial shape (tables without the view, indexes, or guard
+            // triggers) is refused instead of skipped or overwritten.
+            if (tableExists(db, "claim_revision_policy_subjects")) {
+                const missing = CLAIM_POLICY_TABLES.filter((table) => !tableExists(db, table));
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v86 replay guard: claim_revision_policy_subjects exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                const missingObjects = missingClaimPolicySchemaObjects(db);
+                if (missingObjects.length > 0) {
+                    throw new Error(
+                        `v86 replay guard: policy tables exist but ${missingObjects.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                return;
+            }
+            createClaimPolicySchema(db);
+
+            // Sparse legacy databases that never ran v22 lack the meta table.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS schema_migrations_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            `);
+            const writeMeta = db.prepare(
+                `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            );
+            // Record the deterministic seed boundary and fail-closed pending
+            // phase (KTD11, R28) BEFORE any reconciliation: missing policy
+            // rows read as CANDIDATE / unknown / automatic-hidden by contract.
+            const corpus = db
+                .prepare(
+                    "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS boundary FROM claim_revisions",
+                )
+                .get() as { count: number; boundary: number };
+            writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.boundaryRevisionId, String(corpus.boundary));
+            writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.expectedCount, String(corpus.count));
+            writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.cursor, "0");
+            if (corpus.count === 0) {
+                // An empty corpus completes synchronously in the migration.
+                const watermark = tableExists(db, "claim_change_outbox")
+                    ? ((
+                          db
+                              .prepare("SELECT COALESCE(MAX(id), 0) AS id FROM claim_change_outbox")
+                              .get() as { id: number }
+                      ).id ?? 0)
+                    : 0;
+                writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.phase, "complete");
+                writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.completionWatermark, String(watermark));
+                writeMeta.run(
+                    CLAIM_POLICY_SEED_META_KEYS.seededCounts,
+                    JSON.stringify({ CANDIDATE: 0, CORROBORATED: 0, VERIFIED: 0 }),
+                );
+            } else {
+                writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.phase, "pending");
+            }
+
+            // Pre-v86 automatic context was assembled without a policy gate:
+            // invalidate derived project-memory blocks and sticky auto-search
+            // decisions instead of grandfathering unverified content (R28).
+            if (tableExists(db, "project_state")) {
+                db.exec("UPDATE project_state SET project_memory_epoch = project_memory_epoch + 1");
+            }
+            if (tableExists(db, "session_meta")) {
+                const columns = new Set(
+                    (
+                        db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
+                            name: string;
+                        }>
+                    ).map((column) => column.name),
+                );
+                const resets: string[] = [];
+                if (columns.has("cached_m0_bytes")) resets.push("cached_m0_bytes = NULL");
+                if (columns.has("cached_m1_bytes")) resets.push("cached_m1_bytes = NULL");
+                if (columns.has("cached_m0_project_memory_epoch")) {
+                    resets.push("cached_m0_project_memory_epoch = NULL");
+                }
+                if (columns.has("auto_search_hint_decisions")) {
+                    resets.push("auto_search_hint_decisions = '[]'");
+                }
+                if (resets.length > 0) {
+                    // Interpolation is a compile-time column allowlist, not caller input.
+                    // pi-lens-ignore: sql-injection
+                    db.exec(`UPDATE session_meta SET ${resets.join(", ")}`);
+                }
+            }
+            assertClaimPolicySchemaForeignKeys(db);
         },
     },
 ];

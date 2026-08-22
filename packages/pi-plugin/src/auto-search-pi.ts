@@ -123,6 +123,7 @@ async function unifiedSearchWithTimeout(
 				// Auto hints are plugin-internal surfacing, not explicit agent
 				// retrievals; match OpenCode lines 69-73 and search.ts lines 77-84.
 				countRetrievals: false,
+				memoryPolicySurface: "auto_search",
 			}),
 			timeoutPromise,
 		]);

@@ -6,6 +6,11 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { inspectClaimsBackfillReconciliation } from "../claims-backfill";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import {
+    appendMaturityAssertionInCurrentTransaction,
+    recordApprovalActionInCurrentTransaction,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "./storage-claim-policy";
 import { sha256Utf8Hex } from "./storage-claims";
 import {
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
@@ -3480,5 +3485,201 @@ describe("memory/claims kernel: removal-path first-adoption announcements", () =
             { effectKey: `memory:${rawId}:evidence`, effectType: "evidence" },
             { effectKey: `memory:${rawId}:upsert`, effectType: "upsert" },
         ]);
+    });
+});
+
+describe("memory/claims kernel: claim trust policy companions", () => {
+    function policySubject(db: Database, revisionId: number): Record<string, unknown> | null {
+        return (
+            (db
+                .prepare(
+                    `SELECT claim_kind AS claimKind, origin_taint AS originTaint,
+                            origin_observation_id AS originObservationId
+                     FROM claim_revision_policy_subjects WHERE revision_id = ?`,
+                )
+                .get(revisionId) as Record<string, unknown> | undefined) ?? null
+        );
+    }
+
+    function effectivePolicy(db: Database, revisionId: number): Record<string, unknown> | null {
+        return (
+            (db
+                .prepare(
+                    `SELECT effective_maturity AS maturity, origin_taint AS taint,
+                            auto_eligible AS auto, explicit_eligible AS explicit
+                     FROM claim_effective_policy WHERE revision_id = ?`,
+                )
+                .get(revisionId) as Record<string, unknown> | undefined) ?? null
+        );
+    }
+
+    function createUserMemory(
+        db: Database,
+        key: string,
+        content: string,
+    ): { memoryId: number; claimId: number; revisionId: number } {
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            createMemoryWithClaimsInCurrentTransaction(db, envelope(key, { key, content }), {
+                projectPath: PROJECT,
+                category: "CONSTRAINTS",
+                content,
+                normalizedHash: `hash:${content}`,
+                importance: 60,
+                sourceSessionId: "ses-kernel",
+                sourceType: "user",
+                nowMs: 1_000,
+            }),
+        );
+        return {
+            memoryId: outcome.result.memoryId,
+            claimId: outcome.result.claimId as number,
+            revisionId: outcome.result.revisionId as number,
+        };
+    }
+
+    test("every new revision receives a frozen policy subject and effective projection", () => {
+        const db = track(migratedDb());
+        const agentSeed = createSeedMemory(db, "pol-agent", "agent-authored fact");
+        expect(policySubject(db, agentSeed.revisionId)).toEqual({
+            claimKind: "unknown",
+            originTaint: "ASSISTANT_INFERENCE",
+            originObservationId: expect.any(Number),
+        });
+        expect(effectivePolicy(db, agentSeed.revisionId)).toEqual({
+            maturity: "CANDIDATE",
+            taint: "ASSISTANT_INFERENCE",
+            auto: 0,
+            explicit: 1,
+        });
+
+        const userSeed = createUserMemory(db, "pol-user", "user-authored preference");
+        expect(policySubject(db, userSeed.revisionId)).toMatchObject({
+            originTaint: "USER_EXPLICIT",
+        });
+        expect(effectivePolicy(db, userSeed.revisionId)).toEqual({
+            maturity: "VERIFIED",
+            taint: "USER_EXPLICIT",
+            auto: 1,
+            explicit: 1,
+        });
+    });
+
+    test("a model rewrite of a user memory does not inherit explicit-user trust", () => {
+        const db = track(migratedDb());
+        const seed = createUserMemory(db, "pol-rewrite", "original user text");
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-rewrite-2", { next: true }),
+                {
+                    memoryId: seed.memoryId,
+                    content: "model-authored replacement",
+                    normalizedHash: "hash:model-authored replacement",
+                    nowMs: 2_000,
+                },
+            ),
+        );
+        const successorId = outcome.result.revisionId as number;
+        expect(successorId).not.toBe(seed.revisionId);
+        expect(policySubject(db, successorId)).toMatchObject({
+            originTaint: "ASSISTANT_INFERENCE",
+        });
+        expect(effectivePolicy(db, successorId)).toMatchObject({
+            maturity: "CANDIDATE",
+            auto: 0,
+        });
+        // The original revision keeps its own frozen subject and history.
+        expect(policySubject(db, seed.revisionId)).toMatchObject({
+            originTaint: "USER_EXPLICIT",
+        });
+    });
+
+    test("a trusted verification promotes the current revision to effective VERIFIED", () => {
+        const db = track(migratedDb());
+        const seed = createSeedMemory(db, "pol-verify", "verifiable fact");
+        expect(effectivePolicy(db, seed.revisionId)).toMatchObject({
+            maturity: "CANDIDATE",
+            auto: 0,
+        });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-verify-2", { status: "verified" }),
+                { memoryId: seed.memoryId, verificationStatus: "verified", nowMs: 2_000 },
+            ),
+        );
+        expect(effectivePolicy(db, seed.revisionId)).toMatchObject({
+            maturity: "VERIFIED",
+            auto: 1,
+        });
+        expect(count(db, "claim_maturity_assertions", "maturity = 'VERIFIED'")).toBe(1);
+    });
+
+    test("a content successor never inherits approval from its predecessor", () => {
+        const db = track(migratedDb());
+        const seed = createUserMemory(db, "pol-approve", "approved directive");
+        const projectId = readMemoryClaimLink(db, seed.memoryId)?.projectId as number;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            const approval = recordApprovalActionInCurrentTransaction(db, {
+                revisionId: seed.revisionId,
+                projectId,
+                action: "approve",
+                host: "opencode",
+                sessionId: "ses-kernel",
+                userCommandEvent: "evt-approve",
+                commandIdentity: "cmd-pol-approve",
+                confirmationNonce: "nonce",
+            });
+            appendMaturityAssertionInCurrentTransaction(db, {
+                revisionId: seed.revisionId,
+                projectId,
+                maturity: "APPROVED",
+                actor: "user-command",
+                approvalActionId: approval.actionId,
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, seed.revisionId);
+            return undefined;
+        });
+        expect(effectivePolicy(db, seed.revisionId)).toMatchObject({ maturity: "APPROVED" });
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-approve-2", { next: true }),
+                {
+                    memoryId: seed.memoryId,
+                    content: "edited directive",
+                    normalizedHash: "hash:edited directive",
+                    nowMs: 3_000,
+                },
+            ),
+        );
+        const successorId = outcome.result.revisionId as number;
+        expect(effectivePolicy(db, successorId)).toMatchObject({
+            maturity: "CANDIDATE",
+            auto: 0,
+        });
+        expect(count(db, "claim_approval_actions", `revision_id = ${successorId}`)).toBe(0);
+    });
+
+    test("classification-only changes leave the original revision's maturity unchanged", () => {
+        const db = track(migratedDb());
+        const seed = createSeedMemory(db, "pol-classify", "classified fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryClassificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-classify-2", { importance: 90 }),
+                { memoryId: seed.memoryId, importance: 90, nowMs: 2_000 },
+            ),
+        );
+        const heads = db
+            .prepare(
+                `SELECT stream.revision_id AS revisionId, head.maturity AS maturity
+                 FROM claim_maturity_heads head
+                 JOIN claim_maturity_streams stream ON stream.id = head.stream_id
+                 ORDER BY stream.revision_id`,
+            )
+            .all() as Array<{ revisionId: number; maturity: string }>;
+        const original = heads.find((row) => row.revisionId === seed.revisionId);
+        expect(original?.maturity).toBe("CANDIDATE");
     });
 });

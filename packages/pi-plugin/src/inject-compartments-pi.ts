@@ -25,6 +25,7 @@
  *     historyRefreshSessions signal.
  */
 
+import { filterMemoriesByPolicy } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
@@ -1180,18 +1181,22 @@ export function renderM0Pi(
 		workspaceOverride ?? resolveWorkspaceRenderContextPi(state, db);
 	const allMemories =
 		memoriesOverride ??
-		(memPath
-			? workspace.isWorkspaced
-				? getMemoriesByProjects(
-						db,
-						workspace.expandedIdentities,
-						["active", "permanent"],
-						Date.now(),
-						workspace.ownIdentities,
-						workspace.shareCategories,
-					)
-				: getMemoriesByProject(db, memPath, ["active", "permanent"])
-			: []);
+		filterMemoriesByPolicy(
+			db,
+			memPath
+				? workspace.isWorkspaced
+					? getMemoriesByProjects(
+							db,
+							workspace.expandedIdentities,
+							["active", "permanent"],
+							Date.now(),
+							workspace.ownIdentities,
+							workspace.shareCategories,
+						)
+					: getMemoriesByProject(db, memPath, ["active", "permanent"])
+				: [],
+			"auto_inject",
+		).memories;
 	// Use the V2 trim + render helpers (shared with OpenCode) so both harnesses
 	// emit the same category-grouped `#id: fact` bytes and use the same
 	// permanent-first / importance-DESC selection. A divergent shape here would
@@ -1360,23 +1365,27 @@ function readFrozenM0InputsPi(
 	const read = db.transaction(() => {
 		const workspace = resolveWorkspaceRenderContextPi(state, db);
 		const compartments = getRenderableCompartmentsPi(db, state);
-		const memories = memPath
-			? workspace.isWorkspaced
-				? getMemoriesByProjects(
-						db,
-						workspace.expandedIdentities,
-						["active", "permanent"],
-						memoryCutoff,
-						workspace.ownIdentities,
-						workspace.shareCategories,
-					)
-				: getMemoriesByProject(
-						db,
-						memPath,
-						["active", "permanent"],
-						memoryCutoff,
-					)
-			: [];
+		const memories = filterMemoriesByPolicy(
+			db,
+			memPath
+				? workspace.isWorkspaced
+					? getMemoriesByProjects(
+							db,
+							workspace.expandedIdentities,
+							["active", "permanent"],
+							memoryCutoff,
+							workspace.ownIdentities,
+							workspace.shareCategories,
+						)
+					: getMemoriesByProject(
+							db,
+							memPath,
+							["active", "permanent"],
+							memoryCutoff,
+						)
+				: [],
+			"auto_inject",
+		).memories;
 		const userProfile = safeGetActiveUserMemoriesPi(db);
 		const projectState = memPath ? getProjectState(db, memPath) : undefined;
 		const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
@@ -1842,23 +1851,27 @@ function renderM1PiWithMetadata(
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
 
 	const memPath = memoryProjectPath(state);
-	const eligibleMemories = memPath
-		? workspace.isWorkspaced
-			? getMemoriesByProjects(
-					db,
-					workspace.expandedIdentities,
-					["active", "permanent"],
-					markers.materializedAt,
-					workspace.ownIdentities,
-					workspace.shareCategories,
-				)
-			: getMemoriesByProject(
-					db,
-					memPath,
-					["active", "permanent"],
-					markers.materializedAt,
-				)
-		: [];
+	const eligibleMemories = filterMemoriesByPolicy(
+		db,
+		memPath
+			? workspace.isWorkspaced
+				? getMemoriesByProjects(
+						db,
+						workspace.expandedIdentities,
+						["active", "permanent"],
+						markers.materializedAt,
+						workspace.ownIdentities,
+						workspace.shareCategories,
+					)
+				: getMemoriesByProject(
+						db,
+						memPath,
+						["active", "permanent"],
+						markers.materializedAt,
+					)
+			: [],
+		"auto_inject",
+	).memories;
 	const eligibleMemoryIds = new Set(
 		eligibleMemories.map((memory) => memory.id),
 	);

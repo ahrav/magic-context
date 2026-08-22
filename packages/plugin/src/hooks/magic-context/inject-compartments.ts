@@ -10,6 +10,7 @@ import {
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
+import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
@@ -2186,23 +2187,27 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // empty so renderSessionHistoryWithDecay never emits a <session_facts>
         // block and no stale pre-v2 rows leak into m[0].
         facts = [];
-        memories = projectPath
-            ? workspace.isWorkspaced
-                ? getMemoriesByProjects(
-                      options.db,
-                      workspace.expandedIdentities,
-                      ["active", "permanent"],
-                      foldMaterializedAt,
-                      workspace.ownIdentities,
-                      workspace.shareCategories,
-                  )
-                : getMemoriesByProject(
-                      options.db,
-                      projectPath,
-                      ["active", "permanent"],
-                      foldMaterializedAt,
-                  )
-            : [];
+        memories = filterMemoriesByPolicy(
+            options.db,
+            projectPath
+                ? workspace.isWorkspaced
+                    ? getMemoriesByProjects(
+                          options.db,
+                          workspace.expandedIdentities,
+                          ["active", "permanent"],
+                          foldMaterializedAt,
+                          workspace.ownIdentities,
+                          workspace.shareCategories,
+                      )
+                    : getMemoriesByProject(
+                          options.db,
+                          projectPath,
+                          ["active", "permanent"],
+                          foldMaterializedAt,
+                      )
+                : [],
+            "auto_inject",
+        ).memories;
         userMemories = safeGetActiveUserMemories(options.db);
         options.db.exec("COMMIT");
     } catch (error) {
@@ -2567,23 +2572,27 @@ function renderM1WithMetadata(
         workspaceIdentitySet: options.workspaceIdentitySet,
     });
 
-    const eligibleMemories = options.projectPath
-        ? workspace.isWorkspaced
-            ? getMemoriesByProjects(
-                  options.db,
-                  workspace.expandedIdentities,
-                  ["active", "permanent"],
-                  markers.materializedAt,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMemoriesByProject(
-                  options.db,
-                  options.projectPath,
-                  ["active", "permanent"],
-                  markers.materializedAt,
-              )
-        : [];
+    const eligibleMemories = filterMemoriesByPolicy(
+        options.db,
+        options.projectPath
+            ? workspace.isWorkspaced
+                ? getMemoriesByProjects(
+                      options.db,
+                      workspace.expandedIdentities,
+                      ["active", "permanent"],
+                      markers.materializedAt,
+                      workspace.ownIdentities,
+                      workspace.shareCategories,
+                  )
+                : getMemoriesByProject(
+                      options.db,
+                      options.projectPath,
+                      ["active", "permanent"],
+                      markers.materializedAt,
+                  )
+            : [],
+        "auto_inject",
+    ).memories;
     const eligibleMemoryIds = new Set(eligibleMemories.map((memory) => memory.id));
     const memoryUpdates = renderMemoryUpdatesBlock({
         db: options.db,
@@ -3031,23 +3040,27 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     // Use the SAME frozen cutoff for the baseline memory read as m[1] does, so a
     // memory crossing expires_at between two fallback passes can't shift the m[0]
     // baseline bytes either (live Date.now() default would reintroduce drift).
-    const memories = projectPath
-        ? workspace.isWorkspaced
-            ? getMemoriesByProjects(
-                  options.db,
-                  workspace.expandedIdentities,
-                  ["active", "permanent"],
-                  snapshotMarkers.materializedAt,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMemoriesByProject(
-                  options.db,
-                  projectPath,
-                  ["active", "permanent"],
-                  snapshotMarkers.materializedAt,
-              )
-        : [];
+    const memories = filterMemoriesByPolicy(
+        options.db,
+        projectPath
+            ? workspace.isWorkspaced
+                ? getMemoriesByProjects(
+                      options.db,
+                      workspace.expandedIdentities,
+                      ["active", "permanent"],
+                      snapshotMarkers.materializedAt,
+                      workspace.ownIdentities,
+                      workspace.shareCategories,
+                  )
+                : getMemoriesByProject(
+                      options.db,
+                      projectPath,
+                      ["active", "permanent"],
+                      snapshotMarkers.materializedAt,
+                  )
+            : [],
+        "auto_inject",
+    ).memories;
     const userMemories = safeGetActiveUserMemories(options.db);
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const memoryRenderOptions: MemoryRenderOptions = {

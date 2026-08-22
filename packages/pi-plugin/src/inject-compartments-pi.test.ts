@@ -7,7 +7,7 @@ import { resolveProjectIdentity } from "@magic-context/core/features/magic-conte
 import {
 	archiveMemory,
 	getMemoriesByProject,
-	insertMemory,
+	insertMemory as insertMemoryRaw,
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { runInMemoryClaimsWriteTransaction } from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
@@ -32,6 +32,11 @@ import {
 	renderM1Pi,
 } from "./inject-compartments-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
+
+// Policy reclassification: automatic injection requires effective-VERIFIED
+// rows, so these fixtures use explicit-user origin memories.
+const insertMemory: typeof insertMemoryRaw = (db, input) =>
+	insertMemoryRaw(db, { sourceType: "user", ...input });
 
 function user(text: string, timestamp = 1) {
 	return { role: "user" as const, content: text, timestamp };
@@ -374,7 +379,7 @@ describe("injectM0M1Pi memory feature gate", () => {
 				projectPath: base.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "SECRET project memory must not leak when disabled",
-				sourceType: "historian",
+				sourceType: "user",
 			});
 
 			// memoryEnabled=false → memory suppressed, compartments retained.
@@ -433,7 +438,7 @@ describe("injectM0M1Pi", () => {
 				projectPath: offState.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "compaction-off memory survives",
-				sourceType: "historian",
+				sourceType: "user",
 			});
 			const messages = [
 				userMessage("raw history stays visible", 10),
@@ -1111,7 +1116,7 @@ describe("injectM0M1Pi", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "Large baseline memory. ".repeat(300),
-				sourceType: "historian",
+				sourceType: "user",
 			});
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
@@ -1121,7 +1126,7 @@ describe("injectM0M1Pi", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "New additive memory appears only after a bust.",
-				sourceType: "agent",
+				sourceType: "user",
 			});
 
 			const deferOne = [userMessage("defer one", 11)];
@@ -1164,7 +1169,7 @@ describe("injectM0M1Pi", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "Baseline memory to remove from m0. ".repeat(300),
-				sourceType: "historian",
+				sourceType: "user",
 			});
 			injectM0M1Pi(
 				state,
@@ -1280,7 +1285,7 @@ describe("injectM0M1Pi", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "This memory is too large for a one-token m0 budget.",
-				sourceType: "historian",
+				sourceType: "user",
 			});
 			injectM0M1Pi(
 				state,
@@ -1318,7 +1323,7 @@ describe("injectM0M1Pi", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "Old baseline content.",
-				sourceType: "historian",
+				sourceType: "user",
 			});
 			injectM0M1Pi(
 				state,
@@ -1458,7 +1463,7 @@ describe("injectM0M1Pi", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "Pi docs-hash-only CAS delta memory",
-				sourceType: "agent",
+				sourceType: "user",
 			});
 			let changedDocsMarker = false;
 			db.exec = ((sql: string) => {
@@ -1508,7 +1513,7 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "The widget service owns rendering.",
-				sourceType: "historian",
+				sourceType: "user",
 			});
 
 			const m0 = renderM0Pi(state, db);
@@ -1555,7 +1560,7 @@ describe("renderM0Pi sibling-block layout (OpenCode parity)", () => {
 					projectPath: state.projectIdentity,
 					category: "ARCHITECTURE",
 					content,
-					sourceType: "historian",
+					sourceType: "user",
 				});
 			}
 			const maxId = getMemoriesByProject(db, state.projectIdentity, [

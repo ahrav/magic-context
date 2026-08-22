@@ -34,6 +34,7 @@ import type {
 	MagicContextConfig,
 	SidekickConfig,
 } from "@magic-context/core/config/schema/magic-context";
+import { runClaimPolicySeedStartup } from "@magic-context/core/features/magic-context/claim-policy-backfill-startup";
 import { runClaimsBackfillStartup } from "@magic-context/core/features/magic-context/claims-backfill-startup";
 import {
 	summarizeDreamSchedule,
@@ -102,6 +103,7 @@ import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbac
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
+import { registerCtxApproveCommand } from "./commands/ctx-approve";
 import {
 	type PiSidekickConfig,
 	registerCtxAugCommand,
@@ -111,6 +113,7 @@ import {
 	maybeAutoEmbedPiSession,
 	registerCtxEmbedCommand,
 } from "./commands/ctx-embed";
+import { registerCtxEnforceCommand } from "./commands/ctx-enforce";
 import { registerCtxFlushCommand } from "./commands/ctx-flush";
 import { registerCtxRecompCommand } from "./commands/ctx-recomp";
 import { registerCtxSessionUpgradeCommand } from "./commands/ctx-session-upgrade";
@@ -478,9 +481,13 @@ function scheduleStartupBackfills(
 	db: ContextDatabase,
 	run = runClaimsBackfillStartup,
 ): Promise<unknown> {
-	return run(db, { log: warn }).catch((err) => {
-		warn(`[claims-backfill] background runner failed: ${err}`);
-	});
+	return run(db, { log: warn })
+		.then(() => {
+			runClaimPolicySeedStartup(db, { log: warn });
+		})
+		.catch((err) => {
+			warn(`[claims-backfill] background runner failed: ${err}`);
+		});
 }
 
 function getPiMessageModel(message: unknown): {
@@ -1298,6 +1305,11 @@ async function startPiMagicContextRuntime(
 
 	registerCtxFlushCommand(pi, { db, compactionOff });
 	info("registered /ctx-flush");
+
+	registerCtxApproveCommand(pi, { db, projectDir, projectIdentity });
+	info("registered /ctx-approve");
+	registerCtxEnforceCommand(pi, { db, projectDir, projectIdentity });
+	info("registered /ctx-enforce");
 
 	// /ctx-recomp uses its own PiSubagentRunner instance — recomp can run
 	// concurrently with normal historian, and giving each its own runner

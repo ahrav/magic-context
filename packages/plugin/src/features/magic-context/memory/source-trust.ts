@@ -7,3 +7,11 @@ export function trustClassForLegacyMemorySource(
 ): SourceTrustClass {
     return sourceType === "user" ? "explicit_user" : "model_inference";
 }
+
+/**
+ * Returning `null` prevents model-authored replacement bytes from inheriting
+ * a legacy `user` row's `explicit_user` trust classification.
+ */
+export function liveRewriteSourceType(): string | null {
+    return null;
+}

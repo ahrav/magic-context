@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import { insertMemory } from "../../features/magic-context/memory";
+import { insertMemory, updateMemoryVerification } from "../../features/magic-context/memory";
 import { getCurrentMemoryClaimByLegacyMemoryId } from "../../features/magic-context/memory/storage-memory-claims";
 import { runMigrations } from "../../features/magic-context/migrations";
 import {
@@ -965,6 +965,22 @@ describe("module incremental and paged assembly", () => {
             sourceType: "agent",
         });
         expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(memory.content);
+        // Only policy-eligible automatic rows cross the module boundary, so
+        // the wire fixture verifies its memory to keep it in the mirror.
+        updateMemoryVerification(db, memory.id, "verified");
+        const refreshed = { ...memory, ...{} };
+        const row = db
+            .prepare(
+                "SELECT verification_status AS verificationStatus, verified_at AS verifiedAt, updated_at AS updatedAt FROM memories WHERE id = ?",
+            )
+            .get(memory.id) as {
+            verificationStatus: string;
+            verifiedAt: number | null;
+            updatedAt: number;
+        };
+        refreshed.verificationStatus = row.verificationStatus as typeof memory.verificationStatus;
+        refreshed.verifiedAt = row.verifiedAt;
+        refreshed.updatedAt = row.updatedAt;
 
         const statements: string[] = [];
         const originalPrepare = db.prepare.bind(db);
@@ -1007,13 +1023,13 @@ describe("module incremental and paged assembly", () => {
                 retrieval_count: memory.retrievalCount,
                 first_seen_at: memory.firstSeenAt,
                 created_at: memory.createdAt,
-                updated_at: memory.updatedAt,
+                updated_at: refreshed.updatedAt,
                 last_seen_at: memory.lastSeenAt,
                 last_retrieved_at: memory.lastRetrievedAt,
                 status: memory.status,
                 expires_at: memory.expiresAt,
-                verification_status: memory.verificationStatus,
-                verified_at: memory.verifiedAt,
+                verification_status: refreshed.verificationStatus,
+                verified_at: refreshed.verifiedAt,
                 superseded_by_memory_id: memory.supersededByMemoryId,
                 merged_from: memory.mergedFrom,
                 metadata_json: memory.metadataJson,
@@ -1024,9 +1040,8 @@ describe("module incremental and paged assembly", () => {
             Buffer.from(JSON.stringify(expected)),
         );
         expect(statements.some((sql) => /FROM memories\b/i.test(sql))).toBeTrue();
-        expect(
-            statements.some((sql) => /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql)),
-        ).toBeFalse();
+        expect(statements.some((sql) => /claim_effective_policy/i.test(sql))).toBeTrue();
+        expect(statements.some((sql) => /claim_revisions\.content\b/i.test(sql))).toBeFalse();
     });
 
     it("packs pages linearly and preserves item order under the wire cap", () => {

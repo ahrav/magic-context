@@ -36,3 +36,10 @@ describe("legacy memory source trust mapping (AE4)", () => {
         }
     });
 });
+
+describe("live rewrite source type", () => {
+    test("classifies as model_inference so retained user provenance cannot carry", async () => {
+        const { liveRewriteSourceType } = await import("./source-trust");
+        expect(trustClassForLegacyMemorySource(liveRewriteSourceType())).toBe("model_inference");
+    });
+});

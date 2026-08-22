@@ -79,6 +79,7 @@ async function unifiedSearchWithTimeout(
                 // and counting inflates retrieval_count-based memory
                 // promotion decisions with false-positive signal.
                 countRetrievals: false,
+                memoryPolicySurface: "auto_search",
             }),
             timeoutPromise,
         ]);

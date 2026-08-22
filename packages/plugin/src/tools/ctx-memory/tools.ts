@@ -25,6 +25,7 @@ import {
 } from "../../features/magic-context/memory/embedding";
 import { invalidateMemory } from "../../features/magic-context/memory/embedding-cache";
 import { computeNormalizedHash } from "../../features/magic-context/memory/normalize-hash";
+import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
@@ -145,7 +146,7 @@ function moduleMemoryText(response: unknown, args: CtxMemoryArgs): string | null
     return null;
 }
 
-function formatMemoryList(memories: Memory[]): string {
+function formatMemoryList(memories: Memory[], policyLabels?: Map<number, string>): string {
     if (memories.length === 0) {
         return "No active memories found.";
     }
@@ -155,6 +156,7 @@ function formatMemoryList(memories: Memory[]): string {
         category: memory.category,
         status: memory.status,
         verification: memory.verificationStatus,
+        trust: policyLabels?.get(memory.id) ?? "",
         updated: new Date(memory.updatedAt).toISOString(),
         content: memory.content.replace(/\s+/g, " ").trim(),
     }));
@@ -163,6 +165,7 @@ function formatMemoryList(memories: Memory[]): string {
         category: "CATEGORY",
         status: "STATUS",
         verification: "VERIFY",
+        trust: "TRUST",
         updated: "UPDATED",
         content: "CONTENT",
     };
@@ -223,6 +226,7 @@ const GET_MAX_IDS = 20;
 function formatGetOutput(args: {
     requestedIds: number[];
     memoriesById: Map<number, Memory>;
+    policyLabels?: Map<number, string>;
 }): string {
     const parts: string[] = [];
     for (const id of args.requestedIds) {
@@ -230,7 +234,7 @@ function formatGetOutput(args: {
         if (!memory) {
             parts.push(GET_NOT_VISIBLE_MESSAGE(id));
         } else {
-            parts.push(formatMemoryList([memory]));
+            parts.push(formatMemoryList([memory], args.policyLabels));
         }
     }
     return parts.join("\n\n");
@@ -744,12 +748,16 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 if (args.action === "list") {
                     const limit = normalizeLimit(args.limit);
                     const category = normalizeCategory(args.category);
-                    const memories = filterByCategory(
-                        getMemoriesByProject(deps.db, projectPath),
-                        category,
-                    ).slice(0, limit);
-
-                    return formatMemoryList(memories);
+                    // The explicit-surface decision applies before the limit:
+                    // hard-hidden rows get uniform absence; sub-verified rows
+                    // keep sanitized trust labels.
+                    const policyFiltered = filterMemoriesByPolicy(
+                        deps.db,
+                        filterByCategory(getMemoriesByProject(deps.db, projectPath), category),
+                        "explicit_search",
+                    );
+                    const memories = policyFiltered.memories.slice(0, limit);
+                    return formatMemoryList(memories, policyFiltered.labels);
                 }
 
                 if (args.action === "get") {
@@ -764,14 +772,18 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     // each requested id exactly once and never reflects a row twice.
                     const uniqueIds = [...new Set(getIds)];
                     const fetched = getMemoriesByIds(deps.db, uniqueIds);
+                    const policyFiltered = filterMemoriesByPolicy(
+                        deps.db,
+                        fetched.filter((memory) => memoryVisibleToTool(memory)),
+                        "explicit_search",
+                    );
                     const memoriesById = new Map<number, Memory>(
-                        fetched
-                            .filter((memory) => memoryVisibleToTool(memory))
-                            .map((memory) => [memory.id, memory]),
+                        policyFiltered.memories.map((memory) => [memory.id, memory]),
                     );
                     return formatGetOutput({
                         requestedIds: uniqueIds,
                         memoriesById,
+                        policyLabels: policyFiltered.labels,
                     });
                 }
 

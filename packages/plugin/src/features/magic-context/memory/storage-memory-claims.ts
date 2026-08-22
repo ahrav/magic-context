@@ -24,7 +24,12 @@ import {
     memoryLineagePresentSql,
     memoryRelationshipSourceMatchSql,
 } from "../storage-memory-claims-schema.ts";
-import { trustClassForLegacyMemorySource } from "./source-trust.ts";
+import {
+    automaticLadderSteps,
+    classifyFineTaint,
+    TAINT_CLASSIFIER_METHOD,
+} from "./claim-policy.ts";
+import { liveRewriteSourceType, trustClassForLegacyMemorySource } from "./source-trust.ts";
 import {
     type ApplicabilityPathsInput,
     hasClaimApplicabilitySchema,
@@ -34,8 +39,17 @@ import {
     syncMemoryApplicabilityPathsInCurrentTransaction,
 } from "./storage-claim-applicability.ts";
 import {
+    appendMaturityAssertionInCurrentTransaction,
+    createPolicySubjectInCurrentTransaction,
+    hasClaimPolicySchema,
+    readPolicySubject,
+    readPolicySupport,
+    readRevisionIdentity,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "./storage-claim-policy.ts";
+import {
     addClaimConflictInCurrentTransaction,
-    addVerificationEvent,
+    addVerificationEvent as addVerificationEventRaw,
     appendClaimRevisionInCurrentTransaction,
     ClaimGraphCorruptionError,
     type ClaimState,
@@ -820,6 +834,7 @@ function appendMemoryClaimRevision(
         );
     }
     insertRevisionMemoryMetadata(db, outcome.revisionId, args.metadata);
+    ensureRevisionPolicyInCurrentTransaction(db, outcome.revisionId, args.observationId);
     return outcome.revisionId;
 }
 
@@ -931,6 +946,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
         );
     }
     insertRevisionMemoryMetadata(db, created.revisionId, metadataFromProjectionRow(row));
+    ensureRevisionPolicyInCurrentTransaction(db, created.revisionId, observationId);
     db.prepare(
         `INSERT INTO legacy_memory_claims
             (memory_id, canonical_memory_id, claim_id, project_id, root_observation_id, created_at)
@@ -990,6 +1006,9 @@ export function recordMemoryClaimSupersessionOutcomeInCurrentTransaction(
             leftRevisionId: targetRevisionId,
             rightRevisionId: sourceRevisionId,
         });
+        if (hasClaimPolicySchema(db)) {
+            refreshEffectivePolicyInCurrentTransaction(db, sourceRevisionId);
+        }
         return "recorded";
     }
     const existing = db
@@ -1354,6 +1373,134 @@ export function retireMemoryClaimInCurrentTransaction(
 }
 
 // ---------------------------------------------------------------------------
+// Claim policy companions (trust plan U2: KTD1-KTD4)
+// ---------------------------------------------------------------------------
+
+const MEMORY_POLICY_ACTOR = "reducer:mc-memory-v1";
+
+/**
+ * Recompute the automated maturity ladder and effective projection for one
+ * revision from current authoritative rows (R6-R8, R15). No-op until the
+ * revision has a frozen policy subject: a missing subject stays readable as
+ * conservative unknown (R26).
+ */
+function refreshRevisionMaturityInCurrentTransaction(db: Database, revisionId: number): void {
+    if (!hasClaimPolicySchema(db)) return;
+    const subject = readPolicySubject(db, revisionId);
+    if (!subject) return;
+    const identity = readRevisionIdentity(db, revisionId);
+    if (!identity) return;
+    const support = readPolicySupport(db, revisionId);
+    const transition = {
+        kind: subject.claimKind,
+        originTaint: subject.originTaint,
+        independentGroups: support.independentGroups,
+        verified: support.verified,
+        explicitUserEvidence: support.explicitUserEvidence,
+    };
+    for (const step of automaticLadderSteps(support.historicalMaturity, transition)) {
+        appendMaturityAssertionInCurrentTransaction(db, {
+            revisionId,
+            projectId: identity.projectId,
+            maturity: step,
+            actor: MEMORY_POLICY_ACTOR,
+        });
+    }
+    const before = db
+        .prepare("SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?")
+        .get(revisionId) as { auto: number } | null | undefined;
+    const decision = refreshEffectivePolicyInCurrentTransaction(db, revisionId);
+    const autoAfter = decision.surfaces.auto_inject.eligible ? 1 : 0;
+    if ((before?.auto ?? 0) !== autoAfter) {
+        // Crossing the automatic boundary invalidates every derived
+        // project-memory cache, including the native module mirror, through
+        // the existing epoch rematerialization path.
+        bumpEpochForClaimProjectInCurrentTransaction(db, identity.claimId);
+    }
+}
+
+function bumpEpochForClaimProjectInCurrentTransaction(db: Database, claimId: number): void {
+    if (!tableExists(db, "project_state")) return;
+    const row = db
+        .prepare(
+            `SELECT memories.project_path AS projectPath
+             FROM legacy_memory_claims lmc
+             JOIN memories ON memories.id = lmc.canonical_memory_id
+             WHERE lmc.claim_id = ? LIMIT 1`,
+        )
+        .get(claimId) as { projectPath: string } | null | undefined;
+    if (!row) return;
+    db.prepare(
+        `INSERT INTO project_state
+            (project_path, project_memory_epoch, project_user_profile_version, updated_at)
+         VALUES (?, 1, 0, ?)
+         ON CONFLICT(project_path) DO UPDATE SET
+            project_memory_epoch = project_memory_epoch + 1,
+            updated_at = excluded.updated_at`,
+    ).run(row.projectPath, Date.now());
+}
+
+function tableExists(db: Database, name: string): boolean {
+    return (
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !=
+        null
+    );
+}
+
+/**
+ * Freeze the policy subject for a newly appended revision and run the first
+ * ladder pass (R1, R12): origin taint derives from the origin observation's
+ * host-written trust class and extractor lineage, never from extracted
+ * content or retained memory metadata (R4). Successor revisions never
+ * inherit approval or enforcement because the subject and stream are new.
+ */
+function ensureRevisionPolicyInCurrentTransaction(
+    db: Database,
+    revisionId: number,
+    originObservationId: number | null,
+): void {
+    if (!hasClaimPolicySchema(db)) return;
+    const identity = readRevisionIdentity(db, revisionId);
+    if (!identity) return;
+    let originTaint: ReturnType<typeof classifyFineTaint> = "ASSISTANT_INFERENCE";
+    if (originObservationId != null) {
+        const observation = db
+            .prepare("SELECT source_trust_class AS trust, extractor FROM observations WHERE id = ?")
+            .get(originObservationId) as
+            | { trust: string | null; extractor: string | null }
+            | null
+            | undefined;
+        originTaint = classifyFineTaint({
+            // SAFETY: source_trust_class carries a six-value CHECK constraint
+            // at the database boundary; NULL only for pre-v85 fixtures.
+            sourceTrustClass: (observation?.trust ??
+                "model_inference") as import("../storage-claim-applicability-schema.ts").SourceTrustClass,
+            extractor: observation?.extractor,
+        });
+    }
+    createPolicySubjectInCurrentTransaction(db, {
+        revisionId,
+        projectId: identity.projectId,
+        claimKind: "unknown",
+        originObservationId,
+        originTaint,
+        classificationMethod: TAINT_CLASSIFIER_METHOD,
+    });
+    refreshRevisionMaturityInCurrentTransaction(db, revisionId);
+}
+
+/** Verification writes feed the effective reducer, so every event refreshes
+ * the revision's ladder and projection in the same transaction (R27). */
+function addVerificationEvent(
+    db: Database,
+    args: Parameters<typeof addVerificationEventRaw>[1],
+): ReturnType<typeof addVerificationEventRaw> {
+    const result = addVerificationEventRaw(db, args);
+    refreshRevisionMaturityInCurrentTransaction(db, args.revisionId);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Kernel operations (Mutation Transition Matrix)
 // ---------------------------------------------------------------------------
 
@@ -1625,7 +1772,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                         projectId,
                         memoryId: row.id,
                         content: input.content,
-                        sourceType: post.source_type,
+                        sourceType: liveRewriteSourceType(),
                         provenance: repairProvenance,
                     });
                     appendMemoryClaimRevision(db, {
@@ -1696,7 +1843,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             projectId,
             memoryId: row.id,
             content: input.content,
-            sourceType: row.source_type,
+            sourceType: liveRewriteSourceType(),
             provenance: contentProvenance,
         });
         if (
@@ -3069,7 +3216,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                     projectId,
                     memoryId: post.id,
                     content: post.content,
-                    sourceType: post.source_type,
+                    sourceType: liveRewriteSourceType(),
                     provenance: deltaProvenance,
                 });
                 revisionId = appendMemoryClaimRevision(db, {

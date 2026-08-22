@@ -217,14 +217,14 @@ describe("unifiedSearch", () => {
             "content",
             "matchType",
             "memoryId",
+            "policyLabel",
             "score",
             "source",
             "sourceName",
         ]);
         expect(statements.some((sql) => /\bmemories(?:_fts)?\b/i.test(sql))).toBeTrue();
-        expect(
-            statements.some((sql) => /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql)),
-        ).toBeFalse();
+        expect(statements.some((sql) => /claim_effective_policy/i.test(sql))).toBeTrue();
+        expect(statements.some((sql) => /claim_revisions\.content\b/i.test(sql))).toBeFalse();
     });
 
     it("returns ranked results across memories and messages (no facts)", async () => {

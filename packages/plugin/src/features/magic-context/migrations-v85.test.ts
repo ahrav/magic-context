@@ -163,7 +163,7 @@ describe("migration v85: claim applicability, git anchors, and source trust", ()
                 expect(trust?.notnull).toBe(1);
                 expect(trust?.dflt_value).toBe("'model_inference'");
             }
-            expect(LATEST_MIGRATION_VERSION).toBe(85);
+            expect(LATEST_MIGRATION_VERSION).toBeGreaterThanOrEqual(85);
         } finally {
             closeQuietly(fresh);
             closeQuietly(upgraded);
@@ -175,7 +175,8 @@ describe("migration v85: claim applicability, git anchors, and source trust", ()
         try {
             expect(schemaVersionIsSupported(db, 83)).toBeFalse();
             expect(schemaVersionIsSupported(db, 84)).toBeFalse();
-            expect(schemaVersionIsSupported(db, 85)).toBeTrue();
+            expect(schemaVersionIsSupported(db, 85)).toBeFalse();
+            expect(schemaVersionIsSupported(db, LATEST_MIGRATION_VERSION)).toBeTrue();
         } finally {
             closeQuietly(db);
         }
@@ -646,7 +647,7 @@ describe("migration v85: claim applicability, git anchors, and source trust", ()
     test("a replayed v85 no-ops over its published schema; a partial schema refuses", () => {
         const db = migratedDb();
         try {
-            db.prepare("DELETE FROM schema_migrations WHERE version = 85").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version >= 85").run();
             runMigrations(db);
             expect(
                 db
@@ -654,7 +655,7 @@ describe("migration v85: claim applicability, git anchors, and source trust", ()
                     .get(),
             ).toEqual({ count: 1 });
 
-            db.prepare("DELETE FROM schema_migrations WHERE version = 85").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version >= 85").run();
             db.exec("DROP TABLE claim_revision_applicability_symbols");
             expect(() => runMigrations(db)).toThrow(/v85 replay guard/);
         } finally {
@@ -666,7 +667,7 @@ describe("migration v85: claim applicability, git anchors, and source trust", ()
         const db = migratedDb();
         try {
             expect(missingClaimApplicabilitySchemaObjects(db)).toEqual([]);
-            db.prepare("DELETE FROM schema_migrations WHERE version = 85").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version >= 85").run();
             db.exec("DROP TRIGGER claim_applicability_assertions_time_guard");
             expect(() => runMigrations(db)).toThrow(
                 /v85 replay guard: applicability tables exist but trigger claim_applicability_assertions_time_guard missing/,

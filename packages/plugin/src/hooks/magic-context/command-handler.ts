@@ -10,6 +10,10 @@ import {
     isCanonicalDreamTask,
 } from "../../features/magic-context/dreamer/task-registry";
 import type { ManualRunResult } from "../../features/magic-context/dreamer/task-scheduler";
+import {
+    executeClaimApprovalCommand,
+    executeClaimEnforceCommand,
+} from "../../features/magic-context/memory/claim-policy-commands";
 import { runSidekick } from "../../features/magic-context/sidekick/agent";
 import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import type { PluginContext } from "../../plugin/types";
@@ -562,6 +566,8 @@ export function createMagicContextCommandHandler(deps: {
     transformMode?: ResolvedTransformMode;
     rustModeModuleClient?: RustModeModuleClient;
     projectRoot?: string;
+    /** Active project identity as stored in `memories.project_path`. */
+    projectPath?: string;
     sidekick?: {
         config: SidekickConfig;
         projectPath: string;
@@ -606,6 +612,8 @@ export function createMagicContextCommandHandler(deps: {
     const isDreamCommand = (command: string): boolean => command === "ctx-dream";
     const isSessionUpgradeCommand = (command: string): boolean => command === "ctx-session-upgrade";
     const isEmbedCommand = (command: string): boolean => command === "ctx-embed";
+    const isApproveCommand = (command: string): boolean => command === "ctx-approve";
+    const isEnforceCommand = (command: string): boolean => command === "ctx-enforce";
     const rustMode = deps.transformMode === "rust" && deps.rustModeModuleClient;
     const callRust = async (
         method: Parameters<RustModeModuleClient["call"]>[0]["method"],
@@ -638,6 +646,8 @@ export function createMagicContextCommandHandler(deps: {
             const isDream = isDreamCommand(input.command);
             const isSessionUpgrade = isSessionUpgradeCommand(input.command);
             const isEmbed = isEmbedCommand(input.command);
+            const isApprove = isApproveCommand(input.command);
+            const isEnforce = isEnforceCommand(input.command);
 
             if (
                 !isStatus &&
@@ -647,13 +657,44 @@ export function createMagicContextCommandHandler(deps: {
                 !isAug &&
                 !isDream &&
                 !isSessionUpgrade &&
-                !isEmbed
+                !isEmbed &&
+                !isApprove &&
+                !isEnforce
             ) {
                 return;
             }
 
             const sessionId = input.sessionID;
             let result = "";
+
+            if (isApprove || isEnforce) {
+                if (!deps.projectPath || !deps.projectRoot) {
+                    result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Unavailable\n\nNo active project is configured for this session.`;
+                } else if (isSubagentSession(deps.db, sessionId)) {
+                    result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Refused\n\nApproval commands are user-only and unavailable to subagent sessions.`;
+                } else {
+                    const commandDeps = {
+                        db: deps.db,
+                        projectPath: deps.projectPath,
+                        projectRoot: deps.projectRoot,
+                        host: "opencode" as const,
+                        sessionId,
+                    };
+                    try {
+                        result = isApprove
+                            ? executeClaimApprovalCommand(commandDeps, input.arguments).text
+                            : executeClaimEnforceCommand(commandDeps, input.arguments).text;
+                    } catch (error) {
+                        result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Failed\n\n${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+                await deps.sendNotification(sessionId, result, {});
+                sessionLog(
+                    sessionId,
+                    `command ${input.command} handled via command.execute.before`,
+                );
+                throwSentinel(input.command);
+            }
 
             if (deps.compactionOff && (isFlush || isRecomp || isWrapup)) {
                 const command = `/${input.command}`;

@@ -1411,6 +1411,7 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
         projectRoot: deps.directory,
+        projectPath,
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         getLiveModelKey: (sessionId) => {
             // Use DB fallback so /ctx-status shows the correct model-specific

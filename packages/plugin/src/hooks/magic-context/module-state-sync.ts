@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 
 import type { Compartment } from "../../features/magic-context/compartment-storage";
+import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     buildWorkspaceMemorySqlFilter,
     getMaxMemoryIdForProjects,
@@ -1459,7 +1460,14 @@ export async function buildModuleStateSyncPayload(args: {
                   workspace.shareCategories,
               )
             : [];
-    const memoryRows = args.force ? allMemories : incrementalMemories;
+    // The module mirror is a host-computed snapshot: only policy-eligible
+    // automatic rows cross the boundary, so the native memory lane can never
+    // serve content the policy hides. Rust stays free of policy derivation.
+    const memoryRows = filterMemoriesByPolicy(
+        args.pass.db,
+        args.force ? allMemories : incrementalMemories,
+        "auto_inject",
+    ).memories;
     const memories = memoryRows.map((memory) => ({
         id: memory.id,
         project_path: memory.projectPath,

@@ -10,6 +10,7 @@ import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
+import { runClaimPolicySeedStartup } from "./features/magic-context/claim-policy-backfill-startup";
 import { runClaimsBackfillStartup } from "./features/magic-context/claims-backfill-startup";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
@@ -276,9 +277,13 @@ const server: Plugin = async (ctx) => {
             const db = openDatabase();
             if (db && isDatabasePersisted(db)) {
                 scheduleAfterBootQuiet(() => {
-                    runClaimsBackfillStartup(db).catch((err) => {
-                        log(`[claims-backfill] background runner failed: ${err}`);
-                    });
+                    runClaimsBackfillStartup(db)
+                        .then(() => {
+                            runClaimPolicySeedStartup(db);
+                        })
+                        .catch((err) => {
+                            log(`[claims-backfill] background runner failed: ${err}`);
+                        });
                 });
             }
         } catch (err) {
