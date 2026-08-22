@@ -275,10 +275,14 @@ fn retain_lock_until_drained<H: McHostHandler>(shared: Arc<HostShared<H>>, guard
 /// the guard anyway would release the fence while handler code still runs,
 /// and the lock dies with the process regardless.
 fn retain_lock_until_stopped<H: McHostHandler, T: Send + 'static>(
-    guard: InstanceGuard,
+    mut guard: InstanceGuard,
     handler: Arc<H>,
     task: tokio_util::task::AbortOnDropHandle<T>,
 ) {
+    // Teardown is underway: demote the phase so probes report `stopping`
+    // (not `starting`) for however long the unbounded drain below runs
+    // (protocol §12: every teardown path demotes before cleanup).
+    guard.begin_stopping();
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
             let _ = task.await;
@@ -331,6 +335,12 @@ impl<H: McHostHandler> PrePublicationCleanup<H> {
     }
 
     async fn finish(mut self) {
+        // Every `finish` is a teardown: demote the phase before the drain so
+        // probes report `stopping` rather than a stale `starting` that would
+        // expire to `wedged` under a slow handler shutdown (protocol §12).
+        if let Some(guard) = self.guard.as_mut() {
+            guard.begin_stopping();
+        }
         self.shutdown = Some(spawn_handler_shutdown(
             self.handler.take().expect("armed startup cleanup"),
         ));
@@ -350,9 +360,12 @@ impl<H: McHostHandler> PrePublicationCleanup<H> {
 
 impl<H: McHostHandler> Drop for PrePublicationCleanup<H> {
     fn drop(&mut self) {
-        let Some(guard) = self.guard.take() else {
+        let Some(mut guard) = self.guard.take() else {
             return;
         };
+        // Unwind is a teardown too: same demote-before-drain rule as
+        // `finish`.
+        guard.begin_stopping();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let shutdown = self.shutdown.take().unwrap_or_else(|| {
                 spawn_handler_shutdown(self.handler.take().expect("armed startup cleanup"))

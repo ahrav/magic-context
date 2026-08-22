@@ -1548,11 +1548,23 @@ async fn shutdown_after_commit_reports_success_again() {
         .control(&serde_json::json!({"op": "host.shutdown"}))
         .await
         .expect("second shutdown");
+    // Both requests are admitted before the commit, but their per-request
+    // tasks race for latch ownership, so the responses can arrive in either
+    // order; collect by correlation instead of assuming wire order.
+    // Whichever attempt commits, the other settles through the
+    // already-committed branch without a second commit.
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let mut settled: std::collections::HashMap<u64, raw_client::RawFrame> =
+        std::collections::HashMap::new();
+    while settled.len() < 2 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = client.frame_within(remaining).await.expect("settled");
+        if frame.ty != TY_PING && (frame.corr == first || frame.corr == second) {
+            settled.insert(frame.corr, frame);
+        }
+    }
     for corr in [first, second] {
-        let (_skipped, response) = client
-            .frames_until_corr(corr, BUDGET)
-            .await
-            .expect("settled");
+        let response = settled.get(&corr).expect("both correlations settle");
         assert_eq!(response.ty, TY_RESPONSE);
         assert_eq!(response.json()["op"], "host.shutdown");
     }
