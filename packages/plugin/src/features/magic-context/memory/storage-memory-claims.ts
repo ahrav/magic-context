@@ -504,6 +504,32 @@ export function memoryClaimAdoptionFailureReason(
     return memoryClaimMetadataFailureReason(row);
 }
 
+/**
+ * SQL twin of `memoryClaimAdoptionFailureReason` over a `memories` row
+ * aliased as `alias`: true exactly when the TS gate returns null. Project
+ * resolvability mirrors `resolveMemoryClaimProjectInCurrentTransaction` — a
+ * registered alias or a canonical-shape path that registers on demand. NULL
+ * in any non-nullable column fails its comparison (NULL is not true),
+ * matching the TS typeof checks; `source_session_id` is the one nullable
+ * pass-through, and NULL `importance` passes like the TS null check.
+ */
+export function memoryClaimAdoptableSql(alias: string): string {
+    return `(
+        (EXISTS (SELECT 1 FROM project_aliases WHERE alias_identity = ${alias}.project_path)
+            OR ${canonicalMemoryProjectPathSql(`${alias}.project_path`)})
+        AND ${alias}.content <> ''
+        AND ${alias}.category <> ''
+        AND ${alias}.normalized_hash <> ''
+        AND (${alias}.importance IS NULL
+            OR (CAST(${alias}.importance AS INTEGER) = ${alias}.importance
+                AND ${alias}.importance BETWEEN 1 AND 100))
+        AND ${alias}.scope IN ('project', 'ecosystem', 'universe')
+        AND ${alias}.shareable IN (0, 1)
+        AND (${alias}.source_session_id IS NULL OR ${alias}.source_session_id <> '')
+        AND ${alias}.source_type <> ''
+    )`;
+}
+
 export function recordMemoryClaimLinkFailure(
     db: Database,
     memoryId: number,
@@ -1421,20 +1447,19 @@ export interface UpdateMemoryContentClaimInput {
 }
 
 /**
- * Same positivity rule as claims-backfill's
- * `recordAdoptedMemoryVerifiedEventInCurrentTransaction`: a row counts as
- * verified when the projection columns say so or the `memory_verifications`
- * side table carries a positive `verified_at` (the only place pre-v84
- * TypeScript verification writes). An explicit projection revocation
- * outranks stale side-table timestamps: 'stale'/'flagged' only exist as
- * explicit writes, and revocation keeps `verified_at`, so 'unverified' with
- * a positive `verified_at` is the withdrawn shape — the side-table fallback
- * applies only to the untouched projection ('unverified' with no
- * `verified_at`). Duplicated locally because importing claims-backfill here
- * would form a runtime import cycle and break this module's explicit-`.ts`
- * import contract for the Node SQLite smoke script.
+ * Positive-verification truth for one projection row, shared with
+ * claims-backfill's `recordAdoptedMemoryVerifiedEventInCurrentTransaction`
+ * (claims-backfill imports from this module; the reverse direction would
+ * form a runtime import cycle): a row counts as verified when the projection
+ * columns say so or the `memory_verifications` side table carries a positive
+ * `verified_at` (the only place pre-v84 TypeScript verification writes). An
+ * explicit projection revocation outranks stale side-table timestamps:
+ * 'stale'/'flagged' only exist as explicit writes, and revocation keeps
+ * `verified_at`, so 'unverified' with a positive `verified_at` is the
+ * withdrawn shape — the side-table fallback applies only to the untouched
+ * projection ('unverified' with no `verified_at`).
  */
-function memoryRowHasPositiveVerification(
+export function memoryRowHasPositiveVerification(
     db: Database,
     row: Pick<MemoryProjectionRow, "id" | "verification_status" | "verified_at">,
 ): boolean {
@@ -2189,15 +2214,23 @@ export function supersedeMemoryWithClaimsInCurrentTransaction(
             // adoption: an unlinked hash-equal target dedup-adopts onto this
             // same claim, and that live sibling must keep the claim active
             // (the recorder above already returns "same-claim" for the pair,
-            // so no self-supersession edge exists either).
-            if (!claimHasOtherLiveMemoryLink(db, link.claimId, row.id)) {
+            // so no self-supersession edge exists either). Retirement routes
+            // through the shared retire helper so the archive verification
+            // event lands with the state change, matching the delete and
+            // status kernels; the already-archived guard covers a source that
+            // dedup-adopted a claim archived by a prior delete, where a
+            // re-archive would duplicate the event.
+            if (
+                !claimHasOtherLiveMemoryLink(db, link.claimId, row.id) &&
+                readCurrentClaimSemanticState(db, link.claimId).state !== "archived"
+            ) {
                 effects.push({
                     effectKey: `memory:${row.id}:lifecycle`,
                     projectId,
                     claimId: link.claimId,
                     effectType: "lifecycle" as const,
                 });
-                setClaimLifecycleStateInCurrentTransaction(db, link.claimId, "archived");
+                retireMemoryClaimInCurrentTransaction(db, link.claimId, envelope.producer);
             }
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             setMemoryProjectionSuperseded(db, row.id, input.supersededByMemoryId, input.nowMs);

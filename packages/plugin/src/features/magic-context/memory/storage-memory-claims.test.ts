@@ -1127,6 +1127,15 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(source.claimId)).toEqual({
             state: "archived",
         });
+        // The last-live-link retirement routes through the shared retire
+        // helper, so the archive verification event lands with the state
+        // change like every other retirement path — and exactly once, with no
+        // duplicate from the supersession's own evidence recording.
+        expect(
+            db
+                .prepare("SELECT outcome, verifier FROM verification_events WHERE revision_id = ?")
+                .all(source.revisionId),
+        ).toEqual([{ outcome: "archive", verifier: "kernel-test" }]);
         expect(
             db
                 .prepare("SELECT status, superseded_by_memory_id FROM memories WHERE id = ?")

@@ -40,9 +40,11 @@ import {
     listMemoryRelationshipSources,
     type MemoryClaimEffect,
     type MemoryClaimLink,
+    memoryClaimAdoptableSql,
     memoryClaimAdoptionFailureReason,
     memoryClaimMetadataFailureReason,
     memoryClaimSupersessionExists,
+    memoryRowHasPositiveVerification,
     parseMemoryClaimMergedFrom,
     readCurrentClaimSemanticState,
     readMemoryClaimLink,
@@ -431,9 +433,13 @@ function countFailures(
     );
 }
 
-/** Rows-phase failures whose memory has since acquired its crosswalk link,
- *  or whose memories row no longer exists — a deleted row can never link, so
- *  its failure is terminal (rows-phase keys are the bare memory id). */
+/** Rows-phase failures whose memory has since acquired its crosswalk link
+ *  AND projects an adoptable row again — a linked row's later claim-invalid
+ *  mutation (an emptied projection, an invalid scope) keeps its blocker
+ *  until repaired, because the link alone leaves the projection diverged
+ *  from its claim — or whose memories row no longer exists: a deleted row
+ *  can never link, so its failure is terminal (rows-phase keys are the bare
+ *  memory id). */
 function sweepResolvedRowFailures(db: Database): void {
     db.prepare(
         `UPDATE claim_backfill_failures SET disposition = 'resolved', updated_at = ?
@@ -441,7 +447,10 @@ function sweepResolvedRowFailures(db: Database): void {
             AND (
                 EXISTS (
                     SELECT 1 FROM legacy_memory_claims
-                     WHERE memory_id = CAST(claim_backfill_failures.item_key AS INTEGER)
+                      JOIN memories m ON m.id = legacy_memory_claims.memory_id
+                     WHERE legacy_memory_claims.memory_id
+                             = CAST(claim_backfill_failures.item_key AS INTEGER)
+                       AND ${memoryClaimAdoptableSql("m")}
                 )
                 OR NOT EXISTS (
                     SELECT 1 FROM memories
@@ -563,13 +572,16 @@ export function readMemorySideTableVerifiedAt(db: Database, memoryId: number): n
 
 /**
  * Carry a memory's verified status onto its adopted claim as one
- * current-revision verified event. A row counts as verified when either the
- * projection columns say so or the `memory_verifications` side table carries
- * a positive `verified_at` (the only place pre-v84 TypeScript verification
- * writes). Mapped-only rows (no positive `verified_at` anywhere) record
- * nothing. Shared by the boundary backfill, relocation, and identity-merge
- * adoption sites; returns true when an event was recorded so callers can
- * emit a matching evidence effect.
+ * current-revision verified event. Positivity is
+ * `memoryRowHasPositiveVerification`: the projection columns say verified,
+ * or the `memory_verifications` side table carries a positive `verified_at`
+ * (the only place pre-v84 TypeScript verification writes) — with explicit
+ * projection revocations ('stale'/'flagged', or 'unverified' keeping a
+ * positive `verified_at`) outranking stale side-table timestamps.
+ * Mapped-only rows (no positive `verified_at` anywhere) record nothing.
+ * Shared by the boundary backfill, relocation, and identity-merge adoption
+ * sites; returns true when an event was recorded so callers can emit a
+ * matching evidence effect.
  */
 export function recordAdoptedMemoryVerifiedEventInCurrentTransaction(
     db: Database,
@@ -577,9 +589,7 @@ export function recordAdoptedMemoryVerifiedEventInCurrentTransaction(
     claimId: number,
     verifier: string,
 ): boolean {
-    const projectionVerified =
-        row.verification_status === "verified" && row.verified_at !== null && row.verified_at > 0;
-    if (!projectionVerified && readMemorySideTableVerifiedAt(db, row.id) <= 0) {
+    if (!memoryRowHasPositiveVerification(db, row)) {
         return false;
     }
     addVerificationEvent(db, {

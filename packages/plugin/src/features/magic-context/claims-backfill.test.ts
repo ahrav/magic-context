@@ -1056,7 +1056,7 @@ describe("claims backfill lazy preimage adoption effects", () => {
         expect(expectedEffectCount(db, "lazy-adopt-lineage-1")).toBe(keys.length);
     });
 
-    test("a module delta that empties a boundary row still emits the preimage adoption upsert and reconciles", async () => {
+    test("a module delta that empties a boundary row emits the preimage adoption upsert and keeps its blocker until repaired", async () => {
         const { db, ids } = migrateLazy([{ content: "boundary emptied row" }]);
 
         // The preimage is adoptable, the emptied postimage is not; the
@@ -1086,11 +1086,43 @@ describe("claims backfill lazy preimage adoption effects", () => {
         expect(outbox.map((row) => row.effectKey)).toContain(`memory:${ids[0]}:upsert`);
         expect(expectedEffectCount(db, "lazy-adopt-empty-1")).toBe(outbox.length);
 
-        // The backfill sweep resolves the empty-content diagnostic (the row
-        // is linked), and the adoption's outbox effect satisfies the
-        // crosswalk reconciliation check.
+        // The crosswalk alone does not resolve the empty-content diagnostic:
+        // the emptied projection still diverges from its claim, so the sweep
+        // keeps the blocker and the backfill blocks on it.
+        const blocked = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(blocked.status).toBe("blocked");
+        expect(
+            listClaimsBackfillFailures(db, { dispositions: ["blocking"] }).map(
+                (failure) => failure.reasonCode,
+            ),
+        ).toEqual(["empty-content"]);
+
+        // Real content lands, so the projection is adoptable again: the
+        // sweep resolves the diagnostic and the backfill completes.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            const outcome = applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "kernel-test",
+                    operationKey: "lazy-adopt-empty-2",
+                    requestDigest: computeClaimRequestDigest({ key: "lazy-adopt-empty-2" }),
+                },
+                {
+                    memoryId: ids[0],
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET content = 'repaired row', normalized_hash = 'hash:repaired' WHERE id = ?",
+                        ).run(ids[0]);
+                    },
+                },
+            );
+            expect(outcome.result.claimId).not.toBeNull();
+        });
         const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
         expect(summary.status).toBe("complete");
+        expect(
+            listClaimsBackfillFailures(db, { dispositions: ["blocking", "retry"] }),
+        ).toHaveLength(0);
         expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
     });
 
@@ -1129,6 +1161,53 @@ describe("claims backfill lazy preimage adoption effects", () => {
         expect(expectedEffectCount(db, `row:${ids[0]}`)).toBe(verifiedKeys.length);
         const mappedOnlyKeys = operationOutbox(db, `row:${ids[1]}`).map((row) => row.effectKey);
         expect(mappedOnlyKeys).toEqual([`memory:${ids[1]}:upsert`]);
+        expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
+    });
+
+    test("boundary adoption records no verified event for an explicitly revoked row with a stale side-table timestamp", () => {
+        const { db, ids } = migrateLazy([
+            {
+                content: "revoked stale row",
+                hash: "revoked-stale",
+                verificationStatus: "stale",
+                mappedFile: "src/stale.ts",
+            },
+            {
+                content: "withdrawn row",
+                hash: "withdrawn",
+                verificationStatus: "unverified",
+                verifiedAt: 4700,
+                mappedFile: "src/withdrawn.ts",
+            },
+        ]);
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memory_verifications SET verified_at = 4600 WHERE memory_id IN (?, ?)",
+            ).run(ids[0], ids[1]);
+        });
+
+        runInMemoryClaimsWriteTransaction(db, () => {
+            for (const id of ids) {
+                const row = readMemoryProjectionRow(db, id);
+                if (!row) throw new Error(`missing boundary memory ${id}`);
+                expect(adoptBoundaryMemoryRowInCurrentTransaction(db, row)).toBeTrue();
+            }
+        });
+
+        // An explicit projection revocation ('stale', or 'unverified' keeping
+        // a positive verified_at) outranks the stale side-table timestamp, so
+        // neither adoption carries a verified event or evidence effect.
+        expect(
+            db
+                .prepare(
+                    "SELECT COUNT(*) AS count FROM verification_events WHERE outcome = 'verified'",
+                )
+                .get(),
+        ).toEqual({ count: 0 });
+        for (const id of ids) {
+            const keys = operationOutbox(db, `row:${id}`).map((row) => row.effectKey);
+            expect(keys).toEqual([`memory:${id}:upsert`]);
+        }
         expect(inspectClaimsBackfillReconciliation(db).ok).toBeTrue();
     });
 });
