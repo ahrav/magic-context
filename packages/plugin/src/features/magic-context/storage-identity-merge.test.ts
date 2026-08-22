@@ -1047,6 +1047,123 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ count: 1 });
     });
 
+    test("a collision merge ignores a revoked source's stale side-table timestamp", () => {
+        const database = makeDb();
+        const sourceId = insertMemory(database, "git:source", "shared fact", "shared-h1");
+        const targetId = insertMemory(database, "git:target", "shared fact", "shared-h1");
+        // Explicit revocation on the source plus a stale positive side-table
+        // row: the funnel's side-table fallback must honor the revocation.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "UPDATE memories SET verification_status = 'stale', verified_at = 123 WHERE id = ?",
+                )
+                .run(sourceId);
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 100, 100)`,
+                )
+                .run(sourceId);
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        expect(
+            database
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(targetId),
+        ).toEqual({ status: "unverified", at: null });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .get(survivorClaim?.claimId ?? 0),
+        ).toEqual({ count: 0 });
+    });
+
+    test("a collision merge honors the target's own revocation over its stale side-table timestamp", () => {
+        const database = makeDb();
+        insertMemory(database, "git:source", "shared fact", "shared-h1");
+        const targetId = insertMemory(database, "git:target", "shared fact", "shared-h1");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "UPDATE memories SET verification_status = 'flagged', verified_at = 99 WHERE id = ?",
+                )
+                .run(targetId);
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 77, 100)`,
+                )
+                .run(targetId);
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        // The revoked target keeps its own status and records no event.
+        expect(
+            database
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(targetId),
+        ).toEqual({ status: "flagged", at: 99 });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .get(survivorClaim?.claimId ?? 0),
+        ).toEqual({ count: 0 });
+    });
+
+    test("a collision merge with a withdrawn source (unverified keeping verified_at) records nothing", () => {
+        const database = makeDb();
+        const sourceId = insertMemory(database, "git:source", "shared fact", "shared-h1");
+        const targetId = insertMemory(database, "git:target", "shared fact", "shared-h1");
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    "UPDATE memories SET verification_status = 'unverified', verified_at = 123 WHERE id = ?",
+                )
+                .run(sourceId);
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 100, 100)`,
+                )
+                .run(sourceId);
+        });
+
+        mergeProjectIdentities(database, "git:source", "git:target", { now: 60 });
+
+        expect(
+            database
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(targetId),
+        ).toEqual({ status: "unverified", at: null });
+        const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .get(survivorClaim?.claimId ?? 0),
+        ).toEqual({ count: 0 });
+    });
+
     test("a non-collision merge carries a side-table-only verified unlinked row onto its claim with evidence", () => {
         const database = makeDb();
         const rowId = insertMemory(database, "dir:old", "legacy verified fact", "legacy-v1");

@@ -1528,8 +1528,21 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
         // The verdict-driven clear owns the side-table delete inside this
         // transaction; the carry gates below are suppressed with it because
         // the projection's verified columns describe the rejected content.
+        // The projection columns reset to the untouched 'unverified' + NULL
+        // shape ("never verified") in the same transaction: leaving them
+        // 'verified' would keep compat readers reporting verified and let a
+        // later non-clearing edit's carry re-record verification for content
+        // the verdict rejected, while the untouched shape still lets a
+        // future legitimate verify carry.
         if (input.clearsVerification) {
             db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(row.id);
+            db.prepare(
+                `UPDATE memories
+                    SET verification_status = 'unverified', verified_at = NULL, updated_at = ?
+                  WHERE id = ?`,
+            ).run(input.nowMs ?? Date.now(), row.id);
+            row.verification_status = "unverified";
+            row.verified_at = null;
         }
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);

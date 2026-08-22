@@ -756,6 +756,75 @@ describe("memory/claims kernel: content and classification updates", () => {
         expect(after.claim_revisions).toBe(before.claim_revisions);
         expect(after.claim_change_outbox).toBe(before.claim_change_outbox);
     });
+
+    test("a clearsVerification rewrite resets the projection to never-verified and blocks a later carry", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "clears-verification-seed", "rejected fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("clears-verification-verify", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId, verificationStatus: "verified", nowMs: 2_000 },
+            ),
+        );
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/compat.ts', 2000, 100)`,
+            ).run(seeded.memoryId);
+        });
+
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("clears-verification-rewrite", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    content: "corrected fact",
+                    normalizedHash: "hash:corrected fact",
+                    clearsVerification: true,
+                    nowMs: 3_000,
+                },
+            ),
+        );
+
+        // The rewrite invalidated the verification: the projection resets to
+        // the untouched never-verified shape and the side table empties, so
+        // compat readers see the row unverified.
+        expect(
+            db
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(seeded.memoryId),
+        ).toEqual({ status: "unverified", at: null });
+        expect(count(db, "memory_verifications", `memory_id = ${seeded.memoryId}`)).toBe(0);
+
+        // A later non-clearing edit must not re-record verification for
+        // content that was never verified.
+        const later = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("clears-verification-later", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    content: "another edit",
+                    normalizedHash: "hash:another edit",
+                    nowMs: 4_000,
+                },
+            ),
+        );
+        expect(later.result.revisionId).not.toBeNull();
+        expect(
+            count(
+                db,
+                "verification_events",
+                `revision_id = ${later.result.revisionId} AND outcome = 'verified'`,
+            ),
+        ).toBe(0);
+        // Only the original verify's event remains.
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(1);
+    });
 });
 
 describe("memory/claims kernel: atomicity and idempotency", () => {

@@ -18,6 +18,7 @@ import {
     hasMemoryClaimsCompatSchema,
     type MemoryClaimEffect,
     memoryClaimAdoptionFailureReason,
+    memoryRowHasPositiveVerification,
     readCurrentClaimSemanticState,
     readMemoryClaimLink,
     recordMemoryClaimLinkFailure,
@@ -340,16 +341,22 @@ function adoptIdentityMergeRowClaims(
             // Pre-v84 TypeScript verification writes a positive verified_at
             // only to the memory_verifications side table, so each side's
             // side-table maximum stands in when its projection columns are
-            // unset.
-            const sourceVerifiedAt =
-                sourceRow.verification_status === "verified" && (sourceRow.verified_at ?? 0) > 0
-                    ? (sourceRow.verified_at as number)
-                    : readMemorySideTableVerifiedAt(db, sourceId);
+            // unset. `memoryRowHasPositiveVerification` gates each side so an
+            // explicit projection revocation ('stale'/'flagged', or
+            // 'unverified' keeping a positive verified_at) outranks a stale
+            // side-table timestamp and contributes nothing to the funnel.
+            const sourceVerifiedAt = !memoryRowHasPositiveVerification(db, sourceRow)
+                ? 0
+                : sourceRow.verification_status === "verified" && (sourceRow.verified_at ?? 0) > 0
+                  ? (sourceRow.verified_at as number)
+                  : readMemorySideTableVerifiedAt(db, sourceId);
             const targetProjectionVerified =
                 targetRow.verification_status === "verified" && (targetRow.verified_at ?? 0) > 0;
             const targetVerifiedAt = targetProjectionVerified
                 ? (targetRow.verified_at as number)
-                : readMemorySideTableVerifiedAt(db, collisionTargetId);
+                : memoryRowHasPositiveVerification(db, targetRow)
+                  ? readMemorySideTableVerifiedAt(db, collisionTargetId)
+                  : 0;
             const adoptedVerifiedAt = Math.max(sourceVerifiedAt, targetVerifiedAt);
             if (
                 (sourceVerifiedAt > 0 && !targetProjectionVerified) ||

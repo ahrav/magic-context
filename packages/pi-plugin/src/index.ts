@@ -869,10 +869,6 @@ async function startPiMagicContextRuntime(
 	const db = database;
 
 	scheduleAfterBootQuiet(() => {
-		scheduleStartupBackfills(db);
-	});
-
-	scheduleAfterBootQuiet(() => {
 		void (async () => {
 			try {
 				const api = await loadDefaultPiSessionApi();
@@ -981,6 +977,13 @@ async function startPiMagicContextRuntime(
 		info("plugin DISABLED via config (enabled: false) — skipping registration");
 		return;
 	}
+
+	// Behind the enabled gate: the claims backfill mutates the shared DB, so a
+	// disabled plugin must not schedule it (same gating the OpenCode plugin
+	// applies before runClaimsBackfillStartup).
+	scheduleAfterBootQuiet(() => {
+		scheduleStartupBackfills(db);
+	});
 
 	await ensureProjectRegisteredFromPiDirectory(projectDir, db);
 	info(
