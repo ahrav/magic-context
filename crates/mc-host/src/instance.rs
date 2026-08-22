@@ -439,6 +439,14 @@ pub(crate) fn write_atomic_owner_only(
     name: &str,
     bytes: &[u8],
 ) -> Result<rustix::fs::Stat, InstanceError> {
+    // The stale-temp sweep reclaims this writer's crashed attempts by name
+    // prefix, so a name it does not know about would leak one temp file per
+    // crashed write with nothing to reclaim it. The assertion makes an
+    // unregistered name fail the first test that writes it.
+    debug_assert!(
+        ATOMIC_WRITE_NAMES.contains(&name),
+        "{name} is not registered in ATOMIC_WRITE_NAMES; its crashed temps would never be swept"
+    );
     let mut suffix = [0u8; 16];
     getrandom::getrandom(&mut suffix).map_err(|_| InstanceError::Random)?;
     let temp_name = format!(".{name}.{}.{}.tmp", std::process::id(), hex(&suffix));
@@ -517,20 +525,22 @@ fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
 pub(crate) const LOCK_RETRY_ATTEMPTS: u32 = 4;
 pub(crate) const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// Takes a nonblocking exclusive advisory lock, tolerating the brief hold a
-/// concurrent observer may take, per [`LOCK_RETRY_ATTEMPTS`]. A real holder
-/// still yields `AlreadyRunning` after the last attempt.
+/// Bounded nonblocking advisory lock: `Ok(true)` means locked, `Ok(false)`
+/// means a holder outlasted every attempt; the caller decides what
+/// exhaustion means (a mutator reports `AlreadyRunning`, a probe degrades to
+/// evidence-only).
 ///
 /// Blocking: the retry sleeps the calling thread, so this is for synchronous
 /// callers only. Async callers must not park an executor thread here.
-pub(crate) fn flock_exclusive_bounded(
+pub(crate) fn flock_bounded(
     dir: &OwnedFd,
     dir_path: &Path,
     op: &'static str,
-) -> Result<(), InstanceError> {
+    operation: FlockOperation,
+) -> Result<bool, InstanceError> {
     for attempt in 0..LOCK_RETRY_ATTEMPTS {
-        match flock(dir, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(()),
+        match flock(dir, operation) {
+            Ok(()) => return Ok(true),
             // WOULDBLOCK and AGAIN are one errno on Linux.
             Err(rustix::io::Errno::WOULDBLOCK) => {
                 if attempt + 1 < LOCK_RETRY_ATTEMPTS {
@@ -540,8 +550,23 @@ pub(crate) fn flock_exclusive_bounded(
             Err(e) => return Err(io_err(op, dir_path, e)),
         }
     }
-    // Every attempt observed the lock held.
-    Err(InstanceError::AlreadyRunning)
+    Ok(false)
+}
+
+/// Takes a nonblocking exclusive advisory lock, tolerating the brief hold a
+/// concurrent observer may take, per [`LOCK_RETRY_ATTEMPTS`]. A real holder
+/// still yields `AlreadyRunning` after the last attempt.
+pub(crate) fn flock_exclusive_bounded(
+    dir: &OwnedFd,
+    dir_path: &Path,
+    op: &'static str,
+) -> Result<(), InstanceError> {
+    if flock_bounded(dir, dir_path, op, FlockOperation::NonBlockingLockExclusive)? {
+        Ok(())
+    } else {
+        // Every attempt observed the lock held.
+        Err(InstanceError::AlreadyRunning)
+    }
 }
 
 pub(crate) const S_IFMT: u32 = 0o170000;
@@ -571,22 +596,24 @@ pub(crate) fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
         && stat.st_mode & 0o077 == 0
 }
 
+/// Every canonical name installed through [`write_atomic_owner_only`]. The
+/// stale-temp sweep derives its reclaim prefixes from this list, and the
+/// writer asserts membership, so a new atomically written file cannot be
+/// added without also becoming sweepable.
+pub(crate) const ATOMIC_WRITE_NAMES: [&str; 2] = [
+    CONNECTION_FILE_NAME,
+    crate::lifecycle::LIFECYCLE_RECORD_NAME,
+];
+
 /// Best-effort removal of stale temp pathnames left by `write_atomic_owner_only`.
 /// Candidates and metadata come from a path-based directory iterator with
 /// metadata fetched per entry, while deletion is descriptor-relative; the
 /// metadata check and unlink are not atomic. Age is the sole predicate,
 /// failures do not prevent publication (protocol §4.2). The scan examines at
 /// most 1024 successfully read entries.
-///
-/// Every canonical name written through that helper must be listed here. The
-/// lifecycle record is rewritten several times per incarnation, so omitting it
-/// would leak a temp file per crashed write with nothing to reclaim it.
 fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
     const MAX_SWEEP_ENTRIES: usize = 1024;
-    let prefixes = [
-        format!(".{CONNECTION_FILE_NAME}."),
-        format!(".{}.", crate::lifecycle::LIFECYCLE_RECORD_NAME),
-    ];
+    let prefixes = ATOMIC_WRITE_NAMES.map(|name| format!(".{name}."));
     let Ok(entries) = std::fs::read_dir(dir_path) else {
         return;
     };

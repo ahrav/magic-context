@@ -16,9 +16,9 @@ use rustix::fs::{flock, openat, unlinkat, AtFlags, FlockOperation, Mode, OFlags}
 use subc_transport::ConnectionInfo;
 
 use crate::instance::{
-    flock_exclusive_bounded, hex, io_err, is_safe_ancestor, is_secure_regular, read_all_fd,
-    runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard, CONNECTION_FILE_NAME,
-    LOCK_RETRY_ATTEMPTS, LOCK_RETRY_DELAY, S_IFDIR, S_IFMT,
+    flock_bounded, flock_exclusive_bounded, hex, io_err, is_safe_ancestor, is_secure_regular,
+    read_all_fd, runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard,
+    CONNECTION_FILE_NAME, S_IFDIR, S_IFMT,
 };
 
 /// Canonical lifecycle-record name inside the runtime directory.
@@ -272,24 +272,19 @@ impl LifecycleRootLock {
         let Some(dir) = open_validated_dir(&dir_path)? else {
             return Ok(None);
         };
-        for attempt in 0..LOCK_RETRY_ATTEMPTS {
-            match flock(&dir, FlockOperation::NonBlockingLockShared) {
-                Ok(()) => {
-                    return Ok(Some(Self {
-                        _dir: dir,
-                        dir_path,
-                    }))
-                }
-                // WOULDBLOCK and AGAIN are one errno on Linux.
-                Err(rustix::io::Errno::WOULDBLOCK) => {
-                    if attempt + 1 < LOCK_RETRY_ATTEMPTS {
-                        std::thread::sleep(LOCK_RETRY_DELAY);
-                    }
-                }
-                Err(e) => return Err(io_err("flock_lifecycle_root", &dir_path, e)),
-            }
+        if flock_bounded(
+            &dir,
+            &dir_path,
+            "flock_lifecycle_root",
+            FlockOperation::NonBlockingLockShared,
+        )? {
+            Ok(Some(Self {
+                _dir: dir,
+                dir_path,
+            }))
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 }
 

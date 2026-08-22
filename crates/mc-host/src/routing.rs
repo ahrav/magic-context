@@ -296,6 +296,13 @@ impl RouteRegistry {
         abort: tokio::task::AbortHandle,
     ) -> Option<CancellationToken> {
         let mut inner = self.inner.lock().expect("registry lock");
+        // Frozen admission rejects dispatch registration too: a task that
+        // passed the advisory draining check before the shutdown commit must
+        // not start handler work after it. Same lock as `freeze_admission`,
+        // so the fence is atomic with the freeze.
+        if !inner.accepting {
+            return None;
+        }
         let slot = inner.slots.get_mut(&handle.channel)?;
         let occupant = slot.occupant.as_mut()?;
         if occupant.epoch != handle.epoch

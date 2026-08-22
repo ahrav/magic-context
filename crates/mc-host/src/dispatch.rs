@@ -600,13 +600,43 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
                 bytes,
                 tail: Vec::new(),
                 charge,
-                written: Some(Box::new(move |_completed_at| {
-                    commit.acknowledge();
+                written: Some(Box::new({
+                    let shared = Arc::clone(shared);
+                    move |_completed_at| {
+                        // The write acknowledgement IS the commit point, so
+                        // the admission fence must flip here, atomically with
+                        // it: `shutdown_sequence` stores these again only
+                        // after the accept loop observes cancellation, and a
+                        // dispatch that passed the flag checks before the
+                        // commit must find the registry already frozen.
+                        shared.draining.store(true, Ordering::SeqCst);
+                        shared.registry.freeze_admission();
+                        commit.acknowledge();
+                    }
                 })),
             },
             deadline,
         )
         .await;
+    // Admission into the writer queue is not delivery: behind a slow reader,
+    // the committing response could otherwise sit queued for the whole
+    // per-frame stall budget of every earlier frame while the latch holds
+    // `ResponseInFlight` and healthy requesters can only wait. Hold the same
+    // absolute deadline through write completion: if the commit has not
+    // happened by then, retire the winning generation, which drops the
+    // acknowledgement hook unfired and reopens the latch for a successor.
+    let shutdown = shared.shutdown.clone();
+    let gen_watch = Arc::clone(gen);
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {}
+            () = gen_watch.token.cancelled() => {}
+            () = tokio::time::sleep_until(deadline) => {
+                gen_watch.token.cancel();
+            }
+        }
+    });
 }
 
 /// Queues one §7.1-authoritative rejection terminal and reports (via
