@@ -376,20 +376,29 @@ fn validate_serving_limits(
     }
 
     // The result-page metadata reservation is a fixed function of these
-    // limits, taken from the scratch pool on every `embed.result`. A bound
-    // above the pool's ceiling would make every poll fail `queue_full`
-    // forever — a permanent, config-induced outage that must reject at
-    // startup instead of surfacing one request at a time.
+    // limits, taken from the scratch pool on every `embed.result` — while
+    // that request still holds its own decoded charge: up to twice the
+    // validated job-id and cursor lengths plus the 64-byte request key
+    // (decode scratch can retain up to double the decoded length as
+    // capacity) and the response scratch. A combined maximum above the
+    // pool's ceiling would make every poll fail `queue_full` forever even
+    // on an idle host — a permanent, config-induced outage that must
+    // reject at startup instead of surfacing one request at a time.
     let page_items = limits
         .max_page_vectors
         .max(1)
         .min(limits.max_batch_items.max(1));
     let page_meta_bytes =
         page_items.saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
-    if page_meta_bytes as u64 > crate::config::SCRATCH_RESERVED_BYTES {
+    let result_request_bytes = 2
+        * (super::protocol::MAX_JOB_ID_BYTES + super::protocol::MAX_CURSOR_BYTES + 64)
+        + super::RESPONSE_SCRATCH_BYTES;
+    let result_worst_case = page_meta_bytes.saturating_add(result_request_bytes);
+    if result_worst_case as u64 > crate::config::SCRATCH_RESERVED_BYTES {
         return Err(err(format!(
-            "worst-case result-page metadata ({page_meta_bytes} bytes) exceeds the reserved \
-             scratch pool ({} bytes); lower max_page_vectors or max_batch_items",
+            "worst-case result-page metadata plus its request charge ({result_worst_case} \
+             bytes) exceeds the reserved scratch pool ({} bytes); lower max_page_vectors \
+             or max_batch_items",
             crate::config::SCRATCH_RESERVED_BYTES
         )));
     }
@@ -776,17 +785,21 @@ mod tests {
         assert!(error.0.contains("maximum batch result"));
     }
 
-    /// A page-metadata bound above the fixed scratch pool would fail every
-    /// `embed.result` with `queue_full` forever — a permanent config-induced
-    /// outage — so the configuration must reject at startup.
+    /// A page-metadata bound that (together with the poll request's own
+    /// decoded charge) exceeds the fixed scratch pool would fail every
+    /// `embed.result` with `queue_full` forever — a permanent
+    /// config-induced outage — so the configuration must reject at
+    /// startup.
     #[test]
     fn a_page_bound_above_the_scratch_pool_is_rejected() {
         let manifest = manifest();
         let per_item = (jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES) as u64;
-        let over = (crate::config::SCRATCH_RESERVED_BYTES / per_item + 1) as usize;
+        // Fits the pool by itself, but not alongside the request's own
+        // charge — the boundary a page-only check would wave through.
+        let boundary = (crate::config::SCRATCH_RESERVED_BYTES / per_item) as usize;
         let limits = SynapseLimits {
-            max_page_vectors: over,
-            max_batch_items: over,
+            max_page_vectors: boundary,
+            max_batch_items: boundary,
             max_retained_result_bytes: u64::MAX,
             ..SynapseLimits::default()
         };
@@ -797,7 +810,7 @@ mod tests {
         // The bound is clamped by max_batch_items, so an oversized
         // max_page_vectors alone stays valid.
         let limits = SynapseLimits {
-            max_page_vectors: over,
+            max_page_vectors: boundary,
             ..SynapseLimits::default()
         };
         assert!(validate_serving_limits(&manifest, &limits).is_ok());

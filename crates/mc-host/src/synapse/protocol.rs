@@ -16,8 +16,8 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// level nine is not.
 const MAX_BODY_DEPTH: usize = 8;
 const MAX_DIAGNOSTIC_BYTES: usize = 512;
-const MAX_JOB_ID_BYTES: usize = 128;
-const MAX_CURSOR_BYTES: usize = 128;
+pub(crate) const MAX_JOB_ID_BYTES: usize = 128;
+pub(crate) const MAX_CURSOR_BYTES: usize = 128;
 pub(crate) const MAX_DEADLINE_MS: u64 = 3_600_000;
 
 /// One classified request failure: a stable application error code plus a
