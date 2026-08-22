@@ -33,7 +33,7 @@ Actors:
 - **Managed Rust client:** published `SubcConsumer`; owns bounded reconnect and route-open policy around fresh control RPCs.
 - **Handler:** the linked static composite; receives synthetic initialization, target-aware bind, request, route-gone, internal health, and shutdown callbacks, and dispatches each to the owning component (`magic-context` or `synapse`).
 
-The 32-byte connection key is a bearer capability. Possession grants every direct-profile operation and permits any `BindIdentity`. Client `role`, `consumer_identity`, `project_root`, `harness`, and `session` are claims or scoping metadata; none grants authority. A key reader MUST therefore be trusted as the same local security principal as the host.
+The 32-byte connection key is a bearer capability. Possession grants every direct-profile operation — including host-global `host.shutdown` (Section 7.6) — and permits any `BindIdentity`. Client `role`, `consumer_identity`, `project_root`, `harness`, and `session` are claims or scoping metadata; none grants authority. A key reader MUST therefore be trusted as the same local security principal as the host, and every key reader is stop-capable: a diagnostic or proxy principal that holds the bearer is not read-only, whatever its role label or mount permissions claim.
 
 Production transport is unencrypted TCP on numeric IPv4 loopback only. It provides no secrecy or per-frame MAC after authentication. The drive rig's read-only credential mount plus authenticated loopback proxy is a trusted diagnostic exception; it does not make remote transport supported.
 
@@ -116,6 +116,38 @@ Stale publication temporaries matching the host's private naming pattern MAY be 
 A trusted container MAY read an explicitly configured read-only symlink or bind mount. Client validation applies to the resolved target: one regular file, owner-controlled source, 64 KiB snapshot cap. Link replacement during validation MUST fail closed. This exception does not permit host publication or cleanup through links.
 
 Shutdown removal MUST occur while the instance lock is held. Before unlinking, the host MUST reread metadata without following links and confirm that the file is its own publication, including matching daemon ID. An old process MUST NOT remove a replacement host's credential. The handler is dropped before lock release.
+
+### 4.3 Lifecycle record and native state probe
+
+The host additionally maintains `${dataDir}/cortexkit/run/mc-host-lifecycle.json`, an owner-only (0600) strict schema-1 record written atomically through the same pinned runtime-directory descriptor as the publication:
+
+```json
+{
+  "schema": 1,
+  "phase": "running",
+  "launch_id": "<32 lowercase hex>",
+  "daemon_id": "<32 lowercase hex>",
+  "payload_manifest_digest": "",
+  "pid": 4242,
+  "written_at_ms": 1755838080000
+}
+```
+
+`phase` is `starting` (after lock acquisition, before publication), `running` (after publication), or `stopping` (from graceful-shutdown step 1). `pid` is display metadata only: no reader may signal it, infer liveness from it, or authorize anything with it. Record cleanup is fenced by matching launch and daemon identity and runs under the instance lock before lock release, mirroring publication cleanup.
+
+Lifecycle state is derived from lock ownership plus this evidence, never from PID existence:
+
+| Instance lock | Evidence | State |
+| --- | --- | --- |
+| free | anything, including stale record or publication | `stopped`; nothing is unlinked |
+| held | fresh `starting` record, no conflicting publication | `starting` |
+| held | `running` record and publication with the same daemon ID | `running` |
+| held | fresh `stopping` record | `stopping` |
+| held | missing, corrupt, insecure, expired, or daemon-ID-mismatched evidence | `wedged` |
+
+`wedged` is observational: probes and clients MUST NOT kill processes, break locks, or repair files. Probes use a validation-only opener (no create, no chmod, no link following), attempt the instance lock nonblockingly, and reread evidence boundedly when identities change mid-sample.
+
+A separate owner-only directory, `${dataDir}/cortexkit/lifecycle`, carries the cross-process lifecycle transaction lock on its directory inode: mutating lifecycle transactions (launcher start/stop, owned by downstream packaging work) take it exclusively, and probes take it shared when it exists. It is distinct from the runtime-directory instance lock, which only the daemon holds for its whole incarnation.
 
 ## 5. Pre-envelope authentication
 
@@ -338,7 +370,7 @@ Requests MAY omit `module_id` to list all entries or supply a filter. Unknown fi
 ```
 
 ```json
-{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list"]}
+{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown"]}
 ```
 
 An unfiltered request MUST return exactly two entries — `magic-context` then `synapse`, in that deterministic order — and an exact-module filter MUST return that one entry, each derived without lossy rewriting from its startup manifest:
@@ -351,13 +383,13 @@ An unfiltered request MUST return exactly two entries — `magic-context` then `
 | `modules[i].module_version` | that manifest's exact build version |
 | `modules[i].roles` | that manifest's complete `provides` array, including tool schemas |
 | `modules[i].control_ops` | implemented module control operations only; the direct profile never includes `wake.create` |
-| `subc_ops` | `route.open`, `catalog.list` |
+| `subc_ops` | `route.open`, `catalog.list`, `host.shutdown` |
 
 The Synapse entry is immutable identity, not readiness: it stays in the catalog even when the model bundle is missing or invalid (Section 7.5.1). The direct host is final-decision unsupported for `wake.create`: an advertised `wake.create` entry is an ownership certificate for the complete scheduled-wake lifecycle (durable scheduling, agent-callable lifecycle operations, backlog adoption, and readiness withdrawal), not a readiness hint, and the direct profile owns none of it. Wake-plane probing therefore remains fail-open against this profile; only a future host that owns the complete lifecycle may advertise the capability. `generation` changes only when catalog content changes and is unrelated to connection generation.
 
 ### 7.4 Operation classification
 
-`route.open` and `catalog.list` are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. A client health operation MUST NOT proxy handler health, which remains host-internal.
+`route.open`, `catalog.list`, and `host.shutdown` (Section 7.6) are the only required channel-0 operations. Every other operation receives terminal `unsupported_operation`; host stays connected if framing remains valid. A client health operation MUST NOT proxy handler health, which remains host-internal.
 
 Canonical error body:
 
@@ -480,6 +512,29 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | four operations over a real authenticated route, shutdown cleanup | `crates/mc-host/tests/synapse_roundtrip.rs` |
 | request-key golden vectors | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `packages/plugin/src/features/magic-context/memory/embedding-synapse.test.ts` (matching TypeScript golden test) |
 | durable ledger recovery, receipts, atomic application | `packages/plugin/src/features/magic-context/migrations-v83.test.ts`, `storage-embedding-measurements.test.ts`, domain writer suites |
+
+### 7.6 `host.shutdown`
+
+Authenticated host-global stop. Request and success response are both compact tagged objects; unknown request fields are ignored under the Section 7.1 bounds:
+
+```json
+{"op":"host.shutdown"}
+```
+
+```json
+{"op":"host.shutdown"}
+```
+
+Authorization is the bearer key alone. `role` and every other claim MUST NOT grant or deny the operation: any authenticated connection may stop the host, so no supported key-bearing principal is read-only (Section 2).
+
+The host owns one shutdown commit latch per incarnation with phases `open -> response_in_flight -> committed`:
+
+1. The first requester to find the latch `open` owns the attempt and enqueues its correlated success response on its own connection's single writer.
+2. Full-frame write acknowledgement of that response — every byte handed to the socket — commits the latch. Only then does the host cancel admission and begin the normal graceful shutdown order of Section 12. The requester therefore observes the complete response before Goodbye or EOF on that connection.
+3. Any failure before acknowledgement — enqueue rejection, writer retirement, partial write, write deadline expiry, requester disconnect or cancellation — reopens the latch so a later authenticated requester can commit, unless independent fatal shutdown has already begun.
+4. Concurrent requesters wait for the active attempt's outcome. After a commit, each waiting or later `host.shutdown` request settles with its own correlated success response while its generation is still live to emit it — a generation already retiring during the drain settles nothing further — and no second commit occurs; cancellation fires at most once per incarnation.
+
+Commit runs inside retained host work (the connection writer task), so cancelling the requester's task after enqueue cannot lose an acknowledged shutdown. `host.shutdown` performs no PID signaling and no publication cleanup of its own: stop-side effects are exactly the Section 12 sequence, and stop verification (publication removal, instance-lock release) is observed through Section 4.3 evidence.
 
 ## 8. Host and handler lifecycle
 
@@ -680,6 +735,8 @@ Graceful host shutdown order:
 
 Work without an observed terminal remains `outcome_unknown`. Forced shutdown may skip wire Goodbyes but MUST preserve local exactly-once route-gone and handler-drop ordering.
 
+An authenticated `host.shutdown` (Section 7.6) initiates this same graceful order, starting only after its committing response is fully acknowledged. The `stopping` lifecycle record (Section 4.3) is written at step 1 and removed with the publication-side cleanup before lock release.
+
 ## 13. End-to-end normative examples
 
 ### 13.1 Startup, route, call, close
@@ -776,6 +833,9 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | V42 | Host sends structurally valid `Request` | Client closes generation without dispatching or responding |
 | V43 | Host `Ping` correlation numerically equals a pending consumer correlation | `Pong` settles only the Ping; consumer terminals settle only the consumer request; no cross-settlement |
 | V44 | Consumer `Request` reuses a pending, terminal, or lower-than-watermark correlation, on any route | Host closes the generation before dispatch; handler dispatch count for the duplicate stays zero |
+| V45 | Authenticated `host.shutdown` | One correlated success response is fully written before Goodbye/EOF and before admission cancels; shutdown then follows Section 12 |
+| V46 | Shutdown attempt fails before acknowledgement | Latch reopens; a later authenticated requester commits; cancellation fires at most once |
+| V47 | `host.shutdown` under any role label, or without authentication | Every bearer-authenticated connection may stop the host; an unauthenticated socket can never reach the operation |
 
 ### 14.1 Downstream fixture oracle
 
@@ -817,7 +877,7 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 
 ## 17. Scope boundaries
 
-In scope: discovery and secure publication, pre-envelope authentication, v2 framing, `route.open`, `catalog.list`, the fixed two-module static composition, the Synapse application protocol (Section 7.5), routing/correlation/streaming/cancel/close, internal health, send outcomes, and generation recovery.
+In scope: discovery and secure publication, pre-envelope authentication, v2 framing, `route.open`, `catalog.list`, `host.shutdown`, lifecycle evidence and native state probing (Section 4.3), the fixed two-module static composition, the Synapse application protocol (Section 7.5), routing/correlation/streaming/cancel/close, internal health, send outcomes, and generation recovery.
 
 Deferred: executable cross-language golden fixtures; host, shim, and client code; private dependency compiler closure; model-runner routing; test-only TypeScript provider API; deployment-specific numeric quotas beyond required finite bounds.
 

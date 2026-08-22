@@ -1373,7 +1373,9 @@ async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() 
 
     tokio::time::sleep(Duration::from_millis(150)).await;
     let host_dir = data_root.path().join("cortexkit").join("run");
-    std::fs::remove_dir(&host_dir).expect("remove empty runtime directory");
+    // The directory holds the starting lifecycle record; removing the whole
+    // tree still makes the publication write fail.
+    std::fs::remove_dir_all(&host_dir).expect("remove runtime directory");
     handler.release_init();
 
     let result = task.await.expect("run task joins");
@@ -1389,5 +1391,281 @@ async fn a_publication_failure_runs_the_shutdown_callback_before_lock_release() 
     assert!(
         handler.events().contains(&Event::Shutdown),
         "the shutdown callback drains the handler on a post-initialize setup failure"
+    );
+}
+
+// --- host.shutdown and lifecycle evidence (plan U1) ---
+
+/// One authenticated `host.shutdown`: the correlated success response is
+/// fully observed before Goodbye/EOF, the run completes gracefully, and the
+/// runtime directory holds neither publication nor lifecycle record.
+#[tokio::test]
+async fn host_shutdown_commits_after_the_full_response_and_stops_gracefully() {
+    let host = TestHost::start().await;
+    let publication = host.publication_path();
+    let record = host.runtime_dir().join(mc_host::LIFECYCLE_RECORD_NAME);
+    assert!(record.exists(), "a running host keeps a lifecycle record");
+
+    let mut client = host.client().await;
+    let corr = client
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("send shutdown");
+    let (skipped, response) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("shutdown response");
+    assert!(
+        skipped
+            .iter()
+            .all(|frame| frame.ty == TY_PING || frame.ty == TY_GOODBYE),
+        "no other terminal may precede the shutdown response: {skipped:?}"
+    );
+    assert_eq!(response.ty, TY_RESPONSE);
+    assert_eq!(response.json()["op"], "host.shutdown");
+
+    let trailing = client.drain_until_close(BUDGET).await;
+    assert!(
+        trailing.iter().any(|frame| frame.ty == TY_GOODBYE),
+        "the drain still sends a connection Goodbye after the response: {trailing:?}"
+    );
+
+    let handler = host.handler.clone();
+    host.shutdown().await.expect("graceful shutdown");
+    assert!(handler.events().contains(&Event::Shutdown));
+    assert!(!publication.exists(), "publication removed by its owner");
+    assert!(!record.exists(), "lifecycle record removed under the lock");
+}
+
+/// Two connections race `host.shutdown`: each correlation settles exactly
+/// once with a parseable response, and the host cancels once.
+#[tokio::test]
+async fn concurrent_shutdown_requests_each_settle_exactly_once() {
+    let host = TestHost::start().await;
+    let mut first = host.client().await;
+    let mut second = host.client().await;
+
+    let first_corr = first
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("first shutdown");
+    let second_corr = second
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("second shutdown");
+
+    // Each request correlation must receive exactly one non-ping terminal.
+    for (client, corr) in [(&mut first, first_corr), (&mut second, second_corr)] {
+        let (skipped, response) = client
+            .frames_until_corr(corr, BUDGET)
+            .await
+            .expect("each requester settles");
+        assert_eq!(response.ty, TY_RESPONSE);
+        assert_eq!(response.json()["op"], "host.shutdown");
+        let trailing = client.drain_until_close(BUDGET).await;
+        let duplicates = skipped
+            .iter()
+            .chain(trailing.iter())
+            .filter(|frame| frame.corr == corr && frame.ty != TY_PING)
+            .count();
+        assert_eq!(
+            duplicates, 0,
+            "duplicate settlement: {skipped:?} {trailing:?}"
+        );
+    }
+
+    let handler = host.handler.clone();
+    host.shutdown().await.expect("graceful shutdown");
+    assert_eq!(
+        handler
+            .events()
+            .iter()
+            .filter(|event| **event == Event::Shutdown)
+            .count(),
+        1,
+        "cancellation and handler shutdown fire once per incarnation"
+    );
+}
+
+/// A requester that dies right after sending `host.shutdown` cannot strand
+/// the stop: whether its attempt committed or reopened, either the host is
+/// already stopping or a later authenticated requester completes the stop.
+#[tokio::test]
+async fn a_dying_requester_cannot_strand_the_stop() {
+    let host = TestHost::start().await;
+    let mut first = host.client().await;
+    first
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("send shutdown");
+    // Abrupt close: the response write may succeed (commit) or fail and
+    // reopen ownership.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    if let Ok(mut second) = raw_client::RawClient::connect(&host.info).await {
+        if let Ok(corr) = second
+            .control(&serde_json::json!({"op": "host.shutdown"}))
+            .await
+        {
+            // A reopened latch must let this requester commit; a committed
+            // one answers success. A generation retired mid-drain may close
+            // without the frame, which the graceful join below still proves
+            // was a completed stop.
+            let _ = second.frames_until_corr(corr, BUDGET).await;
+        }
+    }
+
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// A second shutdown request on the same connection (after the first) also
+/// settles: an already-committed latch answers without a second commit.
+#[tokio::test]
+async fn shutdown_after_commit_reports_success_again() {
+    let host = TestHost::start().await;
+    let mut client = host.client().await;
+    let first = client
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("first shutdown");
+    let second = client
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("second shutdown");
+    for corr in [first, second] {
+        let (_skipped, response) = client
+            .frames_until_corr(corr, BUDGET)
+            .await
+            .expect("settled");
+        assert_eq!(response.ty, TY_RESPONSE);
+        assert_eq!(response.json()["op"], "host.shutdown");
+    }
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// Key possession is the whole authorization: every role label gets the same
+/// shutdown capability, so no supported key reader is read-only (plan R33).
+#[tokio::test]
+async fn any_role_with_the_bearer_key_can_shut_down() {
+    for role in ["client", "diagnostic-readonly"] {
+        let host = TestHost::start().await;
+        let mut client = raw_client::RawClient::connect_with_role(&host.info, role)
+            .await
+            .expect("authenticated connection");
+        let corr = client
+            .control(&serde_json::json!({"op": "host.shutdown"}))
+            .await
+            .expect("send shutdown");
+        let (_skipped, response) = client
+            .frames_until_corr(corr, BUDGET)
+            .await
+            .expect("shutdown response");
+        assert_eq!(response.ty, TY_RESPONSE, "role {role} must be stop-capable");
+        host.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// Without the bearer key no shutdown is possible, and malformed shutdown
+/// shapes are rejected without stopping the host.
+#[tokio::test]
+async fn shutdown_requires_authentication_and_a_valid_shape() {
+    let host = TestHost::start().await;
+
+    // Unauthenticated socket: no envelope is ever read or written back.
+    let mut raw = raw_client::connect_unauthenticated(&host.info)
+        .await
+        .expect("tcp connect");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let frame = {
+        let body = br#"{"op":"host.shutdown"}"#;
+        let mut wire = raw_client::header(
+            body.len() as u32,
+            raw_client::TY_REQUEST,
+            raw_client::FLAGS_INTERACTIVE,
+            0,
+            0,
+            1,
+        );
+        wire.extend_from_slice(body);
+        wire
+    };
+    let _ = raw.write_all(&frame).await;
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(BUDGET, raw.read(&mut byte))
+        .await
+        .expect("the failed handshake closes within its deadline")
+        .expect("read");
+    assert_eq!(read, 0, "no byte may reach an unauthenticated socket");
+    drop(raw);
+
+    // Authenticated but malformed: binary flag on channel 0.
+    let mut client = host.client().await;
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE | 0b0000_0001,
+            0,
+            0,
+            corr,
+            br#"{"op":"host.shutdown"}"#,
+        )
+        .await
+        .expect("send binary control");
+    let (_skipped, rejection) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("rejection");
+    assert_eq!(rejection.error_code(), "invalid_control_request");
+
+    // The host is still serving: a catalog request round-trips.
+    let catalog_corr = client
+        .control(&serde_json::json!({"op": "catalog.list"}))
+        .await
+        .expect("catalog");
+    let (_skipped, catalog) = client
+        .frames_until_corr(catalog_corr, BUDGET)
+        .await
+        .expect("catalog response");
+    assert_eq!(catalog.ty, TY_RESPONSE);
+
+    host.shutdown_gracefully().await;
+}
+
+/// The native probe tracks one incarnation end to end: running while the
+/// host serves, stopped once it exits, and never by PID.
+#[tokio::test]
+async fn probe_observes_running_then_stopped_across_an_incarnation() {
+    let host = TestHost::start().await;
+    let data_root = host.data_root.path().to_path_buf();
+
+    let observed = mc_host::probe_lifecycle(Some(&data_root), &mc_host::ProbeFreshness::default())
+        .expect("probe while running");
+    assert_eq!(observed.state, mc_host::LifecycleState::Running);
+    assert!(!observed.instance_lock_free);
+    let summary = observed.publication.expect("publication summary");
+    assert_eq!(summary.port, host.info.port);
+
+    // Stop through the authenticated wire operation, then reprobe.
+    let mut client = host.client().await;
+    let corr = client
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("send shutdown");
+    let (_skipped, response) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("shutdown response");
+    assert_eq!(response.ty, TY_RESPONSE);
+    host.shutdown().await.expect("graceful shutdown");
+
+    let observed = mc_host::probe_lifecycle(Some(&data_root), &mc_host::ProbeFreshness::default())
+        .expect("probe after stop");
+    assert_eq!(observed.state, mc_host::LifecycleState::Stopped);
+    assert!(observed.instance_lock_free);
+    assert!(
+        observed.publication.is_none(),
+        "no stale publication remains"
     );
 }

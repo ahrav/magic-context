@@ -115,6 +115,8 @@ pub struct HostShared<H> {
     /// spawn would overlap the handler's shutdown with itself.
     shutdown_callback_ran: AtomicBool,
     pub shutdown: CancellationToken,
+    /// `host.shutdown` commit latch shared by every connection (plan KTD4).
+    pub shutdown_latch: Arc<crate::lifecycle::ShutdownLatch>,
     pub draining: AtomicBool,
     pub fatal: FatalCell,
     pub gen_counter: AtomicU64,
@@ -520,6 +522,9 @@ pub async fn run<H: McHostHandler>(
     crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
     let guard = InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
+    guard
+        .write_lifecycle_record(crate::lifecycle::LifecyclePhase::Starting)
+        .map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
     let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
@@ -646,6 +651,12 @@ pub async fn run<H: McHostHandler>(
             .guard_mut()
             .publish(port, &config.daemon_ver)
             .map_err(HostError::Instance)?;
+        // Best effort: transport is already published, so a failed phase
+        // rewrite must not tear down a serving host — probes then observe a
+        // fresh `starting` record, which ages to `wedged` honestly.
+        let _ = cleanup
+            .guard_mut()
+            .write_lifecycle_record(crate::lifecycle::LifecyclePhase::Running);
         Ok(Some(listener))
     }
     .await;
@@ -692,6 +703,7 @@ pub async fn run<H: McHostHandler>(
         abort_handles: Mutex::new(AbortRegistry::new()),
         shutdown_callback_ran: AtomicBool::new(false),
         shutdown: shutdown.clone(),
+        shutdown_latch: Arc::new(crate::lifecycle::ShutdownLatch::new()),
         draining: AtomicBool::new(false),
         fatal: FatalCell::new(),
         gen_counter: AtomicU64::new(1),
@@ -834,6 +846,10 @@ async fn shutdown_sequence<H: McHostHandler>(
         .draining
         .store(true, std::sync::atomic::Ordering::SeqCst);
     shared.registry.freeze_admission();
+
+    // Best effort: teardown proceeds regardless, and a stale phase ages to
+    // `wedged` honestly.
+    let _ = guard.write_lifecycle_record(crate::lifecycle::LifecyclePhase::Stopping);
 
     // 2. Fenced publication removal while the lock is held.
     guard.remove_publication();

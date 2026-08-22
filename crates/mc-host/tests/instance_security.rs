@@ -214,3 +214,51 @@ async fn startup_errors_render_without_key_material() {
 
     holder.shutdown_gracefully().await;
 }
+
+#[tokio::test]
+async fn lifecycle_record_is_owner_only_and_removed_at_shutdown() {
+    let host = TestHost::start().await;
+    let record = host.runtime_dir().join(mc_host::LIFECYCLE_RECORD_NAME);
+    let meta = std::fs::symlink_metadata(&record).expect("record exists");
+    assert!(meta.file_type().is_file());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).expect("read record")).expect("parse");
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["phase"], "running");
+
+    host.shutdown_gracefully().await;
+    assert!(
+        !record.exists(),
+        "graceful shutdown must remove the lifecycle record"
+    );
+}
+
+#[tokio::test]
+async fn a_planted_symlink_at_the_record_name_is_replaced_not_followed() {
+    let outside = tempfile::tempdir().expect("outside root");
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, b"untouched").expect("write victim");
+
+    let data_root = tempfile::tempdir().expect("temp root");
+    let run_dir = data_root.path().join("cortexkit").join("run");
+    std::fs::create_dir_all(&run_dir).expect("create runtime dir");
+    std::os::unix::fs::symlink(&victim, run_dir.join(mc_host::LIFECYCLE_RECORD_NAME))
+        .expect("plant symlink");
+
+    let host = TestHost::try_start_with(TestHandler::new(), {
+        let path = data_root.path().to_path_buf();
+        move |config| config.data_dir = Some(path)
+    })
+    .await
+    .expect("host publishes despite the planted link");
+
+    // rename(2) replaces the link itself; the outside target is intact.
+    assert_eq!(std::fs::read(&victim).expect("read victim"), b"untouched");
+    let meta = std::fs::symlink_metadata(run_dir.join(mc_host::LIFECYCLE_RECORD_NAME))
+        .expect("stat record");
+    assert!(meta.file_type().is_file(), "the record must be a real file");
+
+    host.shutdown_gracefully().await;
+}
