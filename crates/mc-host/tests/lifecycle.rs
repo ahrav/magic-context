@@ -1510,10 +1510,25 @@ async fn a_dying_requester_cannot_strand_the_stop() {
         {
             // A reopened latch must let this requester commit; a committed
             // one answers success. A generation retired mid-drain may close
-            // without the frame, which the graceful join below still proves
-            // was a completed stop.
+            // without the frame, which the wire-initiated stop proven below
+            // still shows was a completed stop.
             let _ = second.frames_until_corr(corr, BUDGET).await;
         }
+    }
+
+    // The second interaction above is fallible only because a committed
+    // first attempt may already be tearing the host down. Whichever branch
+    // ran, the WIRE must have initiated the stop: the handler observes its
+    // shutdown before the direct cancellation below, which would otherwise
+    // mask a stranded stop (a failed connect against a healthy host).
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while !host.handler.events().contains(&Event::Shutdown) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "wire-initiated shutdown never happened: the dying requester's \
+             attempt did not commit and no successor completed the stop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     host.shutdown().await.expect("graceful shutdown");

@@ -765,6 +765,9 @@ async fn host_shutdown_response_bytes_are_pinned() {
         }
     };
     assert_eq!(frame.ty, TY_RESPONSE);
+    // Interactive priority (bits 1-2 = 01) plus the last-frame bit (bit 3):
+    // the full flags byte is part of the pinned response.
+    assert_eq!(frame.flags, FLAGS_INTERACTIVE | 0b0000_1000);
     assert_eq!(frame.channel, 0);
     assert_eq!(frame.epoch, 0);
     assert_eq!(frame.body, br#"{"op":"host.shutdown"}"#.to_vec());

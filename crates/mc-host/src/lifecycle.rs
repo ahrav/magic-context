@@ -18,7 +18,7 @@ use subc_transport::ConnectionInfo;
 use crate::instance::{
     flock_exclusive_bounded, hex, io_err, is_safe_ancestor, is_secure_regular, read_all_fd,
     runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard, CONNECTION_FILE_NAME,
-    S_IFDIR, S_IFMT,
+    LOCK_RETRY_ATTEMPTS, LOCK_RETRY_DELAY, S_IFDIR, S_IFMT,
 };
 
 /// Canonical lifecycle-record name inside the runtime directory.
@@ -245,21 +245,38 @@ impl LifecycleRootLock {
 
     /// Validation-only shared lock for observational probes: never creates
     /// the root, never chmods it. `Ok(None)` means no lifecycle root exists
-    /// or a mutator currently holds the exclusive lock; the probe proceeds
-    /// on evidence alone and relies on its bounded reread loop.
+    /// or a mutator outlasted the bounded wait below; the probe proceeds on
+    /// evidence alone and relies on its bounded reread loop.
+    ///
+    /// The wait mirrors the bounded retry mutators use against a probe's
+    /// transient shared hold: a mutator's transaction is a few file writes,
+    /// so retrying covers it and the probe samples with the transaction
+    /// excluded instead of reading a stable-looking intermediate state the
+    /// reread loop cannot detect. Blocking: the retry sleeps the calling
+    /// thread, matching `probe_lifecycle`'s documented contract.
     pub fn acquire_shared(data_dir_override: Option<&Path>) -> Result<Option<Self>, InstanceError> {
         let dir_path = lifecycle_dir_path(data_dir_override)?;
         let Some(dir) = open_validated_dir(&dir_path)? else {
             return Ok(None);
         };
-        match flock(&dir, FlockOperation::NonBlockingLockShared) {
-            Ok(()) => Ok(Some(Self {
-                _dir: dir,
-                dir_path,
-            })),
-            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
-            Err(e) => Err(io_err("flock_lifecycle_root", &dir_path, e)),
+        for attempt in 0..LOCK_RETRY_ATTEMPTS {
+            match flock(&dir, FlockOperation::NonBlockingLockShared) {
+                Ok(()) => {
+                    return Ok(Some(Self {
+                        _dir: dir,
+                        dir_path,
+                    }))
+                }
+                // WOULDBLOCK and AGAIN are one errno on Linux.
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    if attempt + 1 < LOCK_RETRY_ATTEMPTS {
+                        std::thread::sleep(LOCK_RETRY_DELAY);
+                    }
+                }
+                Err(e) => return Err(io_err("flock_lifecycle_root", &dir_path, e)),
+            }
         }
+        Ok(None)
     }
 }
 
@@ -467,14 +484,26 @@ fn instance_lock_free(dir: &OwnedFd, dir_path: &Path) -> Result<bool, InstanceEr
     }
 }
 
+/// Decodes a publication and enforces the same contract discovery applies
+/// (protocol §4.1): schema, key length, declared wire version, loopback
+/// host, nonzero port, nonempty daemon version. A publication no conforming
+/// client would accept must not count as evidence of a running host, so
+/// `None` here sends a held lock with a `running` record to `wedged` rather
+/// than `running`.
 fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
     let info: ConnectionInfo = serde_json::from_slice(bytes).ok()?;
-    let port = info.endpoints.first().map(|e| e.port)?;
+    info.validate().ok()?;
+    info.validate_wire_version(subc_protocol::PROTOCOL_VERSION)
+        .ok()?;
+    let endpoint = info.endpoints.first()?;
+    if endpoint.host != "127.0.0.1" || endpoint.port == 0 || info.daemon_ver.is_empty() {
+        return None;
+    }
     Some(PublicationSummary {
         daemon_id: hex(&info.daemon_id),
         daemon_ver: info.daemon_ver,
         pid: info.pid,
-        port,
+        port: endpoint.port,
     })
 }
 
@@ -591,7 +620,10 @@ fn classify(sample: EvidenceSample, lock_free: bool, freshness: &ProbeFreshness)
         return wedged(reason, None);
     };
     if sample.publication != EvidenceFile::Absent && publication.is_none() {
-        return wedged("publication is corrupt", Some(record));
+        return wedged(
+            "publication is corrupt or violates the contract",
+            Some(record),
+        );
     }
     if let Some(publication) = &publication {
         if publication.daemon_id != record.daemon_id {
