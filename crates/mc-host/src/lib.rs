@@ -5,6 +5,7 @@
 pub mod composite;
 pub mod config;
 pub mod handler;
+pub mod lifecycle;
 pub mod synapse;
 
 mod connection;
@@ -24,6 +25,10 @@ pub use handler::{
     StreamClosed, TargetKind,
 };
 pub use instance::{runtime_dir_path, InstanceError, CONNECTION_FILE_NAME};
+pub use lifecycle::{
+    lifecycle_dir_path, probe_lifecycle, LifecyclePhase, LifecycleProbe, LifecycleRecord,
+    LifecycleRootLock, LifecycleState, ProbeFreshness, PublicationSummary, LIFECYCLE_RECORD_NAME,
+};
 pub use runtime::{run, HostError};
 
 pub use tokio_util::sync::CancellationToken;

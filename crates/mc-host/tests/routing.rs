@@ -57,7 +57,7 @@ async fn catalog_is_truthful_and_filters_exactly() {
     );
     assert_eq!(
         json["subc_ops"],
-        serde_json::json!(["route.open", "catalog.list"])
+        serde_json::json!(["route.open", "catalog.list", "host.shutdown"])
     );
     // The direct host implements only `health.check`; `wake.create` stays
     // excluded so TypeScript wake-plane probing stays fail-open (AE10).

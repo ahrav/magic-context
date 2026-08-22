@@ -745,3 +745,31 @@ async fn read_len_prefixed(stream: &mut tokio::net::TcpStream) -> Option<serde_j
         _ => None,
     }
 }
+
+/// Pins the exact `host.shutdown` success bytes: a tagged compact object with
+/// only the `op` field, decoded here by the independent oracle.
+#[tokio::test]
+async fn host_shutdown_response_bytes_are_pinned() {
+    let host = TestHost::start().await;
+    let mut client = host.client().await;
+    let corr = client
+        .control(&serde_json::json!({"op": "host.shutdown"}))
+        .await
+        .expect("send shutdown");
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let frame = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = client.frame_within(remaining).await.expect("frame");
+        if frame.corr == corr && frame.ty != raw_client::TY_PING {
+            break frame;
+        }
+    };
+    assert_eq!(frame.ty, TY_RESPONSE);
+    // Interactive priority (bits 1-2 = 01) plus the last-frame bit (bit 3):
+    // the full flags byte is part of the pinned response.
+    assert_eq!(frame.flags, FLAGS_INTERACTIVE | 0b0000_1000);
+    assert_eq!(frame.channel, 0);
+    assert_eq!(frame.epoch, 0);
+    assert_eq!(frame.body, br#"{"op":"host.shutdown"}"#.to_vec());
+    host.shutdown().await.expect("graceful shutdown");
+}

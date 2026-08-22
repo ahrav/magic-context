@@ -97,7 +97,7 @@ impl std::error::Error for InstanceError {
     }
 }
 
-fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -> InstanceError {
+pub(crate) fn io_err(op: &'static str, path: &Path, source: rustix::io::Errno) -> InstanceError {
     InstanceError::Io {
         op,
         path: path.to_path_buf(),
@@ -135,6 +135,7 @@ pub struct InstanceGuard {
     dir_path: PathBuf,
     key: ConnectionKey,
     daemon_id: [u8; DAEMON_ID_LEN],
+    launch_id: [u8; 16],
     publication: Option<PublicationIdentity>,
 }
 
@@ -166,17 +167,24 @@ impl InstanceGuard {
         let dir_path = runtime_dir_path(data_dir_override)?;
         let dir = secure_runtime_dir(&dir_path)?;
         lock_instance(&dir, &dir_path)?;
+        // Sweep under the freshly held lock rather than at publish: an
+        // incarnation that crash-loops before ever publishing still reclaims
+        // its predecessors' stale temp files on each start.
+        sweep_stale_temps(&dir, &dir_path);
 
         let mut key = [0u8; KEY_LEN];
         getrandom::getrandom(&mut key).map_err(|_| InstanceError::Random)?;
         let mut daemon_id = [0u8; DAEMON_ID_LEN];
         getrandom::getrandom(&mut daemon_id).map_err(|_| InstanceError::Random)?;
+        let mut launch_id = [0u8; 16];
+        getrandom::getrandom(&mut launch_id).map_err(|_| InstanceError::Random)?;
 
         Ok(Self {
             dir,
             dir_path,
             key: ConnectionKey(key),
             daemon_id,
+            launch_id,
             publication: None,
         })
     }
@@ -189,8 +197,15 @@ impl InstanceGuard {
         &self.daemon_id
     }
 
-    #[cfg(test)]
-    pub fn dir_path(&self) -> &Path {
+    pub fn launch_id(&self) -> &[u8; 16] {
+        &self.launch_id
+    }
+
+    pub(crate) fn dir(&self) -> &OwnedFd {
+        &self.dir
+    }
+
+    pub(crate) fn dir_path(&self) -> &Path {
         &self.dir_path
     }
 
@@ -199,8 +214,6 @@ impl InstanceGuard {
     /// over the canonical name both stay relative to the pinned directory
     /// descriptor, so the swap cannot cross filesystems or follow links.
     pub fn publish(&mut self, port: u16, daemon_ver: &str) -> Result<(), InstanceError> {
-        sweep_stale_temps(&self.dir, &self.dir_path);
-
         let info = ConnectionInfo {
             schema: SCHEMA_VERSION,
             wire_version: Some(subc_protocol::PROTOCOL_VERSION),
@@ -216,63 +229,16 @@ impl InstanceGuard {
         let json =
             serde_json::to_vec_pretty(&info).expect("connection info serialization cannot fail");
 
-        let mut suffix = [0u8; 16];
-        getrandom::getrandom(&mut suffix).map_err(|_| InstanceError::Random)?;
-        let temp_name = format!(
-            ".{CONNECTION_FILE_NAME}.{}.{}.tmp",
-            std::process::id(),
-            hex(&suffix)
-        );
-        let temp_path = self.dir_path.join(&temp_name);
-
-        let fd = openat(
-            &self.dir,
-            temp_name.as_str(),
-            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o600),
-        )
-        .map_err(|e| io_err("create_temp", &temp_path, e))?;
-
-        let result = (|| -> Result<PublicationIdentity, InstanceError> {
-            // The create mode is filtered by the process umask (a 0o777-style
-            // umask can strip owner bits and leave the file 0o000); force the
-            // exact owner-only mode so the published credentials stay
-            // readable by the owning principal and fenced cleanup can reopen
-            // the file.
-            rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))
-                .map_err(|e| io_err("chmod_temp", &temp_path, e))?;
-            write_all_fd(&fd, &json).map_err(|source| InstanceError::Io {
-                op: "write_temp",
-                path: temp_path.clone(),
-                source,
-            })?;
-            fsync(&fd).map_err(|e| io_err("fsync_temp", &temp_path, e))?;
-            let stat = rustix::fs::fstat(&fd).map_err(|e| io_err("fstat_temp", &temp_path, e))?;
-            renameat(
-                &self.dir,
-                temp_name.as_str(),
-                &self.dir,
-                CONNECTION_FILE_NAME,
-            )
-            .map_err(|e| io_err("rename", &temp_path, e))?;
-            Ok(PublicationIdentity {
-                dev: stat.st_dev as u64,
-                ino: stat.st_ino as u64,
-            })
-        })();
-
-        match result {
-            Ok(identity) => {
-                self.publication = Some(identity);
-                Ok(())
-            }
-            Err(err) => {
-                // Remove only this attempt's temp file; a predecessor's or
-                // successor's canonical file is untouched.
-                let _ = unlinkat(&self.dir, temp_name.as_str(), AtFlags::empty());
-                Err(err)
-            }
-        }
+        let stat = write_atomic_owner_only(&self.dir, &self.dir_path, CONNECTION_FILE_NAME, &json)?;
+        // `Stat` field types vary by platform (macOS `st_dev` is `i32`); the
+        // casts are no-ops on Linux but load-bearing elsewhere.
+        #[allow(clippy::unnecessary_cast)]
+        let identity = PublicationIdentity {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        };
+        self.publication = Some(identity);
+        Ok(())
     }
 
     /// Best-effort identity fencing before removing the canonical publication:
@@ -337,13 +303,14 @@ impl Drop for InstanceGuard {
         // took the retained identity, making this a no-op. The same
         // best-effort identity checks run before unlink on the drop path.
         self.remove_publication();
+        self.remove_lifecycle_record();
     }
 }
 
 /// Traverses and validates the runtime path without following symlinks,
 /// normalizing newly created components to 0700. Returns a pinned descriptor
 /// for the final directory after validating its ownership and mode.
-fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
+pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
     let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
     let mut current = openat(
         CWD,
@@ -462,8 +429,73 @@ fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceError> {
     Ok(current)
 }
 
+/// Atomically installs `bytes` at `name` inside the pinned `dir` descriptor:
+/// unique owner-only `O_EXCL` temp, exact-mode `fchmod`, full write, fsync,
+/// then rename over the canonical name. Failure removes only this attempt's
+/// temp file; a predecessor's or successor's canonical file is untouched.
+/// Returns the installed file's stat, taken through the still-open temp
+/// descriptor before the rename.
+pub(crate) fn write_atomic_owner_only(
+    dir: &OwnedFd,
+    dir_path: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<rustix::fs::Stat, InstanceError> {
+    // The stale-temp sweep reclaims this writer's crashed attempts by name
+    // prefix, so a name it does not know about would leak one temp file per
+    // crashed write with nothing to reclaim it. The assertion makes an
+    // unregistered name fail the first test that writes it.
+    debug_assert!(
+        ATOMIC_WRITE_NAMES.contains(&name),
+        "{name} is not registered in ATOMIC_WRITE_NAMES; its crashed temps would never be swept"
+    );
+    let mut suffix = [0u8; 16];
+    getrandom::getrandom(&mut suffix).map_err(|_| InstanceError::Random)?;
+    let temp_name = format!(".{name}.{}.{}.tmp", std::process::id(), hex(&suffix));
+    // Errors carry the full path so a failure names which runtime directory
+    // it happened in; the syscalls themselves stay anchored to `dir`.
+    let temp_path = dir_path.join(&temp_name);
+
+    let fd = openat(
+        dir,
+        temp_name.as_str(),
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|e| io_err("create_temp", &temp_path, e))?;
+
+    let result = (|| -> Result<rustix::fs::Stat, InstanceError> {
+        // The create mode is filtered by the process umask (a 0o777-style
+        // umask can strip owner bits and leave the file 0o000); force the
+        // exact owner-only mode so the installed bytes stay readable by the
+        // owning principal and fenced cleanup can reopen the file.
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o600))
+            .map_err(|e| io_err("chmod_temp", &temp_path, e))?;
+        write_all_fd(&fd, bytes).map_err(|source| InstanceError::Io {
+            op: "write_temp",
+            path: temp_path.clone(),
+            source,
+        })?;
+        fsync(&fd).map_err(|e| io_err("fsync_temp", &temp_path, e))?;
+        let stat = rustix::fs::fstat(&fd).map_err(|e| io_err("fstat_temp", &temp_path, e))?;
+        renameat(dir, temp_name.as_str(), dir, name)
+            .map_err(|e| io_err("rename", &temp_path, e))?;
+        Ok(stat)
+    })();
+
+    if result.is_err() {
+        let _ = unlinkat(dir, temp_name.as_str(), AtFlags::empty());
+    }
+    result
+}
+
 /// Takes the nonblocking exclusive advisory lock that makes this process the
 /// single host for `dir`.
+///
+/// One attempt, no waiting: contention is reported as `AlreadyRunning` so the
+/// caller decides how to wait. `run` retries on its own async timer rather
+/// than sleeping an executor thread; synchronous callers use
+/// [`flock_exclusive_bounded`].
 ///
 /// The lock is held on the runtime-directory descriptor itself. Every instance
 /// that serves this runtime directory must resolve this same inode to reach
@@ -483,15 +515,71 @@ fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
     }
 }
 
-const S_IFMT: u32 = 0o170000;
+/// How long a caller should tolerate transient exclusive-lock contention.
+///
+/// An observer holds a lifecycle lock only long enough to read it — a probe
+/// tests instance-lock freedom with a shared lock, and holds the
+/// lifecycle-root lock shared for one sample — but shared still blocks
+/// exclusive, so an unlucky mutator can collide with one. Retrying briefly
+/// keeps that from being reported as a live holder. These are the single
+/// definition of that policy: [`flock_exclusive_bounded`] applies them
+/// synchronously, and `run` applies them on an async timer.
+pub(crate) const LOCK_RETRY_ATTEMPTS: u32 = 4;
+pub(crate) const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Bounded nonblocking advisory lock: `Ok(true)` means locked, `Ok(false)`
+/// means a holder outlasted every attempt; the caller decides what
+/// exhaustion means (a mutator reports `AlreadyRunning`, a probe degrades to
+/// evidence-only).
+///
+/// Blocking: the retry sleeps the calling thread, so this is for synchronous
+/// callers only. Async callers must not park an executor thread here.
+pub(crate) fn flock_bounded(
+    dir: &OwnedFd,
+    dir_path: &Path,
+    op: &'static str,
+    operation: FlockOperation,
+) -> Result<bool, InstanceError> {
+    for attempt in 0..LOCK_RETRY_ATTEMPTS {
+        match flock(dir, operation) {
+            Ok(()) => return Ok(true),
+            // WOULDBLOCK and AGAIN are one errno on Linux.
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                if attempt + 1 < LOCK_RETRY_ATTEMPTS {
+                    std::thread::sleep(LOCK_RETRY_DELAY);
+                }
+            }
+            Err(e) => return Err(io_err(op, dir_path, e)),
+        }
+    }
+    Ok(false)
+}
+
+/// Takes a nonblocking exclusive advisory lock, tolerating the brief hold a
+/// concurrent observer may take, per [`LOCK_RETRY_ATTEMPTS`]. A real holder
+/// still yields `AlreadyRunning` after the last attempt.
+pub(crate) fn flock_exclusive_bounded(
+    dir: &OwnedFd,
+    dir_path: &Path,
+    op: &'static str,
+) -> Result<(), InstanceError> {
+    if flock_bounded(dir, dir_path, op, FlockOperation::NonBlockingLockExclusive)? {
+        Ok(())
+    } else {
+        // Every attempt observed the lock held.
+        Err(InstanceError::AlreadyRunning)
+    }
+}
+
+pub(crate) const S_IFMT: u32 = 0o170000;
 const S_ISVTX: u32 = 0o1000;
-const S_IFDIR: u32 = 0o040000;
+pub(crate) const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
 /// A directory no other principal can replace: owned by us or by root, and
 /// not group/other-writable unless sticky (a sticky directory forbids
 /// renaming entries you do not own, which is what `/tmp` relies on).
-fn is_safe_ancestor(stat: &rustix::fs::Stat) -> bool {
+pub(crate) fn is_safe_ancestor(stat: &rustix::fs::Stat) -> bool {
     if (stat.st_mode & S_IFMT) != S_IFDIR {
         return false;
     }
@@ -503,29 +591,42 @@ fn is_safe_ancestor(stat: &rustix::fs::Stat) -> bool {
 }
 
 /// Regular file, single hard link, owned by us, no group/other bits.
-fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
+pub(crate) fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
     (stat.st_mode & S_IFMT) == S_IFREG
         && stat.st_nlink == 1
         && stat.st_uid == rustix::process::geteuid().as_raw()
         && stat.st_mode & 0o077 == 0
 }
 
-/// Best-effort removal of stale publication temp pathnames. Candidates and
-/// metadata come from a path-based directory iterator with metadata fetched
-/// per entry, while deletion is descriptor-relative; the metadata check and
-/// unlink are not atomic. Age is the sole predicate, failures do not prevent
-/// publication (protocol §4.2). The scan examines at most 1024 successfully
-/// read entries.
+/// Every canonical name installed through [`write_atomic_owner_only`]. The
+/// stale-temp sweep derives its reclaim prefixes from this list, and the
+/// writer asserts membership, so a new atomically written file cannot be
+/// added without also becoming sweepable.
+pub(crate) const ATOMIC_WRITE_NAMES: [&str; 2] = [
+    CONNECTION_FILE_NAME,
+    crate::lifecycle::LIFECYCLE_RECORD_NAME,
+];
+
+/// Best-effort removal of stale temp pathnames left by `write_atomic_owner_only`.
+/// Candidates and metadata come from a path-based directory iterator with
+/// metadata fetched per entry, while deletion is descriptor-relative; the
+/// metadata check and unlink are not atomic. Age is the sole predicate,
+/// failures do not prevent startup (protocol §4.2). The scan examines at
+/// most 1024 successfully read entries.
 fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
     const MAX_SWEEP_ENTRIES: usize = 1024;
-    let prefix = format!(".{CONNECTION_FILE_NAME}.");
+    let prefixes = ATOMIC_WRITE_NAMES.map(|name| format!(".{name}."));
     let Ok(entries) = std::fs::read_dir(dir_path) else {
         return;
     };
     for entry in entries.flatten().take(MAX_SWEEP_ENTRIES) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+        let matches_temp = name.ends_with(".tmp")
+            && prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()));
+        if !matches_temp {
             continue;
         }
         let stale = entry
@@ -543,7 +644,7 @@ fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
     }
 }
 
-fn write_all_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_all_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         let written = rustix::io::write(fd, bytes).map_err(io::Error::from)?;
         if written == 0 {
@@ -554,7 +655,7 @@ fn write_all_fd(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn read_all_fd(fd: &OwnedFd, cap: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn read_all_fd(fd: &OwnedFd, cap: usize) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -569,7 +670,7 @@ fn read_all_fd(fd: &OwnedFd, cap: usize) -> io::Result<Vec<u8>> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -931,8 +1032,12 @@ mod tests {
     #[test]
     fn stale_temps_are_swept_and_fresh_ones_spared() {
         let root = temp_root();
-        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
-        let dir = guard.dir_path().to_path_buf();
+        // A first incarnation creates the runtime directory, then "crashes"
+        // (drop releases the lock), stranding the temps a predecessor would.
+        let dir = {
+            let guard = InstanceGuard::acquire(Some(root.path())).expect("first acquire");
+            guard.dir_path().to_path_buf()
+        };
 
         let stale = dir.join(format!(".{CONNECTION_FILE_NAME}.99999.deadbeef.tmp"));
         std::fs::write(&stale, b"stranded").expect("write stale");
@@ -955,11 +1060,14 @@ mod tests {
             .set_modified(SystemTime::now() - Duration::from_secs(3600))
             .expect("backdate");
 
-        guard.publish(9999, "mc-host/test").expect("publish");
+        // The successor sweeps at lock acquisition — before any publish — so
+        // a crash-loop that never reaches publish still reclaims temps.
+        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
 
         assert!(!stale.exists(), "a stale temp must be swept");
         assert!(fresh.exists(), "an in-flight temp must be spared");
         assert!(unrelated.exists(), "age alone must not condemn other files");
+        guard.publish(9999, "mc-host/test").expect("publish");
         assert!(published(&guard).exists(), "publication must still land");
     }
 
