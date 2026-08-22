@@ -907,8 +907,15 @@ async fn a_routed_depth_nine_request_is_a_schema_violation() {
 async fn a_body_above_resident_capacity_is_a_permanent_size_violation() {
     let engine = DeterministicEngine::new();
     let limits = SynapseLimits {
-        // Make a ~30 MiB query protocol-valid so the resident reservation is
-        // the rejecting rule rather than the text bound.
+        // The scratch pool funds only the parse reservation (the body is
+        // charged to the ingress pool), so a body is unservable only when
+        // its reservation alone exceeds the fixed scratch ceiling. At
+        // default limits that can never happen — the worst-case reservation
+        // is sized to fit — so this config inflates the per-item term: an
+        // absurd item cap lets the body-derived item bound (~one item per
+        // 64 body bytes at 640 bytes of headroom each) push a ~12 MiB
+        // body's reservation past the ~96 MiB scratch pool.
+        max_batch_items: 10_000_000,
         max_text_bytes: 30 * 1024 * 1024,
         ..SynapseLimits::default()
     };
@@ -923,7 +930,7 @@ async fn a_body_above_resident_capacity_is_a_permanent_size_violation() {
     let lane = test_lane();
 
     let mut params = constraints(&lane);
-    params["text"] = "x".repeat(30 * 1024 * 1024).into();
+    params["text"] = "x".repeat(12 * 1024 * 1024).into();
     let frame = call(&mut client, channel, epoch, "embed.query", params).await;
     // Permanent, not retryable: draining traffic can never free enough,
     // because the requirement is above the pool's ceiling, not its level.

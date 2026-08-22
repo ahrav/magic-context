@@ -801,17 +801,17 @@ impl CompositeComponent for SynapseComponent {
         else {
             return app_error("queue_full", "the parse reservation bound is unsatisfiable");
         };
-        // The body's own charge stays held for the whole handler run, so the
-        // pool must cover it and the reservation at once. When that total is
-        // above the ceiling no amount of draining can ever admit this body,
-        // and reporting the permanent condition as `queue_full` would have
-        // clients retry it forever — so it is a size rejection instead.
-        let required = reservation_bytes.saturating_add(ctx.body.len());
+        // The scratch pool funds only the parse reservation — the body's own
+        // charge lives in the ingress pool, held since frame admission — so
+        // the reservation alone is measured against this ceiling. When it
+        // exceeds the ceiling no amount of draining can ever admit this
+        // body, and reporting the permanent condition as `queue_full` would
+        // have clients retry it forever — so it is a size rejection instead.
         let capacity = ctx.resident_capacity();
-        if required > capacity {
+        if reservation_bytes > capacity {
             return request_error(protocol::unservable_body_error(
                 ctx.body.len(),
-                required,
+                reservation_bytes,
                 capacity,
             ));
         }
