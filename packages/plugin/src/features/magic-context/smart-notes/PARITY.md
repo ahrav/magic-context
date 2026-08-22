@@ -18,6 +18,56 @@ state authorities:
 - `runCompiledSmartNoteCheck` remains the only execution entry point for general compiled conditions in both modes. The Rust authority never executes note-authored code; it recomputes the canonical artifact digest (condition, code, manifest, cron separated by NUL bytes, SHA-256) from its authoritative condition before persisting any compile outcome.
 - Worker transport: `evaluator-worker.ts` polls `note.evaluation.next` (protocol 2.0, zero wait) over a dedicated transport connection. It deliberately holds no process-wide QuickJS slot reservation across a claim: each sandbox execution serializes itself for exactly its own window, so a claim lease (minutes) never pins the shared sandbox slot across an LLM round-trip and one project's claim cannot stall another project's sweep. Registration is boot-ephemeral: module restart, route teardown, or heartbeat expiry withdraws availability, and conditioned `ctx_note` writes fail closed without a live protocol-2.0 registration.
 
+### Fair selection cycles
+
+The Rust authority owns multi-acquisition phase fairness through bounded
+selection cycles scoped to one `(registration, slot, mode)`:
+
+- A full-budget cycle grants fresh-claim quotas of 10 due, 5 compile, 3
+  liveness, and 3 fallback, in that order. An `exclude_billable` (nonbillable)
+  cycle exposes only due and liveness with quotas of 10 and 10. Empty phases
+  and exhausted quotas advance to the next phase; once a phase is passed,
+  newly eligible earlier-phase work waits for the next cycle, matching the
+  legacy one-pass sweep shape.
+- Cycle state is boot-ephemeral and lives on the registration slot. It
+  survives interrupted drains, deadlines, and transport failures; unregister,
+  lease expiry, route teardown, replacement registration, or process restart
+  discards it. Restart-spanning fairness is out of scope.
+- The cursor advances exactly once per fresh committed claim and resets only
+  on a fresh durable `no_work`. Replayed claims, recovered slot claims,
+  replayed `no_work`, `busy`, expiry, terminal replay, invalid identity,
+  authority change, and store failures leave it unchanged, so acquisition
+  replay stays idempotent.
+- A fresh `no_work` distinguishes its two causes so the client never mistakes a
+  spent cursor for an empty queue. When the carried cursor found nothing but a
+  fresh cursor over the same snapshot would have, the response carries
+  `cycle_exhausted: true` and the cursor has already been reset; otherwise
+  nothing is eligible for that mode right now. The cause is part of the durable
+  acquisition decision, so a response-loss retry replays the same
+  `cycle_exhausted` answer instead of downgrading to a plain drained queue. A
+  drain treats only the plain answer as a drained queue, and consumes one
+  `cycle_exhausted` before it has claimed anything — so a cursor left spent or
+  mid-cycle by a deadline-truncated drain costs the next drain one poll rather
+  than its whole pass, while a drain that spent its own cycle still stops at
+  that boundary instead of collecting a second set of phase quotas.
+- Fallback selection is deterministic in both authorities: unchecked notes
+  first, then oldest `last_checked_at`, then note ID, and a cycle never claims
+  the same fallback note twice (bounded in-cycle exclusion). Together these
+  let every fallback note eventually receive a confirmation opportunity while
+  false completions keep committing.
+- Fixture ownership: the generated golden (`smart-note-evaluation-golden.json`)
+  characterizes lifecycle transitions and the individual one-phase selectors,
+  including fallback ordering and the named liveness quota. The hand-authored
+  `cycle_trace_cases` in `smart-note-evaluation-normative.json` are the oracle
+  for the stateful cycle policy (quotas, ordering across phases, exclusion,
+  replay/reset rules) and are written from the requirements, never generated
+  from either selector.
+- The worker's client-side caps and duplicate-fallback guard remain as
+  defenses against recovered claims (including a billable claim recovered by a
+  nonbillable drain, which it abandons) and malformed authorities; normal
+  quota exhaustion is answered authority-side with `no_work` instead of an
+  over-cap claim-and-abandon.
+
 ### Downgrade / rollback provenance
 
 The v51 store migration installs a persistent note-writer fence backed by the

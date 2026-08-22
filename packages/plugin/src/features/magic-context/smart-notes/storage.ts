@@ -178,5 +178,11 @@ export function getFallbackSmartNotes(
 ): SmartNoteCheckNote[] {
     return eligibleSmartNotes(db, projectPath, retinaHandoff)
         .filter((note) => note.checkStatus === "fallback")
+        .sort(
+            (a, b) =>
+                Number(a.lastCheckedAt !== null) - Number(b.lastCheckedAt !== null) ||
+                (a.lastCheckedAt ?? 0) - (b.lastCheckedAt ?? 0) ||
+                a.id - b.id,
+        )
         .slice(0, Math.max(1, limit));
 }

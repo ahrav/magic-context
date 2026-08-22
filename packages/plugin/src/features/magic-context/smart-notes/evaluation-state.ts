@@ -23,6 +23,7 @@ import {
 
 export const MAX_COMPILE_PER_RUN = 5;
 export const MAX_FALLBACK_PER_RUN = 3;
+export const MAX_LIVENESS_PER_RUN = 3;
 export const MAX_COMPILATION_FAILURES = 3;
 export const MAX_FAILURES_BEFORE_REAUTHOR = 3;
 

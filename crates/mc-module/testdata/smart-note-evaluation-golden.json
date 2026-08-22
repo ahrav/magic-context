@@ -14,6 +14,7 @@
     "liveness_recheck_ms": 86400000,
     "max_compile_per_run": 5,
     "max_fallback_per_run": 3,
+    "max_liveness_per_run": 3,
     "max_compilation_failures": 3,
     "default_max_checks": 10,
     "max_failures_before_reauthor": 3,
@@ -1788,6 +1789,43 @@
       ],
       "expected_ids": [
         1,
+        3,
+        4
+      ]
+    },
+    {
+      "id": "fallback_orders_unchecked_then_oldest_checked_then_id",
+      "phase": "fallback",
+      "now": 1781542800000,
+      "limit": 3,
+      "retina_handoff": false,
+      "notes": [
+        {
+          "id": 1,
+          "check_status": "fallback",
+          "check_failure_count": 3,
+          "last_checked_at": 1781542799000
+        },
+        {
+          "id": 2,
+          "check_status": "fallback",
+          "check_failure_count": 3
+        },
+        {
+          "id": 3,
+          "check_status": "fallback",
+          "check_failure_count": 3,
+          "last_checked_at": 1781542795000
+        },
+        {
+          "id": 4,
+          "check_status": "fallback",
+          "check_failure_count": 3,
+          "last_checked_at": 1781542795000
+        }
+      ],
+      "expected_ids": [
+        2,
         3,
         4
       ]

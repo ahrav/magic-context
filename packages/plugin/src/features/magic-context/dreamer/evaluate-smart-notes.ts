@@ -14,6 +14,7 @@ import {
     lifecycleStateFromNote,
     MAX_COMPILE_PER_RUN,
     MAX_FALLBACK_PER_RUN,
+    MAX_LIVENESS_PER_RUN,
     reduceSmartNoteEvaluation,
     type SmartNoteReduction,
 } from "../smart-notes/evaluation-state";
@@ -230,7 +231,7 @@ export async function evaluateSmartNotes(
             args.db,
             args.projectIdentity,
             Date.now(),
-            MAX_FALLBACK_PER_RUN,
+            MAX_LIVENESS_PER_RUN,
             args.retinaHandoff,
         );
         for (const note of stale) {

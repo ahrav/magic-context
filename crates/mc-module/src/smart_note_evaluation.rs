@@ -28,6 +28,10 @@ pub const SMART_NOTE_CHECK_LIVENESS_RECHECK_MS: i64 = 24 * 60 * 60 * 1000;
 pub const MAX_COMPILE_PER_RUN: usize = 5;
 /// Fallback-phase selection cap per evaluation run.
 pub const MAX_FALLBACK_PER_RUN: usize = 3;
+/// Liveness-phase fresh-claim quota per full selection cycle.
+pub(crate) const MAX_LIVENESS_PER_RUN: usize = 3;
+/// Due- and liveness-phase fresh-claim quotas per nonbillable selection cycle.
+const NONBILLABLE_PHASE_QUOTA: usize = 10;
 /// Consecutive compilation failures before a note enters fallback.
 pub const MAX_COMPILATION_FAILURES: i64 = 3;
 /// Consecutive check failures before a compiled note needs reauthoring.
@@ -686,6 +690,9 @@ pub struct SmartNoteSelectionSnapshot {
     /// Only artifact PRESENCE affects selection, so the snapshot avoids copying
     /// the artifact body for every pending note on every acquisition poll.
     pub has_compiled_check: bool,
+    /// Fallback rotation key: unchecked notes sort ahead of checked ones,
+    /// then least-recently checked first.
+    pub last_checked_at: Option<i64>,
     pub check_status: String,
     pub check_quarantined_until: Option<i64>,
     pub check_next_due_at: Option<i64>,
@@ -775,7 +782,9 @@ pub fn get_stale_compiled_smart_notes(
     selected
 }
 
-/// Fallback-status notes in input order.
+/// Fallback-status notes ordered unchecked-first, then oldest
+/// `last_checked_at`, then note ID. A repeatedly-false note therefore rotates
+/// behind notes that have not yet received a confirmation opportunity.
 pub fn get_fallback_smart_notes(
     notes: &[SmartNoteSelectionSnapshot],
     limit: usize,
@@ -785,66 +794,158 @@ pub fn get_fallback_smart_notes(
         .iter()
         .filter(|note| eligible(note, retina_handoff) && note.check_status == "fallback")
         .collect();
+    selected.sort_by_key(|note| {
+        (
+            note.last_checked_at.is_some(),
+            note.last_checked_at.unwrap_or(0),
+            note.id,
+        )
+    });
     selected.truncate(limit.max(1));
     selected
 }
 
-/// Evaluator polls prioritize due checks over compilation, liveness, and
-/// fallback.
-pub fn select_next_smart_note_evaluation(
-    notes: &[SmartNoteSelectionSnapshot],
-    now: i64,
-    retina_handoff: bool,
-) -> Option<(i64, String)> {
-    fn first(selected: &[&SmartNoteSelectionSnapshot], phase: &str) -> Option<(i64, String)> {
-        selected.first().map(|note| (note.id, phase.to_string()))
-    }
-    first(
-        &get_due_compiled_smart_note_checks(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
-        "due",
-    )
-    .or_else(|| {
-        first(
-            &get_smart_notes_needing_compilation(notes, now, MAX_COMPILE_PER_RUN, retina_handoff),
-            "compile",
-        )
-    })
-    .or_else(|| {
-        first(
-            &get_stale_compiled_smart_notes(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
-            "liveness",
-        )
-    })
-    .or_else(|| {
-        first(
-            &get_fallback_smart_notes(notes, MAX_FALLBACK_PER_RUN, retina_handoff),
-            "fallback",
-        )
-    })
+// ---------------------------------------------------------------------------
+// Selection cycles: the fair multi-acquisition policy. The stateful cycle
+// behavior is specified by the hand-authored traces in
+// testdata/smart-note-evaluation-normative.json, not by the generated golden.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SmartNoteCycleMode {
+    /// Full-budget drain: due, compile, liveness, fallback (10/5/3/3).
+    Full,
+    /// `exclude_billable` drain: sandbox-only due and liveness (10/10).
+    /// Compile and fallback claims launch LLM prompts and belong to the
+    /// scheduled full-budget drain.
+    Nonbillable,
 }
 
-/// Selection for polls that exclude billable work (`exclude_billable`): only
-/// the due and liveness phases, which execute the already-compiled check in
-/// the sandbox. Compile and fallback claims launch LLM prompts and belong to
-/// the scheduled full-budget drain.
-pub fn select_nonbillable_smart_note_evaluation(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmartNotePhase {
+    Due,
+    Compile,
+    Liveness,
+    Fallback,
+}
+
+impl SmartNotePhase {
+    fn name(self) -> &'static str {
+        match self {
+            SmartNotePhase::Due => "due",
+            SmartNotePhase::Compile => "compile",
+            SmartNotePhase::Liveness => "liveness",
+            SmartNotePhase::Fallback => "fallback",
+        }
+    }
+}
+
+const FULL_CYCLE_PROFILE: &[(SmartNotePhase, usize)] = &[
+    (SmartNotePhase::Due, DEFAULT_MAX_DUE_CHECKS),
+    (SmartNotePhase::Compile, MAX_COMPILE_PER_RUN),
+    (SmartNotePhase::Liveness, MAX_LIVENESS_PER_RUN),
+    (SmartNotePhase::Fallback, MAX_FALLBACK_PER_RUN),
+];
+const NONBILLABLE_CYCLE_PROFILE: &[(SmartNotePhase, usize)] = &[
+    (SmartNotePhase::Due, NONBILLABLE_PHASE_QUOTA),
+    (SmartNotePhase::Liveness, NONBILLABLE_PHASE_QUOTA),
+];
+
+/// Boot-ephemeral fair-selection position for one (registration, slot, mode).
+///
+/// A cycle prefers earlier phases but grants each phase a bounded number of
+/// fresh claims. The caller commits the proposed successor only after the
+/// store durably commits a fresh claim, and resets the cycle only after a
+/// fresh durable `no_work`, so replays, recovery, and failures never move the
+/// cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SmartNoteSelectionCycle {
+    mode: SmartNoteCycleMode,
+    /// Position in the mode profile. Phases before it are passed for this
+    /// cycle: work that becomes eligible for an earlier phase waits for the
+    /// next cycle, matching the legacy one-pass sweep shape.
+    phase_index: usize,
+    /// Fresh claims left for the current phase.
+    remaining: usize,
+    /// Fallback notes already claimed in this cycle, bounded by the fallback
+    /// quota. A false or abandoned fallback note stays eligible in the store,
+    /// so without this exclusion the deterministic ordering would hand the
+    /// same note back before later fallback notes get an opportunity.
+    attempted_fallback: Vec<i64>,
+}
+
+impl SmartNoteSelectionCycle {
+    pub(crate) fn new(mode: SmartNoteCycleMode) -> Self {
+        Self {
+            mode,
+            phase_index: 0,
+            remaining: cycle_profile(mode)[0].1,
+            attempted_fallback: Vec::new(),
+        }
+    }
+}
+
+fn cycle_profile(mode: SmartNoteCycleMode) -> &'static [(SmartNotePhase, usize)] {
+    match mode {
+        SmartNoteCycleMode::Full => FULL_CYCLE_PROFILE,
+        SmartNoteCycleMode::Nonbillable => NONBILLABLE_CYCLE_PROFILE,
+    }
+}
+
+/// One fresh selection under `cycle`: the chosen `(note_id, phase)` plus the
+/// proposed successor cycle. Empty phases and exhausted quotas advance to the
+/// next phase without spending their quotas elsewhere. `None` means the cycle
+/// is spent or nothing is eligible; the store records that as `no_work` and
+/// the caller answers a FRESH `no_work` by resetting this mode's cycle.
+pub(crate) fn select_smart_note_evaluation_cycle(
     notes: &[SmartNoteSelectionSnapshot],
     now: i64,
     retina_handoff: bool,
-) -> Option<(i64, String)> {
-    fn first(selected: &[&SmartNoteSelectionSnapshot], phase: &str) -> Option<(i64, String)> {
-        selected.first().map(|note| (note.id, phase.to_string()))
+    cycle: &SmartNoteSelectionCycle,
+) -> Option<(i64, String, SmartNoteSelectionCycle)> {
+    let profile = cycle_profile(cycle.mode);
+    for (index, &(phase, quota)) in profile.iter().enumerate().skip(cycle.phase_index) {
+        let remaining = if index == cycle.phase_index {
+            cycle.remaining
+        } else {
+            quota
+        };
+        if remaining == 0 {
+            continue;
+        }
+        let selected = match phase {
+            SmartNotePhase::Due => {
+                get_due_compiled_smart_note_checks(notes, now, 1, retina_handoff)
+                    .first()
+                    .map(|note| note.id)
+            }
+            SmartNotePhase::Compile => {
+                get_smart_notes_needing_compilation(notes, now, 1, retina_handoff)
+                    .first()
+                    .map(|note| note.id)
+            }
+            SmartNotePhase::Liveness => {
+                get_stale_compiled_smart_notes(notes, now, 1, retina_handoff)
+                    .first()
+                    .map(|note| note.id)
+            }
+            SmartNotePhase::Fallback => {
+                get_fallback_smart_notes(notes, notes.len(), retina_handoff)
+                    .into_iter()
+                    .find(|note| !cycle.attempted_fallback.contains(&note.id))
+                    .map(|note| note.id)
+            }
+        };
+        let Some(note_id) = selected else { continue };
+        let mut next = cycle.clone();
+        next.phase_index = index;
+        next.remaining = remaining - 1;
+        if phase == SmartNotePhase::Fallback {
+            next.attempted_fallback.push(note_id);
+        }
+        return Some((note_id, phase.name().to_string(), next));
     }
-    first(
-        &get_due_compiled_smart_note_checks(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
-        "due",
-    )
-    .or_else(|| {
-        first(
-            &get_stale_compiled_smart_notes(notes, now, DEFAULT_MAX_DUE_CHECKS, retina_handoff),
-            "liveness",
-        )
-    })
+    None
 }
 
 #[cfg(test)]
@@ -877,6 +978,7 @@ mod tests {
         liveness_recheck_ms: i64,
         max_compile_per_run: usize,
         max_fallback_per_run: usize,
+        max_liveness_per_run: usize,
         max_compilation_failures: i64,
         default_max_checks: usize,
         max_failures_before_reauthor: i64,
@@ -931,6 +1033,7 @@ mod tests {
         compile_status: Option<String>,
         created_at: Option<i64>,
         compiled_check: Option<String>,
+        last_checked_at: Option<i64>,
         check_status: Option<String>,
         check_quarantined_until: Option<i64>,
         check_next_due_at: Option<i64>,
@@ -949,6 +1052,7 @@ mod tests {
             // The fixture records the artifact itself; selection only observes
             // presence, so map it here rather than changing the frozen fixture.
             has_compiled_check: note.compiled_check.is_some(),
+            last_checked_at: note.last_checked_at,
             check_status: note
                 .check_status
                 .clone()
@@ -1012,6 +1116,7 @@ mod tests {
         assert_eq!(SMART_NOTE_CHECK_LIVENESS_RECHECK_MS, c.liveness_recheck_ms);
         assert_eq!(MAX_COMPILE_PER_RUN, c.max_compile_per_run);
         assert_eq!(MAX_FALLBACK_PER_RUN, c.max_fallback_per_run);
+        assert_eq!(MAX_LIVENESS_PER_RUN, c.max_liveness_per_run);
         assert_eq!(MAX_COMPILATION_FAILURES, c.max_compilation_failures);
         assert_eq!(DEFAULT_MAX_DUE_CHECKS, c.default_max_checks);
         assert_eq!(MAX_FAILURES_BEFORE_REAUTHOR, c.max_failures_before_reauthor);
@@ -1239,10 +1344,15 @@ mod tests {
                     0,
                     1,
                     |notes| {
-                        notes
-                            .iter()
-                            .find(|note| note.id == note_id)
-                            .map(|note| (note.id, "due".to_string()))
+                        notes.iter().find(|note| note.id == note_id).map_or(
+                            mc_store::NoteEvalSelection::NoWork {
+                                cycle_exhausted: false,
+                            },
+                            |note| mc_store::NoteEvalSelection::Claim {
+                                note_id: note.id,
+                                phase: "due".to_string(),
+                            },
+                        )
                     },
                     10,
                 )
@@ -1461,10 +1571,11 @@ mod tests {
     }
 
     // The golden fixtures exercise each phase selector in isolation; this pins
-    // the composed priority chain itself so an ordering regression cannot slip
-    // past the fixture replay.
+    // phase precedence inside one fresh cycle so an ordering regression cannot
+    // slip past the fixture replay. The full stateful cycle behavior is owned
+    // by the hand-authored normative traces.
     #[test]
-    fn phase_selection_prefers_due_then_compile_then_liveness_then_fallback() {
+    fn cycle_selection_prefers_due_then_compile_then_liveness_then_fallback() {
         let now: i64 = 1_781_542_800_000;
         let base = SmartNoteSelectionSnapshot {
             id: 0,
@@ -1472,6 +1583,7 @@ mod tests {
             compile_status: None,
             created_at: 1,
             has_compiled_check: false,
+            last_checked_at: None,
             check_status: "uncompiled".to_string(),
             check_quarantined_until: None,
             check_next_due_at: None,
@@ -1504,45 +1616,236 @@ mod tests {
             has_compiled_check: true,
             ..base.clone()
         };
+        let full = SmartNoteSelectionCycle::new(SmartNoteCycleMode::Full);
+        let nonbillable = SmartNoteSelectionCycle::new(SmartNoteCycleMode::Nonbillable);
+        let pick = |notes: &[SmartNoteSelectionSnapshot],
+                    cycle: &SmartNoteSelectionCycle|
+         -> Option<(i64, String)> {
+            select_smart_note_evaluation_cycle(notes, now, false, cycle)
+                .map(|(id, phase, _)| (id, phase))
+        };
         let all = [
             fallback.clone(),
             liveness.clone(),
             compile.clone(),
             due.clone(),
         ];
-        assert_eq!(
-            select_next_smart_note_evaluation(&all, now, false),
-            Some((1, "due".to_string()))
-        );
+        assert_eq!(pick(&all, &full), Some((1, "due".to_string())));
         let no_due = [fallback.clone(), liveness.clone(), compile.clone()];
-        assert_eq!(
-            select_next_smart_note_evaluation(&no_due, now, false),
-            Some((2, "compile".to_string()))
-        );
+        assert_eq!(pick(&no_due, &full), Some((2, "compile".to_string())));
         let no_compile = [fallback.clone(), liveness];
+        assert_eq!(pick(&no_compile, &full), Some((3, "liveness".to_string())));
         assert_eq!(
-            select_next_smart_note_evaluation(&no_compile, now, false),
-            Some((3, "liveness".to_string()))
-        );
-        assert_eq!(
-            select_next_smart_note_evaluation(&[fallback.clone()], now, false),
+            pick(std::slice::from_ref(&fallback), &full),
             Some((4, "fallback".to_string()))
         );
-        assert_eq!(select_next_smart_note_evaluation(&[], now, false), None);
+        assert_eq!(pick(&[], &full), None);
 
-        // The nonbillable selection never hands out compile or fallback work
-        // and still reaches liveness past a compile candidate.
+        // The nonbillable cycle never hands out compile or fallback work and
+        // still reaches liveness past a compile candidate.
+        assert_eq!(pick(&all, &nonbillable), Some((1, "due".to_string())));
         assert_eq!(
-            select_nonbillable_smart_note_evaluation(&all, now, false),
-            Some((1, "due".to_string()))
-        );
-        assert_eq!(
-            select_nonbillable_smart_note_evaluation(&no_due, now, false),
+            pick(&no_due, &nonbillable),
             Some((3, "liveness".to_string()))
         );
-        assert_eq!(
-            select_nonbillable_smart_note_evaluation(&[fallback, compile], now, false),
-            None
+        assert_eq!(pick(&[fallback, compile], &nonbillable), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Normative cycle traces: the intentional multi-acquisition policy
+    // oracle, hand-authored from R1-R7 of the fair-selection contract.
+    // ------------------------------------------------------------------
+
+    #[derive(Deserialize)]
+    struct NormativeCycleTraces {
+        cycle_trace_cases: Vec<CycleTraceCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct CycleTraceCase {
+        id: String,
+        mode: String,
+        now: i64,
+        #[serde(default)]
+        retina_handoff: bool,
+        notes: Vec<CycleNoteSeed>,
+        steps: Vec<CycleStep>,
+    }
+
+    #[derive(Deserialize)]
+    struct CycleNoteSeed {
+        id: i64,
+        status: Option<String>,
+        compile_status: Option<String>,
+        created_at: Option<i64>,
+        #[serde(default)]
+        has_compiled_check: bool,
+        last_checked_at: Option<i64>,
+        check_status: Option<String>,
+        check_quarantined_until: Option<i64>,
+        check_next_due_at: Option<i64>,
+        check_false_since_at: Option<i64>,
+        check_last_liveness_at: Option<i64>,
+        policy_version: Option<i64>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CycleExpectation {
+        NoWork(String),
+        Claim { note_id: i64, phase: String },
+    }
+
+    /// One fresh acquisition. A claim removes the note from the eligible pool
+    /// until an `after` patch touches it (the patch models the committed
+    /// completion row and returns the note to the pool); a bare `{}` patch
+    /// models an abandon that released the claim without changing the row.
+    #[derive(Deserialize)]
+    struct CycleStep {
+        expect: CycleExpectation,
+        #[serde(default)]
+        after: Vec<CyclePatch>,
+    }
+
+    #[derive(Deserialize)]
+    struct CyclePatch {
+        note_id: i64,
+        #[serde(default)]
+        set: serde_json::Map<String, serde_json::Value>,
+    }
+
+    fn cycle_seed_snapshot(seed: &CycleNoteSeed, now: i64) -> SmartNoteSelectionSnapshot {
+        SmartNoteSelectionSnapshot {
+            id: seed.id,
+            status: seed.status.clone().unwrap_or_else(|| "pending".to_string()),
+            compile_status: seed.compile_status.clone(),
+            created_at: seed.created_at.unwrap_or(now - 1_000_000),
+            has_compiled_check: seed.has_compiled_check,
+            last_checked_at: seed.last_checked_at,
+            check_status: seed
+                .check_status
+                .clone()
+                .unwrap_or_else(|| "uncompiled".to_string()),
+            check_quarantined_until: seed.check_quarantined_until,
+            check_next_due_at: seed.check_next_due_at,
+            check_false_since_at: seed.check_false_since_at,
+            check_last_liveness_at: seed.check_last_liveness_at,
+            policy_version: seed.policy_version.unwrap_or(1),
+        }
+    }
+
+    fn apply_cycle_patch(note: &mut SmartNoteSelectionSnapshot, patch: &CyclePatch, case: &str) {
+        let as_i64 = |value: &serde_json::Value| {
+            value.as_i64().unwrap_or_else(|| {
+                panic!(
+                    "case {case}: patch value {value} for note {} must be an integer",
+                    note.id
+                )
+            })
+        };
+        for (key, value) in &patch.set {
+            match key.as_str() {
+                "status" => note.status = value.as_str().expect("status string").to_string(),
+                "check_status" => {
+                    note.check_status = value.as_str().expect("check_status string").to_string()
+                }
+                "has_compiled_check" => {
+                    note.has_compiled_check = value.as_bool().expect("has_compiled_check bool")
+                }
+                "last_checked_at" => note.last_checked_at = Some(as_i64(value)),
+                "check_next_due_at" => note.check_next_due_at = Some(as_i64(value)),
+                "check_false_since_at" => note.check_false_since_at = Some(as_i64(value)),
+                "check_last_liveness_at" => note.check_last_liveness_at = Some(as_i64(value)),
+                other => panic!("case {case}: unsupported patch field {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn smart_note_cycle_traces_normative_matches_selection_policy() {
+        let raw = include_str!("../testdata/smart-note-evaluation-normative.json");
+        let normative: NormativeCycleTraces =
+            serde_json::from_str(raw).expect("parse normative cycle traces");
+        assert!(
+            !normative.cycle_trace_cases.is_empty(),
+            "normative fixture must carry cycle traces"
         );
+
+        for case in &normative.cycle_trace_cases {
+            let mode = match case.mode.as_str() {
+                "full" => SmartNoteCycleMode::Full,
+                "nonbillable" => SmartNoteCycleMode::Nonbillable,
+                other => panic!("case {}: unknown mode {other:?}", case.id),
+            };
+            let mut pool: Vec<(SmartNoteSelectionSnapshot, bool)> = case
+                .notes
+                .iter()
+                .map(|seed| (cycle_seed_snapshot(seed, case.now), false))
+                .collect();
+            let mut cycle = SmartNoteSelectionCycle::new(mode);
+            for (step_index, step) in case.steps.iter().enumerate() {
+                let visible: Vec<SmartNoteSelectionSnapshot> = pool
+                    .iter()
+                    .filter(|(_, claimed)| !claimed)
+                    .map(|(note, _)| note.clone())
+                    .collect();
+                let selection = select_smart_note_evaluation_cycle(
+                    &visible,
+                    case.now,
+                    case.retina_handoff,
+                    &cycle,
+                );
+                match &step.expect {
+                    CycleExpectation::NoWork(marker) => {
+                        assert_eq!(marker, "no_work", "case {} step {step_index}", case.id);
+                        assert_eq!(
+                            selection
+                                .as_ref()
+                                .map(|(id, phase, _)| (*id, phase.clone())),
+                            None,
+                            "case {} step {step_index} expected no_work",
+                            case.id
+                        );
+                        // A fresh durable no_work resets this mode's cycle.
+                        cycle = SmartNoteSelectionCycle::new(mode);
+                    }
+                    CycleExpectation::Claim { note_id, phase } => {
+                        let (selected_id, selected_phase, proposal) =
+                            selection.unwrap_or_else(|| {
+                                panic!(
+                                    "case {} step {step_index} expected ({note_id}, {phase}), got no_work",
+                                    case.id
+                                )
+                            });
+                        assert_eq!(
+                            (selected_id, selected_phase.as_str()),
+                            (*note_id, phase.as_str()),
+                            "case {} step {step_index}",
+                            case.id
+                        );
+                        // A fresh committed claim installs the proposal and
+                        // holds the note out of the pool until completion.
+                        cycle = proposal;
+                        pool.iter_mut()
+                            .find(|(note, _)| note.id == selected_id)
+                            .expect("claimed note exists")
+                            .1 = true;
+                    }
+                }
+                for patch in &step.after {
+                    let entry = pool
+                        .iter_mut()
+                        .find(|(note, _)| note.id == patch.note_id)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "case {}: patch targets unknown note {}",
+                                case.id, patch.note_id
+                            )
+                        });
+                    apply_cycle_patch(&mut entry.0, patch, &case.id);
+                    entry.1 = false;
+                }
+            }
+        }
     }
 }

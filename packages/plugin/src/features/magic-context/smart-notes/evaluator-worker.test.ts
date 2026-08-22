@@ -399,9 +399,10 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         await w.dispose();
     });
 
-    test("a false fallback confirmation is not re-claimed within the same drain", async () => {
-        // Fallback selection has no next-due gate, so the authority hands the
-        // same still-pending note back on every poll after a false confirmation.
+    test("a malformed authority repeating one fallback note is bounded to one completion", async () => {
+        // The authority's in-cycle exclusion normally guarantees distinct
+        // fallback notes; this guard bounds a recovered claim or a malformed
+        // authority that replays the same note anyway.
         const { transport, calls } = stubTransport((method) => {
             if (method === "note.evaluation.register") return REGISTER_OK;
             if (method === "note.evaluation.next") return claimResponse(7, "fallback");
@@ -417,6 +418,119 @@ describe("SmartNoteEvaluatorWorker drain", () => {
         expect(result.abandoned).toBe(1);
         expect(calls.filter((c) => c.method === "note.evaluation.complete")).toHaveLength(1);
         expect(calls.filter((c) => c.method === "note.evaluation.abandon")).toHaveLength(1);
+        await w.dispose();
+    });
+
+    test("distinct fallback claims complete without defensive abandons", async () => {
+        // Authority-owned rotation hands out distinct notes; the duplicate
+        // guard must not stop valid later fallback claims.
+        let served = 0;
+        const { transport, calls } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                return served <= 3 ? claimResponse(served, "fallback") : { result: "no_work" };
+            }
+            if (method === "note.evaluation.complete")
+                return { result: "applied", status: "pending" };
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
+        expect(result).toEqual({
+            claimed: 3,
+            completed: 3,
+            abandoned: 0,
+            surfaced: 0,
+            drained: true,
+        });
+        expect(calls.filter((c) => c.method === "note.evaluation.abandon")).toHaveLength(0);
+        await w.dispose();
+    });
+
+    test("a cursor left spent by an earlier drain costs one poll, not the pass", async () => {
+        // A drain truncated by its deadline can leave the authority's cursor
+        // spent. The next drain's first poll reports cycle_exhausted (the
+        // authority resets the cursor in that same response), so this pass must
+        // poll again rather than report a drained queue and do nothing.
+        let served = 0;
+        const { transport } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                if (served === 1) return { result: "no_work", cycle_exhausted: true };
+                return served <= 3 ? claimResponse(served, "due") : { result: "no_work" };
+            }
+            if (method === "note.evaluation.complete")
+                return { result: "applied", status: "pending" };
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
+        expect(result).toEqual({
+            claimed: 2,
+            completed: 2,
+            abandoned: 0,
+            surfaced: 0,
+            drained: true,
+        });
+        await w.dispose();
+    });
+
+    test("a pass that spends its own cycle stops instead of taking a second one", async () => {
+        // Once this pass has claimed work the cursor is its own, so exhaustion
+        // is a real pass boundary: consuming it would hand out the phase quotas
+        // twice in one drain and defeat the billable per-run bounds.
+        let served = 0;
+        const { transport } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                return served <= 2
+                    ? claimResponse(served, "due")
+                    : { result: "no_work", cycle_exhausted: true };
+            }
+            if (method === "note.evaluation.complete")
+                return { result: "applied", status: "pending" };
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
+        expect(result).toEqual({
+            claimed: 2,
+            completed: 2,
+            abandoned: 0,
+            surfaced: 0,
+            drained: true,
+        });
+        // Two claims plus the boundary poll: the drain did not re-poll for a
+        // second cycle's worth of quota.
+        expect(served).toBe(3);
+        await w.dispose();
+    });
+
+    test("repeated cycle_exhausted answers cannot spin the drain", async () => {
+        // A malformed authority that always claims exhaustion must not turn the
+        // zero-claim retry into an unbounded poll loop.
+        let served = 0;
+        const { transport } = stubTransport((method) => {
+            if (method === "note.evaluation.register") return REGISTER_OK;
+            if (method === "note.evaluation.next") {
+                served += 1;
+                return { result: "no_work", cycle_exhausted: true };
+            }
+            return { ok: true };
+        });
+        const w = worker(transport);
+        const result = await w.drainOnce({ deadline: Date.now() + 30_000 });
+        expect(result).toEqual({
+            claimed: 0,
+            completed: 0,
+            abandoned: 0,
+            surfaced: 0,
+            drained: true,
+        });
+        expect(served).toBe(2);
         await w.dispose();
     });
 
@@ -609,6 +723,7 @@ const SERVER_ALLOWED_FIELDS: Record<EvaluatorMethod, readonly string[]> = {
         "evaluator_slot",
         "acquisition_id",
         "wait_ms",
+        "exclude_billable",
     ],
     "note.evaluation.renew": [
         "v",
@@ -670,6 +785,9 @@ describe("SmartNoteEvaluatorWorker wire schema conformance", () => {
         // body carrying a field outside the server's closed set.
         expect(w.registered).toBe(true);
         await w.drainOnce({ deadline: Date.now() + 5_000 });
+        // A nonbillable poll carries exclude_billable, which the module's
+        // closed field set for note.evaluation.next accepts.
+        await w.drainOnce({ deadline: Date.now() + 5_000, excludeBillable: true });
         expect(w.registered).toBe(true);
         await w.dispose();
 
@@ -680,6 +798,11 @@ describe("SmartNoteEvaluatorWorker wire schema conformance", () => {
         expect(seen.has("note.evaluation.next")).toBe(true);
         expect(seen.has("note.evaluation.complete")).toBe(true);
         expect(seen.has("note.evaluation.unregister")).toBe(true);
+        expect(
+            calls.some(
+                (c) => c.method === "note.evaluation.next" && c.body.exclude_billable === true,
+            ),
+        ).toBe(true);
 
         // The heartbeat/unregister fence must NOT carry evaluator_slot; the
         // claim-scoped fence must.

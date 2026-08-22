@@ -26,9 +26,6 @@ const resolve = (m: string) => Bun.resolveSync(m, pluginDir);
 const storage = await import(
     resolve("./src/features/magic-context/smart-notes/storage")
 );
-const storageNotes = await import(
-    resolve("./src/features/magic-context/storage-notes")
-);
 const schedule = await import(
     resolve("./src/features/magic-context/smart-notes/schedule")
 );
@@ -38,10 +35,10 @@ const types = await import(
 
 const {
     getDueCompiledSmartNoteChecks,
+    getFallbackSmartNotes,
     getSmartNotesNeedingCompilation,
     getStaleCompiledSmartNotes,
 } = storage;
-const { getPendingSmartNotes } = storageNotes;
 const { nextSmartNoteCheckDueAt } = schedule;
 const { parseSmartNoteManifest } = types;
 
@@ -258,6 +255,7 @@ const CONSTANTS = {
     // evaluate-smart-notes.ts private caps
     max_compile_per_run: 5,
     max_fallback_per_run: 3,
+    max_liveness_per_run: 3,
     max_compilation_failures: 3,
     // runner.ts private caps
     default_max_checks: 10,
@@ -1141,14 +1139,34 @@ selectionCase({
             status: "ready",
         },
     ],
-    // evaluate-smart-notes.ts: pendingNotes().filter(checkStatus === 'fallback').slice(0, 3)
-    select: (db) =>
-        getPendingSmartNotes(db, PROJECT)
-            .filter(
-                (note: { checkStatus: string | null }) =>
-                    note.checkStatus === "fallback",
-            )
-            .slice(0, 3),
+    select: (db) => getFallbackSmartNotes(db, PROJECT, 3),
+});
+selectionCase({
+    id: "fallback_orders_unchecked_then_oldest_checked_then_id",
+    phase: "fallback",
+    limit: 3,
+    notes: [
+        {
+            id: 1,
+            check_status: "fallback",
+            check_failure_count: 3,
+            last_checked_at: BASE - 1_000,
+        },
+        { id: 2, check_status: "fallback", check_failure_count: 3 },
+        {
+            id: 3,
+            check_status: "fallback",
+            check_failure_count: 3,
+            last_checked_at: BASE - 5_000,
+        },
+        {
+            id: 4,
+            check_status: "fallback",
+            check_failure_count: 3,
+            last_checked_at: BASE - 5_000,
+        },
+    ],
+    select: (db) => getFallbackSmartNotes(db, PROJECT, 3),
 });
 selectionCase({
     id: "fallback_retina_handoff_excluded",
@@ -1164,17 +1182,7 @@ selectionCase({
         },
         { id: 2, check_status: "fallback", check_failure_count: 3 },
     ],
-    select: (db) =>
-        getPendingSmartNotes(db, PROJECT)
-            .filter(
-                (note: {
-                    checkStatus: string | null;
-                    compileStatus: string | null;
-                }) =>
-                    note.compileStatus !== "compiled" &&
-                    note.checkStatus === "fallback",
-            )
-            .slice(0, 3),
+    select: (db) => getFallbackSmartNotes(db, PROJECT, 3, true),
 });
 
 // ---------------------------------------------------------------------------

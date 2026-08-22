@@ -123,6 +123,41 @@ describe("smart-note compilation selection", () => {
             closeQuietly(db);
         }
     });
+
+    test("fallback selection orders unchecked, then oldest last_checked_at, then id", () => {
+        const db = freshDb();
+        try {
+            const seed = (content: string) =>
+                addNote(db, "smart", {
+                    projectPath: PROJECT,
+                    content,
+                    surfaceCondition: "condition",
+                });
+            const recentlyChecked = seed("recently checked");
+            const unchecked = seed("unchecked");
+            const oldestChecked = seed("oldest checked");
+            const tiedWithOldest = seed("tied with oldest");
+            const stage = (id: number, lastCheckedAt: number | null) =>
+                setCheckColumns(db, id, {
+                    check_status: "fallback",
+                    check_failure_count: 3,
+                    last_checked_at: lastCheckedAt,
+                });
+            stage(recentlyChecked.id, 9_000);
+            stage(unchecked.id, null);
+            stage(oldestChecked.id, 5_000);
+            stage(tiedWithOldest.id, 5_000);
+
+            expect(getFallbackSmartNotes(db, PROJECT, 10).map((n) => n.id)).toEqual([
+                unchecked.id,
+                oldestChecked.id,
+                tiedWithOldest.id,
+                recentlyChecked.id,
+            ]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });
 
 describe("evaluateSmartNotes lease guard", () => {

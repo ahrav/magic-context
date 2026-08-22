@@ -2,7 +2,8 @@
     "schema": "smart-note-evaluation-normative",
     "provenance": {
         "authored": "hand-written from the Revision and Migration Contract in docs/plans/2026-08-19-0219-refactor-smart-note-evaluator-authority-boundary-plan.md",
-        "review": "expected rows derive from the plan's matrix, not from either store implementation"
+        "review": "expected rows derive from the plan's matrix, not from either store implementation",
+        "cycle_traces": "cycle_trace_cases are hand-authored from requirements R1-R7 of the smart-note fair-selection contract; a fresh claim removes the note from the pool until an `after` patch restores it with its committed row state, a bare patch models an abandon that leaves the row unchanged, and a fresh no_work resets the mode's cycle"
     },
     "revision_matrix_cases": [
         {
@@ -93,6 +94,1668 @@
             "event": "authority_transfer",
             "pre": { "source_revision": 3, "state_version": 9, "status_version": 9 },
             "expected": { "source_revision": 3, "state_version": 9, "status_version": 9 }
+        }
+    ],
+    "cycle_trace_cases": [
+        {
+            "id": "ae1_due_backlog_yields_compile_on_opportunity_11",
+            "mode": "full",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 1,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 2,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 3,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 4,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 5,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 6,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 7,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 8,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 9,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 10,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 11,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 12,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 13,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 14,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 15,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 16,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 17,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 18,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 19,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 20,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 21,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 22,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 23,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 24,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 25,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 26,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 100
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 1,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 1,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 2,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 2,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 3,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 3,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 4,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 4,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 5,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 5,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 6,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 6,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 7,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 7,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 8,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 8,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 9,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 9,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 10,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 10,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 100,
+                        "phase": "compile"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "ae2_full_cycle_runs_10_5_3_3_then_no_work_then_resets",
+            "mode": "full",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 1,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 2,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 3,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 4,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 5,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 6,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 7,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 8,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 9,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 10,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 11,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 12,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 21
+                },
+                {
+                    "id": 22
+                },
+                {
+                    "id": 23
+                },
+                {
+                    "id": 24
+                },
+                {
+                    "id": 25
+                },
+                {
+                    "id": 26
+                },
+                {
+                    "id": 27
+                },
+                {
+                    "id": 41,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 42,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 43,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 44,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 45,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 61,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 62,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 63,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 64,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 65,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 1,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 1,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 2,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 2,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 3,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 3,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 4,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 4,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 5,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 5,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 6,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 6,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 7,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 7,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 8,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 8,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 9,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 9,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 10,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 10,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 21,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 21,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 22,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 22,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 23,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 23,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 24,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 24,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 25,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 25,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 41,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 41,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 42,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 42,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 43,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 43,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 61,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 61,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 62,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 62,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 63,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 63,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": "no_work"
+                },
+                {
+                    "expect": {
+                        "note_id": 11,
+                        "phase": "due"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "ae3_nonbillable_reaches_liveness_on_opportunity_11_and_skips_billable_phases",
+            "mode": "nonbillable",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 1,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 2,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 3,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 4,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 5,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 6,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 7,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 8,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 9,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 10,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 11,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 12,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1749999999900
+                },
+                {
+                    "id": 21
+                },
+                {
+                    "id": 41,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 42,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 61,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 1,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 1,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 2,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 2,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 3,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 3,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 4,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 4,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 5,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 5,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 6,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 6,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 7,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 7,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 8,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 8,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 9,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 9,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 10,
+                        "phase": "due"
+                    },
+                    "after": [
+                        {
+                            "note_id": 10,
+                            "set": {
+                                "check_next_due_at": 1750003600000,
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 41,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 41,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 42,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 42,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": "no_work"
+                },
+                {
+                    "expect": {
+                        "note_id": 11,
+                        "phase": "due"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "nonbillable_liveness_quota_is_ten",
+            "mode": "nonbillable",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 1,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 2,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 3,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 4,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 5,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 6,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 7,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 8,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 9,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 10,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                },
+                {
+                    "id": 11,
+                    "check_status": "compiled",
+                    "has_compiled_check": true,
+                    "check_next_due_at": 1750003600000,
+                    "check_false_since_at": 1749391600000
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 1,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 1,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 2,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 2,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 3,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 3,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 4,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 4,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 5,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 5,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 6,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 6,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 7,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 7,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 8,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 8,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 9,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 9,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 10,
+                        "phase": "liveness"
+                    },
+                    "after": [
+                        {
+                            "note_id": 10,
+                            "set": {
+                                "check_last_liveness_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": "no_work"
+                },
+                {
+                    "expect": {
+                        "note_id": 11,
+                        "phase": "liveness"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "ae4_false_fallback_rotates_to_the_next_note_within_the_cycle",
+            "mode": "full",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 1,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 2,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 1,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 1,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 2,
+                        "phase": "fallback"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "fallback_unchanged_row_is_not_reclaimed_within_the_cycle",
+            "mode": "full",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 1,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 2,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 1,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 1
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 2,
+                        "phase": "fallback"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "ae5_unchecked_fourth_note_sorts_ahead_of_checked_notes_next_cycle",
+            "mode": "full",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 1,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 2,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 3,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                },
+                {
+                    "id": 4,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 1,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 1,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 2,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 2,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 3,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 3,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": "no_work"
+                },
+                {
+                    "expect": {
+                        "note_id": 4,
+                        "phase": "fallback"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "fallback_ordering_prefers_oldest_checked_and_ties_resolve_by_note_id",
+            "mode": "full",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 3,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000,
+                    "last_checked_at": 1749999999000
+                },
+                {
+                    "id": 5,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000,
+                    "last_checked_at": 1749999999000
+                },
+                {
+                    "id": 9,
+                    "check_status": "fallback",
+                    "check_next_due_at": 1750003600000,
+                    "last_checked_at": 1749999995000
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 9,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 9,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 3,
+                        "phase": "fallback"
+                    },
+                    "after": [
+                        {
+                            "note_id": 3,
+                            "set": {
+                                "last_checked_at": 1750000000000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 5,
+                        "phase": "fallback"
+                    }
+                }
+            ]
+        },
+        {
+            "id": "empty_earlier_phases_advance_without_spending_their_quotas",
+            "mode": "full",
+            "now": 1750000000000,
+            "notes": [
+                {
+                    "id": 21
+                },
+                {
+                    "id": 22
+                },
+                {
+                    "id": 23
+                },
+                {
+                    "id": 24
+                },
+                {
+                    "id": 25
+                },
+                {
+                    "id": 26
+                }
+            ],
+            "steps": [
+                {
+                    "expect": {
+                        "note_id": 21,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 21,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 22,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 22,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 23,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 23,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 24,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 24,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": {
+                        "note_id": 25,
+                        "phase": "compile"
+                    },
+                    "after": [
+                        {
+                            "note_id": 25,
+                            "set": {
+                                "check_status": "compiled",
+                                "has_compiled_check": true,
+                                "check_next_due_at": 1750003600000
+                            }
+                        }
+                    ]
+                },
+                {
+                    "expect": "no_work"
+                }
+            ]
         }
     ],
     "invariants": [
