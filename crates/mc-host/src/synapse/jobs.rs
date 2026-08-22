@@ -348,6 +348,11 @@ impl JobTable {
         }
         self.sweep_expired(&mut jobs, &mut released);
 
+        // A failed same-digest job the retry below replaces. Eviction is
+        // deferred until every admission check has passed: a retry that
+        // bounces off a full table (or an oversized result) must leave the
+        // stored failure pollable rather than losing it to a rejection.
+        let mut failed_replay = None;
         if let Some(seq) = jobs.by_key.get(&key).copied() {
             let job = jobs.by_seq.get(&seq).expect("keyed job exists");
             if job.payload_digest != digest {
@@ -357,10 +362,9 @@ impl JobTable {
             // failure exists so a poll can read the error, but an identical
             // re-submission is a retry. Returning `Existing` here would
             // hold the key hostage until expiry and make every retryable
-            // failure terminal within the retention window, so the failed
-            // job is evicted and the retry admitted fresh below.
+            // failure terminal within the retention window.
             if matches!(job.state, JobState::Failed { .. }) {
-                released.job(Self::remove(&mut jobs, seq));
+                failed_replay = Some(seq);
             } else {
                 return AdmitOutcome::Existing(JobDescriptor {
                     job_id: self.job_id(seq),
@@ -388,6 +392,13 @@ impl JobTable {
             // Queued and running work is never evicted to admit new work,
             // so a full admission class rejects instead.
             return AdmitOutcome::Full;
+        }
+
+        // Every check passed: the retry replaces the failed job. Removed
+        // before the insert below so the key's index entry is never
+        // clobbered for a job that still lives in the table.
+        if let Some(seq) = failed_replay {
+            released.job(Self::remove(&mut jobs, seq));
         }
 
         let seq = jobs.next_seq;
@@ -993,6 +1004,20 @@ mod tests {
             panic!("admitted");
         };
         jobs.publish_failed(seq, "internal_error".to_owned(), "worker died".to_owned());
+
+        // A retry that fails admission must not consume the stored failure:
+        // the same payload at an absurd dimension count is ResultTooLarge,
+        // and the failed job stays pollable under its key afterwards.
+        let mut rejected = budget.try_charge(job_bytes).expect("rejected charge");
+        assert!(matches!(
+            jobs.admit_charged(key.clone(), items.clone(), usize::MAX, &mut rejected),
+            AdmitOutcome::ResultTooLarge
+        ));
+        drop(rejected);
+        assert!(
+            jobs.key_is_retained(&key),
+            "a bounced retry leaves the failed job retained"
+        );
 
         let mut second = budget.try_charge(job_bytes).expect("recharge");
         let AdmitOutcome::Admitted { seq: retry_seq, .. } =
