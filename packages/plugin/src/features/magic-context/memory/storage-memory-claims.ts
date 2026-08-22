@@ -1425,9 +1425,14 @@ export interface UpdateMemoryContentClaimInput {
  * `recordAdoptedMemoryVerifiedEventInCurrentTransaction`: a row counts as
  * verified when the projection columns say so or the `memory_verifications`
  * side table carries a positive `verified_at` (the only place pre-v84
- * TypeScript verification writes). Duplicated locally because importing
- * claims-backfill here would form a runtime import cycle and break this
- * module's explicit-`.ts` import contract for the Node SQLite smoke script.
+ * TypeScript verification writes). An explicit projection revocation
+ * outranks stale side-table timestamps: 'stale'/'flagged' only exist as
+ * explicit writes, and revocation keeps `verified_at`, so 'unverified' with
+ * a positive `verified_at` is the withdrawn shape — the side-table fallback
+ * applies only to the untouched projection ('unverified' with no
+ * `verified_at`). Duplicated locally because importing claims-backfill here
+ * would form a runtime import cycle and break this module's explicit-`.ts`
+ * import contract for the Node SQLite smoke script.
  */
 function memoryRowHasPositiveVerification(
     db: Database,
@@ -1436,6 +1441,8 @@ function memoryRowHasPositiveVerification(
     if (row.verification_status === "verified" && row.verified_at !== null && row.verified_at > 0) {
         return true;
     }
+    if (row.verification_status !== "unverified") return false;
+    if (row.verified_at !== null && row.verified_at > 0) return false;
     const side = db
         .prepare(
             "SELECT MAX(verified_at) AS verifiedAt FROM memory_verifications WHERE memory_id = ?",

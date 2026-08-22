@@ -639,6 +639,85 @@ describe("memory/claims kernel: content and classification updates", () => {
         }
     });
 
+    test("a classification update after an explicit revocation does not re-record a verified event from stale side-table timestamps", () => {
+        const db = track(migratedDb());
+        for (const [prefix, revokedStatus] of [
+            ["revoked-stale", "stale"],
+            ["revoked-unverified", "unverified"],
+        ] as const) {
+            const seeded = createSeedMemory(db, `${prefix}-seed`, `${prefix} fact`);
+            // Kernel verify: positive side-table snapshot plus the projection
+            // verification columns.
+            runInMemoryClaimsWriteTransaction(db, () =>
+                replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                    db,
+                    envelope(`${prefix}-files`, { id: seeded.memoryId }),
+                    {
+                        memoryId: seeded.memoryId,
+                        files: ["src/compat.ts"],
+                        now: 2_000,
+                        verified: true,
+                    },
+                ),
+            );
+            runInMemoryClaimsWriteTransaction(db, () =>
+                updateMemoryVerificationWithClaimsInCurrentTransaction(
+                    db,
+                    envelope(`${prefix}-verify`, { id: seeded.memoryId }),
+                    { memoryId: seeded.memoryId, verificationStatus: "verified", nowMs: 2_000 },
+                ),
+            );
+            runInMemoryClaimsWriteTransaction(db, () =>
+                updateMemoryVerificationWithClaimsInCurrentTransaction(
+                    db,
+                    envelope(`${prefix}-revoke`, { id: seeded.memoryId }),
+                    { memoryId: seeded.memoryId, verificationStatus: revokedStatus, nowMs: 3_000 },
+                ),
+            );
+            // Revocation preconditions of the trap: the projection keeps its
+            // positive verified_at and the side-table rows stay positive.
+            expect(
+                db
+                    .prepare("SELECT verification_status, verified_at FROM memories WHERE id = ?")
+                    .get(seeded.memoryId),
+            ).toEqual({ verification_status: revokedStatus, verified_at: 2_000 });
+            expect(
+                count(
+                    db,
+                    "memory_verifications",
+                    `memory_id = ${seeded.memoryId} AND verified_at > 0`,
+                ),
+            ).toBe(1);
+
+            const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+                updateMemoryClassificationWithClaimsInCurrentTransaction(
+                    db,
+                    envelope(`${prefix}-classify`, { id: seeded.memoryId }),
+                    { memoryId: seeded.memoryId, importance: 90, nowMs: 4_000 },
+                ),
+            );
+            expect(outcome.result.revisionId).not.toBeNull();
+            // The revoked projection outranks the stale side-table timestamps:
+            // the appended revision carries no verified event and no evidence
+            // effect.
+            expect(
+                count(
+                    db,
+                    "verification_events",
+                    `revision_id = ${outcome.result.revisionId} AND outcome = 'verified'`,
+                ),
+            ).toBe(0);
+            expect(
+                count(
+                    db,
+                    "claim_change_outbox",
+                    `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'
+                     AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = '${prefix}-classify')`,
+                ),
+            ).toBe(0);
+        }
+    });
+
     test("a content update without a source session carries the row's session; a telemetry-only delta appends nothing", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "content-session-seed", "session default fact");
