@@ -625,37 +625,37 @@ fn classify(sample: EvidenceSample, lock_free: bool, freshness: &ProbeFreshness)
             Some(record),
         );
     }
-    if let Some(publication) = &publication {
-        if publication.daemon_id != record.daemon_id {
-            return wedged(
-                "publication daemon ID does not match the record",
-                Some(record),
-            );
-        }
-    }
-
     let (state, reason) = match record.phase {
         LifecyclePhase::Starting => {
+            // A publication under a foreign daemon ID is expected crash
+            // residue here: a SIGKILLed predecessor leaves its publication
+            // behind, and the successor writes its `starting` record before
+            // its own `publish` overwrites the file. Only a `running` claim
+            // requires the publication to match.
             if timestamp_fresh(record.written_at_ms, freshness.window) {
                 (LifecycleState::Starting, "starting record is fresh")
             } else {
                 (LifecycleState::Wedged, "starting record expired")
             }
         }
-        LifecyclePhase::Running => {
-            if publication.is_some() {
-                (
-                    LifecycleState::Running,
-                    "publication matches the running record",
-                )
-            } else {
-                (
-                    LifecycleState::Wedged,
-                    "running record without a publication",
-                )
-            }
-        }
+        LifecyclePhase::Running => match &publication {
+            Some(publication) if publication.daemon_id == record.daemon_id => (
+                LifecycleState::Running,
+                "publication matches the running record",
+            ),
+            Some(_) => (
+                LifecycleState::Wedged,
+                "publication daemon ID does not match the record",
+            ),
+            None => (
+                LifecycleState::Wedged,
+                "running record without a publication",
+            ),
+        },
         LifecyclePhase::Stopping => {
+            // Same crash-residue rule as `starting`: an incarnation that
+            // failed before publishing tears down past a predecessor's
+            // fenced-off publication without ever owning it.
             if timestamp_fresh(record.written_at_ms, freshness.window) {
                 (LifecycleState::Stopping, "stopping record is fresh")
             } else {
@@ -1065,6 +1065,45 @@ mod tests {
         assert_eq!(observed.state, LifecycleState::Stopped);
         assert!(observed.instance_lock_free);
         assert!(publication.exists(), "a probe must never unlink");
+    }
+
+    #[test]
+    fn fresh_starting_record_beside_a_crashed_predecessors_publication_is_starting() {
+        let root = temp_root();
+        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        guard
+            .write_lifecycle_record(LifecyclePhase::Starting)
+            .expect("starting");
+        // Plant a crashed predecessor's leftover: a well-formed publication
+        // under a foreign daemon ID, exactly what a SIGKILLed incarnation
+        // leaves behind for its successor to overwrite at `publish`.
+        guard.publish(43123, "mc-host/test").expect("publish");
+        let publication = guard.dir_path().join(CONNECTION_FILE_NAME);
+        let bytes = std::fs::read(&publication).expect("read");
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        json["daemon_id"] = serde_json::json!(vec![7u8; 16]);
+        std::fs::write(&publication, serde_json::to_vec(&json).expect("encode")).expect("rewrite");
+        std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+
+        let observed = probe(root.path());
+        assert_eq!(
+            observed.state,
+            LifecycleState::Starting,
+            "crash residue must not wedge a healthy start: {}",
+            observed.reason
+        );
+
+        // The same residue under a `running` claim is a real fault.
+        guard
+            .write_lifecycle_record(LifecyclePhase::Running)
+            .expect("running");
+        let observed = probe(root.path());
+        assert_eq!(observed.state, LifecycleState::Wedged);
+        assert_eq!(
+            observed.reason,
+            "publication daemon ID does not match the record"
+        );
     }
 
     #[test]

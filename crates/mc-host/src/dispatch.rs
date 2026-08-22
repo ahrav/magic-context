@@ -587,6 +587,10 @@ pub async fn handle_host_shutdown<H: McHostHandler>(
         FrameId::control(corr),
         body,
     ) else {
+        // Unreachable for the fixed-size shutdown body, but tear the
+        // generation down like every sibling failure branch rather than
+        // stranding the requester without a response or a cancellation.
+        gen.token.cancel();
         return;
     };
     let _ = gen

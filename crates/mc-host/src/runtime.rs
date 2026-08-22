@@ -526,8 +526,11 @@ pub async fn run<H: McHostHandler>(
     config.validate().map_err(HostError::Config)?;
     // The first attempt runs inline, so startup ordering and latency are
     // unchanged. Only the wait between attempts is async: parking an executor
-    // thread here would stall the predecessor drain whose completion releases
-    // the lock being waited on.
+    // thread here would stall a same-process predecessor drain whose
+    // completion releases the lock being waited on. The ~75ms budget only
+    // rides out a probe's momentary shared hold; a predecessor still draining
+    // (bounded by the callback and shutdown deadlines) exhausts it and yields
+    // `AlreadyRunning`, and the caller decides whether to retry the start.
     let guard = {
         let mut acquired = None;
         for attempt in 0..crate::instance::LOCK_RETRY_ATTEMPTS {
