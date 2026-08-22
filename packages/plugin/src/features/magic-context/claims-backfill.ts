@@ -1361,35 +1361,40 @@ export async function runClaimsBackfill(
 
     /**
      * Reconciling, part two: the completion decision (R11). The caller runs
-     * the read-only oracle OUTSIDE the write lock and passes its report in;
-     * this short immediate transaction re-verifies the decisive conditions —
-     * phase unchanged, zero unlinked boundary rows, zero boundary-scoped
-     * blocking failures, no pending v22 takeover — so a write racing between
-     * the oracle read and this commit cannot certify a stale state, then
-     * publishes the completion checkpoint.
+     * the read-only oracle OUTSIDE the write lock; this short immediate
+     * transaction re-runs the FULL oracle (sub-millisecond, read-only)
+     * against the locked state, so a write racing between the outside read
+     * and this commit cannot certify a stale state on ANY oracle dimension —
+     * not just the unlinked/blocking/takeover trio. The outside report
+     * serves only as the race baseline: a locked report that degraded from
+     * a clean outside read means the corpus changed inside the race window,
+     * so the phase falls back to rows to re-derive; a report that was
+     * already failing outside blocks.
      */
-    const finalizeReconciliation = (report: ClaimsBackfillReconciliationReport): BatchStep => {
+    const finalizeReconciliation = (
+        outsideReport: ClaimsBackfillReconciliationReport,
+    ): BatchStep => {
         const phase = readMeta(db, CLAIMS_BACKFILL_META_KEYS.phase);
         if (phase !== "reconciling") return { kind: "phase-changed" };
         const state = readClaimsBackfillState(db);
+        const report = inspectClaimsBackfillReconciliation(db, state);
         if (!report.ok) {
+            if (outsideReport.ok) {
+                // The corpus changed between the oracle read and this
+                // transaction; fall back to the rows phase to re-derive.
+                // Every cursor resets with the phase: the batch queries
+                // select strictly above their cursor, so a stale cursor
+                // would hide the very rows the fallback exists to re-observe
+                // and the re-derive would re-block with an unchanged failure
+                // digest.
+                writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "rows");
+                writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
+                writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
+                writeMeta(db, CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY, "0");
+                return { kind: "advance" };
+            }
             writeBlockedCheckpoint(db, state.boundaryMemoryId);
             return { kind: "blocked", problems: report.problems };
-        }
-        const unlinked = countUnlinkedBoundaryRows(db, state.boundaryMemoryId);
-        const blocking = countBoundaryFailures(db, ["blocking", "retry"], state.boundaryMemoryId);
-        if (unlinked > 0 || blocking > 0 || state.v22Takeover === "pending") {
-            // The corpus changed between the oracle read and this
-            // transaction; fall back to the rows phase to re-derive. Every
-            // cursor resets with the phase: the batch queries select strictly
-            // above their cursor, so a stale cursor would hide the very rows
-            // the fallback exists to re-observe and the re-derive would
-            // re-block with an unchanged failure digest.
-            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.phase, "rows");
-            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
-            writeMeta(db, CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
-            writeMeta(db, CLAIMS_BACKFILL_RECONCILE_CURSOR_META_KEY, "0");
-            return { kind: "advance" };
         }
         writeCompletionCheckpoint(db);
         hitFailpoint("claims-backfill.030.complete.before");

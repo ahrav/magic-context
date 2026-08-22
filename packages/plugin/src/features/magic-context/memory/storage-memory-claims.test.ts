@@ -403,6 +403,70 @@ describe("memory/claims kernel: content and classification updates", () => {
         ).toEqual({ disposition: "resolved" });
     });
 
+    test("an already-linked row emptied and then repaired appends the repaired revision and clears the blocker", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "linked-empty-seed", "linked original");
+
+        // The emptying write cannot form a revision, so the claim keeps the
+        // last good content while the projection empties; the blocking
+        // diagnostic records the divergence.
+        const emptied = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("linked-empty-1", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId, content: "", normalizedHash: "hash:" },
+            ),
+        );
+        expect(emptied.result.claimId).toBeNull();
+        expect(
+            db.prepare("SELECT content FROM memories WHERE id = ?").get(seeded.memoryId),
+        ).toEqual({ content: "" });
+        expect(
+            db
+                .prepare(
+                    "SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(seeded.memoryId)),
+        ).toEqual({ reason_code: "empty-content", disposition: "blocking" });
+
+        const repaired = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("linked-empty-2", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    content: "linked repaired",
+                    normalizedHash: "hash:linked repaired",
+                },
+            ),
+        );
+
+        // The repair appends the repaired bytes onto the EXISTING claim as a
+        // new revision (the ensure early-returns the stale link without
+        // appending), emits the upsert for that real change, and resolves
+        // the empty-content blocker.
+        expect(repaired.result.claimId).toBe(seeded.claimId);
+        expect(repaired.result.revisionId).not.toBe(seeded.revisionId);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, seeded.memoryId);
+        expect(claim?.claimId).toBe(seeded.claimId);
+        expect(claim?.content).toBe("linked repaired");
+        expect(count(db, "claim_revisions", `claim_id = ${seeded.claimId}`)).toBe(2);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'upsert' AND effect_key = 'memory:${seeded.memoryId}:upsert'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'linked-empty-2')`,
+            ),
+        ).toBe(1);
+        expect(
+            db
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(String(seeded.memoryId)),
+        ).toEqual({ disposition: "resolved" });
+        expect(inspectClaimsBackfillReconciliation(db).contentDivergences).toBe(0);
+    });
+
     test("a classification update that repairs an invalid-importance row adopts the repaired postimage in the same operation", () => {
         const db = track(migratedDb());
         let memoryId = 0;

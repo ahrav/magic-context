@@ -163,6 +163,7 @@ export async function runClaimsBackfillCommands(
             );
         }
 
+        let exitCode = 0;
         if (args.retryClaimsBackfill) {
             const status = getClaimsBackfillStatus(db);
             if (!status.applicable) {
@@ -190,7 +191,10 @@ export async function runClaimsBackfillCommands(
                     harness.log.warn(
                         `claims backfill still ${retry.after.state}: ${retry.summary.problems.join("; ") || "see --check-claims-backfill"}`,
                     );
-                    return { handled: true, exitCode: 1 };
+                    // The retry already wrote to disk, so the schema line and
+                    // restart warning below must still print; only the exit
+                    // code reports the block.
+                    exitCode = 1;
                 }
             }
         }
@@ -202,7 +206,7 @@ export async function runClaimsBackfillCommands(
                 "If OpenCode, Pi, or OMP is running, restart it before creating new sessions so every process reloads the repaired state.",
             );
         }
-        return { handled: true, exitCode: 0 };
+        return { handled: true, exitCode };
     } catch (error) {
         harness.log.error(error instanceof Error ? error.message : String(error));
         return { handled: true, exitCode: 1 };

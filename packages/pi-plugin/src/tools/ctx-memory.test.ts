@@ -1366,13 +1366,47 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 				),
 			).toBe(1);
 
-			await expect(
-				run(
-					tool,
-					{ ...args, content: "Different Pi request under reused id." },
-					"pi-lost-ack",
-				),
-			).rejects.toThrow(/already committed for a different request digest/);
+			// A reused tool-call id with a different digest surfaces as a tool
+			// result instead of an unhandled throw.
+			const reused = await run(
+				tool,
+				{ ...args, content: "Different Pi request under reused id." },
+				"pi-lost-ack",
+			);
+			expect(reused.isError).toBe(true);
+			expect(reused.content[0]?.text).toBe(
+				"Error: this tool call id was already committed with different arguments. Retry as a new call.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("whitespace-only archive reason is dropped from the reply", async () => {
+		const db = createTestDb();
+		try {
+			const projectIdentity = resolveProjectIdentity(process.cwd());
+			const memory = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "CONSTRAINTS",
+				content: "Archive me without a reason.",
+			});
+			const tool = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+
+			const result = await run(tool, {
+				action: "archive",
+				ids: [memory.id],
+				reason: "  ",
+			});
+
+			expect(result.content[0]?.text).toBe(
+				`Archived memory [ID: ${memory.id}].`,
+			);
 		} finally {
 			closeQuietly(db);
 		}
@@ -1443,13 +1477,15 @@ describe("createCtxMemoryTool on a migrated v84 database (claims kernel, U3 pari
 						`producer = 'ctx-memory-pi' AND operation_key = 'ses-claims:${callId}:merge:2'`,
 					),
 				).toBe(1);
-				await expect(
-					run(
-						staleTool,
-						{ ...args, content: `${content} digest mismatch` },
-						callId,
-					),
-				).rejects.toThrow(/already committed for a different request digest/);
+				const mismatch = await run(
+					staleTool,
+					{ ...args, content: `${content} digest mismatch` },
+					callId,
+				);
+				expect(mismatch.isError).toBe(true);
+				expect(mismatch.content[0]?.text).toBe(
+					"Error: this tool call id was already committed with different arguments. Retry as a new call.",
+				);
 			} finally {
 				closeQuietly(peer);
 				closeQuietly(db);

@@ -280,6 +280,15 @@ function adoptIdentityMergeRowClaims(
         recordSkippedCollisionMergeDiagnostic(db, sourceId, collisionTargetId, sourceFailure);
         return false;
     }
+    if (sourceFailure !== null) {
+        // A claim-invalid source cannot form the duplicate crosswalk link
+        // (unlinked case) and cannot push its raw metadata through the
+        // claims kernel, so the caller also skips its classification
+        // promotion (linked or not). The archive below still proceeds; the
+        // blocking rows-phase diagnostic keeps the skipped work observable
+        // and repairable via retry.
+        recordMemoryClaimLinkFailure(db, sourceId, toIdentity, sourceFailure);
+    }
     // Adoption derives the canonical claim's lifecycle from the target row's
     // status, and a NULL status derives archived. The survivor is live by
     // contract, so the status normalizes to 'active' — after the adoption
@@ -384,22 +393,26 @@ function adoptIdentityMergeRowClaims(
                 }
             }
             let sourceLink = readMemoryClaimLink(db, sourceId);
-            if (!sourceLink) {
-                if (sourceFailure === null) {
-                    sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
-                        db,
-                        sourceRow,
-                        projectId,
-                        { kind: "migration" },
-                        { adoptDivergentContent: false },
-                    );
-                } else {
-                    // An unadoptable source cannot form the duplicate
-                    // crosswalk link; the archive below still proceeds and
-                    // the skipped link stays observable as a blocking
-                    // rows-phase diagnostic.
-                    recordMemoryClaimLinkFailure(db, sourceId, toIdentity, sourceFailure);
-                }
+            if (!sourceLink && sourceFailure === null) {
+                sourceLink = ensureMemoryClaimLinkInCurrentTransaction(
+                    db,
+                    sourceRow,
+                    projectId,
+                    { kind: "migration" },
+                    { adoptDivergentContent: false },
+                );
+                // The adoption dedups onto the survivor's canonical claim
+                // (same project + category + hash), so the divergent-claim
+                // block below no-ops for a freshly-linked source. This
+                // upsert is the fresh crosswalk row's only outbox effect;
+                // without it the boundary reconciliation oracle flags the
+                // archived source's link as effectless forever.
+                effects.push({
+                    effectKey: `memory:${sourceId}:upsert`,
+                    projectId,
+                    claimId: sourceLink.claimId,
+                    effectType: "upsert" as const,
+                });
             }
             effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, sourceRow));
             if (sourceLink && sourceLink.claimId !== targetLink.claimId) {
@@ -442,7 +455,14 @@ function adoptIdentityMergeRowClaims(
                         effectType: "lifecycle" as const,
                     });
                 }
-                recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink);
+                if (recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink)) {
+                    effects.push({
+                        effectKey: `memory:${collisionTargetId}:supersede`,
+                        projectId,
+                        claimId: targetLink.claimId,
+                        effectType: "evidence" as const,
+                    });
+                }
             }
             return { result: targetLink.claimId, effects };
         },
@@ -531,6 +551,14 @@ function mergeMemoryRow(
         ) {
             return false;
         }
+        if (!claimsActive) {
+            // The survivor is live by contract, so a NULL status normalizes
+            // to 'active'. The claims-active path runs this normalization
+            // inside the adoption helper, after its adoption gate.
+            db.prepare("UPDATE memories SET status = COALESCE(status, 'active') WHERE id = ?").run(
+                targetId,
+            );
+        }
         const mergedSeen = Math.max(
             effectiveSeenCount(targetId, collision.seen_count),
             effectiveSeenCount(sourceId, row.seen_count),
@@ -548,8 +576,9 @@ function mergeMemoryRow(
                 // A claim-invalid source would push its raw metadata through
                 // the kernel's revision CHECKs and abort the whole merge, so
                 // the promotion only runs for an adoptable source; the
-                // adoption pass above already recorded the blocking
-                // diagnostic for a skipped one.
+                // adoption pass above records the blocking diagnostic for
+                // any claim-invalid source, linked or not, so the skipped
+                // promotion stays observable.
                 const sourceProjection = readMemoryProjectionRow(db, sourceId);
                 const sourceAdoptable =
                     sourceProjection !== null &&

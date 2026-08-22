@@ -515,10 +515,16 @@ describe("doctor claims backfill commands", () => {
                 (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
             VALUES ('rows', 'memory', '${blockedId}', 'unresolved-project-identity', '', 'blocking', 1, 1);
         `);
-        const retry = await runClaimsBackfillCommands(makeHarness(database, []), {
+        const retryMessages: string[] = [];
+        const retry = await runClaimsBackfillCommands(makeHarness(database, retryMessages), {
             retryClaimsBackfill: true,
         });
         expect(retry.exitCode).toBe(1);
+        // A blocked retry still mutated the database, so the epilogue must
+        // print the schema delta and the restart warning despite exit 1.
+        const retryOutput = retryMessages.join("\n");
+        expect(retryOutput).toContain("Magic Context schema:");
+        expect(retryOutput).toContain("restart it before creating new sessions");
 
         for (const invalid of [null, "--force", "7junk", "0", "-1"]) {
             const messages: string[] = [];

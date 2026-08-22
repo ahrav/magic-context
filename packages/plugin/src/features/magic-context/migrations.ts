@@ -32,6 +32,7 @@ import {
     synapseBatchLedgerDdl,
     synapseBatchLedgerIndexDdl,
 } from "./storage-schema-helpers";
+import { V22_BACKFILL_META_KEY } from "./v22-deferred-backfill";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
 /** First version reserved for downstream migrations; upstream versions stay below it. */
@@ -1226,8 +1227,8 @@ export const MIGRATIONS: Migration[] = [
             }
 
             db.prepare(
-                "INSERT OR IGNORE INTO schema_migrations_meta (key, value) VALUES ('v22_legacy_memory_backfill', 'pending')",
-            ).run();
+                "INSERT OR IGNORE INTO schema_migrations_meta (key, value) VALUES (?, 'pending')",
+            ).run(V22_BACKFILL_META_KEY);
         },
     },
     {
@@ -3277,10 +3278,8 @@ export const MIGRATIONS: Migration[] = [
             writeMeta.run(CLAIMS_BACKFILL_META_KEYS.rowsCursor, "0");
             writeMeta.run(CLAIMS_BACKFILL_META_KEYS.relationshipsCursor, "0");
             const v22Status = db
-                .prepare(
-                    "SELECT value FROM schema_migrations_meta WHERE key = 'v22_legacy_memory_backfill'",
-                )
-                .get() as { value: string } | null | undefined;
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(V22_BACKFILL_META_KEY) as { value: string } | null | undefined;
             const v22Pending =
                 v22Status != null &&
                 (v22Status.value === "pending" || v22Status.value === "completed_with_failures");

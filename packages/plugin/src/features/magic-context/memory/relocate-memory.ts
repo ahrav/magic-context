@@ -385,6 +385,18 @@ function adoptRelocationMergeClaims(
                     { kind: "migration" },
                     { adoptDivergentContent: false },
                 );
+                // The adoption dedups onto the target's canonical claim
+                // (same project + category + hash), so the divergent-claim
+                // block below no-ops for a freshly-linked source. This
+                // upsert is the fresh crosswalk row's only outbox effect —
+                // without it the boundary reconciliation oracle flags the
+                // link forever once the caller deletes the source row.
+                effects.push({
+                    effectKey: `memory:${sourceId}:upsert`,
+                    projectId: targetProjectId,
+                    claimId: sourceLink.claimId,
+                    effectType: "upsert" as const,
+                });
             }
             if (sourceLink && sourceRow) {
                 effects.push(
@@ -428,7 +440,14 @@ function adoptRelocationMergeClaims(
                         effectType: "lifecycle" as const,
                     });
                 }
-                recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink);
+                if (recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink)) {
+                    effects.push({
+                        effectKey: `memory:${targetId}:supersede`,
+                        projectId: targetProjectId,
+                        claimId: targetLink.claimId,
+                        effectType: "evidence" as const,
+                    });
+                }
             }
             return { result: targetLink.claimId, effects };
         },
@@ -637,7 +656,11 @@ export function moveLinkedMemoryAcrossProjects(
                     effectType: "lifecycle",
                 });
             }
-            recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, newLink);
+            const supersessionRecorded = recordMemoryClaimSupersessionInCurrentTransaction(
+                db,
+                sourceLink,
+                newLink,
+            );
             const effects: MemoryClaimEffect[] = [
                 {
                     effectKey: `memory:${newId}:upsert`,
@@ -648,6 +671,14 @@ export function moveLinkedMemoryAcrossProjects(
                 ...stateEffects,
                 ...sourceStateEffects,
             ];
+            if (supersessionRecorded) {
+                effects.push({
+                    effectKey: `memory:${newId}:supersede`,
+                    projectId: targetProjectId,
+                    claimId: newLink.claimId,
+                    effectType: "evidence",
+                });
+            }
             // The inserted copy inherits the source row's merged_from /
             // superseded_by_memory_id under a fresh id, so no relationship
             // source exists for it yet. Translating here records that source

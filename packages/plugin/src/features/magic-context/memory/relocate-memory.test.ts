@@ -206,6 +206,51 @@ describe("relocate-memory claims (v84)", () => {
         expect(database.prepare("SELECT COUNT(*) AS c FROM claims").get()).toEqual({ c: 1 });
     });
 
+    test("a collision merge emits the deleted source's dedup-link upsert effect", () => {
+        const database = makeDb();
+        const target = insertMemory(database, {
+            projectPath: "git:shared",
+            category: "CONSTRAINTS",
+            content: "announced fact",
+        });
+        const targetHash = (
+            database
+                .prepare("SELECT normalized_hash AS hash FROM memories WHERE id = ?")
+                .get(target.id) as { hash: string }
+        ).hash;
+        const sourceId = insertUnlinkedMemory(
+            database,
+            "/raw/announce/path",
+            "announced fact",
+            targetHash,
+        );
+
+        const changed = inTransaction(database, () =>
+            rekeyMemoryRowWithCollisionMerge(
+                database,
+                sourceId,
+                "/raw/announce/path",
+                "git:shared",
+            ),
+        );
+
+        expect(changed).toBe(true);
+        const targetLink = readMemoryClaimLink(database, target.id);
+        if (!targetLink) throw new Error("expected the merge target to stay linked");
+        // The source's dedup crosswalk link survives the delete; its upsert
+        // effect is the only outbox announcement the boundary reconciliation
+        // oracle gets for that link.
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS c FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'upsert'
+                        AND claim_id = ? AND project_id = ?`,
+                )
+                .get(`memory:${sourceId}:upsert`, targetLink.claimId, targetLink.projectId),
+        ).toEqual({ c: 1 });
+    });
+
     test("an authorized cross-project move creates the target claim and retires the source claim with lineage", () => {
         const database = makeDb();
         const source = insertMemory(database, {
@@ -273,6 +318,43 @@ describe("relocate-memory claims (v84)", () => {
         expect(database.prepare("SELECT COUNT(*) AS c FROM claim_merge_lineage").get()).toEqual({
             c: 2,
         });
+    });
+
+    test("a cross-project move announces the recorded lineage edge with an evidence effect", () => {
+        const database = makeDb();
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "lineage-free moving fact",
+        });
+        insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "resident fact",
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [source.id], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const moved = database
+            .prepare(
+                "SELECT id FROM memories WHERE project_path = 'git:project-b' AND content = 'lineage-free moving fact'",
+            )
+            .get() as { id: number };
+        const movedLink = readMemoryClaimLink(database, moved.id);
+        if (!movedLink) throw new Error("expected the moved row to link");
+        // The move records the source-claim → target-claim lineage edge; the
+        // evidence effect announces it on the moved row's outbox.
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS c FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence' AND claim_id = ?`,
+                )
+                .get(`memory:${moved.id}:supersede`, movedLink.claimId),
+        ).toEqual({ c: 1 });
     });
 
     test("a cross-project move of one shared-claim link keeps the claim live for the surviving sibling and retires it only with the last link", () => {
@@ -1004,6 +1086,21 @@ describe("relocate-memory claims (v84)", () => {
             database.prepare("SELECT state FROM claims WHERE id = ?").get(soleLink.claimId),
         ).toEqual({ state: "archived" });
         expect(memoryClaimSupersessionExists(database, soleLink, soleTargetLink)).toBe(true);
+        // Only the recorded edge carries an evidence effect; the suppressed
+        // shared-claim pair announces nothing.
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS c FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${soleTarget.id}:supersede`),
+        ).toEqual({ c: 1 });
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS c FROM claim_change_outbox WHERE effect_key = ?")
+                .get(`memory:${sharedTarget.id}:supersede`),
+        ).toEqual({ c: 0 });
     });
 
     test("copying creates a target claim for each fresh row and leaves the source intact", () => {

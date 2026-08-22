@@ -655,6 +655,40 @@ describe("project identity merge claims (v84)", () => {
         });
     });
 
+    test("a collision merge emits the archived source's dedup-link upsert effect", () => {
+        const database = makeDb();
+        const target = insertMemoryThroughKernel(database, {
+            projectPath: "git:new",
+            category: "CONSTRAINTS",
+            content: "announced fact",
+        });
+        const targetHash = (
+            database
+                .prepare("SELECT normalized_hash AS hash FROM memories WHERE id = ?")
+                .get(target.id) as { hash: string }
+        ).hash;
+        const sourceId = insertMemory(database, "dir:old", "announced fact", targetHash);
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 60 });
+
+        const sourceLink = readMemoryClaimLink(database, sourceId);
+        const targetLink = readMemoryClaimLink(database, target.id);
+        if (!sourceLink || !targetLink) throw new Error("expected both rows to link");
+        expect(sourceLink.claimId).toBe(targetLink.claimId);
+        // The archived source's dedup crosswalk link is a fresh row; its
+        // upsert effect is the only outbox announcement the boundary
+        // reconciliation oracle gets for that link.
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'upsert'
+                        AND claim_id = ? AND project_id = ?`,
+                )
+                .get(`memory:${sourceId}:upsert`, sourceLink.claimId, sourceLink.projectId),
+        ).toEqual({ count: 1 });
+    });
+
     test("an empty-content collision target skips the row with a diagnostic instead of rolling back", () => {
         const database = makeDb();
         const sourceId = insertMemory(database, "dir:old", "legacy fact", "same-hash");
@@ -1188,6 +1222,91 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ reason_code: "invalid-importance", disposition: "blocking" });
     });
 
+    test("a pre-claims collision merge normalizes the survivor's NULL status", () => {
+        // Deliberately-unmigrated database: no claims compat schema, so the
+        // merge takes the claims-inactive collision path (the doctor
+        // merge-identity shape on a pre-v84 store).
+        const database = new Database(":memory:");
+        db = database;
+        database.exec(`
+            CREATE TABLE memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_path TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                normalized_hash TEXT NOT NULL,
+                seen_count INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'active',
+                importance INTEGER,
+                scope TEXT,
+                shareable INTEGER,
+                classified_at INTEGER,
+                mural_cue TEXT,
+                mural_cue_hash TEXT,
+                mural_cue_at INTEGER,
+                mural_cue_rejection_count INTEGER DEFAULT 0,
+                merged_from TEXT,
+                superseded_by_memory_id INTEGER,
+                updated_at INTEGER,
+                UNIQUE(project_path, category, normalized_hash)
+            );
+            CREATE TABLE memory_verifications (
+                memory_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                verified_at INTEGER,
+                mapped_at INTEGER,
+                UNIQUE(memory_id, file_path)
+            );
+            CREATE TABLE memory_mutation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_path TEXT NOT NULL,
+                mutation_type TEXT NOT NULL,
+                target_memory_id INTEGER,
+                superseded_by_id INTEGER,
+                category TEXT,
+                queued_at INTEGER
+            );
+            CREATE TABLE identity_merge_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_identity TEXT NOT NULL,
+                to_identity TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                row_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_row_id TEXT,
+                merged_at INTEGER NOT NULL
+            );
+            CREATE TABLE project_state (
+                project_path TEXT PRIMARY KEY,
+                project_memory_epoch INTEGER,
+                project_user_profile_version INTEGER,
+                updated_at INTEGER
+            );
+        `);
+        const insert = database.prepare(
+            "INSERT INTO memories (project_path, category, content, normalized_hash, status) VALUES (?, 'CONSTRAINTS', ?, ?, ?)",
+        );
+        const targetId = Number(
+            insert.run("git:new", "pre-claims fact", "pre-h1", null).lastInsertRowid,
+        );
+        const sourceId = Number(
+            insert.run("dir:old", "pre-claims fact", "pre-h1", "active").lastInsertRowid,
+        );
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 90 });
+
+        // The survivor is live by contract: its NULL status normalizes to
+        // 'active' on the claims-inactive path too.
+        expect(database.prepare("SELECT status FROM memories WHERE id = ?").get(targetId)).toEqual({
+            status: "active",
+        });
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ status: "archived", by: targetId });
+    });
+
     test("a collision merge keeps a shared source claim live for its alias sibling and retires a last-link claim", () => {
         const database = makeDb();
         const source = insertMemoryThroughKernel(database, {
@@ -1295,6 +1414,72 @@ describe("project identity merge claims (v84)", () => {
                 )
                 .get(String(sourceId)),
         ).toEqual({ reason_code: "invalid-scope", disposition: "blocking" });
+    });
+
+    test("a linked claim-invalid source records a blocking diagnostic and its promotion lands on retry after repair", () => {
+        const database = makeDb();
+        const target = insertMemoryThroughKernel(database, {
+            projectPath: "git:new",
+            category: "CONSTRAINTS",
+            content: "promoted fact",
+        });
+        const source = insertMemoryThroughKernel(database, {
+            projectPath: "dir:old",
+            category: "CONSTRAINTS",
+            content: "promoted fact",
+        });
+        // Schema-legal but claim-invalid drift on the LINKED source:
+        // `memories` has no CHECK on scope, while the kernel's revision
+        // metadata does — promoting the raw value would abort the merge.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET scope = 'bogus', classified_at = 20 WHERE id = ?")
+                .run(source.id);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 60 });
+
+        // The merge proceeds — source archived with an announced lineage
+        // edge — but the classification promotion is skipped and stays
+        // observable as a blocking diagnostic even though the source is
+        // linked.
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(source.id),
+        ).toEqual({ status: "archived", by: target.id });
+        expect(
+            database
+                .prepare("SELECT scope, classified_at FROM memories WHERE id = ?")
+                .get(target.id),
+        ).toEqual({ scope: "project", classified_at: null });
+        expect(
+            database
+                .prepare(
+                    "SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(source.id)),
+        ).toEqual({ reason_code: "invalid-scope", disposition: "blocking" });
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${target.id}:supersede`),
+        ).toEqual({ count: 1 });
+
+        // Repair the drift, then retry: the promotion now runs through the
+        // kernel and lands on the survivor.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database.prepare("UPDATE memories SET scope = 'ecosystem' WHERE id = ?").run(source.id);
+        });
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 70 });
+        expect(
+            database
+                .prepare("SELECT scope, classified_at FROM memories WHERE id = ?")
+                .get(target.id),
+        ).toEqual({ scope: "ecosystem", classified_at: 20 });
     });
 
     test("a claim-invalid unlinked row is diagnosed without rolling back the rest of the merge", () => {

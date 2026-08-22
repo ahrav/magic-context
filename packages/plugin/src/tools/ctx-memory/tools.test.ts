@@ -2156,12 +2156,16 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
             ),
         ).toBe(1);
 
-        await expect(
-            tools.ctx_memory.execute(
+        // A reused tool-call id with a different digest surfaces as a tool
+        // result instead of an unhandled throw.
+        expect(
+            await tools.ctx_memory.execute(
                 { ...args, content: "Different request under reused id." },
                 context,
             ),
-        ).rejects.toThrow(/already committed for a different request digest/);
+        ).toBe(
+            "Error: this tool call id was already committed with different arguments. Retry as a new call.",
+        );
     });
 
     it("a duplicate write with a tool-call id persists an envelope and replays without a second seen-count bump", async () => {
@@ -2395,12 +2399,14 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
                         `producer = 'ctx-memory-opencode' AND operation_key = 'ses-stable-merge:stable-merge-${existingCanonical}:merge:2'`,
                     ),
                 ).toBe(1);
-                await expect(
-                    staleTools.ctx_memory.execute(
+                expect(
+                    await staleTools.ctx_memory.execute(
                         { ...args, content: `${content} digest mismatch` },
                         context,
                     ),
-                ).rejects.toThrow(/already committed for a different request digest/);
+                ).toBe(
+                    "Error: this tool call id was already committed with different arguments. Retry as a new call.",
+                );
             } finally {
                 closeQuietly(peer);
                 closeQuietly(db);

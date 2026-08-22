@@ -1503,10 +1503,14 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
         const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
         if (failure !== null || projectId === null || input.content.length === 0) {
             // An empty replacement content cannot form a revision even when
-            // the preimage row itself is adoptable.
+            // the preimage row itself is adoptable. The blocking row records
+            // for a linked row too: the emptied projection diverges from its
+            // claim's current revision, and the repair path below resolves
+            // the diagnostic once real content lands.
             if (failure === null) {
                 recordMemoryClaimLinkFailure(db, row.id, row.project_path, "empty-content");
             }
+            const existingLink = readMemoryClaimLink(db, row.id);
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             updateMemoryProjectionContent(
                 db,
@@ -1526,12 +1530,37 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                 projectId !== null &&
                 memoryClaimAdoptionFailureReason(post, projectId) === null
             ) {
+                const sessionId = input.sourceSessionId ?? post.source_session_id;
                 const link = ensureMemoryClaimLinkInCurrentTransaction(
                     db,
                     post,
                     projectId,
-                    liveProvenance(envelope, input.sourceSessionId ?? post.source_session_id),
+                    liveProvenance(envelope, sessionId),
                 );
+                if (existingLink) {
+                    // A row linked before this rewrite gets its stale link
+                    // back from the ensure's early return, so the repaired
+                    // bytes must append their own revision here — otherwise
+                    // the claim keeps the pre-empty content and the upsert
+                    // effect announces a claim that never changed.
+                    const observationId = createMemoryObservation(db, {
+                        projectId,
+                        memoryId: row.id,
+                        content: input.content,
+                        provenance: liveProvenance(envelope, sessionId),
+                    });
+                    appendMemoryClaimRevision(db, {
+                        claimId: link.claimId,
+                        content: input.content,
+                        observationId,
+                        metadata: metadataFromProjectionRow(post),
+                        sourceSessionId: sessionId,
+                    });
+                    // The ensure's early return skips its resolve call, so
+                    // the empty-content blocker recorded by the emptying
+                    // write clears here.
+                    resolveMemoryClaimLinkFailure(db, row.id);
+                }
                 const effects: MemoryClaimEffect[] = [
                     {
                         effectKey: `memory:${row.id}:upsert`,

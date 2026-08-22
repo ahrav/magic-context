@@ -21,7 +21,13 @@ import type { V22BackfillErrorClass } from "./storage-v22-backfill-failures";
 export const BATCH_SIZE = 25;
 export const YIELD_EVERY_N_ROWS = 5;
 
-const BACKFILL_META_KEY = "v22_legacy_memory_backfill";
+/**
+ * `schema_migrations_meta` status key for the v22 legacy memory backfill:
+ * seeded 'pending' by the v22 migration, driven to its terminal status by
+ * this runner, and read by v84 to decide whether remaining v22 identity
+ * work is adopted as a claims takeover.
+ */
+export const V22_BACKFILL_META_KEY = "v22_legacy_memory_backfill";
 const BACKFILL_CURSOR_META_KEY = "v22_legacy_memory_backfill_cursor";
 const MEMORIES_TABLE = "memories";
 
@@ -198,7 +204,7 @@ function updateFinalBackfillStatus(db: Database): V22BackfillStatus {
     const failureCount = countFailures(db);
     const status: V22BackfillStatus = failureCount > 0 ? "completed_with_failures" : "completed";
     db.transaction(() => {
-        writeMeta(db, BACKFILL_META_KEY, status);
+        writeMeta(db, V22_BACKFILL_META_KEY, status);
         syncClaimsTakeoverMeta(db, failureCount);
     }).immediate();
     return status;
@@ -210,7 +216,7 @@ export function getV22BackfillStatus(db: Database): {
     cursor: number;
     maxLegacyMemoryId: number;
 } {
-    const status = readMeta(db, BACKFILL_META_KEY) as V22BackfillStatus | null;
+    const status = readMeta(db, V22_BACKFILL_META_KEY) as V22BackfillStatus | null;
     const maxLegacyRow = db
         .prepare(
             `SELECT COALESCE(MAX(id), 0) AS m
@@ -231,7 +237,7 @@ export async function runDeferredV22Backfill(
     db: Database,
     options: DeferredV22BackfillOptions = {},
 ): Promise<V22BackfillSummary> {
-    const initialStatus = readMeta(db, BACKFILL_META_KEY);
+    const initialStatus = readMeta(db, V22_BACKFILL_META_KEY);
     if (initialStatus === "completed" || initialStatus === "skipped") {
         const failureCount = countFailures(db);
         // A runner without the claims compat schema reaches this terminal
