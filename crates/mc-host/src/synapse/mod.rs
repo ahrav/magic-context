@@ -51,6 +51,19 @@ pub struct SynapseLimits {
     pub retry_after_ms: u64,
 }
 
+impl SynapseLimits {
+    /// The most items one result page can attainably hold: a job never
+    /// holds more than `max_batch_items` items so no page can either, and
+    /// the pager always places at least one item per page. Shared by the
+    /// runtime page reservation and its startup validation so the two
+    /// cannot drift apart.
+    pub(crate) fn page_item_bound(&self) -> usize {
+        self.max_page_vectors
+            .max(1)
+            .min(self.max_batch_items.max(1))
+    }
+}
+
 impl Default for SynapseLimits {
     fn default() -> Self {
         let max_batch_items = 64;
@@ -687,21 +700,14 @@ impl SynapseComponent {
         // The ready-page branch clones every page item's id and hash out of
         // the job table, and those copies live until the response encoder
         // finishes. Their worst case is reserved before polling and shrunk
-        // to the real page after, mirroring the parse-reservation pattern.
-        // The bound uses the attainable page maximum, not the raw config:
-        // a job never holds more than max_batch_items items, so no page
-        // can either (an oversized max_page_vectors must not reserve
-        // configuration-sized bytes per poll), and page_boundaries always
-        // places at least one item per page (a zero config must not yield
-        // a zero reservation that under-covers the clones).
-        let page_items = self
+        // to the real page after, mirroring the parse-reservation pattern;
+        // `page_item_bound` keeps this reservation and its startup
+        // validation on one formula.
+        let page_meta_bound = self
             .inner
             .limits
-            .max_page_vectors
-            .max(1)
-            .min(self.inner.limits.max_batch_items.max(1));
-        let page_meta_bound =
-            page_items.saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
+            .page_item_bound()
+            .saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
         // Reserve first, sweep only if that fails — the same fallback the
         // parse reservation uses. Retained job charges live in this pool,
         // so expired jobs can starve this second reservation while the

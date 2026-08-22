@@ -593,8 +593,8 @@ pub(crate) fn preflight(body: &[u8], binary: bool) -> Result<(), RequestError> {
 }
 
 /// Typed decode after [`preflight`]. The host calls this with a resident
-/// reservation already held; [`parse_request`] is the unreserved public
-/// composition of both stages.
+/// reservation already held; [`parse_request_unreserved`] is the unreserved
+/// public composition of both stages.
 pub(crate) fn decode_request(
     body: &[u8],
     lane: &LaneInfo,

@@ -384,12 +384,9 @@ fn validate_serving_limits(
     // pool's ceiling would make every poll fail `queue_full` forever even
     // on an idle host — a permanent, config-induced outage that must
     // reject at startup instead of surfacing one request at a time.
-    let page_items = limits
-        .max_page_vectors
-        .max(1)
-        .min(limits.max_batch_items.max(1));
-    let page_meta_bytes =
-        page_items.saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
+    let page_meta_bytes = limits
+        .page_item_bound()
+        .saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
     let result_request_bytes = 2
         * (super::protocol::MAX_JOB_ID_BYTES + super::protocol::MAX_CURSOR_BYTES + 64)
         + super::RESPONSE_SCRATCH_BYTES;
