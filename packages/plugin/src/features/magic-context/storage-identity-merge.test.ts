@@ -1374,6 +1374,52 @@ describe("project identity merge claims (v84)", () => {
         });
     });
 
+    test("a claim-invalid unlinked boundary row is skipped with a diagnostic instead of aborting the merge", () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        // Pre-migration boundary row: unlinked, claim-invalid metadata
+        // (`memories` has no CHECK on scope), no lineage.
+        const boundaryId = Number(
+            db
+                .prepare(
+                    `INSERT INTO memories (project_path, category, content, normalized_hash, scope,
+                        first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES ('dir:old', 'CONSTRAINTS', 'boundary fact', 'boundary-h1', 'bogus', 1, 1, 1, 1)`,
+                )
+                .run().lastInsertRowid,
+        );
+        runMigrations(db);
+        const database = db;
+        const healthyId = insertMemory(database, "dir:old", "healthy fact", "healthy-boundary-h1");
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 70 });
+
+        // The healthy row rekeys and links; the unadoptable boundary row
+        // cannot satisfy the v84 identity-move guard (no claim link), so it
+        // stays under the source identity with a blocking diagnostic.
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(healthyId),
+        ).toEqual({ project_path: "git:new" });
+        expect(readMemoryClaimLink(database, healthyId)).not.toBeNull();
+        expect(
+            database.prepare("SELECT project_path FROM memories WHERE id = ?").get(boundaryId),
+        ).toEqual({ project_path: "dir:old" });
+        expect(readMemoryClaimLink(database, boundaryId)).toBeNull();
+        expect(
+            database
+                .prepare(
+                    `SELECT phase, item_kind, reason_code, disposition
+                       FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(String(boundaryId)),
+        ).toEqual({
+            phase: "rows",
+            item_kind: "memory",
+            reason_code: "invalid-scope",
+            disposition: "blocking",
+        });
+    });
+
     test("still refuses a two-project merge when a mirror episode also carries an observation-less span", () => {
         const database = makeDb();
         insertMemoryThroughKernel(database, {

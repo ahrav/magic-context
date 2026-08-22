@@ -25,6 +25,10 @@ import {
     type MemoryProjectionRow,
     readMemoryProjectionRow,
 } from "./memory/storage-memory-projection";
+import {
+    memoryLineagePresentSql,
+    memoryRelationshipSourceMatchSql,
+} from "./storage-memory-claims-schema";
 
 export const AUTHORITY_DOMAINS = ["memories", "notes"] as const;
 export type AuthorityDomain = (typeof AUTHORITY_DOMAINS)[number];
@@ -2170,6 +2174,29 @@ function probePendingSupersessionEndpoint(
     return { row, link: null, adoptableProjectId: failure === null ? projectId : null, failure };
 }
 
+/** Mirror of the memories_claims_relationship_update_guard predicate for the
+ * pending-pair pointer write: true when setting `superseded_by_memory_id` to
+ * `targetId` on this row would abort because the row carries lineage with no
+ * matching relationship snapshot. A row whose pointer already equals the
+ * target never fires the guard (the value-change condition is false). */
+function supersededPointerWriteTripsRelationshipGuard(
+    db: Database,
+    sourceId: number,
+    targetId: number,
+): boolean {
+    return Boolean(
+        db
+            .prepare(
+                `SELECT 1 FROM memories m
+                  WHERE m.id = ?
+                    AND m.superseded_by_memory_id IS NOT ?
+                    AND ${memoryLineagePresentSql("m")}
+                    AND NOT ${memoryRelationshipSourceMatchSql("m")}`,
+            )
+            .get(sourceId, targetId),
+    );
+}
+
 /**
  * Resolve pending supersession references under the claims kernel. A pair
  * translates its pointer only when both endpoints carry real content: a
@@ -2273,7 +2300,13 @@ function translatePendingSupersessionClaims(db: Database, statements: MirrorPage
         // driver: it clears when the committed envelope exists, and survives
         // an unadoptable endpoint so a later page re-attempts the pair.
         if (sourceProbe.link) translateMemoryClaimRelationshipsInCurrentTransaction(db, source);
-        statements.updateSuperseded.run(pair.targetId, pair.sourceId);
+        // An unlinked lineage-bearing source has no relationship snapshot, so
+        // the pointer write would trip the relationship guard and abort the
+        // whole page. Skip it; the surviving pending reference retries the
+        // pointer together with the claim edge once the pair links.
+        if (!supersededPointerWriteTripsRelationshipGuard(db, pair.sourceId, pair.targetId)) {
+            statements.updateSuperseded.run(pair.targetId, pair.sourceId);
+        }
         if (replayed) {
             statements.deletePendingReference.run(pair.moduleProject, pair.moduleRowId);
         } else {

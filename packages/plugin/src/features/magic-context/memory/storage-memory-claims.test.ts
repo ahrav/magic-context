@@ -519,6 +519,62 @@ describe("memory/claims kernel: content and classification updates", () => {
         ).toEqual({ seen_count: 2 });
     });
 
+    test("a classification update on a verified memory records a verified event on the new revision", () => {
+        const db = track(migratedDb());
+        const projectionSeed = createSeedMemory(
+            db,
+            "verified-classify-seed",
+            "projection classified",
+        );
+        const sideTableSeed = createSeedMemory(
+            db,
+            "side-verified-classify-seed",
+            "side classified",
+        );
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+            ).run(projectionSeed.memoryId);
+            // Pre-v84 TypeScript verification: positive verified_at lives only
+            // in memory_verifications; the projection columns stay unverified.
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/compat.ts', 123, 100)`,
+            ).run(sideTableSeed.memoryId);
+        });
+
+        for (const [key, seeded] of [
+            ["verified-classify-1", projectionSeed],
+            ["side-verified-classify-1", sideTableSeed],
+        ] as const) {
+            const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+                updateMemoryClassificationWithClaimsInCurrentTransaction(
+                    db,
+                    envelope(key, { key }),
+                    { memoryId: seeded.memoryId, importance: 90, scope: "project", shareable: 1 },
+                ),
+            );
+            expect(outcome.result.revisionId).not.toBeNull();
+            // The verified event attaches to the NEW current revision, with a
+            // matching evidence effect in the operation's outbox.
+            expect(
+                db
+                    .prepare(
+                        "SELECT outcome, verifier FROM verification_events WHERE revision_id = ?",
+                    )
+                    .all(outcome.result.revisionId),
+            ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
+            expect(
+                count(
+                    db,
+                    "claim_change_outbox",
+                    `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'
+                     AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = '${key}')`,
+                ),
+            ).toBe(1);
+        }
+    });
+
     test("a content update without a source session carries the row's session; a telemetry-only delta appends nothing", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "content-session-seed", "session default fact");

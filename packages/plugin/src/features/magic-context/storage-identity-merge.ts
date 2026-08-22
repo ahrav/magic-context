@@ -33,6 +33,7 @@ import {
 } from "./memory/storage-memory-claims";
 import { readMemoryProjectionRow } from "./memory/storage-memory-projection";
 import {
+    CLAIMS_BACKFILL_META_KEYS,
     memoryLineagePresentSql,
     memoryRelationshipSourceMatchSql,
 } from "./storage-memory-claims-schema";
@@ -452,6 +453,25 @@ function rekeyTripsRelationshipGuard(db: Database, memoryId: number): boolean {
     );
 }
 
+/**
+ * Mirror of the memories_claims_boundary_identity_guard predicate: true when
+ * a project_path rekey of this row would abort because the row is unlinked
+ * at or below the recorded claims-backfill boundary.
+ */
+function rekeyTripsBoundaryIdentityGuard(db: Database, memoryId: number): boolean {
+    return Boolean(
+        db
+            .prepare(
+                `SELECT 1 FROM memories m
+                  WHERE m.id = ?
+                    AND m.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
+                                           WHERE key = '${CLAIMS_BACKFILL_META_KEYS.boundaryMemoryId}'), 0)
+                    AND NOT EXISTS (SELECT 1 FROM legacy_memory_claims WHERE memory_id = m.id)`,
+            )
+            .get(memoryId),
+    );
+}
+
 function mergeMemoryRow(
     db: Database,
     row: SqliteRow,
@@ -664,11 +684,16 @@ function mergeMemoryRow(
         const failure = projectionRow
             ? memoryClaimAdoptionFailureReason(projectionRow, targetProjectId)
             : null;
-        if (failure !== null && rekeyTripsRelationshipGuard(db, sourceId)) {
-            // An unadoptable row cannot carry a relationship snapshot (the
-            // snapshot requires a claim link), so a lineage-bearing one would
-            // trip the v84 relationship guard on the project_path rekey and
-            // abort the whole merge. Record the blocking diagnostic and leave
+        if (
+            failure !== null &&
+            (rekeyTripsRelationshipGuard(db, sourceId) ||
+                rekeyTripsBoundaryIdentityGuard(db, sourceId))
+        ) {
+            // An unadoptable row cannot carry a relationship snapshot or a
+            // crosswalk link (both require adoption), so a lineage-bearing one
+            // would trip the v84 relationship guard and an unlinked boundary
+            // one the identity-move guard on the project_path rekey — either
+            // aborts the whole merge. Record the blocking diagnostic and leave
             // the row under the source identity for the repair lane.
             recordMemoryClaimLinkFailure(db, sourceId, fromIdentity, failure);
             return false;

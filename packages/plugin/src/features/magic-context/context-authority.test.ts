@@ -3571,6 +3571,98 @@ describe("module mirror claims (v84)", () => {
         ).toEqual({ c: 1 });
     });
 
+    test("a claim-invalid lineage-bearing source skips the pointer write instead of aborting the page", () => {
+        const database = db();
+        // The source carries claim-invalid metadata AND nonblank merged_from,
+        // so it cannot adopt (no relationship snapshot) while the projection
+        // update installs lineage; the pointer write must be skipped or the
+        // relationship guard would roll back the whole page.
+        applyMirrorPage({
+            db: database,
+            page: page(0, [
+                {
+                    feedSeq: 1,
+                    op: "insert",
+                    moduleRowId: 11,
+                    snapshot: moduleSnapshot(11, "old fact", "mm-lb-h1", {
+                        superseded_by_memory_id: 12,
+                        merged_from: "7",
+                        scope: "bogus",
+                    }),
+                },
+                {
+                    feedSeq: 2,
+                    op: "insert",
+                    moduleRowId: 12,
+                    snapshot: moduleSnapshot(12, "new fact", "mm-lb-h2"),
+                },
+            ]),
+        });
+
+        const sourceId = (
+            database
+                .prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-lb-h1'")
+                .get() as { id: number }
+        ).id;
+        const targetId = (
+            database
+                .prepare("SELECT id FROM memories WHERE normalized_hash = 'mm-lb-h2'")
+                .get() as { id: number }
+        ).id;
+        // The page committed with the pointer write skipped: the pending
+        // reference is the pair's retry driver, and the unadoptable source
+        // records a blocking diagnostic.
+        expect(getMirrorCursor(database, "memories")).toBe(2);
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ s: null });
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 1 });
+        expect(
+            database
+                .prepare(
+                    "SELECT reason_code, disposition FROM claim_backfill_failures WHERE phase = 'rows' AND item_kind = 'memory' AND item_key = ?",
+                )
+                .get(String(sourceId)),
+        ).toEqual({ reason_code: "invalid-scope", disposition: "blocking" });
+
+        // The module repairs the source's metadata: the next page adopts both
+        // endpoints, writes the pointer inside the pair envelope, and clears
+        // the pending reference.
+        applyMirrorPage({
+            db: database,
+            page: page(2, [
+                {
+                    feedSeq: 3,
+                    op: "update",
+                    moduleRowId: 11,
+                    snapshot: moduleSnapshot(11, "old fact", "mm-lb-h1", {
+                        superseded_by_memory_id: 12,
+                        merged_from: "7",
+                    }),
+                },
+            ]),
+        });
+        expect(
+            database
+                .prepare("SELECT superseded_by_memory_id AS s FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ s: targetId });
+        expect(
+            database
+                .prepare("SELECT COUNT(*) AS c FROM claim_operations WHERE operation_key = ?")
+                .get(`memories:supersede:${sourceId}:${targetId}`),
+        ).toEqual({ c: 1 });
+        expect(
+            database.prepare("SELECT COUNT(*) AS c FROM mirror_pending_references").get(),
+        ).toEqual({ c: 0 });
+        expect(readMemoryClaimLink(database, sourceId)).not.toBeNull();
+        expect(readMemoryClaimLink(database, targetId)).not.toBeNull();
+    });
+
     /** Pre-v84 mirrored corpus shape: two boundary rows (inserted before the
      * migration chain, so they never linked) mapped in mirror_identity with a
      * pending supersession reference between them. */

@@ -1765,19 +1765,37 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
             }),
             sourceSessionId: row.source_session_id,
         });
+        const effects: MemoryClaimEffect[] = [
+            {
+                effectKey: `memory:${row.id}:upsert`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "upsert" as const,
+            },
+        ];
+        // The projection keeps its verified columns across a classification
+        // change, so the appended revision needs its own verified event —
+        // without one the claim's current revision reads unverified while
+        // the projection stays verified.
+        if (memoryRowHasPositiveVerification(db, row)) {
+            addVerificationEvent(db, {
+                revisionId,
+                outcome: "verified",
+                verifier: envelope.producer,
+            });
+            effects.push({
+                effectKey: `memory:${row.id}:evidence`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "evidence" as const,
+            });
+        }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         updateMemoryProjectionClassification(db, row.id, projectionUpdate, input.nowMs);
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
         return {
             result: { memoryId: row.id, claimId: link.claimId, revisionId, found: true },
-            effects: [
-                {
-                    effectKey: `memory:${row.id}:upsert`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "upsert" as const,
-                },
-            ],
+            effects,
         };
     });
 }
