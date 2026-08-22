@@ -27,6 +27,16 @@
 
 import { createHash } from "node:crypto";
 import type { Database } from "../../../shared/sqlite";
+import {
+    APPLICABILITY_BASELINE_STREAM_KEY,
+    APPLICABILITY_STREAM_KEY_PROTOCOL,
+    type SourceTrustClass,
+} from "../storage-claim-applicability-schema.ts";
+import {
+    hasClaimApplicabilitySchema,
+    type RevisionApplicabilityInput,
+    writeRevisionApplicabilityInCurrentTransaction,
+} from "./storage-claim-applicability.ts";
 
 export type ClaimState = "active" | "permanent" | "archived";
 export type EvidenceRelation = "supports" | "merged_from";
@@ -176,26 +186,42 @@ export interface ObservationInput {
     extractorVersion: string;
     extractorRunId: string;
     independenceKey: string;
+    /** Omitted means the schema's conservative `model_inference` default. */
+    sourceTrustClass?: SourceTrustClass;
 }
 
 export function createObservation(db: Database, input: ObservationInput): number {
+    const columns = [
+        "source_span_id",
+        "extracted_text",
+        "content_sha256",
+        "extractor",
+        "extractor_version",
+        "extractor_run_id",
+        "independence_key",
+    ];
+    const values: Array<string | number> = [
+        input.sourceSpanId,
+        input.extractedText,
+        sha256Utf8Hex(input.extractedText),
+        input.extractor,
+        input.extractorVersion,
+        input.extractorRunId,
+        input.independenceKey,
+    ];
+    if (input.sourceTrustClass !== undefined) {
+        columns.push("source_trust_class");
+        values.push(input.sourceTrustClass);
+    }
+    columns.push("created_at");
+    values.push(Date.now());
+    const placeholders = columns.map(() => "?").join(", ");
     return toRowId(
         db
-            .prepare(
-                `INSERT INTO observations
-                    (source_span_id, extracted_text, content_sha256, extractor, extractor_version, extractor_run_id, independence_key, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            )
-            .run(
-                input.sourceSpanId,
-                input.extractedText,
-                sha256Utf8Hex(input.extractedText),
-                input.extractor,
-                input.extractorVersion,
-                input.extractorRunId,
-                input.independenceKey,
-                Date.now(),
-            ),
+            // Column names come from the fixed list above, never caller input.
+            // pi-lens-ignore: sql-injection
+            .prepare(`INSERT INTO observations (${columns.join(", ")}) VALUES (${placeholders})`)
+            .run(...values),
     );
 }
 
@@ -287,7 +313,8 @@ function insertRevisionWithEvidence(
         evidence: readonly NormalizedEvidence[];
         now: number;
     },
-): number {
+): { revisionId: number; contentSha256: string } {
+    const contentSha256 = sha256Utf8Hex(args.content);
     const revisionId = toRowId(
         db
             .prepare(
@@ -299,7 +326,7 @@ function insertRevisionWithEvidence(
                 args.claimId,
                 args.revision,
                 args.content,
-                sha256Utf8Hex(args.content),
+                contentSha256,
                 args.sourceSessionId,
                 args.now,
             ),
@@ -310,7 +337,42 @@ function insertRevisionWithEvidence(
     for (const item of args.evidence) {
         insertEvidence.run(revisionId, item.observationId, item.relation, args.now);
     }
-    return revisionId;
+    return { revisionId, contentSha256 };
+}
+
+/**
+ * Applicability is written in the same transaction as the revision:
+ * caller-supplied lineage when present, otherwise the `unknown` baseline
+ * stream.
+ */
+function writeNewRevisionApplicability(
+    db: Database,
+    args: {
+        revisionId: number;
+        projectId: number;
+        contentSha256: string;
+        now: number;
+        applicability?: RevisionApplicabilityInput;
+    },
+): void {
+    if (!hasClaimApplicabilitySchema(db)) return;
+    const applicability: RevisionApplicabilityInput = args.applicability ?? {
+        ownerKind: "source",
+        streamKey: APPLICABILITY_BASELINE_STREAM_KEY,
+        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
+        sourceDigest: args.contentSha256,
+        assertion: {
+            state: "unknown",
+            paths: { state: "unknown" },
+            knownFrom: args.now,
+            recordedAt: args.now,
+        },
+    };
+    writeRevisionApplicabilityInCurrentTransaction(db, {
+        revisionId: args.revisionId,
+        projectId: args.projectId,
+        applicability,
+    });
 }
 
 export interface CreateClaimInput {
@@ -322,6 +384,8 @@ export interface CreateClaimInput {
     content: string;
     evidence: readonly ClaimEvidenceInput[];
     sourceSessionId?: string | null;
+    /** Lineage-specific applicability; omitted means the `unknown` baseline. */
+    applicability?: RevisionApplicabilityInput;
 }
 
 /** Transaction-local `createClaim`: requires a caller-held write transaction. */
@@ -362,13 +426,20 @@ export function createClaimInCurrentTransaction(
                 now,
             ),
     );
-    const revisionId = insertRevisionWithEvidence(db, {
+    const { revisionId, contentSha256 } = insertRevisionWithEvidence(db, {
         claimId,
         revision: 1,
         content: input.content,
         sourceSessionId: input.sourceSessionId ?? null,
         evidence: validated.evidence,
         now,
+    });
+    writeNewRevisionApplicability(db, {
+        revisionId,
+        projectId: input.projectId,
+        contentSha256,
+        now,
+        applicability: input.applicability,
     });
     const published = changeCount(
         db
@@ -397,6 +468,8 @@ export interface AppendClaimRevisionInput {
     content: string;
     evidence: readonly ClaimEvidenceInput[];
     sourceSessionId?: string | null;
+    /** Lineage-specific applicability; omitted means the `unknown` baseline. */
+    applicability?: RevisionApplicabilityInput;
 }
 
 /**
@@ -457,13 +530,20 @@ export function appendClaimRevisionInCurrentTransaction(
     }
 
     const revision = current.revision + 1;
-    const revisionId = insertRevisionWithEvidence(db, {
+    const { revisionId, contentSha256 } = insertRevisionWithEvidence(db, {
         claimId: input.claimId,
         revision,
         content: input.content,
         sourceSessionId: input.sourceSessionId ?? null,
         evidence: validated.evidence,
         now,
+    });
+    writeNewRevisionApplicability(db, {
+        revisionId,
+        projectId: current.projectId,
+        contentSha256,
+        now,
+        applicability: input.applicability,
     });
     const advanced = changeCount(
         db

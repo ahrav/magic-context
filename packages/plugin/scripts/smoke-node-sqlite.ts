@@ -30,6 +30,15 @@ import {
 import { readMemoryProjectionRow } from "../src/features/magic-context/memory/storage-memory-projection.ts";
 import { createClaimsAndEvidenceSchema } from "../src/features/magic-context/storage-claims-schema.ts";
 import {
+    addObservationSourceTrustClassColumn,
+    createClaimApplicabilitySchema,
+} from "../src/features/magic-context/storage-claim-applicability-schema.ts";
+import {
+    appendApplicabilityAssertionInCurrentTransaction,
+    readApplicabilityIntervals,
+    readCurrentApplicabilityAssertions,
+} from "../src/features/magic-context/memory/storage-claim-applicability.ts";
+import {
     createMemoryClaimsCompatSchema,
     installMemoryClaimsWriteGuards,
 } from "../src/features/magic-context/storage-memory-claims-schema.ts";
@@ -49,6 +58,8 @@ const dir = mkdtempSync(join(tmpdir(), "mc-node-sqlite-smoke-"));
 const dbPath = join(dir, "smoke.db");
 try {
     // Construction + basic DDL/DML.
+    // SAFETY: The smoke test invokes every asserted Database member, so an
+    // absent member throws.
     const db = new Database(dbPath) as unknown as {
         exec: (s: string) => void;
         prepare: (s: string) => {
@@ -115,6 +126,8 @@ try {
     check("nested savepoint: outer kept, inner rolled back", names.join(",") === "a,b,outer", names.join(","));
 
     // ATTACH (used by tool-owner-backfill) works under defensive mode.
+    // SAFETY: The smoke test invokes every asserted Database member, so an
+    // absent member throws.
     const other = new Database(join(dir, "other.db")) as unknown as { exec: (s: string) => void; close: () => void };
     other.exec("CREATE TABLE x(id INTEGER); INSERT INTO x(id) VALUES(42)");
     other.close();
@@ -125,6 +138,8 @@ try {
     db.close();
 
     // readonly → readOnly mapping.
+    // SAFETY: The smoke test invokes every asserted Database member, so an
+    // absent member throws.
     const ro = new Database(dbPath, { readonly: true } as never) as unknown as {
         prepare: (s: string) => { get: (...a: unknown[]) => unknown };
         exec: (s: string) => void;
@@ -147,6 +162,8 @@ try {
     };
     console.log(`  sqlite_version() = ${engine.version}`);
     createClaimsAndEvidenceSchema(claimsDb);
+    addObservationSourceTrustClassColumn(claimsDb);
+    createClaimApplicabilitySchema(claimsDb);
     const projectId = ensureProject(claimsDb, "git:node-smoke");
     const episodeId = createEpisode(claimsDb, { projectId, sourceSessionId: "ses_smoke" });
     const spanId = createSourceSpan(claimsDb, {
@@ -163,7 +180,12 @@ try {
         extractorVersion: "1",
         extractorRunId: "run",
         independenceKey: "ik",
+        sourceTrustClass: "explicit_user",
     });
+    const storedTrust = claimsDb
+        .prepare("SELECT source_trust_class AS trust FROM observations WHERE id = ?")
+        .get(observationId) as { trust: string };
+    check("v85 observation trust class persists", storedTrust.trust === "explicit_user");
     const created = createClaim(claimsDb, {
         projectId,
         subject: "s",
@@ -194,11 +216,37 @@ try {
         const revisionCount = claimsDb
             .prepare("SELECT COUNT(*) AS count FROM claim_revisions")
             .get() as { count: number };
-        check(
-            "v82 stale append leaves no revision residue",
+        check("v82 stale append leaves no revision residue",
             revisionCount.count === 2,
             String(revisionCount.count),
         );
+        const baselineHeads = readCurrentApplicabilityAssertions(claimsDb, created.revisionId);
+        check(
+            "v85 create writes an unknown baseline assertion",
+            baselineHeads.length === 1 && baselineHeads[0]?.state === "unknown",
+            JSON.stringify(baselineHeads),
+        );
+        const baseline = baselineHeads[0];
+        if (baseline) {
+            claimsDb
+                .transaction(() =>
+                    appendApplicabilityAssertionInCurrentTransaction(claimsDb, {
+                        streamId: baseline.streamId,
+                        state: "historical",
+                        paths: { state: "known", exact: ["src/smoke.ts"] },
+                        knownFrom: (baseline.knownFrom ?? 0) + 1_000,
+                    }),
+                )
+                .immediate();
+            const intervals = readApplicabilityIntervals(claimsDb, created.revisionId);
+            const closed = intervals.find((row) => row.seq === 1);
+            check(
+                "v85 successor closes the baseline knowledge interval",
+                closed?.knownUntil === (baseline.knownFrom ?? 0) + 1_000 &&
+                    closed?.recordedUntil !== null,
+                JSON.stringify(intervals),
+            );
+        }
     }
     claimsDb.close();
 

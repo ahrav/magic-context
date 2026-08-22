@@ -17,7 +17,7 @@ import {
     setClaimsBackfillCalibrationForTests,
     setClaimsBackfillFailpoint,
 } from "../claims-backfill.ts";
-import { runMigrations } from "../migrations.ts";
+import { LATEST_MIGRATION_VERSION, runMigrations } from "../migrations.ts";
 import { initializeDatabase } from "../storage-db.ts";
 import { CLAIMS_BACKFILL_META_KEYS } from "../storage-memory-claims-schema.ts";
 import { computeNormalizedHash } from "./normalize-hash.ts";
@@ -54,10 +54,14 @@ const IMPLEMENTATION_FILES = [
     "packages/pi-plugin/PARITY.md",
     "packages/plugin/src/features/magic-context/dreamer/task-gates.test.ts",
     "packages/plugin/src/features/magic-context/memory/fixtures/claims-crash-worker.ts",
+    "packages/plugin/src/features/magic-context/memory/source-trust.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-claim-applicability.ts",
+    "packages/plugin/src/features/magic-context/memory/storage-claims.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-claims-crash.test.ts",
     "packages/plugin/src/features/magic-context/memory/storage-memory-claims.ts",
     "packages/plugin/src/features/magic-context/mural/resolve-mural.test.ts",
     "packages/plugin/src/features/magic-context/search.test.ts",
+    "packages/plugin/src/features/magic-context/storage-claim-applicability-schema.ts",
     "packages/plugin/src/hooks/magic-context/module-state-sync.test.ts",
 ] as const;
 
@@ -103,6 +107,8 @@ interface SemanticSnapshot {
     failures: Array<Record<string, unknown>>;
     backfillMeta: Array<Record<string, unknown>>;
     mutationLogCount: number;
+    applicabilityStreams: Array<Record<string, unknown>>;
+    applicabilityAssertions: Array<Record<string, unknown>>;
 }
 
 let rootDir = "";
@@ -475,6 +481,22 @@ function semanticSnapshot(path: string): SemanticSnapshot {
                       }
                   ).count
                 : 0,
+            applicabilityStreams: tableExists(db, "claim_revision_applicability_streams")
+                ? rows(
+                      db,
+                      `SELECT revision_id, owner_kind, stream_key, source_digest
+                         FROM claim_revision_applicability_streams
+                        ORDER BY revision_id, stream_key`,
+                  )
+                : [],
+            applicabilityAssertions: tableExists(db, "claim_revision_applicability_assertions")
+                ? rows(
+                      db,
+                      `SELECT stream_id, seq, state, paths_state
+                         FROM claim_revision_applicability_assertions
+                        ORDER BY stream_id, seq`,
+                  )
+                : [],
         };
     } finally {
         close(db);
@@ -491,7 +513,7 @@ function meta(snapshot: SemanticSnapshot, key: string): string | null {
 }
 
 function assertMemoryTuple(snapshot: SemanticSnapshot, committed: boolean): void {
-    expect(snapshot.schemaVersion).toBe(84);
+    expect(snapshot.schemaVersion).toBe(LATEST_MIGRATION_VERSION);
     expect(snapshot.memories).toHaveLength(committed ? 1 : 0);
     expect(snapshot.links).toHaveLength(committed ? 1 : 0);
     expect(snapshot.revisions).toHaveLength(committed ? 1 : 0);
@@ -519,7 +541,7 @@ function assertMemoryTuple(snapshot: SemanticSnapshot, committed: boolean): void
 }
 
 function assertBackfillCut(snapshot: SemanticSnapshot, scenario: string): void {
-    expect(snapshot.schemaVersion).toBe(84);
+    expect(snapshot.schemaVersion).toBe(LATEST_MIGRATION_VERSION);
     if (scenario === "lazy-row-uncommitted") {
         expect(snapshot.links).toHaveLength(0);
         expect(meta(snapshot, CLAIMS_BACKFILL_META_KEYS.phase)).toBe("rows");

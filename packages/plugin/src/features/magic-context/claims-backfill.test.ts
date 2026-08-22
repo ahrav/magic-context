@@ -47,6 +47,7 @@ interface LegacyRow {
     supersededBy?: number | null;
     metadataJson?: string | null;
     sourceSessionId?: string | null;
+    sourceType?: string;
     mappedFile?: string;
 }
 
@@ -85,7 +86,7 @@ function prepareLegacyDb(
              source_session_id, source_type, first_seen_at, created_at, updated_at, last_seen_at,
              status, verification_status, verified_at, merged_from, superseded_by_memory_id,
              metadata_json)
-         VALUES (?, ?, ?, ?, 73, ?, 1, ?, 'historian', 11, 12, 13, 14, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, 73, ?, 1, ?, ?, 11, 12, 13, 14, ?, ?, ?, ?, ?, ?)`,
     );
     const ids: number[] = [];
     for (const [index, row] of rows.entries()) {
@@ -96,6 +97,7 @@ function prepareLegacyDb(
             row.hash ?? `hash:${index + 1}`,
             row.scope ?? "ecosystem",
             row.sourceSessionId ?? null,
+            row.sourceType ?? "historian",
             row.status ?? "active",
             row.verificationStatus ?? "unverified",
             row.verifiedAt ?? null,
@@ -105,7 +107,7 @@ function prepareLegacyDb(
         ) as { lastInsertRowid: number | bigint };
         const id = Number(result.lastInsertRowid);
         ids.push(id);
-        if (row.mappedFile) {
+        if (row.mappedFile !== undefined) {
             db.prepare(
                 `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
                  VALUES (?, ?, 0, 17)`,
@@ -622,6 +624,7 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
                 (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
              VALUES (?, ?, ?, ?, '', 'blocking', 1, 1)`,
         );
+        // pi-lens-ignore: sql-injection
         insertFailure.run("rows", "memory", String(boundary + 1), "unresolved-project-identity");
         insertFailure.run(
             "relationships",
@@ -708,6 +711,7 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
             db.prepare(
                 `UPDATE claim_backfill_failures SET disposition = 'blocking'
                   WHERE phase = 'relationships' AND item_key LIKE ?`,
+                // pi-lens-ignore: sql-injection
             ).run(`memory:${ids[1]}:%`);
         });
 
@@ -1388,6 +1392,119 @@ describe("claims backfill dedup adoption lifecycle", () => {
             { effectKey: `memory:${sourceId}:upsert`, effectType: "upsert" },
             { effectKey: `memory:${targetId}:upsert`, effectType: "upsert" },
         ]);
+        expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([]);
+    });
+});
+
+describe("claims backfill: source trust and applicability population (AE4, AE5)", () => {
+    function rootObservationTrust(db: Database, memoryId: number): string {
+        return (
+            db
+                .prepare(
+                    `SELECT o.source_trust_class AS trust
+                       FROM legacy_memory_claims lmc
+                       JOIN observations o ON o.id = lmc.root_observation_id
+                      WHERE lmc.memory_id = ?`,
+                )
+                .get(memoryId) as { trust: string }
+        ).trust;
+    }
+
+    function currentMemoryStreamHead(
+        db: Database,
+        memoryId: number,
+    ): {
+        pathsState: string;
+        knownFrom: number | null;
+        paths: Array<{ kind: string; value: string }>;
+    } | null {
+        const row = db
+            .prepare(
+                `SELECT a.id AS assertionId, a.paths_state AS pathsState, a.known_from AS knownFrom
+                   FROM legacy_memory_claims lmc
+                   JOIN claims c ON c.id = lmc.claim_id
+                   JOIN claim_revision_applicability_streams s
+                     ON s.revision_id = c.current_revision_id
+                    AND s.stream_key = 'legacy-memory:' || lmc.memory_id || ':v1'
+                   JOIN claim_revision_applicability_assertions a ON a.stream_id = s.id
+                  WHERE lmc.memory_id = ?
+                  ORDER BY a.seq DESC LIMIT 1`,
+            )
+            .get(memoryId) as
+            | { assertionId: number; pathsState: string; knownFrom: number | null }
+            | undefined;
+        if (!row) return null;
+        const paths = db
+            .prepare(
+                `SELECT kind, value FROM claim_revision_applicability_paths
+                  WHERE assertion_id = ? ORDER BY kind, value`,
+            )
+            .all(row.assertionId) as Array<{ kind: string; value: string }>;
+        return { pathsState: row.pathsState, knownFrom: row.knownFrom, paths };
+    }
+
+    test("lazy conversion maps only the user source to explicit_user (AE4)", async () => {
+        const { db, ids } = migrateLazy([
+            { content: "from user", sourceType: "user", hash: "hash:user" },
+            { content: "from historian", sourceType: "historian", hash: "hash:historian" },
+            { content: "from agent", sourceType: "agent", hash: "hash:agent" },
+            { content: "from dreamer", sourceType: "dreamer", hash: "hash:dreamer" },
+            { content: "from unknown", sourceType: "module:mystery", hash: "hash:unknown" },
+        ]);
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        expect(rootObservationTrust(db, ids[0])).toBe("explicit_user");
+        for (const id of ids.slice(1)) {
+            expect(rootObservationTrust(db, id)).toBe("model_inference");
+        }
+    });
+
+    test("lazy conversion records exact, known-empty, and unknown path states (AE5)", async () => {
+        const { db, ids } = migrateLazy([
+            { content: "mapped memory", hash: "hash:mapped", mappedFile: "src/mapped.ts" },
+            { content: "independent memory", hash: "hash:independent", mappedFile: "" },
+            { content: "unmapped memory", hash: "hash:unmapped" },
+        ]);
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+
+        const mapped = currentMemoryStreamHead(db, ids[0]);
+        expect(mapped?.pathsState).toBe("known");
+        expect(mapped?.paths).toEqual([{ kind: "exact", value: "src/mapped.ts" }]);
+        expect(mapped?.knownFrom).toBe(11);
+
+        const independent = currentMemoryStreamHead(db, ids[1]);
+        expect(independent?.pathsState).toBe("known");
+        expect(independent?.paths).toEqual([]);
+
+        const unmapped = currentMemoryStreamHead(db, ids[2]);
+        expect(unmapped?.pathsState).toBe("unknown");
+        expect(unmapped?.paths).toEqual([]);
+    });
+
+    test("eager conversion inside the v84 migration keeps the conservative default and seeded baselines", () => {
+        const { db, ids } = migrateEager([
+            { content: "eager user memory", sourceType: "user", hash: "hash:eager-user" },
+        ]);
+        expect(rootObservationTrust(db, ids[0])).toBe("model_inference");
+        const baseline = db
+            .prepare(
+                `SELECT COUNT(*) AS count
+                   FROM claim_revision_applicability_streams
+                  WHERE stream_key = 'baseline:v1'`,
+            )
+            .get() as { count: number };
+        expect(baseline.count).toBeGreaterThanOrEqual(1);
+        const streamless = db
+            .prepare(
+                `SELECT COUNT(*) AS count FROM claim_revisions rev
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM claim_revision_applicability_streams s
+                       WHERE s.revision_id = rev.id
+                  )`,
+            )
+            .get() as { count: number };
+        expect(streamless.count).toBe(0);
         expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([]);
     });
 });

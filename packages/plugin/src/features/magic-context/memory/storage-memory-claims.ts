@@ -24,6 +24,14 @@ import {
     memoryLineagePresentSql,
     memoryRelationshipSourceMatchSql,
 } from "../storage-memory-claims-schema.ts";
+import { trustClassForLegacyMemorySource } from "./source-trust.ts";
+import {
+    type ApplicabilityPathsInput,
+    hasClaimApplicabilitySchema,
+    legacyMemorySourceApplicability,
+    type RevisionApplicabilityInput,
+    syncMemoryApplicabilityPathsInCurrentTransaction,
+} from "./storage-claim-applicability.ts";
 import {
     addClaimConflictInCurrentTransaction,
     addVerificationEvent,
@@ -570,6 +578,7 @@ function createMemoryObservation(
         projectId: number;
         memoryId: number;
         content: string;
+        sourceType: string | null;
         provenance: MemoryClaimProvenance;
     },
 ): number {
@@ -595,7 +604,19 @@ function createMemoryObservation(
         extractorVersion: "1",
         extractorRunId: live ? live.operationKey : `legacy-memory:${args.memoryId}`,
         independenceKey: `legacy-memory:${args.memoryId}`,
+        sourceTrustClass: hasClaimApplicabilitySchema(db)
+            ? trustClassForLegacyMemorySource(args.sourceType)
+            : undefined,
     });
+}
+
+function memorySourceApplicability(
+    db: Database,
+    row: Pick<MemoryProjectionRow, "id" | "first_seen_at">,
+    provenance: MemoryClaimProvenance,
+): RevisionApplicabilityInput | undefined {
+    if (!hasClaimApplicabilitySchema(db)) return undefined;
+    return legacyMemorySourceApplicability(db, row, provenance.kind);
 }
 
 interface RevisionMemoryMetadataInput {
@@ -780,6 +801,7 @@ function appendMemoryClaimRevision(
         observationId: number;
         metadata: RevisionMemoryMetadataInput;
         sourceSessionId?: string | null;
+        applicability?: RevisionApplicabilityInput;
     },
 ): number {
     const expected = readClaimCurrentRevisionId(db, args.claimId);
@@ -789,6 +811,7 @@ function appendMemoryClaimRevision(
         content: args.content,
         evidence: [{ observationId: args.observationId }],
         sourceSessionId: args.sourceSessionId ?? null,
+        applicability: args.applicability,
     });
     if (outcome.status !== "applied") {
         throw new Error(
@@ -838,6 +861,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
             projectId,
             memoryId: row.id,
             content: row.content,
+            sourceType: row.source_type,
             provenance,
         });
         if (options.adoptDivergentContent ?? true) {
@@ -856,6 +880,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
                     observationId,
                     metadata: desiredMeta,
                     sourceSessionId: row.source_session_id,
+                    applicability: memorySourceApplicability(db, row, provenance),
                 });
             }
         }
@@ -885,6 +910,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
         projectId,
         memoryId: row.id,
         content: row.content,
+        sourceType: row.source_type,
         provenance,
     });
     const created = createClaimInCurrentTransaction(db, {
@@ -896,6 +922,7 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
         content: row.content,
         evidence: [{ observationId }],
         sourceSessionId: row.source_session_id,
+        applicability: memorySourceApplicability(db, row, provenance),
     });
     if (created.status !== "applied") {
         throw new ClaimGraphCorruptionError(
@@ -1592,11 +1619,13 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                     // bytes must append their own revision here — otherwise
                     // the claim keeps the pre-empty content and the upsert
                     // effect announces a claim that never changed.
+                    const repairProvenance = liveProvenance(envelope, sessionId);
                     const observationId = createMemoryObservation(db, {
                         projectId,
                         memoryId: row.id,
                         content: input.content,
-                        provenance: liveProvenance(envelope, sessionId),
+                        sourceType: post.source_type,
+                        provenance: repairProvenance,
                     });
                     appendMemoryClaimRevision(db, {
                         claimId: link.claimId,
@@ -1604,6 +1633,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                         observationId,
                         metadata: metadataFromProjectionRow(post),
                         sourceSessionId: sessionId,
+                        applicability: memorySourceApplicability(db, post, repairProvenance),
                     });
                     // The ensure's early return skips its resolve call, so
                     // the empty-content blocker recorded by the emptying
@@ -1664,6 +1694,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             projectId,
             memoryId: row.id,
             content: input.content,
+            sourceType: row.source_type,
             provenance: liveProvenance(envelope, sessionId),
         });
         if (
@@ -1786,11 +1817,13 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
                     // revision here — otherwise the claim keeps the
                     // pre-repair metadata and the upsert effect announces a
                     // claim that never changed.
+                    const repairProvenance = liveProvenance(envelope, post.source_session_id);
                     const observationId = createMemoryObservation(db, {
                         projectId,
                         memoryId: row.id,
                         content: post.content,
-                        provenance: liveProvenance(envelope, post.source_session_id),
+                        sourceType: post.source_type,
+                        provenance: repairProvenance,
                     });
                     appendMemoryClaimRevision(db, {
                         claimId: link.claimId,
@@ -1798,6 +1831,7 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
                         observationId,
                         metadata: metadataFromProjectionRow(post),
                         sourceSessionId: post.source_session_id,
+                        applicability: memorySourceApplicability(db, post, repairProvenance),
                     });
                     // The ensure's early return skips its resolve call, so
                     // the blocker recorded by the invalidating write clears
@@ -1850,11 +1884,13 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
         const link = ensureMemoryClaimLinkInCurrentTransaction(db, row, projectId, {
             kind: "migration",
         });
+        const classificationProvenance = liveProvenance(envelope);
         const observationId = createMemoryObservation(db, {
             projectId,
             memoryId: row.id,
             content: row.content,
-            provenance: liveProvenance(envelope),
+            sourceType: row.source_type,
+            provenance: classificationProvenance,
         });
         const revisionId = appendMemoryClaimRevision(db, {
             claimId: link.claimId,
@@ -1869,6 +1905,7 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
                 shareable: input.shareable ?? (row.shareable ? 1 : 0),
             }),
             sourceSessionId: row.source_session_id,
+            applicability: memorySourceApplicability(db, row, classificationProvenance),
         });
         const effects: MemoryClaimEffect[] = [
             {
@@ -1954,11 +1991,13 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
         const effects: MemoryClaimEffect[] = [];
         let revisionId: number | null = null;
         if (input.metadataJson !== undefined && input.metadataJson !== row.metadata_json) {
+            const metadataProvenance = liveProvenance(envelope);
             const observationId = createMemoryObservation(db, {
                 projectId,
                 memoryId: row.id,
                 content: row.content,
-                provenance: liveProvenance(envelope),
+                sourceType: row.source_type,
+                provenance: metadataProvenance,
             });
             revisionId = appendMemoryClaimRevision(db, {
                 claimId: link.claimId,
@@ -1966,6 +2005,7 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                 observationId,
                 metadata: metadataFromProjectionRow(row, { metadataJson: input.metadataJson }),
                 sourceSessionId: row.source_session_id,
+                applicability: memorySourceApplicability(db, row, metadataProvenance),
             });
             effects.push({
                 effectKey: `memory:${row.id}:upsert`,
@@ -2531,8 +2571,9 @@ export interface ReplaceMemoryVerificationFilesResult {
 /**
  * File mapping / positive verification snapshot: replaces the
  * `memory_verifications` rows; a positive verification also appends one
- * current-snapshot verification event. A mapped-only snapshot appends no
- * event and no outbox effect (no claim-domain state change).
+ * current-snapshot verification event. A snapshot whose path state differs
+ * from the linked claim's current assertion appends an applicability
+ * successor and one upsert effect.
  */
 export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
     db: Database,
@@ -2564,7 +2605,38 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
             const failure = input.verified
                 ? recordMemoryClaimAdoptionFailure(db, row, projectId)
                 : null;
+            const snapshotPaths: ApplicabilityPathsInput = {
+                state: "known",
+                exact: input.files.filter((file) => file.length > 0),
+            };
+            const syncApplicabilityEffect = (
+                claimId: number,
+                effectProjectId: number,
+                effects: MemoryClaimEffect[],
+            ): void => {
+                if (!hasClaimApplicabilitySchema(db)) return;
+                const sync = syncMemoryApplicabilityPathsInCurrentTransaction(db, {
+                    revisionId: readClaimCurrentRevisionId(db, claimId),
+                    projectId: effectProjectId,
+                    memoryId: row.id,
+                    paths: snapshotPaths,
+                    knownFrom: input.now,
+                });
+                if (sync.appended) {
+                    effects.push({
+                        effectKey: `memory:${row.id}:applicability`,
+                        projectId: effectProjectId,
+                        claimId,
+                        effectType: "upsert" as const,
+                    });
+                }
+            };
             if (!input.verified || failure !== null || projectId === null) {
+                const existingLink = projectId !== null ? readMemoryClaimLink(db, row.id) : null;
+                const effects: MemoryClaimEffect[] = [];
+                if (existingLink) {
+                    syncApplicabilityEffect(existingLink.claimId, existingLink.projectId, effects);
+                }
                 hitMemoryClaimFailpoint("memory-claim.010.claim.after");
                 const rowsWritten = replaceMemoryProjectionVerificationFiles(
                     db,
@@ -2574,7 +2646,14 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
                     input.now,
                 );
                 hitMemoryClaimFailpoint("memory-claim.020.projection.after");
-                return { result: { memoryId: row.id, claimId: null, rowsWritten }, effects: [] };
+                return {
+                    result: {
+                        memoryId: row.id,
+                        claimId: existingLink?.claimId ?? null,
+                        rowsWritten,
+                    },
+                    effects,
+                };
             }
             // A first adoption owes the outbox its upsert: the evidence
             // effect below only refreshes verification columns, so without
@@ -2603,6 +2682,7 @@ export function replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
                 outcome: "verified",
                 verifier: envelope.producer,
             });
+            syncApplicabilityEffect(link.claimId, projectId, effects);
             hitMemoryClaimFailpoint("memory-claim.010.claim.after");
             const rowsWritten = replaceMemoryProjectionVerificationFiles(
                 db,
@@ -2984,11 +3064,13 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                     post.source_session_id,
                 )
             ) {
+                const deltaProvenance = liveProvenance(envelope, post.source_session_id);
                 const observationId = createMemoryObservation(db, {
                     projectId,
                     memoryId: post.id,
                     content: post.content,
-                    provenance: liveProvenance(envelope, post.source_session_id),
+                    sourceType: post.source_type,
+                    provenance: deltaProvenance,
                 });
                 revisionId = appendMemoryClaimRevision(db, {
                     claimId: link.claimId,
@@ -2996,6 +3078,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                     observationId,
                     metadata: desiredMeta,
                     sourceSessionId: post.source_session_id,
+                    applicability: memorySourceApplicability(db, post, deltaProvenance),
                 });
                 effects.push({
                     effectKey: `memory:${post.id}:upsert`,

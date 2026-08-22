@@ -8,6 +8,14 @@ import {
     runEagerClaimsBackfillInMigrationTransaction,
 } from "./claims-backfill";
 import {
+    addObservationSourceTrustClassColumn,
+    assertClaimApplicabilitySchemaForeignKeys,
+    CLAIM_APPLICABILITY_TABLES,
+    createClaimApplicabilitySchema,
+    observationSourceTrustClassColumnExists,
+    seedApplicabilityBaselines,
+} from "./storage-claim-applicability-schema";
+import {
     assertClaimsSchemaForeignKeys,
     CLAIMS_AND_EVIDENCE_TABLES,
     createClaimsAndEvidenceSchema,
@@ -3307,6 +3315,38 @@ export const MIGRATIONS: Migration[] = [
                 runEagerClaimsBackfillInMigrationTransaction(db);
             }
             assertMemoryClaimsSchemaForeignKeys(db);
+        },
+    },
+    {
+        version: 85,
+        description:
+            "bitemporal claim applicability streams, project-scoped git anchors, and observation source trust",
+        up(db: Database): void {
+            if (tableExists(db, "git_anchors")) {
+                const missing = CLAIM_APPLICABILITY_TABLES.filter(
+                    (table) => !tableExists(db, table),
+                );
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v85 replay guard: git_anchors exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                if (!observationSourceTrustClassColumnExists(db)) {
+                    throw new Error(
+                        "v85 replay guard: applicability tables exist but observations.source_trust_class missing; refusing to skip or overwrite",
+                    );
+                }
+                return;
+            }
+            if (observationSourceTrustClassColumnExists(db)) {
+                throw new Error(
+                    "v85 replay guard: observations.source_trust_class exists without the applicability tables; refusing to skip or overwrite",
+                );
+            }
+            addObservationSourceTrustClassColumn(db);
+            createClaimApplicabilitySchema(db);
+            seedApplicabilityBaselines(db, Date.now());
+            assertClaimApplicabilitySchemaForeignKeys(db);
         },
     },
 ];

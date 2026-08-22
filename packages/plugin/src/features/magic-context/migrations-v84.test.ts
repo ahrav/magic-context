@@ -97,7 +97,7 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
                         .get(),
                 ).toEqual({ count: 1 });
             }
-            expect(LATEST_MIGRATION_VERSION).toBe(84);
+            expect(LATEST_MIGRATION_VERSION).toBeGreaterThanOrEqual(84);
         } finally {
             closeQuietly(fresh);
             closeQuietly(upgraded);
@@ -185,7 +185,7 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
     test("a replayed v84 no-ops over its published schema; a partial schema refuses", () => {
         const db = migratedDb();
         try {
-            db.prepare("DELETE FROM schema_migrations WHERE version = 84").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version >= 84").run();
             runMigrations(db);
             expect(
                 db
@@ -193,7 +193,7 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
                     .get(),
             ).toEqual({ count: 1 });
 
-            db.prepare("DELETE FROM schema_migrations WHERE version = 84").run();
+            db.prepare("DELETE FROM schema_migrations WHERE version >= 84").run();
             db.exec("DROP TABLE claim_backfill_failures");
             expect(() => runMigrations(db)).toThrow(/replay guard/);
         } finally {
@@ -353,7 +353,8 @@ describe("migration v84: memories-to-claims compatibility contract", () => {
         try {
             expect(schemaVersionIsSupported(db, 82)).toBeFalse();
             expect(schemaVersionIsSupported(db, 83)).toBeFalse();
-            expect(schemaVersionIsSupported(db, 84)).toBeTrue();
+            expect(schemaVersionIsSupported(db, 84)).toBeFalse();
+            expect(schemaVersionIsSupported(db, LATEST_MIGRATION_VERSION)).toBeTrue();
         } finally {
             closeQuietly(db);
         }
