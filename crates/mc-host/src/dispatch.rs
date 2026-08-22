@@ -663,7 +663,11 @@ pub async fn dispatch_request<H: McHostHandler>(
     };
     let corr = header.corr;
 
-    if shared.draining.load(Ordering::SeqCst) {
+    // `draining` is stored by the shutdown sequence, which starts only after
+    // the accept loop observes cancellation; a request pipelined behind a
+    // committed `host.shutdown` response can reach here first. The token
+    // check makes the admission fence coincide with the commit point.
+    if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
         drop(frame);
         emit_rejection(
             shared,
@@ -908,7 +912,9 @@ pub async fn open_route<H: McHostHandler>(
     target: crate::handler::RouteTarget,
     identity: crate::handler::RouteIdentity,
 ) {
-    if shared.draining.load(Ordering::SeqCst) {
+    // Same fence as routed dispatch: reject at the shutdown commit point,
+    // not only once the later shutdown sequence stores `draining`.
+    if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
         emit_error_terminal(
             &shared.egress_budget,
             &gen,

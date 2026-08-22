@@ -179,7 +179,11 @@ pub async fn run_connection<H: McHostHandler>(
         .track_future(read_loop(&shared, &gen, read_half));
     {
         let mut connections = shared.connections.lock().expect("connections lock");
-        if shared.draining.load(Ordering::SeqCst) {
+        // The token check closes the window between a committed
+        // `host.shutdown` (which cancels the token) and the shutdown
+        // sequence storing `draining`: a socket accepted just before the
+        // commit must not register a new generation after it.
+        if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
             return;
         }
         connections.insert(gen.id, Arc::clone(&gen));
