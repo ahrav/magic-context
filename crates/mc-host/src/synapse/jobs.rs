@@ -350,13 +350,23 @@ impl JobTable {
 
         if let Some(seq) = jobs.by_key.get(&key).copied() {
             let job = jobs.by_seq.get(&seq).expect("keyed job exists");
-            if job.payload_digest == digest {
+            if job.payload_digest != digest {
+                return AdmitOutcome::Conflict;
+            }
+            // A failed job is not a result worth replaying: the retained
+            // failure exists so a poll can read the error, but an identical
+            // re-submission is a retry. Returning `Existing` here would
+            // hold the key hostage until expiry and make every retryable
+            // failure terminal within the retention window, so the failed
+            // job is evicted and the retry admitted fresh below.
+            if matches!(job.state, JobState::Failed { .. }) {
+                released.job(Self::remove(&mut jobs, seq));
+            } else {
                 return AdmitOutcome::Existing(JobDescriptor {
                     job_id: self.job_id(seq),
                     status: job.status(),
                 });
             }
-            return AdmitOutcome::Conflict;
         }
 
         let Some(result_bytes) = result_bytes else {
@@ -961,6 +971,44 @@ mod tests {
             POOL,
             "sweep released the expired job's charge"
         );
+    }
+
+    /// An identical re-submission of a failed payload is a retry, not a
+    /// replay of the stored failure: the failed job is evicted (releasing
+    /// its retained charge) and the retry admitted fresh, so a retryable
+    /// failure is not terminal within the retention window.
+    #[test]
+    fn an_identical_retry_replaces_a_failed_job() {
+        const POOL: usize = 1_000_000;
+        let budget = ByteBudget::new(POOL as u64);
+        let jobs = JobTable::new(SynapseLimits::default());
+        let key = "r".repeat(64);
+        let items = vec![charged_item("a", "alpha")];
+        let job_bytes = job_input_bytes(&key, &items);
+
+        let mut first = budget.try_charge(job_bytes).expect("charge");
+        let AdmitOutcome::Admitted { seq, .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut first)
+        else {
+            panic!("admitted");
+        };
+        jobs.publish_failed(seq, "internal_error".to_owned(), "worker died".to_owned());
+
+        let mut second = budget.try_charge(job_bytes).expect("recharge");
+        let AdmitOutcome::Admitted { seq: retry_seq, .. } =
+            jobs.admit_charged(key.clone(), items.clone(), 4, &mut second)
+        else {
+            panic!("retry admitted");
+        };
+        assert_ne!(seq, retry_seq, "the retry is a new job");
+        assert_eq!(
+            budget.available(),
+            POOL - job_bytes,
+            "the failed job's retained charge was released with its eviction"
+        );
+
+        jobs.clear();
+        assert_eq!(budget.available(), POOL);
     }
 
     #[test]
