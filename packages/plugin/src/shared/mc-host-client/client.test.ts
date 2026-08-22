@@ -14,6 +14,7 @@ import { SocketClosedError, SubcCallError, SubcError } from "./errors";
 import type { RouteHandle } from "./route-handle";
 import { StaleRouteHandleError } from "./route-handle";
 import {
+    encodePeerFrame,
     FakePeer,
     type FakePeerConnection,
     type PeerFrame,
@@ -242,6 +243,22 @@ async function jamWriter(
     client.request(handle, big, { timeoutMs: 3_000 }).catch(() => {});
     await delay(20);
 }
+
+/**
+ * Arrange to pause the NEXT accepted connection's reads before the client's
+ * auth hello is processed (the pause runs in a microtask ahead of any socket
+ * 'data' event), deterministically stalling setup until `resumeReading()`.
+ * Must be called before the dial is triggered.
+ */
+function stallNextConnection(peer: FakePeer): Promise<FakePeerConnection> {
+    return peer.waitForConnection().then((conn) => {
+        conn.pauseReading();
+        return conn;
+    });
+}
+
+const isRoutedFrame = (frame: PeerFrame): boolean =>
+    frame.ty === PeerFrameType.Request && frame.channel !== 0;
 
 describe("SubcClient facade", () => {
     test("completes tagged catalog, route open, opaque JSON request, and route Goodbye", async () => {
@@ -929,6 +946,343 @@ describe("SubcClient facade", () => {
             "missing_identity",
         );
         expect(conn.frames.length).toBe(0);
+    });
+});
+
+describe("deadline-independent setup coalescing", () => {
+    interface ReconnectHarness extends ConnectedHarness {
+        events: SubcDiagnosticsEvent[];
+    }
+
+    /** Connect, then retire the first generation so the next call redials. */
+    async function retiredHarness(
+        overrides: Partial<SubcClientOptions> = {},
+    ): Promise<ReconnectHarness> {
+        const events: SubcDiagnosticsEvent[] = [];
+        const harness = await connected({
+            identity: IDENTITY,
+            diagnostics: (event) => events.push(event),
+            ...overrides,
+        });
+        harness.conn.destroy();
+        await waitUntil(() => events.some((e) => e.type === "retired"));
+        return { ...harness, events };
+    }
+
+    test("a short connection joiner detaches while the long owner completes the shared dial", async () => {
+        const { client, peer } = await retiredHarness();
+        const stalled = stallNextConnection(peer);
+        const longCall = client.call("mod-a", "long");
+        const shortCall = client.call("mod-b", "short", undefined, { timeoutMs: 250 });
+        const conn2 = await stalled;
+
+        // The short joiner fails on its own stage without touching the dial.
+        const joinErr = expectCallError(await rejection(shortCall), "not_sent");
+        expect(joinErr.message).toContain("connection setup stage expired");
+        expect(peer.connections.length).toBe(2);
+
+        conn2.resumeReading();
+        await conn2.authenticated;
+        const cursor2 = frameCursor(conn2);
+        await serveManagedCall(conn2, cursor2, 7, 1, { ok: "long" });
+        expect(await longCall).toEqual({ ok: "long" });
+        expect(peer.connections.length).toBe(2);
+        // No application body escaped from the expired waiter.
+        const methods = conn2.frames
+            .filter(isRoutedFrame)
+            .map((f) => (bodyJson(f) as { method: string }).method);
+        expect(methods).toEqual(["long"]);
+    });
+
+    test("connection survivors coalesce exactly one replacement dial after owner setup expiry", async () => {
+        const { client, peer, events } = await retiredHarness();
+        const stalled = stallNextConnection(peer);
+        const shortOwner = client.call("mod-a", "short", undefined, { timeoutMs: 250 });
+        const callB = client.call("mod-b", "b");
+        const callC = client.call("mod-c", "c");
+        const conn2 = await stalled;
+
+        // The owner keeps its own setup failure and its generation retires.
+        const ownerErr = expectCallError(await rejection(shortOwner), "not_sent");
+        expect(ownerErr.message).toContain("connect failed");
+        expect(ownerErr.message).not.toContain("connection setup stage expired");
+        await waitUntil(() => events.filter((e) => e.type === "retired").length >= 2);
+
+        const conn3 = await nthConnection(peer, 3);
+        await conn3.authenticated;
+        const cursor3 = frameCursor(conn3);
+        const channelByModule: Record<string, number> = { "mod-b": 7, "mod-c": 8 };
+        for (let i = 0; i < 2; i++) {
+            const open = await cursor3.next(isRouteOpen);
+            const moduleId =
+                (bodyJson(open) as { target?: { module_id?: string } })?.target?.module_id ?? "";
+            await sendRouteOpenOk(conn3, open.corr, channelByModule[moduleId] as number, 1);
+        }
+        for (let i = 0; i < 2; i++) {
+            const body = await cursor3.next(isRoutedFrame);
+            await sendResponse(conn3, body.corr, { via: body.channel }, body.channel, 1);
+        }
+        expect(await callB).toEqual({ via: 7 });
+        expect(await callC).toEqual({ via: 8 });
+        // Exactly one replacement dial; the retired generation saw no traffic.
+        expect(peer.connections.length).toBe(3);
+        expect(conn2.frames.length).toBe(0);
+    });
+
+    test("an expired connection joiner is not a survivor and never creates a replacement dial", async () => {
+        const { client, peer } = await retiredHarness();
+        const stalled = stallNextConnection(peer);
+        const owner = client.call("mod-a", "o", undefined, { timeoutMs: 400 });
+        const joiner = client.call("mod-b", "j", undefined, { timeoutMs: 150 });
+        await stalled;
+
+        const joinErr = expectCallError(await rejection(joiner), "not_sent");
+        expect(joinErr.message).toContain("connection setup stage expired");
+        expect(peer.connections.length).toBe(2);
+        const ownerErr = expectCallError(await rejection(owner), "not_sent");
+        expect(ownerErr.message).toContain("connect failed");
+        expect(ownerErr.message).not.toContain("connection setup stage expired");
+        // Owner-budget exhaustion with no live survivors replaces nothing.
+        await delay(200);
+        expect(peer.connections.length).toBe(2);
+    });
+
+    test("a permanent connection-file failure propagates to every waiter without replacement", async () => {
+        const { client, peer, filePath } = await retiredHarness();
+        await writeFile(filePath, "not json", { mode: 0o600 });
+        const errA = rejection(client.call("mod-a", "a"));
+        const errB = rejection(client.call("mod-b", "b"));
+        const failA = expectCallError(await errA, "terminal", "invalid_json");
+        const failB = expectCallError(await errB, "terminal", "invalid_json");
+        // Both waiters carry the same underlying failure instance: a joiner
+        // that retried would have produced a second connection-file read and
+        // a distinct cause.
+        expect(failA.cause).toBe(failB.cause);
+        expect((failA.cause as Error).name).toBe("ConnectionFileError");
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("a mid-handshake socket failure is not owner-budget exhaustion: no replacement dial", async () => {
+        const { client, peer } = await retiredHarness();
+        const stalled = stallNextConnection(peer);
+        // catalogList joins the connection flight directly, with no route
+        // retry loop above it, so any extra dial can only come from flight
+        // replacement.
+        const errA = rejection(client.catalogList());
+        const errB = rejection(client.catalogList());
+        const conn2 = await stalled;
+        conn2.destroy();
+
+        // A mid-auth socket loss rejects callers with AuthError, not with
+        // owner-budget exhaustion.
+        expect(((await errA) as Error).name).toBe("AuthError");
+        expect(((await errB) as Error).name).toBe("AuthError");
+        await delay(150);
+        expect(peer.connections.length).toBe(2);
+    });
+
+    test("owner close during a shared connect leaves no replacement after client_closed", async () => {
+        const { client, peer } = await retiredHarness({ handshakeTimeoutMs: 300 });
+        const stalled = stallNextConnection(peer);
+        const errA = rejection(client.call("mod-a", "a"));
+        const errB = rejection(client.call("mod-b", "b"));
+        await stalled;
+
+        const closePromise = client.closeAsync();
+        expectCallError(await errA, "not_sent");
+        expectCallError(await errB, "not_sent");
+        await closePromise;
+        expect(peer.connections.length).toBe(2);
+    });
+
+    test("a short route joiner detaches pre-body while the long owner uses the shared route", async () => {
+        const { client, conn } = await connected({ identity: IDENTITY });
+        const cursor = frameCursor(conn);
+        const owner = client.call("magic-context", "long-a");
+        const joiner = client.call("magic-context", "short-b", undefined, { timeoutMs: 200 });
+        const open1 = await cursor.next(isRouteOpen);
+
+        // The joiner fails on its own stage; the shared opening stays live.
+        expectCallError(await rejection(joiner), "not_sent", "deadline_expired");
+        expect(conn.frames.filter(isRouteOpen).length).toBe(1);
+
+        await sendRouteOpenOk(conn, open1.corr, 7, 77);
+        const body = await cursor.next(isRoutedRequest(7));
+        expect(bodyJson(body)).toEqual({ method: "long-a" });
+        await sendResponse(conn, body.corr, { ok: true }, 7, 77);
+        expect(await owner).toEqual({ ok: true });
+        // Exactly one body: nothing escaped from the expired waiter.
+        expect(conn.frames.filter(isRoutedFrame).length).toBe(1);
+    });
+
+    test("route survivors coalesce one replacement connection and route after an ambiguous owner open", async () => {
+        const { client, conn, peer } = await connected({ identity: IDENTITY });
+        const cursor = frameCursor(conn);
+        const owner = client.call("magic-context", "own", undefined, { timeoutMs: 250 });
+        const callB = client.call("magic-context", "b");
+        const callC = client.call("magic-context", "c");
+        await cursor.next(isRouteOpen);
+
+        // Never respond: the ambiguous owner open retires generation 1.
+        expectCallError(await rejection(owner), "outcome_unknown", "deadline_expired");
+
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        const cursor2 = frameCursor(conn2);
+        const open2 = await cursor2.next(isRouteOpen);
+        await sendRouteOpenOk(conn2, open2.corr, 7, 1);
+        const methods: string[] = [];
+        for (let i = 0; i < 2; i++) {
+            const body = await cursor2.next(isRoutedRequest(7));
+            const method = (bodyJson(body) as { method: string }).method;
+            methods.push(method);
+            await sendResponse(conn2, body.corr, { done: method }, 7, 1);
+        }
+        expect(await callB).toEqual({ done: "b" });
+        expect(await callC).toEqual({ done: "c" });
+        expect(methods.sort()).toEqual(["b", "c"]);
+        expect(peer.connections.length).toBe(2);
+        expect(conn2.frames.filter(isRouteOpen).length).toBe(1);
+        expect(conn.frames.filter(isRoutedFrame)).toEqual([]);
+    });
+
+    test("a longer joiner replaces the route flight after the owner's allowlisted retry budget", async () => {
+        let nowMs = 0;
+        const { client, conn, peer } = await connected({
+            identity: IDENTITY,
+            clock: () => nowMs,
+            sleep: async (ms) => {
+                nowMs += ms;
+            },
+        });
+        const cursor = frameCursor(conn);
+        const ownerErr = rejection(
+            client.call("magic-context", "own", undefined, { timeoutMs: 350 }),
+        );
+        const joiner = client.call("magic-context", "join");
+
+        // The owner's 350ms stage permits exactly three route-open attempts.
+        // The fake clock advances by 100ms, 200ms, then a clamped 50ms.
+        for (let i = 0; i < 3; i++) {
+            const open = await cursor.next(isRouteOpen);
+            await sendErrorBody(conn, open.corr, "module_reloading");
+        }
+        const error = expectCallError(await ownerErr, "not_sent", "module_reloading");
+        expect(error.message).toContain("retry budget exhausted");
+
+        // The surviving joiner runs one replacement route loop on the same
+        // connection under its unchanged stage.
+        const replacementOpen = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, replacementOpen.corr, 7, 77);
+        const body = await cursor.next(isRoutedRequest(7));
+        expect(bodyJson(body)).toEqual({ method: "join" });
+        await sendResponse(conn, body.corr, { ok: true }, 7, 77);
+        expect(await joiner).toEqual({ ok: true });
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isRoutedFrame).length).toBe(1);
+        expect(conn.frames.filter(isRouteOpen).length).toBe(4);
+    });
+
+    test("a permanent artifact_invalid terminal reaches every route waiter without replacement", async () => {
+        const sleeps: number[] = [];
+        const { client, conn, peer } = await connected({
+            identity: IDENTITY,
+            sleep: async (ms) => {
+                sleeps.push(ms);
+            },
+        });
+        const cursor = frameCursor(conn);
+        const errA = rejection(client.call("magic-context", "a"));
+        const errB = rejection(client.call("magic-context", "b"));
+        const open1 = await cursor.next(isRouteOpen);
+        await sendErrorBody(conn, open1.corr, "artifact_invalid");
+
+        expectCallError(await errA, "terminal", "artifact_invalid");
+        expectCallError(await errB, "terminal", "artifact_invalid");
+        expect(sleeps).toEqual([]);
+        expect(conn.frames.filter(isRouteOpen).length).toBe(1);
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("a stale route success is re-evaluated before adoption and keeps the replay token", async () => {
+        const { client, conn, peer } = await connected({ identity: IDENTITY });
+        const cursor = frameCursor(conn);
+        const callA = client.call("magic-context", "a");
+        const callB = client.call("magic-context", "b");
+        const open1 = await cursor.next(isRouteOpen);
+
+        // Deliver the route success and a connection Goodbye in one chunk:
+        // the shared flight resolves and the generation retires synchronously
+        // before any caller's adoption continuation runs.
+        await conn.sendRaw(
+            Buffer.concat([
+                encodePeerFrame({
+                    ty: PeerFrameType.Response,
+                    channel: 0,
+                    epoch: 0,
+                    corr: open1.corr,
+                    body: jsonBody({ op: "route.open", route_channel: 7, route_epoch: 77 }),
+                }),
+                encodePeerFrame({ ty: PeerFrameType.Goodbye, channel: 0, epoch: 0, corr: 0n }),
+            ]),
+        );
+
+        // Both callers recover inside route acquisition: one replacement
+        // connection and one shared replacement route open.
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        const cursor2 = frameCursor(conn2);
+        const open2 = await cursor2.next(isRouteOpen);
+        await sendRouteOpenOk(conn2, open2.corr, 9, 1);
+        const first = await cursor2.next(isRoutedRequest(9));
+        const second = await cursor2.next(isRoutedRequest(9));
+        const [bodyA, bodyB] =
+            (bodyJson(first) as { method: string }).method === "a"
+                ? [first, second]
+                : [second, first];
+        await sendResponse(conn2, bodyB.corr, { ok: "b" }, 9, 1);
+        // Caller A's managed replay token must still be unspent: the stale
+        // recovery happened pre-body, so unknown_channel earns the replay.
+        await sendErrorBody(conn2, bodyA.corr, "unknown_channel", 9, 1);
+        const open3 = await cursor2.next(isRouteOpen);
+        await sendRouteOpenOk(conn2, open3.corr, 9, 2);
+        const bodyA2 = await cursor2.next((f) => isRoutedRequest(9)(f) && f.epoch === 2);
+        await sendResponse(conn2, bodyA2.corr, { ok: "a" }, 9, 2);
+
+        expect(await callA).toEqual({ ok: "a" });
+        expect(await callB).toEqual({ ok: "b" });
+        // No application body ever reached the retired first generation.
+        expect(conn.frames.filter(isRoutedFrame)).toEqual([]);
+        expect(peer.connections.length).toBe(2);
+        expect(conn2.frames.filter(isRouteOpen).length).toBe(2);
+    });
+
+    test("owner close during a shared route opening fences the late success without replacement", async () => {
+        const { client, conn, peer } = await connected({
+            identity: IDENTITY,
+            shutdownDeadlineMs: 3_000,
+        });
+        const cursor = frameCursor(conn);
+        const errA = rejection(client.call("magic-context", "a"));
+        const errB = rejection(client.call("magic-context", "b"));
+        const open1 = await cursor.next(isRouteOpen);
+
+        const closePromise = client.closeAsync();
+        await delay(30);
+        await sendRouteOpenOk(conn, open1.corr, 7, 77);
+
+        expectCallError(await errA, "not_sent", "route_closed");
+        expectCallError(await errB, "not_sent", "route_closed");
+        const routeGoodbye = await cursor.next((f) => f.ty === PeerFrameType.Goodbye);
+        expect(routeGoodbye.channel).toBe(7);
+        expect(routeGoodbye.epoch).toBe(77);
+        const connGoodbye = await cursor.next((f) => f.ty === PeerFrameType.Goodbye);
+        expect(connGoodbye.channel).toBe(0);
+        await closePromise;
+        // No replacement connection or route open, and no body escaped.
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isRouteOpen).length).toBe(1);
+        expect(conn.frames.filter(isRoutedFrame)).toEqual([]);
     });
 });
 

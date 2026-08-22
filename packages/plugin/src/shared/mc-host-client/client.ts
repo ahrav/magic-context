@@ -22,10 +22,15 @@ import {
     type PendingRequest,
     type RequestTerminal,
     type RetirementInfo,
+    type RetirementReason,
 } from "./connection";
-import { type ConnectionSnapshot, readConnectionFile } from "./connection-file";
-import { Deadline, type MonotonicClock } from "./deadline";
-import { isSubcCallError, SubcCallError, SubcError } from "./errors";
+import {
+    ConnectionFileError,
+    type ConnectionSnapshot,
+    readConnectionFile,
+} from "./connection-file";
+import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
+import { isSubcCallError, SocketTimeoutError, SubcCallError, SubcError } from "./errors";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -135,12 +140,79 @@ interface CachedManagedRoute {
     readonly identity: BindIdentity;
     readonly consumerIdentity: ConsumerIdentity | undefined;
     handle: RouteHandle | null;
-    opening: Promise<RouteHandle> | null;
+    opening: SetupFlight<RouteHandle> | null;
     /**
      * Set by `closeRoute` while an open is in flight; the open must not
      * install its handle and instead sends best-effort route Goodbye.
      */
     closed: boolean;
+}
+
+/**
+ * One shared setup operation (a connect or a managed route open) with
+ * explicit replacement eligibility (KTD1). The creator awaits `promise`
+ * directly; a joiner races it against its own stage deadline. `replaceable`
+ * turns true only at the exact owner-budget-exhaustion exits (KTD3), so a
+ * surviving joiner may coalesce one replacement; permanent failures and
+ * close outcomes leave it false.
+ */
+interface SetupFlight<T> {
+    promise: Promise<T>;
+    replaceable: boolean;
+}
+
+/**
+ * Race a shared flight against the caller's own stage deadline (KTD2). The
+ * rejection implies `stage.isExpired()` via `armExpiryTimer`. `flight` has a
+ * creation-time rejection observer, preventing unhandled rejections when a
+ * caller abandons it after losing the race.
+ */
+async function raceAgainstStage<T>(
+    flight: Promise<T>,
+    stage: Deadline,
+    makeError: () => Error,
+): Promise<T> {
+    let cancelTimer: (() => void) | undefined;
+    try {
+        return await Promise.race([
+            flight,
+            new Promise<never>((_resolve, reject) => {
+                cancelTimer = armExpiryTimer(stage, () => reject(makeError()));
+            }),
+        ]);
+    } finally {
+        cancelTimer?.();
+    }
+}
+
+function connectionStageError(): SocketTimeoutError {
+    return new SocketTimeoutError(
+        "connection setup stage expired before the shared connect completed",
+    );
+}
+
+function routeStageError(): SubcCallError {
+    return new SubcCallError(
+        "not_sent",
+        "route.open deadline expired before a route was opened",
+        "deadline_expired",
+    );
+}
+
+/**
+ * `clearSlot` receives this flight's identity on settlement, so an old
+ * flight never clears a newer one (KTD1). Two-phase construction is safe:
+ * `promise` is assigned before anything can read it, since `run` only
+ * writes `replaceable`.
+ */
+function makeSetupFlight<T>(
+    run: (flight: SetupFlight<T>) => Promise<T>,
+    clearSlot: (flight: SetupFlight<T>) => void,
+): SetupFlight<T> {
+    const flight = { replaceable: false } as SetupFlight<T>;
+    flight.promise = run(flight).finally(() => clearSlot(flight));
+    flight.promise.catch(() => {});
+    return flight;
 }
 
 interface RequestParams {
@@ -237,7 +309,7 @@ export class SubcClient {
     private readonly maxDiagnosticEventsPerSecond: number;
 
     private active: ActiveConnection | null = null;
-    private connecting: Promise<ActiveConnection> | null = null;
+    private connecting: SetupFlight<ActiveConnection> | null = null;
     private readonly liveRoutes = new Map<number, RouteHandle>();
     private readonly routes = new Map<string, CachedManagedRoute>();
     /** In-flight route.open attempts, drained bounded during owner close. */
@@ -431,33 +503,76 @@ export class SubcClient {
     // ------------------------------------------------------------------
 
     private async ensureConnection(deadline: Deadline): Promise<ActiveConnection> {
-        if (this.closeStarted) throw new SubcError("client closed", "client_closed");
-        const active = this.active;
-        if (active && !active.generation.isRetired()) return active;
-        if (!this.connecting) {
-            const connecting = this.openConnection(deadline).finally(() => {
-                if (this.connecting === connecting) this.connecting = null;
-            });
-            connecting.catch(() => {});
-            this.connecting = connecting;
+        // R1: one immutable handshake stage per caller, derived once from its
+        // own operation deadline and kept through every join and replacement.
+        const stage = deadline.stage(this.handshakeTimeoutMs);
+        for (;;) {
+            if (this.closeStarted) throw new SubcError("client closed", "client_closed");
+            const active = this.active;
+            if (active && !active.generation.isRetired()) return active;
+            let flight = this.connecting;
+            let owner = false;
+            if (!flight) {
+                owner = true;
+                flight = makeSetupFlight(
+                    (f) => this.openConnection(stage, f),
+                    (f) => {
+                        if (this.connecting === f) this.connecting = null;
+                    },
+                );
+                this.connecting = flight;
+            }
+            let conn: ActiveConnection;
+            try {
+                // KTD2: the owner awaits its bounded operation directly to keep
+                // existing error and retirement behavior; a joiner races the
+                // shared flight against its own stage.
+                conn = owner
+                    ? await flight.promise
+                    : await raceAgainstStage(flight.promise, stage, connectionStageError);
+            } catch (error) {
+                // A joiner whose own stage expired detaches without mutating
+                // the shared flight (R2). Only owner-budget exhaustion of a
+                // joined flight authorizes one coalesced replacement (R3).
+                if (owner || !flight.replaceable || stage.isExpired() || this.closeStarted) {
+                    throw error;
+                }
+                continue;
+            }
+            // KTD4: adopt only a still-current, non-retired generation; a
+            // stale success re-enters recovery under the unchanged stage.
+            if (this.active === conn && !conn.generation.isRetired()) return conn;
+            if (stage.isExpired()) throw connectionStageError();
         }
-        return this.connecting;
     }
 
-    private async openConnection(deadline: Deadline): Promise<ActiveConnection> {
-        const stage = deadline.stage(this.handshakeTimeoutMs);
+    private async openConnection(
+        stage: Deadline,
+        flight: SetupFlight<ActiveConnection>,
+    ): Promise<ActiveConnection> {
         // Reconnect rereads the file and reauthenticates from scratch (wire
         // doc Section 12); credentials are never cached across generations.
-        const snapshot = await readConnectionFile(this.connectionFile, {
-            deadline: stage,
-            trustedSymlink: this.trustedSymlink,
-        });
+        let snapshot: ConnectionSnapshot;
+        try {
+            snapshot = await readConnectionFile(this.connectionFile, {
+                deadline: stage,
+                trustedSymlink: this.trustedSymlink,
+            });
+        } catch (error) {
+            // KTD3: the connection-file stage budget is the failure authority.
+            if (error instanceof ConnectionFileError && error.code === "deadline_expired") {
+                flight.replaceable = true;
+            }
+            throw error;
+        }
         let conn: ActiveConnection | null = null;
+        let retiredReason: RetirementReason | null = null;
         const generation = new ConnectionGeneration({
             host: snapshot.endpoint.host,
             port: snapshot.endpoint.port,
             credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
             onRetired: (info) => {
+                retiredReason = info.reason;
                 if (conn) this.onGenerationRetired(conn, info);
             },
             onRouteGoodbye: (channel, epoch) => {
@@ -470,7 +585,15 @@ export class SubcClient {
             ...this.generationOptions,
         });
         conn = { generation, token: newConnectionToken(), snapshot };
-        await generation.start(stage);
+        try {
+            await generation.start(stage);
+        } catch (error) {
+            // KTD3: only the setup-deadline retirement is an owner-budget
+            // exit; auth, socket, and protocol failures never authorize a
+            // replacement.
+            if (retiredReason === "setup_deadline") flight.replaceable = true;
+            throw error;
+        }
         if (this.closeStarted) {
             generation.retire("owner_close");
             throw new SubcError("client closed", "client_closed");
@@ -717,31 +840,61 @@ export class SubcClient {
         >;
         const consumerIdentity = this.envConsumerIdentity();
         const key = routeCacheKey(target, identity, consumerIdentity);
-        let cached = this.routes.get(key);
-        if (!cached) {
-            cached = {
-                key,
-                target,
-                identity,
-                consumerIdentity,
-                handle: null,
-                opening: null,
-                closed: false,
-            };
-            this.routes.set(key, cached);
+        // R1: one immutable route-open stage per caller, derived once and
+        // kept through every join and replacement decision.
+        const stage = deadline.stage(this.routeOpenDeadlineMs);
+        for (;;) {
+            let cached = this.routes.get(key);
+            if (!cached) {
+                cached = {
+                    key,
+                    target,
+                    identity,
+                    consumerIdentity,
+                    handle: null,
+                    opening: null,
+                    closed: false,
+                };
+                this.routes.set(key, cached);
+            }
+            if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
+            let flight = cached.opening;
+            let owner = false;
+            if (!flight) {
+                owner = true;
+                const slot = cached;
+                flight = makeSetupFlight(
+                    (f) => this.openCachedRoute(slot, stage, f),
+                    (f) => {
+                        if (slot.opening === f) slot.opening = null;
+                    },
+                );
+                cached.opening = flight;
+            }
+            let handle: RouteHandle;
+            try {
+                // KTD2: owner awaits directly; a joiner races its own stage.
+                handle = owner
+                    ? await flight.promise
+                    : await raceAgainstStage(flight.promise, stage, routeStageError);
+            } catch (error) {
+                if (owner || !flight.replaceable || stage.isExpired() || this.closeStarted) {
+                    throw error;
+                }
+                continue;
+            }
+            // KTD4: adopt only the cache's current live handle for this route
+            // identity; a stale success recovers here, before any body-replay
+            // token is considered.
+            if (
+                this.routes.get(key) === cached &&
+                cached.handle === handle &&
+                this.isLiveHandle(handle)
+            ) {
+                return handle;
+            }
+            if (stage.isExpired()) throw routeStageError();
         }
-        if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
-        if (!cached.opening) {
-            const opening = this.openCachedRoute(
-                cached,
-                deadline.stage(this.routeOpenDeadlineMs),
-            ).finally(() => {
-                if (cached.opening === opening) cached.opening = null;
-            });
-            opening.catch(() => {});
-            cached.opening = opening;
-        }
-        return cached.opening;
     }
 
     /**
@@ -753,6 +906,7 @@ export class SubcClient {
     private async openCachedRoute(
         cached: CachedManagedRoute,
         deadline: Deadline,
+        flight: SetupFlight<RouteHandle>,
     ): Promise<RouteHandle> {
         let delayMs = ROUTE_RETRY_BASE_MS;
         const backoff = async (): Promise<boolean> => {
@@ -769,26 +923,24 @@ export class SubcClient {
                 );
             }
             if (deadline.isExpired()) {
-                throw new SubcCallError(
-                    "not_sent",
-                    "route.open deadline expired before a route was opened",
-                    "deadline_expired",
-                );
+                // KTD3: the owner's route-open budget is the failure authority.
+                flight.replaceable = true;
+                throw routeStageError();
             }
             let active: ActiveConnection;
             try {
                 active = await this.ensureConnection(deadline);
             } catch (error) {
                 if (error instanceof SubcCallError) throw error;
-                if (
-                    isConsumerReconnectTransient(error) &&
-                    !this.closeStarted &&
-                    (await backoff())
-                ) {
-                    continue;
+                const transient = isConsumerReconnectTransient(error);
+                if (transient && !this.closeStarted) {
+                    if (await backoff()) continue;
+                    // KTD3: transient reconnects ended only because the
+                    // owner's budget ran out.
+                    flight.replaceable = true;
                 }
                 throw new SubcCallError(
-                    isConsumerReconnectTransient(error) ? "not_sent" : "terminal",
+                    transient ? "not_sent" : "terminal",
                     `route.open could not run because connect failed${causeMessage(error)}`,
                     errorCode(error),
                     error,
@@ -826,6 +978,8 @@ export class SubcClient {
                 if (error.code === "route_closed" || this.closeStarted) throw error;
                 if (error.kind === "terminal" && isRetryableRouteOpenCode(error.code)) {
                     if (await backoff()) continue;
+                    // KTD3: the allowlisted retry budget is owner budget.
+                    flight.replaceable = true;
                     throw new SubcCallError(
                         "not_sent",
                         `route.open failed for module ${cached.target.module_id}: ${error.code} (route-open retry budget exhausted)`,
@@ -837,6 +991,9 @@ export class SubcClient {
                     // An ambiguous open already retired its generation; the
                     // next loop iteration reconnects under the same deadline.
                     if (await backoff()) continue;
+                    // KTD3: this transient surfaced only because the owner's
+                    // budget ran out; survivors may coalesce one replacement.
+                    flight.replaceable = true;
                     throw error;
                 }
                 throw error;
@@ -852,7 +1009,7 @@ export class SubcClient {
         const deadline = Deadline.start(this.shutdownDeadlineMs, this.clock);
         if (this.connecting) {
             try {
-                await this.connecting;
+                await this.connecting.promise;
             } catch {
                 // A failed connect has nothing to tear down.
             }
