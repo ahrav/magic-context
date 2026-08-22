@@ -913,19 +913,24 @@ pub async fn dispatch_request<H: McHostHandler>(
     {
         let _ = start_tx.send(());
     } else {
-        // The route left Live between the advisory check and registration.
         // No dispatch crossed the registry's live-route linearization point,
         // so this rejection proves zero handler invocation; the spawned task
         // observes the dropped start signal and removes the pending entry.
+        // Registration refuses for two distinct reasons that need different
+        // codes: frozen admission (the shutdown fence won the race after the
+        // advisory check above) is retryable-elsewhere `server_busy`, while
+        // a route that left Live is `unknown_channel`.
         drop(start_tx);
-        emit_rejection(
-            shared,
-            gen,
-            FrameId::routed(route, corr),
-            CODE_UNKNOWN_CHANNEL,
-            "no live route for this channel and epoch",
-        )
-        .await;
+        let (code, message) =
+            if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
+                (CODE_SERVER_BUSY, "host is shutting down")
+            } else {
+                (
+                    CODE_UNKNOWN_CHANNEL,
+                    "no live route for this channel and epoch",
+                )
+            };
+        emit_rejection(shared, gen, FrameId::routed(route, corr), code, message).await;
     }
 }
 
