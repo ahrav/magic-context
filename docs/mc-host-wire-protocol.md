@@ -140,10 +140,13 @@ Lifecycle state is derived from lock ownership plus this evidence, never from PI
 | Instance lock | Evidence | State |
 | --- | --- | --- |
 | free | anything, including stale record or publication | `stopped`; nothing is unlinked |
-| held | fresh `starting` record, no conflicting publication | `starting` |
+| held | fresh `starting` record, with or without a predecessor's leftover publication | `starting` |
 | held | `running` record and publication with the same daemon ID | `running` |
-| held | fresh `stopping` record | `stopping` |
-| held | missing, corrupt, insecure, expired, or daemon-ID-mismatched evidence | `wedged` |
+| held | `running` record with a missing or daemon-ID-mismatched publication | `wedged` |
+| held | fresh `stopping` record, with or without a predecessor's leftover publication | `stopping` |
+| held | missing, corrupt, insecure, or expired evidence | `wedged` |
+
+A publication whose daemon ID differs from the record's is crash residue during `starting` and `stopping`: a killed incarnation leaves its publication behind, and its successor writes a `starting` record before its own publication overwrites the file (symmetrically, an incarnation that fails before publishing demotes to `stopping` without ever owning the leftover). Only the `running` claim requires the publication to match the record; the freshness windows still age a hung start or stop to `wedged`.
 
 `wedged` is observational: probes and clients MUST NOT kill processes, break locks, or repair files. Probes use a validation-only opener (no create, no chmod, no link following, and no blocking on a non-regular file), test the instance lock nonblockingly and in shared mode so concurrent probes cannot alias each other into a false holder reading, and reread evidence boundedly when identities change mid-sample. Because a daemon must hold the instance lock before it can write its `starting` record, a held lock with no record is rechecked over a bounded grace window before it classifies `wedged`. An evidence name that is present but not a secure regular file — a symlink, FIFO, directory, or wrong owner or mode — is `insecure`, never `missing`.
 
