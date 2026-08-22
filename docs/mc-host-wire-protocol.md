@@ -145,7 +145,7 @@ Lifecycle state is derived from lock ownership plus this evidence, never from PI
 | held | fresh `stopping` record | `stopping` |
 | held | missing, corrupt, insecure, expired, or daemon-ID-mismatched evidence | `wedged` |
 
-`wedged` is observational: probes and clients MUST NOT kill processes, break locks, or repair files. Probes use a validation-only opener (no create, no chmod, no link following), attempt the instance lock nonblockingly, and reread evidence boundedly when identities change mid-sample.
+`wedged` is observational: probes and clients MUST NOT kill processes, break locks, or repair files. Probes use a validation-only opener (no create, no chmod, no link following, and no blocking on a non-regular file), test the instance lock nonblockingly and in shared mode so concurrent probes cannot alias each other into a false holder reading, and reread evidence boundedly when identities change mid-sample. Because a daemon must hold the instance lock before it can write its `starting` record, a held lock with no record is rechecked over a bounded grace window before it classifies `wedged`. An evidence name that is present but not a secure regular file — a symlink, FIFO, directory, or wrong owner or mode — is `insecure`, never `missing`.
 
 A separate owner-only directory, `${dataDir}/cortexkit/lifecycle`, carries the cross-process lifecycle transaction lock on its directory inode: mutating lifecycle transactions (launcher start/stop, owned by downstream packaging work) take it exclusively, and probes take it shared when it exists. It is distinct from the runtime-directory instance lock, which only the daemon holds for its whole incarnation.
 
@@ -735,7 +735,7 @@ Graceful host shutdown order:
 
 Work without an observed terminal remains `outcome_unknown`. Forced shutdown may skip wire Goodbyes but MUST preserve local exactly-once route-gone and handler-drop ordering.
 
-An authenticated `host.shutdown` (Section 7.6) initiates this same graceful order, starting only after its committing response is fully acknowledged. The `stopping` lifecycle record (Section 4.3) is written at step 1 and removed with the publication-side cleanup before lock release.
+An authenticated `host.shutdown` (Section 7.6) initiates this same graceful order, starting only after its committing response is fully acknowledged. The `stopping` lifecycle record (Section 4.3) is written at step 1 and removed with the publication-side cleanup before lock release. Every teardown path MUST demote the phase to `stopping` before retiring the publication, including abandoned or aborted runs: a `running` record whose publication is already gone classifies `wedged`, so unpublishing first would report an operator-visible fault for an orderly stop.
 
 ## 13. End-to-end normative examples
 

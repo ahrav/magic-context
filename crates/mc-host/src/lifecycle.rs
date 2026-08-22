@@ -16,8 +16,9 @@ use rustix::fs::{flock, openat, unlinkat, AtFlags, FlockOperation, Mode, OFlags}
 use subc_transport::ConnectionInfo;
 
 use crate::instance::{
-    hex, io_err, is_safe_ancestor, is_secure_regular, read_all_fd, runtime_dir_path,
-    secure_runtime_dir, InstanceError, InstanceGuard, CONNECTION_FILE_NAME, S_IFDIR, S_IFMT,
+    flock_exclusive_bounded, hex, io_err, is_safe_ancestor, is_secure_regular, read_all_fd,
+    runtime_dir_path, secure_runtime_dir, InstanceError, InstanceGuard, CONNECTION_FILE_NAME,
+    S_IFDIR, S_IFMT,
 };
 
 /// Canonical lifecycle-record name inside the runtime directory.
@@ -150,15 +151,39 @@ impl InstanceGuard {
             .map(|_stat| ())
     }
 
+    /// Marks this incarnation `stopping` and then retires its publication.
+    ///
+    /// The order matters: `classify` maps a held lock plus a `running` record
+    /// with no publication to `wedged`, so unpublishing without first
+    /// demoting the phase reports an operator-visible fault for an orderly
+    /// stop. Every teardown path — graceful shutdown and the abandoned-`run`
+    /// guard — goes through here so the two cannot report different states
+    /// for the same situation.
+    ///
+    /// The phase write is best effort: teardown proceeds regardless, and a
+    /// stale phase ages to `wedged` honestly.
+    pub fn begin_stopping(&mut self) {
+        let _ = self.write_lifecycle_record(LifecyclePhase::Stopping);
+        self.remove_publication();
+    }
+
     /// Best-effort fenced removal of this incarnation's lifecycle record:
     /// no-follow open, secure regular file, matching launch and daemon
     /// identity. A mismatch leaves the file alone — an old incarnation must
     /// never delete a successor's evidence.
+    ///
+    /// `O_NONBLOCK` is load-bearing, not an optimization: `O_NOFOLLOW`
+    /// rejects a symlink but not a FIFO, and opening a FIFO for reading
+    /// blocks until a writer arrives. Without it a planted FIFO at this name
+    /// would hang this call forever — and this runs from `Drop` while the
+    /// instance lock is still held, so the lock would never be released and
+    /// every later start would fail `AlreadyRunning`. The flag is a no-op on
+    /// regular files, and `is_secure_regular` below still rejects the FIFO.
     pub fn remove_lifecycle_record(&self) {
         let Ok(fd) = openat(
             self.dir(),
             LIFECYCLE_RECORD_NAME,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         ) else {
             return;
@@ -204,17 +229,18 @@ impl LifecycleRootLock {
     /// Securely creates or opens the lifecycle root and takes the exclusive
     /// nonblocking transaction lock. `AlreadyRunning` means another lifecycle
     /// transaction holds it.
+    ///
+    /// Uses the same bounded retry as the instance lock: a probe's shared
+    /// hold is transient, and reporting `AlreadyRunning` for it would name a
+    /// mutator that does not exist.
     pub fn acquire_exclusive(data_dir_override: Option<&Path>) -> Result<Self, InstanceError> {
         let dir_path = lifecycle_dir_path(data_dir_override)?;
         let dir = secure_runtime_dir(&dir_path)?;
-        match flock(&dir, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(Self {
-                _dir: dir,
-                dir_path,
-            }),
-            Err(rustix::io::Errno::WOULDBLOCK) => Err(InstanceError::AlreadyRunning),
-            Err(e) => Err(io_err("flock_lifecycle_root", &dir_path, e)),
-        }
+        flock_exclusive_bounded(&dir, &dir_path, "flock_lifecycle_root")?;
+        Ok(Self {
+            _dir: dir,
+            dir_path,
+        })
     }
 
     /// Validation-only shared lock for observational probes: never creates
@@ -357,14 +383,28 @@ struct EvidenceSample {
     publication: EvidenceFile,
 }
 
+/// Reads one evidence file, distinguishing genuine absence from a hostile
+/// shape. `O_NONBLOCK` is required for correctness: `O_NOFOLLOW` rejects a
+/// symlink but not a FIFO, and a FIFO opened for reading blocks until a
+/// writer arrives, which would hang every probe uncancellably (a blocking
+/// syscall outruns any `spawn_blocking` timeout). The flag is a no-op on
+/// regular files and `is_secure_regular` still rejects the FIFO.
 fn read_evidence_file(dir: &OwnedFd, name: &str) -> EvidenceFile {
-    let Ok(fd) = openat(
+    let fd = match openat(
         dir,
         name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
-    ) else {
-        return EvidenceFile::Absent;
+    ) {
+        Ok(fd) => fd,
+        // Only "the name is not there" is absence. Every other failure is a
+        // shape this probe must fail closed on: `ELOOP` from a planted
+        // symlink, `ENOTDIR`/`ENXIO` from a hostile type, `EACCES` from a
+        // mode we cannot vouch for, `EMFILE`/`ENFILE` from exhaustion.
+        // Collapsing those to `Absent` would let a symlink downgrade a
+        // `wedged` verdict to `starting`/`stopping` (protocol §4.3).
+        Err(rustix::io::Errno::NOENT) => return EvidenceFile::Absent,
+        Err(_) => return EvidenceFile::Insecure,
     };
     let Ok(stat) = rustix::fs::fstat(&fd) else {
         return EvidenceFile::Insecure;
@@ -405,11 +445,19 @@ fn sample_evidence(dir: &OwnedFd) -> EvidenceSample {
 /// Nonblocking probe of instance-lock ownership on the same open file
 /// description the evidence was sampled through, so a directory swapped
 /// between opens cannot pair one inode's evidence with another's lock.
-/// Acquiring succeeds only when no incarnation holds the lock; the probe
-/// unlocks immediately. flock ownership is per open file description, so
-/// this works even when the holding daemon lives in the same process.
+/// flock ownership is per open file description, so this works even when the
+/// holding daemon lives in the same process.
+///
+/// The test takes a *shared* lock, not an exclusive one. A daemon holds this
+/// inode exclusively for its whole incarnation, and shared conflicts with
+/// exclusive, so a live host is still detected. Testing with an exclusive
+/// lock would instead make probes conflict with each other: the loser would
+/// read `WOULDBLOCK`, report the lock held, and misclassify a stopped host as
+/// `wedged` (or resurrect a crashed daemon's stale evidence as `running`),
+/// inverting the protocol §4.3 rule that a free lock always means `stopped`.
+/// The probe unlocks immediately either way.
 fn instance_lock_free(dir: &OwnedFd, dir_path: &Path) -> Result<bool, InstanceError> {
-    match flock(dir, FlockOperation::NonBlockingLockExclusive) {
+    match flock(dir, FlockOperation::NonBlockingLockShared) {
         Ok(()) => {
             flock(dir, FlockOperation::Unlock).map_err(|e| io_err("flock_unlock", dir_path, e))?;
             Ok(true)
@@ -432,8 +480,9 @@ fn publication_summary(bytes: &[u8]) -> Option<PublicationSummary> {
 
 /// Classifies host lifecycle state from lock ownership plus fenced evidence
 /// (plan KTD3). Blocking-synchronous and observational: it creates nothing,
-/// chmods nothing, unlinks nothing, and never signals a PID. Async callers
-/// should wrap it in `spawn_blocking`.
+/// chmods nothing, unlinks nothing, and never signals a PID. It may sleep its
+/// thread briefly while re-sampling, so async callers must wrap it in
+/// `spawn_blocking`.
 pub fn probe_lifecycle(
     data_dir_override: Option<&Path>,
     freshness: &ProbeFreshness,
@@ -456,13 +505,30 @@ pub fn probe_lifecycle(
     };
 
     const MAX_REREADS: usize = 3;
-    let mut attempt = 0;
+    // A daemon must hold the instance lock before it can write its `starting`
+    // record, so a probe landing in that window sees a held lock with no
+    // evidence — by shape alone indistinguishable from a wedged host. The
+    // record write includes an fsync, so the window is short but not
+    // instantaneous; re-sample a bounded number of times before believing it.
+    // A genuinely record-less holder still classifies `wedged` after the last
+    // attempt.
+    const ABSENT_RECORD_GRACE: usize = 2;
+    const GRACE_DELAY: Duration = Duration::from_millis(25);
+
+    let mut torn_rereads = 0;
+    let mut grace_rereads = 0;
     loop {
         let before = sample_evidence(&dir);
         let lock_free = instance_lock_free(&dir, &dir_path)?;
         let after = sample_evidence(&dir);
-        attempt += 1;
-        if before != after && attempt < MAX_REREADS {
+        if before != after && torn_rereads + 1 < MAX_REREADS {
+            torn_rereads += 1;
+            continue;
+        }
+        if !lock_free && after.record == EvidenceFile::Absent && grace_rereads < ABSENT_RECORD_GRACE
+        {
+            grace_rereads += 1;
+            std::thread::sleep(GRACE_DELAY);
             continue;
         }
         return Ok(classify(after, lock_free, freshness));
@@ -1141,5 +1207,233 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), changed)
             .await
             .expect("the pre-poll notification must not be lost");
+    }
+
+    // --- hostile evidence shapes and probe non-interference ---
+
+    /// Runs `work` on a scratch thread and refuses to wait past `budget`.
+    ///
+    /// A thread parked in a blocking `openat` on a writer-less FIFO cannot be
+    /// cancelled or joined, so a regression here would hang the whole test
+    /// binary instead of failing it. Exiting the process on timeout keeps the
+    /// signal unambiguous and bounded: the harness reports a failure, and no
+    /// wedged thread outlives it. The fixed build returns in microseconds and
+    /// never reaches the deadline.
+    fn within<T: Send + 'static>(
+        budget: Duration,
+        diagnosis: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        match rx.recv_timeout(budget) {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("FAILED: {diagnosis}");
+                eprintln!(
+                    "  a blocking open never returned within {budget:?}; \
+                     O_NONBLOCK is missing from the evidence opener"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    /// `O_NOFOLLOW` rejects a symlink but not a FIFO, and a FIFO opened for
+    /// reading blocks until a writer arrives. Without `O_NONBLOCK` both
+    /// evidence readers hang forever; the probe must instead classify the
+    /// hostile shape.
+    #[test]
+    fn a_fifo_at_an_evidence_name_cannot_hang_the_probe() {
+        for name in [LIFECYCLE_RECORD_NAME, CONNECTION_FILE_NAME] {
+            let root = temp_root();
+            let guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+            guard
+                .write_lifecycle_record(LifecyclePhase::Running)
+                .expect("running");
+            // Replace the named evidence with a FIFO the test never opens for
+            // writing, so a blocking open can never complete.
+            let path = guard.dir_path().join(name);
+            let _ = std::fs::remove_file(&path);
+            rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
+                .expect("plant fifo");
+
+            let root_path = root.path().to_path_buf();
+            let state = within(
+                Duration::from_secs(5),
+                &format!("probe_lifecycle blocked on a fifo planted at {name}"),
+                move || {
+                    probe_lifecycle(Some(&root_path), &ProbeFreshness::default())
+                        .expect("probe")
+                        .state
+                },
+            );
+            assert_eq!(
+                state,
+                LifecycleState::Wedged,
+                "a fifo at {name} is a hostile shape, not liveness"
+            );
+            assert!(
+                path.exists(),
+                "a probe must never unlink the planted {name}"
+            );
+        }
+    }
+
+    /// A FIFO at the record name must not hang fenced removal either: that
+    /// runs from `Drop` while the instance lock is held, so a hang would
+    /// retain the lock and fail every later start.
+    #[test]
+    fn a_fifo_at_the_record_name_cannot_hang_fenced_removal() {
+        let root = temp_root();
+        let guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let path = record_path(&guard);
+        rustix::fs::mkfifoat(rustix::fs::CWD, path.as_path(), Mode::from_raw_mode(0o600))
+            .expect("plant fifo");
+
+        within(
+            Duration::from_secs(5),
+            "remove_lifecycle_record blocked on a fifo, retaining the instance lock",
+            move || guard.remove_lifecycle_record(),
+        );
+        assert!(path.exists(), "a foreign shape must survive fenced removal");
+    }
+
+    /// A symlink is a hostile shape, not absence. Collapsing its `ELOOP` to
+    /// `Absent` would let it downgrade a `wedged` verdict to `stopping`.
+    #[test]
+    fn a_symlinked_publication_is_insecure_not_absent() {
+        let root = temp_root();
+        let elsewhere = temp_root();
+        let guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        guard
+            .write_lifecycle_record(LifecyclePhase::Stopping)
+            .expect("stopping");
+
+        let target = elsewhere.path().join("decoy");
+        std::fs::write(&target, b"{}").expect("write decoy");
+        std::os::unix::fs::symlink(&target, guard.dir_path().join(CONNECTION_FILE_NAME))
+            .expect("plant symlink");
+
+        let observed = probe(root.path());
+        assert_eq!(
+            observed.state,
+            LifecycleState::Wedged,
+            "a symlinked publication must fail closed, not read as missing"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read decoy"),
+            b"{}",
+            "the outside target must be untouched"
+        );
+    }
+
+    /// The probe tests lock freedom with a shared lock, so concurrent probes
+    /// do not alias each other into a false "lock held" reading. An exclusive
+    /// test made the loser read `WOULDBLOCK` and resurrect a crashed daemon's
+    /// leftover evidence as `Running` — a false liveness claim that inverts
+    /// the protocol §4.3 rule that a free lock always means `stopped`
+    /// (plan R5). Leftover evidence is deliberate: it is the shape the
+    /// absent-record grace re-read cannot mask.
+    #[test]
+    fn concurrent_probes_never_resurrect_stale_evidence_as_live() {
+        let root = temp_root();
+        let root_path = root.path().to_path_buf();
+
+        // Produce genuinely valid publication bytes, then strand them with no
+        // holder — exactly what a crashed daemon leaves behind.
+        let (publication_bytes, daemon_hex) = {
+            let mut guard = InstanceGuard::acquire(Some(&root_path)).expect("acquire");
+            guard.publish(43123, "mc-host/test").expect("publish");
+            let bytes = std::fs::read(guard.dir_path().join(CONNECTION_FILE_NAME)).expect("read");
+            (bytes, hex(guard.daemon_id()))
+        };
+
+        let run_dir = runtime_dir_path(Some(&root_path)).expect("runtime path");
+        let publication = run_dir.join(CONNECTION_FILE_NAME);
+        std::fs::write(&publication, &publication_bytes).expect("restore publication");
+        std::fs::set_permissions(&publication, std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+        let record = serde_json::json!({
+            "schema": 1,
+            "phase": "running",
+            "launch_id": "ab".repeat(16),
+            "daemon_id": daemon_hex,
+            "payload_manifest_digest": "",
+            "pid": std::process::id(),
+            "written_at_ms": now_ms(),
+        });
+        let record_path = run_dir.join(LIFECYCLE_RECORD_NAME);
+        std::fs::write(&record_path, serde_json::to_vec(&record).expect("encode"))
+            .expect("write record");
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+
+        // A single, uncontended probe must already call this stopped.
+        assert_eq!(probe(root.path()).state, LifecycleState::Stopped);
+
+        let workers: Vec<_> = (0..6)
+            .map(|_| {
+                let root_path = root_path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        let observed =
+                            probe_lifecycle(Some(&root_path), &ProbeFreshness::default())
+                                .expect("probe");
+                        assert_eq!(
+                            observed.state,
+                            LifecycleState::Stopped,
+                            "a concurrent probe aliased as a lock holder: {}",
+                            observed.reason
+                        );
+                        assert!(observed.instance_lock_free);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("probe thread");
+        }
+    }
+
+    /// A probe still detects a real incarnation's exclusive hold.
+    #[test]
+    fn a_shared_freedom_test_still_sees_a_live_holder() {
+        let root = temp_root();
+        let guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        guard
+            .write_lifecycle_record(LifecyclePhase::Starting)
+            .expect("starting");
+        let observed = probe(root.path());
+        assert!(
+            !observed.instance_lock_free,
+            "an exclusive incarnation lock must still read as held"
+        );
+        assert_eq!(observed.state, LifecycleState::Starting);
+    }
+
+    /// Lifecycle temps must be reclaimable: they share the publication's temp
+    /// shape, so the stale sweep has to cover both canonical names.
+    #[test]
+    fn stale_lifecycle_temps_are_swept() {
+        let root = temp_root();
+        let mut guard = InstanceGuard::acquire(Some(root.path())).expect("acquire");
+        let stale = guard
+            .dir_path()
+            .join(format!(".{LIFECYCLE_RECORD_NAME}.99999.deadbeef.tmp"));
+        std::fs::write(&stale, b"orphaned mid-write").expect("plant temp");
+        let long_ago = SystemTime::now() - Duration::from_secs(60 * 60 * 24);
+        std::fs::File::open(&stale)
+            .expect("open temp")
+            .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+            .expect("age temp");
+
+        guard.publish(43123, "mc-host/test").expect("publish");
+        assert!(
+            !stale.exists(),
+            "a stale lifecycle temp must be swept like a publication temp"
+        );
     }
 }

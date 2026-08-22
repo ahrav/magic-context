@@ -408,8 +408,11 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
         shared.abort_all();
         // The listener died with the dropped future: unpublish immediately so
         // discovery stops advertising a dead endpoint, instead of waiting out
-        // the lifecycle cleanup chain below. Idempotent and fenced.
-        guard.remove_publication();
+        // the lifecycle cleanup chain below. Idempotent and fenced. The phase
+        // demotion travels with it, so an observer sees `stopping` rather than
+        // the `wedged` a publication-less `running` record would report for
+        // this path's whole (unbounded) drain.
+        guard.begin_stopping();
         // Route cleanup is async (route-gone callbacks must run before the
         // handler drops), so the guard moves into the cleanup task and drops
         // last — the lock releases only after handler-visible routes got
@@ -521,7 +524,31 @@ pub async fn run<H: McHostHandler>(
 ) -> Result<(), HostError> {
     crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
-    let guard = InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
+    // The first attempt runs inline, so startup ordering and latency are
+    // unchanged. Only the wait between attempts is async: parking an executor
+    // thread here would stall the predecessor drain whose completion releases
+    // the lock being waited on.
+    let guard = {
+        let mut acquired = None;
+        for attempt in 0..crate::instance::LOCK_RETRY_ATTEMPTS {
+            match InstanceGuard::acquire(config.data_dir.as_deref()) {
+                Ok(guard) => {
+                    acquired = Some(guard);
+                    break;
+                }
+                Err(InstanceError::AlreadyRunning)
+                    if attempt + 1 < crate::instance::LOCK_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(crate::instance::LOCK_RETRY_DELAY).await;
+                }
+                Err(e) => return Err(HostError::Instance(e)),
+            }
+        }
+        match acquired {
+            Some(guard) => guard,
+            None => return Err(HostError::Instance(InstanceError::AlreadyRunning)),
+        }
+    };
     guard
         .write_lifecycle_record(crate::lifecycle::LifecyclePhase::Starting)
         .map_err(HostError::Instance)?;
@@ -847,12 +874,9 @@ async fn shutdown_sequence<H: McHostHandler>(
         .store(true, std::sync::atomic::Ordering::SeqCst);
     shared.registry.freeze_admission();
 
-    // Best effort: teardown proceeds regardless, and a stale phase ages to
-    // `wedged` honestly.
-    let _ = guard.write_lifecycle_record(crate::lifecycle::LifecyclePhase::Stopping);
-
-    // 2. Fenced publication removal while the lock is held.
-    guard.remove_publication();
+    // 2. Demote the phase to `stopping`, then remove the publication — both
+    // fenced, both while the lock is held.
+    guard.begin_stopping();
 
     // 3-5. Settle each route's admitted work (emitting its terminals) and run
     // its route-gone while read loops are still available to refuse work

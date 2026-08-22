@@ -480,6 +480,11 @@ pub(crate) fn write_atomic_owner_only(
 /// Takes the nonblocking exclusive advisory lock that makes this process the
 /// single host for `dir`.
 ///
+/// One attempt, no waiting: contention is reported as `AlreadyRunning` so the
+/// caller decides how to wait. `run` retries on its own async timer rather
+/// than sleeping an executor thread; synchronous callers use
+/// [`flock_exclusive_bounded`].
+///
 /// The lock is held on the runtime-directory descriptor itself. Every instance
 /// that serves this runtime directory must resolve this same inode to reach
 /// the shared publication, so all of them contend for one lock. A lock file
@@ -490,24 +495,51 @@ pub(crate) fn write_atomic_owner_only(
 /// difference.
 /// commentlint: allow(JUDGE)
 fn lock_instance(dir: &OwnedFd, dir_path: &Path) -> Result<(), InstanceError> {
-    // A lifecycle probe momentarily acquires and releases this lock to test
-    // freedom, so a short bounded retry keeps that transient hold from
-    // failing a legitimate start; a real holder still yields
-    // `AlreadyRunning` after the last attempt.
-    const ATTEMPTS: u32 = 4;
-    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
-    for attempt in 0..ATTEMPTS {
+    match flock(dir, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(()),
+        // WOULDBLOCK and AGAIN are one errno on Linux.
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(InstanceError::AlreadyRunning),
+        Err(e) => Err(io_err("flock", dir_path, e)),
+    }
+}
+
+/// How long a caller should tolerate transient exclusive-lock contention.
+///
+/// An observer holds a lifecycle lock only long enough to read it — a probe
+/// tests instance-lock freedom with a shared lock, and holds the
+/// lifecycle-root lock shared for one sample — but shared still blocks
+/// exclusive, so an unlucky mutator can collide with one. Retrying briefly
+/// keeps that from being reported as a live holder. These are the single
+/// definition of that policy: [`flock_exclusive_bounded`] applies them
+/// synchronously, and `run` applies them on an async timer.
+pub(crate) const LOCK_RETRY_ATTEMPTS: u32 = 4;
+pub(crate) const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Takes a nonblocking exclusive advisory lock, tolerating the brief hold a
+/// concurrent observer may take, per [`LOCK_RETRY_ATTEMPTS`]. A real holder
+/// still yields `AlreadyRunning` after the last attempt.
+///
+/// Blocking: the retry sleeps the calling thread, so this is for synchronous
+/// callers only. Async callers must not park an executor thread here.
+pub(crate) fn flock_exclusive_bounded(
+    dir: &OwnedFd,
+    dir_path: &Path,
+    op: &'static str,
+) -> Result<(), InstanceError> {
+    for attempt in 0..LOCK_RETRY_ATTEMPTS {
         match flock(dir, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => return Ok(()),
             // WOULDBLOCK and AGAIN are one errno on Linux.
-            Err(rustix::io::Errno::WOULDBLOCK) if attempt + 1 < ATTEMPTS => {
-                std::thread::sleep(RETRY_DELAY);
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                if attempt + 1 < LOCK_RETRY_ATTEMPTS {
+                    std::thread::sleep(LOCK_RETRY_DELAY);
+                }
             }
-            Err(rustix::io::Errno::WOULDBLOCK) => return Err(InstanceError::AlreadyRunning),
-            Err(e) => return Err(io_err("flock", dir_path, e)),
+            Err(e) => return Err(io_err(op, dir_path, e)),
         }
     }
-    unreachable!("the final attempt always returns");
+    // Every attempt observed the lock held.
+    Err(InstanceError::AlreadyRunning)
 }
 
 pub(crate) const S_IFMT: u32 = 0o170000;
@@ -537,22 +569,33 @@ pub(crate) fn is_secure_regular(stat: &rustix::fs::Stat) -> bool {
         && stat.st_mode & 0o077 == 0
 }
 
-/// Best-effort removal of stale publication temp pathnames. Candidates and
-/// metadata come from a path-based directory iterator with metadata fetched
-/// per entry, while deletion is descriptor-relative; the metadata check and
-/// unlink are not atomic. Age is the sole predicate, failures do not prevent
-/// publication (protocol §4.2). The scan examines at most 1024 successfully
-/// read entries.
+/// Best-effort removal of stale temp pathnames left by `write_atomic_owner_only`.
+/// Candidates and metadata come from a path-based directory iterator with
+/// metadata fetched per entry, while deletion is descriptor-relative; the
+/// metadata check and unlink are not atomic. Age is the sole predicate,
+/// failures do not prevent publication (protocol §4.2). The scan examines at
+/// most 1024 successfully read entries.
+///
+/// Every canonical name written through that helper must be listed here. The
+/// lifecycle record is rewritten several times per incarnation, so omitting it
+/// would leak a temp file per crashed write with nothing to reclaim it.
 fn sweep_stale_temps(dir: &OwnedFd, dir_path: &Path) {
     const MAX_SWEEP_ENTRIES: usize = 1024;
-    let prefix = format!(".{CONNECTION_FILE_NAME}.");
+    let prefixes = [
+        format!(".{CONNECTION_FILE_NAME}."),
+        format!(".{}.", crate::lifecycle::LIFECYCLE_RECORD_NAME),
+    ];
     let Ok(entries) = std::fs::read_dir(dir_path) else {
         return;
     };
     for entry in entries.flatten().take(MAX_SWEEP_ENTRIES) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+        let matches_temp = name.ends_with(".tmp")
+            && prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()));
+        if !matches_temp {
             continue;
         }
         let stale = entry
