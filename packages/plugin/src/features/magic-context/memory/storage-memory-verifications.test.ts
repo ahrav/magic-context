@@ -57,8 +57,33 @@ describe("memory verification side-table helpers", () => {
                 .get(memory.id);
             expect(after).toEqual(before);
 
+            const eventsBefore = (
+                db.prepare("SELECT COUNT(*) AS count FROM verification_events").get() as {
+                    count: number;
+                }
+            ).count;
             clearMemoryVerifications(db, memory.id);
-            expect(getMemoryVerifications(db, [memory.id]).has(memory.id)).toBe(false);
+            // The claims-active clear is a kernel replace to the no-file
+            // sentinel: mapped (known to be backed by no files), not
+            // verified, and no verification event (KTD5 mapped-only rule).
+            const cleared = getMemoryVerifications(db, [memory.id]).get(memory.id);
+            expect(cleared?.files).toEqual([]);
+            expect(cleared?.hasSentinel).toBe(true);
+            expect(cleared?.verifiedAt).toBe(0);
+            expect(
+                (
+                    db.prepare("SELECT COUNT(*) AS count FROM verification_events").get() as {
+                        count: number;
+                    }
+                ).count,
+            ).toBe(eventsBefore);
+            expect(
+                db
+                    .prepare(
+                        "SELECT verification_status, verified_at, updated_at FROM memories WHERE id=?",
+                    )
+                    .get(memory.id),
+            ).toEqual(before);
         } finally {
             closeQuietly(db);
         }

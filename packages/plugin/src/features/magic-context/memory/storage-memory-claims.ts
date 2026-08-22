@@ -48,6 +48,7 @@ import {
     updateMemoryProjectionStatus,
     updateMemoryProjectionVerification,
 } from "./storage-memory-projection.ts";
+import type { MemoryStatus } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Failpoint seams (Process-Crash Test Contract). No-op by default; U6
@@ -1437,6 +1438,42 @@ function memoryRowHasPositiveVerification(
 }
 
 /**
+ * Lifecycle half of an adoption: `ensureMemoryClaimLinkInCurrentTransaction`
+ * reuses whatever canonical claim already owns the (project, category, hash)
+ * tuple — including one archived by a prior delete of an equivalent row — so
+ * the claim state is re-derived from the adopting projection row under the
+ * shared-claim max-rank rule and an active row never points at an archived
+ * claim. An archive transition retires (archive event); any other change
+ * sets the state directly. Returns the lifecycle effect only when the state
+ * actually changed. Local twin of relocate-memory's
+ * `syncAdoptedClaimLifecycleState`: importing it here would form an import
+ * cycle (relocate-memory imports this module).
+ */
+function syncClaimLifecycleAfterAdoption(
+    db: Database,
+    row: MemoryProjectionRow,
+    link: MemoryClaimLink,
+    projectId: number,
+    producer: string,
+): MemoryClaimEffect[] {
+    const desiredState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, row.status);
+    if (readCurrentClaimSemanticState(db, link.claimId).state === desiredState) return [];
+    if (desiredState === "archived") {
+        retireMemoryClaimInCurrentTransaction(db, link.claimId, producer);
+    } else {
+        setClaimLifecycleStateInCurrentTransaction(db, link.claimId, desiredState);
+    }
+    return [
+        {
+            effectKey: `memory:${row.id}:lifecycle`,
+            projectId,
+            claimId: link.claimId,
+            effectType: "lifecycle" as const,
+        },
+    ];
+}
+
+/**
  * Content rewrite: adopt an unlinked preimage as revision 1, then append the
  * requested content as the next revision in the same transaction (R10),
  * update the projection semantic fields, and invalidate derived rows.
@@ -1495,6 +1532,13 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                         claimId: link.claimId,
                         effectType: "upsert" as const,
                     },
+                    ...syncClaimLifecycleAfterAdoption(
+                        db,
+                        post,
+                        link,
+                        projectId,
+                        envelope.producer,
+                    ),
                 ];
                 // The projection keeps its verified columns across a content
                 // rewrite, so the adopted claim's current revision needs its
@@ -1556,6 +1600,10 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                 claimId: link.claimId,
                 effectType: "upsert" as const,
             },
+            // The link above can dedup-adopt an archived canonical claim, so
+            // the lifecycle re-derivation runs after the revision append and
+            // any archive event lands on the new current revision.
+            ...syncClaimLifecycleAfterAdoption(db, row, link, projectId, envelope.producer),
         ];
         // The projection deliberately keeps its verified columns across a
         // content rewrite, so the appended revision needs its own verified
@@ -1660,7 +1708,7 @@ export function updateMemoryClassificationWithClaimsInCurrentTransaction(
 
 export interface SetMemoryStatusClaimInput {
     memoryId: number;
-    status: string;
+    status: MemoryStatus;
     /** Replacement metadata JSON (already merged by the caller), if any. */
     metadataJson?: string | null;
     nowMs?: number;
@@ -1725,7 +1773,7 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
         const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, row.id, input.status);
         if (readCurrentClaimSemanticState(db, link.claimId).state !== nextState) {
             setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
-            if (nextState === "archived" && input.status === "archived") {
+            if (nextState === "archived") {
                 addVerificationEvent(db, {
                     revisionId: readClaimCurrentRevisionId(db, link.claimId),
                     outcome: "archive",
@@ -2510,6 +2558,10 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                     targetProjectId !== null &&
                     memoryClaimAdoptionFailureReason(target, targetProjectId) === null
                 ) {
+                    // Like the preimage probe above, the adoption below must
+                    // not be mistaken for a pre-existing link: a first
+                    // adoption owes the target's claim its verified carry.
+                    const targetWasLinked = readMemoryClaimLink(db, target.id) !== null;
                     const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
                         db,
                         target,
@@ -2519,6 +2571,24 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                     if (recordMemoryClaimSupersessionInCurrentTransaction(db, link, targetLink)) {
                         effects.push({
                             effectKey: `memory:${target.id}:supersede`,
+                            projectId: targetProjectId,
+                            claimId: targetLink.claimId,
+                            effectType: "evidence" as const,
+                        });
+                    }
+                    if (!targetWasLinked && memoryRowHasPositiveVerification(db, target)) {
+                        // Side-table-only verification never sets the
+                        // projection columns, so the target's first adoption
+                        // owes one verified event for its pre-existing
+                        // verified state — the target-side twin of the
+                        // preimage carry above.
+                        addVerificationEvent(db, {
+                            revisionId: readClaimCurrentRevisionId(db, targetLink.claimId),
+                            outcome: "verified",
+                            verifier: envelope.producer,
+                        });
+                        effects.push({
+                            effectKey: `memory:${target.id}:evidence`,
                             projectId: targetProjectId,
                             claimId: targetLink.claimId,
                             effectType: "evidence" as const,

@@ -819,6 +819,21 @@ function copyMemoriesToProjectInner(
     let relocated = 0;
     let skipped = 0;
     for (const id of ids) {
+        if (targetProjectId !== null) {
+            const source = readMemoryProjectionRow(db, id);
+            const failure = source
+                ? memoryClaimAdoptionFailureReason(source, targetProjectId)
+                : null;
+            if (failure !== null) {
+                // A claim-invalid source row (empty content, bad metadata)
+                // cannot acquire the target-project link its copy needs, so
+                // the copy skips it fail-visible (blocking diagnostic)
+                // instead of aborting the caller's batch.
+                recordMemoryClaimLinkFailure(db, id, toIdentity, failure);
+                skipped += 1;
+                continue;
+            }
+        }
         const result = insertStmt.run(toIdentity, id) as {
             changes?: number;
             lastInsertRowid?: number | bigint;

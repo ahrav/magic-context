@@ -35,6 +35,7 @@ import {
     updateMemoryVerificationWithClaimsInCurrentTransaction,
 } from "./storage-memory-claims";
 import { recordMemoryMapping, recordMemoryVerifications } from "./storage-memory-verifications";
+import type { MemoryStatus } from "./types";
 
 const PROJECT = "git:kernel-project";
 
@@ -1425,6 +1426,111 @@ describe("memory/claims kernel: canonical claim reuse", () => {
             state: "active",
         });
     });
+
+    test("a repair adoption onto an archived canonical reactivates the claim with a lifecycle effect", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "repair-revive-seed", "repair revive fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("repair-revive-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "archived",
+        });
+
+        // Empty-content row: unadoptable until the rewrite repairs it.
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', '', ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT, "hash:repair revive fact").lastInsertRowid,
+            );
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("repair-revive-update", { id: memoryId }),
+                {
+                    memoryId,
+                    content: "repair revive fact",
+                    normalizedHash: "hash:repair revive fact",
+                },
+            ),
+        );
+
+        expect(outcome.result.claimId).toBe(seeded.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "active",
+        });
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${memoryId}:lifecycle'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'repair-revive-update')`,
+            ),
+        ).toBe(1);
+    });
+
+    test("a content update adopting an unlinked row onto an archived canonical reactivates the claim", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "update-revive-seed", "update revive fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("update-revive-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+
+        // Adoptable but unlinked row on the archived canonical's (category, hash).
+        let memoryId = 0;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            memoryId = Number(
+                db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            seen_count, retrieval_count, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES (?, 'CONSTRAINTS', ?, ?, 1, 0, 1, 1, 1, 1)`,
+                    )
+                    .run(PROJECT, "update revive fact", "hash:update revive fact").lastInsertRowid,
+            );
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("update-revive-update", { id: memoryId }),
+                {
+                    memoryId,
+                    content: "update revive fact v2",
+                    normalizedHash: "hash:update revive fact v2",
+                },
+            ),
+        );
+
+        expect(outcome.result.claimId).toBe(seeded.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "active",
+        });
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_key = 'memory:${memoryId}:lifecycle'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'update-revive-update')`,
+            ),
+        ).toBe(1);
+    });
 });
 
 describe("memory/claims kernel: status transitions with metadata replacement", () => {
@@ -1564,6 +1670,51 @@ describe("memory/claims kernel: relationship and session-attribution effects", (
         expect(expectedEffectCount(db, "supersede-lineage-1")).toBe(3);
     });
 
+    test("a module delta adopting its supersession target carries the target's side-table verification", () => {
+        const db = track(migratedDb());
+        const sourceId = insertUnlinkedRow(db, "module supersede source", "[]");
+        const targetId = insertUnlinkedRow(db, "module supersede target", "[]");
+        // Pre-v84 TypeScript verification: positive verified_at lives only in
+        // memory_verifications; the projection columns stay unverified.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                 VALUES (?, 'src/target.ts', 123, 100)`,
+            ).run(targetId);
+        });
+
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("module-supersede-target-1", { key: "module-supersede-target" }),
+                {
+                    memoryId: sourceId,
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET superseded_by_memory_id = ? WHERE id = ?",
+                        ).run(targetId, sourceId);
+                    },
+                },
+            ),
+        );
+        expect(outcome.result.claimId).not.toBeNull();
+
+        const targetLink = readMemoryClaimLink(db, targetId);
+        expect(targetLink).not.toBeNull();
+        expect(
+            db
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(targetLink?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
+        const keys = operationOutbox(db, "module-supersede-target-1").map((row) => row.effectKey);
+        expect(keys).toContain(`memory:${targetId}:evidence`);
+        expect(keys).toContain(`memory:${targetId}:supersede`);
+        expect(expectedEffectCount(db, "module-supersede-target-1")).toBe(keys.length);
+    });
+
     test("a module delta changing only source_session_id appends a revision carrying the new session id", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "session-reattr-seed", "session reattribution fact");
@@ -1682,7 +1833,7 @@ describe("memory/claims kernel: shared-claim lifecycle rank", () => {
         return siblingId;
     }
 
-    function setStatus(db: Database, key: string, memoryId: number, status: string): void {
+    function setStatus(db: Database, key: string, memoryId: number, status: MemoryStatus): void {
         runInMemoryClaimsWriteTransaction(db, () =>
             setMemoryStatusWithClaimsInCurrentTransaction(db, envelope(key, { key, memoryId }), {
                 memoryId,
@@ -1690,6 +1841,19 @@ describe("memory/claims kernel: shared-claim lifecycle rank", () => {
             }),
         );
     }
+
+    test("an unknown status quarantined to archived rank still emits the archive event", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "rank-unknown-seed", "rank unknown fact");
+        // Runtime writers are not bound by the compile-time status union; an
+        // unknown status ranks archived, and the archive event follows the
+        // derived state, not the input spelling.
+        setStatus(db, "rank-unknown-archive", seeded.memoryId, "quarantined" as MemoryStatus);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "archived",
+        });
+        expect(count(db, "verification_events", "outcome = 'archive'")).toBe(1);
+    });
 
     test("restoring an archived sibling never downgrades a permanent shared claim", () => {
         const db = track(migratedDb());

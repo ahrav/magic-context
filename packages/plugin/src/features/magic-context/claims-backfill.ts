@@ -431,14 +431,22 @@ function countFailures(
     );
 }
 
-/** Rows-phase failures whose memory has since acquired its crosswalk link. */
+/** Rows-phase failures whose memory has since acquired its crosswalk link,
+ *  or whose memories row no longer exists — a deleted row can never link, so
+ *  its failure is terminal (rows-phase keys are the bare memory id). */
 function sweepResolvedRowFailures(db: Database): void {
     db.prepare(
         `UPDATE claim_backfill_failures SET disposition = 'resolved', updated_at = ?
           WHERE phase = 'rows' AND item_kind = 'memory' AND disposition IN ('blocking', 'retry')
-            AND EXISTS (
-                SELECT 1 FROM legacy_memory_claims
-                 WHERE memory_id = CAST(claim_backfill_failures.item_key AS INTEGER)
+            AND (
+                EXISTS (
+                    SELECT 1 FROM legacy_memory_claims
+                     WHERE memory_id = CAST(claim_backfill_failures.item_key AS INTEGER)
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM memories
+                     WHERE id = CAST(claim_backfill_failures.item_key AS INTEGER)
+                )
             )`,
     ).run(Date.now());
 }
@@ -688,6 +696,9 @@ export interface ClaimsBackfillReconciliationReport {
     ok: boolean;
     problems: string[];
     warningCount: number;
+    /** Lifecycle-oracle mismatches folded into `warningCount`; broken out so
+     *  the status surface can name the warning that has no failure row. */
+    lifecycleMismatches: number;
 }
 
 /** Anti-join fragment: the aliased memories row has no crosswalk link (R1, R11). */
@@ -1016,6 +1027,7 @@ export function inspectClaimsBackfillReconciliation(
         ok: problems.length === 0,
         problems,
         warningCount: countBoundaryFailures(db, ["warning"], boundary) + lifecycleMismatches,
+        lifecycleMismatches,
     };
 }
 
@@ -1519,11 +1531,24 @@ export function getClaimsBackfillStatus(
     else if (state.phase === "complete" && reconciliation && !reconciliation.ok) {
         operational = "blocked";
     } else if (state.phase === "complete" && state.v22Takeover !== "pending") {
-        operational = gatingWarnings > 0 ? "complete-with-warnings" : "complete";
+        // The reconciliation warning count folds in lifecycle mismatches the
+        // failure-row count cannot see, so the full oracle wins whenever the
+        // caller requested it; the boundary warning rows are the fallback.
+        operational =
+            (reconciliation?.warningCount ?? gatingWarnings) > 0
+                ? "complete-with-warnings"
+                : "complete";
     } else if (state.phase === "blocked" || gatingBlocking > 0 || state.v22Takeover === "pending") {
         operational = "blocked";
     } else operational = "pending";
-    const problems = reconciliation?.problems ?? [];
+    const problems = [...(reconciliation?.problems ?? [])];
+    if (reconciliation && reconciliation.lifecycleMismatches > 0) {
+        // Lifecycle mismatches have no claim_backfill_failures row, so the
+        // warning is only observable through this line.
+        problems.push(
+            `warning: ${reconciliation.lifecycleMismatches} claim lifecycle state mismatch(es) within the boundary corpus`,
+        );
+    }
     return {
         applicable: state.mode !== null,
         state: operational,

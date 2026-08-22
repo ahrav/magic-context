@@ -5,7 +5,6 @@ import {
     hasMemoryClaimsCompatSchema,
     replaceMemoryVerificationFilesWithClaimsInCurrentTransaction,
     runInMemoryClaimsWriteTransaction,
-    withClaimsWriteCapabilityInCurrentTransaction,
 } from "./storage-memory-claims";
 
 export const MEMORY_VERIFICATION_SENTINEL = "";
@@ -131,11 +130,22 @@ export function getUnmappedMemoryIds(db: Database, memoryIds: readonly number[])
 
 export function clearMemoryVerifications(db: Database, memoryId: number): void {
     if (hasMemoryClaimsCompatSchema(db)) {
-        db.transaction(() =>
-            withClaimsWriteCapabilityInCurrentTransaction(db, () => {
-                db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);
-            }),
-        ).immediate();
+        // The claims-active clear rides the same kernel operation as the
+        // record paths above: the side-table replace (empty file set, not
+        // verified) runs inside an operation envelope instead of a raw
+        // capability-scoped DELETE no kernel accounting can observe.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            replaceMemoryVerificationFilesWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "storage-memory-verifications",
+                    operationKey: `clear:${randomUUID()}`,
+                    requestDigest: computeClaimRequestDigest({ memoryId, clear: true }),
+                    ephemeral: true,
+                },
+                { memoryId, files: [], now: Date.now(), verified: false },
+            ),
+        );
         return;
     }
     db.prepare("DELETE FROM memory_verifications WHERE memory_id = ?").run(memoryId);

@@ -607,6 +607,15 @@ describe("claims backfill boundary scoping and blocked-state gating", () => {
     test("an above-boundary blocking failure never gates completion but stays on the repair surface", async () => {
         const { db } = migrateLazy([{ content: "boundary row" }]);
         const boundary = getClaimsBackfillStatus(db).boundaryMemoryId;
+        // The rows-phase failure must reference a still-existing live-writer
+        // row: a failure whose memories row is gone is terminal and sweeps
+        // to resolved.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memories (id, project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
+                 VALUES (?, '/raw/live-writer', 'CONSTRAINTS', 'live writer row', 'hash:live-writer', 1, 1, 1, 1)`,
+            ).run(boundary + 1);
+        });
         const insertFailure = db.prepare(
             `INSERT INTO claim_backfill_failures
                 (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
@@ -791,6 +800,45 @@ describe("claims backfill reconciliation", () => {
         expect(report.warningCount).toBe(1);
         const rerun = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
         expect(rerun.status).toBe("complete-with-warnings");
+    });
+
+    test("a lifecycle mismatch with zero warning rows flips completed status to complete-with-warnings", async () => {
+        const { db, ids } = migrateLazy([{ content: "status drift row" }]);
+        expect((await runClaimsBackfill(db, { yieldToEventLoop: async () => {} })).status).toBe(
+            "complete",
+        );
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET status = 'archived' WHERE id = ?").run(ids[0]);
+        });
+        expect(listClaimsBackfillFailures(db, { dispositions: ["warning"] })).toHaveLength(0);
+
+        const status = getClaimsBackfillStatus(db, { includeProblems: true });
+        expect(status.state).toBe("complete-with-warnings");
+        expect(status.problems.join("\n")).toContain("1 claim lifecycle state mismatch(es)");
+    });
+
+    test("deleting a still-unlinked failed row resolves its blocking failure on the next sweep", async () => {
+        const { db } = migrateLazy([{ content: "boundary row" }]);
+        // A live writer records an above-boundary blocking failure (raw
+        // path, unlinkable), then deletes the row before it ever links.
+        const doomed = insertMemory(db, {
+            projectPath: "/raw/live-writer-path",
+            category: "CONSTRAINTS",
+            content: "doomed unlinkable row",
+        });
+        deleteMemory(db, doomed.id);
+        expect(listClaimsBackfillFailures(db, { dispositions: ["blocking"] })).toHaveLength(1);
+
+        const summary = await runClaimsBackfill(db, { yieldToEventLoop: async () => {} });
+        expect(summary.status).toBe("complete");
+        expect(
+            listClaimsBackfillFailures(db, { dispositions: ["blocking", "retry"] }),
+        ).toHaveLength(0);
+        expect(
+            db
+                .prepare("SELECT disposition FROM claim_backfill_failures WHERE item_key = ?")
+                .get(String(doomed.id)),
+        ).toEqual({ disposition: "resolved" });
     });
 
     test("refuses missing metadata, root evidence, outbox, generation, and lineage disposition", async () => {

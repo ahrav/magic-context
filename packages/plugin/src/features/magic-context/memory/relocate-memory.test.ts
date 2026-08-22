@@ -794,6 +794,60 @@ describe("relocate-memory claims (v84)", () => {
         expect(copiedClaim?.state).toBe("active");
     });
 
+    test("a claim-invalid source row is skipped with a diagnostic instead of aborting the copy batch", () => {
+        const database = makeDb();
+        const first = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "good copy fact one",
+        });
+        // Schema-legal but claim-invalid: the scope value passes the memories
+        // table but fails the adoption metadata gate.
+        let badId = 0;
+        runInMemoryClaimsWriteTransaction(database, () => {
+            badId = Number(
+                database
+                    .prepare(
+                        `INSERT INTO memories
+                            (project_path, category, content, normalized_hash, scope, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES ('git:project-a', 'CONSTRAINTS', 'claim-invalid fact', 'ci-h1', 'galaxy', 1, 1, 1, 1)`,
+                    )
+                    .run().lastInsertRowid,
+            );
+        });
+        const second = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "good copy fact two",
+        });
+
+        const result = inTransaction(database, () =>
+            copyMemoriesToProject(database, [first.id, badId, second.id], "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 2, merged: 0, skipped: 1 });
+        const copied = database
+            .prepare(
+                "SELECT content FROM memories WHERE project_path = 'git:project-b' ORDER BY id",
+            )
+            .all() as Array<{ content: string }>;
+        expect(copied.map((row) => row.content)).toEqual([
+            "good copy fact one",
+            "good copy fact two",
+        ]);
+        expect(
+            database
+                .prepare(
+                    "SELECT reason_code AS reasonCode, disposition, detail FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(badId)),
+        ).toEqual({
+            reasonCode: "invalid-scope",
+            disposition: "blocking",
+            detail: "git:project-b",
+        });
+    });
+
     test("a cross-project move onto a deleted equivalent reactivates the adopted archived claim", () => {
         const database = makeDb();
         const deleted = insertMemory(database, {

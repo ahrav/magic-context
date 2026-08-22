@@ -500,15 +500,20 @@ describe("doctor claims backfill commands", () => {
 
     it("blocked retry exits 1 and malformed waiver ids are rejected exactly", async () => {
         const database = makeDb();
-        // The boundary meta places failure item 999 inside the boundary
-        // corpus: only boundary-scoped blocking failures gate completion.
+        // A real unlinked row under a raw project path keeps the failure
+        // legitimately blocking: the resolution sweep clears diagnostics whose
+        // memory row is linked or gone, so the fixture must hold a live,
+        // unadoptable boundary row. The boundary meta places it inside the
+        // boundary corpus: only boundary-scoped blocking failures gate
+        // completion.
+        const blockedId = insertMemory(database, "/raw/unresolvable", "blocked-hash");
         database.exec(`
             UPDATE schema_migrations_meta SET value = 'blocked' WHERE key = 'claims_backfill_phase';
             UPDATE schema_migrations_meta SET value = 'none' WHERE key = 'claims_backfill_v22_takeover';
-            UPDATE schema_migrations_meta SET value = '999' WHERE key = 'claims_backfill_boundary_memory_id';
+            UPDATE schema_migrations_meta SET value = '${blockedId}' WHERE key = 'claims_backfill_boundary_memory_id';
             INSERT INTO claim_backfill_failures
                 (phase, item_kind, item_key, reason_code, detail, disposition, created_at, updated_at)
-            VALUES ('rows', 'memory', '999', 'unresolved-project-identity', '', 'blocking', 1, 1);
+            VALUES ('rows', 'memory', '${blockedId}', 'unresolved-project-identity', '', 'blocking', 1, 1);
         `);
         const retry = await runClaimsBackfillCommands(makeHarness(database, []), {
             retryClaimsBackfill: true,
