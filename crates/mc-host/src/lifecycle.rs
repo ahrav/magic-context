@@ -147,8 +147,13 @@ impl InstanceGuard {
             written_at_ms: now_ms(),
         };
         let json = serde_json::to_vec(&record).expect("record serialization cannot fail");
-        crate::instance::write_atomic_owner_only(self.dir(), LIFECYCLE_RECORD_NAME, &json)
-            .map(|_stat| ())
+        crate::instance::write_atomic_owner_only(
+            self.dir(),
+            self.dir_path(),
+            LIFECYCLE_RECORD_NAME,
+            &json,
+        )
+        .map(|_stat| ())
     }
 
     /// Marks this incarnation `stopping` and then retires its publication.

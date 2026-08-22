@@ -201,8 +201,7 @@ impl InstanceGuard {
         &self.dir
     }
 
-    #[cfg(test)]
-    pub fn dir_path(&self) -> &Path {
+    pub(crate) fn dir_path(&self) -> &Path {
         &self.dir_path
     }
 
@@ -228,7 +227,7 @@ impl InstanceGuard {
         let json =
             serde_json::to_vec_pretty(&info).expect("connection info serialization cannot fail");
 
-        let stat = write_atomic_owner_only(&self.dir, CONNECTION_FILE_NAME, &json)?;
+        let stat = write_atomic_owner_only(&self.dir, &self.dir_path, CONNECTION_FILE_NAME, &json)?;
         // `Stat` field types vary by platform (macOS `st_dev` is `i32`); the
         // casts are no-ops on Linux but load-bearing elsewhere.
         #[allow(clippy::unnecessary_cast)]
@@ -436,13 +435,16 @@ pub(crate) fn secure_runtime_dir(dir_path: &Path) -> Result<OwnedFd, InstanceErr
 /// descriptor before the rename.
 pub(crate) fn write_atomic_owner_only(
     dir: &OwnedFd,
+    dir_path: &Path,
     name: &str,
     bytes: &[u8],
 ) -> Result<rustix::fs::Stat, InstanceError> {
     let mut suffix = [0u8; 16];
     getrandom::getrandom(&mut suffix).map_err(|_| InstanceError::Random)?;
     let temp_name = format!(".{name}.{}.{}.tmp", std::process::id(), hex(&suffix));
-    let temp_path = PathBuf::from(&temp_name);
+    // Errors carry the full path so a failure names which runtime directory
+    // it happened in; the syscalls themselves stay anchored to `dir`.
+    let temp_path = dir_path.join(&temp_name);
 
     let fd = openat(
         dir,
