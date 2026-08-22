@@ -133,6 +133,12 @@ fn now_ms() -> u64 {
 impl InstanceGuard {
     /// A path or symlink swap cannot redirect the write outside the locked
     /// directory inode.
+    ///
+    /// Blocking-synchronous: one small-file open/write/fsync/rename, the same
+    /// exposure `publish` and `remove_publication` already have. Callers run
+    /// it directly on startup and teardown paths — once per incarnation, not
+    /// per request — accepting a single fsync's latency there rather than
+    /// restructuring guard ownership around `spawn_blocking`.
     pub fn write_lifecycle_record(&self, phase: LifecyclePhase) -> Result<(), InstanceError> {
         let record = WireRecord {
             schema: 1,
