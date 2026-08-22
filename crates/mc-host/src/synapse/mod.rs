@@ -688,11 +688,19 @@ impl SynapseComponent {
         // the job table, and those copies live until the response encoder
         // finishes. Their worst case is reserved before polling and shrunk
         // to the real page after, mirroring the parse-reservation pattern.
-        let page_meta_bound = self
+        // The bound uses the attainable page maximum, not the raw config:
+        // a job never holds more than max_batch_items items, so no page
+        // can either (an oversized max_page_vectors must not reserve
+        // configuration-sized bytes per poll), and page_boundaries always
+        // places at least one item per page (a zero config must not yield
+        // a zero reservation that under-covers the clones).
+        let page_items = self
             .inner
             .limits
             .max_page_vectors
-            .saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
+            .clamp(1, self.inner.limits.max_batch_items);
+        let page_meta_bound =
+            page_items.saturating_mul(jobs::MAX_ITEM_ID_BYTES + jobs::CONTENT_SHA256_BYTES);
         let Some(mut meta_charge) = ctx.try_reserve_resident(page_meta_bound) else {
             return app_error(
                 "queue_full",

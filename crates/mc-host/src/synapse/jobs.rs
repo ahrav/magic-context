@@ -243,6 +243,22 @@ fn admitted_result_bytes(items: &[BatchItem], dimensions: usize) -> Option<u64> 
 }
 
 impl JobTable {
+    /// Acquires the table lock, recovering from poisoning. A panic while
+    /// the lock is held would otherwise brick the whole route: `sweep`
+    /// runs at the top of every request, so one poisoned acquisition
+    /// becomes a panic on every subsequent request until restart, and
+    /// `AbandonGuard::drop` re-entering a poisoned lock during unwind
+    /// would double-panic and abort the process. Recovered state may
+    /// reflect a partially applied mutation from the panicking call;
+    /// every operation on `Jobs` is defensive against missing or
+    /// already-completed entries, and the expiry sweep bounds how long
+    /// an inconsistent entry survives.
+    fn lock_jobs(&self) -> std::sync::MutexGuard<'_, Jobs> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn new(limits: SynapseLimits) -> Self {
         let mut nonce = [0u8; 8];
         // The incarnation fence must be unpredictable across restarts, or a
@@ -287,7 +303,7 @@ impl JobTable {
         // Declared before the guard so it drops after it: permits release
         // outside the table lock.
         let mut released = Released::default();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         self.sweep_expired(&mut jobs, &mut released);
         jobs.by_key.contains_key(key)
     }
@@ -326,7 +342,7 @@ impl JobTable {
         // Declared before the guard so it drops after it: permits release
         // outside the table lock.
         let mut released = Released::default();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         if jobs.closed {
             return AdmitOutcome::Closed;
         }
@@ -397,7 +413,7 @@ impl JobTable {
     /// Claims the queued inputs for inference. `None` means the job was
     /// cancelled by shutdown before its worker started.
     pub fn start(&self, seq: u64) -> Option<Vec<BatchItem>> {
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         let job = jobs.by_seq.get_mut(&seq)?;
         let JobState::Queued { items } = &mut job.state else {
             return None;
@@ -415,7 +431,7 @@ impl JobTable {
         // Declared before the guard so it drops after it: permits release
         // outside the table lock.
         let mut released = Released::default();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         let Some(job) = jobs.by_seq.get_mut(&seq) else {
             return;
         };
@@ -470,16 +486,7 @@ impl JobTable {
         // Declared before the guard so it drops after it: permits release
         // outside the table lock.
         let mut released = Released::default();
-        // `AbandonGuard::drop` calls this, possibly while unwinding from a
-        // panic raised under this same mutex further down the stack. An
-        // `.expect()` on the poisoned lock would panic inside a `Drop`
-        // during unwind and abort the process, so recover the poisoned
-        // state instead: `fail_job` tolerates partially updated entries
-        // (missing or already-completed jobs are no-ops).
-        let mut jobs = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut jobs = self.lock_jobs();
         self.fail_job(&mut jobs, seq, code, message, &mut released);
     }
 
@@ -518,7 +525,7 @@ impl JobTable {
         // Declared before the guard so it drops after it: permits release
         // outside the table lock.
         let mut released = Released::default();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         self.sweep_expired(&mut jobs, &mut released);
         let Some(seq) = self.parse_job_id(job_id) else {
             return PollOutcome::Restarted;
@@ -647,7 +654,7 @@ impl JobTable {
         // Declared before the guard so it drops after it: permits release
         // outside the table lock.
         let mut released = Released::default();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         self.sweep_expired(&mut jobs, &mut released);
     }
 
@@ -716,7 +723,7 @@ impl JobTable {
         // would otherwise take the byte budget's waiter lock while this
         // lock is held.
         let mut released = Released::default();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         jobs.closed = true;
         let queued: Vec<u64> = jobs
             .by_seq
@@ -734,7 +741,7 @@ impl JobTable {
         // carry both their charges and their retained vectors, and freeing
         // either under the table lock is what this ordering avoids.
         let mut released = Released::default();
-        let mut jobs = self.inner.lock().expect("job table lock");
+        let mut jobs = self.lock_jobs();
         released
             .jobs
             .extend(jobs.by_seq.drain().map(|(_, job)| job));
