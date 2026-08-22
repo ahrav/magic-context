@@ -13,6 +13,7 @@ import {
     APPLICABILITY_BASELINE_STREAM_KEY,
     CLAIM_APPLICABILITY_TABLES,
     dropClaimApplicabilityObjectsForTests,
+    missingClaimApplicabilitySchemaObjects,
     SOURCE_TRUST_CLASSES,
 } from "./storage-claim-applicability-schema";
 import { initializeDatabase, schemaVersionIsSupported } from "./storage-db";
@@ -656,6 +657,56 @@ describe("migration v85: claim applicability, git anchors, and source trust", ()
             db.prepare("DELETE FROM schema_migrations WHERE version = 85").run();
             db.exec("DROP TABLE claim_revision_applicability_symbols");
             expect(() => runMigrations(db)).toThrow(/v85 replay guard/);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a fresh schema publishes every required non-table object; a replay missing one refuses", () => {
+        const db = migratedDb();
+        try {
+            expect(missingClaimApplicabilitySchemaObjects(db)).toEqual([]);
+            db.prepare("DELETE FROM schema_migrations WHERE version = 85").run();
+            db.exec("DROP TRIGGER claim_applicability_assertions_time_guard");
+            expect(() => runMigrations(db)).toThrow(
+                /v85 replay guard: applicability tables exist but trigger claim_applicability_assertions_time_guard missing/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("an INSERT OR REPLACE colliding on the commit-OID unique index cannot replace another anchor's representation", () => {
+        const db = migratedDb();
+        try {
+            seedClaimGraph(db);
+            db.prepare("INSERT INTO git_anchors (project_id, created_at) VALUES (1, 1)").run();
+            db.prepare("INSERT INTO git_anchors (project_id, created_at) VALUES (1, 1)").run();
+            const anchors = db.prepare("SELECT id FROM git_anchors ORDER BY id").all() as Array<{
+                id: number;
+            }>;
+            const oid = "f".repeat(40);
+            db.prepare(
+                `INSERT INTO git_anchor_representations
+                    (anchor_id, project_id, kind, object_format, protocol, namespace, value, created_at)
+                 VALUES (?, 1, 'commit_oid', 'sha1', 'git-oid-v1', '', ?, 1)`,
+            ).run(anchors[0].id, oid);
+            expect(() =>
+                db
+                    .prepare(
+                        `INSERT OR REPLACE INTO git_anchor_representations
+                            (anchor_id, project_id, kind, object_format, protocol, namespace, value, created_at)
+                         VALUES (?, 1, 'commit_oid', 'sha1', 'git-oid-v1', '', ?, 2)`,
+                    )
+                    .run(anchors[1].id, oid),
+            ).toThrow(/key collisions cannot replace rows/);
+            expect(
+                db
+                    .prepare(
+                        "SELECT anchor_id FROM git_anchor_representations WHERE kind = 'commit_oid' AND value = ?",
+                    )
+                    .all(oid),
+            ).toEqual([{ anchor_id: anchors[0].id }]);
         } finally {
             closeQuietly(db);
         }

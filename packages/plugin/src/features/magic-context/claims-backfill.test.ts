@@ -1471,15 +1471,19 @@ describe("claims backfill: source trust and applicability population (AE4, AE5)"
         const mapped = currentMemoryStreamHead(db, ids[0]);
         expect(mapped?.pathsState).toBe("known");
         expect(mapped?.paths).toEqual([{ kind: "exact", value: "src/mapped.ts" }]);
-        expect(mapped?.knownFrom).toBe(11);
+        // The mapping (mapped_at = 17) postdates first-seen (11): the snapshot
+        // is known from the mapping time, not before the paths were mapped.
+        expect(mapped?.knownFrom).toBe(17);
 
         const independent = currentMemoryStreamHead(db, ids[1]);
         expect(independent?.pathsState).toBe("known");
         expect(independent?.paths).toEqual([]);
+        expect(independent?.knownFrom).toBe(17);
 
         const unmapped = currentMemoryStreamHead(db, ids[2]);
         expect(unmapped?.pathsState).toBe("unknown");
         expect(unmapped?.paths).toEqual([]);
+        expect(unmapped?.knownFrom).toBe(11);
     });
 
     test("eager conversion inside the v84 migration keeps the conservative default and seeded baselines", () => {

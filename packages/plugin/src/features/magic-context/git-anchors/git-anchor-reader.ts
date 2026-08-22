@@ -153,7 +153,16 @@ export async function captureGitAnchor(
         }
         const objectFormat = commitOid.length === 64 ? "sha256" : "sha1";
 
-        const metaOut = await runGit(repoRoot, ["log", "-1", "--format=%T%x1f%P", commitOid]);
+        // --no-show-signature: `git log` is porcelain, and a repository or
+        // user `log.showSignature = true` would prepend signature text that
+        // breaks the \x1f metadata split.
+        const metaOut = await runGit(repoRoot, [
+            "log",
+            "-1",
+            "--no-show-signature",
+            "--format=%T%x1f%P",
+            commitOid,
+        ]);
         const metaLine = metaOut.trim();
         const [treeOid = "", parentField = ""] = metaLine.split("\x1f");
         if (!FULL_OID_PATTERN.test(treeOid)) {

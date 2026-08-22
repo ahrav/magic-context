@@ -192,8 +192,8 @@ export function createClaimApplicabilitySchema(db: Database): void {
         UNIQUE (revision_id, stream_key),
         CHECK (owner_kind <> 'evaluation' OR context_fingerprint IS NOT NULL)
     );
-    CREATE INDEX idx_claim_applicability_streams_revision
-        ON claim_revision_applicability_streams(revision_id);
+    -- UNIQUE (revision_id, stream_key) already provides the revision_id-
+    -- leading index, so revision lookups need no separate index.
     CREATE INDEX idx_claim_applicability_streams_project
         ON claim_revision_applicability_streams(project_id);
 
@@ -321,9 +321,19 @@ export function createClaimApplicabilitySchema(db: Database): void {
     BEGIN SELECT RAISE(ABORT, 'git_anchor_representations is append-only: deletes are not allowed'); END;
     CREATE TRIGGER git_anchor_representations_append_only_insert_collision
     BEFORE INSERT ON git_anchor_representations
+    -- Covers every uniqueness on the table: the rowid, the full identity
+    -- UNIQUE, and the partial commit-OID unique index — so an INSERT OR
+    -- REPLACE colliding on any of them cannot silently delete the existing
+    -- row (REPLACE's implicit delete skips the BEFORE DELETE trigger while
+    -- recursive_triggers is off).
     WHEN EXISTS (
         SELECT 1 FROM git_anchor_representations
         WHERE id = NEW.id OR (${representationIdentityMatch})
+           OR (NEW.kind = 'commit_oid' AND kind = 'commit_oid'
+               AND project_id = NEW.project_id
+               AND object_format = NEW.object_format
+               AND protocol = NEW.protocol
+               AND value = NEW.value)
     )
     BEGIN SELECT RAISE(ABORT, 'git_anchor_representations is append-only: key collisions cannot replace rows'); END;
 
@@ -541,6 +551,64 @@ export function assertClaimApplicabilitySchemaForeignKeys(db: Database): void {
     if (violations.length > 0) {
         throw new Error(`v85 foreign_key_check failed: ${violations.join("; ")}`);
     }
+}
+
+/**
+ * Non-table objects `createClaimApplicabilitySchema` creates, absent from
+ * `sqlite_master`. The v85 replay guard uses this so a database whose tables
+ * survived but whose view, indexes, or guard triggers did not (for example
+ * one created by an earlier draft of the schema) is refused instead of being
+ * accepted as complete. migrations-v85.test.ts asserts the name list below
+ * stays in sync with the DDL.
+ */
+export function missingClaimApplicabilitySchemaObjects(db: Database): string[] {
+    const required: Array<[type: string, name: string]> = [
+        ["view", "claim_revision_applicability_intervals"],
+        ["index", "idx_git_anchors_project"],
+        ["index", "idx_git_anchor_representations_commit_unique"],
+        ["index", "idx_git_anchor_representations_lookup"],
+        ["index", "idx_git_anchor_representations_anchor"],
+        ["index", "idx_claim_applicability_streams_project"],
+        ["index", "idx_claim_applicability_assertions_predecessor"],
+        ["index", "idx_claim_applicability_assertions_known_from"],
+        ["trigger", "git_anchors_append_only_update"],
+        ["trigger", "git_anchors_append_only_delete"],
+        ["trigger", "git_anchors_append_only_insert_collision"],
+        ["trigger", "git_anchor_representations_append_only_update"],
+        ["trigger", "git_anchor_representations_append_only_delete"],
+        ["trigger", "git_anchor_representations_append_only_insert_collision"],
+        ["trigger", "git_anchor_representations_project_guard"],
+        ["trigger", "claim_applicability_streams_append_only_update"],
+        ["trigger", "claim_applicability_streams_append_only_delete"],
+        ["trigger", "claim_applicability_streams_append_only_insert_collision"],
+        ["trigger", "claim_applicability_streams_project_guard"],
+        ["trigger", "claim_applicability_assertions_append_only_update"],
+        ["trigger", "claim_applicability_assertions_append_only_delete"],
+        ["trigger", "claim_applicability_assertions_append_only_insert_collision"],
+        ["trigger", "claim_applicability_assertions_chain_guard"],
+        ["trigger", "claim_applicability_assertions_first_seq_guard"],
+        ["trigger", "claim_applicability_assertions_time_guard"],
+        ["trigger", "claim_applicability_assertions_anchor_project_guard"],
+        ["trigger", "claim_applicability_paths_append_only_update"],
+        ["trigger", "claim_applicability_paths_append_only_delete"],
+        ["trigger", "claim_applicability_paths_append_only_insert_collision"],
+        ["trigger", "claim_applicability_paths_known_state_guard"],
+        ["trigger", "claim_applicability_symbols_append_only_update"],
+        ["trigger", "claim_applicability_symbols_append_only_delete"],
+        ["trigger", "claim_applicability_symbols_append_only_insert_collision"],
+    ];
+    const present = new Set(
+        (
+            db
+                .prepare(
+                    "SELECT type || ' ' || name AS object FROM sqlite_master WHERE type IN ('view', 'index', 'trigger')",
+                )
+                .all() as Array<{ object: string }>
+        ).map((row) => row.object),
+    );
+    return required
+        .map(([type, name]) => `${type} ${name}`)
+        .filter((object) => !present.has(object));
 }
 
 export function dropClaimApplicabilityObjectsForTests(db: Database): void {

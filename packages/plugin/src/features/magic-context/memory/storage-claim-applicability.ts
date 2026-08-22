@@ -52,10 +52,27 @@ export function hasClaimApplicabilitySchema(db: Database): boolean {
     return present;
 }
 
+/**
+ * Recursively key-sorted clone so the digest is independent of object-key
+ * insertion order: semantically identical sources always hash to one value.
+ */
+function sortKeysDeep(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(sortKeysDeep);
+    if (value !== null && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        return Object.fromEntries(
+            Object.keys(record)
+                .sort()
+                .map((key) => [key, sortKeysDeep(record[key])]),
+        );
+    }
+    return value;
+}
+
 /** Canonical SHA-256 digest over a JSON-serializable source description. */
 export function computeApplicabilitySourceDigest(source: unknown): string {
     return createHash("sha256")
-        .update(JSON.stringify(source) ?? "null", "utf8")
+        .update(JSON.stringify(sortKeysDeep(source)) ?? "null", "utf8")
         .digest("hex");
 }
 
@@ -95,6 +112,7 @@ export interface ApplicabilityStreamHandle {
 
 interface StreamRow {
     id: number;
+    project_id: number;
     owner_kind: string;
     key_protocol: string;
     source_digest: string;
@@ -118,7 +136,7 @@ export function ensureApplicabilityStreamInCurrentTransaction(
     }
     const existing = db
         .prepare(
-            `SELECT id, owner_kind, key_protocol, source_digest, branch_selector, context_fingerprint
+            `SELECT id, project_id, owner_kind, key_protocol, source_digest, branch_selector, context_fingerprint
                FROM claim_revision_applicability_streams
               WHERE revision_id = ? AND stream_key = ?`,
         )
@@ -126,6 +144,7 @@ export function ensureApplicabilityStreamInCurrentTransaction(
     if (existing) {
         const mismatches: string[] = [];
         if (existing.source_digest !== input.sourceDigest) mismatches.push("source digest");
+        if (existing.project_id !== input.projectId) mismatches.push("project");
         if (existing.owner_kind !== input.ownerKind) mismatches.push("owner kind");
         if (existing.key_protocol !== input.keyProtocol) mismatches.push("key protocol");
         if (existing.branch_selector !== (input.branchSelector ?? null)) {
@@ -550,10 +569,24 @@ export interface LegacyMemoryApplicabilitySource {
 }
 
 /**
+ * Latest plausible mapping time across a memory's verification rows. Rows
+ * from before the mapping-time column carry the 0 default and are ignored.
+ */
+function latestMemoryVerificationMappedAt(db: Database, memoryId: number): number | null {
+    const row = db
+        .prepare("SELECT MAX(mapped_at) AS max FROM memory_verifications WHERE memory_id = ?")
+        .get(memoryId) as { max: number | null } | undefined;
+    const max = row?.max;
+    return typeof max === "number" && Number.isSafeInteger(max) && max > 0 ? max : null;
+}
+
+/**
  * Source-stream applicability for a legacy-memory revision. A live write
- * learned its content now; a migration adoption retains the memory's
- * first-seen time as `known_from` when it is a plausible positive timestamp
- * and leaves knowledge time unknown otherwise.
+ * learned its content now. A migration adoption timestamps the snapshot at
+ * the latest plausible positive time the memory's content and path mappings
+ * were known — first-seen for content, `mapped_at` for paths — and leaves
+ * knowledge time unknown when neither is plausible: an as-of read must not
+ * see a path selector before it was mapped.
  */
 export function legacyMemorySourceApplicability(
     db: Database,
@@ -562,6 +595,13 @@ export function legacyMemorySourceApplicability(
 ): RevisionApplicabilityInput {
     const retainedFirstSeen =
         Number.isSafeInteger(row.first_seen_at) && row.first_seen_at > 0 ? row.first_seen_at : null;
+    const paths = readMemoryVerificationPathsState(db, row.id);
+    const retainedMappedAt =
+        paths.state === "unknown" ? null : latestMemoryVerificationMappedAt(db, row.id);
+    const retainedKnownFrom =
+        retainedFirstSeen != null && retainedMappedAt != null
+            ? Math.max(retainedFirstSeen, retainedMappedAt)
+            : (retainedMappedAt ?? retainedFirstSeen);
     return {
         ownerKind: "source",
         streamKey: legacyMemoryApplicabilityStreamKey(row.id),
@@ -572,8 +612,8 @@ export function legacyMemorySourceApplicability(
         }),
         assertion: {
             state: "unknown",
-            paths: readMemoryVerificationPathsState(db, row.id),
-            knownFrom: origin === "live" ? Date.now() : retainedFirstSeen,
+            paths,
+            knownFrom: origin === "live" ? Date.now() : retainedKnownFrom,
         },
     };
 }
@@ -599,9 +639,12 @@ function pathsStateEquals(
  * Append a successor assertion carrying the memory's current side-table path
  * knowledge onto the revision's legacy-memory source stream — only when that
  * knowledge differs from the stream head, so a replayed or no-op mapping
- * write appends nothing. Callers supply the desired path state and knowledge
- * time explicitly; a regressing knowledge time is clamped forward to the
- * stream maximum.
+ * write appends nothing. Every non-path head field carries into the
+ * successor unchanged: readers treat the head as the whole current snapshot,
+ * so a path-only update must not erase anchors, dependency or verifier
+ * metadata, or symbol selectors. Callers supply the desired path state and
+ * knowledge time explicitly; a regressing knowledge time is clamped forward
+ * to the stream maximum.
  */
 export function syncMemoryApplicabilityPathsInCurrentTransaction(
     db: Database,
@@ -635,6 +678,13 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
         state: head?.state ?? "unknown",
         paths: args.paths,
         knownFrom,
+        symbols: head?.symbols,
+        validFromAnchorId: head?.validFromAnchorId ?? null,
+        validUntilAnchorId: head?.validUntilAnchorId ?? null,
+        evaluatedAgainstAnchorId: head?.evaluatedAgainstAnchorId ?? null,
+        dependencyFingerprint: head?.dependencyFingerprint ?? null,
+        dependencyProtocol: head?.dependencyProtocol ?? null,
+        verifierSpec: head?.verifierSpec ?? null,
     });
     return { appended: true };
 }
