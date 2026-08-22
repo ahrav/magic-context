@@ -168,7 +168,12 @@ pub(crate) fn escaped_string_bytes(s: &str) -> usize {
 fn failure_is_permanent(code: &str) -> bool {
     matches!(
         code,
-        "artifact_invalid" | "substitution_rejected" | "schema_violation" | "not_certified"
+        "artifact_invalid"
+            | "substitution_rejected"
+            | "schema_violation"
+            | "not_certified"
+            | "probe_required"
+            | "idempotency_conflict"
     )
 }
 
