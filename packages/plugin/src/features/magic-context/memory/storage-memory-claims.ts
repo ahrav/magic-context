@@ -19,7 +19,11 @@
  */
 
 import { type Database, hasClaimCompatibilityWriteState } from "../../../shared/sqlite.ts";
-import { CLAIMS_BACKFILL_META_KEYS } from "../storage-memory-claims-schema.ts";
+import {
+    CLAIMS_BACKFILL_META_KEYS,
+    memoryLineagePresentSql,
+    memoryRelationshipSourceMatchSql,
+} from "../storage-memory-claims-schema.ts";
 import {
     addClaimConflictInCurrentTransaction,
     addVerificationEvent,
@@ -2720,6 +2724,28 @@ function unlinkedRowDeleteTripsBoundaryGuard(db: Database, memoryId: number): bo
 }
 
 /**
+ * Mirror of the memories_claims_relationship_delete_guard predicate: true
+ * when deleting this row would abort because the row carries relationship
+ * lineage whose exact preimage was never snapshotted into
+ * claim_memory_relationship_sources. The snapshot is written by
+ * translateMemoryClaimRelationshipsInCurrentTransaction, which requires a
+ * crosswalk link — so an unlinked lineage-bearing row always trips this
+ * guard.
+ */
+function unlinkedRowDeleteTripsRelationshipGuard(db: Database, memoryId: number): boolean {
+    return Boolean(
+        db
+            .prepare(
+                `SELECT 1 FROM memories m
+                  WHERE m.id = ?
+                    AND ${memoryLineagePresentSql("m")}
+                    AND NOT ${memoryRelationshipSourceMatchSql("m")}`,
+            )
+            .get(memoryId),
+    );
+}
+
+/**
  * Apply one module changefeed memory delta with its claim-side effects in the
  * caller's privileged mirror-page transaction (R15). The envelope key is the
  * durable feed identity (module project + row id + feed sequence), so an
@@ -2788,27 +2814,38 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
     }
 
     // A projection delete of an unlinked boundary row aborts on the
-    // memories_claims_boundary_delete_guard. When the preimage stayed
-    // unlinked (unadoptable), a module tombstone trips it and the RAISE
-    // would roll back the whole mirror page, pinning the feed cursor on
-    // this delta. The abort is statement-scoped — the page transaction
-    // survives — so the kernel catches exactly that shape, records the
-    // blocking repair diagnostic, and retains the projection row for the
-    // repair lanes. The envelope stays uncommitted: the retained run
-    // performs zero claim mutations, and a committed result would replay
-    // as final — skipping claim retirement even after the repair lanes
-    // link the row and a redelivered delete succeeds. Like the
-    // pending-pair unadoptable path, no claim write happens outside an
-    // envelope, and a later delivery of the same feed identity re-attempts
-    // the tombstone whole.
-    if (pre && !preLink && unlinkedRowDeleteTripsBoundaryGuard(db, pre.id)) {
+    // memories_claims_boundary_delete_guard, and an unlinked lineage-bearing
+    // row aborts on the memories_claims_relationship_delete_guard (its
+    // snapshot requires a link, so an unlinked row can never satisfy it).
+    // When the preimage stayed unlinked (unadoptable), a module tombstone
+    // trips one of them and the RAISE would roll back the whole mirror page,
+    // pinning the feed cursor on this delta — after the tombstone already
+    // removed the module-side source that could repair the row. The abort is
+    // statement-scoped — the page transaction survives — so the kernel
+    // catches exactly those shapes, records the blocking repair diagnostic,
+    // and retains the projection row for the repair lanes. The envelope
+    // stays uncommitted: the retained run performs zero claim mutations, and
+    // a committed result would replay as final — skipping claim retirement
+    // even after the repair lanes link the row and a redelivered delete
+    // succeeds. Like the pending-pair unadoptable path, no claim write
+    // happens outside an envelope, and a later delivery of the same feed
+    // identity re-attempts the tombstone whole. A guard trip on a LINKED row
+    // stays loud: preLink gates this path, so an unsnapshotted lineage
+    // mutation under a live link — a kernel bug — still aborts the page.
+    if (
+        pre &&
+        !preLink &&
+        (unlinkedRowDeleteTripsBoundaryGuard(db, pre.id) ||
+            unlinkedRowDeleteTripsRelationshipGuard(db, pre.id))
+    ) {
         try {
             input.applyProjection();
         } catch (error) {
             if (
                 !(
                     error instanceof Error &&
-                    error.message.includes("claim crosswalk link before delete")
+                    (error.message.includes("claim crosswalk link before delete") ||
+                        error.message.includes("relationships require translation before delete"))
                 )
             ) {
                 throw error;
@@ -3080,7 +3117,8 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 ) {
                     // Like the preimage probe above, the adoption below must
                     // not be mistaken for a pre-existing link: a first
-                    // adoption owes the target's claim its verified carry.
+                    // adoption owes the target's claim its upsert effect and
+                    // verified carry.
                     const targetWasLinked = readMemoryClaimLink(db, target.id) !== null;
                     const targetLink = ensureMemoryClaimLinkInCurrentTransaction(
                         db,
@@ -3088,6 +3126,18 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                         targetProjectId,
                         { kind: "migration" },
                     );
+                    if (!targetWasLinked) {
+                        // The adoption above committed the target's claim and
+                        // crosswalk rows inside this operation, so the outbox
+                        // owes the upsert announcing them — the module-path
+                        // twin of the ordinary kernel's target adoption.
+                        effects.push({
+                            effectKey: `memory:${target.id}:upsert`,
+                            projectId: targetProjectId,
+                            claimId: targetLink.claimId,
+                            effectType: "upsert" as const,
+                        });
+                    }
                     // The link above can dedup-adopt a canonical claim
                     // archived by a prior delete, so the target claim's state
                     // re-derives from its live links; the helper no-ops when

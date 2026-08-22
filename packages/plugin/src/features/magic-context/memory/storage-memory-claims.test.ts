@@ -2166,6 +2166,80 @@ describe("memory/claims kernel: unresolved identity fallback", () => {
         ).toEqual({ state: "archived" });
         expect(count(db, "claim_operations", "operation_key = 'module-tombstone-guarded'")).toBe(1);
     });
+
+    test("a module tombstone on an unlinked unadoptable lineage-bearing row retains the projection past the relationship guard, and a redelivery after repair completes it", () => {
+        const db = track(v82DatabaseWithRows(["lineage source fact", "lineage tombstone fact"]));
+        const ids = db.prepare("SELECT id FROM memories ORDER BY id").all() as Array<{
+            id: number;
+        }>;
+        const sourceId = ids[0]?.id ?? 0;
+        const memoryId = ids[1]?.id ?? 0;
+        // Claim-invalid AND lineage-bearing: the unlinked preimage has no
+        // relationship snapshot, so the projection delete trips the
+        // relationship delete guard (which fires before the boundary guard).
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET scope = '', merged_from = ? WHERE id = ?").run(
+                `[${sourceId}]`,
+                memoryId,
+            );
+        });
+        const env = envelope("module-tombstone-lineage-guarded", { id: memoryId });
+        const applyProjection = (): void => {
+            db.prepare("DELETE FROM memories WHERE id = ?").run(memoryId);
+        };
+
+        const retained = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(db, env, {
+                memoryId,
+                applyProjection,
+            }),
+        );
+        // The relationship guard aborted only the projection delete: the row
+        // survives with a blocking diagnostic, and the envelope stays
+        // uncommitted so a later delivery of the same feed identity retries.
+        expect(retained.result).toEqual({
+            memoryId,
+            claimId: null,
+            revisionId: null,
+            removed: false,
+        });
+        expect(db.prepare("SELECT 1 FROM memories WHERE id = ?").get(memoryId)).toBeTruthy();
+        expect(
+            db
+                .prepare(
+                    "SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?",
+                )
+                .get(String(memoryId)),
+        ).toEqual({ reason_code: "invalid-scope", disposition: "blocking" });
+        expect(
+            count(db, "claim_operations", "operation_key = 'module-tombstone-lineage-guarded'"),
+        ).toBe(0);
+        expect(count(db, "claims")).toBe(0);
+
+        // Doctor-style metadata repair, then the redelivered tombstone adopts
+        // the preimage, snapshots its lineage, passes both delete guards, and
+        // retires the claim normally.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare("UPDATE memories SET scope = 'project' WHERE id = ?").run(memoryId);
+        });
+        const completed = runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(db, env, {
+                memoryId,
+                applyProjection,
+            }),
+        );
+        expect(completed.result.removed).toBeTrue();
+        expect(completed.result.claimId).not.toBeNull();
+        expect(db.prepare("SELECT 1 FROM memories WHERE id = ?").get(memoryId)).toBeFalsy();
+        expect(count(db, "legacy_memory_claims", `memory_id = ${memoryId}`)).toBe(1);
+        expect(count(db, "claim_memory_relationship_sources", `memory_id = ${memoryId}`)).toBe(1);
+        expect(
+            db.prepare("SELECT state FROM claims WHERE id = ?").get(completed.result.claimId),
+        ).toEqual({ state: "archived" });
+        expect(
+            count(db, "claim_operations", "operation_key = 'module-tombstone-lineage-guarded'"),
+        ).toBe(1);
+    });
 });
 
 describe("memory/claims kernel: current-claim reads and corruption reporting", () => {
@@ -2773,7 +2847,13 @@ describe("memory/claims kernel: relationship and session-attribution effects", (
         const keys = operationOutbox(db, "module-supersede-target-1").map((row) => row.effectKey);
         expect(keys).toContain(`memory:${targetId}:evidence`);
         expect(keys).toContain(`memory:${targetId}:supersede`);
+        // The target's first adoption committed its claim and crosswalk rows,
+        // so the outbox owes the upsert announcing them.
+        expect(keys).toContain(`memory:${targetId}:upsert`);
         expect(expectedEffectCount(db, "module-supersede-target-1")).toBe(keys.length);
+        expect(inspectClaimsBackfillReconciliation(db).problems).toEqual([
+            "pending v22 identity work",
+        ]);
     });
 
     test("a module delta supersession target that dedup-adopts an archived canonical reactivates the target claim", () => {
