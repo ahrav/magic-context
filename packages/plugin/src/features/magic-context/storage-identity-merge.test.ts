@@ -10,6 +10,7 @@ import {
 } from "./memory/storage-memory";
 import {
     getCurrentMemoryClaimByLegacyMemoryId,
+    memoryClaimSupersessionExists,
     readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
 } from "./memory/storage-memory-claims";
@@ -1149,6 +1150,151 @@ describe("project identity merge claims (v84)", () => {
         ).toEqual({ status: "archived", by: targetId });
         const survivorClaim = getCurrentMemoryClaimByLegacyMemoryId(database, targetId);
         expect(survivorClaim?.state).toBe("active");
+    });
+
+    test("a rejected NULL-status collision target keeps its NULL status when the merge is skipped", () => {
+        const database = makeDb();
+        const targetId = insertMemory(database, "git:new", "rejected null fact", "null-h2");
+        const sourceId = insertMemory(database, "dir:old", "rejected null fact", "null-h2");
+        // Schema-legal drift on the target: NULL status plus claim-invalid
+        // importance, so the adoption gate rejects it.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET status = NULL, importance = 0 WHERE id = ?")
+                .run(targetId);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 80 });
+
+        // The skipped target keeps its NULL status: normalizing it would
+        // publish a claim-invalid row active while its claim work stays
+        // skipped.
+        expect(database.prepare("SELECT status FROM memories WHERE id = ?").get(targetId)).toEqual({
+            status: null,
+        });
+        expect(
+            database
+                .prepare(
+                    "SELECT project_path, status, superseded_by_memory_id AS by FROM memories WHERE id = ?",
+                )
+                .get(sourceId),
+        ).toEqual({ project_path: "dir:old", status: "active", by: null });
+        expect(
+            database
+                .prepare(
+                    `SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(`memory:${sourceId}:collision-merge:${targetId}`),
+        ).toEqual({ reason_code: "invalid-importance", disposition: "blocking" });
+    });
+
+    test("a collision merge keeps a shared source claim live for its alias sibling and retires a last-link claim", () => {
+        const database = makeDb();
+        const source = insertMemoryThroughKernel(database, {
+            projectPath: "dir:old",
+            category: "CONSTRAINTS",
+            content: "shared alias fact",
+        });
+        // Both identities resolve to the same numeric project, so the second
+        // insert takes the dedup branch and shares the source's claim.
+        database
+            .prepare(
+                `INSERT INTO project_aliases (alias_identity, project_id, created_at)
+                 SELECT 'dir:old-alias', project_id, 1 FROM project_aliases
+                  WHERE alias_identity = 'dir:old'`,
+            )
+            .run();
+        const sibling = insertMemoryThroughKernel(database, {
+            projectPath: "dir:old-alias",
+            category: "CONSTRAINTS",
+            content: "shared alias fact",
+        });
+        const sharedLink = readMemoryClaimLink(database, source.id);
+        expect(sharedLink?.claimId).toBe(readMemoryClaimLink(database, sibling.id)?.claimId ?? -1);
+        // A last-link source in the same merge: its claim has no live sibling.
+        const soleSource = insertMemoryThroughKernel(database, {
+            projectPath: "dir:old",
+            category: "CONSTRAINTS",
+            content: "sole claim fact",
+        });
+        const soleLink = readMemoryClaimLink(database, soleSource.id);
+        // Pre-linked collision targets carrying their own claims.
+        const sharedTarget = insertMemoryThroughKernel(database, {
+            projectPath: "git:new",
+            category: "CONSTRAINTS",
+            content: "shared alias fact",
+        });
+        const soleTarget = insertMemoryThroughKernel(database, {
+            projectPath: "git:new",
+            category: "CONSTRAINTS",
+            content: "sole claim fact",
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 90 });
+
+        // The sibling still asserts the shared claim: it stays live with no
+        // supersession edge and no lifecycle effect for the archived source.
+        const sharedTargetLink = readMemoryClaimLink(database, sharedTarget.id);
+        const soleTargetLink = readMemoryClaimLink(database, soleTarget.id);
+        if (!sharedLink || !soleLink || !sharedTargetLink || !soleTargetLink) {
+            throw new Error("expected claim links on both merge pairs");
+        }
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(sharedLink.claimId),
+        ).toEqual({ state: "active" });
+        expect(getCurrentMemoryClaimByLegacyMemoryId(database, sibling.id)?.state).toBe("active");
+        expect(memoryClaimSupersessionExists(database, sharedLink, sharedTargetLink)).toBe(false);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'lifecycle'`,
+                )
+                .get(`memory:${source.id}:lifecycle`),
+        ).toEqual({ count: 0 });
+        // The last-link claim still retires with supersession lineage.
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(soleLink.claimId),
+        ).toEqual({ state: "archived" });
+        expect(memoryClaimSupersessionExists(database, soleLink, soleTargetLink)).toBe(true);
+    });
+
+    test("a claim-invalid source's newer classification is skipped instead of aborting the merge", () => {
+        const database = makeDb();
+        const targetId = insertMemory(database, "git:new", "bogus scope fact", "bogus-h1");
+        const sourceId = insertMemory(database, "dir:old", "bogus scope fact", "bogus-h1");
+        // Schema-legal but claim-invalid: `memories` has no CHECK on scope,
+        // while the kernel's revision metadata does — promoting the raw value
+        // would abort the whole merge.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare("UPDATE memories SET scope = 'bogus', classified_at = 20 WHERE id = ?")
+                .run(sourceId);
+        });
+
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 60 });
+
+        // The merge completes; the promotion is skipped and the survivor
+        // keeps its own classification.
+        expect(
+            database
+                .prepare("SELECT status, superseded_by_memory_id AS by FROM memories WHERE id = ?")
+                .get(sourceId),
+        ).toEqual({ status: "archived", by: targetId });
+        expect(
+            database
+                .prepare("SELECT scope, classified_at FROM memories WHERE id = ?")
+                .get(targetId),
+        ).toEqual({ scope: "project", classified_at: null });
+        // The adoption pass recorded the blocking diagnostic for the
+        // unadoptable source.
+        expect(
+            database
+                .prepare(
+                    `SELECT reason_code, disposition FROM claim_backfill_failures WHERE item_key = ?`,
+                )
+                .get(String(sourceId)),
+        ).toEqual({ reason_code: "invalid-scope", disposition: "blocking" });
     });
 
     test("a claim-invalid unlinked row is diagnosed without rolling back the rest of the merge", () => {

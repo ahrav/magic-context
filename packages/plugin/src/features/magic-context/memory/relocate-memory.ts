@@ -362,14 +362,43 @@ function adoptRelocationMergeClaims(
                 );
             }
             if (sourceLink && sourceLink.claimId !== targetLink.claimId) {
-                retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, RELOCATION_PRODUCER);
+                // Shared-claim rule: the source claim holds the max-rank
+                // state across its surviving linked projections — the caller
+                // deletes this row after the merge, but a live alias sibling
+                // keeps the claim live, so retirement lands only with the
+                // last live link. The supersession recorder itself
+                // suppresses the lineage edge while a live sibling remains.
+                const desiredSourceState = sharedClaimStateFromLiveLinks(
+                    db,
+                    sourceLink.claimId,
+                    sourceId,
+                    "archived",
+                );
+                if (
+                    readCurrentClaimSemanticState(db, sourceLink.claimId).state !==
+                    desiredSourceState
+                ) {
+                    if (desiredSourceState === "archived") {
+                        retireMemoryClaimInCurrentTransaction(
+                            db,
+                            sourceLink.claimId,
+                            RELOCATION_PRODUCER,
+                        );
+                    } else {
+                        setClaimLifecycleStateInCurrentTransaction(
+                            db,
+                            sourceLink.claimId,
+                            desiredSourceState,
+                        );
+                    }
+                    effects.push({
+                        effectKey: `memory:${sourceId}:lifecycle`,
+                        projectId: sourceLink.projectId,
+                        claimId: sourceLink.claimId,
+                        effectType: "lifecycle" as const,
+                    });
+                }
                 recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink);
-                effects.push({
-                    effectKey: `memory:${sourceId}:lifecycle`,
-                    projectId: sourceLink.projectId,
-                    claimId: sourceLink.claimId,
-                    effectType: "lifecycle" as const,
-                });
             }
             return { result: targetLink.claimId, effects };
         },
@@ -826,6 +855,22 @@ function copyMemoriesToProjectInner(
         `INSERT OR IGNORE INTO memory_embeddings (memory_id, embedding, model_id)
          SELECT ?, embedding, model_id FROM memory_embeddings WHERE memory_id = ?`,
     );
+    // The copy gets a fresh id, so a bare INSERT cannot conflict. The rows
+    // must land before the claim adoption below: adoption derives the copied
+    // claim's verified event from the side table, and compat readers filter
+    // on these mappings. Callers migrating from external harness databases
+    // may lack the side table entirely, so the copy is probed like
+    // memory_stats.
+    const copyVerificationsStmt = db
+        .prepare(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_verifications'",
+        )
+        .get()
+        ? db.prepare(
+              `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+               SELECT ?, file_path, verified_at, mapped_at FROM memory_verifications WHERE memory_id = ?`,
+          )
+        : null;
     const copyStatsStmt = hasMemoryStatsTable(db)
         ? db.prepare(
               `UPDATE memory_stats
@@ -864,6 +909,7 @@ function copyMemoriesToProjectInner(
             const newId = Number(result.lastInsertRowid);
             copyEmbeddingStmt.run(newId, id);
             copyStatsStmt?.run(id, newId);
+            copyVerificationsStmt?.run(newId, id);
             // The copy is an authorized operation that creates a target
             // claim; the source row and its claim stay intact.
             if (targetProjectId !== null) {

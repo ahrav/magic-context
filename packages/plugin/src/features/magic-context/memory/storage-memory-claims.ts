@@ -1377,11 +1377,15 @@ export function createMemoryWithClaimsInCurrentTransaction(
         // Re-adding content whose canonical claim was archived by a delete
         // reactivates the claim alongside the fresh projection row. The
         // max-rank shared state (not a hardcoded 'active') keeps a permanent
-        // sibling's claim permanent.
-        const nextState = sharedClaimStateFromLiveLinks(db, link.claimId, memoryId, "active");
-        if (readCurrentClaimSemanticState(db, link.claimId).state !== nextState) {
-            setClaimLifecycleStateInCurrentTransaction(db, link.claimId, nextState);
-        }
+        // sibling's claim permanent; the sync emits the lifecycle effect for
+        // an actual state change.
+        const lifecycleEffects = syncClaimLifecycleAfterAdoption(
+            db,
+            row,
+            link,
+            projectId,
+            envelope.producer,
+        );
         const revisionId = readClaimCurrentRevisionId(db, link.claimId);
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -1394,6 +1398,7 @@ export function createMemoryWithClaimsInCurrentTransaction(
                     claimId: link.claimId,
                     effectType: "upsert" as const,
                 },
+                ...lifecycleEffects,
             ],
         };
     });
@@ -2644,6 +2649,29 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                 addVerificationEvent(db, {
                     revisionId: readClaimCurrentRevisionId(db, link.claimId),
                     outcome,
+                    verifier: envelope.producer,
+                });
+                effects.push({
+                    effectKey: `memory:${post.id}:evidence`,
+                    projectId,
+                    claimId: link.claimId,
+                    effectType: "evidence" as const,
+                });
+            } else if (
+                statusChanged &&
+                post.verification_status === "unverified" &&
+                pre &&
+                memoryRowHasPositiveVerification(db, pre)
+            ) {
+                // 'unverified' has no event outcome of its own, but a delta
+                // that withdraws a positive verification records 'stale'
+                // instead of silently losing the claim's verified standing —
+                // the module-path twin of the direct verification writer's
+                // withdrawal branch. The PRE row carries the positive state;
+                // the postimage already reads unverified.
+                addVerificationEvent(db, {
+                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                    outcome: "stale",
                     verifier: envelope.producer,
                 });
                 effects.push({

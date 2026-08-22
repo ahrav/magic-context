@@ -17,12 +17,15 @@ import {
     hasMemoryClaimsCompatSchema,
     type MemoryClaimEffect,
     memoryClaimAdoptionFailureReason,
+    readCurrentClaimSemanticState,
     readMemoryClaimLink,
     recordMemoryClaimLinkFailure,
     recordMemoryClaimSupersessionInCurrentTransaction,
     resolveMemoryClaimProjectInCurrentTransaction,
     retireMemoryClaimInCurrentTransaction,
     runMemoryClaimOperationInCurrentTransaction,
+    setClaimLifecycleStateInCurrentTransaction,
+    sharedClaimStateFromLiveLinks,
     translateMemoryClaimRelationshipsInCurrentTransaction,
     updateMemoryClassificationWithClaimsInCurrentTransaction,
     withClaimsWriteCapabilityInCurrentTransaction,
@@ -261,6 +264,16 @@ function adoptIdentityMergeRowClaims(
         recordSkippedCollisionMergeDiagnostic(db, sourceId, collisionTargetId, targetFailure);
         return false;
     }
+    // Adoption derives the canonical claim's lifecycle from the target row's
+    // status, and a NULL status derives archived. The survivor is live by
+    // contract, so the status normalizes to 'active' — after the adoption
+    // gate above, so a rejected target keeps its NULL status instead of
+    // being published active with its claim work skipped. The lifecycle
+    // sync below reads this snapshot, so it carries the normalized value.
+    db.prepare("UPDATE memories SET status = COALESCE(status, 'active') WHERE id = ?").run(
+        collisionTargetId,
+    );
+    targetRow.status = (readMemoryProjectionRow(db, collisionTargetId) ?? targetRow).status;
     runMemoryClaimOperationInCurrentTransaction(
         db,
         {
@@ -374,17 +387,46 @@ function adoptIdentityMergeRowClaims(
             }
             effects.push(...translateMemoryClaimRelationshipsInCurrentTransaction(db, sourceRow));
             if (sourceLink && sourceLink.claimId !== targetLink.claimId) {
-                // A colliding source with its own claim retires it with
-                // supersession lineage; two active claims must not survive for
-                // one surviving fact.
-                retireMemoryClaimInCurrentTransaction(db, sourceLink.claimId, "identity-merge");
+                // A colliding source with its own claim hands the surviving
+                // fact to the target claim with supersession lineage; two
+                // active claims must not survive for one surviving fact.
+                // Shared-claim rule: the source claim holds the max-rank
+                // state across its surviving linked projections — the caller
+                // archives this row below, but a live alias sibling keeps the
+                // claim live, so retirement lands only with the last live
+                // link. The supersession recorder itself suppresses the
+                // lineage edge while a live sibling remains.
+                const desiredSourceState = sharedClaimStateFromLiveLinks(
+                    db,
+                    sourceLink.claimId,
+                    sourceId,
+                    "archived",
+                );
+                if (
+                    readCurrentClaimSemanticState(db, sourceLink.claimId).state !==
+                    desiredSourceState
+                ) {
+                    if (desiredSourceState === "archived") {
+                        retireMemoryClaimInCurrentTransaction(
+                            db,
+                            sourceLink.claimId,
+                            "identity-merge",
+                        );
+                    } else {
+                        setClaimLifecycleStateInCurrentTransaction(
+                            db,
+                            sourceLink.claimId,
+                            desiredSourceState,
+                        );
+                    }
+                    effects.push({
+                        effectKey: `memory:${sourceId}:lifecycle`,
+                        projectId: sourceLink.projectId,
+                        claimId: sourceLink.claimId,
+                        effectType: "lifecycle" as const,
+                    });
+                }
                 recordMemoryClaimSupersessionInCurrentTransaction(db, sourceLink, targetLink);
-                effects.push({
-                    effectKey: `memory:${sourceId}:lifecycle`,
-                    projectId: sourceLink.projectId,
-                    claimId: sourceLink.claimId,
-                    effectType: "lifecycle" as const,
-                });
             }
             return { result: targetLink.claimId, effects };
         },
@@ -441,14 +483,6 @@ function mergeMemoryRow(
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
     if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
-        // Adoption derives the canonical claim's lifecycle from the target
-        // row's status, and a NULL status derives archived. The survivor is
-        // live by contract, so the status normalizes to 'active' before the
-        // adoption pass — activating it afterwards would flip the projection
-        // active while the claim stays archived, outside the kernel.
-        db.prepare("UPDATE memories SET status = COALESCE(status, 'active') WHERE id = ?").run(
-            targetId,
-        );
         // An unadoptable collision target cannot anchor the canonical claim,
         // so the merge is skipped for this row (fail-visible diagnostic,
         // source row preserved) before any stats or verification mutation.
@@ -472,25 +506,39 @@ function mergeMemoryRow(
                 // projection UPDATE would leave the survivor's claim stale.
                 // The kernel stamps classified_at from nowMs, so the survivor
                 // inherits the source's newer classification timestamp.
-                updateMemoryClassificationWithClaimsInCurrentTransaction(
-                    db,
-                    {
-                        producer: "identity-merge",
-                        operationKey: `merge-classification:${randomUUID()}`,
-                        requestDigest: computeClaimRequestDigest({
-                            sourceId,
-                            targetId,
-                            toIdentity,
-                        }),
-                    },
-                    {
-                        memoryId: targetId,
-                        importance: row.importance as number,
-                        scope: row.scope as string,
-                        shareable: row.shareable as number,
-                        nowMs: sourceClassifiedAt,
-                    },
-                );
+                // A claim-invalid source would push its raw metadata through
+                // the kernel's revision CHECKs and abort the whole merge, so
+                // the promotion only runs for an adoptable source; the
+                // adoption pass above already recorded the blocking
+                // diagnostic for a skipped one.
+                const sourceProjection = readMemoryProjectionRow(db, sourceId);
+                const sourceAdoptable =
+                    sourceProjection !== null &&
+                    memoryClaimAdoptionFailureReason(
+                        sourceProjection,
+                        resolveMemoryClaimProjectInCurrentTransaction(db, toIdentity),
+                    ) === null;
+                if (sourceAdoptable) {
+                    updateMemoryClassificationWithClaimsInCurrentTransaction(
+                        db,
+                        {
+                            producer: "identity-merge",
+                            operationKey: `merge-classification:${randomUUID()}`,
+                            requestDigest: computeClaimRequestDigest({
+                                sourceId,
+                                targetId,
+                                toIdentity,
+                            }),
+                        },
+                        {
+                            memoryId: targetId,
+                            importance: row.importance as number,
+                            scope: row.scope as string,
+                            shareable: row.shareable as number,
+                            nowMs: sourceClassifiedAt,
+                        },
+                    );
+                }
             } else {
                 db.prepare(
                     `UPDATE memories

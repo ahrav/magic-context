@@ -800,6 +800,72 @@ describe("relocate-memory claims (v84)", () => {
         ).toEqual([{ outcome: "verified", verifier: "memory-relocation" }]);
     });
 
+    test("a collision merge keeps a shared source claim live for its alias sibling and retires a last-link claim", () => {
+        const database = makeDb();
+        const moving = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "shared merge fact",
+        });
+        // Both identities resolve to the same numeric project, so the second
+        // insert takes the dedup branch and shares the moving row's claim.
+        database
+            .prepare(
+                `INSERT INTO project_aliases (alias_identity, project_id, created_at)
+                 SELECT 'git:alias-of-project-a', project_id, 1 FROM project_aliases
+                  WHERE alias_identity = 'git:project-a'`,
+            )
+            .run();
+        const sibling = insertMemory(database, {
+            projectPath: "git:alias-of-project-a",
+            category: "CONSTRAINTS",
+            content: "shared merge fact",
+        });
+        const sharedLink = readMemoryClaimLink(database, moving.id);
+        expect(sharedLink?.claimId).toBe(readMemoryClaimLink(database, sibling.id)?.claimId ?? -1);
+        // A last-link source in the same batch: its claim has no live sibling.
+        const sole = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "sole merge fact",
+        });
+        const soleLink = readMemoryClaimLink(database, sole.id);
+        // Pre-linked collision targets carrying their own claims.
+        const sharedTarget = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "shared merge fact",
+        });
+        const soleTarget = insertMemory(database, {
+            projectPath: "git:project-b",
+            category: "CONSTRAINTS",
+            content: "sole merge fact",
+        });
+
+        const result = inTransaction(database, () =>
+            moveMemoriesToProject(database, [moving.id, sole.id], "git:project-a", "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 0, merged: 2, skipped: 0 });
+        const sharedTargetLink = readMemoryClaimLink(database, sharedTarget.id);
+        const soleTargetLink = readMemoryClaimLink(database, soleTarget.id);
+        if (!sharedLink || !soleLink || !sharedTargetLink || !soleTargetLink) {
+            throw new Error("expected claim links on both merge pairs");
+        }
+        // The sibling still asserts the shared claim: the deleted source's
+        // merge leaves it live and records no supersession edge.
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(sharedLink.claimId),
+        ).toEqual({ state: "active" });
+        expect(getCurrentMemoryClaimByLegacyMemoryId(database, sibling.id)?.state).toBe("active");
+        expect(memoryClaimSupersessionExists(database, sharedLink, sharedTargetLink)).toBe(false);
+        // The last-link claim still retires with supersession lineage.
+        expect(
+            database.prepare("SELECT state FROM claims WHERE id = ?").get(soleLink.claimId),
+        ).toEqual({ state: "archived" });
+        expect(memoryClaimSupersessionExists(database, soleLink, soleTargetLink)).toBe(true);
+    });
+
     test("copying creates a target claim for each fresh row and leaves the source intact", () => {
         const database = makeDb();
         const source = insertMemory(database, {
@@ -974,6 +1040,62 @@ describe("relocate-memory claims (v84)", () => {
                 )
                 .all(copiedClaim?.claimId ?? 0),
         ).toEqual([{ outcome: "verified", verifier: "memory-relocation" }]);
+    });
+
+    test("copying a side-table-verified memory carries the mappings and records verified evidence on the target claim", () => {
+        const database = makeDb();
+        const source = insertMemory(database, {
+            projectPath: "git:project-a",
+            category: "CONSTRAINTS",
+            content: "side verified copy fact",
+        });
+        // Pre-v84 TypeScript verification: positive verified_at lives only in
+        // memory_verifications; the projection columns stay unverified.
+        runInMemoryClaimsWriteTransaction(database, () => {
+            database
+                .prepare(
+                    `INSERT INTO memory_verifications (memory_id, file_path, verified_at, mapped_at)
+                     VALUES (?, 'src/compat.ts', 123, 100)`,
+                )
+                .run(source.id);
+        });
+
+        const result = inTransaction(database, () =>
+            copyMemoriesToProject(database, [source.id], "git:project-b"),
+        );
+
+        expect(result).toEqual({ relocated: 1, merged: 0, skipped: 0 });
+        const copied = database
+            .prepare("SELECT id FROM memories WHERE project_path = 'git:project-b'")
+            .get() as { id: number };
+        // The copy carries the side-table mappings, so compat readers see the
+        // copied row as mapped and verified.
+        expect(
+            database
+                .prepare(
+                    "SELECT file_path, verified_at, mapped_at FROM memory_verifications WHERE memory_id = ?",
+                )
+                .all(copied.id),
+        ).toEqual([{ file_path: "src/compat.ts", verified_at: 123, mapped_at: 100 }]);
+        // The adoption read the copied rows, so the copied claim carries the
+        // verified event and its evidence effect.
+        const copiedClaim = getCurrentMemoryClaimByLegacyMemoryId(database, copied.id);
+        expect(
+            database
+                .prepare(
+                    `SELECT outcome, verifier FROM verification_events
+                      WHERE revision_id IN (SELECT id FROM claim_revisions WHERE claim_id = ?)`,
+                )
+                .all(copiedClaim?.claimId ?? 0),
+        ).toEqual([{ outcome: "verified", verifier: "memory-relocation" }]);
+        expect(
+            database
+                .prepare(
+                    `SELECT COUNT(*) AS count FROM claim_change_outbox
+                      WHERE effect_key = ? AND effect_type = 'evidence'`,
+                )
+                .get(`memory:${copied.id}:evidence`),
+        ).toEqual({ count: 1 });
     });
 
     test("a pre-v84 database keeps the plain rekey behavior", () => {

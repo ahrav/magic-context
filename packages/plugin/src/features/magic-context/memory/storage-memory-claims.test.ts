@@ -793,6 +793,35 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         });
     });
 
+    test("re-adding deleted content emits a lifecycle effect for the reactivation", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "readd-effect-seed", "readd effect fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            deleteMemoryWithClaimsInCurrentTransaction(
+                db,
+                envelope("readd-effect-delete", { id: seeded.memoryId }),
+                { memoryId: seeded.memoryId },
+            ),
+        );
+
+        const readded = createSeedMemory(db, "readd-effect-create", "readd effect fact");
+
+        // The reactivation is a claim state change, so the create operation
+        // owes the outbox a lifecycle effect alongside its upsert.
+        expect(readded.claimId).toBe(seeded.claimId);
+        expect(db.prepare("SELECT state FROM claims WHERE id = ?").get(seeded.claimId)).toEqual({
+            state: "active",
+        });
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'lifecycle' AND effect_key = 'memory:${readded.memoryId}:lifecycle'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'readd-effect-create')`,
+            ),
+        ).toBe(1);
+    });
+
     test("deleting one projection of a shared canonical claim retires the claim only with its last live link", () => {
         const db = track(migratedDb());
         const survivor = createSeedMemory(db, "shared-dup", "shared claim fact");
@@ -1329,6 +1358,71 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
                 `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'`,
             ),
         ).toBe(2);
+    });
+
+    test("a module delta withdrawing a verified status records a stale event; a never-verified no-op records nothing", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "unverify-seed", "unverify fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("unverify-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET verification_status = 'verified', verified_at = 5000 WHERE id = ?",
+                        ).run(seeded.memoryId);
+                    },
+                },
+            ),
+        );
+        expect(count(db, "verification_events", "outcome = 'verified'")).toBe(1);
+
+        // verified → unverified withdraws positive evidence: one stale event
+        // on the current revision plus a matching evidence effect.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("unverify-2", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    applyProjection: () => {
+                        db.prepare(
+                            "UPDATE memories SET verification_status = 'unverified' WHERE id = ?",
+                        ).run(seeded.memoryId);
+                    },
+                },
+            ),
+        );
+        expect(count(db, "verification_events", "outcome = 'stale'")).toBe(1);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'
+                 AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = 'unverify-2')`,
+            ),
+        ).toBe(1);
+
+        // A no-op delta on a never-verified row transitions nothing: no
+        // event, no evidence effect.
+        const fresh = createSeedMemory(db, "unverify-fresh", "never verified fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
+                db,
+                envelope("unverify-noop", { id: fresh.memoryId }),
+                { memoryId: fresh.memoryId, applyProjection: () => {} },
+            ),
+        );
+        expect(count(db, "verification_events", "outcome = 'stale'")).toBe(1);
+        expect(
+            count(
+                db,
+                "claim_change_outbox",
+                `effect_type = 'evidence' AND effect_key = 'memory:${fresh.memoryId}:evidence'`,
+            ),
+        ).toBe(0);
     });
 
     test("a first module delta on an unlinked side-table-verified row with unchanged state records one verified event with evidence", () => {
