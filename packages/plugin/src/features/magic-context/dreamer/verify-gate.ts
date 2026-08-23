@@ -10,7 +10,7 @@ import {
     resolveGitTopLevel,
     verificationFileExists,
 } from "../memory";
-import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
+import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
 import { runLeaseGuardedWrite } from "./lease";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
 import type { VerifyPromptMemory } from "./verify-prompt";
@@ -103,15 +103,14 @@ export async function partitionVerifyScope(args: {
     leaseKey?: string;
 }): Promise<VerifyGateResult> {
     const runStartedAt = args.now ?? Date.now();
-    // Verification is the ladder step that PRODUCES the VERIFIED rung, so its
-    // pool keeps candidate/stale/disputed rows and excludes only the
-    // uniform-absence class (hard-hidden and rejected): those must not reach
-    // any agent surface, child-model prompts included.
-    const active = filterMemoriesByPolicy(
+    // Verification is the lane that OWNS stale/disputed outcomes and heals
+    // them, so its pool keeps those rows and candidates; the uniform-absence
+    // class and superseded rows never reach the child-model prompt.
+    const active = filterMemoriesForMaintenance(
         args.db,
         getMemoriesByProject(args.db, args.projectIdentity),
-        "explicit_search",
-    ).memories;
+        "verification",
+    );
     const verById = getMemoryVerifications(
         args.db,
         active.map((m) => m.id),

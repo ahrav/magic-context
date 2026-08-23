@@ -21,7 +21,7 @@ import {
     type Memory,
     setMemoryClassification,
 } from "../memory";
-import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
+import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
 import { recordChildInvocation } from "../subagent-token-capture";
 import {
     buildClassifyPrompt,
@@ -153,15 +153,15 @@ function isModuleRoute(args: ClassifyArgs): boolean {
  * the exact value checked by memory.set_classification.
  */
 function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
-    // Classification is maintenance that candidate rows need to become
-    // injectable later, so the pool keeps them and excludes only the
-    // uniform-absence class (hard-hidden and rejected): those must not reach
-    // any agent surface, child-model prompts included.
-    const active = filterMemoriesByPolicy(
+    // Classification is hygiene maintenance with no healing authority over
+    // dispositions: candidates stay (they need classification to climb the
+    // ladder later), while soft-hidden and uniform-absence rows never reach
+    // the child-model prompt.
+    const active = filterMemoriesForMaintenance(
         args.db,
         getMemoriesByProject(args.db, args.projectIdentity),
-        "explicit_search",
-    ).memories;
+        "hygiene",
+    );
     if (!isModuleRoute(args) || active.length === 0) {
         return active.map((memory) => ({
             contextMemory: memory,

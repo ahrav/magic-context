@@ -24,7 +24,7 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
-import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
+import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
 import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
@@ -182,15 +182,15 @@ function loadActiveMemoryPromptMemories(
     db: Database,
     projectIdentity: string,
 ): CuratePromptMemory[] {
-    // Curation is pool hygiene over mostly-candidate rows, so the pool keeps
-    // them and excludes only the uniform-absence class (hard-hidden and
-    // rejected): those must not reach any agent surface, child-model prompts
-    // included — and the ctx_memory gate refuses them as mutation targets.
-    const memories = filterMemoriesByPolicy(
+    // Curation is hygiene maintenance with no healing authority over
+    // dispositions: candidates stay in the pool, while soft-hidden and
+    // uniform-absence rows never reach the child-model prompt — and the
+    // ctx_memory gate refuses hidden rows as mutation targets.
+    const memories = filterMemoriesForMaintenance(
         db,
         getMemoriesByProject(db, projectIdentity),
-        "explicit_search",
-    ).memories;
+        "hygiene",
+    );
     const verificationById = getMemoryVerifications(
         db,
         memories.map((memory) => memory.id),

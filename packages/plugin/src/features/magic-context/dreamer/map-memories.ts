@@ -20,7 +20,7 @@ import {
     normalizeVerificationFiles,
     recordMemoryMapping,
 } from "../memory";
-import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
+import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
@@ -125,15 +125,15 @@ export function selectMapMemoryInputs(
     projectIdentity: string,
     repoDir: string,
 ): MapMemoryInput[] {
-    // Mapping feeds verification — the ladder step candidate rows need to
-    // become injectable — so the pool keeps them and excludes only the
-    // uniform-absence class (hard-hidden and rejected): those must not reach
-    // any agent surface, child-model prompts included.
-    const active = filterMemoriesByPolicy(
+    // Mapping feeds verification, which owns and heals stale/disputed
+    // outcomes, so those rows and candidates stay in the pool; the
+    // uniform-absence class and superseded rows never reach the child-model
+    // prompt.
+    const active = filterMemoriesForMaintenance(
         db,
         getMemoriesByProject(db, projectIdentity),
-        "explicit_search",
-    ).memories;
+        "verification",
+    );
     const activeIds = active.map((m) => m.id);
     const unmapped = new Set(getUnmappedMemoryIds(db, activeIds));
     const verifications = getMemoryVerifications(db, activeIds);

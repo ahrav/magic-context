@@ -13,6 +13,7 @@ import {
 import {
     decideMemoryPolicy,
     filterMemoriesByPolicy,
+    filterMemoriesForMaintenance,
     readMemoryPolicyRows,
 } from "./storage-claim-visibility";
 import { sha256Utf8Hex } from "./storage-claims";
@@ -309,6 +310,30 @@ describe("claim policy surface enforcement", () => {
             ).not.toContain(source.memoryId);
             const explicit = filterMemoriesByPolicy(db, memories, "explicit_search");
             expect(explicit.labels.get(source.memoryId)).toContain("superseded");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("maintenance lanes keep only the rows they can heal", () => {
+        const db = migratedDb();
+        try {
+            const clean = seedMemory(db, "maint-clean", "clean candidate row");
+            const staleSeed = seedMemory(db, "maint-stale", "stale row to re-verify");
+            const hidden = seedMemory(db, "maint-hidden", "quarantined row");
+            verify(db, staleSeed.memoryId);
+            db.prepare(
+                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'v', 9_000)",
+            ).run(staleSeed.revisionId);
+            quarantine(db, hidden.revisionId, hidden.projectId);
+            const memories = getMemoriesByProject(db, PROJECT);
+            const idsFor = (lane: "verification" | "hygiene") =>
+                filterMemoriesForMaintenance(db, memories, lane).map((m) => m.id);
+            // Verification owns and heals stale outcomes; hygiene does not.
+            expect(idsFor("verification").sort()).toEqual(
+                [clean.memoryId, staleSeed.memoryId].sort(),
+            );
+            expect(idsFor("hygiene")).toEqual([clean.memoryId]);
         } finally {
             closeQuietly(db);
         }

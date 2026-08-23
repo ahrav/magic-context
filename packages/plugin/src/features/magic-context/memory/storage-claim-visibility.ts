@@ -265,6 +265,35 @@ export function decideMemoryPolicy(
 }
 
 /**
+ * Maintenance pools keep the rows their lane can heal and exclude everything
+ * else the policy hides from automatic prompts. The verification lane owns
+ * the stale/disputed facts (they are its own outcomes) and must observe
+ * those rows to heal them; the hygiene lane (classify/curate) has no healing
+ * authority and excludes every soft-hidden row. Both always exclude the
+ * uniform-absence class (hard-hidden, rejected) and superseded rows, which
+ * no maintenance lane may resurrect. Unlinked rows pass: nothing hides them.
+ */
+export function filterMemoriesForMaintenance(
+    db: Database,
+    memories: readonly Memory[],
+    lane: "verification" | "hygiene",
+): Memory[] {
+    if (!hasClaimEffectivePolicy(db)) return [...memories];
+    const rows = readMemoryPolicyRows(
+        db,
+        memories.map((memory) => memory.id),
+    );
+    return memories.filter((memory) => {
+        const row = rows.get(memory.id);
+        if (row == null) return true;
+        if (row.hardHidden || row.contradicted || row.quarantined || row.rejected) return false;
+        if (row.superseded) return false;
+        if (lane === "hygiene" && (row.stale || row.disputed)) return false;
+        return true;
+    });
+}
+
+/**
  * True when the memory's content may leave the process for embedding.
  * Content in the uniform-absence class (hard-hidden / rejected) is barred
  * from every agent surface and must not be sent verbatim to a remote
