@@ -474,6 +474,11 @@ export function seedFixture(release: SeedReleaseInput, options: SeedFixtureOptio
                 category: "ARCHITECTURE_DECISIONS",
                 content: documentText(plan.document.semanticPayload),
                 nowMs: SEED_EPOCH_MS + Number(plan.alias.locator),
+                // The benchmark measures retrieval quality over eligible
+                // rows, not the trust ladder: the default historian origin
+                // is CANDIDATE under the claim trust policy and invisible
+                // to the automatic lane.
+                sourceType: "user",
             });
             verifyEmittedId(plan, memory.id);
             const vector = documentVector(plan.document);
@@ -740,6 +745,9 @@ function seedSyntheticStream(
                     category: "ARCHITECTURE_DECISIONS",
                     content: documentText(document),
                     nowMs: SEED_EPOCH_MS,
+                    // Eligible under the claim trust policy; see the memory
+                    // seeding loop above.
+                    sourceType: "user",
                 });
                 saveEmbedding(
                     db,
