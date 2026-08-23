@@ -379,6 +379,7 @@ fn base_manifest(cfg: &CollectConfig, pair: Option<(u32, u32)>) -> Manifest {
         skip_reason: None,
         fail_reason: None,
         sidecars: Vec::new(),
+        collection: None,
         results: None,
     }
 }
@@ -537,6 +538,11 @@ fn collect_atomic(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String>
     let median = evidence::median(&mut means).unwrap_or(0.0);
     let manifest = attempt.manifest_mut();
     manifest.histogram = Some(hist_cfg);
+    manifest.collection = Some(serde_json::json!({
+        "warmup_batches": cfg.warmup_batches,
+        "batches": cfg.batches,
+        "exchanges_per_batch": cfg.exchanges_per_batch,
+    }));
     manifest.recorded_samples = Some(output.batch_mean_rtt_ns.len() as u64 - rejected);
     manifest.histogram_rejected = Some(rejected);
     manifest.affinity = Some(serde_json::json!({
@@ -580,12 +586,22 @@ fn check_host_alive(host: &mut ChildHost) -> Result<(), String> {
 /// returning wrong bodies, protocol errors, or unexpected frames
 /// satisfies conservation, and publishing the successful subset would
 /// select latency from only the requests the host answered correctly.
+/// A histogram overflow is a valid measured terminal excluded from every
+/// percentile, so retaining the attempt would survivorship-bias the
+/// tails toward the faster subset; it fails the attempt the same way.
 fn check_correctness(outcomes: &perf_measurement::OutcomeCounts) -> Result<(), String> {
     let correctness_failures =
         outcomes.protocol_error + outcomes.body_mismatch + outcomes.unexpected_frame;
     if correctness_failures > 0 {
         return Err(format!(
             "{correctness_failures} correctness violation(s) in measured outcomes: {outcomes:?}"
+        ));
+    }
+    if outcomes.histogram_overflow > 0 {
+        return Err(format!(
+            "{} measured terminal(s) exceeded the histogram range and would be silently \
+             excluded from every percentile: {outcomes:?}",
+            outcomes.histogram_overflow
         ));
     }
     Ok(())
@@ -616,7 +632,10 @@ fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Str
     let result =
         tcp::run_serial(host.publication(), &cfg).map_err(|err| format!("serial arm: {err}"))?;
     if result.scheduled != cfg.measured_ops
-        || result.outcomes.peer_closed + result.outcomes.write_failure > 0
+        || result.outcomes.peer_closed
+            + result.outcomes.write_failure
+            + result.outcomes.unresolved_at_drain
+            > 0
     {
         return Err(format!(
             "serial window truncated: {} of {} measured operations scheduled on a connection \
@@ -629,6 +648,10 @@ fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Str
     let hist = &result.histogram;
     let manifest = attempt.manifest_mut();
     manifest.histogram = Some(cfg.histogram.clone());
+    manifest.collection = Some(serde_json::json!({
+        "warmup_ops": cfg.warmup_ops,
+        "measured_ops": cfg.measured_ops,
+    }));
     manifest.outcomes = Some(result.outcomes.clone());
     manifest.recorded_samples = Some(hist.len());
     manifest.histogram_rejected = Some(result.outcomes.histogram_overflow);
@@ -684,6 +707,12 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
     }
     let manifest = attempt.manifest_mut();
     manifest.histogram = Some(cfg.histogram.clone());
+    manifest.collection = Some(serde_json::json!({
+        "rate_per_sec": rate,
+        "warmup_secs": cfg.warmup.as_secs(),
+        "measure_secs": cfg.measure.as_secs(),
+        "inflight_cap": cfg.inflight_cap,
+    }));
     manifest.outcomes = Some(result.outcomes.clone());
     manifest.recorded_samples = Some(result.sched_to_completion.len());
     manifest.histogram_rejected = Some(result.outcomes.histogram_overflow);
@@ -726,6 +755,11 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
     check_host_alive(&mut host)?;
     check_correctness(&result.outcomes)?;
     let manifest = attempt.manifest_mut();
+    manifest.collection = Some(serde_json::json!({
+        "depth": cfg.depth,
+        "warmup_secs": cfg.warmup.as_secs(),
+        "measure_secs": cfg.measure.as_secs(),
+    }));
     manifest.outcomes = Some(result.outcomes.clone());
     manifest.recorded_samples = Some(result.successful);
     manifest.results = Some(serde_json::json!({
@@ -840,17 +874,37 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
     }
 
     let mut arms_summary = serde_json::Map::new();
-    let mut arm_ids: Vec<ArmId> = Vec::new();
+    // Groups are (arm, collection configuration): one ArmId can cover
+    // several operating points (the open-loop arm runs one attempt per
+    // offered rate), and pooling their histograms would merge different
+    // workloads into one distribution.
+    type Group = (ArmId, Option<serde_json::Value>);
+    let mut groups: Vec<Group> = Vec::new();
     for attempt in &attempts {
-        if attempt.manifest.state == State::Complete && !arm_ids.contains(&attempt.manifest.arm) {
-            arm_ids.push(attempt.manifest.arm.clone());
+        let group = (
+            attempt.manifest.arm.clone(),
+            attempt.manifest.collection.clone(),
+        );
+        if attempt.manifest.state == State::Complete && !groups.contains(&group) {
+            groups.push(group);
         }
     }
-    arm_ids.sort_by(|a, b| (&a.name, a.pair).cmp(&(&b.name, b.pair)));
-    for arm in &arm_ids {
-        let complete: Vec<&evidence::LoadedAttempt> = attempts
+    groups.sort_by(|a, b| {
+        (&a.0.name, a.0.pair, a.1.as_ref().map(ToString::to_string)).cmp(&(
+            &b.0.name,
+            b.0.pair,
+            b.1.as_ref().map(ToString::to_string),
+        ))
+    });
+    for (arm, collection) in &groups {
+        let group_attempts: Vec<evidence::LoadedAttempt> = attempts
             .iter()
-            .filter(|a| a.manifest.state == State::Complete && a.manifest.arm == *arm)
+            .filter(|a| a.manifest.arm == *arm && a.manifest.collection == *collection)
+            .cloned()
+            .collect();
+        let complete: Vec<&evidence::LoadedAttempt> = group_attempts
+            .iter()
+            .filter(|a| a.manifest.state == State::Complete)
             .collect();
         let mut entry = serde_json::Map::new();
         entry.insert("attempts".to_owned(), serde_json::json!(complete.len()));
@@ -859,13 +913,14 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             serde_json::json!(arm.class.clone().unwrap_or_default()),
         );
         entry.insert("pair".to_owned(), serde_json::json!(arm.pair));
+        entry.insert("collection".to_owned(), serde_json::json!(collection));
         let hist_file = match arm.name.as_str() {
             ARM_ATOMIC => Some("batch_mean_rtt.hist"),
             ARM_TCP_SERIAL => Some("issue_to_terminal.hist"),
             _ => None,
         };
         if let Some(file) = hist_file {
-            let merged = evidence::merge_arm_histograms(&attempts, arm, file)?;
+            let merged = evidence::merge_arm_histograms(&group_attempts, arm, file)?;
             let total: u64 = merged.len();
             let headline_ok = complete.iter().all(|a| {
                 a.manifest.recorded_samples.unwrap_or(0) >= perf_measurement::HEADLINE_TAIL_FLOOR
@@ -896,7 +951,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             })
             .collect();
         entry.insert("blocks".to_owned(), serde_json::Value::Array(per_block));
-        let key = match arm.pair {
+        let mut key = match arm.pair {
             Some((a, b)) => format!(
                 "{}@{}-{},{}",
                 arm.name,
@@ -906,6 +961,11 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             ),
             None => arm.name.clone(),
         };
+        // Operating points of one arm stay distinct in the summary; the
+        // rate suffix matches the plan preview's `arm@class:rN` shape.
+        if let Some(rate) = collection.as_ref().and_then(|c| c["rate_per_sec"].as_u64()) {
+            key.push_str(&format!(":r{rate}"));
+        }
         arms_summary.insert(key, serde_json::Value::Object(entry));
     }
 

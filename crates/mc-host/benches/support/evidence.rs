@@ -122,6 +122,14 @@ pub struct Manifest {
     pub skip_reason: Option<String>,
     pub fail_reason: Option<String>,
     pub sidecars: Vec<Sidecar>,
+    /// Workload-shaping knobs of the collection (warmup and measured
+    /// counts, rates, caps, depths). Merges and pairings require this to
+    /// be uniform per arm: pooling repetitions collected under different
+    /// configurations would combine non-comparable experiments even when
+    /// build, host, and fixture bytes all match. Absent in manifests
+    /// written before the field existed.
+    #[serde(default)]
+    pub collection: Option<serde_json::Value>,
     /// Arm-specific scalar summaries, written only after sidecars exist.
     pub results: Option<serde_json::Value>,
 }
@@ -319,13 +327,39 @@ pub fn verify_sidecars(attempt: &LoadedAttempt) -> Result<(), String> {
 }
 
 /// True when two complete manifests may enter one aggregate: same schema,
-/// workload, build, and host.
+/// workload, build, host, and collection configuration.
 pub fn compatible(a: &Manifest, b: &Manifest) -> bool {
-    a.schema == b.schema && a.workload == b.workload && a.build == b.build && a.host == b.host
+    a.schema == b.schema
+        && a.workload == b.workload
+        && a.build == b.build
+        && a.host == b.host
+        && a.collection == b.collection
+}
+
+/// Errors unless `file` is declared exactly once in the manifest's
+/// checksummed sidecar list. Reading an undeclared file would bypass
+/// verification entirely: `verify_sidecars` checks only declared entries,
+/// so an edited manifest that drops a declaration could pair an altered
+/// file with an altered scalar and still verify.
+pub fn require_declared(attempt: &LoadedAttempt, file: &str) -> Result<(), String> {
+    match attempt
+        .manifest
+        .sidecars
+        .iter()
+        .filter(|s| s.file == file)
+        .count()
+    {
+        1 => Ok(()),
+        n => Err(format!(
+            "{}: sidecar {file} declared {n} times in the manifest (expected exactly 1)",
+            attempt.dir.display()
+        )),
+    }
 }
 
 /// Deserializes a histogram sidecar back into memory.
 pub fn read_histogram(attempt: &LoadedAttempt, file: &str) -> Result<Histogram<u64>, String> {
+    require_declared(attempt, file)?;
     let path = attempt.dir.join(file);
     let bytes = std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
     Deserializer::new()
@@ -425,6 +459,7 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
                 // so an edited or corrupted scalar could otherwise steer
                 // gap statistics while every checksum still verifies.
                 verify_sidecars(attempt)?;
+                require_declared(attempt, "batches.json")?;
                 let raw = std::fs::read(attempt.dir.join("batches.json"))
                     .map_err(|err| format!("{}: batches.json: {err}", attempt.dir.display()))?;
                 let parsed: serde_json::Value = serde_json::from_slice(&raw)

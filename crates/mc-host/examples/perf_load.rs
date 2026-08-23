@@ -709,4 +709,17 @@ async fn main() {
         );
         std::process::exit(1);
     }
+    // A connection retired before the requested window, or transport
+    // failures resolving in-flight requests, conserve a shortened prefix
+    // that looks healthy in the outcome table; the retained results
+    // would silently describe a partial window.
+    let transport_failures =
+        outcomes.peer_closed + outcomes.write_failure + outcomes.unresolved_at_drain;
+    if closed > 0 || transport_failures > 0 {
+        eprintln!(
+            "{closed} connection(s) retired before the requested window \
+             ({transport_failures} transport-failure outcome(s)): aborting with failure status"
+        );
+        std::process::exit(1);
+    }
 }

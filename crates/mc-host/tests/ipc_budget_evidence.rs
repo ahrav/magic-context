@@ -59,6 +59,7 @@ fn manifest(arm: &str, block: u32, pair: Option<(u32, u32)>) -> Manifest {
         skip_reason: None,
         fail_reason: None,
         sidecars: Vec::new(),
+        collection: None,
         results: None,
     }
 }

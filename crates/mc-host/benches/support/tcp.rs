@@ -235,8 +235,28 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
             }
             return finish_serial(hist, outcomes, measured_scheduled, window_start);
         }
+        // Each response wait is bounded: a live host that stops
+        // responding would otherwise hang the arm before its liveness
+        // and truncation checks can run. Expiry abandons the connection
+        // outright, so the cancelled read_exact cannot desync later
+        // reads — there are none.
+        let response_deadline = Instant::now() + DRAIN_BUDGET;
         loop {
-            if stream.read_exact(&mut header).await.is_err() {
+            let remaining = response_deadline.saturating_duration_since(Instant::now());
+            let header_read = if remaining.is_zero() {
+                None
+            } else {
+                tokio::time::timeout(remaining, stream.read_exact(&mut header))
+                    .await
+                    .ok()
+            };
+            let Some(header_read) = header_read else {
+                if measured {
+                    outcomes.record(Outcome::UnresolvedAtDrain);
+                }
+                return finish_serial(hist, outcomes, measured_scheduled, window_start);
+            };
+            if header_read.is_err() {
                 if measured {
                     outcomes.record(Outcome::PeerClosed);
                 }
@@ -253,7 +273,25 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 return finish_serial(hist, outcomes, measured_scheduled, window_start);
             }
             body.resize(decoded.len as usize, 0);
-            if decoded.len > 0 && stream.read_exact(&mut body).await.is_err() {
+            let remaining = response_deadline.saturating_duration_since(Instant::now());
+            let body_read = if decoded.len == 0 {
+                Some(Ok(()))
+            } else if remaining.is_zero() {
+                None
+            } else {
+                tokio::time::timeout(remaining, async {
+                    stream.read_exact(&mut body).await.map(|_| ())
+                })
+                .await
+                .ok()
+            };
+            let Some(body_read) = body_read else {
+                if measured {
+                    outcomes.record(Outcome::UnresolvedAtDrain);
+                }
+                return finish_serial(hist, outcomes, measured_scheduled, window_start);
+            };
+            if body_read.is_err() {
                 if measured {
                     outcomes.record(Outcome::PeerClosed);
                 }
