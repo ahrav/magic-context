@@ -3,6 +3,7 @@ import type { Database } from "../../../shared/sqlite";
 import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { computeNormalizedHash } from "./normalize-hash";
+import { memoriesEligibleForEmbedding } from "./storage-claim-visibility";
 import {
     getMemoryByHash,
     getMemoryById,
@@ -106,6 +107,11 @@ async function embedAndStoreMemory(
     content: string,
 ): Promise<void> {
     try {
+        // Hard-hidden / rejected content never leaves the process, remote
+        // embedding providers included.
+        if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
+            return;
+        }
         // Capture the row's content hash BEFORE the async provider call: the
         // vector it returns is only valid for the content stored right now. If
         // the memory is edited while the call is in flight, the row's

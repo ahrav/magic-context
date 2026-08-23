@@ -264,6 +264,25 @@ export function decideMemoryPolicy(
     return { eligible: true, label: null };
 }
 
+/**
+ * True when the memory's content may leave the process for embedding.
+ * Content in the uniform-absence class (hard-hidden / rejected) is barred
+ * from every agent surface and must not be sent verbatim to a remote
+ * embedding provider either. Candidate and soft-hidden rows keep their
+ * embeddings because labeled explicit search legitimately serves them.
+ */
+export function memoriesEligibleForEmbedding(
+    db: Database,
+    memoryIds: readonly number[],
+): Set<number> {
+    const rows = readMemoryPolicyRows(db, memoryIds);
+    const eligible = new Set<number>();
+    for (const id of memoryIds) {
+        if (decideMemoryPolicy(rows.get(id), "explicit_search").eligible) eligible.add(id);
+    }
+    return eligible;
+}
+
 export interface MemoryPolicyFilterResult {
     memories: Memory[];
     /** Sanitized labels keyed by memory id, for labeled explicit rendering. */

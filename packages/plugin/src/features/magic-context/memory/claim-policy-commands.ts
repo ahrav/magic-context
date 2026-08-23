@@ -454,6 +454,16 @@ export async function executeClaimEnforceCommand(
         kind = value;
         parts.splice(kindFlagIndex, 2);
     }
+    // The default evaluator only knows `test`; without a host-supplied
+    // evaluator, a policy/config confirmation would walk the two-step flow
+    // and then always fail. Refuse up front instead of advertising a mode
+    // that cannot succeed.
+    if (kind !== "test" && !deps.evaluateArtifact) {
+        return {
+            text: `## Claim Enforcement — Unavailable\n\nArtifact kind '${kind}' has no evaluator on this host; only 'test' artifacts are supported.`,
+            level: "error",
+        };
+    }
     const [idText, artifactInput] = parts;
     const memoryId = Number(idText);
     if (!Number.isSafeInteger(memoryId) || memoryId <= 0 || !artifactInput) {

@@ -113,6 +113,31 @@ export function clearInjectionCache(sessionId: string): void {
     resetDegradedReanchorState(sessionId);
 }
 
+/**
+ * A cached memory block replays only while every rendered id is still
+ * automatic-eligible: policy transitions must not replay hidden content from
+ * the process-local injection cache or the session_meta snapshot. Reads the
+ * ids the render recorded in `session_meta.memory_block_ids`.
+ */
+function sessionMemoryBlockStillEligible(db: Database, sessionId: string): boolean {
+    if (!hasClaimEffectivePolicy(db)) return true;
+    const row = db
+        .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
+        .get(sessionId) as { memory_block_ids: string | null } | null;
+    let ids: number[] = [];
+    try {
+        const parsed = JSON.parse(row?.memory_block_ids ?? "[]") as unknown;
+        ids = Array.isArray(parsed)
+            ? parsed.filter((id): id is number => typeof id === "number")
+            : [];
+    } catch {
+        return false;
+    }
+    if (ids.length === 0) return true;
+    const rows = readMemoryPolicyRows(db, ids);
+    return ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible);
+}
+
 // ── Degraded-mode re-anchor (#263/#264) ─────────────────────────
 //
 // When the compartment boundary message is not in the visible window, the
@@ -339,11 +364,25 @@ export function prepareCompartmentInjection(
     }
     const usableCached = cached?.db === db ? cached : undefined;
 
-    if (!isCacheBusting && usableCached) {
-        if (usableCached.kind === "empty") {
+    // The fast path replays a prepared block without touching the database
+    // caches below, so it needs its own policy revalidation: an epoch bump
+    // does not clear this process-local map.
+    if (
+        !isCacheBusting &&
+        usableCached?.kind === "populated" &&
+        usableCached.injection.memoryCount > 0 &&
+        !sessionMemoryBlockStillEligible(db, sessionId)
+    ) {
+        clearInjectionCache(sessionId);
+    }
+    const revalidatedCached = injectionCache.get(sessionId);
+    const replayableCached = revalidatedCached?.db === db ? revalidatedCached : undefined;
+
+    if (!isCacheBusting && replayableCached) {
+        if (replayableCached.kind === "empty") {
             return null;
         }
-        const prepared = usableCached.injection;
+        const prepared = replayableCached.injection;
         if (prepared.compartmentEndMessageId === null) {
             sessionLog(
                 sessionId,

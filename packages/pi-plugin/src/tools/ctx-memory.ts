@@ -64,6 +64,7 @@ import {
 import {
 	decideMemoryPolicy,
 	filterMemoriesByPolicy,
+	memoriesEligibleForEmbedding,
 	readMemoryPolicyRows,
 } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import type { MemoryClaimOperationIdentity } from "@magic-context/core/features/magic-context/memory/storage-memory";
@@ -366,6 +367,15 @@ function queueEmbedding(args: {
 }) {
 	const snapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
 	if (!snapshot?.enabled) return;
+	// Hard-hidden / rejected content never leaves the process, remote
+	// embedding providers included.
+	if (
+		!memoriesEligibleForEmbedding(args.deps.db, [args.memoryId]).has(
+			args.memoryId,
+		)
+	) {
+		return;
+	}
 	void (async () => {
 		try {
 			const result = await embedTextForProject(

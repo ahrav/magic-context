@@ -29,6 +29,7 @@ import {
     decideMemoryPolicy,
     filterMemoriesByPolicy,
     hasClaimEffectivePolicy,
+    memoriesEligibleForEmbedding,
     readMemoryPolicyRows,
 } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
@@ -257,6 +258,11 @@ function queueMemoryEmbedding(args: {
 }): void {
     const snapshot = getProjectEmbeddingSnapshot(args.projectPath);
     if (!snapshot?.enabled) {
+        return;
+    }
+    // Hard-hidden / rejected content never leaves the process, remote
+    // embedding providers included.
+    if (!memoriesEligibleForEmbedding(args.deps.db, [args.memoryId]).has(args.memoryId)) {
         return;
     }
 

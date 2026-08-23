@@ -51,6 +51,7 @@ import {
     SYNAPSE_MAX_INPUT_TOKENS,
     SynapseEmbeddingProvider,
 } from "./memory/embedding-synapse";
+import { memoriesEligibleForEmbedding } from "./memory/storage-claim-visibility";
 import {
     getMemoryEmbedCoverage,
     hasMemoryEmbedding,
@@ -2633,9 +2634,16 @@ export async function embedUnembeddedMemoriesForProject(
     if (!snapshot?.enabled) return 0;
 
     const normalizedBatchSize = Math.max(1, Math.floor(batchSize));
-    const memories = getLoadUnembeddedMemoriesStatement(db)
+    // Hard-hidden / rejected content never leaves the process, remote
+    // embedding providers included; the backlog query itself is policy-blind.
+    const fetched = getLoadUnembeddedMemoriesStatement(db)
         .all(snapshot.modelId, projectIdentity, normalizedBatchSize)
         .filter(isUnembeddedMemoryRow);
+    const embeddable = memoriesEligibleForEmbedding(
+        db,
+        fetched.map((memory) => memory.id),
+    );
+    const memories = fetched.filter((memory) => embeddable.has(memory.id));
     if (memories.length === 0) return 0;
 
     try {
