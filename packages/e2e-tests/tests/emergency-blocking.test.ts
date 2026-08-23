@@ -158,8 +158,12 @@ describe("emergency >=95%", () => {
                 return;
             }
 
+            // 90s, not 30s: the historian pass runs a subprocess against the
+            // mock provider, which on GitHub-hosted runners is 3-5x slower
+            // than local hardware; the test's own budget below stays the
+            // real bound.
             await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
-                timeoutMs: 30_000,
+                timeoutMs: 90_000,
                 label: "emergency historian compartment",
             });
             expect(h.countCompartments(sessionId)).toBeGreaterThanOrEqual(1);
