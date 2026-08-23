@@ -125,12 +125,14 @@ export function selectMapMemoryInputs(
     projectIdentity: string,
     repoDir: string,
 ): MapMemoryInput[] {
-    // Mapping prompts are automatic child-model calls: policy-hidden content
-    // stays out of them; an eligible-again row maps on a later pass.
+    // Mapping feeds verification — the ladder step candidate rows need to
+    // become injectable — so the pool keeps them and excludes only the
+    // uniform-absence class (hard-hidden and rejected): those must not reach
+    // any agent surface, child-model prompts included.
     const active = filterMemoriesByPolicy(
         db,
         getMemoriesByProject(db, projectIdentity),
-        "auto_inject",
+        "explicit_search",
     ).memories;
     const activeIds = active.map((m) => m.id);
     const unmapped = new Set(getUnmappedMemoryIds(db, activeIds));

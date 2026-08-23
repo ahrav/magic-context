@@ -858,7 +858,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
         expect(getMemoryCount(migrated, "git:v82-charter")).toBe(1);
     });
 
-    it("update: content rewrite resets shareable/classified_at/mural cue and embedding, keeps verification", () => {
+    it("update: content rewrite resets shareable/classified_at/mural cue and embedding, withdraws verification", () => {
         migrated = migratedDb();
         const memory = insertMemory(migrated, {
             projectPath: "git:v82-charter",
@@ -898,8 +898,9 @@ describe("migrated-v82 mutation inventory characterization", () => {
         expect(row?.mural_cue_hash).toBeNull();
         expect(row?.mural_cue_at).toBeNull();
         expect(row?.mural_cue_rejection_count).toBe(0);
-        // Verification state is NOT reset by a content update in v82.
-        expect(row?.verification_status).toBe("verified");
+        // Verification attested the OLD bytes: the rewrite withdraws it
+        // ('unverified' with the original verified_at kept as history).
+        expect(row?.verification_status).toBe("unverified");
         expect(row?.verified_at).toBe(222);
         // The stale vector is dropped; stats stay untouched.
         expect(loadAllEmbeddings(migrated, "git:v82-charter", "local:model-a")).toEqual(new Map());

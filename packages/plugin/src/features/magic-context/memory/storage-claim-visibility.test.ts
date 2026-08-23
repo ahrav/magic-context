@@ -282,6 +282,38 @@ describe("claim policy surface enforcement", () => {
         }
     });
 
+    test("a raw supersedes conflict outranks a stale projection's eligibility", () => {
+        const db = migratedDb();
+        try {
+            const source = seedMemory(db, "super-raw-src", "superseded via raw conflict");
+            const target = seedMemory(db, "super-raw-tgt", "surviving replacement row");
+            verify(db, source.memoryId);
+            const memories = getMemoriesByProject(db, PROJECT);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).toContain(source.memoryId);
+            // A policy-unaware writer inserts the supersedes conflict without
+            // refreshing the projection; auto_eligible stays 1.
+            db.prepare(
+                `INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at)
+                 VALUES ('supersedes', ?, ?, 9_000)`,
+            ).run(target.revisionId, source.revisionId);
+            const probe = db
+                .prepare(
+                    "SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+                )
+                .get(source.revisionId) as { auto: number };
+            expect(probe.auto).toBe(1);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).not.toContain(source.memoryId);
+            const explicit = filterMemoriesByPolicy(db, memories, "explicit_search");
+            expect(explicit.labels.get(source.memoryId)).toContain("superseded");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("a contradicted row with no projection row is absent from explicit search", () => {
         const db = migratedDb();
         try {

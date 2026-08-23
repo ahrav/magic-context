@@ -820,6 +820,22 @@ function appendMemoryClaimRevision(
     },
 ): number {
     const expected = readClaimCurrentRevisionId(db, args.claimId);
+    // Rendered surfaces follow the claim's CURRENT revision. The per-revision
+    // refresh diffs a brand-new revision against its own (absent) projection
+    // — both sides read ineligible — so replacing an auto-eligible revision
+    // with an ineligible successor would never bump the epoch and cached
+    // m0/mirror content would keep serving the predecessor. Diff across the
+    // succession instead.
+    const policySchema = hasClaimPolicySchema(db);
+    const predecessorEligible = policySchema
+        ? ((
+              db
+                  .prepare(
+                      "SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+                  )
+                  .get(expected) as { auto: number } | null | undefined
+          )?.auto ?? 0)
+        : 0;
     const outcome = appendClaimRevisionInCurrentTransaction(db, {
         claimId: args.claimId,
         expectedCurrentRevisionId: expected,
@@ -835,6 +851,19 @@ function appendMemoryClaimRevision(
     }
     insertRevisionMemoryMetadata(db, outcome.revisionId, args.metadata);
     ensureRevisionPolicyInCurrentTransaction(db, outcome.revisionId, args.observationId);
+    if (policySchema) {
+        const successorEligible =
+            (
+                db
+                    .prepare(
+                        "SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+                    )
+                    .get(outcome.revisionId) as { auto: number } | null | undefined
+            )?.auto ?? 0;
+        if (successorEligible !== predecessorEligible) {
+            bumpEpochForClaimProjectInCurrentTransaction(db, args.claimId);
+        }
+    }
     return outcome.revisionId;
 }
 
@@ -1748,6 +1777,24 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             ).run(input.nowMs ?? Date.now(), row.id);
             row.verification_status = "unverified";
             row.verified_at = null;
+        } else if (memoryRowHasPositiveVerification(db, row)) {
+            // Exact-revision verification attests the OLD bytes; a rewrite
+            // must not let arbitrary replacement content inherit VERIFIED
+            // maturity. Withdraw rather than delete: 'unverified' with a
+            // positive verified_at is the documented withdrawn shape, which
+            // blocks the side-table carry in adoption paths while keeping
+            // history. The new revision earns visibility from a fresh
+            // verification event.
+            const withdrawnAt = input.nowMs ?? Date.now();
+            db.prepare(
+                `UPDATE memories
+                    SET verification_status = 'unverified',
+                        verified_at = COALESCE(verified_at, ?),
+                        updated_at = ?
+                  WHERE id = ?`,
+            ).run(withdrawnAt, withdrawnAt, row.id);
+            row.verification_status = "unverified";
+            row.verified_at = row.verified_at ?? withdrawnAt;
         }
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
@@ -1829,22 +1876,6 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                         envelope.producer,
                     ),
                 ];
-                // The projection keeps its verified columns across a content
-                // rewrite, so the adopted claim's current revision needs its
-                // own verified event.
-                if (!input.clearsVerification && memoryRowHasPositiveVerification(db, post)) {
-                    addVerificationEvent(db, {
-                        revisionId: readClaimCurrentRevisionId(db, link.claimId),
-                        outcome: "verified",
-                        verifier: envelope.producer,
-                    });
-                    effects.push({
-                        effectKey: `memory:${row.id}:evidence`,
-                        projectId,
-                        claimId: link.claimId,
-                        effectType: "evidence" as const,
-                    });
-                }
                 return {
                     result: {
                         memoryId: row.id,
@@ -1909,23 +1940,6 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             // any archive event lands on the new current revision.
             ...syncClaimLifecycleAfterAdoption(db, row, link, projectId, envelope.producer),
         ];
-        // The projection deliberately keeps its verified columns across a
-        // content rewrite, so the appended revision needs its own verified
-        // event — without one the claim's current revision reads unverified
-        // while the projection stays verified.
-        if (!input.clearsVerification && memoryRowHasPositiveVerification(db, row)) {
-            addVerificationEvent(db, {
-                revisionId,
-                outcome: "verified",
-                verifier: envelope.producer,
-            });
-            effects.push({
-                effectKey: `memory:${row.id}:evidence`,
-                projectId,
-                claimId: link.claimId,
-                effectType: "evidence" as const,
-            });
-        }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         updateMemoryProjectionContent(db, row.id, input.content, input.normalizedHash, input.nowMs);
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");

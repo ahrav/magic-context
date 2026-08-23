@@ -46,13 +46,14 @@ export interface MemoryPolicyRow {
     rejected: boolean;
     /**
      * Authoritative soft-hide facts, read from `verification_events` /
-     * `claim_disposition_events` (mirroring `readActiveDispositions`): a
-     * policy-unaware writer can append a stale/flagged verification without
-     * refreshing the projection, and projected eligibility must not outlive
-     * that event.
+     * `claim_disposition_events` / `claim_conflicts` (mirroring
+     * `readActiveDispositions`): a policy-unaware writer can append a
+     * stale/flagged verification or a supersedes conflict without refreshing
+     * the projection, and projected eligibility must not outlive those rows.
      */
     stale: boolean;
     disputed: boolean;
+    superseded: boolean;
     dispositions: string[];
     policyVersion: number;
     generation: number;
@@ -143,7 +144,12 @@ export function readMemoryPolicyRows(
                             WHERE revision_id = claims.current_revision_id
                               AND disposition = 'disputed'
                             ORDER BY id DESC LIMIT 1
-                        ), 'clear') = 'assert' AS disputed
+                        ), 'clear') = 'assert' AS disputed,
+                        EXISTS (
+                            SELECT 1 FROM claim_conflicts
+                            WHERE relation = 'supersedes'
+                              AND right_revision_id = claims.current_revision_id
+                        ) AS superseded
                  FROM legacy_memory_claims lmc
                  JOIN claims ON claims.id = lmc.claim_id
                  LEFT JOIN claim_effective_policy policy
@@ -168,6 +174,7 @@ export function readMemoryPolicyRows(
             rejected: number;
             stale: number;
             disputed: number;
+            superseded: number;
         }>;
         for (const row of rows) {
             let dispositions: string[] = [];
@@ -191,6 +198,7 @@ export function readMemoryPolicyRows(
                 rejected: row.rejected === 1,
                 stale: row.stale === 1,
                 disputed: row.disputed === 1,
+                superseded: row.superseded === 1,
                 dispositions,
                 policyVersion: row.policyVersion ?? 0,
                 generation: row.generation ?? 0,
@@ -219,10 +227,14 @@ export function decideMemoryPolicy(
     const unprojected = row == null || !row.projected || row.policyVersion > CLAIM_POLICY_VERSION;
     // Authoritative soft-hide facts outrank projected eligibility: a
     // policy-unaware writer (a pre-v86 binary holding the database open) can
-    // append a stale/flagged verification without refreshing the projection,
-    // and the stored `autoEligible` must not keep injecting that revision.
+    // append a stale/flagged verification or a supersedes conflict without
+    // refreshing the projection, and the stored `autoEligible` must not keep
+    // injecting that revision.
     const authoritativeStale = row != null && row.stale;
     const authoritativeDisputed = row != null && row.disputed;
+    const authoritativeSuperseded = row != null && row.superseded;
+    const authoritativeSoftHide =
+        authoritativeStale || authoritativeDisputed || authoritativeSuperseded;
     if (surface === "explicit_search") {
         if (!unprojected && !row.explicitEligible) {
             return { eligible: false, label: null };
@@ -232,6 +244,9 @@ export function decideMemoryPolicy(
         if (authoritativeDisputed && !dispositions.includes("disputed")) {
             dispositions.push("disputed");
         }
+        if (authoritativeSuperseded && !dispositions.includes("superseded")) {
+            dispositions.push("superseded");
+        }
         return {
             eligible: true,
             label: explicitSearchLabelFromFields({
@@ -239,15 +254,11 @@ export function decideMemoryPolicy(
                 originTaint: unprojected ? "unknown" : row.originTaint,
                 dispositions,
                 policyMissing: unprojected,
-                autoEligible:
-                    !unprojected &&
-                    row.autoEligible &&
-                    !authoritativeStale &&
-                    !authoritativeDisputed,
+                autoEligible: !unprojected && row.autoEligible && !authoritativeSoftHide,
             }),
         };
     }
-    if (unprojected || !row.autoEligible || authoritativeStale || authoritativeDisputed) {
+    if (unprojected || !row.autoEligible || authoritativeSoftHide) {
         return { eligible: false, label: null };
     }
     return { eligible: true, label: null };

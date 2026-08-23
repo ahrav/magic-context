@@ -182,12 +182,14 @@ function loadActiveMemoryPromptMemories(
     db: Database,
     projectIdentity: string,
 ): CuratePromptMemory[] {
-    // Curate prompts are automatic child-model calls: policy-hidden content
-    // stays out of them.
+    // Curation is pool hygiene over mostly-candidate rows, so the pool keeps
+    // them and excludes only the uniform-absence class (hard-hidden and
+    // rejected): those must not reach any agent surface, child-model prompts
+    // included — and the ctx_memory gate refuses them as mutation targets.
     const memories = filterMemoriesByPolicy(
         db,
         getMemoriesByProject(db, projectIdentity),
-        "auto_inject",
+        "explicit_search",
     ).memories;
     const verificationById = getMemoryVerifications(
         db,

@@ -153,13 +153,14 @@ function isModuleRoute(args: ClassifyArgs): boolean {
  * the exact value checked by memory.set_classification.
  */
 function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
-    // Classification prompts are automatic child-model calls: policy-hidden
-    // content stays out of them, and a hidden row is simply classified on a
-    // later pass if it becomes eligible again.
+    // Classification is maintenance that candidate rows need to become
+    // injectable later, so the pool keeps them and excludes only the
+    // uniform-absence class (hard-hidden and rejected): those must not reach
+    // any agent surface, child-model prompts included.
     const active = filterMemoriesByPolicy(
         args.db,
         getMemoriesByProject(args.db, args.projectIdentity),
-        "auto_inject",
+        "explicit_search",
     ).memories;
     if (!isModuleRoute(args) || active.length === 0) {
         return active.map((memory) => ({

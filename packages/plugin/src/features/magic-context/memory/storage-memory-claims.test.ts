@@ -347,7 +347,7 @@ describe("memory/claims kernel: content and classification updates", () => {
         expect(head).toEqual({ pathsState: "known", path: "src/lineage.ts" });
     });
 
-    test("a content update on a verified memory records a verified event on the new revision", () => {
+    test("a content update on a verified memory withdraws verification instead of carrying it", () => {
         const db = track(migratedDb());
         const projectionSeed = createSeedMemory(db, "verified-update-seed", "projection verified");
         const sideTableSeed = createSeedMemory(db, "side-verified-update-seed", "side verified");
@@ -375,23 +375,26 @@ describe("memory/claims kernel: content and classification updates", () => {
                 }),
             );
             expect(outcome.result.revisionId).not.toBeNull();
-            // The verified event attaches to the NEW current revision, with a
-            // matching evidence effect in the operation's outbox.
+            // Verification attests the OLD bytes: the rewritten revision must
+            // NOT inherit a verified event, or arbitrary replacement content
+            // would keep VERIFIED maturity and automatic visibility.
             expect(
                 db
                     .prepare(
                         "SELECT outcome, verifier FROM verification_events WHERE revision_id = ?",
                     )
                     .all(outcome.result.revisionId),
-            ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
-            expect(
-                count(
-                    db,
-                    "claim_change_outbox",
-                    `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'
-                     AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = '${key}')`,
-                ),
-            ).toBe(1);
+            ).toEqual([]);
+            // The projection lands in the withdrawn shape ('unverified' with a
+            // positive verified_at), which blocks the side-table carry in the
+            // adoption paths while keeping history.
+            const row = db
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(seeded.memoryId) as { status: string; at: number | null };
+            expect(row.status).toBe("unverified");
+            expect(row.at ?? 0).toBeGreaterThan(0);
         }
     });
 
