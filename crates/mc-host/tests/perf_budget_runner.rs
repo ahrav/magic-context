@@ -1,7 +1,7 @@
-//! Runner-level contract tests: script syntax, deterministic
-//! counterbalanced dry-run schedules, preserved open-loop arrival
-//! schedules, missed-slot accounting under a full in-flight queue, and
-//! throughput-arm rate separation.
+//! Runner-level contract tests: script syntax, script/Rust schedule and
+//! rate-default parity, deterministic counterbalanced dry-run schedules,
+//! preserved open-loop arrival schedules, missed-slot accounting under a
+//! full in-flight queue, and throughput-arm rate separation.
 
 #[path = "support/raw_client.rs"]
 mod raw_client;
@@ -18,6 +18,13 @@ mod tcp;
 #[path = "support/echo_host.rs"]
 mod echo_host;
 
+// The bench entry point, included for its schedule-expansion seam
+// (`plan_block_entries`, `DEFAULT_RATES`); its collection machinery is
+// unused here.
+#[path = "../benches/ipc_budget.rs"]
+#[allow(dead_code)]
+mod ipc_budget;
+
 use std::time::Duration;
 
 use evidence::{counterbalanced_schedule, HistogramConfig};
@@ -27,6 +34,46 @@ fn repo_root() -> std::path::PathBuf {
         .join("../..")
         .canonicalize()
         .unwrap()
+}
+
+fn script_text() -> String {
+    std::fs::read_to_string(repo_root().join("scripts/perf-mc-host.sh")).unwrap()
+}
+
+/// The budget arm names in forward orientation, from the shared constants.
+fn budget_arms() -> Vec<String> {
+    [
+        evidence::ARM_ATOMIC,
+        evidence::ARM_TCP_SERIAL,
+        evidence::ARM_TCP_OPEN,
+        evidence::ARM_TCP_THROUGHPUT,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The cross-NUMA paired tail in forward orientation.
+fn cross_arms() -> Vec<String> {
+    [evidence::ARM_ATOMIC, evidence::ARM_TCP_SERIAL]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Extracts every `name=(...)` array assignment in the script as its
+/// whitespace-separated tokens, in file order.
+fn script_array_values(script: &str, name: &str) -> Vec<Vec<String>> {
+    let prefix = format!("{name}=(");
+    script
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("local ").unwrap_or(line);
+            let inner = line.strip_prefix(&prefix)?.strip_suffix(')')?;
+            Some(inner.split_whitespace().map(str::to_owned).collect())
+        })
+        .collect()
 }
 
 #[test]
@@ -41,16 +88,91 @@ fn perf_script_parses() {
 }
 
 #[test]
+fn script_arm_orders_match_rust_constants_in_both_orientations() {
+    let script = script_text();
+
+    let forward = budget_arms();
+    let mut reversed = forward.clone();
+    reversed.reverse();
+    assert_eq!(
+        script_array_values(&script, "arms"),
+        vec![forward, reversed],
+        "the script's same-l3 arms=() lines must match the Rust arm \
+         constants forward then reversed"
+    );
+
+    let cross_forward = cross_arms();
+    let mut cross_reversed = cross_forward.clone();
+    cross_reversed.reverse();
+    assert_eq!(
+        script_array_values(&script, "cross"),
+        vec![cross_forward, cross_reversed],
+        "the script's cross=() lines must match the cross-NUMA tail \
+         forward then reversed"
+    );
+}
+
+#[test]
+fn script_rate_default_matches_rust_constant() {
+    let default = script_text()
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("BUDGET_RATES=\"${BUDGET_RATES:-")?
+                .strip_suffix("}\"")
+                .map(str::to_owned)
+        })
+        .expect("script defines the BUDGET_RATES default");
+    assert_eq!(default, ipc_budget::DEFAULT_RATES);
+}
+
+#[test]
+fn plan_blocks_expand_rates_and_cross_numa_tail() {
+    let rates: Vec<u64> = ipc_budget::DEFAULT_RATES
+        .split_whitespace()
+        .map(|token| token.parse().unwrap())
+        .collect();
+    let same_l3 = counterbalanced_schedule(2, &budget_arms());
+    let cross = counterbalanced_schedule(2, &cross_arms());
+
+    let odd = ipc_budget::plan_block_entries(&same_l3[0], &cross[0], &rates);
+    assert_eq!(
+        odd,
+        [
+            "atomic-floor@same-l3",
+            "tcp-serial@same-l3",
+            "tcp-open@same-l3:r20000",
+            "tcp-open@same-l3:r50000",
+            "tcp-open@same-l3:r80000",
+            "tcp-throughput@same-l3",
+            "atomic-floor@cross-numa",
+            "tcp-serial@cross-numa",
+        ]
+    );
+
+    // Even blocks reverse the same-L3 arm order and the cross-NUMA tail
+    // (matching the script's `arms` and `cross` arrays); the rate
+    // fan-out inside tcp-open keeps the script's `for rate in
+    // $BUDGET_RATES` order.
+    let even = ipc_budget::plan_block_entries(&same_l3[1], &cross[1], &rates);
+    assert_eq!(
+        even,
+        [
+            "tcp-throughput@same-l3",
+            "tcp-open@same-l3:r20000",
+            "tcp-open@same-l3:r50000",
+            "tcp-open@same-l3:r80000",
+            "tcp-serial@same-l3",
+            "atomic-floor@same-l3",
+            "tcp-serial@cross-numa",
+            "atomic-floor@cross-numa",
+        ]
+    );
+}
+
+#[test]
 fn dry_run_schedule_is_stable_across_invocations() {
-    let arms: Vec<String> = [
-        evidence::ARM_ATOMIC,
-        evidence::ARM_TCP_SERIAL,
-        evidence::ARM_TCP_OPEN,
-        evidence::ARM_TCP_THROUGHPUT,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let arms = budget_arms();
     let first = counterbalanced_schedule(10, &arms);
     let second = counterbalanced_schedule(10, &arms);
     assert_eq!(first, second);
@@ -171,6 +293,16 @@ fn throughput_arm_reports_rates_separately() {
     assert!(result.successful_per_sec > 0.0);
     assert!(result.goodput_bytes_per_sec > result.successful_per_sec);
     assert!(result.measured >= Duration::from_millis(700));
+    // A healthy window closes either on the boundary terminal (depth-1
+    // requests left in flight) or on the window deadline between frames
+    // (depth in flight); the post-window drain must resolve each exactly
+    // once (an undrained response returns Err instead).
+    let depth = cfg.depth as u64;
+    assert!(
+        result.drained == depth || result.drained == depth - 1,
+        "drained {} responses for a depth-{depth} pipeline",
+        result.drained
+    );
 }
 
 #[test]

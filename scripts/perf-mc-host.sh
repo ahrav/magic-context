@@ -11,6 +11,11 @@ BIN="$ROOT/target/release/examples"
 
 BUDGET_BENCH=""
 BUDGET_CHILD=""
+# Offered-rate points shared by the plan preview and execution paths. The
+# default string stays byte-identical to DEFAULT_RATES in
+# crates/mc-host/benches/ipc_budget.rs (parity-tested by
+# crates/mc-host/tests/perf_budget_runner.rs).
+BUDGET_RATES="${BUDGET_RATES:-20000 50000 80000}"
 
 budget_build() {
   local out
@@ -134,13 +139,14 @@ budget_run() {
 case "${2:-${1:-}}" in
 budget-plan)
   budget_build
-  MC_IPC_BUDGET_MODE=plan MC_IPC_BUDGET_BLOCKS="${MC_IPC_BUDGET_BLOCKS:-10}" "$BUDGET_BENCH"
+  MC_IPC_BUDGET_MODE=plan MC_IPC_BUDGET_BLOCKS="${MC_IPC_BUDGET_BLOCKS:-10}" \
+    MC_IPC_BUDGET_RATES="$BUDGET_RATES" "$BUDGET_BENCH"
   exit 0
   ;;
 budget-preflight)
   budget_build
   budget_env
-  MC_IPC_BUDGET_MODE=plan "$BUDGET_BENCH"
+  MC_IPC_BUDGET_MODE=plan MC_IPC_BUDGET_RATES="$BUDGET_RATES" "$BUDGET_BENCH"
   BUDGET_OUT=$(mktemp -d)
   BUDGET_PAIR="${BUDGET_PAIR:-}"
   budget_trap
@@ -164,7 +170,6 @@ case "${2:-}" in
 budget-smoke | budget-pilot | budget-final)
   BUDGET_OUT="${1:?outdir}"
   BUDGET_PAIR="${BUDGET_PAIR:-}"
-  BUDGET_RATES="${BUDGET_RATES:-20000 50000 80000}"
   case "$2" in
   budget-smoke)
     BUDGET_RATES="${BUDGET_SMOKE_RATES:-20000}"
@@ -180,7 +185,7 @@ budget-smoke | budget-pilot | budget-final)
       MC_IPC_BUDGET_WARMUP_SECS=2 MC_IPC_BUDGET_MEASURE_SECS=5
     ;;
   budget-final)
-    budget_run "${BUDGET_BLOCKS:-10}" \
+    budget_run "${MC_IPC_BUDGET_BLOCKS:-10}" \
       MC_IPC_BUDGET_WARMUP_BATCHES=50 MC_IPC_BUDGET_BATCHES=200 MC_IPC_BUDGET_EXCHANGES=10000 \
       MC_IPC_BUDGET_WARMUP_OPS=20000 MC_IPC_BUDGET_MEASURED_OPS=150000 \
       MC_IPC_BUDGET_WARMUP_SECS=2 MC_IPC_BUDGET_MEASURE_SECS=10
@@ -236,7 +241,7 @@ stop_host() {
 }
 
 load() {
-  "$BIN/perf_load" "$PUB" "$@" | tee -a "$OUT/results.txt"
+  "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt"
 }
 
 LABEL_SUFFIX=""

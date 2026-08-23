@@ -317,6 +317,28 @@ pub fn pin_current_thread(cpu: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Sets the calling thread's affinity to every CPU in `cpus`, widening a
+/// singleton pin back to a full schedulable set. An empty set is an
+/// error: the kernel rejects an empty mask, and silently keeping the old
+/// mask would leave the thread pinned.
+pub fn set_current_thread_affinity(cpus: &BTreeSet<u32>) -> Result<(), String> {
+    if cpus.is_empty() {
+        return Err("cannot set affinity to an empty CPU set".to_owned());
+    }
+    let mut set = rustix::thread::CpuSet::new();
+    for &cpu in cpus {
+        if cpu as usize >= rustix::thread::CpuSet::MAX_CPU {
+            return Err(format!(
+                "cpu{cpu} exceeds the kernel cpuset size {}",
+                rustix::thread::CpuSet::MAX_CPU
+            ));
+        }
+        set.set(cpu as usize);
+    }
+    rustix::thread::sched_setaffinity(None, &set)
+        .map_err(|err| format!("sched_setaffinity({cpus:?}): {err}"))
+}
+
 /// The CPU the calling thread is currently executing on.
 pub fn current_cpu() -> u32 {
     rustix::thread::sched_getcpu() as u32

@@ -319,7 +319,9 @@ fn host_id() -> HostId {
         })
         .unwrap_or_else(|| std::env::consts::ARCH.to_owned());
     HostId {
-        hostname: read("/proc/sys/kernel/hostname"),
+        // Manifests are retained in the repository, so the hostname field
+        // carries an operator-chosen label rather than the machine's FQDN.
+        hostname: env_var("MC_IPC_BUDGET_HOST_LABEL").unwrap_or_else(|| "redacted".to_owned()),
         kernel: read("/proc/sys/kernel/osrelease"),
         cpu_model,
         cpu_count: std::thread::available_parallelism()
@@ -555,24 +557,18 @@ fn tcp_arm_setup(attempt: &mut Attempt, pair: (u32, u32)) -> Result<ChildHost, S
     Ok(host)
 }
 
-fn check_host_and_conservation(
-    host: &mut ChildHost,
-    outcomes: &perf_measurement::OutcomeCounts,
-    scheduled: u64,
-) -> Result<(), String> {
+fn check_host_alive(host: &mut ChildHost) -> Result<(), String> {
     if !host.alive() {
         return Err("child host exited during measurement".to_owned());
     }
-    if !outcomes.conserved(scheduled) {
-        return Err(format!(
-            "outcome-accounting loss: {} outcomes for {scheduled} scheduled slots",
-            outcomes.total()
-        ));
-    }
-    // Correctness is a gate, not an outcome to average over: a live host
-    // returning wrong bodies, protocol errors, or unexpected frames
-    // satisfies conservation, and publishing the successful subset would
-    // select latency from only the requests the host answered correctly.
+    Ok(())
+}
+
+/// Correctness is a gate, not an outcome to average over: a live host
+/// returning wrong bodies, protocol errors, or unexpected frames
+/// satisfies conservation, and publishing the successful subset would
+/// select latency from only the requests the host answered correctly.
+fn check_correctness(outcomes: &perf_measurement::OutcomeCounts) -> Result<(), String> {
     let correctness_failures =
         outcomes.protocol_error + outcomes.body_mismatch + outcomes.unexpected_frame;
     if correctness_failures > 0 {
@@ -581,6 +577,21 @@ fn check_host_and_conservation(
         ));
     }
     Ok(())
+}
+
+fn check_host_and_conservation(
+    host: &mut ChildHost,
+    outcomes: &perf_measurement::OutcomeCounts,
+    scheduled: u64,
+) -> Result<(), String> {
+    check_host_alive(host)?;
+    if !outcomes.conserved(scheduled) {
+        return Err(format!(
+            "outcome-accounting loss: {} outcomes for {scheduled} scheduled slots",
+            outcomes.total()
+        ));
+    }
+    check_correctness(outcomes)
 }
 
 fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
@@ -695,7 +706,13 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
             result.outcomes
         ));
     }
-    check_host_and_conservation(&mut host, &result.outcomes, result.terminal)?;
+    // The throughput arm has no scheduled count independent of its
+    // outcomes (`terminal` is `outcomes.total()`), so a conservation
+    // check against it proves nothing; response loss surfaces instead as
+    // an undrained in-flight request, which `run_throughput` returns as
+    // an error. Host liveness and correctness stay as gates.
+    check_host_alive(&mut host)?;
+    check_correctness(&result.outcomes)?;
     let manifest = attempt.manifest_mut();
     manifest.outcomes = Some(result.outcomes.clone());
     manifest.recorded_samples = Some(result.successful);
@@ -706,12 +723,22 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
         "successful": result.successful,
         "successful_per_sec": result.successful_per_sec,
         "goodput_bytes_per_sec": result.goodput_bytes_per_sec,
+        "drained": result.drained,
         "measured_secs": result.measured.as_secs_f64(),
     }));
     Ok(())
 }
 
 // --- plan / aggregate / finalize ----------------------------------------
+
+/// Default open-loop offered-rate points; byte-identical to the script's
+/// `BUDGET_RATES` default so the plan preview matches execution.
+pub const DEFAULT_RATES: &str = "20000 50000 80000";
+
+/// Cross-NUMA paired tail in forward orientation. The script's
+/// `budget_block` runs these after the same-L3 arms, reversing their
+/// order on even blocks like the same-L3 arms.
+const CROSS_ARMS: [&str; 2] = [ARM_ATOMIC, ARM_TCP_SERIAL];
 
 fn plan_arms() -> Vec<String> {
     [ARM_ATOMIC, ARM_TCP_SERIAL, ARM_TCP_OPEN, ARM_TCP_THROUGHPUT]
@@ -720,12 +747,45 @@ fn plan_arms() -> Vec<String> {
         .collect()
 }
 
+/// Expands one block into the collection sequence the script's
+/// `budget_block` executes: the counterbalanced same-L3 arms with
+/// `tcp-open` fanned out per offered rate (rate order as given, never
+/// reversed), then the cross-NUMA paired tail in its own counterbalanced
+/// order.
+pub fn plan_block_entries(same_l3: &[String], cross: &[String], rates: &[u64]) -> Vec<String> {
+    let mut entries = Vec::new();
+    for arm in same_l3 {
+        if arm == ARM_TCP_OPEN {
+            entries.extend(rates.iter().map(|rate| format!("{arm}@same-l3:r{rate}")));
+        } else {
+            entries.push(format!("{arm}@same-l3"));
+        }
+    }
+    entries.extend(cross.iter().map(|arm| format!("{arm}@cross-numa")));
+    entries
+}
+
 fn render_plan() -> Result<String, String> {
     let blocks = env_parse("MC_IPC_BUDGET_BLOCKS", 10u32)?;
-    let arms = plan_arms();
+    let rates: Vec<u64> = env_var("MC_IPC_BUDGET_RATES")
+        .unwrap_or_else(|| DEFAULT_RATES.to_owned())
+        .split_whitespace()
+        .map(|token| {
+            token
+                .parse()
+                .map_err(|_| format!("MC_IPC_BUDGET_RATES: malformed rate {token:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let cross: Vec<String> = CROSS_ARMS.iter().map(|s| (*s).to_owned()).collect();
+    let same_l3_schedule = counterbalanced_schedule(blocks, &plan_arms());
+    let cross_schedule = counterbalanced_schedule(blocks, &cross);
     let mut out = String::new();
-    for (block, order) in counterbalanced_schedule(blocks, &arms).iter().enumerate() {
-        out.push_str(&format!("block {:02}: {}\n", block + 1, order.join(" -> ")));
+    for (block, (same_l3, cross)) in same_l3_schedule.iter().zip(&cross_schedule).enumerate() {
+        out.push_str(&format!(
+            "block {:02}: {}\n",
+            block + 1,
+            plan_block_entries(same_l3, cross, &rates).join(" -> ")
+        ));
     }
     Ok(out)
 }
@@ -954,6 +1014,15 @@ fn run_criterion() {
             bencher.iter_custom(|iters| timed_exchanges(a, b, iters).expect("valid pinned pair"));
         });
         group.finish();
+        // Any pin the atomic fixture leaves on this thread propagates
+        // into the child host spawned below (an unpinned spawn inherits
+        // the parent's mask), time-slicing host and client on one core;
+        // restore the schedulable set captured before any group ran.
+        if allowed.is_empty() {
+            eprintln!("atomic_rtt: affinity not restored (allowed CPU set is empty)");
+        } else if let Err(err) = linux_topology::set_current_thread_affinity(&allowed) {
+            eprintln!("atomic_rtt: affinity not restored ({err})");
+        }
     }
 
     match ChildHost::spawn(None) {

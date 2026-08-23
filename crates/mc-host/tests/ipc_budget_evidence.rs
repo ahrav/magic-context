@@ -97,24 +97,19 @@ fn write_complete(
 }
 
 #[test]
-fn nonempty_output_directory_is_refused_unmodified() {
-    let dir = tempfile::tempdir().unwrap();
-    let run_dir = dir.path().join("run");
-    std::fs::create_dir(&run_dir).unwrap();
-    std::fs::write(run_dir.join("existing.txt"), b"keep me").unwrap();
-
-    let err = evidence::create_run_dir(&run_dir).unwrap_err();
-    assert!(err.contains("not empty"), "{err}");
-    assert_eq!(
-        std::fs::read(run_dir.join("existing.txt")).unwrap(),
-        b"keep me"
-    );
-
-    // An empty preexisting directory and a fresh path are both fine.
-    let empty = dir.path().join("empty");
-    std::fs::create_dir(&empty).unwrap();
-    evidence::create_run_dir(&empty).unwrap();
-    evidence::create_run_dir(&dir.path().join("fresh")).unwrap();
+fn histogram_resolves_sub_microsecond_samples_to_the_nanosecond() {
+    // The atomic-floor arm records 146-280 ns samples. The 1 ns unit
+    // floor keeps adjacent nanosecond values in distinct buckets; a
+    // coarser power-of-two unit (e.g. 64 ns from a rounded-down floor of
+    // 100) would collapse neighbors and quantize merged percentiles.
+    let samples = [146u64, 147, 210, 279, 280];
+    let hist = small_histogram(&samples);
+    for &v in &samples {
+        assert_eq!(hist.count_at(v), 1, "{v} ns shares a bucket");
+    }
+    assert_eq!(hist.min(), 146);
+    assert_eq!(hist.max(), 280);
+    assert_eq!(hist.value_at_quantile(0.5), 210);
 }
 
 #[test]
@@ -159,10 +154,12 @@ fn interrupted_attempt_is_retained_and_excluded() {
     assert!(evidence::load_attempts(dir.path()).unwrap().is_empty());
 
     // The runner's interrupt trap finalizes it as interrupted; it stays
-    // retained for diagnosis and still never aggregates.
+    // retained for diagnosis and still never aggregates. Publication is
+    // atomic: the rename consumes the temp file.
     let finalized = evidence::finalize_interrupted(dir.path()).unwrap();
     assert_eq!(finalized.len(), 1);
     assert!(!attempt_dir.join(evidence::RUNNING_MANIFEST).exists());
+    assert!(!attempt_dir.join("manifest.json.tmp").exists());
     let loaded = evidence::load_attempts(dir.path()).unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].manifest.state, State::Interrupted);

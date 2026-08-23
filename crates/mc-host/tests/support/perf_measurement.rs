@@ -30,6 +30,12 @@ pub const TAIL_SAMPLE_FLOOR: u64 = 30_000;
 /// p99.9 row in the published budget.
 pub const HEADLINE_TAIL_FLOOR: u64 = 100_000;
 
+/// Upper bound accepted for a response body length. The fixture is 69
+/// bytes and error terminals are small JSON; anything larger is a
+/// corrupted or hostile length field that must fail the run before it
+/// drives a multi-gigabyte allocation from an untrusted 32-bit value.
+pub const MAX_BODY_LEN: u32 = 1 << 20;
+
 /// Identity of a workload: enough to prove two runs measured the same bytes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkloadId {

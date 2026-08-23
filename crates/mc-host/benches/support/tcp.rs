@@ -19,7 +19,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::evidence::HistogramConfig;
-use super::perf_measurement::{open_loop_interval_ns, Outcome, OutcomeCounts, FIXTURE_BODY};
+use super::perf_measurement::{
+    open_loop_interval_ns, Outcome, OutcomeCounts, FIXTURE_BODY, MAX_BODY_LEN,
+};
 use super::raw_client::{self, RawClient, FLAGS_INTERACTIVE, TY_ERROR, TY_RESPONSE};
 
 const MODULE_ID: &str = "perf-echo";
@@ -142,6 +144,9 @@ pub fn run_serial(publication: &Path, cfg: &SerialConfig) -> Result<SerialResult
 }
 
 async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<SerialResult, String> {
+    if cfg.measured_ops == 0 {
+        return Err("serial arm requires a nonzero measured operation count".to_owned());
+    }
     let (mut stream, channel, epoch) = open_route(publication, "budget-serial").await?;
     let mut hist = cfg.histogram.build()?;
     let mut outcomes = OutcomeCounts::default();
@@ -175,6 +180,15 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 return finish_serial(hist, outcomes, measured_scheduled, window_start);
             }
             let decoded = raw_client::decode_header(&header);
+            // The length field is untrusted 32-bit input: a corrupted
+            // value must fail the attempt, not drive the allocation, and
+            // the stream cannot be resynchronized past an unread body.
+            if decoded.len > MAX_BODY_LEN {
+                if measured {
+                    outcomes.record(Outcome::UnexpectedFrame);
+                }
+                return finish_serial(hist, outcomes, measured_scheduled, window_start);
+            }
             body.resize(decoded.len as usize, 0);
             if decoded.len > 0 && stream.read_exact(&mut body).await.is_err() {
                 if measured {
@@ -244,6 +258,9 @@ pub struct OpenLoopResult {
 /// schedule is absolute: a slot whose permit is unavailable is a missed
 /// slot, never a catch-up burst.
 pub fn run_open_loop(publication: &Path, cfg: &OpenLoopConfig) -> Result<OpenLoopResult, String> {
+    if cfg.measure.is_zero() {
+        return Err("open-loop arm requires a nonzero measurement window".to_owned());
+    }
     let interval_ns = open_loop_interval_ns(cfg.rate_per_sec)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -420,6 +437,11 @@ impl OpenLoopState {
         read_half: &mut tokio::net::tcp::OwnedReadHalf,
         frame: raw_client::RawFrame,
     ) -> Result<(), ()> {
+        // Untrusted 32-bit length: refuse the allocation and fail the
+        // connection, since the stream cannot resync past an unread body.
+        if frame.len > MAX_BODY_LEN {
+            return Err(());
+        }
         self.body.resize(frame.len as usize, 0);
         if frame.len > 0 && read_half.read_exact(&mut self.body).await.is_err() {
             return Err(());
@@ -486,6 +508,10 @@ pub struct ThroughputResult {
     pub successful_per_sec: f64,
     pub outcomes: OutcomeCounts,
     pub measured: Duration,
+    /// Responses drained after the measure window closes, one per request
+    /// still in flight at the window boundary; drained frames are never
+    /// measured outcomes.
+    pub drained: u64,
     /// True when the connection failed before the measure window
     /// completed; `measured` then covers only the partial window.
     pub truncated: bool,
@@ -510,6 +536,9 @@ async fn run_throughput_inner(
 ) -> Result<ThroughputResult, String> {
     if cfg.depth == 0 {
         return Err("throughput depth must be nonzero".to_owned());
+    }
+    if cfg.measure.is_zero() {
+        return Err("throughput arm requires a nonzero measurement window".to_owned());
     }
     let (mut stream, channel, epoch) = open_route(publication, "budget-throughput").await?;
     let mut header = [0u8; raw_client::HEADER_LEN];
@@ -538,25 +567,57 @@ async fn run_throughput_inner(
             .map_err(|err| format!("prime write: {err}"))?;
     }
 
+    // The window deadline bounds every receive: a host that delays one
+    // response past the deadline cannot stretch the fixed measurement
+    // window's denominator, and a live-but-silent host cannot hang the
+    // run with an unbounded read.
+    let window_deadline = start + cfg.warmup + cfg.measure;
     loop {
-        if stream.read_exact(&mut header).await.is_err() {
-            for c in outstanding.drain() {
-                if measured_corr(first_measured, c) {
-                    outcomes.record(Outcome::PeerClosed);
+        let remaining = window_deadline.saturating_duration_since(Instant::now());
+        let received: Option<std::io::Result<raw_client::RawFrame>> = if remaining.is_zero() {
+            None
+        } else {
+            tokio::time::timeout(remaining, async {
+                stream.read_exact(&mut header).await?;
+                let decoded = raw_client::decode_header(&header);
+                if decoded.len > MAX_BODY_LEN {
+                    // Untrusted 32-bit length: refuse the allocation and
+                    // fail the connection; the stream cannot resync past
+                    // an unread body.
+                    return Err(std::io::ErrorKind::InvalidData.into());
                 }
-            }
-            break;
-        }
-        let decoded = raw_client::decode_header(&header);
-        body.resize(decoded.len as usize, 0);
-        if decoded.len > 0 && stream.read_exact(&mut body).await.is_err() {
-            for c in outstanding.drain() {
-                if measured_corr(first_measured, c) {
-                    outcomes.record(Outcome::PeerClosed);
+                body.resize(decoded.len as usize, 0);
+                if decoded.len > 0 {
+                    stream.read_exact(&mut body).await?;
                 }
+                Ok(decoded)
+            })
+            .await
+            .ok()
+        };
+        let decoded = match received {
+            None => {
+                // Deadline reached without a frame. Inside the measured
+                // window that closes the window at its nominal length and
+                // hands the outstanding requests to the drain below; a
+                // deadline during warmup means the host produced no
+                // terminal for the whole warmup+measure budget and the
+                // zero measured window marks the run truncated.
+                if measuring {
+                    measured_elapsed = measure_start.elapsed();
+                }
+                break;
             }
-            break;
-        }
+            Some(Err(_)) => {
+                for c in outstanding.drain() {
+                    if measured_corr(first_measured, c) {
+                        outcomes.record(Outcome::PeerClosed);
+                    }
+                }
+                break;
+            }
+            Some(Ok(decoded)) => decoded,
+        };
         if decoded.ty == raw_client::TY_PING {
             continue;
         }
@@ -606,36 +667,47 @@ async fn run_throughput_inner(
         }
     }
 
-    // A zero measured window here means the loop exited on a transport
-    // failure rather than reaching the configured measure duration; the
-    // fallback still reports the partial elapsed time for diagnostics.
+    // A zero measured window here means the loop exited before the
+    // measure window completed (transport failure, or a host silent for
+    // the whole warmup+measure budget); the fallback still reports the
+    // partial elapsed time for diagnostics. Truncated runs skip the
+    // drain: the caller rejects the attempt, so in-flight accounting
+    // proves nothing further.
     let truncated = measured_elapsed.is_zero();
+    let mut drained = 0u64;
     if truncated {
         measured_elapsed = measure_start.elapsed();
-    }
-    // The rate is snapshotted at the deadline; the bounded drain below
-    // resolves and validates the requests still in flight (they would
-    // otherwise never be correlated or body-checked) without extending
-    // the measured window.
-    let successful_at_deadline = outcomes.success;
-    if !truncated {
+    } else {
+        // Post-window drain: the host owes one response per request still
+        // in flight at the window close. Drained frames resolve pipeline
+        // accounting only and are never measured outcomes; a drain-budget
+        // expiry or connection failure with requests still outstanding is
+        // real response loss, and the arm fails rather than publishing a
+        // window that quietly dropped responses.
+        let undrained = |n: usize| {
+            format!(
+                "{n} in-flight response(s) undrained after the {}s post-window drain budget",
+                DRAIN_BUDGET.as_secs()
+            )
+        };
         let drain_deadline = Instant::now() + DRAIN_BUDGET;
-        while outstanding
-            .iter()
-            .any(|c| measured_corr(first_measured, *c))
-        {
+        while !outstanding.is_empty() {
             let remaining = drain_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                for c in outstanding.drain() {
-                    if measured_corr(first_measured, c) {
-                        outcomes.record(Outcome::UnresolvedAtDrain);
-                    }
-                }
-                break;
+                return Err(undrained(outstanding.len()));
             }
+            // The deadline bounds the whole receive, body included, so a
+            // peer that sends a valid header and stalls mid-body cannot
+            // hang the drain.
             let read = tokio::time::timeout(remaining, async {
                 stream.read_exact(&mut header).await?;
                 let decoded = raw_client::decode_header(&header);
+                if decoded.len > MAX_BODY_LEN {
+                    // Untrusted 32-bit length: refuse the allocation and
+                    // fail the connection; the stream cannot resync past
+                    // an unread body.
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
                 body.resize(decoded.len as usize, 0);
                 if decoded.len > 0 {
                     stream.read_exact(&mut body).await?;
@@ -645,29 +717,19 @@ async fn run_throughput_inner(
             .await;
             match read {
                 Ok(Ok(decoded)) => {
-                    if decoded.ty == raw_client::TY_PING || !outstanding.remove(&decoded.corr) {
-                        continue;
-                    }
-                    if measured_corr(first_measured, decoded.corr) {
-                        outcomes.record(classify_terminal(&decoded, (channel, epoch), &body));
+                    // Pings and frames naming no outstanding request are
+                    // skipped exactly as in the measurement loop.
+                    if decoded.ty != raw_client::TY_PING && outstanding.remove(&decoded.corr) {
+                        drained += 1;
                     }
                 }
                 Ok(Err(_)) => {
-                    for c in outstanding.drain() {
-                        if measured_corr(first_measured, c) {
-                            outcomes.record(Outcome::PeerClosed);
-                        }
-                    }
-                    break;
+                    return Err(format!(
+                        "connection failed with {} in-flight response(s) undrained",
+                        outstanding.len()
+                    ));
                 }
-                Err(_) => {
-                    for c in outstanding.drain() {
-                        if measured_corr(first_measured, c) {
-                            outcomes.record(Outcome::UnresolvedAtDrain);
-                        }
-                    }
-                    break;
-                }
+                Err(_) => return Err(undrained(outstanding.len())),
             }
         }
     }
@@ -676,10 +738,11 @@ async fn run_throughput_inner(
         offered,
         terminal: outcomes.total(),
         successful: outcomes.success,
-        goodput_bytes_per_sec: successful_at_deadline as f64 * FIXTURE_BODY.len() as f64 / secs,
-        successful_per_sec: successful_at_deadline as f64 / secs,
+        goodput_bytes_per_sec: outcomes.success as f64 * FIXTURE_BODY.len() as f64 / secs,
+        successful_per_sec: outcomes.success as f64 / secs,
         outcomes,
         measured: measured_elapsed,
+        drained,
         truncated,
     })
 }
@@ -733,6 +796,11 @@ impl SerialProbe {
                         .await
                         .map_err(|err| format!("read: {err}"))?;
                     let decoded = raw_client::decode_header(&header);
+                    if decoded.len > MAX_BODY_LEN {
+                        // Untrusted 32-bit length: refuse the allocation;
+                        // the stream cannot resync past an unread body.
+                        return Err(format!("oversized response length {}", decoded.len));
+                    }
                     body.resize(decoded.len as usize, 0);
                     if decoded.len > 0 {
                         stream

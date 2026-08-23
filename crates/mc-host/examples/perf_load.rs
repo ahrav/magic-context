@@ -11,6 +11,12 @@
 //! scheduler-lag distributions separately, preserving the original arrival
 //! schedule. Every scheduled request resolves to exactly one terminal
 //! outcome.
+//!
+//! `--workload raw|json` selects the request body: `json` sends the
+//! committed compact-JSON fixture and validates every echoed terminal
+//! body against the fixture bytes; `raw` (the default) sends the legacy
+//! payload (mode byte plus optional sleep-ms), non-comparable with the
+//! JSON fixture arms.
 
 #[path = "../tests/support/raw_client.rs"]
 mod raw_client;
@@ -397,6 +403,12 @@ async fn run_conn(
             }
         }
         let frame = raw_client::decode_header(&header);
+        // Untrusted 32-bit length: refuse the allocation and fail the
+        // connection, since the stream cannot resync past an unread body.
+        if frame.len > perf_measurement::MAX_BODY_LEN {
+            result.closed_early = true;
+            break;
+        }
         body_buf.resize(frame.len as usize, 0);
         if frame.len > 0 && read_half.read_exact(&mut body_buf).await.is_err() {
             result.closed_early = true;
@@ -410,6 +422,19 @@ async fn run_conn(
         inflight.add_permits(1);
         resolved += 1;
         let measured = in_window(sched, issue);
+        // Route identity: the pending identity on the wire is
+        // (channel, epoch, corr), so a frame that resolves an
+        // outstanding correlation on the wrong channel or epoch is a
+        // routing failure, never a success.
+        if (frame.channel, frame.epoch) != (channel, epoch) {
+            if measured {
+                result.outcomes.record(Outcome::UnexpectedFrame);
+            }
+            if done_wait && resolved >= sent_count.load(Ordering::Acquire) {
+                break;
+            }
+            continue;
+        }
         match frame.ty {
             TY_RESPONSE => {
                 let valid = !expect_fixture || body_buf.as_slice() == FIXTURE_BODY;
