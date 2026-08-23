@@ -26847,45 +26847,44 @@ mod shadow_tests {
     fn state_sync_replace_scope_prunes_absent_rows_within_project_only() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
-        let request = |seq: u64,
-                       memories: &'static [ModuleMemoryRow],
-                       scope: Option<&'static [String]>| {
-            ModuleStateSyncRequest {
-                session_id: "mirror-session",
-                project_path: "shadow:real",
-                shadow_generation: 0,
-                expected_shadow_seq: seq,
-                seed_boundary_id: None,
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories,
-                memories_replace_projects: scope,
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: false,
-                workspace: None,
-                workspace_present: false,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                acked_watermarks: serde_json::Value::Null,
-            }
-        };
+        let request =
+            |seq: u64, memories: &'static [ModuleMemoryRow], scope: Option<&'static [String]>| {
+                ModuleStateSyncRequest {
+                    session_id: "mirror-session",
+                    project_path: "shadow:real",
+                    shadow_generation: 0,
+                    expected_shadow_seq: seq,
+                    seed_boundary_id: None,
+                    drop_seeds: &[],
+                    drop_seed_skipped: 0,
+                    strip_seeds: &[],
+                    strip_seed_skipped: 0,
+                    reasoning_cleared_through_tag: None,
+                    compartments: &[],
+                    memories,
+                    memories_replace_projects: scope,
+                    memory_mutations: &[],
+                    user_profile: &[],
+                    user_profile_present: false,
+                    workspace: None,
+                    workspace_present: false,
+                    last_todo_state: None,
+                    project_memory_epoch: None,
+                    user_profile_version: None,
+                    pending_agent_drops: &[],
+                    pending_agent_drops_skipped: 0,
+                    user_hint_seeds: &[],
+                    auto_search_hint_skipped: 0,
+                    note_nudge_anchors: None,
+                    todo_synthetic_anchor: None,
+                    todo_synthetic_anchor_present: false,
+                    emergency_latches: None,
+                    pending_compaction_marker: None,
+                    deferred_execute_state: None,
+                    channel2_nudge_state: None,
+                    acked_watermarks: serde_json::Value::Null,
+                }
+            };
         let mut other_project = memory(103, "other project row");
         other_project.project_path = "shadow:other".to_string();
         let seeded: &'static [ModuleMemoryRow] = Box::leak(Box::new([
@@ -26893,7 +26892,9 @@ mod shadow_tests {
             memory(102, "revoked row"),
             other_project,
         ]));
-        store.apply_authority_state_sync(request(0, seeded, None)).unwrap();
+        store
+            .apply_authority_state_sync(request(0, seeded, None))
+            .unwrap();
 
         // A full snapshot scoped to shadow:real prunes 102 (absent) but must
         // not touch the other project's row.
@@ -26978,7 +26979,7 @@ mod shadow_tests {
                     reasoning_cleared_through_tag: None,
                     compartments: &[],
                     memories: &[incoming],
-                memories_replace_projects: None,
+                    memories_replace_projects: None,
                     memory_mutations: &[],
                     user_profile: &[],
                     user_profile_present: true,
@@ -27083,7 +27084,7 @@ mod shadow_tests {
                     reasoning_cleared_through_tag: None,
                     compartments: &[],
                     memories: &[incoming],
-                memories_replace_projects: None,
+                    memories_replace_projects: None,
                     memory_mutations: &[],
                     user_profile: &[],
                     user_profile_present: true,

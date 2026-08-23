@@ -38,6 +38,18 @@ import { createTestDb, textOf, userMessage } from "./test-utils.test";
 const insertMemory: typeof insertMemoryRaw = (db, input) =>
 	insertMemoryRaw(db, { sourceType: "user", ...input });
 
+function projectMemoryEpochOf(
+	db: ReturnType<typeof createTestDb>,
+	projectPath: string,
+): number {
+	const row = db
+		.prepare(
+			"SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
+		)
+		.get(projectPath) as { epoch: number } | null | undefined;
+	return row?.epoch ?? 0;
+}
+
 function user(text: string, timestamp = 1) {
 	return { role: "user" as const, content: text, timestamp };
 }
@@ -1121,12 +1133,20 @@ describe("injectM0M1Pi", () => {
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
 			const initialM1 = textOf(first[1] as never);
+			const epochBeforeAdditive = projectMemoryEpochOf(db, state.projectIdentity);
 
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "New additive memory appears only after a bust.",
 				sourceType: "user",
+			});
+			// Linking an immediately auto-eligible memory bumps the project
+			// memory epoch, which would rematerialize m0 on the next bust and
+			// absorb the memory there. Pin the epoch back so this test keeps
+			// exercising the memory-id additive m[1] lane in isolation.
+			setProjectState(db, state.projectIdentity, {
+				projectMemoryEpoch: epochBeforeAdditive,
 			});
 
 			const deferOne = [userMessage("defer one", 11)];
@@ -1346,7 +1366,11 @@ describe("injectM0M1Pi", () => {
 				newContent: "Reconciled content.",
 				queuedAt: 10,
 			});
-			setProjectState(db, state.projectIdentity, { projectMemoryEpoch: 1 });
+			// The insert-time eligibility bump already moved the epoch past its
+			// cached value; reconcile needs a value the cache has not seen.
+			setProjectState(db, state.projectIdentity, {
+				projectMemoryEpoch: projectMemoryEpochOf(db, state.projectIdentity) + 1,
+			});
 
 			const bust = [userMessage("bust", 11)];
 			const result = injectM0M1Pi(state, db, bust as never, undefined, true);
@@ -1459,11 +1483,17 @@ describe("injectM0M1Pi", () => {
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
 			const baselineM0 = textOf(first[0] as never);
+			const epochBeforeDelta = projectMemoryEpochOf(db, state.projectIdentity);
 			insertMemory(db, {
 				projectPath: state.projectIdentity,
 				category: "ARCHITECTURE",
 				content: "Pi docs-hash-only CAS delta memory",
 				sourceType: "user",
+			});
+			// Pin the epoch back past the insert-time eligibility bump so the
+			// only marker drift under test is the docs hash.
+			setProjectState(db, state.projectIdentity, {
+				projectMemoryEpoch: epochBeforeDelta,
 			});
 			let changedDocsMarker = false;
 			db.exec = ((sql: string) => {
