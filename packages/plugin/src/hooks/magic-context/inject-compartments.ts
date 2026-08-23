@@ -114,6 +114,25 @@ export function clearInjectionCache(sessionId: string): void {
 }
 
 /**
+ * Parse the id list a render recorded in `memory_block_ids`. Returns `null`
+ * when no trustworthy record exists — a NULL column, malformed JSON, or a
+ * non-array shape — which callers must treat as ineligible: "the render
+ * recorded zero ids" (`[]`) replays safely, but "the rendered set is
+ * unknown" cannot prove the cached block holds no policy-hidden content.
+ */
+function parseRecordedMemoryBlockIds(raw: string | null | undefined): number[] | null {
+    if (raw == null) return null;
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        return Array.isArray(parsed)
+            ? parsed.filter((id): id is number => typeof id === "number")
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * A cached memory block replays only while every rendered id is still
  * automatic-eligible: policy transitions must not replay hidden content from
  * the process-local injection cache or the session_meta snapshot. Reads the
@@ -124,15 +143,8 @@ function sessionMemoryBlockStillEligible(db: Database, sessionId: string): boole
     const row = db
         .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { memory_block_ids: string | null } | null;
-    let ids: number[] = [];
-    try {
-        const parsed = JSON.parse(row?.memory_block_ids ?? "[]") as unknown;
-        ids = Array.isArray(parsed)
-            ? parsed.filter((id): id is number => typeof id === "number")
-            : [];
-    } catch {
-        return false;
-    }
+    const ids = parseRecordedMemoryBlockIds(row?.memory_block_ids);
+    if (ids === null) return false;
     if (ids.length === 0) return true;
     const rows = readMemoryPolicyRows(db, ids);
     return ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible);
@@ -445,15 +457,8 @@ export function prepareCompartmentInjection(
         // clear the cache.
         const cachedBlockStillEligible = (): boolean => {
             if (!hasClaimEffectivePolicy(db)) return true;
-            let cachedIds: number[] = [];
-            try {
-                const parsed = JSON.parse(cachedMemory?.memory_block_ids ?? "[]") as unknown;
-                cachedIds = Array.isArray(parsed)
-                    ? parsed.filter((id): id is number => typeof id === "number")
-                    : [];
-            } catch {
-                return false;
-            }
+            const cachedIds = parseRecordedMemoryBlockIds(cachedMemory?.memory_block_ids);
+            if (cachedIds === null) return false;
             if (cachedIds.length === 0) return true;
             const rows = readMemoryPolicyRows(db, cachedIds);
             return cachedIds.every(

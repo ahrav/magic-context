@@ -265,7 +265,7 @@ describe("claim policy surface enforcement", () => {
             // database open): the raw verification event lands, but nothing
             // refreshes the projection, whose auto_eligible bit stays 1.
             db.prepare(
-                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'held-open-writer', 9_000)",
+                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'held-open-writer', 9000)",
             ).run(seed.revisionId);
             const probe = db
                 .prepare(
@@ -297,7 +297,7 @@ describe("claim policy surface enforcement", () => {
             // refreshing the projection; auto_eligible stays 1.
             db.prepare(
                 `INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at)
-                 VALUES ('supersedes', ?, ?, 9_000)`,
+                 VALUES ('supersedes', ?, ?, 9000)`,
             ).run(target.revisionId, source.revisionId);
             const probe = db
                 .prepare(
@@ -323,7 +323,7 @@ describe("claim policy surface enforcement", () => {
             const hidden = seedMemory(db, "maint-hidden", "quarantined row");
             verify(db, staleSeed.memoryId);
             db.prepare(
-                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'v', 9_000)",
+                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'v', 9000)",
             ).run(staleSeed.revisionId);
             quarantine(db, hidden.revisionId, hidden.projectId);
             const memories = getMemoriesByProject(db, PROJECT);

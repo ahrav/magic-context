@@ -437,7 +437,7 @@ describe("claim policy seed", () => {
             // running the ladder reducer.
             fx.db
                 .prepare(
-                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'verified', 'held-open-writer', 9_000)",
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'verified', 'held-open-writer', 9000)",
                 )
                 .run(ids.corroborated);
             expect(eligibility()).toBe(0);
@@ -458,7 +458,7 @@ describe("claim policy seed", () => {
             // ...until a new raw event re-opens examination.
             fx.db
                 .prepare(
-                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'verified', 'held-open-writer', 9_100)",
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'verified', 'held-open-writer', 9100)",
                 )
                 .run(ids.corroborated);
             expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(1);

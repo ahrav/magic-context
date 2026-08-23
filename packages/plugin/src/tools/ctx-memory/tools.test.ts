@@ -2100,6 +2100,64 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
         expect(relisted).not.toContain("Quarantine target fact.");
     });
 
+    it("refuses a module-lane write whose content duplicates a policy-hidden row", async () => {
+        const write = await tools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Hidden duplicate target." },
+            toolContext(),
+        );
+        expect(write).toContain("Saved memory [ID:");
+        const [memory] = getMemoriesByProject(db, OWN_PROJECT);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+        if (!claim) throw new Error("expected claim link");
+        const {
+            recordDispositionEventInCurrentTransaction,
+            refreshEffectivePolicyInCurrentTransaction,
+        } = await import("../../features/magic-context/memory/storage-claim-policy");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: claim.revisionId,
+                projectId: claim.projectId,
+                disposition: "quarantined",
+                action: "assert",
+                actor: "host",
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
+            return undefined;
+        });
+
+        const routed: string[] = [];
+        const moduleTools = createCtxMemoryTools({
+            db,
+            resolveProjectPath: () => OWN_PROJECT,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                memory: async (request) => {
+                    routed.push(request.action);
+                    return { content: [{ type: "text", text: `module ${request.action}` }] };
+                },
+            },
+        });
+        // The same bytes get the TS-authority uniform refusal without
+        // reaching the native backend: the native store dedups against its
+        // own policy-filtered mirror, so dispatching would either mint a
+        // divergent row or confirm the hidden row's existence.
+        const refused = await moduleTools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Hidden duplicate target." },
+            toolContext(),
+        );
+        expect(refused).toBe("Error: Memory could not be saved in CONSTRAINTS.");
+        expect(routed).toEqual([]);
+        // Fresh content still dispatches to the module lane.
+        const dispatched = await moduleTools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Fresh module content." },
+            toolContext(),
+        );
+        expect(dispatched).toContain("module write");
+        expect(routed).toEqual(["write"]);
+    });
+
     it("writing the same content twice keeps one projection row and one revision while telemetry increments", async () => {
         const write = await tools.ctx_memory.execute(
             { action: "write", category: "CONSTRAINTS", content: "Use bun for scripts." },

@@ -2640,6 +2640,11 @@ export async function embedUnembeddedMemoriesForProject(
     // pin the batch to ineligible rows and starve every eligible memory
     // behind them. Widen until the batch fills or the table is exhausted.
     let fetchLimit = normalizedBatchSize * 4;
+    // Widening is bounded: past this ceiling a single pass would page most of
+    // the table (full content per row) into memory. Eligible rows beyond a
+    // ceiling-sized ineligible prefix wait for that prefix to shrink (rows
+    // embed or leave 'active') instead of being chased in one unbounded scan.
+    const fetchCeiling = normalizedBatchSize * 64;
     let memories: { id: number; content: string; normalized_hash: string }[] = [];
     for (;;) {
         const fetched = getLoadUnembeddedMemoriesStatement(db)
@@ -2652,7 +2657,13 @@ export async function embedUnembeddedMemoriesForProject(
         memories = fetched
             .filter((memory) => embeddable.has(memory.id))
             .slice(0, normalizedBatchSize);
-        if (memories.length >= normalizedBatchSize || fetched.length < fetchLimit) break;
+        if (
+            memories.length >= normalizedBatchSize ||
+            fetched.length < fetchLimit ||
+            fetchLimit >= fetchCeiling
+        ) {
+            break;
+        }
         fetchLimit *= 4;
     }
     if (memories.length === 0) return 0;

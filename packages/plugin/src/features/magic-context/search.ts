@@ -845,6 +845,10 @@ async function searchMemories(args: {
     // eligible lower-ranked match.
     const eligibleMemoryIds = new Set(memories.map((memory) => memory.id));
     let ftsFetchLimit = candidateLimit * 4;
+    // Widening is bounded: past this ceiling the loop would page most of the
+    // table — full content per row — into memory on a hidden-heavy corpus.
+    // Stopping at the ceiling degrades to fewer lexical candidates instead.
+    const ftsFetchCeiling = candidateLimit * 64;
     let ftsMatches: Memory[] = [];
     for (;;) {
         const fetched = getFtsMatches({
@@ -857,7 +861,13 @@ async function searchMemories(args: {
         ftsMatches = fetched
             .filter((match) => eligibleMemoryIds.has(match.id))
             .slice(0, candidateLimit);
-        if (ftsMatches.length >= candidateLimit || fetched.length < ftsFetchLimit) break;
+        if (
+            ftsMatches.length >= candidateLimit ||
+            fetched.length < ftsFetchLimit ||
+            ftsFetchLimit >= ftsFetchCeiling
+        ) {
+            break;
+        }
         ftsFetchLimit *= 4;
     }
     lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });

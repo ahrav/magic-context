@@ -538,6 +538,38 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                     : `Error: Memory with ID ${denied} was not found.`;
                             }
                         }
+                        // A write carries no ids, but the native store dedups
+                        // by normalized hash and returns the existing row's id
+                        // (bumping its seen count). The TypeScript claims
+                        // database stays the policy authority, so content that
+                        // duplicates a policy-hidden row must get the same
+                        // uniform refusal the TS-authority write path returns
+                        // instead of confirming the hidden row's existence.
+                        if (
+                            args.action === "write" &&
+                            args.content &&
+                            hasClaimEffectivePolicy(deps.db)
+                        ) {
+                            const category = getValidatedCategory(args.category?.trim() ?? "");
+                            const duplicate = category
+                                ? getMemoryByHash(
+                                      deps.db,
+                                      projectPath,
+                                      category,
+                                      computeNormalizedHash(args.content.trim()),
+                                  )
+                                : null;
+                            if (duplicate) {
+                                const policyRows = readMemoryPolicyRows(deps.db, [duplicate.id]);
+                                const decision = decideMemoryPolicy(
+                                    policyRows.get(duplicate.id),
+                                    "explicit_search",
+                                );
+                                if (!decision.eligible) {
+                                    return `Error: Memory could not be saved in ${category}.`;
+                                }
+                            }
+                        }
                         try {
                             const text = moduleMemoryText(
                                 await memoryBackend({
