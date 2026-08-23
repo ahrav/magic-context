@@ -2624,6 +2624,16 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_memories(project_path, updated_at DESC, id ASC);
         ",
     },
+    Migration {
+        version: 54,
+        // Primer-candidate reads and session cleanups filter by session_id, but the only
+        // index leads with project_path, so every load and per-session delete scans the
+        // whole table. (session_id, id) also satisfies the read's ORDER BY id.
+        statements: "
+        CREATE INDEX IF NOT EXISTS idx_mc_primer_candidates_session
+            ON mc_primer_candidates(session_id, id);
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
