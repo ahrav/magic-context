@@ -2634,6 +2634,20 @@ const MIGRATIONS: &[Migration] = &[
             ON mc_primer_candidates(session_id, id);
         ",
     },
+    Migration {
+        version: 55,
+        // Every render-pool read carries a top-level `status IN ('active','permanent')`
+        // term, so the render-order index only ever serves that subset. Making it
+        // partial skips archived/superseded rows during the ordered walk and shrinks
+        // index maintenance for non-visible rows. Same name, so callers and the
+        // schema-shape tests are unchanged.
+        statements: "
+        DROP INDEX IF EXISTS idx_mc_memories_project_render_order;
+        CREATE INDEX idx_mc_memories_project_render_order
+            ON mc_memories(project_path, COALESCE(importance, 50) DESC, id ASC)
+            WHERE status IN ('active', 'permanent');
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
