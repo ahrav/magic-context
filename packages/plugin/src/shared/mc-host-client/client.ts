@@ -187,11 +187,15 @@ async function raceAgainstStage<T>(
                 cancelTimer = armExpiryTimer(stage, () => reject(makeError()));
             }),
         ]);
-        // A fulfillment queued ahead of an overdue timer callback must not
-        // let the caller adopt setup that exceeded its own stage budget;
-        // the stage is authoritative over timer delivery order.
+        // The stage is authoritative over timer delivery order on both
+        // branches: a settlement queued ahead of an overdue timer callback
+        // must not let the caller adopt setup that exceeded its own stage
+        // budget, nor report the shared flight's failure as its own.
         if (stage.isExpired()) throw makeError();
         return result;
+    } catch (error) {
+        if (stage.isExpired()) throw makeError();
+        throw error;
     } finally {
         cancelTimer?.();
     }
@@ -947,20 +951,13 @@ export class SubcClient {
                 active = await this.ensureConnection(deadline);
             } catch (error) {
                 if (error instanceof SubcCallError) throw error;
-                // KTD3: a connection-file snapshot that outlives the owner's
-                // route-open budget is owner-budget exhaustion, not a file
-                // fault; survivors may coalesce one replacement. Every other
+                // KTD3: a snapshot that outlives its stage names the clamped
+                // handshake budget, not the route budget, so it reconnects
+                // like any transient setup failure; every other
                 // connection-file failure stays terminal.
-                if (error instanceof ConnectionFileError && error.code === "deadline_expired") {
-                    flight.replaceable = true;
-                    throw new SubcCallError(
-                        "not_sent",
-                        `route.open could not run because connect failed${causeMessage(error)}`,
-                        errorCode(error),
-                        error,
-                    );
-                }
-                const transient = isConsumerReconnectTransient(error);
+                const transient =
+                    isConsumerReconnectTransient(error) ||
+                    (error instanceof ConnectionFileError && error.code === "deadline_expired");
                 if (transient && !this.closeStarted) {
                     if (await backoff()) continue;
                     // KTD3: transient reconnects ended only because the
@@ -1016,6 +1013,10 @@ export class SubcClient {
                     );
                 }
                 if (error.kind === "not_sent" || error.kind === "outcome_unknown") {
+                    // A local encode rejection is deterministic: the same
+                    // oversized control body fails every attempt, so neither
+                    // retry nor replacement can change the outcome.
+                    if (error.code === "control_body_too_large") throw error;
                     // An ambiguous open already retired its generation; the
                     // next loop iteration reconnects under the same deadline.
                     if (await backoff()) continue;

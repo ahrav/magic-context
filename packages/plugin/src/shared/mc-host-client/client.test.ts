@@ -1352,6 +1352,72 @@ describe("deadline-independent setup coalescing", () => {
         expect(conn.frames.filter(isRouteOpen).length).toBe(1);
         expect(conn.frames.filter(isRoutedFrame).length).toBe(1);
     });
+
+    test("an expired joiner reports its own stage when the shared flight fails", async () => {
+        let nowMs = 0;
+        const { client, conn } = await connected({ identity: IDENTITY, clock: () => nowMs });
+        const cursor = frameCursor(conn);
+        const ownerErr = rejection(
+            client.call("magic-context", "own", undefined, { timeoutMs: 200_000 }),
+        );
+        const joinerErr = rejection(
+            client.call("magic-context", "join", undefined, { timeoutMs: 100_000 }),
+        );
+        const open = await cursor.next(isRouteOpen);
+        // The joiner's stage expires on the fake clock while its real expiry
+        // timer stays pending; the flight then fails ahead of any timer
+        // callback, so the rejection is queued first.
+        nowMs = 100_001;
+        await sendErrorBody(conn, open.corr, "artifact_invalid");
+        expectCallError(await joinerErr, "not_sent", "deadline_expired");
+        expectCallError(await ownerErr, "terminal", "artifact_invalid");
+        expect(conn.frames.filter(isRouteOpen).length).toBe(1);
+    });
+
+    test("a snapshot that outlives the handshake stage retries within the live route budget", async () => {
+        let nowMs = 0;
+        let expireSnapshot = false;
+        const { client, peer } = await retiredHarness({
+            clock: () => nowMs,
+            sleep: async () => {},
+            connectionFileAfterOpen: () => {
+                if (!expireSnapshot) return;
+                expireSnapshot = false;
+                // Outlive the 2s handshake stage while most of the route
+                // budget stays live.
+                nowMs += 2_500;
+            },
+        });
+        expireSnapshot = true;
+        const call = client.call("magic-context", "go");
+        // The owner reconnects under its unchanged route deadline instead
+        // of failing on the expired handshake-stage snapshot.
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        const cursor = frameCursor(conn2);
+        const open = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn2, open.corr, 7, 77);
+        const body = await cursor.next(isRoutedRequest(7));
+        await sendResponse(conn2, body.corr, { ok: true }, 7, 77);
+        expect(await call).toEqual({ ok: true });
+        expect(peer.connections.length).toBe(2);
+    });
+
+    test("an oversized control body fails route.open immediately without retry or replacement", async () => {
+        let sleeps = 0;
+        const { client, conn } = await connected({
+            identity: IDENTITY,
+            sleep: async () => {
+                sleeps++;
+            },
+        });
+        const bigModule = "m".repeat(70_000);
+        const error = await rejection(client.call(bigModule, "x", undefined, { timeoutMs: 500 }));
+        expectCallError(error, "not_sent", "control_body_too_large");
+        // Deterministic local failure: no backoff spin, no wire traffic.
+        expect(sleeps).toBe(0);
+        expect(conn.frames.filter(isRouteOpen).length).toBe(0);
+    });
 });
 
 describe("facade helpers", () => {
