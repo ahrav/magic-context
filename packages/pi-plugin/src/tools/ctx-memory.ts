@@ -61,7 +61,11 @@ import {
 	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { filterMemoriesByPolicy } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
+import {
+	decideMemoryPolicy,
+	filterMemoriesByPolicy,
+	readMemoryPolicyRows,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import type { MemoryClaimOperationIdentity } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	ClaimOperationKeyReuseError,
@@ -526,6 +530,21 @@ export function createCtxMemoryTool(
 						? targetIdentityForStoredPath(memory.projectPath) ===
 							projectIdentity
 						: storedPathBelongsToIdentity(memory.projectPath, projectIdentity);
+				// Hard-hidden and rejected rows return uniform absence on every
+				// agent surface — including as MUTATION targets: updating a
+				// policy-hidden memory would mint a fresh current revision
+				// without the old revision's disposition and resurface the
+				// content. One decision covers every id-based branch (update,
+				// merge, archive) for every agent (parity with OpenCode).
+				const memoryPolicyDeniesToolTarget = (
+					memoryIds: readonly number[],
+				): boolean => {
+					const rows = readMemoryPolicyRows(deps.db, memoryIds);
+					return memoryIds.some(
+						(id) =>
+							!decideMemoryPolicy(rows.get(id), "explicit_search").eligible,
+					);
+				};
 				const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
 				if (
 					snapshot
@@ -778,7 +797,11 @@ export function createCtxMemoryTool(
 							? memoryVisibleToTool(memory)
 							: memoryOwnedByTool(memory)
 						: false;
-					if (!memory || !updateAllowed) {
+					if (
+						!memory ||
+						!updateAllowed ||
+						memoryPolicyDeniesToolTarget([updateId])
+					) {
 						return err(`Error: Memory with ID ${updateId} was not found.`);
 					}
 					if (!dreamerAllowed && !isPrimaryMutableMemory(memory)) {
@@ -942,6 +965,9 @@ export function createCtxMemoryTool(
 						);
 					}
 					if (sourceMemories.length !== ids.length) {
+						return err("Error: One or more source memories were not found.");
+					}
+					if (memoryPolicyDeniesToolTarget(ids)) {
 						return err("Error: One or more source memories were not found.");
 					}
 
@@ -1238,7 +1264,11 @@ export function createCtxMemoryTool(
 								? memoryVisibleToTool(memory)
 								: memoryOwnedByTool(memory)
 							: false;
-						if (!memory || !archiveAllowed) {
+						if (
+							!memory ||
+							!archiveAllowed ||
+							memoryPolicyDeniesToolTarget([memoryId])
+						) {
 							return err(`Error: Memory with ID ${memoryId} was not found.`);
 						}
 						if (!dreamerAllowed && !isPrimaryMutableMemory(memory)) {

@@ -95,12 +95,11 @@ function resolveTarget(
 ): ResolvedTarget | { error: string } {
     const link = readMemoryClaimLink(deps.db, memoryId);
     if (!link) return { error: `Memory ${memoryId} has no claim link in this project.` };
-    const row = deps.db
-        .prepare("SELECT project_path AS projectPath FROM memories WHERE id = ?")
-        .get(memoryId) as { projectPath: string } | null | undefined;
-    if (!row || row.projectPath !== deps.projectPath) {
-        return { error: `Memory ${memoryId} does not belong to the active project.` };
-    }
+    // Membership is decided by resolved project id, not stored-path bytes: a
+    // legacy raw path or an older alias maps to the same numeric project
+    // through `project_aliases`, and the crosswalk's project id carries that
+    // resolution. Foreign and workspace-shared rows still fail the id
+    // comparison (R10).
     const projectId = runInMemoryClaimsWriteTransaction(deps.db, () =>
         resolveMemoryClaimProjectInCurrentTransaction(deps.db, deps.projectPath),
     );

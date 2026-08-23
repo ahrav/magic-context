@@ -278,11 +278,6 @@ export async function runClaimPolicySeed(
                 counts[outcome.maturity] = (counts[outcome.maturity] ?? 0) + 1;
                 if (!outcome.autoEligible) autoHidden += 1;
             }
-            // Counters live outside the transaction, so persist them only after
-            // the batch that produced them has committed.
-            db.transaction(() => {
-                writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.seededCounts, JSON.stringify(counts));
-            }).immediate();
         }
         batches += 1;
         await yieldToEventLoop();
@@ -325,6 +320,23 @@ function seedBatchInCurrentTransaction(
             bumpEpochForClaimProjectInCurrentTransaction(db, row.claimId);
         }
     }
+    // Counts commit atomically with the subjects and cursor they describe: a
+    // separate post-commit write could be lost to a crash, after which the
+    // seeded revisions are no longer selected as unseeded and completion
+    // would publish permanently underreported counts.
+    const persistedCountsRaw = readMeta(db, CLAIM_POLICY_SEED_META_KEYS.seededCounts);
+    let persistedCounts: Record<string, number> = {};
+    if (persistedCountsRaw != null) {
+        try {
+            persistedCounts = JSON.parse(persistedCountsRaw) as Record<string, number>;
+        } catch {
+            persistedCounts = {};
+        }
+    }
+    for (const outcome of outcomes) {
+        persistedCounts[outcome.maturity] = (persistedCounts[outcome.maturity] ?? 0) + 1;
+    }
+    writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.seededCounts, JSON.stringify(persistedCounts));
     writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.cursor, String(rows[rows.length - 1].revisionId));
     return { kind: "seeded", outcomes };
 }

@@ -251,6 +251,37 @@ describe("claim policy surface enforcement", () => {
         }
     });
 
+    test("a raw stale verification outranks a stale projection's eligibility", () => {
+        const db = migratedDb();
+        try {
+            const seed = seedMemory(db, "stale-raw-1", "stale via policy-unaware writer");
+            verify(db, seed.memoryId);
+            const memories = getMemoriesByProject(db, PROJECT);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).toContain(seed.memoryId);
+            // Reproduce a policy-unaware writer (a pre-v86 binary holding the
+            // database open): the raw verification event lands, but nothing
+            // refreshes the projection, whose auto_eligible bit stays 1.
+            db.prepare(
+                "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'held-open-writer', 9_000)",
+            ).run(seed.revisionId);
+            const probe = db
+                .prepare(
+                    "SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+                )
+                .get(seed.revisionId) as { auto: number };
+            expect(probe.auto).toBe(1);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).not.toContain(seed.memoryId);
+            const explicit = filterMemoriesByPolicy(db, memories, "explicit_search");
+            expect(explicit.labels.get(seed.memoryId)).toContain("stale");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("a contradicted row with no projection row is absent from explicit search", () => {
         const db = migratedDb();
         try {

@@ -44,6 +44,15 @@ export interface MemoryPolicyRow {
     contradicted: boolean;
     quarantined: boolean;
     rejected: boolean;
+    /**
+     * Authoritative soft-hide facts, read from `verification_events` /
+     * `claim_disposition_events` (mirroring `readActiveDispositions`): a
+     * policy-unaware writer can append a stale/flagged verification without
+     * refreshing the projection, and projected eligibility must not outlive
+     * that event.
+     */
+    stale: boolean;
+    disputed: boolean;
     dispositions: string[];
     policyVersion: number;
     generation: number;
@@ -112,7 +121,29 @@ export function readMemoryPolicyRows(
                             WHERE revision_id = claims.current_revision_id
                               AND disposition = 'rejected'
                             ORDER BY id DESC LIMIT 1
-                        ), 'clear') = 'assert' AS rejected
+                        ), 'clear') = 'assert' AS rejected,
+                        COALESCE((
+                            SELECT outcome FROM verification_events
+                            WHERE revision_id = claims.current_revision_id
+                              AND outcome IN ('verified', 'stale', 'flagged')
+                            ORDER BY id DESC LIMIT 1
+                        ), '') = 'stale' OR COALESCE((
+                            SELECT action FROM claim_disposition_events
+                            WHERE revision_id = claims.current_revision_id
+                              AND disposition = 'stale'
+                            ORDER BY id DESC LIMIT 1
+                        ), 'clear') = 'assert' AS stale,
+                        COALESCE((
+                            SELECT outcome FROM verification_events
+                            WHERE revision_id = claims.current_revision_id
+                              AND outcome IN ('verified', 'stale', 'flagged')
+                            ORDER BY id DESC LIMIT 1
+                        ), '') = 'flagged' OR COALESCE((
+                            SELECT action FROM claim_disposition_events
+                            WHERE revision_id = claims.current_revision_id
+                              AND disposition = 'disputed'
+                            ORDER BY id DESC LIMIT 1
+                        ), 'clear') = 'assert' AS disputed
                  FROM legacy_memory_claims lmc
                  JOIN claims ON claims.id = lmc.claim_id
                  LEFT JOIN claim_effective_policy policy
@@ -135,6 +166,8 @@ export function readMemoryPolicyRows(
             contradicted: number;
             quarantined: number;
             rejected: number;
+            stale: number;
+            disputed: number;
         }>;
         for (const row of rows) {
             let dispositions: string[] = [];
@@ -156,6 +189,8 @@ export function readMemoryPolicyRows(
                 contradicted: row.contradicted === 1,
                 quarantined: row.quarantined === 1,
                 rejected: row.rejected === 1,
+                stale: row.stale === 1,
+                disputed: row.disputed === 1,
                 dispositions,
                 policyVersion: row.policyVersion ?? 0,
                 generation: row.generation ?? 0,
@@ -182,22 +217,39 @@ export function decideMemoryPolicy(
     // or a future policy version. Fail closed on automatic surfaces; explicit
     // search may still show it as a labeled unknown.
     const unprojected = row == null || !row.projected || row.policyVersion > CLAIM_POLICY_VERSION;
+    // Authoritative soft-hide facts outrank projected eligibility: a
+    // policy-unaware writer (a pre-v86 binary holding the database open) can
+    // append a stale/flagged verification without refreshing the projection,
+    // and the stored `autoEligible` must not keep injecting that revision.
+    const authoritativeStale = row != null && row.stale;
+    const authoritativeDisputed = row != null && row.disputed;
     if (surface === "explicit_search") {
         if (!unprojected && !row.explicitEligible) {
             return { eligible: false, label: null };
+        }
+        const dispositions = [...(row?.dispositions ?? [])];
+        if (authoritativeStale && !dispositions.includes("stale")) dispositions.push("stale");
+        if (authoritativeDisputed && !dispositions.includes("disputed")) {
+            dispositions.push("disputed");
         }
         return {
             eligible: true,
             label: explicitSearchLabelFromFields({
                 effectiveMaturity: unprojected ? "CANDIDATE" : row.effectiveMaturity,
                 originTaint: unprojected ? "unknown" : row.originTaint,
-                dispositions: row?.dispositions ?? [],
+                dispositions,
                 policyMissing: unprojected,
-                autoEligible: !unprojected && row.autoEligible,
+                autoEligible:
+                    !unprojected &&
+                    row.autoEligible &&
+                    !authoritativeStale &&
+                    !authoritativeDisputed,
             }),
         };
     }
-    if (unprojected || !row.autoEligible) return { eligible: false, label: null };
+    if (unprojected || !row.autoEligible || authoritativeStale || authoritativeDisputed) {
+        return { eligible: false, label: null };
+    }
     return { eligible: true, label: null };
 }
 

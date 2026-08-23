@@ -25,6 +25,7 @@ import {
     providerOutputFailureFromInvalidManifest,
 } from "../dreamer/provider-output-failure";
 import { getMemoriesByProject, type Memory } from "../memory";
+import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
 import {
     buildCompressCuesPrompt,
     COMPRESS_CUES_SYSTEM_PROMPT,
@@ -213,11 +214,16 @@ function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string
 
 /** Select the memories whose cue is missing or stale (content hash mismatch). */
 function selectCandidates(db: Database, projectIdentity: string): CueCandidate[] {
-    // Cue rows are inert stored data; the policy gate lives at the injection
-    // boundary (`getMuralCoverage`/`resolveMural`), so a row that is currently
-    // policy-hidden still gets a cue and needs no recompression if it later
-    // becomes eligible.
-    const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+    // Cue compression sends memory CONTENT to a child-model prompt — an
+    // automatic surface — so the pool passes the same automatic policy gate
+    // as injection. A currently hidden row gets its cue on the pass after it
+    // becomes eligible; the render gate (`getMuralCoverage`/`resolveMural`)
+    // stays the injection-time authority.
+    const memories = filterMemoriesByPolicy(
+        db,
+        getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
+        "auto_inject",
+    ).memories;
     const cueState = getMuralCueState(
         db,
         memories.map((memory) => memory.id),

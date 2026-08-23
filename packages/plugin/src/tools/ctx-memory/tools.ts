@@ -25,7 +25,11 @@ import {
 } from "../../features/magic-context/memory/embedding";
 import { invalidateMemory } from "../../features/magic-context/memory/embedding-cache";
 import { computeNormalizedHash } from "../../features/magic-context/memory/normalize-hash";
-import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
+import {
+    decideMemoryPolicy,
+    filterMemoriesByPolicy,
+    readMemoryPolicyRows,
+} from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
@@ -597,6 +601,20 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     workspaceIdentitySet.identities.length > 1
                         ? targetIdentityForStoredPath(memory.projectPath) === projectPath
                         : memoryBelongsToProject(memory, projectPath);
+                // Hard-hidden and rejected rows return uniform absence on
+                // every agent surface — including as MUTATION targets:
+                // updating a policy-hidden memory would mint a fresh current
+                // revision without the old revision's disposition and
+                // resurface the content. One decision covers every id-based
+                // branch (update, merge, archive) for every agent, so the
+                // dreamer cannot feed hidden content back into its prompts
+                // either.
+                const memoryPolicyDeniesToolTarget = (memoryIds: readonly number[]): boolean => {
+                    const rows = readMemoryPolicyRows(deps.db, memoryIds);
+                    return memoryIds.some(
+                        (id) => !decideMemoryPolicy(rows.get(id), "explicit_search").eligible,
+                    );
+                };
                 const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
                 if (
                     embeddingSnapshot
@@ -829,7 +847,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             ? memoryVisibleToTool(memory)
                             : memoryOwnedByTool(memory)
                         : false;
-                    if (!memory || !rawProjectPath || !updateAllowed) {
+                    if (
+                        !memory ||
+                        !rawProjectPath ||
+                        !updateAllowed ||
+                        memoryPolicyDeniesToolTarget([updateId])
+                    ) {
                         return `Error: Memory with ID ${updateId} was not found.`;
                     }
                     if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {
@@ -975,6 +998,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             : "Error: A valid category is required when action is 'merge'.";
                     }
                     if (sourceMemories.length !== ids.length) {
+                        return "Error: One or more source memories were not found.";
+                    }
+                    if (memoryPolicyDeniesToolTarget(ids)) {
                         return "Error: One or more source memories were not found.";
                     }
                     // Cross-identity consolidation is a DREAMER-ONLY capability: the
@@ -1249,7 +1275,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 ? memoryVisibleToTool(memory)
                                 : memoryOwnedByTool(memory)
                             : false;
-                        if (!memory || !rawProjectPath || !archiveAllowed) {
+                        if (
+                            !memory ||
+                            !rawProjectPath ||
+                            !archiveAllowed ||
+                            memoryPolicyDeniesToolTarget([memoryId])
+                        ) {
                             return `Error: Memory with ID ${memoryId} was not found.`;
                         }
                         if (
