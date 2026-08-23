@@ -380,13 +380,27 @@ function writeTransformDecisionBestEffort(dbPath: string, row: TransformDecision
     }
 }
 
-function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
-    const db = new Database(dbPath);
-    try {
-        writeTransformDecisionRowOnDatabase(db, row, true);
-    } finally {
-        closeQuietly(db);
+// One long-lived non-blocking telemetry handle per database path. Opening a
+// connection per write costs a file open, schema read, and close on every
+// cache-affecting pass; the handle is separate from the main plugin connection
+// so busy_timeout=0 keeps telemetry writes non-blocking (a locked DB throws
+// SQLITE_BUSY immediately and the row is dropped by the best-effort caller).
+// If the DB file is ever replaced on disk, writes land on the old inode until
+// restart — acceptable for drop-on-contention telemetry.
+const telemetryDbByPath = new Map<string, Database>();
+
+function telemetryDatabase(dbPath: string): Database {
+    let db = telemetryDbByPath.get(dbPath);
+    if (!db) {
+        db = new Database(dbPath);
+        db.exec("PRAGMA busy_timeout=0");
+        telemetryDbByPath.set(dbPath, db);
     }
+    return db;
+}
+
+function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
+    writeTransformDecisionRowOnDatabase(telemetryDatabase(dbPath), row, false);
 }
 
 function writeTransformDecisionRowOnDatabase(
@@ -450,6 +464,8 @@ export const __test = {
         scheduledWriteTokensBySession.clear();
         writerOverrideForTests = null;
         retentionOverrideForTests = null;
+        for (const db of telemetryDbByPath.values()) closeQuietly(db);
+        telemetryDbByPath.clear();
     },
     setWriterForTests(writer: TransformDecisionWriter | null): void {
         writerOverrideForTests = writer;
