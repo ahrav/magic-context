@@ -5811,12 +5811,28 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
+                // Exact-revision verification attests the OLD bytes: a content
+                // rewrite withdraws a verified projection instead of carrying
+                // it, so arbitrary replacement content cannot inherit VERIFIED
+                // maturity. 'unverified' with a positive verified_at is the
+                // documented withdrawn shape (the TypeScript harness twin
+                // writes the same shape); verifier-authored rewrites go
+                // through the verification applier, which re-verifies
+                // explicitly.
                 "UPDATE mc_memories
                     SET content = ?1,
                         normalized_hash = ?2,
                         updated_at = ?3,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        verified_at = CASE
+                            WHEN verification_status = 'verified'
+                                THEN COALESCE(verified_at, ?3)
+                            ELSE verified_at END,
+                        verification_status = CASE
+                            WHEN verification_status = 'verified'
+                                THEN 'unverified'
+                            ELSE verification_status END
                   WHERE id = ?4",
                 params![content, normalized_hash, now_ms, id],
             )
@@ -11613,12 +11629,24 @@ impl McStore {
                 return Ok(MemoryMutationOutcome::Duplicate(duplicate_id));
             }
             tx.execute(
+                // Withdrawal twin of `Tx::update_memory_content`: a content
+                // rewrite must not carry a verified projection onto bytes the
+                // verification never attested. 'unverified' with a positive
+                // verified_at is the documented withdrawn shape.
                 "UPDATE mc_memories
                     SET content = ?1,
                         normalized_hash = ?2,
                         updated_at = ?3,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        verified_at = CASE
+                            WHEN verification_status = 'verified'
+                                THEN COALESCE(verified_at, ?3)
+                            ELSE verified_at END,
+                        verification_status = CASE
+                            WHEN verification_status = 'verified'
+                                THEN 'unverified'
+                            ELSE verification_status END
                   WHERE id = ?4",
                 params![content, normalized_hash, now_ms, id],
             )?;
@@ -22929,6 +22957,49 @@ mod tests {
         assert_eq!(mutations[0].target_memory_id, id);
         assert_eq!(mutations[0].mutation_type, "update");
         assert_eq!(mutations[0].new_content.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn update_memory_content_withdraws_verified_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let id = store
+            .insert_memory(insert_input(project, "ARCHITECTURE", "attested bytes", 1))
+            .unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET verification_status = 'verified', verified_at = 5
+                      WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Verification attests the old bytes: a rewrite lands in the withdrawn
+        // shape ('unverified' with the positive verified_at preserved) instead
+        // of carrying VERIFIED onto content the verifier never saw.
+        let updated = store
+            .update_memory_content(project, id, "replacement bytes", 9)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.verification_status, "unverified");
+        assert_eq!(updated.verified_at, Some(5));
+
+        // A never-verified row is untouched by the withdrawal clause.
+        let plain = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "plain", 1))
+            .unwrap();
+        let plain_updated = store
+            .update_memory_content(project, plain, "plain v2", 9)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain_updated.verification_status, "unverified");
+        assert_eq!(plain_updated.verified_at, None);
     }
 
     #[test]

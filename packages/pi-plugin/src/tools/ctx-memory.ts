@@ -649,6 +649,26 @@ export function createCtxMemoryTool(
 												sourceSessionId: sessionId,
 												sourceType: dreamerAllowed ? "dreamer" : "agent",
 											});
+											if (!inserted.inserted) {
+												// Raced duplicate recovered from the unique
+												// constraint: same policy-before-mutation
+												// contract as the pre-check branch above — a
+												// hidden row's id and seen count stay
+												// undisclosed and untouched.
+												if (
+													memoryPolicyDeniesToolTarget([inserted.memory.id])
+												) {
+													return {
+														result: {
+															memoryId: inserted.memory.id,
+															duplicate: true,
+															denied: true,
+														},
+														effects: [],
+													};
+												}
+												updateMemorySeenCount(deps.db, inserted.memory.id);
+											}
 											return {
 												result: {
 													memoryId: inserted.memory.id,
@@ -709,9 +729,13 @@ export function createCtxMemoryTool(
 						writeIdentity,
 					);
 					if (!insertResult.inserted) {
+						// The recovery is non-mutating, so the policy decision runs
+						// before the raced row is touched: a hidden duplicate gets the
+						// uniform refusal with its seen count intact.
 						if (memoryPolicyDeniesToolTarget([insertResult.memory.id])) {
 							return err(`Error: Memory could not be saved in ${rawCategory}.`);
 						}
+						updateMemorySeenCount(deps.db, insertResult.memory.id);
 						return ok(
 							`Memory already exists [ID: ${insertResult.memory.id}] in ${rawCategory} (seen count incremented).`,
 						);

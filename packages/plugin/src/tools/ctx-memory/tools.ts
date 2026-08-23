@@ -816,6 +816,26 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                                     ? "dreamer"
                                                     : getSourceType(deps),
                                         });
+                                        if (!inserted.inserted) {
+                                            // Raced duplicate recovered from the unique
+                                            // constraint: same policy-before-mutation
+                                            // contract as the pre-check branch above —
+                                            // a hidden row's id and seen count stay
+                                            // undisclosed and untouched.
+                                            if (
+                                                memoryPolicyDeniesToolTarget([inserted.memory.id])
+                                            ) {
+                                                return {
+                                                    result: {
+                                                        memoryId: inserted.memory.id,
+                                                        duplicate: true,
+                                                        denied: true,
+                                                    },
+                                                    effects: [],
+                                                };
+                                            }
+                                            updateMemorySeenCount(deps.db, inserted.memory.id);
+                                        }
                                         return {
                                             result: {
                                                 memoryId: inserted.memory.id,
@@ -879,9 +899,14 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         writeIdentity,
                     );
                     if (!insertResult.inserted) {
+                        // The recovery is non-mutating, so the policy decision
+                        // runs before the raced row is touched: a hidden
+                        // duplicate gets the uniform refusal with its seen
+                        // count intact.
                         if (memoryPolicyDeniesToolTarget([insertResult.memory.id])) {
                             return `Error: Memory could not be saved in ${category}.`;
                         }
+                        updateMemorySeenCount(deps.db, insertResult.memory.id);
                         requestRustMemorySync(deps, toolContext.sessionID);
                         return `Memory already exists [ID: ${insertResult.memory.id}] in ${category} (seen count incremented).`;
                     }

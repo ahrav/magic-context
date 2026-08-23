@@ -822,7 +822,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
         ).toEqual([memory.id]);
     });
 
-    it("duplicate: idempotent re-insert bumps stats seen_count only; direct insert throws UNIQUE", () => {
+    it("duplicate: idempotent re-insert is non-mutating; direct insert throws UNIQUE", () => {
         migrated = migratedDb();
         const first = insertMemory(migrated, {
             projectPath: "git:v82-charter",
@@ -831,6 +831,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
             nowMs: 1_000,
         });
         const baseBefore = JSON.stringify(baseRow(migrated, first.id));
+        const statsBefore = JSON.stringify(statsRow(migrated, first.id));
 
         const dup = insertMemoryIdempotent(migrated, {
             projectPath: "git:v82-charter",
@@ -842,11 +843,10 @@ describe("migrated-v82 mutation inventory characterization", () => {
 
         expect(dup.inserted).toBeFalse();
         expect(dup.memory.id).toBe(first.id);
-        expect(dup.memory.seenCount).toBe(2);
-        // The base row is byte-identical: telemetry lives in memory_stats.
+        // The recovery mutates nothing: a raced row can be policy-hidden, so
+        // the caller owns the seen-count bump after its visibility decision.
         expect(JSON.stringify(baseRow(migrated, first.id))).toBe(baseBefore);
-        expect(statsRow(migrated, first.id)?.seen_count).toBe(2);
-        expect((statsRow(migrated, first.id)?.last_seen_at as number) > 1_000).toBeTrue();
+        expect(JSON.stringify(statsRow(migrated, first.id))).toBe(statsBefore);
 
         expect(() =>
             insertMemory(migrated, {

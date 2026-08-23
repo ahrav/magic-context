@@ -568,6 +568,16 @@ export function createMagicContextCommandHandler(deps: {
     projectRoot?: string;
     /** Active project identity as stored in `memories.project_path`. */
     projectPath?: string;
+    /** Resolve the project for the invoking session at call time: the session
+     * can be resumed in (or moved to) a different directory than the hook's
+     * construction-time project, so approval/enforcement must target the
+     * ACTIVE project — the same per-call discipline as `ctx_memory`'s
+     * `toolContext.directory` and Pi's `resolveProject`. Absent resolver
+     * falls back to the construction-time values. */
+    resolveProjectForSession?: (sessionId: string) => {
+        projectPath?: string;
+        projectRoot: string;
+    };
     sidekick?: {
         config: SidekickConfig;
         projectPath: string;
@@ -668,15 +678,20 @@ export function createMagicContextCommandHandler(deps: {
             let result = "";
 
             if (isApprove || isEnforce) {
-                if (!deps.projectPath || !deps.projectRoot) {
+                // Per-call project resolution: the invoking session may run in
+                // a different project than the hook's construction-time one.
+                const resolved = deps.resolveProjectForSession?.(sessionId);
+                const projectPath = resolved ? resolved.projectPath : deps.projectPath;
+                const projectRoot = resolved ? resolved.projectRoot : deps.projectRoot;
+                if (!projectPath || !projectRoot) {
                     result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Unavailable\n\nNo active project is configured for this session.`;
                 } else if (isSubagentSession(deps.db, sessionId)) {
                     result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Refused\n\n${isApprove ? "Approval" : "Enforcement"} commands are user-only and unavailable to subagent sessions.`;
                 } else {
                     const commandDeps = {
                         db: deps.db,
-                        projectPath: deps.projectPath,
-                        projectRoot: deps.projectRoot,
+                        projectPath,
+                        projectRoot,
                         host: "opencode" as const,
                         sessionId,
                     };
