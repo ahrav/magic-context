@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { PiTestHarness } from "../src/pi-harness";
+import { promoteMemoryToVerified } from "../src/test-db";
 
 let h: PiTestHarness;
 
@@ -67,6 +68,9 @@ describe("pi memory injection", () => {
         const directive = "pi seeded directive: prefer stable cross-harness memory checks";
         emitMemoryWriteOnce(directive);
         await h.sendPrompt("remember the project memory directive", { timeoutMs: 60_000 });
+        // v86 trust policy: an agent write starts CANDIDATE and is hidden
+        // from automatic surfaces; injection needs a verified row.
+        promoteMemoryToVerified(h.contextDbPath(), directive);
         await h.newSession();
 
         h.mock.reset();

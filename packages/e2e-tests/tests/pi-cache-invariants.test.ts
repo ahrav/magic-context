@@ -14,7 +14,7 @@
 import { describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
-import { insertMemory, updateMemoryContent } from "../../plugin/src/features/magic-context/memory";
+import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
@@ -28,6 +28,7 @@ import {
 } from "../src/cache-analysis";
 import type { CapturedRequest, MockUsage } from "../src/mock-provider/server";
 import { PiTestHarness } from "../src/pi-harness";
+import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 const MODEL_LIMIT = 100_000;
@@ -148,7 +149,7 @@ function projectIdentity(h: PiTestHarness): string {
 }
 
 function writeDb<T>(h: PiTestHarness, fn: (db: Database) => T): T {
-    const db = new Database(h.contextDbPath());
+    const db = openTestDb(h.contextDbPath(), { readwrite: true });
     try {
         return fn(db);
     } finally {
@@ -161,16 +162,48 @@ function seedMemory(
     content: string,
     category: Memory["category"] = "PROJECT_RULES",
 ): number {
+    return writeDb(h, (db) => {
+        const id = insertMemory(db, {
+            projectPath: projectIdentity(h),
+            category,
+            content,
+            // v86 trust policy: explicit-user origin rows are auto-eligible,
+            // but the effective policy is computed by an ASYNC evaluator; a
+            // synchronous verification promotion makes eligibility
+            // deterministic before the next turn materializes m[0].
+            sourceType: "user",
+        }).id;
+        updateMemoryVerification(db, id, "verified");
+        return id;
+    });
+}
+
+function projectEpoch(h: PiTestHarness): number {
     return writeDb(
         h,
         (db) =>
-            insertMemory(db, {
-                projectPath: projectIdentity(h),
-                category,
-                content,
-                sourceType: "historian",
-            }).id,
+            (
+                db
+                    .prepare(
+                        "SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
+                    )
+                    .get(projectIdentity(h)) as { epoch: number } | null
+            )?.epoch ?? 0,
     );
+}
+
+/** Pin the project epoch to a captured value. Eligible writes and
+ * verification promotions bump the epoch, which HARD-refolds m[0]; the
+ * m[1] delta lanes under test only fire when memory ids advance WITHOUT an
+ * epoch change, so tests pin the epoch back after seeding. */
+function setProjectEpoch(h: PiTestHarness, epoch: number): void {
+    writeDb(h, (db) => {
+        db.prepare(
+            `INSERT INTO project_state (project_path, project_memory_epoch)
+             VALUES (?, ?)
+             ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = excluded.project_memory_epoch`,
+        ).run(projectIdentity(h), epoch);
+    });
 }
 
 /** Queue the memory-update record used when a memory is replaced, archived, or deleted. */
@@ -446,7 +479,9 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
             expect(m0Baseline).toContain("B10 baseline rule");
 
             await sendTurn(h, "pi B10 turn 4: high usage marks the next pass execute.", "pi B10 pressure", HIGH_USAGE);
+            const epochBeforeAdditive = projectEpoch(h);
             seedMemory(h, "B10 fresh rule: always run the full gate before a release.");
+            setProjectEpoch(h, epochBeforeAdditive);
             await sendTurn(h, "pi B10 turn 5: execute pass surfaces the new memory.", "pi B10 surface");
 
             const surfaceReq = mainRequests(h).find((r) => extractM1(r.body)?.includes("B10 fresh rule"));
@@ -482,7 +517,14 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
             expect(m0Baseline).toContain("B11 original rule");
 
             await sendTurn(h, "pi B11 turn 4: high usage marks the next pass execute.", "pi B11 pressure", HIGH_USAGE);
+            const epochBeforeUpdate = projectEpoch(h);
             queueMemoryUpdate(h, memId, "B11 revised rule: deploys go straight to production with a feature flag.");
+            // A content rewrite withdraws verification (the successor revision
+            // starts CANDIDATE); re-verify through the real API so the revised
+            // row stays render-eligible, then pin the epoch so the mutation
+            // rides the m[1] delta instead of HARD-refolding m[0].
+            writeDb(h, (db) => updateMemoryVerification(db, memId, "verified"));
+            setProjectEpoch(h, epochBeforeUpdate);
             await sendTurn(h, "pi B11 turn 5: execute pass renders the memory-updates delta.", "pi B11 reconcile");
 
             const reconcileReq = mainRequests(h).find((r) => extractM1(r.body)?.includes("<memory-updates>"));
@@ -513,7 +555,9 @@ describe("pi cache invariants — m[0]/m[1] taxonomy", () => {
             expect(extractM0(mainRequests(h).at(-1)!.body)).toContain("<session-history></session-history>");
 
             await sendTurn(h, "pi B12 turn 4: high usage marks next pass execute.", "pi B12 pressure", HIGH_USAGE);
+            const epochBeforeSeed = projectEpoch(h);
             seedMemory(h, "B12 delta rule: keep the cache prefix byte-identical across defer passes.");
+            setProjectEpoch(h, epochBeforeSeed);
             await sendTurn(h, "pi B12 turn 5: execute pass surfaces the memory into m[1].", "pi B12 surface");
 
             let requests = mainRequests(h);
