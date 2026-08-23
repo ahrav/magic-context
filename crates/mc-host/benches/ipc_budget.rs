@@ -56,10 +56,17 @@ fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
-    env_var(name)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Parses an env knob, defaulting only when the variable is unset. A
+/// present but malformed value is a configuration error: silently
+/// substituting the default would finalize evidence for a workload the
+/// operator did not request, without recording any error.
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
+    match env_var(name) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|_| format!("{name}: malformed value {v:?}")),
+    }
 }
 
 fn main() {
@@ -70,7 +77,13 @@ fn main() {
     match env_var("MC_IPC_BUDGET_MODE").as_deref() {
         Some("collect") => std::process::exit(run_collect()),
         Some("plan") => {
-            print!("{}", render_plan());
+            match render_plan() {
+                Ok(plan) => print!("{plan}"),
+                Err(err) => {
+                    eprintln!("configuration: {err}");
+                    std::process::exit(1);
+                }
+            }
             return;
         }
         Some("aggregate") => std::process::exit(run_aggregate()),
@@ -263,12 +276,15 @@ fn read_collect_config() -> Result<CollectConfig, String> {
         }
         None => None,
     };
+    // Validated here so every later read of the rate (attempt naming,
+    // the open-loop collector) sees a well-formed value.
+    env_parse::<u64>("MC_IPC_BUDGET_RATE", 0)?;
     Ok(CollectConfig {
         out,
         arm,
         class,
         explicit_pair,
-        block: env_parse("MC_IPC_BUDGET_BLOCK", 1),
+        block: env_parse("MC_IPC_BUDGET_BLOCK", 1)?,
     })
 }
 
@@ -356,7 +372,8 @@ fn base_manifest(cfg: &CollectConfig, pair: Option<(u32, u32)>) -> Manifest {
 fn attempt_name(cfg: &CollectConfig) -> String {
     let mut name = format!("{}-{}-b{:02}", cfg.arm, cfg.class.label(), cfg.block);
     if cfg.arm == ARM_TCP_OPEN {
-        name.push_str(&format!("-r{}", env_parse("MC_IPC_BUDGET_RATE", 0u64)));
+        let rate = env_parse("MC_IPC_BUDGET_RATE", 0u64).expect("rate validated at config load");
+        name.push_str(&format!("-r{rate}"));
     }
     name
 }
@@ -486,9 +503,9 @@ fn collect_atomic(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String>
     let cfg = PingPongConfig {
         initiator_cpu: pair.0,
         responder_cpu: pair.1,
-        warmup_batches: env_parse("MC_IPC_BUDGET_WARMUP_BATCHES", 50),
-        batches: env_parse("MC_IPC_BUDGET_BATCHES", 200),
-        exchanges_per_batch: env_parse("MC_IPC_BUDGET_EXCHANGES", 10_000),
+        warmup_batches: env_parse("MC_IPC_BUDGET_WARMUP_BATCHES", 50)?,
+        batches: env_parse("MC_IPC_BUDGET_BATCHES", 200)?,
+        exchanges_per_batch: env_parse("MC_IPC_BUDGET_EXCHANGES", 10_000)?,
     };
     let output = run_ping_pong(cfg).map_err(|err| format!("atomic arm: {err}"))?;
     let hist_cfg = HistogramConfig::default();
@@ -568,8 +585,8 @@ fn check_host_and_conservation(
 
 fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
     let cfg = tcp::SerialConfig {
-        warmup_ops: env_parse("MC_IPC_BUDGET_WARMUP_OPS", 20_000),
-        measured_ops: env_parse("MC_IPC_BUDGET_MEASURED_OPS", 120_000),
+        warmup_ops: env_parse("MC_IPC_BUDGET_WARMUP_OPS", 20_000)?,
+        measured_ops: env_parse("MC_IPC_BUDGET_MEASURED_OPS", 120_000)?,
         histogram: HistogramConfig::default(),
     };
     let mut host = tcp_arm_setup(attempt, pair)?;
@@ -608,12 +625,12 @@ fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Str
 }
 
 fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
-    let rate = env_parse("MC_IPC_BUDGET_RATE", 0u64);
+    let rate = env_parse("MC_IPC_BUDGET_RATE", 0u64)?;
     let cfg = tcp::OpenLoopConfig {
         rate_per_sec: rate,
-        warmup: Duration::from_secs(env_parse("MC_IPC_BUDGET_WARMUP_SECS", 2)),
-        measure: Duration::from_secs(env_parse("MC_IPC_BUDGET_MEASURE_SECS", 10)),
-        inflight_cap: env_parse("MC_IPC_BUDGET_INFLIGHT_CAP", 1024),
+        warmup: Duration::from_secs(env_parse("MC_IPC_BUDGET_WARMUP_SECS", 2)?),
+        measure: Duration::from_secs(env_parse("MC_IPC_BUDGET_MEASURE_SECS", 10)?),
+        inflight_cap: env_parse("MC_IPC_BUDGET_INFLIGHT_CAP", 1024)?,
         histogram: HistogramConfig::default(),
     };
     let mut host = tcp_arm_setup(attempt, pair)?;
@@ -662,9 +679,9 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
 
 fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
     let cfg = tcp::ThroughputConfig {
-        depth: env_parse("MC_IPC_BUDGET_DEPTH", 32),
-        warmup: Duration::from_secs(env_parse("MC_IPC_BUDGET_WARMUP_SECS", 2)),
-        measure: Duration::from_secs(env_parse("MC_IPC_BUDGET_MEASURE_SECS", 10)),
+        depth: env_parse("MC_IPC_BUDGET_DEPTH", 32)?,
+        warmup: Duration::from_secs(env_parse("MC_IPC_BUDGET_WARMUP_SECS", 2)?),
+        measure: Duration::from_secs(env_parse("MC_IPC_BUDGET_MEASURE_SECS", 10)?),
     };
     let mut host = tcp_arm_setup(attempt, pair)?;
     let result = tcp::run_throughput(host.publication(), &cfg)
@@ -703,14 +720,14 @@ fn plan_arms() -> Vec<String> {
         .collect()
 }
 
-fn render_plan() -> String {
-    let blocks = env_parse("MC_IPC_BUDGET_BLOCKS", 10u32);
+fn render_plan() -> Result<String, String> {
+    let blocks = env_parse("MC_IPC_BUDGET_BLOCKS", 10u32)?;
     let arms = plan_arms();
     let mut out = String::new();
     for (block, order) in counterbalanced_schedule(blocks, &arms).iter().enumerate() {
         out.push_str(&format!("block {:02}: {}\n", block + 1, order.join(" -> ")));
     }
-    out
+    Ok(out)
 }
 
 fn run_aggregate() -> i32 {

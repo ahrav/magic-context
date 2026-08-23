@@ -28,7 +28,7 @@ use perf_measurement::{
 };
 use raw_client::{RawClient, FLAGS_INTERACTIVE, TY_ERROR, TY_REQUEST, TY_RESPONSE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Semaphore, TryAcquireError};
 
 const MODULE_ID: &str = "perf-echo";
 /// Bound on post-send drain before pending requests resolve as
@@ -216,7 +216,12 @@ async fn run_conn(
                 };
                 let permit = match inflight.clone().try_acquire_owned() {
                     Ok(permit) => permit,
-                    Err(_) => {
+                    // The reader closes the semaphore once the connection
+                    // is gone; the schedule must stop rather than record
+                    // the rest of the window as missed slots against a
+                    // connection that no longer exists.
+                    Err(TryAcquireError::Closed) => break,
+                    Err(TryAcquireError::NoPermits) => {
                         inflight_full += 1;
                         if interval_ns > 0 {
                             // Open loop: a saturated window drops the slot
@@ -248,6 +253,16 @@ async fn run_conn(
                 // The measured RTT starts here: after the in-flight permit
                 // wait, immediately before frame construction.
                 let issue_ns = Instant::now().duration_since(start).as_nanos() as u64;
+                // Open-loop window membership follows the scheduled time
+                // (the arrival process defines the window); closed-loop
+                // follows the issue time. Classifying an open-loop request
+                // by a late issue would move pre-warmup arrivals into the
+                // measured distribution under scheduler lag.
+                let window_ns = if interval_ns > 0 {
+                    scheduled_ns
+                } else {
+                    issue_ns
+                };
                 if meta_tx.send((corr, scheduled_ns, issue_ns)).is_err() {
                     break;
                 }
@@ -264,14 +279,14 @@ async fn run_conn(
                     // The slot is scheduled and terminal: mark it so the
                     // reader records WriteFailure instead of letting the
                     // stale meta entry rot into UnresolvedAtDrain.
-                    if issue_ns >= warmup_ns {
+                    if window_ns >= warmup_ns {
                         measured_sent.fetch_add(1, Ordering::Release);
                     }
                     let _ = meta_tx.send((corr, u64::MAX, issue_ns));
                     break;
                 }
                 sent_count.fetch_add(1, Ordering::Release);
-                if issue_ns >= warmup_ns {
+                if window_ns >= warmup_ns {
                     measured_sent.fetch_add(1, Ordering::Release);
                 }
             }
@@ -293,6 +308,16 @@ async fn run_conn(
     };
     let mut read_half = read_half;
     let mut pending: HashMap<u64, (u64, u64)> = HashMap::new();
+    // Window membership mirrors the sender: scheduled time in open loop,
+    // issue time in closed loop.
+    let open_loop = opts.rate > 0;
+    let in_window = move |sched: u64, issue: u64| {
+        if open_loop {
+            sched >= warmup_ns
+        } else {
+            issue >= warmup_ns
+        }
+    };
     let drain_meta = |meta_rx: &mut mpsc::UnboundedReceiver<(u64, u64, u64)>,
                       pending: &mut HashMap<u64, (u64, u64)>,
                       outcomes: &mut OutcomeCounts| {
@@ -304,9 +329,12 @@ async fn run_conn(
                     outcomes.record(Outcome::MissedSlot);
                 }
             } else if sched == u64::MAX {
-                pending.remove(&corr);
-                if issue >= warmup_ns {
-                    outcomes.record(Outcome::WriteFailure);
+                // Write-failure marker: the request's scheduled/issue pair
+                // is already in `pending` (meta precedes the write).
+                if let Some((sched0, issue0)) = pending.remove(&corr) {
+                    if in_window(sched0, issue0) {
+                        outcomes.record(Outcome::WriteFailure);
+                    }
                 }
             } else {
                 pending.insert(corr, (sched, issue));
@@ -341,8 +369,8 @@ async fn run_conn(
                 // Drain budget exhausted: everything still pending is a
                 // terminal unresolved outcome.
                 drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
-                for (_, (_, issue)) in pending.drain() {
-                    if issue >= warmup_ns {
+                for (_, (sched, issue)) in pending.drain() {
+                    if in_window(sched, issue) {
                         result.outcomes.record(Outcome::UnresolvedAtDrain);
                     }
                 }
@@ -381,7 +409,7 @@ async fn run_conn(
         };
         inflight.add_permits(1);
         resolved += 1;
-        let measured = issue >= warmup_ns;
+        let measured = in_window(sched, issue);
         match frame.ty {
             TY_RESPONSE => {
                 let valid = !expect_fixture || body_buf.as_slice() == FIXTURE_BODY;
@@ -433,8 +461,8 @@ async fn run_conn(
     drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
     // A closed connection resolves every remaining in-flight request.
     if result.closed_early {
-        for (_, (_, issue)) in pending.drain() {
-            if issue >= warmup_ns {
+        for (_, (sched, issue)) in pending.drain() {
+            if in_window(sched, issue) {
                 result.outcomes.record(Outcome::PeerClosed);
             }
         }
@@ -563,6 +591,9 @@ async fn main() {
         Workload::Raw => "raw-legacy",
         Workload::Json => perf_measurement::FIXTURE_LABEL,
     };
+    // The JSON workload always sends the fixed fixture regardless of
+    // --payload; the label reports the bytes actually sent per request.
+    let payload_bytes = body_bytes(&opts).len();
     println!(
         "RESULT label={} loop={} workload={} conns={} payload={} rate={} pipeline={} secs={} \
          sent={} completed={} measured={} closed_early={} inflight_full={} errors={:?}",
@@ -570,7 +601,7 @@ async fn main() {
         loop_kind,
         workload,
         opts.conns,
-        opts.payload,
+        payload_bytes,
         opts.rate,
         opts.pipeline,
         opts.secs,

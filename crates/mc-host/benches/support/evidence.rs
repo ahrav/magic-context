@@ -277,10 +277,17 @@ pub fn load_attempts(run_dir: &Path) -> Result<Vec<LoadedAttempt>, String> {
     let mut out = Vec::new();
     let entries =
         std::fs::read_dir(run_dir).map_err(|err| format!("{}: {err}", run_dir.display()))?;
-    let mut dirs: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| path.is_dir())
-        .collect();
+    // Enumeration errors fail the load: silently dropping an attempt
+    // directory would let aggregation publish a valid-looking partial
+    // summary that omits a finalized repetition.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("{}: {err}", run_dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path);
+        }
+    }
     dirs.sort();
     for dir in dirs {
         let manifest_path = dir.join(FINAL_MANIFEST);
