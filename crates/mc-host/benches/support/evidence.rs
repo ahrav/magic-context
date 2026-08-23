@@ -107,6 +107,7 @@ pub struct Manifest {
     pub build: BuildId,
     pub host: HostId,
     pub histogram: Option<HistogramConfig>,
+    pub host_load: Option<serde_json::Value>,
     /// Requested pair plus post-pin singleton affinity readbacks.
     pub affinity: Option<serde_json::Value>,
     pub outcomes: Option<OutcomeCounts>,

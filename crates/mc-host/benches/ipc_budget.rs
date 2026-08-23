@@ -259,6 +259,22 @@ fn read_collect_config() -> Result<CollectConfig, String> {
     })
 }
 
+fn loadavg() -> serde_json::Value {
+    let raw = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let fields: Vec<f64> = raw
+        .split_whitespace()
+        .take(3)
+        .filter_map(|f| f.parse().ok())
+        .collect();
+    serde_json::json!(fields)
+}
+
+fn stamp_end_load(attempt: &mut Attempt) {
+    if let Some(serde_json::Value::Object(map)) = attempt.manifest_mut().host_load.as_mut() {
+        map.insert("end".to_owned(), loadavg());
+    }
+}
+
 fn host_id() -> HostId {
     let read = |path: &str| {
         std::fs::read_to_string(path)
@@ -272,7 +288,7 @@ fn host_id() -> HostId {
                 .find(|line| line.starts_with("model name"))
                 .and_then(|line| line.split_once(':').map(|(_, v)| v.trim().to_owned()))
         })
-        .unwrap_or_else(|| "unknown".to_owned());
+        .unwrap_or_else(|| std::env::consts::ARCH.to_owned());
     HostId {
         hostname: read("/proc/sys/kernel/hostname"),
         kernel: read("/proc/sys/kernel/osrelease"),
@@ -312,6 +328,7 @@ fn base_manifest(cfg: &CollectConfig, pair: Option<(u32, u32)>) -> Manifest {
         build: build_id(),
         host: host_id(),
         histogram: None,
+        host_load: Some(serde_json::json!({ "begin": loadavg() })),
         affinity: None,
         outcomes: None,
         recorded_samples: None,
@@ -513,6 +530,7 @@ fn collect_atomic(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "batches": output.batch_mean_rtt_ns.len(),
         "exchanges_per_batch": cfg.exchanges_per_batch,
     }));
+    stamp_end_load(&mut attempt);
     attempt.finalize(State::Complete).map_err(|err| (None, err))
 }
 
@@ -584,6 +602,7 @@ fn collect_tcp_serial(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "scheduled": result.scheduled,
         "elapsed_secs": result.elapsed.as_secs_f64(),
     }));
+    stamp_end_load(&mut attempt);
     attempt.finalize(State::Complete).map_err(|err| (None, err))
 }
 
@@ -644,6 +663,7 @@ fn collect_tcp_open(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "scheduled_slots": result.scheduled_slots,
         "elapsed_secs": result.elapsed.as_secs_f64(),
     }));
+    stamp_end_load(&mut attempt);
     attempt.finalize(State::Complete).map_err(|err| (None, err))
 }
 
@@ -676,6 +696,7 @@ fn collect_tcp_throughput(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "goodput_bytes_per_sec": result.goodput_bytes_per_sec,
         "measured_secs": result.measured.as_secs_f64(),
     }));
+    stamp_end_load(&mut attempt);
     attempt.finalize(State::Complete).map_err(|err| (None, err))
 }
 
