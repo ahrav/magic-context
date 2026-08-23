@@ -2635,15 +2635,26 @@ export async function embedUnembeddedMemoriesForProject(
 
     const normalizedBatchSize = Math.max(1, Math.floor(batchSize));
     // Hard-hidden / rejected content never leaves the process, remote
-    // embedding providers included; the backlog query itself is policy-blind.
-    const fetched = getLoadUnembeddedMemoriesStatement(db)
-        .all(snapshot.modelId, projectIdentity, normalizedBatchSize)
-        .filter(isUnembeddedMemoryRow);
-    const embeddable = memoriesEligibleForEmbedding(
-        db,
-        fetched.map((memory) => memory.id),
-    );
-    const memories = fetched.filter((memory) => embeddable.has(memory.id));
+    // embedding providers included — but the backlog query is policy-blind
+    // and hidden rows stay unembedded forever, so a fixed-limit fetch could
+    // pin the batch to ineligible rows and starve every eligible memory
+    // behind them. Widen until the batch fills or the table is exhausted.
+    let fetchLimit = normalizedBatchSize * 4;
+    let memories: { id: number; content: string; normalized_hash: string }[] = [];
+    for (;;) {
+        const fetched = getLoadUnembeddedMemoriesStatement(db)
+            .all(snapshot.modelId, projectIdentity, fetchLimit)
+            .filter(isUnembeddedMemoryRow);
+        const embeddable = memoriesEligibleForEmbedding(
+            db,
+            fetched.map((memory) => memory.id),
+        );
+        memories = fetched
+            .filter((memory) => embeddable.has(memory.id))
+            .slice(0, normalizedBatchSize);
+        if (memories.length >= normalizedBatchSize || fetched.length < fetchLimit) break;
+        fetchLimit *= 4;
+    }
     if (memories.length === 0) return 0;
 
     try {
