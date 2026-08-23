@@ -5,6 +5,26 @@ Owner: PR 6 perf pipeline. No repository performance policy exists; nothing
 here is a pass/fail threshold. Numbers are evidence for optimization
 decisions on `crates/mc-host` only.
 
+> **Erratum (IPC budget follow-up).** Three properties of this contract
+> make its numbers non-comparable with the IPC budget in
+> [mc-host-ipc-budget.md](./mc-host-ipc-budget.md), which is the
+> authority for transport comparisons going forward:
+>
+> 1. **Closed-loop latency did not use the documented actual-send
+>    boundary.** The load generator subtracted the *scheduled* timestamp
+>    in closed-loop arms too, so "closed-loop p50" here includes
+>    in-flight permit queueing, and headline closed-loop arms pipelined
+>    32 requests — those values are queued completion latency, not
+>    serial RTT.
+> 2. **Raw request bodies.** Arms used a mode-byte + zero-fill body, not
+>    the committed compact JSON fixture that matches the production
+>    client's small-message shape.
+> 3. **No topology contract.** Runs did not pin or verify CPU pairs, so
+>    no hardware floor can be paired with these numbers.
+>
+> The results below stay frozen as recorded; do not infer improvements
+> or regressions by comparing them against IPC-budget values.
+
 ## System under test
 
 - `crates/mc-host` host runtime, release build (`--release`,
