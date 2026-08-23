@@ -12114,6 +12114,46 @@ impl McHandler {
             .await
     }
 
+    /// Cross-crate test seam: dispatch one parsed request, bypassing the transport. `RequestCtx` is transport-owned, so the authenticated round-trip test cannot call `handle()`. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub async fn dispatch_value_for_integration(
+        &self,
+        channel: u16,
+        request: Value,
+    ) -> HandlerOutcome {
+        self.dispatch_value_with_inbound_bytes(channel, request, None)
+            .await
+    }
+
+    /// Cross-crate test seam mirroring `on_bind`: `RouteBindRequest` needs a `RouteHandle`, whose constructor is private to the transport crate. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn bind_route_for_integration(
+        &self,
+        channel: u16,
+        project_root: &Path,
+        harness: &str,
+        session: &str,
+    ) {
+        let config = self.effective_config(project_root);
+        self.bind_route(
+            channel,
+            SessionBinding {
+                project_root: project_root.to_path_buf(),
+                harness: harness.to_owned(),
+                session: session.to_owned(),
+                model_key: None,
+                config,
+                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+            },
+        );
+    }
+
+    /// Cross-crate test seam mirroring the `on_hello_ack` store open: sharing one already-open handle lets the test seed and verify rows without fighting the store's single-writer lease. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn install_store_for_integration(&self, store: Arc<McStore>) {
+        let _ = self.store.set(store);
+    }
+
     async fn dispatch_value_with_inbound_bytes(
         &self,
         channel: u16,
