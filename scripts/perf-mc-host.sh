@@ -99,9 +99,17 @@ budget_block() {
     fi
   done
   # Cross-NUMA paired arms: auto-selection either finds a pair or
-  # finalizes a structured skip without failing the block.
-  BUDGET_PAIR="${BUDGET_CROSS_PAIR:-}" budget_collect atomic-floor cross-numa "$block" "$@"
-  BUDGET_PAIR="${BUDGET_CROSS_PAIR:-}" budget_collect tcp-serial cross-numa "$block" "$@"
+  # finalizes a structured skip without failing the block. Their order
+  # reverses on even blocks exactly like the same-L3 arms, so
+  # time-dependent drift cancels for the cross-NUMA paired comparison
+  # too.
+  local cross=(atomic-floor tcp-serial)
+  if (((block - 1) % 2 == 1)); then
+    cross=(tcp-serial atomic-floor)
+  fi
+  for arm in "${cross[@]}"; do
+    BUDGET_PAIR="${BUDGET_CROSS_PAIR:-}" budget_collect "$arm" cross-numa "$block" "$@"
+  done
 }
 
 budget_run() {

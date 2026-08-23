@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -338,15 +338,20 @@ async fn run_open_loop_inner(
             state.fail_pending(Outcome::UnresolvedAtDrain);
             break;
         }
-        match tokio::time::timeout(remaining, header.step(&mut read_half)).await {
-            Ok(Ok(None)) => {}
-            Ok(Ok(Some(frame))) => {
-                if state.consume(&mut read_half, frame).await.is_err() {
-                    state.fail_pending(Outcome::PeerClosed);
-                    break;
-                }
+        // The deadline bounds the whole receive, body included: a peer
+        // that sends a valid header and stalls mid-body would otherwise
+        // hang the drain inside `consume` despite the budget.
+        let step = tokio::time::timeout(remaining, async {
+            match header.step(&mut read_half).await {
+                Ok(None) => Ok(()),
+                Ok(Some(frame)) => state.consume(&mut read_half, frame).await,
+                Err(_) => Err(()),
             }
-            Ok(Err(_)) => {
+        })
+        .await;
+        match step {
+            Ok(Ok(())) => {}
+            Ok(Err(())) => {
                 state.fail_pending(Outcome::PeerClosed);
                 break;
             }
@@ -484,6 +489,7 @@ async fn run_throughput_inner(
     let mut body = Vec::new();
     let mut outcomes = OutcomeCounts::default();
     let mut corr = CORR_BASE;
+    let mut outstanding: HashSet<u64> = HashSet::with_capacity(cfg.depth);
     let mut offered = 0u64;
     let mut measuring = false;
     let mut measure_start = Instant::now();
@@ -493,6 +499,7 @@ async fn run_throughput_inner(
     // Prime the pipeline to the fixed depth.
     for _ in 0..cfg.depth {
         corr += 1;
+        outstanding.insert(corr);
         stream
             .write_all(&request_frame(channel, epoch, corr))
             .await
@@ -513,6 +520,13 @@ async fn run_throughput_inner(
         if decoded.ty == raw_client::TY_PING {
             continue;
         }
+        // A frame naming no outstanding request (a duplicate or stale
+        // response) is not a terminal: counting it would trigger an
+        // extra send, quietly deepening the pipeline beyond cfg.depth
+        // and inflating the reported throughput.
+        if !outstanding.remove(&decoded.corr) {
+            continue;
+        }
         if measuring {
             outcomes.record(classify_terminal(decoded.ty, &body));
         }
@@ -528,6 +542,7 @@ async fn run_throughput_inner(
         if measuring {
             offered += 1;
         }
+        outstanding.insert(corr);
         if stream
             .write_all(&request_frame(channel, epoch, corr))
             .await

@@ -552,6 +552,17 @@ fn check_host_and_conservation(
             outcomes.total()
         ));
     }
+    // Correctness is a gate, not an outcome to average over: a live host
+    // returning wrong bodies, protocol errors, or unexpected frames
+    // satisfies conservation, and publishing the successful subset would
+    // select latency from only the requests the host answered correctly.
+    let correctness_failures =
+        outcomes.protocol_error + outcomes.body_mismatch + outcomes.unexpected_frame;
+    if correctness_failures > 0 {
+        return Err(format!(
+            "{correctness_failures} correctness violation(s) in measured outcomes: {outcomes:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -564,6 +575,15 @@ fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Str
     let mut host = tcp_arm_setup(attempt, pair)?;
     let result =
         tcp::run_serial(host.publication(), &cfg).map_err(|err| format!("serial arm: {err}"))?;
+    if result.scheduled != cfg.measured_ops
+        || result.outcomes.peer_closed + result.outcomes.write_failure > 0
+    {
+        return Err(format!(
+            "serial window truncated: {} of {} measured operations scheduled on a connection \
+             that must stay healthy for the whole window (outcomes: {:?}); the attempt is invalid",
+            result.scheduled, cfg.measured_ops, result.outcomes
+        ));
+    }
     check_host_and_conservation(&mut host, &result.outcomes, result.scheduled)?;
     attempt.add_histogram("issue_to_terminal.hist", &result.histogram)?;
     let hist = &result.histogram;
