@@ -2618,7 +2618,7 @@ function getLoadUnembeddedMemoriesStatement(db: Database): PreparedStatement {
     let stmt = loadUnembeddedMemoriesStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?",
+            "SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL AND m.id > ? ORDER BY m.id LIMIT ?",
         );
         loadUnembeddedMemoriesStatements.set(db, stmt);
     }
@@ -2635,36 +2635,40 @@ export async function embedUnembeddedMemoriesForProject(
 
     const normalizedBatchSize = Math.max(1, Math.floor(batchSize));
     // Hard-hidden / rejected content never leaves the process, remote
-    // embedding providers included — but the backlog query is policy-blind
-    // and hidden rows stay unembedded forever, so a fixed-limit fetch could
-    // pin the batch to ineligible rows and starve every eligible memory
-    // behind them. Widen until the batch fills or the table is exhausted.
-    let fetchLimit = normalizedBatchSize * 4;
-    // Widening is bounded: past this ceiling a single pass would page most of
-    // the table (full content per row) into memory. Eligible rows beyond a
-    // ceiling-sized ineligible prefix wait for that prefix to shrink (rows
-    // embed or leave 'active') instead of being chased in one unbounded scan.
-    const fetchCeiling = normalizedBatchSize * 64;
-    let memories: { id: number; content: string; normalized_hash: string }[] = [];
+    // embedding providers included — and hidden rows are deliberately never
+    // embedded, so they sit in this backlog indefinitely. Walk the backlog in
+    // fixed-size id-ordered pages: each page bounds memory (a growing LIMIT
+    // would page most of the table in at once), and the walk runs to table
+    // exhaustion so no hidden prefix — of any length — can starve an eligible
+    // row behind it.
+    const pageSize = Math.max(normalizedBatchSize * 4, 64);
+    let cursor = 0;
+    const memories: { id: number; content: string; normalized_hash: string }[] = [];
     for (;;) {
-        const fetched = getLoadUnembeddedMemoriesStatement(db)
-            .all(snapshot.modelId, projectIdentity, fetchLimit)
-            .filter(isUnembeddedMemoryRow);
+        const page = getLoadUnembeddedMemoriesStatement(db).all(
+            snapshot.modelId,
+            projectIdentity,
+            cursor,
+            pageSize,
+        );
+        const fetched = page.filter(isUnembeddedMemoryRow);
+        const nextCursor = fetched.length > 0 ? fetched[fetched.length - 1].id : cursor;
         const embeddable = memoriesEligibleForEmbedding(
             db,
             fetched.map((memory) => memory.id),
         );
-        memories = fetched
-            .filter((memory) => embeddable.has(memory.id))
-            .slice(0, normalizedBatchSize);
+        for (const memory of fetched) {
+            if (memories.length >= normalizedBatchSize) break;
+            if (embeddable.has(memory.id)) memories.push(memory);
+        }
         if (
             memories.length >= normalizedBatchSize ||
-            fetched.length < fetchLimit ||
-            fetchLimit >= fetchCeiling
+            page.length < pageSize ||
+            nextCursor <= cursor
         ) {
             break;
         }
-        fetchLimit *= 4;
+        cursor = nextCursor;
     }
     if (memories.length === 0) return 0;
 

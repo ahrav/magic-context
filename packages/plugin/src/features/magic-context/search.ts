@@ -15,8 +15,7 @@ import {
     type Memory,
     ModuleMemoryAuthorityError,
     peekProjectEmbeddings,
-    searchMemoriesFTS,
-    searchMemoriesFTSUnion,
+    searchMemoriesFTSWithinIds,
     updateMemoryRetrievalCount,
 } from "./memory";
 import { cosineSimilarity } from "./memory/cosine-similarity";
@@ -643,24 +642,14 @@ async function getSemanticScores(args: {
     return pruneToLaneCeiling(semanticScores);
 }
 
-function getFtsMatches(args: {
+function getFtsEligibleMatches(args: {
     db: Database;
-    projectPath: string;
+    memoryIds: readonly number[];
     query: string;
     limit: number;
-    workspace?: SearchWorkspaceContext;
 }): Memory[] {
     try {
-        return args.workspace?.isWorkspaced
-            ? searchMemoriesFTSUnion(
-                  args.db,
-                  args.workspace.expandedIdentities,
-                  args.query,
-                  args.limit,
-                  args.workspace.ownIdentities,
-                  args.workspace.shareCategories,
-              )
-            : searchMemoriesFTS(args.db, args.projectPath, args.query, args.limit);
+        return searchMemoriesFTSWithinIds(args.db, args.memoryIds, args.query, args.limit);
     } catch (error) {
         log(
             `[search] FTS query failed for "${args.query}": ${error instanceof Error ? error.message : String(error)}`,
@@ -836,40 +825,17 @@ async function searchMemories(args: {
             dependsOn: hydrationDeps,
         }) ?? null;
     const candidateLimit = args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT;
-    // The FTS table ranks rows before the policy filter sees them, so hidden
-    // matches would consume candidate slots and — because a nonempty match
-    // set restricts the semantic lane to matched ids — could pin the semantic
-    // candidates to rows that are later discarded. Fetch, drop rows absent
-    // from the eligible set, and widen the fetch until the bound is satisfied
-    // or the table is exhausted, so a hidden-heavy corpus cannot starve an
-    // eligible lower-ranked match.
-    const eligibleMemoryIds = new Set(memories.map((memory) => memory.id));
-    let ftsFetchLimit = candidateLimit * 4;
-    // Widening is bounded: past this ceiling the loop would page most of the
-    // table — full content per row — into memory on a hidden-heavy corpus.
-    // Stopping at the ceiling degrades to fewer lexical candidates instead.
-    const ftsFetchCeiling = candidateLimit * 64;
-    let ftsMatches: Memory[] = [];
-    for (;;) {
-        const fetched = getFtsMatches({
-            db: args.db,
-            projectPath: args.projectPath,
-            query: args.query,
-            limit: ftsFetchLimit,
-            workspace: args.workspace,
-        });
-        ftsMatches = fetched
-            .filter((match) => eligibleMemoryIds.has(match.id))
-            .slice(0, candidateLimit);
-        if (
-            ftsMatches.length >= candidateLimit ||
-            fetched.length < ftsFetchLimit ||
-            ftsFetchLimit >= ftsFetchCeiling
-        ) {
-            break;
-        }
-        ftsFetchLimit *= 4;
-    }
+    // The FTS query ranks WITHIN the eligible id set, so hidden matches can
+    // neither consume candidate slots nor force a widening scan: one bounded
+    // fetch returns the top-ranked eligible matches exactly, however many
+    // hidden rows outrank them, and pins the semantic lane to rows that
+    // survive the policy filter.
+    const ftsMatches = getFtsEligibleMatches({
+        db: args.db,
+        memoryIds: memories.map((memory) => memory.id),
+        query: args.query,
+        limit: candidateLimit,
+    });
     lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
     const ftsScores = getFtsScores(ftsMatches);
     const semanticCandidates = selectSemanticCandidates({
