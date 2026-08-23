@@ -838,22 +838,39 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
     }
 
     let gaps = evidence::paired_gaps(&attempts)?;
-    let mut gap_ratios: Vec<f64> = gaps.iter().map(|g| g.ratio).collect();
-    let mut gap_ns: Vec<f64> = gaps.iter().map(|g| g.gap_ns).collect();
-    let gap_stats = if gaps.is_empty() {
+    // Gap statistics never pool topology classes: same-L3 and cross-NUMA
+    // pairs measure different hardware paths, so each class gets its own
+    // median and bootstrap interval, keyed by class label.
+    let mut gaps_by_class: std::collections::BTreeMap<String, (Vec<f64>, Vec<f64>)> =
+        std::collections::BTreeMap::new();
+    for g in &gaps {
+        let entry = gaps_by_class
+            .entry(g.class.clone().unwrap_or_default())
+            .or_default();
+        entry.0.push(g.ratio);
+        entry.1.push(g.gap_ns);
+    }
+    let gap_stats = if gaps_by_class.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::json!({
-            "blocks": gaps.len(),
-            "median_gap_ns": evidence::median(&mut gap_ns),
-            "min_gap_ns": gap_ns.first(),
-            "max_gap_ns": gap_ns.last(),
-            "median_ratio": evidence::median(&mut gap_ratios),
-            "min_ratio": gap_ratios.first(),
-            "max_ratio": gap_ratios.last(),
-            "ratio_bootstrap_95": evidence::bootstrap_interval(&gap_ratios, 2000, 42),
-            "gap_ns_bootstrap_95": evidence::bootstrap_interval(&gap_ns, 2000, 42),
-        })
+        let mut by_class = serde_json::Map::new();
+        for (class, (mut gap_ratios, mut gap_ns)) in gaps_by_class {
+            by_class.insert(
+                class,
+                serde_json::json!({
+                    "blocks": gap_ratios.len(),
+                    "median_gap_ns": evidence::median(&mut gap_ns),
+                    "min_gap_ns": gap_ns.first(),
+                    "max_gap_ns": gap_ns.last(),
+                    "median_ratio": evidence::median(&mut gap_ratios),
+                    "min_ratio": gap_ratios.first(),
+                    "max_ratio": gap_ratios.last(),
+                    "ratio_bootstrap_95": evidence::bootstrap_interval(&gap_ratios, 2000, 42),
+                    "gap_ns_bootstrap_95": evidence::bootstrap_interval(&gap_ns, 2000, 42),
+                }),
+            );
+        }
+        serde_json::Value::Object(by_class)
     };
 
     let states: Vec<serde_json::Value> = attempts
@@ -876,6 +893,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         "arms": arms_summary,
         "gaps": gaps.iter().map(|g| serde_json::json!({
             "run_block": g.run_block,
+            "class": g.class,
             "pair": g.pair,
             "atomic_rtt_ns": g.atomic_rtt_ns,
             "tcp_p50_ns": g.tcp_p50_ns,

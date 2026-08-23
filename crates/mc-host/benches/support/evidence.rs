@@ -26,9 +26,12 @@ pub const ARM_TCP_SERIAL: &str = "tcp-serial";
 pub const ARM_TCP_OPEN: &str = "tcp-open";
 pub const ARM_TCP_THROUGHPUT: &str = "tcp-throughput";
 
-/// Fixed-range three-significant-digit histogram bounds shared by every
-/// latency-recording arm: 100ns floor, 10s ceiling.
-pub const HIST_LOW_NS: u64 = 100;
+/// Fixed-range histogram bounds shared by every latency-recording arm:
+/// 1 ns unit floor, 10 s ceiling, 3 significant digits. HdrHistogram
+/// rounds `lowest_discernible_value` down to a power of two, so the unit
+/// floor must be 1 to keep sub-microsecond samples (the atomic-floor
+/// arm's 146-280 ns range) in distinct nanosecond buckets.
+pub const HIST_LOW_NS: u64 = 1;
 pub const HIST_HIGH_NS: u64 = 10_000_000_000;
 pub const HIST_SIGFIGS: u8 = 3;
 
@@ -188,14 +191,7 @@ impl Attempt {
         );
         self.manifest.state = state;
         self.manifest.finished_utc = Some(utc_now());
-        let tmp = self.dir.join("manifest.json.tmp");
-        let bytes = manifest_bytes(&self.manifest)?;
-        std::fs::write(&tmp, &bytes).map_err(|err| format!("{}: {err}", tmp.display()))?;
-        let final_path = self.dir.join(FINAL_MANIFEST);
-        std::fs::rename(&tmp, &final_path)
-            .map_err(|err| format!("{}: {err}", final_path.display()))?;
-        let _ = std::fs::remove_file(self.dir.join(RUNNING_MANIFEST));
-        Ok(final_path)
+        write_terminal_manifest(&self.dir, &self.manifest)
     }
 
     fn write_manifest(&self, name: &str) -> Result<(), String> {
@@ -211,29 +207,25 @@ fn manifest_bytes(manifest: &Manifest) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Publishes a terminal manifest atomically: writes `manifest.json.tmp`,
+/// renames it to `FINAL_MANIFEST`, then removes the running marker. The
+/// rename guarantees a reader never observes a torn final manifest, which
+/// would poison aggregation for the whole run directory.
+fn write_terminal_manifest(dir: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+    let tmp = dir.join("manifest.json.tmp");
+    let bytes = manifest_bytes(manifest)?;
+    std::fs::write(&tmp, &bytes).map_err(|err| format!("{}: {err}", tmp.display()))?;
+    let final_path = dir.join(FINAL_MANIFEST);
+    std::fs::rename(&tmp, &final_path).map_err(|err| format!("{}: {err}", final_path.display()))?;
+    let _ = std::fs::remove_file(dir.join(RUNNING_MANIFEST));
+    Ok(final_path)
+}
+
 pub fn utc_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("unix:{}.{:09}", now.as_secs(), now.subsec_nanos())
-}
-
-/// Creates a run directory, refusing a preexisting nonempty one.
-pub fn create_run_dir(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        let nonempty = std::fs::read_dir(path)
-            .map_err(|err| format!("{}: {err}", path.display()))?
-            .next()
-            .is_some();
-        if nonempty {
-            return Err(format!(
-                "output directory {} is not empty; refusing to append",
-                path.display()
-            ));
-        }
-        return Ok(());
-    }
-    std::fs::create_dir_all(path).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Rewrites every leftover running manifest under `run_dir` to a terminal
@@ -254,11 +246,7 @@ pub fn finalize_interrupted(run_dir: &Path) -> Result<Vec<PathBuf>, String> {
             .map_err(|err| format!("{}: {err}", running.display()))?;
         manifest.state = State::Interrupted;
         manifest.finished_utc = Some(utc_now());
-        let final_path = dir.join(FINAL_MANIFEST);
-        std::fs::write(&final_path, manifest_bytes(&manifest)?)
-            .map_err(|err| format!("{}: {err}", final_path.display()))?;
-        let _ = std::fs::remove_file(&running);
-        finalized.push(final_path);
+        finalized.push(write_terminal_manifest(&dir, &manifest)?);
     }
     Ok(finalized)
 }
@@ -386,6 +374,9 @@ pub fn merge_arm_histograms(
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GapRow {
     pub run_block: u32,
+    /// Topology class of both joined arms; rows from different classes
+    /// are never statistically comparable.
+    pub class: Option<String>,
     pub pair: (u32, u32),
     pub atomic_rtt_ns: f64,
     pub tcp_p50_ns: f64,
@@ -444,6 +435,7 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
         if let Some(tcp_p50) = tcp.get(key) {
             rows.push(GapRow {
                 run_block: key.0,
+                class: key.1.clone(),
                 pair: key.2,
                 atomic_rtt_ns: *atomic_rtt,
                 tcp_p50_ns: *tcp_p50,

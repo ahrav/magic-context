@@ -38,9 +38,15 @@ fn record(hist: &mut Histogram<u64>, outcomes: &mut OutcomeCounts, value_ns: u64
     }
 }
 
-/// Classifies one non-ping terminal frame against the fixture contract.
-fn classify_terminal(ty: u8, body: &[u8]) -> Outcome {
-    match ty {
+/// Classifies one non-ping terminal frame against the fixture and route
+/// contract. The pending identity on the wire is (channel, epoch, corr):
+/// a frame that resolves a pending correlation on the wrong channel or
+/// epoch is a routing failure, never a success.
+fn classify_terminal(frame: &raw_client::RawFrame, route: (u16, u32), body: &[u8]) -> Outcome {
+    if (frame.channel, frame.epoch) != route {
+        return Outcome::UnexpectedFrame;
+    }
+    match frame.ty {
         TY_RESPONSE if body == FIXTURE_BODY => Outcome::Success,
         TY_RESPONSE => Outcome::BodyMismatch,
         TY_ERROR => Outcome::ProtocolError,
@@ -183,7 +189,7 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
             if !measured {
                 break;
             }
-            match classify_terminal(decoded.ty, &body) {
+            match classify_terminal(&decoded, (channel, epoch), &body) {
                 Outcome::Success => record(&mut hist, &mut outcomes, rtt_ns),
                 other => outcomes.record(other),
             }
@@ -263,6 +269,7 @@ async fn run_open_loop_inner(
         pending: HashMap::new(),
         start,
         warmup_ns: cfg.warmup.as_nanos() as u64,
+        route: (channel, epoch),
         body: Vec::new(),
     };
     let deadline_ns = (cfg.warmup + cfg.measure).as_nanos() as u64;
@@ -290,10 +297,28 @@ async fn run_open_loop_inner(
                     match step {
                         Ok(None) => {}
                         Ok(Some(frame)) => {
-                            if state.consume(&mut read_half, frame).await.is_err() {
-                                state.fail_pending(Outcome::PeerClosed);
-                                truncated = true;
-                                break 'sender;
+                            // The body read is bounded: a peer that sends a
+                            // valid header and stalls mid-body would
+                            // otherwise hang the window with no deadline at
+                            // all, since the sleep arm above was already
+                            // cancelled when this arm won.
+                            let consumed = tokio::time::timeout(
+                                DRAIN_BUDGET,
+                                state.consume(&mut read_half, frame),
+                            )
+                            .await;
+                            match consumed {
+                                Ok(Ok(())) => {}
+                                Ok(Err(())) => {
+                                    state.fail_pending(Outcome::PeerClosed);
+                                    truncated = true;
+                                    break 'sender;
+                                }
+                                Err(_) => {
+                                    state.fail_pending(Outcome::UnresolvedAtDrain);
+                                    truncated = true;
+                                    break 'sender;
+                                }
                             }
                         }
                         Err(_) => {
@@ -383,6 +408,8 @@ struct OpenLoopState {
     pending: HashMap<u64, (u64, u64)>,
     start: Instant,
     warmup_ns: u64,
+    /// Route identity (channel, epoch) every terminal must carry.
+    route: (u16, u32),
     body: Vec<u8>,
 }
 
@@ -407,7 +434,7 @@ impl OpenLoopState {
         if scheduled_ns < self.warmup_ns {
             return Ok(());
         }
-        match classify_terminal(frame.ty, &self.body) {
+        match classify_terminal(&frame, self.route, &self.body) {
             Outcome::Success => {
                 // sched-to-completion spans both the lag and the
                 // issue-to-completion intervals, so it is the largest of
@@ -494,6 +521,11 @@ async fn run_throughput_inner(
     let mut measuring = false;
     let mut measure_start = Instant::now();
     let mut measured_elapsed = Duration::ZERO;
+    // First corr sent inside the measured window: terminals attribute to
+    // the REQUEST's window, so a response to a warmup send arriving
+    // inside the window is carry-in, never measured work.
+    let mut first_measured: Option<u64> = None;
+    let measured_corr = |first: Option<u64>, c: u64| first.is_some_and(|f| c >= f);
     let start = Instant::now();
 
     // Prime the pipeline to the fixed depth.
@@ -508,13 +540,21 @@ async fn run_throughput_inner(
 
     loop {
         if stream.read_exact(&mut header).await.is_err() {
-            outcomes.record(Outcome::PeerClosed);
+            for c in outstanding.drain() {
+                if measured_corr(first_measured, c) {
+                    outcomes.record(Outcome::PeerClosed);
+                }
+            }
             break;
         }
         let decoded = raw_client::decode_header(&header);
         body.resize(decoded.len as usize, 0);
         if decoded.len > 0 && stream.read_exact(&mut body).await.is_err() {
-            outcomes.record(Outcome::PeerClosed);
+            for c in outstanding.drain() {
+                if measured_corr(first_measured, c) {
+                    outcomes.record(Outcome::PeerClosed);
+                }
+            }
             break;
         }
         if decoded.ty == raw_client::TY_PING {
@@ -527,8 +567,8 @@ async fn run_throughput_inner(
         if !outstanding.remove(&decoded.corr) {
             continue;
         }
-        if measuring {
-            outcomes.record(classify_terminal(decoded.ty, &body));
+        if measured_corr(first_measured, decoded.corr) {
+            outcomes.record(classify_terminal(&decoded, (channel, epoch), &body));
         }
         let elapsed = start.elapsed();
         if !measuring && elapsed >= cfg.warmup {
@@ -541,6 +581,9 @@ async fn run_throughput_inner(
         corr += 1;
         if measuring {
             offered += 1;
+            if first_measured.is_none() {
+                first_measured = Some(corr);
+            }
         }
         outstanding.insert(corr);
         if stream
@@ -548,7 +591,17 @@ async fn run_throughput_inner(
             .await
             .is_err()
         {
-            outcomes.record(Outcome::WriteFailure);
+            // The failed send and every other outstanding measured
+            // request resolve as failures; the window did not complete.
+            for c in outstanding.drain() {
+                if measured_corr(first_measured, c) {
+                    outcomes.record(if c == corr {
+                        Outcome::WriteFailure
+                    } else {
+                        Outcome::PeerClosed
+                    });
+                }
+            }
             break;
         }
     }
@@ -560,13 +613,71 @@ async fn run_throughput_inner(
     if truncated {
         measured_elapsed = measure_start.elapsed();
     }
+    // The rate is snapshotted at the deadline; the bounded drain below
+    // resolves and validates the requests still in flight (they would
+    // otherwise never be correlated or body-checked) without extending
+    // the measured window.
+    let successful_at_deadline = outcomes.success;
+    if !truncated {
+        let drain_deadline = Instant::now() + DRAIN_BUDGET;
+        while outstanding
+            .iter()
+            .any(|c| measured_corr(first_measured, *c))
+        {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                for c in outstanding.drain() {
+                    if measured_corr(first_measured, c) {
+                        outcomes.record(Outcome::UnresolvedAtDrain);
+                    }
+                }
+                break;
+            }
+            let read = tokio::time::timeout(remaining, async {
+                stream.read_exact(&mut header).await?;
+                let decoded = raw_client::decode_header(&header);
+                body.resize(decoded.len as usize, 0);
+                if decoded.len > 0 {
+                    stream.read_exact(&mut body).await?;
+                }
+                std::io::Result::Ok(decoded)
+            })
+            .await;
+            match read {
+                Ok(Ok(decoded)) => {
+                    if decoded.ty == raw_client::TY_PING || !outstanding.remove(&decoded.corr) {
+                        continue;
+                    }
+                    if measured_corr(first_measured, decoded.corr) {
+                        outcomes.record(classify_terminal(&decoded, (channel, epoch), &body));
+                    }
+                }
+                Ok(Err(_)) => {
+                    for c in outstanding.drain() {
+                        if measured_corr(first_measured, c) {
+                            outcomes.record(Outcome::PeerClosed);
+                        }
+                    }
+                    break;
+                }
+                Err(_) => {
+                    for c in outstanding.drain() {
+                        if measured_corr(first_measured, c) {
+                            outcomes.record(Outcome::UnresolvedAtDrain);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
     let secs = measured_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
     Ok(ThroughputResult {
         offered,
         terminal: outcomes.total(),
         successful: outcomes.success,
-        goodput_bytes_per_sec: outcomes.success as f64 * FIXTURE_BODY.len() as f64 / secs,
-        successful_per_sec: outcomes.success as f64 / secs,
+        goodput_bytes_per_sec: successful_at_deadline as f64 * FIXTURE_BODY.len() as f64 / secs,
+        successful_per_sec: successful_at_deadline as f64 / secs,
         outcomes,
         measured: measured_elapsed,
         truncated,
@@ -630,7 +741,8 @@ impl SerialProbe {
                             .map_err(|err| format!("read body: {err}"))?;
                     }
                     if decoded.corr == *corr && decoded.ty != raw_client::TY_PING {
-                        if classify_terminal(decoded.ty, &body) != Outcome::Success {
+                        if classify_terminal(&decoded, (channel, epoch), &body) != Outcome::Success
+                        {
                             return Err("unexpected terminal during probe".to_owned());
                         }
                         break;
