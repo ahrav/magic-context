@@ -11493,7 +11493,9 @@ impl McStore {
                 AND ({visibility})"
         );
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare_cached(&sql)?;
+            // Not prepare_cached: the IN-list arity varies per call, so each
+            // shape is a near-unique SQL text that would churn the LRU cache.
+            let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     let memory = stored_memory_full_from_row(r)?;
@@ -12640,7 +12642,9 @@ impl McStore {
             visibility_binds.push(rusqlite::types::Value::from(
                 MEMORY_VISIBILITY_MUTATION_CATEGORY.to_string(),
             ));
-            let mut visibility_stmt = tx.prepare_cached(&visibility_sql)?;
+            // Not prepare_cached: the IN-list arity varies with projects.len(),
+            // so the SQL text is unstable across calls and would churn the cache.
+            let mut visibility_stmt = tx.prepare(&visibility_sql)?;
             let visibility_targets = visibility_stmt
                 .query_map(rusqlite::params_from_iter(visibility_binds.iter()), |row| {
                     row.get::<_, i64>(0)
@@ -12683,7 +12687,9 @@ impl McStore {
                         .iter()
                         .map(|target| rusqlite::types::Value::from(*target)),
                 );
-                let mut stmt = tx.prepare_cached(&sql)?;
+                // Not prepare_cached: the frontier shrinks each iteration, so
+                // the IN-list arity (and SQL text) is unique nearly every time.
+                let mut stmt = tx.prepare(&sql)?;
                 let batch = stmt
                     .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
                         let category: Option<String> = row.get(4)?;
