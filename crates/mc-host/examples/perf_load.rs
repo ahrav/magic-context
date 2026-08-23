@@ -1,19 +1,49 @@
 //! This binary drives the perf-harness host over loopback TCP.
-//! docs/perf/mc-host-baseline.md defines the benchmark arms and metrics.
+//! docs/perf/mc-host-baseline.md defines the historical benchmark arms;
+//! the shared measurement contract lives in
+//! `tests/support/perf_measurement.rs`.
+//!
+//! Timing semantics: issue time is captured after admission and
+//! immediately before frame construction. Closed-loop arms report
+//! issue-to-validated-terminal latency (serial mode, `--pipeline 1` via
+//! `--serial`, is the only closed-loop shape whose value is an RTT).
+//! Open-loop arms report scheduled-to-completion, issue-to-completion, and
+//! scheduler-lag distributions separately, preserving the original arrival
+//! schedule. Every scheduled request resolves to exactly one terminal
+//! outcome.
 
 #[path = "../tests/support/raw_client.rs"]
 mod raw_client;
+
+#[path = "../tests/support/perf_measurement.rs"]
+mod perf_measurement;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use perf_measurement::{
+    open_loop_interval_ns, LatencySummary, Outcome, OutcomeCounts, FIXTURE_BODY,
+};
 use raw_client::{RawClient, FLAGS_INTERACTIVE, TY_ERROR, TY_REQUEST, TY_RESPONSE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Semaphore};
 
 const MODULE_ID: &str = "perf-echo";
+/// Bound on post-send drain before pending requests resolve as
+/// `UnresolvedAtDrain`; the drain loop can never hang on a lost response.
+const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Workload {
+    /// Legacy raw body (mode byte + optional sleep), non-comparable with
+    /// the JSON fixture arms.
+    Raw,
+    /// Committed compact JSON fixture; terminal bodies are validated
+    /// against the fixture bytes before counting success.
+    Json,
+}
 
 #[derive(Clone, Debug)]
 struct Opts {
@@ -27,6 +57,7 @@ struct Opts {
     stall_big: usize,
     inflight_cap: usize,
     label: String,
+    workload: Workload,
 }
 
 fn parse_opts() -> Opts {
@@ -41,6 +72,7 @@ fn parse_opts() -> Opts {
         stall_big: 0,
         inflight_cap: 1024,
         label: "run".to_owned(),
+        workload: Workload::Raw,
     };
     let mut args = std::env::args().skip(1);
     opts.publication = args
@@ -48,6 +80,10 @@ fn parse_opts() -> Opts {
         .expect("usage: perf_load <publication> ...")
         .into();
     while let Some(flag) = args.next() {
+        if flag == "--serial" {
+            opts.pipeline = 1;
+            continue;
+        }
         let mut value = || args.next().expect("flag value");
         match flag.as_str() {
             "--conns" => opts.conns = value().parse().expect("conns"),
@@ -59,6 +95,13 @@ fn parse_opts() -> Opts {
             "--stall-big" => opts.stall_big = value().parse().expect("stall-big"),
             "--inflight-cap" => opts.inflight_cap = value().parse().expect("cap"),
             "--label" => opts.label = value(),
+            "--workload" => {
+                opts.workload = match value().as_str() {
+                    "raw" => Workload::Raw,
+                    "json" => Workload::Json,
+                    other => panic!("unknown workload {other}"),
+                }
+            }
             other => panic!("unknown flag {other}"),
         }
     }
@@ -66,20 +109,32 @@ fn parse_opts() -> Opts {
 }
 
 fn body_bytes(opts: &Opts) -> Vec<u8> {
-    let len = opts.payload.max(5);
-    let mut body = vec![0u8; len];
-    body[0] = if opts.sleep_ms > 0 { 1 } else { 0 };
-    body[1..5].copy_from_slice(&opts.sleep_ms.to_le_bytes());
-    body
+    match opts.workload {
+        Workload::Json => FIXTURE_BODY.to_vec(),
+        Workload::Raw => {
+            let len = opts.payload.max(5);
+            let mut body = vec![0u8; len];
+            body[0] = if opts.sleep_ms > 0 { 1 } else { 0 };
+            body[1..5].copy_from_slice(&opts.sleep_ms.to_le_bytes());
+            body
+        }
+    }
 }
 
 struct ConnResult {
-    latencies_ns: Vec<u64>,
-    sent: u64,
-    completed: u64,
-    errors: HashMap<String, u64>,
-    closed_early: bool,
+    /// Issue-to-validated-terminal (closed loop: the primary value; open
+    /// loop: the issue-based distribution).
+    issue_latencies_ns: Vec<u64>,
+    /// Scheduled-to-completion (open loop only; coordinated-omission
+    /// honest).
+    sched_latencies_ns: Vec<u64>,
+    /// Issue minus scheduled: load-generator lag, never server latency.
     sched_lag_ns: Vec<u64>,
+    sent: u64,
+    measured_scheduled: u64,
+    outcomes: OutcomeCounts,
+    error_codes: HashMap<String, u64>,
+    closed_early: bool,
     inflight_full: u64,
 }
 
@@ -107,6 +162,7 @@ async fn run_conn(
     let (stream, channel, epoch) = conn;
     let (read_half, mut write_half) = stream.into_split();
     let body = body_bytes(&opts);
+    let expect_fixture = opts.workload == Workload::Json;
 
     let inflight = Arc::new(Semaphore::new(if opts.rate > 0 {
         opts.inflight_cap
@@ -115,16 +171,21 @@ async fn run_conn(
     }));
     let (meta_tx, mut meta_rx) = mpsc::unbounded_channel::<(u64, u64, u64)>();
     let sent_count = Arc::new(AtomicU64::new(0));
+    let measured_sent = Arc::new(AtomicU64::new(0));
     let sender_done = Arc::new(tokio::sync::Notify::new());
 
     let send_deadline = start + Duration::from_secs(opts.secs);
-    let interval_ns = (1_000_000_000u64 * opts.conns as u64)
-        .checked_div(opts.rate)
-        .unwrap_or(0);
+    let interval_ns = if opts.rate > 0 {
+        open_loop_interval_ns(opts.rate).expect("offered rate") * opts.conns as u64
+    } else {
+        0
+    };
+    let warmup_ns = warmup.as_nanos() as u64;
 
     let sender = {
         let inflight = Arc::clone(&inflight);
         let sent_count = Arc::clone(&sent_count);
+        let measured_sent = Arc::clone(&measured_sent);
         let sender_done = Arc::clone(&sender_done);
         let conns = opts.conns as u64;
         tokio::spawn(async move {
@@ -137,6 +198,9 @@ async fn run_conn(
                 0
             };
             loop {
+                // Open loop: the arrival schedule is absolute; a late wake
+                // issues immediately (lag recorded), never a catch-up
+                // burst of extra slots.
                 let scheduled = if interval_ns > 0 {
                     let at = start + Duration::from_nanos(offset_ns + k * interval_ns);
                     if at >= send_deadline {
@@ -164,8 +228,10 @@ async fn run_conn(
                 corr += 1;
                 k += 1;
                 let scheduled_ns = scheduled.duration_since(start).as_nanos() as u64;
-                let sent_ns = Instant::now().duration_since(start).as_nanos() as u64;
-                if meta_tx.send((corr, scheduled_ns, sent_ns)).is_err() {
+                // The measured RTT starts here: after the in-flight permit
+                // wait, immediately before frame construction.
+                let issue_ns = Instant::now().duration_since(start).as_nanos() as u64;
+                if meta_tx.send((corr, scheduled_ns, issue_ns)).is_err() {
                     break;
                 }
                 let mut frame = raw_client::header(
@@ -181,6 +247,9 @@ async fn run_conn(
                     break;
                 }
                 sent_count.fetch_add(1, Ordering::Release);
+                if issue_ns >= warmup_ns {
+                    measured_sent.fetch_add(1, Ordering::Release);
+                }
             }
             sender_done.notify_one();
             (inflight_full, write_half)
@@ -188,12 +257,14 @@ async fn run_conn(
     };
 
     let mut result = ConnResult {
-        latencies_ns: Vec::new(),
-        sent: 0,
-        completed: 0,
-        errors: HashMap::new(),
-        closed_early: false,
+        issue_latencies_ns: Vec::new(),
+        sched_latencies_ns: Vec::new(),
         sched_lag_ns: Vec::new(),
+        sent: 0,
+        measured_scheduled: 0,
+        outcomes: OutcomeCounts::default(),
+        error_codes: HashMap::new(),
+        closed_early: false,
         inflight_full: 0,
     };
     let mut read_half = read_half;
@@ -201,18 +272,39 @@ async fn run_conn(
     let mut header = [0u8; raw_client::HEADER_LEN];
     let mut body_buf: Vec<u8> = Vec::new();
     let mut done_wait = false;
-    let warmup_ns = warmup.as_nanos() as u64;
+    let mut resolved: u64 = 0;
+    let mut drain_deadline: Option<Instant> = None;
 
     loop {
         let read = tokio::select! {
             biased;
             read = read_half.read_exact(&mut header) => Some(read),
-            () = sender_done.notified(), if !done_wait => { done_wait = true; None }
+            () = sender_done.notified(), if !done_wait => {
+                done_wait = true;
+                drain_deadline = Some(Instant::now() + DRAIN_BUDGET);
+                None
+            }
+            () = async {
+                match drain_deadline {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            }, if done_wait => {
+                // Drain budget exhausted: everything still pending is a
+                // terminal unresolved outcome.
+                while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
+                    pending.insert(corr, (sched, issue));
+                }
+                for (_, (_, issue)) in pending.drain() {
+                    if issue >= warmup_ns {
+                        result.outcomes.record(Outcome::UnresolvedAtDrain);
+                    }
+                }
+                break;
+            }
         };
         let Some(read) = read else {
-            if result.completed + result.errors.values().sum::<u64>()
-                >= sent_count.load(Ordering::Acquire)
-            {
+            if resolved >= sent_count.load(Ordering::Acquire) {
                 break;
             }
             continue;
@@ -223,45 +315,72 @@ async fn run_conn(
         }
         let frame = raw_client::decode_header(&header);
         body_buf.resize(frame.len as usize, 0);
-        if read_half.read_exact(&mut body_buf).await.is_err() {
+        if frame.len > 0 && read_half.read_exact(&mut body_buf).await.is_err() {
             result.closed_early = true;
             break;
         }
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
-        while let Ok((corr, sched, sent)) = meta_rx.try_recv() {
-            pending.insert(corr, (sched, sent));
+        while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
+            pending.insert(corr, (sched, issue));
         }
-        let Some((sched, sent)) = pending.remove(&frame.corr) else {
+        let Some((sched, issue)) = pending.remove(&frame.corr) else {
             continue;
         };
         inflight.add_permits(1);
+        resolved += 1;
+        let measured = issue >= warmup_ns;
         match frame.ty {
             TY_RESPONSE => {
-                if sched >= warmup_ns {
-                    result.latencies_ns.push(now_ns.saturating_sub(sched));
-                    result.sched_lag_ns.push(sent.saturating_sub(sched));
+                let valid = !expect_fixture || body_buf.as_slice() == FIXTURE_BODY;
+                if !valid {
+                    if measured {
+                        result.outcomes.record(Outcome::BodyMismatch);
+                    }
+                } else if measured {
+                    result.outcomes.record(Outcome::Success);
+                    result.issue_latencies_ns.push(now_ns.saturating_sub(issue));
+                    if opts.rate > 0 {
+                        result.sched_latencies_ns.push(now_ns.saturating_sub(sched));
+                        result.sched_lag_ns.push(issue.saturating_sub(sched));
+                    }
                 }
-                result.completed += 1;
             }
             TY_ERROR => {
+                if measured {
+                    result.outcomes.record(Outcome::ProtocolError);
+                }
                 let code = serde_json::from_slice::<serde_json::Value>(&body_buf)
                     .ok()
                     .and_then(|v| v["code"].as_str().map(str::to_owned))
                     .unwrap_or_else(|| "unparsable".to_owned());
-                *result.errors.entry(code).or_default() += 1;
+                *result.error_codes.entry(code).or_default() += 1;
             }
-            _ => {}
+            _ => {
+                if measured {
+                    result.outcomes.record(Outcome::UnexpectedFrame);
+                }
+            }
         }
-        if done_wait
-            && result.completed + result.errors.values().sum::<u64>()
-                >= sent_count.load(Ordering::Acquire)
-        {
+        if done_wait && resolved >= sent_count.load(Ordering::Acquire) {
             break;
+        }
+    }
+
+    // A closed connection resolves every remaining in-flight request.
+    if result.closed_early {
+        while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
+            pending.insert(corr, (sched, issue));
+        }
+        for (_, (_, issue)) in pending.drain() {
+            if issue >= warmup_ns {
+                result.outcomes.record(Outcome::PeerClosed);
+            }
         }
     }
 
     result.inflight_full = sender.await.map(|(count, _write_half)| count).unwrap_or(0);
     result.sent = sent_count.load(Ordering::Acquire);
+    result.measured_scheduled = measured_sent.load(Ordering::Acquire);
     result
 }
 
@@ -291,21 +410,37 @@ async fn run_stall(info: raw_client::Discovered, opts: Opts) {
     tokio::time::sleep(Duration::from_secs(opts.secs)).await;
 }
 
-fn pct(sorted: &[u64], q: f64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let rank = ((sorted.len() as f64 - 1.0) * q).round() as usize;
-    sorted[rank]
-}
-
 fn ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
+}
+
+fn print_latency(kind: &str, samples: Vec<u64>) {
+    let Some(summary) = LatencySummary::from_unsorted(samples) else {
+        println!("LATENCY_MS kind={kind} count=0");
+        return;
+    };
+    let p999 = summary
+        .p999_ns
+        .map(|v| format!("{:.3}", ms(v)))
+        .unwrap_or_else(|| "suppressed(below-tail-floor)".to_owned());
+    println!(
+        "LATENCY_MS kind={kind} count={} p50={:.3} p90={:.3} p99={:.3} p999={} max={:.3}",
+        summary.count,
+        ms(summary.p50_ns),
+        ms(summary.p90_ns),
+        ms(summary.p99_ns),
+        p999,
+        ms(summary.max_ns),
+    );
 }
 
 #[tokio::main]
 async fn main() {
     let opts = parse_opts();
+    if opts.rate > 0 {
+        // Fail malformed offered rates before any traffic is generated.
+        open_loop_interval_ns(opts.rate).expect("offered rate");
+    }
     let info = raw_client::discover(&opts.publication).expect("publication");
 
     if opts.stall_big > 0 {
@@ -330,61 +465,91 @@ async fn main() {
         )));
     }
 
-    let mut latencies = Vec::new();
+    let mut issue_latencies = Vec::new();
+    let mut sched_latencies = Vec::new();
     let mut lags = Vec::new();
     let mut sent = 0u64;
-    let mut completed = 0u64;
-    let mut errors: HashMap<String, u64> = HashMap::new();
+    let mut measured_scheduled = 0u64;
+    let mut outcomes = OutcomeCounts::default();
+    let mut error_codes: HashMap<String, u64> = HashMap::new();
     let mut closed = 0usize;
     let mut inflight_full = 0u64;
     for task in tasks {
         let conn = task.await.expect("conn task");
-        latencies.extend(conn.latencies_ns);
+        issue_latencies.extend(conn.issue_latencies_ns);
+        sched_latencies.extend(conn.sched_latencies_ns);
         lags.extend(conn.sched_lag_ns);
         sent += conn.sent;
-        completed += conn.completed;
+        measured_scheduled += conn.measured_scheduled;
         closed += usize::from(conn.closed_early);
         inflight_full += conn.inflight_full;
-        for (code, count) in conn.errors {
-            *errors.entry(code).or_default() += count;
+        for (code, count) in conn.error_codes {
+            *error_codes.entry(code).or_default() += count;
         }
+        let c = conn.outcomes;
+        outcomes.merge(&c);
     }
-    latencies.sort_unstable();
-    lags.sort_unstable();
 
     let measured_secs = opts.secs as f64 * 0.9;
-    let loop_kind = if opts.rate > 0 { "open" } else { "closed" };
+    let loop_kind = if opts.rate > 0 {
+        "open"
+    } else if opts.pipeline == 1 {
+        "serial"
+    } else {
+        "closed"
+    };
+    let workload = match opts.workload {
+        Workload::Raw => "raw-legacy",
+        Workload::Json => perf_measurement::FIXTURE_LABEL,
+    };
     println!(
-        "RESULT label={} loop={} conns={} payload={} rate={} pipeline={} secs={} \
+        "RESULT label={} loop={} workload={} conns={} payload={} rate={} pipeline={} secs={} \
          sent={} completed={} measured={} closed_early={} inflight_full={} errors={:?}",
         opts.label,
         loop_kind,
+        workload,
         opts.conns,
         opts.payload,
         opts.rate,
         opts.pipeline,
         opts.secs,
         sent,
-        completed,
-        latencies.len(),
+        outcomes.success,
+        issue_latencies.len(),
         closed,
         inflight_full,
-        errors,
+        error_codes,
     );
     println!(
-        "LATENCY_MS p50={:.3} p90={:.3} p99={:.3} p999={:.3} max={:.3} mean={:.3} \
-         sched_lag_p99={:.3} throughput_rps={:.0}",
-        ms(pct(&latencies, 0.50)),
-        ms(pct(&latencies, 0.90)),
-        ms(pct(&latencies, 0.99)),
-        ms(pct(&latencies, 0.999)),
-        latencies.last().copied().map(ms).unwrap_or(0.0),
-        if latencies.is_empty() {
-            0.0
-        } else {
-            ms(latencies.iter().sum::<u64>() / latencies.len() as u64)
-        },
-        ms(pct(&lags, 0.99)),
-        latencies.len() as f64 / measured_secs,
+        "OUTCOMES scheduled={} success={} protocol_error={} missed_slot={} write_failure={} \
+         peer_closed={} unexpected_frame={} body_mismatch={} unresolved_at_drain={} \
+         histogram_overflow={} conserved={}",
+        measured_scheduled,
+        outcomes.success,
+        outcomes.protocol_error,
+        outcomes.missed_slot,
+        outcomes.write_failure,
+        outcomes.peer_closed,
+        outcomes.unexpected_frame,
+        outcomes.body_mismatch,
+        outcomes.unresolved_at_drain,
+        outcomes.histogram_overflow,
+        outcomes.conserved(measured_scheduled),
     );
+    let conserved = outcomes.conserved(measured_scheduled);
+
+    print_latency("issue_to_completion", issue_latencies.clone());
+    if opts.rate > 0 {
+        print_latency("sched_to_completion", sched_latencies);
+        print_latency("scheduler_lag", lags);
+    }
+    println!(
+        "THROUGHPUT completed_rps={:.0}",
+        outcomes.success as f64 / measured_secs,
+    );
+
+    if !conserved {
+        eprintln!("outcome-accounting loss: aborting with failure status");
+        std::process::exit(1);
+    }
 }

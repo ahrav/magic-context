@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Baseline arms for crates/mc-host per docs/perf/mc-host-baseline.md.
+# docs/perf/mc-host-baseline.md defines the baseline arms;
+# docs/perf/mc-host-ipc-budget.md defines the budget-* operations.
 # Usage: perf-mc-host.sh <outdir> <arm> [args...]
 #   arms: ceiling <conns> <rep> | open <conns> <rate> | large <payload>
 #         slowreader | greedy | starvation | strace | perfrec
@@ -7,6 +8,152 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/release/examples"
+
+BUDGET_BENCH=""
+
+budget_build() {
+  local out
+  out=$(cd "$ROOT" && cargo bench -p mc-host --bench ipc_budget --no-run --locked 2>&1) || {
+    echo "$out"
+    echo "bench build failed" >&2
+    exit 1
+  }
+  BUDGET_BENCH=$(echo "$out" | grep -oE 'target/release/deps/ipc_budget-[0-9a-f]+' | tail -1)
+  [[ -n "$BUDGET_BENCH" && -x "$ROOT/$BUDGET_BENCH" ]] || {
+    echo "could not locate ipc_budget bench binary" >&2
+    exit 1
+  }
+  BUDGET_BENCH="$ROOT/$BUDGET_BENCH"
+}
+
+budget_env() {
+  export MC_IPC_BUDGET_COMMIT="${MC_IPC_BUDGET_COMMIT:-$(git -C "$ROOT" rev-parse --short HEAD)}"
+  export MC_IPC_BUDGET_RUSTC="${MC_IPC_BUDGET_RUSTC:-$(rustc --version)}"
+}
+
+budget_trap() {
+  # Interrupts kill children, then finalize the active manifest as
+  # interrupted so the attempt stays retained and out of the aggregate.
+  trap 'kill 0 2>/dev/null || true; sleep 0.5; \
+    MC_IPC_BUDGET_MODE=finalize-interrupted MC_IPC_BUDGET_OUT="$BUDGET_OUT" \
+    "$BUDGET_BENCH" || true; exit 130' INT TERM
+}
+
+budget_collect() {
+  local arm="$1" class="$2" block="$3"
+  shift 3
+  env "$@" \
+    MC_IPC_BUDGET_MODE=collect \
+    MC_IPC_BUDGET_OUT="$BUDGET_OUT" \
+    MC_IPC_BUDGET_ARM="$arm" \
+    MC_IPC_BUDGET_CLASS="$class" \
+    MC_IPC_BUDGET_BLOCK="$block" \
+    ${BUDGET_PAIR:+MC_IPC_BUDGET_PAIR="$BUDGET_PAIR"} \
+    "$BUDGET_BENCH" | tee -a "$BUDGET_OUT/collection.log"
+}
+
+# Odd blocks run arms forward, even blocks reversed (matches
+# evidence::counterbalanced_schedule).
+budget_block() {
+  local block="$1"
+  shift
+  local arms=(atomic-floor tcp-serial tcp-open tcp-throughput)
+  if (((block - 1) % 2 == 1)); then
+    arms=(tcp-throughput tcp-open tcp-serial atomic-floor)
+  fi
+  for arm in "${arms[@]}"; do
+    if [[ "$arm" == tcp-open ]]; then
+      for rate in $BUDGET_RATES; do
+        budget_collect tcp-open same-l3 "$block" "$@" "MC_IPC_BUDGET_RATE=$rate"
+      done
+    else
+      budget_collect "$arm" same-l3 "$block" "$@"
+    fi
+  done
+  # Cross-NUMA paired arms: auto-selection either finds a pair or
+  # finalizes a structured skip without failing the block.
+  BUDGET_PAIR="${BUDGET_CROSS_PAIR:-}" budget_collect atomic-floor cross-numa "$block" "$@"
+  BUDGET_PAIR="${BUDGET_CROSS_PAIR:-}" budget_collect tcp-serial cross-numa "$block" "$@"
+}
+
+budget_run() {
+  local blocks="$1"
+  shift
+  budget_build
+  budget_env
+  [[ -e "$BUDGET_OUT" && -n "$(ls -A "$BUDGET_OUT" 2>/dev/null)" ]] && {
+    echo "refusing nonempty evidence directory $BUDGET_OUT" >&2
+    exit 1
+  }
+  mkdir -p "$BUDGET_OUT"
+  budget_trap
+  for block in $(seq 1 "$blocks"); do
+    budget_block "$block" "$@"
+  done
+  MC_IPC_BUDGET_MODE=aggregate MC_IPC_BUDGET_OUT="$BUDGET_OUT" "$BUDGET_BENCH" \
+    > "$BUDGET_OUT/summary.stdout.json"
+  echo "evidence: $BUDGET_OUT"
+}
+
+case "${2:-${1:-}}" in
+budget-plan)
+  budget_build
+  MC_IPC_BUDGET_MODE=plan MC_IPC_BUDGET_BLOCKS="${MC_IPC_BUDGET_BLOCKS:-10}" "$BUDGET_BENCH"
+  exit 0
+  ;;
+budget-preflight)
+  budget_build
+  budget_env
+  MC_IPC_BUDGET_MODE=plan "$BUDGET_BENCH"
+  BUDGET_OUT=$(mktemp -d)
+  BUDGET_PAIR="${BUDGET_PAIR:-}"
+  budget_trap
+  budget_collect atomic-floor same-l3 1 \
+    MC_IPC_BUDGET_WARMUP_BATCHES=2 MC_IPC_BUDGET_BATCHES=5 MC_IPC_BUDGET_EXCHANGES=1000
+  budget_collect tcp-serial same-l3 1 \
+    MC_IPC_BUDGET_WARMUP_OPS=200 MC_IPC_BUDGET_MEASURED_OPS=1000
+  rm -rf "$BUDGET_OUT"
+  echo "preflight ok"
+  exit 0
+  ;;
+esac
+
+case "${2:-}" in
+budget-smoke | budget-pilot | budget-final)
+  BUDGET_OUT="${1:?outdir}"
+  BUDGET_PAIR="${BUDGET_PAIR:-}"
+  BUDGET_RATES="${BUDGET_RATES:-20000 60000 120000}"
+  case "$2" in
+  budget-smoke)
+    BUDGET_RATES="${BUDGET_SMOKE_RATES:-20000}"
+    budget_run 1 \
+      MC_IPC_BUDGET_WARMUP_BATCHES=5 MC_IPC_BUDGET_BATCHES=20 MC_IPC_BUDGET_EXCHANGES=2000 \
+      MC_IPC_BUDGET_WARMUP_OPS=500 MC_IPC_BUDGET_MEASURED_OPS=5000 \
+      MC_IPC_BUDGET_WARMUP_SECS=1 MC_IPC_BUDGET_MEASURE_SECS=2
+    ;;
+  budget-pilot)
+    budget_run 3 \
+      MC_IPC_BUDGET_WARMUP_BATCHES=20 MC_IPC_BUDGET_BATCHES=100 MC_IPC_BUDGET_EXCHANGES=10000 \
+      MC_IPC_BUDGET_WARMUP_OPS=10000 MC_IPC_BUDGET_MEASURED_OPS=120000 \
+      MC_IPC_BUDGET_WARMUP_SECS=2 MC_IPC_BUDGET_MEASURE_SECS=5
+    ;;
+  budget-final)
+    budget_run "${BUDGET_BLOCKS:-10}" \
+      MC_IPC_BUDGET_WARMUP_BATCHES=50 MC_IPC_BUDGET_BATCHES=200 MC_IPC_BUDGET_EXCHANGES=10000 \
+      MC_IPC_BUDGET_WARMUP_OPS=20000 MC_IPC_BUDGET_MEASURED_OPS=150000 \
+      MC_IPC_BUDGET_WARMUP_SECS=2 MC_IPC_BUDGET_MEASURE_SECS=10
+    ;;
+  esac
+  exit 0
+  ;;
+budget-summarize)
+  BUDGET_OUT="${1:?outdir}"
+  budget_build
+  MC_IPC_BUDGET_MODE=aggregate MC_IPC_BUDGET_OUT="$BUDGET_OUT" "$BUDGET_BENCH"
+  exit 0
+  ;;
+esac
+
 OUT="${1:?outdir}"
 ARM="${2:?arm}"
 shift 2
