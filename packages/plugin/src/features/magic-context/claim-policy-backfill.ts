@@ -406,14 +406,22 @@ function seedRevisionInCurrentTransaction(
  * value.
  *
  * Two bounds keep the pass cheap on a large corpus. An event-id watermark
- * skips revisions whose newest `verified` event a previous pass already
- * examined — every in-process eligibility change runs the reducer itself, so
- * only unexamined raw events can create new divergence, and a legitimately
- * ineligible verified row (an untrusted directive that must stay CANDIDATE)
- * stops re-matching on every startup. Refreshes commit in fixed-size
- * batches so the pass never holds the shared write lock for the whole
- * corpus; the watermark advances only after every batch commits, and a
- * crash mid-pass re-probes idempotently from the old watermark.
+ * skips events a previous pass already examined — every in-process
+ * eligibility change runs the reducer itself, so only unexamined raw events
+ * can create new divergence, and a legitimately ineligible verified row (an
+ * untrusted directive that must stay CANDIDATE) stops re-matching on every
+ * startup. Events are walked in fixed-size id-ordered pages, each committing
+ * in its own transaction, so the pass never materializes the corpus or holds
+ * the shared write lock end to end; the watermark advances only after every
+ * page commits, and a crash mid-pass re-probes idempotently from the old
+ * watermark.
+ *
+ * Negative events (`stale`/`flagged`) from the same writer need no refresh —
+ * the reader's authoritative soft-hide already outranks the projection — but
+ * cached automatic lanes (m0 snapshots, the native mirror) key on the
+ * project-memory epoch, which a policy-unaware writer also cannot bump. Each
+ * unexamined negative event on a current revision therefore bumps its
+ * claim's project epochs here so those caches refold.
  */
 export function reconcileCompatibilityVerificationsAtStartup(db: Database): number {
     if (!hasClaimPolicySchema(db)) return 0;
@@ -426,37 +434,59 @@ export function reconcileCompatibilityVerificationsAtStartup(db: Database): numb
         }
     ).id;
     if (maxEventId <= watermark) return 0;
-    const divergent = db
-        .prepare(
-            `SELECT policy.revision_id AS revisionId
-             FROM claim_effective_policy policy
-             JOIN claims ON claims.current_revision_id = policy.revision_id
-             WHERE policy.auto_eligible = 0
-               AND (
-                   SELECT outcome FROM verification_events
-                   WHERE revision_id = policy.revision_id
-                     AND outcome IN ('verified', 'stale', 'flagged')
-                   ORDER BY id DESC LIMIT 1
-               ) = 'verified'
-               AND (
-                   SELECT MAX(id) FROM verification_events
-                   WHERE revision_id = policy.revision_id AND outcome = 'verified'
-               ) > ?`,
-        )
-        .all(watermark) as Array<{ revisionId: number }>;
-    const RECONCILE_BATCH_SIZE = 100;
-    for (let start = 0; start < divergent.length; start += RECONCILE_BATCH_SIZE) {
-        const batch = divergent.slice(start, start + RECONCILE_BATCH_SIZE);
+    const RECONCILE_PAGE_SIZE = 100;
+    let refreshed = 0;
+    let cursor = watermark;
+    const bumpedClaims = new Set<number>();
+    while (cursor < maxEventId) {
+        const events = db
+            .prepare(
+                `SELECT events.id AS id, events.revision_id AS revisionId,
+                        events.outcome AS outcome, claims.id AS claimId
+                 FROM verification_events events
+                 JOIN claims ON claims.current_revision_id = events.revision_id
+                 WHERE events.id > ? AND events.id <= ?
+                   AND events.outcome IN ('verified', 'stale', 'flagged')
+                 ORDER BY events.id LIMIT ?`,
+            )
+            .all(cursor, maxEventId, RECONCILE_PAGE_SIZE) as Array<{
+            id: number;
+            revisionId: number;
+            outcome: "verified" | "stale" | "flagged";
+            claimId: number;
+        }>;
+        if (events.length === 0) break;
+        cursor = events[events.length - 1].id;
         db.transaction(() => {
-            for (const row of batch) {
-                refreshRevisionMaturityInCurrentTransaction(db, row.revisionId);
+            for (const event of events) {
+                if (event.outcome === "verified") {
+                    const divergent = db
+                        .prepare(
+                            `SELECT 1 FROM claim_effective_policy policy
+                             WHERE policy.revision_id = ? AND policy.auto_eligible = 0
+                               AND (
+                                   SELECT outcome FROM verification_events
+                                   WHERE revision_id = policy.revision_id
+                                     AND outcome IN ('verified', 'stale', 'flagged')
+                                   ORDER BY id DESC LIMIT 1
+                               ) = 'verified'`,
+                        )
+                        .get(event.revisionId);
+                    if (divergent) {
+                        refreshRevisionMaturityInCurrentTransaction(db, event.revisionId);
+                        refreshed += 1;
+                    }
+                } else if (!bumpedClaims.has(event.claimId)) {
+                    bumpedClaims.add(event.claimId);
+                    bumpEpochForClaimProjectInCurrentTransaction(db, event.claimId);
+                }
             }
         }).immediate();
     }
     db.transaction(() =>
         writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark, String(maxEventId)),
     ).immediate();
-    return divergent.length;
+    return refreshed;
 }
 
 /** Publish completion only after count and anti-join reconciliation (KTD11).

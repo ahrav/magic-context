@@ -9,7 +9,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Database } from "../../../shared/sqlite";
 import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
@@ -527,16 +527,26 @@ export async function executeClaimEnforceCommand(
                 // recorded.
                 const bytes = readFileSync(canonical.absolutePath);
                 bytesDigest = createHash("sha256").update(bytes).digest("hex");
-                const snapshotPath = join(
-                    dirname(canonical.absolutePath),
-                    `mc-enforce-${randomUUID().slice(0, 8)}.${basename(canonical.absolutePath)}`,
-                );
+                const snapshotName = `mc-enforce-${randomUUID().slice(0, 8)}.${basename(canonical.absolutePath)}`;
+                const snapshotPath = join(dirname(canonical.absolutePath), snapshotName);
+                // Bun keys test snapshots by the test file's name, so the
+                // copy must carry the artifact's committed `.snap` under its
+                // own name — otherwise every committed snapshot reads as
+                // newly added and the run passes without comparing (KTD6).
+                const snapDir = join(dirname(canonical.absolutePath), "__snapshots__");
+                const committedSnap = join(snapDir, `${basename(canonical.absolutePath)}.snap`);
+                const copiedSnap = join(snapDir, `${snapshotName}.snap`);
+                const carrySnapshots = existsSync(committedSnap);
                 writeFileSync(snapshotPath, bytes);
+                if (carrySnapshots) copyFileSync(committedSnap, copiedSnap);
                 try {
                     const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
                     evaluation = await evaluate(snapshotPath, kind, deps.projectRoot);
                 } finally {
                     rmSync(snapshotPath, { force: true });
+                    // Remove the carried copy AND any snapshot the run
+                    // created fresh under the copy's name.
+                    rmSync(copiedSnap, { force: true });
                 }
                 // A live artifact that drifted during the run cannot be
                 // recorded: the digest would describe bytes no longer on
