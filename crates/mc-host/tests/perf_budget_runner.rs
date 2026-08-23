@@ -85,6 +85,7 @@ fn open_loop_preserves_schedule_and_records_missed_slots() {
         histogram: HistogramConfig::default(),
     };
     let result = tcp::run_open_loop(&host.publication, &cfg).unwrap();
+    assert!(!result.truncated, "healthy host must complete the window");
 
     // The arrival schedule is frozen by (rate, window): the measured slot
     // count equals measure/interval regardless of completions.
@@ -137,6 +138,7 @@ fn open_loop_separates_lag_from_server_latency() {
         histogram: HistogramConfig::default(),
     };
     let result = tcp::run_open_loop(&host.publication, &cfg).unwrap();
+    assert!(!result.truncated, "healthy host must complete the window");
     assert!(result.outcomes.success > 0);
     assert!(result.outcomes.conserved(result.scheduled_slots));
     // Three distinct distributions with consistent sample counts.
@@ -162,6 +164,7 @@ fn throughput_arm_reports_rates_separately() {
         measure: Duration::from_millis(800),
     };
     let result = tcp::run_throughput(&host.publication, &cfg).unwrap();
+    assert!(!result.truncated, "healthy host must complete the window");
     assert!(result.successful > 0);
     assert_eq!(result.successful, result.outcomes.success);
     assert!(result.terminal >= result.successful);
@@ -221,12 +224,15 @@ fn host_death_mid_run_conserves_outcomes() {
     let result = tcp::run_open_loop(&publication, &cfg).unwrap();
     killer.join().unwrap();
 
-    // The failure paths (peer close, write failure, unresolved drain)
-    // must still resolve every measured slot exactly once.
+    // Host death may resolve every in-flight request cleanly first (the
+    // host error-flushes before closing), so specific failure outcomes
+    // are not guaranteed. The guaranteed signals are the truncation
+    // marker — the window cannot complete against a dead host — and
+    // conservation over the slots reached before the break.
     let o = &result.outcomes;
     assert!(
-        o.peer_closed + o.write_failure + o.unresolved_at_drain > 0,
-        "host death must surface as failure outcomes: {o:?}"
+        result.truncated,
+        "a connection retired mid-window must report truncation: {o:?}"
     );
     assert!(
         o.conserved(result.scheduled_slots),

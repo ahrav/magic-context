@@ -211,7 +211,10 @@ fn sidecar_corruption_blocks_aggregation() {
 #[test]
 fn incompatible_manifests_never_merge_or_pair() {
     // Each incompatibility axis must independently reject histogram
-    // merging and gap pairing.
+    // merging and gap pairing. Schema mismatches are rejected earlier,
+    // at load (see unsupported_schema_version_is_refused_at_load), since
+    // a whole directory sharing one wrong schema would pass any pairwise
+    // check.
     for (name, mutate) in [
         (
             "build",
@@ -226,7 +229,6 @@ fn incompatible_manifests_never_merge_or_pair() {
             "host",
             Box::new(|m: &mut Manifest| m.host.hostname = "other-host".to_owned()),
         ),
-        ("schema", Box::new(|m: &mut Manifest| m.schema += 1)),
     ] {
         let dir = tempfile::tempdir().unwrap();
         write_complete(
@@ -261,6 +263,27 @@ fn incompatible_manifests_never_merge_or_pair() {
         let err = evidence::paired_gaps(&loaded).expect_err(name);
         assert!(err.contains("incompatible"), "{name}: {err}");
     }
+}
+
+#[test]
+fn unsupported_schema_version_is_refused_at_load() {
+    // Schema is checked against SCHEMA_VERSION per manifest, not only
+    // pairwise: a directory whose manifests all carry the same foreign
+    // schema would otherwise aggregate under this binary's field
+    // semantics and be restamped as the current schema.
+    let dir = tempfile::tempdir().unwrap();
+    let mut foreign = manifest(ARM_ATOMIC, 1, Some((0, 1)));
+    foreign.schema += 1;
+    let mut attempt = Attempt::begin(dir.path(), "atomic-b01", foreign).unwrap();
+    attempt
+        .add_histogram("batch_mean_rtt.hist", &small_histogram(&[500]))
+        .unwrap();
+    attempt.manifest_mut().histogram = Some(HistogramConfig::default());
+    attempt.manifest_mut().results = Some(serde_json::json!({"median_batch_rtt_ns": 500.0}));
+    attempt.finalize(State::Complete).unwrap();
+
+    let err = evidence::load_attempts(dir.path()).expect_err("foreign schema must refuse to load");
+    assert!(err.contains("schema"), "{err}");
 }
 
 #[test]

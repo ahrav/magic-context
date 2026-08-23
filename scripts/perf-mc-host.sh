@@ -10,6 +10,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/target/release/examples"
 
 BUDGET_BENCH=""
+BUDGET_CHILD=""
 
 budget_build() {
   local out
@@ -27,15 +28,33 @@ budget_build() {
 }
 
 budget_env() {
-  export MC_IPC_BUDGET_COMMIT="${MC_IPC_BUDGET_COMMIT:-$(git -C "$ROOT" rev-parse --short HEAD)}"
+  if [[ -z "${MC_IPC_BUDGET_COMMIT:-}" ]]; then
+    # Evidence identity: stamping the clean HEAD hash onto a binary built
+    # from modified sources lets two different dirty builds share one
+    # BuildId, pass `compatible`, and merge as though they measured the
+    # same code. Only bench build inputs gate this; docs and evidence
+    # output stay writable during a run.
+    if [[ -n "$(git -C "$ROOT" status --porcelain -- crates Cargo.toml Cargo.lock)" ]]; then
+      echo "refusing dirty build inputs (crates/, Cargo.toml, Cargo.lock);" \
+        "commit or stash, or set MC_IPC_BUDGET_COMMIT explicitly" >&2
+      exit 1
+    fi
+    MC_IPC_BUDGET_COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
+    export MC_IPC_BUDGET_COMMIT
+  fi
   export MC_IPC_BUDGET_RUSTC="${MC_IPC_BUDGET_RUSTC:-$(rustc --version)}"
 }
 
 budget_trap() {
-  # Interrupts kill children, then finalize the active manifest as
-  # interrupted so the attempt stays retained and out of the aggregate.
-  # Masking INT/TERM first keeps kill 0 from re-entering this handler.
-  trap 'trap "" INT TERM; kill 0 2>/dev/null || true; sleep 0.5; \
+  # Interrupts kill the tracked bench child, then finalize the active
+  # manifest as interrupted so the attempt stays retained and out of the
+  # aggregate. Masking INT/TERM first keeps the handler from re-entering.
+  # Only the tracked child is signalled: `kill 0` targets the whole
+  # process group, which includes the invoking shell whenever this script
+  # runs without job control (CI, wrapper shells).
+  trap 'trap "" INT TERM; \
+    { [[ -z "${BUDGET_CHILD:-}" ]] || kill "$BUDGET_CHILD" 2>/dev/null || true; }; \
+    sleep 0.5; \
     MC_IPC_BUDGET_MODE=finalize-interrupted MC_IPC_BUDGET_OUT="$BUDGET_OUT" \
     "$BUDGET_BENCH" || true; exit 130' INT TERM
 }
@@ -43,6 +62,9 @@ budget_trap() {
 budget_collect() {
   local arm="$1" class="$2" block="$3"
   shift 3
+  # The bench runs as a tracked background child so the INT/TERM trap can
+  # signal exactly it; `wait` surfaces the signal to the trap immediately
+  # and still propagates the bench's exit status under `set -e`.
   env "$@" \
     MC_IPC_BUDGET_MODE=collect \
     MC_IPC_BUDGET_OUT="$BUDGET_OUT" \
@@ -50,7 +72,12 @@ budget_collect() {
     MC_IPC_BUDGET_CLASS="$class" \
     MC_IPC_BUDGET_BLOCK="$block" \
     ${BUDGET_PAIR:+MC_IPC_BUDGET_PAIR="$BUDGET_PAIR"} \
-    "$BUDGET_BENCH" | tee -a "$BUDGET_OUT/collection.log"
+    "$BUDGET_BENCH" > >(tee -a "$BUDGET_OUT/collection.log") &
+  BUDGET_CHILD=$!
+  local rc=0
+  wait "$BUDGET_CHILD" || rc=$?
+  BUDGET_CHILD=""
+  return "$rc"
 }
 
 # Odd blocks run arms forward, even blocks reversed (matches
@@ -92,7 +119,7 @@ budget_run() {
     budget_block "$block" "$@"
   done
   MC_IPC_BUDGET_MODE=aggregate MC_IPC_BUDGET_OUT="$BUDGET_OUT" "$BUDGET_BENCH" \
-    > "$BUDGET_OUT/summary.stdout.json"
+    >"$BUDGET_OUT/summary.stdout.json"
   echo "evidence: $BUDGET_OUT"
 }
 
@@ -113,6 +140,12 @@ budget-preflight)
     MC_IPC_BUDGET_WARMUP_BATCHES=2 MC_IPC_BUDGET_BATCHES=5 MC_IPC_BUDGET_EXCHANGES=1000
   budget_collect tcp-serial same-l3 1 \
     MC_IPC_BUDGET_WARMUP_OPS=200 MC_IPC_BUDGET_MEASURED_OPS=1000
+  if [[ -n "${BUDGET_CROSS_PAIR:-}" ]]; then
+    # An explicit cross pair must fail preflight, not the final run: an
+    # invalid pair finalizes a failed attempt and exits nonzero here.
+    BUDGET_PAIR="$BUDGET_CROSS_PAIR" budget_collect atomic-floor cross-numa 1 \
+      MC_IPC_BUDGET_WARMUP_BATCHES=2 MC_IPC_BUDGET_BATCHES=5 MC_IPC_BUDGET_EXCHANGES=1000
+  fi
   rm -rf "$BUDGET_OUT"
   echo "preflight ok"
   exit 0

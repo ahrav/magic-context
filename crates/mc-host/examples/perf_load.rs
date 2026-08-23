@@ -218,6 +218,23 @@ async fn run_conn(
                     Ok(permit) => permit,
                     Err(_) => {
                         inflight_full += 1;
+                        if interval_ns > 0 {
+                            // Open loop: a saturated window drops the slot
+                            // (the reader records MissedSlot) and holds the
+                            // absolute schedule. Waiting for a permit here
+                            // would throttle the offered rate down to the
+                            // completion rate and hide the overload behind
+                            // a conserved-looking outcome table.
+                            let scheduled_ns = scheduled.duration_since(start).as_nanos() as u64;
+                            if scheduled_ns >= warmup_ns {
+                                measured_sent.fetch_add(1, Ordering::Release);
+                            }
+                            if meta_tx.send((0, scheduled_ns, u64::MAX)).is_err() {
+                                break;
+                            }
+                            k += 1;
+                            continue;
+                        }
                         match inflight.clone().acquire_owned().await {
                             Ok(permit) => permit,
                             Err(_) => break,
@@ -280,7 +297,13 @@ async fn run_conn(
                       pending: &mut HashMap<u64, (u64, u64)>,
                       outcomes: &mut OutcomeCounts| {
         while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
-            if sched == u64::MAX {
+            if issue == u64::MAX {
+                // Missed open-loop slot: terminal at the scheduler, never
+                // issued, so it carries a scheduled time but no issue time.
+                if sched >= warmup_ns {
+                    outcomes.record(Outcome::MissedSlot);
+                }
+            } else if sched == u64::MAX {
                 pending.remove(&corr);
                 if issue >= warmup_ns {
                     outcomes.record(Outcome::WriteFailure);

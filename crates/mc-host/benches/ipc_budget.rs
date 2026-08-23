@@ -599,6 +599,15 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
     let mut host = tcp_arm_setup(attempt, pair)?;
     let result = tcp::run_open_loop(host.publication(), &cfg)
         .map_err(|err| format!("open-loop arm: {err}"))?;
+    if result.truncated {
+        return Err(format!(
+            "connection retired after {:.2}s, before the {}s warmup+measure window completed \
+             (outcomes: {:?}); the attempt is invalid",
+            result.elapsed.as_secs_f64(),
+            (cfg.warmup + cfg.measure).as_secs(),
+            result.outcomes
+        ));
+    }
     check_host_and_conservation(&mut host, &result.outcomes, result.scheduled_slots)?;
     if result.outcomes.success == 0 {
         return Err(format!(
@@ -640,6 +649,15 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
     let mut host = tcp_arm_setup(attempt, pair)?;
     let result = tcp::run_throughput(host.publication(), &cfg)
         .map_err(|err| format!("throughput arm: {err}"))?;
+    if result.truncated {
+        return Err(format!(
+            "connection retired before the {}s measure window completed (measured {:.2}s, \
+             outcomes: {:?}); the attempt is invalid",
+            cfg.measure.as_secs(),
+            result.measured.as_secs_f64(),
+            result.outcomes
+        ));
+    }
     check_host_and_conservation(&mut host, &result.outcomes, result.terminal)?;
     let manifest = attempt.manifest_mut();
     manifest.outcomes = Some(result.outcomes.clone());

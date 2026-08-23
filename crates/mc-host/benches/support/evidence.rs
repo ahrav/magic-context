@@ -291,6 +291,16 @@ pub fn load_attempts(run_dir: &Path) -> Result<Vec<LoadedAttempt>, String> {
             .map_err(|err| format!("{}: {err}", manifest_path.display()))?;
         let manifest: Manifest = serde_json::from_slice(&bytes)
             .map_err(|err| format!("{}: {err}", manifest_path.display()))?;
+        // Pairwise `compatible` checks cannot catch a directory whose
+        // manifests all share an unsupported schema; every manifest must
+        // match the schema this binary's field semantics were written for.
+        if manifest.schema != SCHEMA_VERSION {
+            return Err(format!(
+                "{}: manifest schema {} is not the supported schema {SCHEMA_VERSION}",
+                manifest_path.display(),
+                manifest.schema
+            ));
+        }
         out.push(LoadedAttempt { dir, manifest });
     }
     Ok(out)

@@ -98,6 +98,17 @@ point exceeded what the host tolerates on one connection (connection
 retired before measurement) and is rejected as an invalid operating
 point rather than reported.
 
+Known defect in the retained 80 k/s evidence: one of its ten blocks
+(b10) had its connection retired ~2.2 s into the 12 s window (393
+peer-closed outcomes) yet was finalized as complete, because the harness
+at that commit only checked conservation over the slots reached. The
+harness now rejects any attempt whose connection fails before the
+warmup+measure window completes. The effect on the published row is
+small — recomputing the medians without b10 moves issue→completion p50
+from 44.4 to 43.6 µs, lag p99 from 26.5 to 26.2 µs, and sched p99 from
+100.1 to 99.9 µs — so the table retains the as-published values from
+all ten blocks.
+
 ## Sustained TCP throughput (closed loop, depth 32) — not latency
 
 Timestamp-minimal closed loop, medians across 10 blocks:

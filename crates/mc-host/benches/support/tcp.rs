@@ -228,6 +228,10 @@ pub struct OpenLoopResult {
     pub outcomes: OutcomeCounts,
     pub scheduled_slots: u64,
     pub elapsed: Duration,
+    /// True when the connection failed before the warmup+measure window
+    /// completed. Conservation still holds over the slots reached, so a
+    /// caller must check this flag to reject the partial window.
+    pub truncated: bool,
 }
 
 /// Open-loop loaded latency at one frozen offered rate. The arrival
@@ -263,6 +267,7 @@ async fn run_open_loop_inner(
     };
     let deadline_ns = (cfg.warmup + cfg.measure).as_nanos() as u64;
     let mut scheduled_slots = 0u64;
+    let mut truncated = false;
     let mut header = HeaderReader::new();
     let mut slot = 0u64;
 
@@ -287,11 +292,13 @@ async fn run_open_loop_inner(
                         Ok(Some(frame)) => {
                             if state.consume(&mut read_half, frame).await.is_err() {
                                 state.fail_pending(Outcome::PeerClosed);
+                                truncated = true;
                                 break 'sender;
                             }
                         }
                         Err(_) => {
                             state.fail_pending(Outcome::PeerClosed);
+                            truncated = true;
                             break 'sender;
                         }
                     }
@@ -316,6 +323,7 @@ async fn run_open_loop_inner(
                 state.outcomes.record(Outcome::WriteFailure);
             }
             state.fail_pending(Outcome::PeerClosed);
+            truncated = true;
             break;
         }
         state.pending.insert(corr, (scheduled_ns, issue_ns));
@@ -356,6 +364,7 @@ async fn run_open_loop_inner(
         outcomes: state.outcomes,
         scheduled_slots,
         elapsed: start.elapsed(),
+        truncated,
     })
 }
 
@@ -439,6 +448,9 @@ pub struct ThroughputResult {
     pub successful_per_sec: f64,
     pub outcomes: OutcomeCounts,
     pub measured: Duration,
+    /// True when the connection failed before the measure window
+    /// completed; `measured` then covers only the partial window.
+    pub truncated: bool,
 }
 
 /// Sustained closed-loop throughput at a fixed depth with timestamps only
@@ -520,7 +532,11 @@ async fn run_throughput_inner(
         }
     }
 
-    if measured_elapsed.is_zero() {
+    // A zero measured window here means the loop exited on a transport
+    // failure rather than reaching the configured measure duration; the
+    // fallback still reports the partial elapsed time for diagnostics.
+    let truncated = measured_elapsed.is_zero();
+    if truncated {
         measured_elapsed = measure_start.elapsed();
     }
     let secs = measured_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
@@ -532,6 +548,7 @@ async fn run_throughput_inner(
         successful_per_sec: outcomes.success as f64 / secs,
         outcomes,
         measured: measured_elapsed,
+        truncated,
     })
 }
 
