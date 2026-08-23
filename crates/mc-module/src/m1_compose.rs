@@ -603,6 +603,7 @@ mod tests {
                 reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
+                memories_replace_projects: None,
                 memory_mutations: &[],
                 user_profile: profile,
                 user_profile_present: true,

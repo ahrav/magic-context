@@ -6,7 +6,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { insertMemory, updateMemoryVerification } from "../../features/magic-context/memory";
-import { getCurrentMemoryClaimByLegacyMemoryId } from "../../features/magic-context/memory/storage-memory-claims";
+import {
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+} from "../../features/magic-context/memory/storage-memory-claims";
 import { runMigrations } from "../../features/magic-context/migrations";
 import {
     addProcessedImageStrippedIds,
@@ -410,6 +413,42 @@ describe("module state sync section deltas", () => {
         const forced = await buildDeltaPayload({ db, state, sessionId, force: true });
         expect(forced.user_profile).toEqual(["likes deltas"]);
         expect(forced.workspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
+    });
+
+    it("an epoch-only change sends a full replace snapshot instead of the id-gated increment", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-epoch-replace";
+        setProjectState(db, "/tmp/project", { projectMemoryEpoch: 1 });
+        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: "/tmp/project" });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: baseline,
+            seedPassPending: false,
+        };
+
+        // A policy transition bumps the epoch without minting a new memory
+        // id; the payload must carry replace semantics so the module prunes
+        // rows the policy now hides.
+        setProjectState(db, "/tmp/project", { projectMemoryEpoch: 2 });
+        const params = await buildDeltaPayload({ db, state, sessionId });
+        expect(params.memories_replace_projects).toEqual(["/tmp/project"]);
+        expect(Array.isArray(params.memories)).toBeTrue();
+
+        // An ordinary id-gated increment keeps upsert-only semantics.
+        state.lastAckedWatermarks = loadModuleWatermarks({
+            db,
+            sessionId,
+            projectPath: "/tmp/project",
+        });
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memories (project_path, category, content, normalized_hash,
+                    first_seen_at, created_at, updated_at, last_seen_at)
+                 VALUES ('/tmp/project', 'CONSTRAINTS', 'new row', 'hash-epoch-test', 1, 1, 1, 1)`,
+            ).run();
+        });
+        const incremental = await buildDeltaPayload({ db, state, sessionId });
+        expect(incremental).not.toHaveProperty("memories_replace_projects");
     });
 
     it("uses omitted sections only after the module advertises the delta capability", async () => {

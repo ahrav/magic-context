@@ -8,7 +8,10 @@
  * Fail-closed semantics (R19-R22, R26): a memory with no claim link, no
  * projection row, or an unsupported policy version is automatic-hidden;
  * explicit search may include it only as a labeled unknown. Hard-hidden rows
- * (contradicted/quarantined) return uniform absence on every agent surface.
+ * (contradicted/quarantined) and review-only rejected rows return uniform
+ * absence on every agent surface — those facts are read from the authoritative
+ * conflict/disposition rows, not the projection, so absence does not depend on
+ * the projection existing or on its policy version being understood.
  */
 
 import type { Database } from "../../../shared/sqlite";
@@ -20,12 +23,27 @@ export type MemoryPolicySurface = "auto_inject" | "auto_search" | "explicit_sear
 export interface MemoryPolicyRow {
     memoryId: number;
     claimId: number;
-    revisionId: number;
+    revisionId: number | null;
+    /**
+     * False when no `claim_effective_policy` row backs this memory. The
+     * maturity/taint/eligibility fields are then defaults, NOT stored state,
+     * and only the authoritative hard-hide facts below may be trusted.
+     */
+    projected: boolean;
     effectiveMaturity: string;
     originTaint: string;
     autoEligible: boolean;
     explicitEligible: boolean;
     hardHidden: boolean;
+    /**
+     * Authoritative hard-hide and review-only facts, read from
+     * `claim_conflicts` / `claim_disposition_events` rather than the
+     * projection, so uniform absence does not depend on a projection row
+     * existing or on its policy version being understood (R17, R22, R26).
+     */
+    contradicted: boolean;
+    quarantined: boolean;
+    rejected: boolean;
     dispositions: string[];
     policyVersion: number;
     generation: number;
@@ -49,7 +67,9 @@ export function hasClaimEffectivePolicy(db: Database): boolean {
 }
 
 /** Indexed policy rows for a set of memory ids through the crosswalk. Ids
- * without a link or projection row are absent from the map. */
+ * without a claim link are absent from the map; a linked id with no projection
+ * row is present with `projected: false` so its authoritative hard-hide facts
+ * still gate every surface. */
 export function readMemoryPolicyRows(
     db: Database,
     memoryIds: readonly number[],
@@ -65,7 +85,8 @@ export function readMemoryPolicyRows(
                 // Interpolation is a compile-time placeholder list, not caller input.
                 // pi-lens-ignore: sql-injection
                 `SELECT lmc.memory_id AS memoryId, claims.id AS claimId,
-                        policy.revision_id AS revisionId,
+                        claims.current_revision_id AS revisionId,
+                        policy.revision_id IS NOT NULL AS projected,
                         policy.effective_maturity AS effectiveMaturity,
                         policy.origin_taint AS originTaint,
                         policy.auto_eligible AS autoEligible,
@@ -73,30 +94,52 @@ export function readMemoryPolicyRows(
                         policy.hard_hidden AS hardHidden,
                         policy.dispositions_json AS dispositionsJson,
                         policy.policy_version AS policyVersion,
-                        policy.generation AS generation
+                        policy.generation AS generation,
+                        EXISTS (
+                            SELECT 1 FROM claim_conflicts
+                            WHERE relation = 'contradicts'
+                              AND (left_revision_id = claims.current_revision_id
+                                   OR right_revision_id = claims.current_revision_id)
+                        ) AS contradicted,
+                        COALESCE((
+                            SELECT action FROM claim_disposition_events
+                            WHERE revision_id = claims.current_revision_id
+                              AND disposition = 'quarantined'
+                            ORDER BY id DESC LIMIT 1
+                        ), 'clear') = 'assert' AS quarantined,
+                        COALESCE((
+                            SELECT action FROM claim_disposition_events
+                            WHERE revision_id = claims.current_revision_id
+                              AND disposition = 'rejected'
+                            ORDER BY id DESC LIMIT 1
+                        ), 'clear') = 'assert' AS rejected
                  FROM legacy_memory_claims lmc
                  JOIN claims ON claims.id = lmc.claim_id
-                 JOIN claim_effective_policy policy
+                 LEFT JOIN claim_effective_policy policy
                      ON policy.revision_id = claims.current_revision_id
                  WHERE lmc.memory_id IN (${placeholders})`,
             )
             .all(...chunk) as Array<{
             memoryId: number;
             claimId: number;
-            revisionId: number;
-            effectiveMaturity: string;
-            originTaint: string;
-            autoEligible: number;
-            explicitEligible: number;
-            hardHidden: number;
-            dispositionsJson: string;
-            policyVersion: number;
-            generation: number;
+            revisionId: number | null;
+            projected: number;
+            effectiveMaturity: string | null;
+            originTaint: string | null;
+            autoEligible: number | null;
+            explicitEligible: number | null;
+            hardHidden: number | null;
+            dispositionsJson: string | null;
+            policyVersion: number | null;
+            generation: number | null;
+            contradicted: number;
+            quarantined: number;
+            rejected: number;
         }>;
         for (const row of rows) {
             let dispositions: string[] = [];
             try {
-                dispositions = JSON.parse(row.dispositionsJson) as string[];
+                dispositions = JSON.parse(row.dispositionsJson ?? "[]") as string[];
             } catch {
                 dispositions = [];
             }
@@ -104,14 +147,18 @@ export function readMemoryPolicyRows(
                 memoryId: row.memoryId,
                 claimId: row.claimId,
                 revisionId: row.revisionId,
-                effectiveMaturity: row.effectiveMaturity,
-                originTaint: row.originTaint,
+                projected: row.projected === 1,
+                effectiveMaturity: row.effectiveMaturity ?? "CANDIDATE",
+                originTaint: row.originTaint ?? "unknown",
                 autoEligible: row.autoEligible === 1,
                 explicitEligible: row.explicitEligible === 1,
                 hardHidden: row.hardHidden === 1,
+                contradicted: row.contradicted === 1,
+                quarantined: row.quarantined === 1,
+                rejected: row.rejected === 1,
                 dispositions,
-                policyVersion: row.policyVersion,
-                generation: row.generation,
+                policyVersion: row.policyVersion ?? 0,
+                generation: row.generation ?? 0,
             });
         }
     }
@@ -123,24 +170,34 @@ export function decideMemoryPolicy(
     row: MemoryPolicyRow | undefined,
     surface: MemoryPolicySurface,
 ): MemoryPolicyDecision {
-    const missing = row == null || row.policyVersion > CLAIM_POLICY_VERSION;
+    // Hard-hide and review-only rejection are decided from authoritative rows,
+    // so they hold even when the projection is absent (pre-seed window) or was
+    // written by a policy version this build cannot interpret. Absence of a
+    // projection must never make a contradicted/quarantined row surfaceable:
+    // that would break uniform absence (R17, R22).
+    if (row != null && (row.hardHidden || row.contradicted || row.quarantined || row.rejected)) {
+        return { eligible: false, label: null };
+    }
+    // `unprojected` means "no trustworthy stored decision": no projection row,
+    // or a future policy version. Fail closed on automatic surfaces; explicit
+    // search may still show it as a labeled unknown.
+    const unprojected = row == null || !row.projected || row.policyVersion > CLAIM_POLICY_VERSION;
     if (surface === "explicit_search") {
-        if (row != null && row.hardHidden) return { eligible: false, label: null };
-        if (row != null && !missing && !row.explicitEligible) {
+        if (!unprojected && !row.explicitEligible) {
             return { eligible: false, label: null };
         }
         return {
             eligible: true,
             label: explicitSearchLabelFromFields({
-                effectiveMaturity: row?.effectiveMaturity ?? "CANDIDATE",
-                originTaint: missing ? "unknown" : (row?.originTaint ?? "unknown"),
+                effectiveMaturity: unprojected ? "CANDIDATE" : row.effectiveMaturity,
+                originTaint: unprojected ? "unknown" : row.originTaint,
                 dispositions: row?.dispositions ?? [],
-                policyMissing: missing,
-                autoEligible: row?.autoEligible ?? false,
+                policyMissing: unprojected,
+                autoEligible: !unprojected && row.autoEligible,
             }),
         };
     }
-    if (missing || row.hardHidden || !row.autoEligible) return { eligible: false, label: null };
+    if (unprojected || !row.autoEligible) return { eligible: false, label: null };
     return { eligible: true, label: null };
 }
 

@@ -385,6 +385,38 @@ describe("claim policy storage kernel", () => {
         }
     });
 
+    test("a stale/flagged transition supersedes the earlier outcome instead of stacking both", () => {
+        const fx = fixture();
+        try {
+            const observationId = addObservation(fx);
+            const revisionId = addRevision(fx, [observationId]);
+            subjectFor(fx, revisionId, observationId);
+            fx.db
+                .prepare(
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'v', 1)",
+                )
+                .run(revisionId);
+            fx.db
+                .prepare(
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'flagged', 'v', 2)",
+                )
+                .run(revisionId);
+            let dispositions = readActiveDispositions(fx.db, revisionId);
+            expect(dispositions.disputed).toBeTrue();
+            expect(dispositions.stale).toBeFalse();
+            fx.db
+                .prepare(
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'stale', 'v', 3)",
+                )
+                .run(revisionId);
+            dispositions = readActiveDispositions(fx.db, revisionId);
+            expect(dispositions.stale).toBeTrue();
+            expect(dispositions.disputed).toBeFalse();
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
     test("independence groups collapse shared keys, runs, and mirrored content", () => {
         const fx = fixture();
         try {

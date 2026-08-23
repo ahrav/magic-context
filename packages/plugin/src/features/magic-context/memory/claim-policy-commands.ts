@@ -157,6 +157,12 @@ interface ConfirmedMutationArgs<T> {
     producer: string;
     operationKey: (nonce: string) => string;
     request: (nonce: string) => unknown;
+    /** Runs on the confirming invocation BEFORE the write transaction opens:
+     * expensive work (artifact evaluation spawns a test process with a
+     * 120-second budget) must not hold the immediate transaction that every
+     * memory, claim, and backfill writer serializes on. `mutate` re-verifies
+     * its inputs transactionally afterwards. */
+    beforeMutate?: () => void;
     /** Runs inside the write transaction after the stale-safe recheck. */
     mutate: (nonce: string) => { result: T; effects: MemoryClaimEffect[] };
 }
@@ -194,6 +200,7 @@ function runConfirmedClaimMutation<T>(
     }
     pendingByKey.delete(key);
     const nonce = pendingBefore.nonce;
+    args.beforeMutate?.();
     const outcome = runInMemoryClaimsWriteTransaction(deps.db, () =>
         withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
             const operation = runMemoryClaimOperationInCurrentTransaction(
@@ -465,15 +472,11 @@ export function executeClaimEnforceCommand(
                 kind,
                 nonce,
             }),
-            mutate: () => {
-                const approvalId = currentApprovalActionId(deps.db, target.revisionId);
-                if (approvalId == null) {
-                    throw new Error("the approval was revoked since confirmation");
-                }
-                const subject = readPolicySubject(deps.db, target.revisionId);
-                if (!subject) {
-                    throw new Error("the revision has no policy subject yet; retry after seeding");
-                }
+            beforeMutate: () => {
+                // Evaluation happens outside the write transaction: the
+                // default evaluator synchronously runs a test process with a
+                // 120-second budget, and holding BEGIN IMMEDIATE that long
+                // would block every other memory/claim/backfill writer.
                 const digestBefore = sha256Bytes(canonical.absolutePath);
                 const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
                 evaluation = evaluate(canonical.absolutePath, kind, deps.projectRoot);
@@ -484,18 +487,35 @@ export function executeClaimEnforceCommand(
                 if (bytesDigest !== digestBefore) {
                     throw new Error("the artifact changed during evaluation; rerun the command");
                 }
+            },
+            mutate: () => {
+                const approvalId = currentApprovalActionId(deps.db, target.revisionId);
+                if (approvalId == null) {
+                    throw new Error("the approval was revoked since confirmation");
+                }
+                const subject = readPolicySubject(deps.db, target.revisionId);
+                if (!subject) {
+                    throw new Error("the revision has no policy subject yet; retry after seeding");
+                }
+                const evaluated = evaluation;
+                if (!evaluated) throw new Error("artifact evaluation did not run");
+                // Transactional recheck: the artifact bytes recorded must
+                // still be the bytes the pre-transaction evaluation ran on.
+                if (sha256Bytes(canonical.absolutePath) !== bytesDigest) {
+                    throw new Error("the artifact changed since evaluation; rerun the command");
+                }
                 const artifactId = recordEnforcementArtifactInCurrentTransaction(deps.db, {
                     revisionId: target.revisionId,
                     projectId: target.projectId,
                     artifactKind: kind,
                     canonicalPath: canonical.canonicalPath,
                     bytesDigest,
-                    evaluator: evaluation.evaluator,
-                    evaluatorVersion: evaluation.evaluatorVersion,
-                    evaluatorResult: evaluation.result,
+                    evaluator: evaluated.evaluator,
+                    evaluatorVersion: evaluated.evaluatorVersion,
+                    evaluatorResult: evaluated.result,
                     nowMs: deps.nowMs,
                 });
-                if (evaluation.result === "pass") {
+                if (evaluated.result === "pass") {
                     appendMaturityAssertionInCurrentTransaction(deps.db, {
                         revisionId: target.revisionId,
                         projectId: target.projectId,

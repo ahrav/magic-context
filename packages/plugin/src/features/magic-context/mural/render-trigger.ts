@@ -4,6 +4,8 @@ import { piModelRefToCanonical } from "../../../shared/harness-provider-map";
 import { log } from "../../../shared/logger";
 import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
+import { getMemoriesByProject } from "../memory";
+import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
 import { renderMural } from "./render-mural";
 import type { MuralWireOptions } from "./resolve-mural";
@@ -63,7 +65,18 @@ export function ensureMuralRendered(
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
 ): EnsureMuralResult {
-    const coverage = getMuralCoverage(db, projectIdentity);
+    // The mural is folded into m[0] as an image, so it is an AUTOMATIC
+    // injection channel and must use the same `auto_inject` decision the m[0]
+    // text pool uses. Filtering here (not inside resolve-mural, which stays a
+    // memories-only reader) keeps policy-hidden rows — including
+    // contradicted/quarantined ones — out of both the coverage denominator and
+    // the rendered image, on a channel that carries no trust label.
+    const pool = filterMemoriesByPolicy(
+        db,
+        getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
+        "auto_inject",
+    ).memories;
+    const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (
         coverage.activeMemoryCount === 0 ||
         !muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount)
@@ -76,7 +89,7 @@ export function ensureMuralRendered(
         return { hasMural: false, rerendered: false, skipReason };
     }
 
-    const entries = resolveMural(db, projectIdentity, budgetTokens);
+    const entries = resolveMural(db, projectIdentity, budgetTokens, pool);
     if (entries.length === 0) {
         // Empty overflow pool → no mural block. Leave any stale stored row alone
         // so the dashboard can still show the last render.

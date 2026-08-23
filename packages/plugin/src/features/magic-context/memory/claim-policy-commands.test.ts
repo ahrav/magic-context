@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database } from "../../../shared/sqlite";
+import { Database, isInTransaction } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
@@ -346,6 +346,27 @@ describe("claim enforcement command workflow", () => {
             expect(
                 executeClaimEnforceCommand(commandDeps, `${seed.memoryId} dir.test.ts`).text,
             ).toContain("regular file");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("the artifact evaluator runs outside the claims write transaction", () => {
+        const db = migratedDb();
+        try {
+            let evaluatedInTransaction: boolean | null = null;
+            const commandDeps = deps(db, {
+                evaluateArtifact: () => {
+                    evaluatedInTransaction = isInTransaction(db);
+                    return passEvaluator();
+                },
+            });
+            const seed = approvedSeed(db, commandDeps, "enf-outside-tx");
+            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
+            executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
+            const second = executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
+            expect(second.level).toBe("info");
+            expect(evaluatedInTransaction).toBeFalse();
         } finally {
             closeQuietly(db);
         }

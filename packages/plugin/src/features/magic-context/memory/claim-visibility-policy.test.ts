@@ -3,13 +3,36 @@
 import { describe, expect, test } from "bun:test";
 import {
     type ActiveDispositions,
-    agentPolicyLabel,
     effectiveMaturity,
     evaluateClaimPolicy,
+    explicitSearchLabelFromFields,
     NO_DISPOSITIONS,
+    type PolicyDecision,
     type PolicyEvaluationInput,
     type PolicySupport,
 } from "./claim-visibility-policy";
+
+/**
+ * The label an agent would see for a decision, derived through the SHIPPED
+ * label path. `decideMemoryPolicy` calls `explicitSearchLabelFromFields` with
+ * the projected columns, so asserting against it here keeps these
+ * sanitization tests pointed at the code agents actually reach.
+ */
+function labelFor(decision: PolicyDecision): string | null {
+    const explicit = decision.surfaces.explicit_search;
+    if (!explicit.eligible || explicit.renderMode !== "labeled") return null;
+    return explicitSearchLabelFromFields({
+        effectiveMaturity: decision.effectiveMaturity,
+        originTaint: decision.originTaint,
+        dispositions: decision.activeDispositions,
+        // Unsupported versions label as unknown policy exactly like missing
+        // rows: both mean this evaluator cannot vouch for the stored state.
+        policyMissing:
+            decision.reasonCodes.includes("policy_state_missing") ||
+            decision.reasonCodes.includes("policy_version_unsupported"),
+        autoEligible: decision.surfaces.auto_inject.eligible,
+    });
+}
 
 const BASE_SUPPORT: PolicySupport = {
     historicalMaturity: null,
@@ -76,7 +99,7 @@ describe("visibility matrix", () => {
         });
         expect(decision.surfaces.review).toEqual({ eligible: true, renderMode: "normal" });
         expect(decision.reasonCodes).toEqual(["eligible"]);
-        expect(agentPolicyLabel(decision)).toBeNull();
+        expect(labelFor(decision)).toBeNull();
     });
 
     test("CANDIDATE and CORROBORATED are explicit-search-only with labels", () => {
@@ -92,7 +115,7 @@ describe("visibility matrix", () => {
                 renderMode: "labeled",
             });
             expect(decision.reasonCodes).toContain("maturity_below_automatic");
-            const label = agentPolicyLabel(decision);
+            const label = labelFor(decision);
             expect(label).toContain("taint:assistant_inference");
         }
     });
@@ -110,7 +133,7 @@ describe("visibility matrix", () => {
                 eligible: true,
                 renderMode: "labeled",
             });
-            expect(agentPolicyLabel(decision)).toContain(disposition);
+            expect(labelFor(decision)).toContain(disposition);
         }
     });
 
@@ -148,7 +171,7 @@ describe("visibility matrix", () => {
         expect(missing.surfaces.explicit_search.renderMode).toBe("labeled");
         expect(missing.reasonCodes).toContain("policy_state_missing");
         expect(missing.originTaint).toBe("unknown");
-        expect(agentPolicyLabel(missing)).toContain("policy:unknown");
+        expect(labelFor(missing)).toContain("policy:unknown");
 
         const future = evaluateClaimPolicy(
             input({
@@ -158,11 +181,18 @@ describe("visibility matrix", () => {
         );
         expect(future.surfaces.auto_inject.eligible).toBeFalse();
         expect(future.reasonCodes).toContain("policy_version_unsupported");
+        // Unsupported versions read exactly like missing state: the stored
+        // taint was written under a scheme this evaluator does not
+        // understand, and the label must say so — matching the storage path
+        // in storage-claim-visibility.ts.
+        expect(future.originTaint).toBe("unknown");
+        expect(labelFor(future)).toContain("taint:unknown");
+        expect(labelFor(future)).toContain("policy:unknown");
     });
 
     test("agent labels never carry locators, hashes, or conflict details", () => {
         const decision = evaluateClaimPolicy(input({ dispositions: { stale: true }, support: {} }));
-        const label = agentPolicyLabel(decision) ?? "";
+        const label = labelFor(decision) ?? "";
         expect(label).not.toMatch(/[0-9a-f]{32}/);
         expect(label).not.toContain("/");
         expect(label).not.toContain("contradict");

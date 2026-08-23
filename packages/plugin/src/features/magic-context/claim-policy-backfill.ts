@@ -13,8 +13,13 @@
  */
 
 import type { Database } from "../../shared/sqlite.ts";
-import { classifyFineTaint, TAINT_CLASSIFIER_METHOD } from "./memory/claim-policy.ts";
-import { supportedMaturity } from "./memory/claim-visibility-policy.ts";
+import { isRetryableSqliteBusyError } from "./claims-backfill.ts";
+import {
+    automaticMaturityTarget,
+    classifyFineTaint,
+    TAINT_CLASSIFIER_METHOD,
+} from "./memory/claim-policy.ts";
+import type { PolicySupport } from "./memory/claim-visibility-policy.ts";
 import {
     appendMaturityAssertionInCurrentTransaction,
     createPolicySubjectInCurrentTransaction,
@@ -22,6 +27,7 @@ import {
     readPolicySupport,
     refreshEffectivePolicyInCurrentTransaction,
 } from "./memory/storage-claim-policy.ts";
+import { bumpEpochForClaimProjectInCurrentTransaction } from "./memory/storage-memory-claims.ts";
 import type { SourceTrustClass } from "./storage-claim-applicability-schema.ts";
 import {
     CLAIM_POLICY_SEED_META_KEYS,
@@ -30,7 +36,15 @@ import {
 } from "./storage-claim-policy-schema.ts";
 
 const SEED_ACTOR = "claim-policy-seed:v1";
-const DEFAULT_BATCH_SIZE = 200;
+/**
+ * Seeding a revision issues roughly thirty statements (subject insert, support
+ * aggregation, assertion append, projection refresh), so batches stay well
+ * under the v84 write-lock budget of 2500ms — 2x margin below the 5s sibling
+ * `busy_timeout` (see CLAIMS_BACKFILL_BATCH_SIZE and
+ * docs/evidence/claims-backfill/v84-threshold.json).
+ */
+const DEFAULT_BATCH_SIZE = 25;
+const DEFAULT_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
 
 export interface ClaimPolicySeedStatus {
     applicable: boolean;
@@ -91,6 +105,7 @@ export function getClaimPolicySeedStatus(db: Database): ClaimPolicySeedStatus {
 
 interface SeedRevisionRow {
     revisionId: number;
+    claimId: number;
     projectId: number;
     originObservationId: number | null;
     sourceTrustClass: SourceTrustClass | null;
@@ -101,18 +116,35 @@ interface SeedRevisionRow {
 function seedTaint(row: SeedRevisionRow): FineTaint {
     // Retained raw `user` provenance predates the v85 trust column; the v85
     // contract keeps it exactly so a later policy can re-derive channel
-    // confidence (R25). Anything else classifies from the coarse class.
-    if (row.metadataSourceType === "user" || row.sourceTrustClass === "explicit_user") {
-        return "USER_EXPLICIT";
-    }
-    return classifyFineTaint({
-        sourceTrustClass: row.sourceTrustClass ?? "model_inference",
-        extractor: row.extractor,
-    });
+    // confidence (R25). Feed it in as the coarse class rather than mapping it
+    // here, so `classifyFineTaint` stays the only coarse-to-fine authority —
+    // the taint this returns is frozen in an append-only table and cannot be
+    // repaired in place if the two ever disagree.
+    const sourceTrustClass: SourceTrustClass =
+        row.metadataSourceType === "user"
+            ? "explicit_user"
+            : (row.sourceTrustClass ?? "model_inference");
+    return classifyFineTaint({ sourceTrustClass, extractor: row.extractor });
 }
 
-function seedMaturity(db: Database, row: SeedRevisionRow): MaturityLevel {
-    return supportedMaturity(readPolicySupport(db, row.revisionId));
+/**
+ * The rung the seed may assert for a legacy revision. Shares the live
+ * reducer's ceiling (`automaticMaturityTarget`) rather than the ungated
+ * `supportedMaturity`: the frozen subject records `claimKind: "unknown"`,
+ * which carries directive-strength restrictions, so a legacy revision whose
+ * origin cannot originate a directive must stay CANDIDATE exactly like a new
+ * one. Using the ungated reducer here would grandfather untrusted-origin
+ * legacy rows straight into automatic visibility, and the ladder only moves
+ * upward so the over-promotion would never be reconciled back down.
+ */
+function seedMaturity(support: PolicySupport, taint: FineTaint): MaturityLevel {
+    return automaticMaturityTarget({
+        kind: "unknown",
+        originTaint: taint,
+        independentGroups: support.independentGroups,
+        verified: support.verified,
+        explicitUserEvidence: support.explicitUserEvidence,
+    });
 }
 
 function selectUnseededBatch(
@@ -124,6 +156,7 @@ function selectUnseededBatch(
         .prepare(
             `SELECT
                 claim_revisions.id AS revisionId,
+                claims.id AS claimId,
                 claims.project_id AS projectId,
                 origin_observation.id AS originObservationId,
                 origin_observation.source_trust_class AS sourceTrustClass,
@@ -161,7 +194,19 @@ export interface RunClaimPolicySeedOptions {
     /** Bound the batches one call may run; remaining work stays pending. */
     maxBatches?: number;
     nowMs?: number;
+    /** Bounded backoff before a contended batch reports `pending`. */
+    retryDelaysMs?: readonly number[];
+    sleep?: (delayMs: number) => Promise<void>;
+    yieldToEventLoop?: () => Promise<void>;
 }
+
+/** One committed batch's effect, applied to the run totals only after the
+ * batch commits — a busy retry re-runs the body, so accumulating inside it
+ * would double-count. */
+type SeedBatchStep =
+    | { kind: "seeded"; outcomes: Array<{ maturity: MaturityLevel; autoEligible: boolean }> }
+    | { kind: "reconcile-reset" }
+    | { kind: "complete" };
 
 /**
  * Run bounded seed batches until done (or `maxBatches`). Deterministic and
@@ -170,11 +215,15 @@ export interface RunClaimPolicySeedOptions {
  * results (AE9). Completion re-checks the whole table with an anti-join so a
  * revision added by a held-open v85 writer during reconciliation is seeded
  * before the completion watermark publishes.
+ *
+ * Async and cooperative on purpose (the v84 runner's shape): batches yield to
+ * the event loop so a large corpus cannot stall the host, and a contended
+ * batch backs off and reports `pending` instead of aborting the whole run.
  */
-export function runClaimPolicySeed(
+export async function runClaimPolicySeed(
     db: Database,
     options: RunClaimPolicySeedOptions = {},
-): ClaimPolicySeedRunSummary {
+): Promise<ClaimPolicySeedRunSummary> {
     const status = getClaimPolicySeedStatus(db);
     const emptyCounts: Record<string, number> = { CANDIDATE: 0, CORROBORATED: 0, VERIFIED: 0 };
     if (!status.applicable || status.phase === "complete") {
@@ -189,6 +238,12 @@ export function runClaimPolicySeed(
     const batchSize = Math.max(1, options.batchSize ?? DEFAULT_BATCH_SIZE);
     const maxBatches = options.maxBatches ?? Number.POSITIVE_INFINITY;
     const nowMs = options.nowMs ?? Date.now();
+    const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_BUSY_RETRY_DELAYS_MS;
+    const sleep =
+        options.sleep ??
+        ((delayMs: number) => new Promise((resolve) => setTimeout(resolve, delayMs)));
+    const yieldToEventLoop =
+        options.yieldToEventLoop ?? (() => new Promise<void>((resolve) => setImmediate(resolve)));
 
     let batches = 0;
     let seeded = 0;
@@ -196,51 +251,82 @@ export function runClaimPolicySeed(
     const counts: Record<string, number> =
         status.seededCounts != null ? { ...emptyCounts, ...status.seededCounts } : emptyCounts;
 
-    while (batches < maxBatches) {
-        let batchDone = false;
-        db.exec("BEGIN IMMEDIATE");
-        try {
-            const cursor = Number(readMeta(db, CLAIM_POLICY_SEED_META_KEYS.cursor) ?? 0);
-            const rows = selectUnseededBatch(db, cursor, batchSize);
-            if (rows.length === 0) {
-                // Final reconciliation: a full anti-join (cursor 0) catches
-                // rows a held-open writer added behind the cursor.
-                const remaining = selectUnseededBatch(db, 0, 1);
-                if (remaining.length > 0) {
-                    writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.cursor, "0");
-                    db.exec("COMMIT");
-                    continue;
-                }
-                publishSeedCompletion(db, counts);
-                db.exec("COMMIT");
-                return { status: "complete", batches, seeded, seededCounts: counts, autoHidden };
+    const runBatch = async (): Promise<SeedBatchStep | "busy"> => {
+        for (let attempt = 0; ; attempt += 1) {
+            try {
+                return db
+                    .transaction(() => seedBatchInCurrentTransaction(db, batchSize, nowMs))
+                    .immediate() as SeedBatchStep;
+            } catch (error) {
+                if (!isRetryableSqliteBusyError(error)) throw error;
+                const delayMs = retryDelaysMs[attempt];
+                if (delayMs === undefined) return "busy";
+                await sleep(delayMs);
             }
-            for (const row of rows) {
-                const outcome = seedRevisionInCurrentTransaction(db, row, nowMs);
+        }
+    };
+
+    while (batches < maxBatches) {
+        const step = await runBatch();
+        if (step === "busy") break;
+        if (step.kind === "complete") {
+            return { status: "complete", batches, seeded, seededCounts: counts, autoHidden };
+        }
+        if (step.kind === "seeded") {
+            for (const outcome of step.outcomes) {
                 seeded += 1;
                 counts[outcome.maturity] = (counts[outcome.maturity] ?? 0) + 1;
                 if (!outcome.autoEligible) autoHidden += 1;
             }
-            writeMeta(
-                db,
-                CLAIM_POLICY_SEED_META_KEYS.cursor,
-                String(rows[rows.length - 1].revisionId),
-            );
-            writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.seededCounts, JSON.stringify(counts));
-            db.exec("COMMIT");
-            batchDone = true;
-        } finally {
-            if (!batchDone) {
-                try {
-                    db.exec("ROLLBACK");
-                } catch {
-                    // Transaction already rolled back by SQLite.
-                }
-            }
+            // Counters live outside the transaction, so persist them only after
+            // the batch that produced them has committed.
+            db.transaction(() => {
+                writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.seededCounts, JSON.stringify(counts));
+            }).immediate();
         }
         batches += 1;
+        await yieldToEventLoop();
     }
     return { status: "pending", batches, seeded, seededCounts: counts, autoHidden };
+}
+
+/** One batch inside an already-open immediate transaction. */
+function seedBatchInCurrentTransaction(
+    db: Database,
+    batchSize: number,
+    nowMs: number,
+): SeedBatchStep {
+    const cursor = Number(readMeta(db, CLAIM_POLICY_SEED_META_KEYS.cursor) ?? 0);
+    const rows = selectUnseededBatch(db, cursor, batchSize);
+    if (rows.length === 0) {
+        // Final reconciliation: a full anti-join (cursor 0) catches rows a
+        // held-open writer added behind the cursor.
+        const remaining = selectUnseededBatch(db, 0, 1);
+        if (remaining.length > 0) {
+            writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.cursor, "0");
+            return { kind: "reconcile-reset" };
+        }
+        publishSeedCompletion(db);
+        return { kind: "complete" };
+    }
+    // Seeding can flip a legacy revision into automatic visibility after the
+    // migration's one-time epoch bump was already acknowledged; without a
+    // fresh bump per affected project, cached m0/module snapshots keep
+    // omitting the memory until an unrelated mutation lands. One bump per
+    // project per batch suffices — consumers compare epochs, they do not
+    // count them.
+    const eligibleClaimByProject = new Map<number, number>();
+    const outcomes: Array<{ maturity: MaturityLevel; autoEligible: boolean }> = [];
+    for (const row of rows) {
+        const outcome = seedRevisionInCurrentTransaction(db, row, nowMs);
+        outcomes.push(outcome);
+        if (outcome.autoEligible) eligibleClaimByProject.set(row.projectId, row.claimId);
+    }
+    for (const claimId of eligibleClaimByProject.values()) {
+        bumpEpochForClaimProjectInCurrentTransaction(db, claimId);
+    }
+    writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.cursor, String(rows[rows.length - 1].revisionId));
+    return { kind: "seeded", outcomes };
 }
 
 function seedRevisionInCurrentTransaction(
@@ -260,7 +346,7 @@ function seedRevisionInCurrentTransaction(
         classificationMethod: `${TAINT_CLASSIFIER_METHOD}:seed`,
         nowMs,
     });
-    const maturity = seedMaturity(db, row);
+    const maturity = seedMaturity(readPolicySupport(db, row.revisionId), taint);
     appendMaturityAssertionInCurrentTransaction(db, {
         revisionId: row.revisionId,
         projectId: row.projectId,
@@ -273,8 +359,10 @@ function seedRevisionInCurrentTransaction(
     return { maturity, autoEligible: decision.surfaces.auto_inject.eligible };
 }
 
-/** Publish completion only after count and anti-join reconciliation (KTD11). */
-function publishSeedCompletion(db: Database, counts: Record<string, number>): void {
+/** Publish completion only after count and anti-join reconciliation (KTD11).
+ * Seeded counts are persisted per committed batch, so this only publishes the
+ * phase and completion watermark. */
+function publishSeedCompletion(db: Database): void {
     const boundary = Number(readMeta(db, CLAIM_POLICY_SEED_META_KEYS.boundaryRevisionId) ?? 0);
     const expected = Number(readMeta(db, CLAIM_POLICY_SEED_META_KEYS.expectedCount) ?? 0);
     const subjectsAtBoundary = (
@@ -318,5 +406,4 @@ function publishSeedCompletion(db: Database, counts: Record<string, number>): vo
     ).id;
     writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.phase, "complete");
     writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.completionWatermark, String(watermark));
-    writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.seededCounts, JSON.stringify(counts));
 }

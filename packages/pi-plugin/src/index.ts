@@ -481,13 +481,17 @@ function scheduleStartupBackfills(
 	db: ContextDatabase,
 	run = runClaimsBackfillStartup,
 ): Promise<unknown> {
-	return run(db, { log: warn })
-		.then(() => {
-			runClaimPolicySeedStartup(db, { log: warn });
-		})
-		.catch((err) => {
+	// The two runners are independent: an unseeded revision reads as
+	// automatic-hidden, so chaining the policy seed behind the claims backfill
+	// would hide every pre-existing memory whenever that backfill fails.
+	return Promise.all([
+		run(db, { log: warn }).catch((err) => {
 			warn(`[claims-backfill] background runner failed: ${err}`);
-		});
+		}),
+		runClaimPolicySeedStartup(db, { log: warn }).catch((err) => {
+			warn(`[claim-policy-seed] background runner failed: ${err}`);
+		}),
+	]);
 }
 
 function getPiMessageModel(message: unknown): {
@@ -1306,9 +1310,23 @@ async function startPiMagicContextRuntime(
 	registerCtxFlushCommand(pi, { db, compactionOff });
 	info("registered /ctx-flush");
 
-	registerCtxApproveCommand(pi, { db, projectDir, projectIdentity });
+	const resolveCommandProject = (ctx: { cwd: string }) => ({
+		projectDir: ctx.cwd,
+		projectIdentity: resolveCurrentProjectDeps(ctx).projectIdentity,
+	});
+	registerCtxApproveCommand(pi, {
+		db,
+		projectDir,
+		projectIdentity,
+		resolveProject: resolveCommandProject,
+	});
 	info("registered /ctx-approve");
-	registerCtxEnforceCommand(pi, { db, projectDir, projectIdentity });
+	registerCtxEnforceCommand(pi, {
+		db,
+		projectDir,
+		projectIdentity,
+		resolveProject: resolveCommandProject,
+	});
 	info("registered /ctx-enforce");
 
 	// /ctx-recomp uses its own PiSubagentRunner instance — recomp can run

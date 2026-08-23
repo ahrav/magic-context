@@ -277,13 +277,17 @@ const server: Plugin = async (ctx) => {
             const db = openDatabase();
             if (db && isDatabasePersisted(db)) {
                 scheduleAfterBootQuiet(() => {
-                    runClaimsBackfillStartup(db)
-                        .then(() => {
-                            runClaimPolicySeedStartup(db);
-                        })
-                        .catch((err) => {
-                            log(`[claims-backfill] background runner failed: ${err}`);
-                        });
+                    runClaimsBackfillStartup(db).catch((err) => {
+                        log(`[claims-backfill] background runner failed: ${err}`);
+                    });
+                });
+                // Independent of the backfill above: an unseeded revision reads
+                // as automatic-hidden, so chaining this behind that backfill
+                // would hide every pre-existing memory whenever it fails.
+                scheduleAfterBootQuiet(() => {
+                    runClaimPolicySeedStartup(db).catch((err) => {
+                        log(`[claim-policy-seed] background runner failed: ${err}`);
+                    });
                 });
             }
         } catch (err) {

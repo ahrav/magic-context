@@ -61,6 +61,7 @@ import {
 	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { filterMemoriesByPolicy } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import type { MemoryClaimOperationIdentity } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	ClaimOperationKeyReuseError,
@@ -181,7 +182,10 @@ function normalizeLimit(limit?: number): number {
 	return Math.max(1, Math.floor(limit));
 }
 
-function formatMemoryList(memories: Memory[]): string {
+function formatMemoryList(
+	memories: Memory[],
+	policyLabels?: Map<number, string>,
+): string {
 	if (memories.length === 0) return "No active memories found.";
 
 	const rows = memories.map((m) => ({
@@ -189,6 +193,7 @@ function formatMemoryList(memories: Memory[]): string {
 		category: m.category,
 		status: m.status,
 		verification: m.verificationStatus,
+		trust: policyLabels?.get(m.id) ?? "",
 		updated: new Date(m.updatedAt).toISOString(),
 		content: m.content.replace(/\s+/g, " ").trim(),
 	}));
@@ -197,6 +202,7 @@ function formatMemoryList(memories: Memory[]): string {
 		category: "CATEGORY",
 		status: "STATUS",
 		verification: "VERIFY",
+		trust: "TRUST",
 		updated: "UPDATED",
 		content: "CONTENT",
 	};
@@ -214,6 +220,7 @@ function formatMemoryList(memories: Memory[]): string {
 			headers.verification.length,
 			...rows.map((r) => r.verification.length),
 		),
+		trust: Math.max(headers.trust.length, ...rows.map((r) => r.trust.length)),
 		updated: Math.max(
 			headers.updated.length,
 			...rows.map((r) => r.updated.length),
@@ -225,6 +232,7 @@ function formatMemoryList(memories: Memory[]): string {
 			r.category.padEnd(widths.category),
 			r.status.padEnd(widths.status),
 			r.verification.padEnd(widths.verification),
+			r.trust.padEnd(widths.trust),
 			r.updated.padEnd(widths.updated),
 			r.content,
 		].join(" | ");
@@ -237,6 +245,7 @@ function formatMemoryList(memories: Memory[]): string {
 			"-".repeat(widths.category),
 			"-".repeat(widths.status),
 			"-".repeat(widths.verification),
+			"-".repeat(widths.trust),
 			"-".repeat(widths.updated),
 			"-------",
 		].join("-+-"),
@@ -281,6 +290,7 @@ const getNotVisibleMessage = (id: number): string =>
 function formatGetOutput(args: {
 	requestedIds: number[];
 	memoriesById: Map<number, Memory>;
+	policyLabels?: Map<number, string>;
 }): string {
 	const parts: string[] = [];
 	for (const id of args.requestedIds) {
@@ -288,7 +298,7 @@ function formatGetOutput(args: {
 		if (!memory) {
 			parts.push(getNotVisibleMessage(id));
 		} else {
-			parts.push(formatMemoryList([memory]));
+			parts.push(formatMemoryList([memory], args.policyLabels));
 		}
 	}
 	return parts.join("\n\n");
@@ -673,7 +683,21 @@ export function createCtxMemoryTool(
 					const filtered2 = category
 						? filtered.filter((m) => m.category === category)
 						: filtered;
-					return ok(formatMemoryList(filtered2.slice(0, limit)));
+					// The explicit-surface decision applies before the limit:
+					// hard-hidden rows get uniform absence; sub-verified rows
+					// keep sanitized trust labels. Same gate as the OpenCode
+					// tool so neither harness is a laxer read path.
+					const policyFiltered = filterMemoriesByPolicy(
+						deps.db,
+						filtered2,
+						"explicit_search",
+					);
+					return ok(
+						formatMemoryList(
+							policyFiltered.memories.slice(0, limit),
+							policyFiltered.labels,
+						),
+					);
 				}
 
 				if (params.action === "get") {
@@ -696,15 +720,19 @@ export function createCtxMemoryTool(
 					// each requested id exactly once and never reflects a row twice.
 					const uniqueIds = [...new Set(getIds)];
 					const fetched = getMemoriesByIds(deps.db, uniqueIds);
+					const policyFiltered = filterMemoriesByPolicy(
+						deps.db,
+						fetched.filter((memory) => memoryVisibleToTool(memory)),
+						"explicit_search",
+					);
 					const memoriesById = new Map<number, Memory>(
-						fetched
-							.filter((memory) => memoryVisibleToTool(memory))
-							.map((memory) => [memory.id, memory]),
+						policyFiltered.memories.map((memory) => [memory.id, memory]),
 					);
 					return ok(
 						formatGetOutput({
 							requestedIds: uniqueIds,
 							memoriesById,
+							policyLabels: policyFiltered.labels,
 						}),
 					);
 				}

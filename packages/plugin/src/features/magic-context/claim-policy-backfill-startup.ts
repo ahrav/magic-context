@@ -8,18 +8,27 @@ import {
 
 export interface ClaimPolicySeedStartupOptions {
     log?: (message: string) => void;
-    runSeed?: (db: Database) => ClaimPolicySeedRunSummary;
+    runSeed?: (db: Database) => Promise<ClaimPolicySeedRunSummary>;
 }
 
-export function runClaimPolicySeedStartup(
+/**
+ * Start-of-process v86 policy seeding.
+ *
+ * Runs independently of the v84 claims backfill: until a revision is seeded it
+ * reads as automatic-hidden (R26), so a seed that never runs leaves every
+ * pre-existing memory invisible to injection, auto-search, and the native
+ * mirror. Chaining it behind an unrelated backfill's success would make that
+ * outage a side effect of that backfill's failure.
+ */
+export async function runClaimPolicySeedStartup(
     db: Database,
     options: ClaimPolicySeedStartupOptions = {},
-): ClaimPolicySeedRunSummary | null {
+): Promise<ClaimPolicySeedRunSummary | null> {
     const emit = options.log ?? log;
     const status = getClaimPolicySeedStatus(db);
     if (!status.applicable || status.phase !== "pending") return null;
     const run = options.runSeed ?? runClaimPolicySeed;
-    const summary = run(db);
+    const summary = await run(db);
     if (summary.status === "complete") {
         emit(
             `[claim-policy-seed] complete; seeded ${summary.seeded} revision(s), ` +
@@ -27,7 +36,9 @@ export function runClaimPolicySeedStartup(
                 `(${JSON.stringify(summary.seededCounts)})`,
         );
     } else if (summary.status === "pending") {
-        emit("[claim-policy-seed] bounded run left work pending; resumes next start");
+        emit(
+            `[claim-policy-seed] ${summary.batches} batch(es) left work pending; resumes next start`,
+        );
     }
     return summary;
 }

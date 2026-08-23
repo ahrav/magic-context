@@ -678,6 +678,11 @@ struct ModuleStateSyncWire {
     compartments: Vec<ModuleCompartmentWire>,
     #[serde(default)]
     memories: Vec<ModuleMemoryWire>,
+    /// Present when `memories` is a FULL policy snapshot for these projects:
+    /// the store prunes mirrored rows absent from the payload within this
+    /// scope. Absent means incremental upsert-only semantics.
+    #[serde(default)]
+    memories_replace_projects: Option<Vec<String>>,
     #[serde(default)]
     memory_mutations: Vec<ModuleMemoryMutationWire>,
     #[serde(default)]
@@ -9214,6 +9219,30 @@ impl McHandler {
             Ok(mutations) => mutations,
             Err(error) => return invalid_params_error(error),
         };
+        // Replace-scope entries are project assertions exactly like memory
+        // rows: validate each against the bound owner / workspace membership
+        // so one sync cannot prune rows outside its authority.
+        let memories_replace_projects = match parsed
+            .memories_replace_projects
+            .take()
+            .map(|projects| {
+                projects
+                    .into_iter()
+                    .map(|project| {
+                        authority_source_path(
+                            Some(&project),
+                            store_project_path,
+                            &member_paths,
+                            has_workspace,
+                        )
+                    })
+                    .collect::<Result<Vec<String>, String>>()
+            })
+            .transpose()
+        {
+            Ok(scope) => scope,
+            Err(error) => return invalid_params_error(error),
+        };
         let acked_watermarks = parsed.acked_watermarks.unwrap_or_else(|| {
             json!({
                 "compartment_seq": compartments.iter().map(|c| c.sequence).max(),
@@ -9268,6 +9297,7 @@ impl McHandler {
             reasoning_cleared_through_tag: parsed.reasoning_cleared_through_tag,
             compartments: &compartments,
             memories: &memories,
+            memories_replace_projects: memories_replace_projects.as_deref(),
             memory_mutations: &memory_mutations,
             user_profile: &user_profile,
             user_profile_present,
@@ -13578,6 +13608,9 @@ fn assemble_state_sync_seed(
         seed_boundary_id: final_batch.seed_boundary_id,
         compartments,
         memories,
+        // Seed batches are additive slices of one snapshot; the sender never
+        // attaches replace semantics to them.
+        memories_replace_projects: None,
         memory_mutations,
         user_profile,
         workspace: final_batch.workspace,

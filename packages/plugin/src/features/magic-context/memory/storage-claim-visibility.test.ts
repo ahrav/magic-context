@@ -250,4 +250,74 @@ describe("claim policy surface enforcement", () => {
             closeQuietly(db);
         }
     });
+
+    test("a contradicted row with no projection row is absent from explicit search", () => {
+        const db = migratedDb();
+        try {
+            // Two revisions so the symmetric contradiction CHECK is satisfiable.
+            const left = seedMemory(db, "contra-left", "contradiction left side");
+            const right = seedMemory(db, "contra-right", "contradiction right side");
+            verify(db, left.memoryId);
+            const [lo, hi] =
+                left.revisionId < right.revisionId
+                    ? [left.revisionId, right.revisionId]
+                    : [right.revisionId, left.revisionId];
+            db.prepare(
+                `INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at)
+                 VALUES ('contradicts', ?, ?, ?)`,
+            ).run(lo, hi, 3_000);
+            // Reproduce the pre-seed window: the projection (rebuildable, not
+            // authoritative) carries no row for this revision, so the reader
+            // must fall back to the authoritative conflict rows rather than
+            // treating absence as "surface it as unknown".
+            db.prepare("DELETE FROM claim_effective_policy WHERE revision_id = ?").run(
+                left.revisionId,
+            );
+            // Guard the oracle: if a projection row still existed, its own
+            // hard_hidden flag would hide the row and this test would pass
+            // without exercising the authoritative fallback at all.
+            const probe = readMemoryPolicyRows(db, [left.memoryId]).get(left.memoryId);
+            expect(probe?.projected).toBeFalse();
+            expect(probe?.contradicted).toBeTrue();
+
+            const memories = getMemoriesByProject(db, PROJECT);
+            expect(
+                filterMemoriesByPolicy(db, memories, "auto_inject").memories.map((m) => m.id),
+            ).not.toContain(left.memoryId);
+            const explicit = filterMemoriesByPolicy(db, memories, "explicit_search");
+            expect(explicit.memories.map((m) => m.id)).not.toContain(left.memoryId);
+            expect(explicit.labels.get(left.memoryId)).toBeUndefined();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a rejected row from an unsupported policy version stays review-only", () => {
+        const db = migratedDb();
+        try {
+            const seed = seedMemory(db, "rejected-future", "rejected under a newer policy");
+            verify(db, seed.memoryId);
+            runInMemoryClaimsWriteTransaction(db, () => {
+                recordDispositionEventInCurrentTransaction(db, {
+                    revisionId: seed.revisionId,
+                    projectId: seed.projectId,
+                    disposition: "rejected",
+                    action: "assert",
+                    actor: "host",
+                });
+                refreshEffectivePolicyInCurrentTransaction(db, seed.revisionId);
+                return undefined;
+            });
+            // A newer policy version must not reopen a rejected row: the
+            // rejection is an authoritative fact, not a projected opinion.
+            db.prepare(
+                "UPDATE claim_effective_policy SET policy_version = 999 WHERE revision_id = ?",
+            ).run(seed.revisionId);
+            const memories = getMemoriesByProject(db, PROJECT);
+            const explicit = filterMemoriesByPolicy(db, memories, "explicit_search");
+            expect(explicit.memories.map((m) => m.id)).not.toContain(seed.memoryId);
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });

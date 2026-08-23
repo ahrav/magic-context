@@ -946,12 +946,16 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
         );
     }
     insertRevisionMemoryMetadata(db, created.revisionId, metadataFromProjectionRow(row));
-    ensureRevisionPolicyInCurrentTransaction(db, created.revisionId, observationId);
     db.prepare(
         `INSERT INTO legacy_memory_claims
             (memory_id, canonical_memory_id, claim_id, project_id, root_observation_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
     ).run(row.id, row.id, created.claimId, projectId, observationId, now);
+    // The crosswalk row must exist before the policy refresh: an immediately
+    // auto-eligible link (e.g. USER_EXPLICIT taint) bumps the owning
+    // project's memory epoch through `legacy_memory_claims`, and a missing
+    // row silently skips the bump, leaving cached snapshots stale.
+    ensureRevisionPolicyInCurrentTransaction(db, created.revisionId, observationId);
     resolveMemoryClaimLinkFailure(db, row.id);
     return {
         memoryId: row.id,
@@ -1419,7 +1423,12 @@ function refreshRevisionMaturityInCurrentTransaction(db: Database, revisionId: n
     }
 }
 
-function bumpEpochForClaimProjectInCurrentTransaction(db: Database, claimId: number): void {
+/** Bump the owning project's memory epoch for a claim so every derived
+ * project-memory cache (including the native module mirror) rematerializes.
+ * Resolves the project identity through the `legacy_memory_claims`
+ * crosswalk; a claim with no memory link feeds no memory surface and
+ * no-ops. */
+export function bumpEpochForClaimProjectInCurrentTransaction(db: Database, claimId: number): void {
     if (!tableExists(db, "project_state")) return;
     const row = db
         .prepare(

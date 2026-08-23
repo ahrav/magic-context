@@ -9,6 +9,13 @@ export interface RegisterCtxApproveDeps {
 	db: ContextDatabase;
 	projectDir: string;
 	projectIdentity: string;
+	/** Resolve the project for the invoking context: Pi can `/cd` between
+	 * projects after boot, so approval must target the ACTIVE project, not
+	 * the registration-time one. Absent resolver falls back to boot values. */
+	resolveProject?: (ctx: { cwd: string }) => {
+		projectDir: string;
+		projectIdentity: string;
+	};
 }
 
 export function registerCtxApproveCommand(
@@ -37,7 +44,11 @@ export function registerCtxApproveCommand(
 				});
 				return;
 			}
-			if (!deps.projectIdentity) {
+			const project = deps.resolveProject?.(ctx) ?? {
+				projectDir: deps.projectDir,
+				projectIdentity: deps.projectIdentity,
+			};
+			if (!project.projectIdentity) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-approve",
 					text: "## Claim Approval — Unavailable\n\nNo active project is configured for this session.",
@@ -49,8 +60,8 @@ export function registerCtxApproveCommand(
 				const result = executeClaimApprovalCommand(
 					{
 						db: deps.db,
-						projectPath: deps.projectIdentity,
-						projectRoot: deps.projectDir,
+						projectPath: project.projectIdentity,
+						projectRoot: project.projectDir,
 						host: "pi",
 						sessionId,
 					},
@@ -64,7 +75,7 @@ export function registerCtxApproveCommand(
 			} catch (error) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-approve",
-					text: `## Claim Approval — Failed\n\n${describeError(error)}`,
+					text: `## Claim Approval — Failed\n\n${describeError(error).brief}`,
 					level: "error",
 				});
 			}

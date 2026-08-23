@@ -1431,8 +1431,18 @@ export async function buildModuleStateSyncPayload(args: {
         }
     }
 
+    // A policy transition (approval, verification, revocation) changes rows
+    // the memory-id watermark cannot see: pre-existing memories flip in or
+    // out of automatic eligibility with no new row id. The epoch watermark
+    // carries exactly that signal, so an epoch change sends the FULL
+    // policy-filtered snapshot with replace semantics instead of the id-gated
+    // increment — the receiver prunes mirrored rows absent from the snapshot.
+    const epochChanged =
+        memoryChanged &&
+        !args.force &&
+        currentWatermarks.project_memory_epoch !== acked.project_memory_epoch;
     const allMemories =
-        args.force && !omitAuthorityMemorySections && args.pass.projectPath
+        (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
             ? workspace.workspace
                 ? getMemoriesByProjects(
                       args.pass.db,
@@ -1450,7 +1460,7 @@ export async function buildModuleStateSyncPayload(args: {
                   )
             : [];
     const incrementalMemories =
-        memoryChanged && !args.force && args.pass.projectPath
+        memoryChanged && !args.force && !epochChanged && args.pass.projectPath
             ? readNewMemoriesForM1Union(
                   args.pass.db,
                   workspace.expandedIdentities,
@@ -1460,12 +1470,18 @@ export async function buildModuleStateSyncPayload(args: {
                   workspace.shareCategories,
               )
             : [];
+    const memoriesReplaceProjects =
+        epochChanged && args.pass.projectPath
+            ? workspace.workspace
+                ? workspace.expandedIdentities
+                : [args.pass.projectPath]
+            : undefined;
     // The module mirror is a host-computed snapshot: only policy-eligible
     // automatic rows cross the boundary, so the native memory lane can never
     // serve content the policy hides. Rust stays free of policy derivation.
     const memoryRows = filterMemoriesByPolicy(
         args.pass.db,
-        args.force ? allMemories : incrementalMemories,
+        args.force || epochChanged ? allMemories : incrementalMemories,
         "auto_inject",
     ).memories;
     const memories = memoryRows.map((memory) => ({
@@ -1661,6 +1677,9 @@ export async function buildModuleStateSyncPayload(args: {
             expected_shadow_seq: args.state.lastAckedSeq,
             compartments,
             ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
+            ...(memoriesReplaceProjects !== undefined
+                ? { memories_replace_projects: memoriesReplaceProjects }
+                : {}),
             ...(includeUserProfile ? { user_profile: userProfile } : {}),
             ...(includeWorkspace ? { workspace: workspace.workspace } : {}),
             last_todo_state: effectiveLastTodoState(args.pass.sessionId, sessionMeta),

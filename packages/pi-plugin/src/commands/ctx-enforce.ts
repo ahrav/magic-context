@@ -9,6 +9,14 @@ export interface RegisterCtxEnforceDeps {
 	db: ContextDatabase;
 	projectDir: string;
 	projectIdentity: string;
+	/** Resolve the project for the invoking context: Pi can `/cd` between
+	 * projects after boot, so enforcement must target the ACTIVE project (and
+	 * evaluate artifacts under its filesystem root), not the
+	 * registration-time one. Absent resolver falls back to boot values. */
+	resolveProject?: (ctx: { cwd: string }) => {
+		projectDir: string;
+		projectIdentity: string;
+	};
 }
 
 export function registerCtxEnforceCommand(
@@ -37,7 +45,11 @@ export function registerCtxEnforceCommand(
 				});
 				return;
 			}
-			if (!deps.projectIdentity) {
+			const project = deps.resolveProject?.(ctx) ?? {
+				projectDir: deps.projectDir,
+				projectIdentity: deps.projectIdentity,
+			};
+			if (!project.projectIdentity) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-enforce",
 					text: "## Claim Enforcement — Unavailable\n\nNo active project is configured for this session.",
@@ -49,8 +61,8 @@ export function registerCtxEnforceCommand(
 				const result = executeClaimEnforceCommand(
 					{
 						db: deps.db,
-						projectPath: deps.projectIdentity,
-						projectRoot: deps.projectDir,
+						projectPath: project.projectIdentity,
+						projectRoot: project.projectDir,
 						host: "pi",
 						sessionId,
 					},
@@ -64,7 +76,7 @@ export function registerCtxEnforceCommand(
 			} catch (error) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-enforce",
-					text: `## Claim Enforcement — Failed\n\n${describeError(error)}`,
+					text: `## Claim Enforcement — Failed\n\n${describeError(error).brief}`,
 					level: "error",
 				});
 			}

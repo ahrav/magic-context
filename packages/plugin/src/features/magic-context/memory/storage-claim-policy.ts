@@ -475,8 +475,14 @@ export function hasExplicitUserEvidence(db: Database, revisionId: number): boole
 }
 
 export function readActiveDispositions(db: Database, revisionId: number): ActiveDispositions {
-    const staleOutcome = latestVerificationOutcome(db, revisionId, ["verified", "stale"]);
-    const flaggedOutcome = latestVerificationOutcome(db, revisionId, ["verified", "flagged"]);
+    // Verification status is ONE current outcome: the latest event across
+    // verified/stale/flagged supersedes every earlier one. Filtering per
+    // disposition would let a stale->flagged transition keep both active.
+    const verificationOutcome = latestVerificationOutcome(db, revisionId, [
+        "verified",
+        "stale",
+        "flagged",
+    ]);
     const contradicted =
         db
             .prepare(
@@ -493,9 +499,11 @@ export function readActiveDispositions(db: Database, revisionId: number): Active
             )
             .get(revisionId) != null;
     return {
-        stale: staleOutcome === "stale" || explicitDispositionActive(db, revisionId, "stale"),
+        stale:
+            verificationOutcome === "stale" || explicitDispositionActive(db, revisionId, "stale"),
         disputed:
-            flaggedOutcome === "flagged" || explicitDispositionActive(db, revisionId, "disputed"),
+            verificationOutcome === "flagged" ||
+            explicitDispositionActive(db, revisionId, "disputed"),
         superseded,
         rejected: explicitDispositionActive(db, revisionId, "rejected"),
         contradicted,

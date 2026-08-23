@@ -213,6 +213,10 @@ function deterministicFallbackCue(candidate: CueCandidate, lastCandidate: string
 
 /** Select the memories whose cue is missing or stale (content hash mismatch). */
 function selectCandidates(db: Database, projectIdentity: string): CueCandidate[] {
+    // Cue rows are inert stored data; the policy gate lives at the injection
+    // boundary (`getMuralCoverage`/`resolveMural`), so a row that is currently
+    // policy-hidden still gets a cue and needs no recompression if it later
+    // becomes eligible.
     const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
     const cueState = getMuralCueState(
         db,

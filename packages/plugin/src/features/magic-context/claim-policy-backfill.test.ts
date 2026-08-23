@@ -5,6 +5,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getClaimPolicySeedStatus, runClaimPolicySeed } from "./claim-policy-backfill";
 import { runClaimPolicySeedStartup } from "./claim-policy-backfill-startup";
+import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
 import { dropClaimPolicyObjectsForTests } from "./storage-claim-policy-schema";
 import { initializeDatabase } from "./storage-db";
@@ -173,12 +174,12 @@ function effectivePolicyRows(db: Database): Array<Record<string, unknown>> {
 }
 
 describe("claim policy seed", () => {
-    test("AE9: verified, explicit-user, corroborated, and unsupported revisions seed the four states", () => {
+    test("AE9: verified, explicit-user, corroborated, and unsupported revisions seed the four states", async () => {
         const fx = fixture();
         try {
             const ids = seedAe9Corpus(fx);
             runMigrations(fx.db);
-            const summary = runClaimPolicySeed(fx.db);
+            const summary = await runClaimPolicySeed(fx.db);
             expect(summary.status).toBe("complete");
             expect(summary.seededCounts).toEqual({ CANDIDATE: 1, CORROBORATED: 1, VERIFIED: 2 });
             expect(summary.autoHidden).toBe(2);
@@ -204,7 +205,7 @@ describe("claim policy seed", () => {
         }
     });
 
-    test("copies of one source stay one independence group and do not corroborate", () => {
+    test("copies of one source stay one independence group and do not corroborate", async () => {
         const fx = fixture();
         try {
             // Two observations from one extractor run: distinct writer keys
@@ -239,7 +240,7 @@ describe("claim policy seed", () => {
                 }),
             ]);
             runMigrations(fx.db);
-            runClaimPolicySeed(fx.db);
+            await runClaimPolicySeed(fx.db);
             const byRevision = new Map(
                 effectivePolicyRows(fx.db).map((row) => [row.revision_id, row]),
             );
@@ -250,16 +251,16 @@ describe("claim policy seed", () => {
         }
     });
 
-    test("interruption at any batch cursor resumes to identical results without duplicates", () => {
+    test("interruption at any batch cursor resumes to identical results without duplicates", async () => {
         const fx = fixture();
         try {
             seedAe9Corpus(fx);
             runMigrations(fx.db);
             // One bounded batch, then stop: work stays pending.
-            const first = runClaimPolicySeed(fx.db, { batchSize: 1, maxBatches: 2 });
+            const first = await runClaimPolicySeed(fx.db, { batchSize: 1, maxBatches: 2 });
             expect(first.status).toBe("pending");
             expect(getClaimPolicySeedStatus(fx.db).phase).toBe("pending");
-            const resumed = runClaimPolicySeed(fx.db, { batchSize: 1 });
+            const resumed = await runClaimPolicySeed(fx.db, { batchSize: 1 });
             expect(resumed.status).toBe("complete");
             const counts = getClaimPolicySeedStatus(fx.db).seededCounts;
             expect(counts).toEqual({ CANDIDATE: 1, CORROBORATED: 1, VERIFIED: 2 });
@@ -274,12 +275,12 @@ describe("claim policy seed", () => {
         }
     });
 
-    test("a revision added behind the cursor during reconciliation is seeded before completion", () => {
+    test("a revision added behind the cursor during reconciliation is seeded before completion", async () => {
         const fx = fixture();
         try {
             seedAe9Corpus(fx);
             runMigrations(fx.db);
-            runClaimPolicySeed(fx.db, { batchSize: 4, maxBatches: 1 });
+            await runClaimPolicySeed(fx.db, { batchSize: 4, maxBatches: 1 });
             // A held-open writer appends a revision without a policy subject
             // while reconciliation is between batches.
             const late = addClaimRevision(fx, "late-writer", [
@@ -298,7 +299,7 @@ describe("claim policy seed", () => {
                     )
                     .get(late),
             ).toEqual({ count: 0 });
-            const summary = runClaimPolicySeed(fx.db);
+            const summary = await runClaimPolicySeed(fx.db);
             expect(summary.status).toBe("complete");
             expect(
                 fx.db
@@ -312,20 +313,89 @@ describe("claim policy seed", () => {
         }
     });
 
-    test("startup runs the pending seed once and no-ops when complete", () => {
+    test("seeding an auto-eligible linked revision bumps the owning project's memory epoch", async () => {
+        const fx = fixture();
+        try {
+            const ids = seedAe9Corpus(fx);
+            const claimId = Number(
+                (
+                    fx.db
+                        .prepare(
+                            "SELECT claim_id AS id FROM claim_revisions JOIN claims ON claims.id = claim_revisions.claim_id WHERE claim_revisions.id = ?",
+                        )
+                        .get(ids.verified) as { id: number }
+                ).id,
+            );
+            runInMemoryClaimsWriteTransaction(fx.db, () => {
+                fx.db
+                    .prepare(
+                        `INSERT INTO memories (project_path, category, content, normalized_hash,
+                            first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES ('git:seedfx', 'CONSTRAINTS', 'verified content', 'hash-1', 1, 1, 1, 1)`,
+                    )
+                    .run();
+                const memoryId = Number(
+                    (fx.db.prepare("SELECT MAX(id) AS id FROM memories").get() as { id: number })
+                        .id,
+                );
+                const observationId = Number(
+                    (
+                        fx.db
+                            .prepare(
+                                "SELECT observation_id AS id FROM claim_evidence WHERE revision_id = ? LIMIT 1",
+                            )
+                            .get(ids.verified) as { id: number }
+                    ).id,
+                );
+                fx.db
+                    .prepare(
+                        `INSERT INTO legacy_memory_claims
+                            (memory_id, canonical_memory_id, claim_id, project_id, root_observation_id, created_at)
+                         VALUES (?, ?, ?, ?, ?, 1)`,
+                    )
+                    .run(memoryId, memoryId, claimId, fx.projectId, observationId);
+            });
+            runMigrations(fx.db);
+            const epochBefore = Number(
+                (
+                    fx.db
+                        .prepare(
+                            "SELECT COALESCE(MAX(project_memory_epoch), 0) AS epoch FROM project_state WHERE project_path = 'git:seedfx'",
+                        )
+                        .get() as { epoch: number }
+                ).epoch,
+            );
+            const summary = await runClaimPolicySeed(fx.db);
+            expect(summary.status).toBe("complete");
+            const epochAfter = Number(
+                (
+                    fx.db
+                        .prepare(
+                            "SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = 'git:seedfx'",
+                        )
+                        .get() as { epoch: number }
+                ).epoch,
+            );
+            expect(epochAfter).toBeGreaterThan(epochBefore);
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
+    test("startup runs the pending seed once and no-ops when complete", async () => {
         const fx = fixture();
         try {
             seedAe9Corpus(fx);
             runMigrations(fx.db);
             const messages: string[] = [];
-            const summary = runClaimPolicySeedStartup(fx.db, {
+            const summary = await runClaimPolicySeedStartup(fx.db, {
                 log: (message) => messages.push(message),
             });
             expect(summary?.status).toBe("complete");
             expect(
                 messages.some((line) => line.includes("moved out of automatic visibility")),
             ).toBe(true);
-            expect(runClaimPolicySeedStartup(fx.db)).toBeNull();
+            expect(await runClaimPolicySeedStartup(fx.db)).toBeNull();
         } finally {
             closeQuietly(fx.db);
         }
