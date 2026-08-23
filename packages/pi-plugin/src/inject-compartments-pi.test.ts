@@ -1133,7 +1133,10 @@ describe("injectM0M1Pi", () => {
 			const first = [userMessage("hello", 10)];
 			injectM0M1Pi(state, db, first as never, undefined, true);
 			const initialM1 = textOf(first[1] as never);
-			const epochBeforeAdditive = projectMemoryEpochOf(db, state.projectIdentity);
+			const epochBeforeAdditive = projectMemoryEpochOf(
+				db,
+				state.projectIdentity,
+			);
 
 			insertMemory(db, {
 				projectPath: state.projectIdentity,

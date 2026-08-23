@@ -63,10 +63,7 @@ const sessionMetaSelectColumnsCache = new WeakMap<Database, string>();
 // Prepared once per connection: the projection spans ~50 columns, so re-parsing
 // the statement on every call costs more than the row fetch itself. Safe for
 // the same reason the projection string is: the schema is fixed after init.
-const sessionMetaSelectStatementCache = new WeakMap<
-    Database,
-    ReturnType<Database["prepare"]>
->();
+const sessionMetaSelectStatementCache = new WeakMap<Database, ReturnType<Database["prepare"]>>();
 
 function getSessionMetaSelectStatement(db: Database): ReturnType<Database["prepare"]> {
     const cached = sessionMetaSelectStatementCache.get(db);
