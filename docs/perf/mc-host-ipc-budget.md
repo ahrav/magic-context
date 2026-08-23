@@ -41,7 +41,7 @@ every table below from the sidecars without rerunning the benchmark.
 
 | | |
 | --- | --- |
-| Host | dev-dsk-ahrav-2b (shared dev host) |
+| Host | shared dev host (hostname withheld; manifests record the operator-set `MC_IPC_BUDGET_HOST_LABEL`, default `redacted`) |
 | CPU | aarch64, 32 cores, 1 socket, no SMT, one 32 MiB L3, 1 NUMA node |
 | Kernel | 6.12.100-125.179.amzn2023.aarch64 |
 | rustc | 1.94.1, release profile |
@@ -63,6 +63,17 @@ Each serial repetition recorded 150,000 successful post-warmup
 observations (headline p99.9 floor is 100,000); merged across blocks the
 serial histogram holds 1.5 M samples. Atomic blocks each retain 200
 batch means of 10,000 full round trips.
+
+Known quantization in the retained atomic evidence: the run's histogram
+sidecars were recorded with a 100 ns `lowest_discernible_value`, which
+HdrHistogram rounds down to a 64 ns unit, so the merged histogram
+percentiles for the atomic arm in `summary.json` (p50 255 ns) are
+inflated by up to one 64 ns bucket. The exact per-batch means in each
+block's `batches.json` and the scalar block medians are authoritative
+for the atomic arm — the headline 219 ns comes from those scalars, never
+from the merged histogram. The harness records at a 1 ns unit floor, so
+later runs do not carry this artifact. TCP arms are unaffected at three
+significant digits (their values sit at 24 µs and above).
 
 **Interpretation.** The atomic ping-pong is a cache-coherence lower
 bound for moving one line between these two cores, not wholly
@@ -118,8 +129,16 @@ Timestamp-minimal closed loop, medians across 10 blocks:
 | Quantity | Value |
 | --- | --- |
 | Successful completions/s | **100.7 k/s** (block spread 99.8–102.1 k/s) |
-| Offered = terminal = successful | yes (zero errors, zero losses) |
+| Terminal outcomes all successful | yes (zero error, mismatch, or peer-closed outcomes) |
 | Goodput (fixture bytes echoed) | 6.95 MB/s |
+
+In the retained run, offered = terminal is an arithmetic identity of the
+fixed-depth loop (one response read per request written), not loss
+evidence; the real evidence in that run is the zero non-success terminal
+split above. The harness now additionally drains every in-flight
+response after the measure window under a bounded deadline and fails the
+attempt if any response never arrives, so later runs carry a genuine
+loss check.
 
 ## Reproducing
 
