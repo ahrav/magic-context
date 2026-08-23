@@ -5577,8 +5577,9 @@ fn session_has_durable_state(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> rusqlite::Result<bool> {
-    let exists: i64 = conn.prepare_cached(
-        "SELECT EXISTS(
+    let exists: i64 = conn
+        .prepare_cached(
+            "SELECT EXISTS(
              SELECT 1 FROM mc_cache_state WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_compartments WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_tags WHERE session_id = ?1
@@ -5597,8 +5598,8 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM mc_user_memory_candidates WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
          )",
-    )?
-    .query_row(params![session_id], |row| row.get(0))?;
+        )?
+        .query_row(params![session_id], |row| row.get(0))?;
     Ok(exists != 0)
 }
 
@@ -8238,16 +8239,13 @@ impl McStore {
                    FROM mc_tag_cache_generations
                   WHERE session_id = ?1",
             )?
-            .query_row(
-                params![session_id],
-                |row| {
-                    Ok(TagCacheSummary {
-                        generation: row.get::<_, i64>(0)?.max(0) as u64,
-                        count: row.get::<_, i64>(1)?.max(0) as usize,
-                        max_tag_number: row.get(2)?,
-                    })
-                },
-            )
+            .query_row(params![session_id], |row| {
+                Ok(TagCacheSummary {
+                    generation: row.get::<_, i64>(0)?.max(0) as u64,
+                    count: row.get::<_, i64>(1)?.max(0) as usize,
+                    max_tag_number: row.get(2)?,
+                })
+            })
             .optional()
             .map(|summary| summary.unwrap_or_default())
         })?)
@@ -21801,7 +21799,8 @@ mod tests {
         let remaining_classes = migrated
             .inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare_cached("SELECT class FROM shadow_divergences ORDER BY id")?;
+                let mut stmt =
+                    conn.prepare_cached("SELECT class FROM shadow_divergences ORDER BY id")?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;

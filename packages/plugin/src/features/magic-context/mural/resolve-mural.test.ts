@@ -312,10 +312,14 @@ describe("mural coverage gate", () => {
 
             const after = resolveMural(db, project, 1, muralPool(db, project));
             expect(after.map((entry) => entry.id)).not.toContain(hidden.id);
-            // And the injection path agrees: the rendered mural is built from
-            // the same gated pool.
+            // And the injection path agrees: the PERSISTED manifest is the
+            // artifact later renders serve from, so absence must hold on its
+            // stored memory ids, not just on a fresh resolver pass.
             const rendered = ensureMuralRendered(db, project, 1);
             expect(rendered.hasMural).toBe(true);
+            const persisted = getMural(db, project);
+            if (!persisted) throw new Error("expected a persisted mural manifest");
+            expect(persisted.memoryIds).not.toContain(hidden.id);
             expect(
                 resolveMural(db, project, 1, muralPool(db, project)).some(
                     (entry) => entry.id === hidden.id,

@@ -156,6 +156,10 @@ export interface ModuleStateSyncPayload {
         seed_boundary_id?: string | null;
         compartments: unknown[];
         memories?: unknown[];
+        /** Projects whose `memories` entries form a FULL policy snapshot: the
+         * receiver prunes mirrored rows absent from the payload within this
+         * scope. Absent means incremental upsert-only semantics. */
+        memories_replace_projects?: string[];
         memory_mutations?: unknown[];
         user_profile?: string[];
         workspace?: ModuleWorkspacePayload | null;
@@ -1093,6 +1097,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
     lastTodoState: string;
     watermarks: ModuleWatermarks;
     omitAuthorityMemorySections?: boolean;
+    /** Full-snapshot replace scope; rides the completing batch so the module
+     * prunes after assembling every page's memories. */
+    memoriesReplaceProjects?: string[];
 }): ModuleStateSyncPayload[] {
     const items: SeedItem[] = [
         ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
@@ -1209,6 +1216,10 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       project_memory_epoch: args.watermarks.project_memory_epoch,
                       user_profile_version: args.watermarks.project_user_profile_version,
                       acked_watermarks: args.watermarks,
+                      ...(args.memoriesReplaceProjects !== undefined &&
+                      !args.omitAuthorityMemorySections
+                          ? { memories_replace_projects: args.memoriesReplaceProjects }
+                          : {}),
                       ...(args.dropSeedSkipped !== undefined
                           ? { drop_seed_skipped: args.dropSeedSkipped }
                           : {}),
@@ -1470,8 +1481,13 @@ export async function buildModuleStateSyncPayload(args: {
                   workspace.shareCategories,
               )
             : [];
+    // Both full-snapshot shapes need replace semantics: the receiver only
+    // upserts, so without a prune scope a policy-hidden row already mirrored
+    // in the durable module store would survive a forced resync (which also
+    // acknowledges the current epoch, blocking any later epoch-driven
+    // replacement until the next policy change).
     const memoriesReplaceProjects =
-        epochChanged && args.pass.projectPath
+        (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
             ? workspace.workspace
                 ? workspace.expandedIdentities
                 : [args.pass.projectPath]
@@ -1665,6 +1681,7 @@ export async function buildModuleStateSyncPayload(args: {
         lastTodoState: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
         watermarks: currentWatermarks,
         omitAuthorityMemorySections,
+        memoriesReplaceProjects,
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);

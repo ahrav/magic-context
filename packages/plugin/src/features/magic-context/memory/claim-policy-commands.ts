@@ -7,7 +7,7 @@
  * any agent tool schema.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -59,7 +59,7 @@ export interface ClaimCommandDeps {
         canonicalPath: string,
         kind: EnforcementArtifactKind,
         projectRoot: string,
-    ) => ArtifactEvaluation;
+    ) => ArtifactEvaluation | Promise<ArtifactEvaluation>;
 }
 
 interface PendingConfirmation {
@@ -158,11 +158,12 @@ interface ConfirmedMutationArgs<T> {
     operationKey: (nonce: string) => string;
     request: (nonce: string) => unknown;
     /** Runs on the confirming invocation BEFORE the write transaction opens:
-     * expensive work (artifact evaluation spawns a test process with a
+     * expensive work (artifact evaluation runs a test process with a
      * 120-second budget) must not hold the immediate transaction that every
-     * memory, claim, and backfill writer serializes on. `mutate` re-verifies
+     * memory, claim, and backfill writer serializes on — and must not block
+     * the host event loop that serves every other hook. `mutate` re-verifies
      * its inputs transactionally afterwards. */
-    beforeMutate?: () => void;
+    beforeMutate?: () => void | Promise<void>;
     /** Runs inside the write transaction after the stale-safe recheck. */
     mutate: (nonce: string) => { result: T; effects: MemoryClaimEffect[] };
 }
@@ -175,10 +176,10 @@ interface ConfirmedMutationArgs<T> {
  * and bumps the project-memory epoch in the same transaction so no stale m0
  * cache keeps serving the old decision (R27).
  */
-function runConfirmedClaimMutation<T>(
+async function runConfirmedClaimMutation<T>(
     deps: ClaimCommandDeps,
     args: ConfirmedMutationArgs<T>,
-): { pending: true } | { pending: false; result: T } {
+): Promise<{ pending: true } | { pending: false; result: T }> {
     const key = `${deps.host}:${deps.sessionId}:${args.command}`;
     const pendingBefore = pendingByKey.get(key);
     const now = deps.nowMs ?? Date.now();
@@ -200,7 +201,7 @@ function runConfirmedClaimMutation<T>(
     }
     pendingByKey.delete(key);
     const nonce = pendingBefore.nonce;
-    args.beforeMutate?.();
+    await args.beforeMutate?.();
     const outcome = runInMemoryClaimsWriteTransaction(deps.db, () =>
         withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
             const operation = runMemoryClaimOperationInCurrentTransaction(
@@ -249,10 +250,10 @@ const APPROVE_USAGE = [
     "- `/ctx-approve <memory-id> --revoke` — revoke a recorded approval",
 ].join("\n");
 
-export function executeClaimApprovalCommand(
+export async function executeClaimApprovalCommand(
     deps: ClaimCommandDeps,
     argsText: string,
-): ClaimCommandResult {
+): Promise<ClaimCommandResult> {
     const parts = argsText.trim().split(/\s+/).filter(Boolean);
     const revoke = parts.includes("--revoke");
     const idText = parts.find((part) => !part.startsWith("--"));
@@ -278,9 +279,9 @@ export function executeClaimApprovalCommand(
             level: "info",
         };
     }
-    let outcome: ReturnType<typeof runConfirmedClaimMutation<{ actionId: number }>>;
+    let outcome: Awaited<ReturnType<typeof runConfirmedClaimMutation<{ actionId: number }>>>;
     try {
-        outcome = runConfirmedClaimMutation(deps, {
+        outcome = await runConfirmedClaimMutation(deps, {
             command: "ctx-approve",
             argsKey: `${action}:${memoryId}`,
             target,
@@ -363,31 +364,51 @@ const ENFORCE_USAGE = [
 ].join("\n");
 
 /** ponytail: the default evaluator only knows `bun test`; policy/config
- * artifact evaluators plug in through `deps.evaluateArtifact` when needed. */
+ * artifact evaluators plug in through `deps.evaluateArtifact` when needed.
+ * The child process runs detached from the event loop so a slow or hanging
+ * test cannot freeze the host that serves every other hook and transform. */
 function defaultEvaluateArtifact(
     canonicalPath: string,
     kind: EnforcementArtifactKind,
     projectRoot: string,
-): ArtifactEvaluation {
+): Promise<ArtifactEvaluation> {
     if (kind !== "test") {
-        return {
+        return Promise.resolve({
             result: "fail",
             evaluator: "unsupported",
             evaluatorVersion: "1",
             detail: `No default evaluator for artifact kind '${kind}'.`,
-        };
+        });
     }
-    const run = spawnSync("bun", ["test", canonicalPath], {
-        cwd: projectRoot,
-        timeout: 120_000,
-        encoding: "utf8",
+    return new Promise((resolve) => {
+        const run = spawn("bun", ["test", canonicalPath], { cwd: projectRoot });
+        let output = "";
+        run.stdout.on("data", (chunk: Buffer) => {
+            output += chunk.toString("utf8");
+        });
+        run.stderr.on("data", (chunk: Buffer) => {
+            output += chunk.toString("utf8");
+        });
+        const timer = setTimeout(() => {
+            run.kill("SIGKILL");
+        }, 120_000);
+        const settle = (result: "pass" | "fail", detail?: string) => {
+            clearTimeout(timer);
+            resolve({
+                result,
+                evaluator: "bun-test",
+                evaluatorVersion: "1",
+                detail,
+            });
+        };
+        run.on("error", (error) => {
+            settle("fail", String(error).slice(-500));
+        });
+        run.on("close", (status) => {
+            if (status === 0) settle("pass");
+            else settle("fail", output.slice(-500) || `exit status ${status}`);
+        });
     });
-    return {
-        result: run.status === 0 ? "pass" : "fail",
-        evaluator: "bun-test",
-        evaluatorVersion: "1",
-        detail: run.status === 0 ? undefined : (run.stderr || run.stdout || "").slice(-500),
-    };
 }
 
 /** Canonicalize an artifact path inside the owning project: aliases, absolute
@@ -417,10 +438,10 @@ function sha256Bytes(path: string): string {
     return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-export function executeClaimEnforceCommand(
+export async function executeClaimEnforceCommand(
     deps: ClaimCommandDeps,
     argsText: string,
-): ClaimCommandResult {
+): Promise<ClaimCommandResult> {
     const parts = argsText.trim().split(/\s+/).filter(Boolean);
     const kindFlagIndex = parts.indexOf("--kind");
     let kind: EnforcementArtifactKind = "test";
@@ -455,11 +476,11 @@ export function executeClaimEnforceCommand(
     let evaluation: ArtifactEvaluation | null = null;
     let bytesDigest = "";
     let enforced = false;
-    let outcome: ReturnType<
-        typeof runConfirmedClaimMutation<{ artifactId: number; enforced: boolean }>
+    let outcome: Awaited<
+        ReturnType<typeof runConfirmedClaimMutation<{ artifactId: number; enforced: boolean }>>
     >;
     try {
-        outcome = runConfirmedClaimMutation(deps, {
+        outcome = await runConfirmedClaimMutation(deps, {
             command: "ctx-enforce",
             argsKey: `${memoryId}:${canonical.canonicalPath}:${kind}`,
             target,
@@ -472,14 +493,15 @@ export function executeClaimEnforceCommand(
                 kind,
                 nonce,
             }),
-            beforeMutate: () => {
-                // Evaluation happens outside the write transaction: the
-                // default evaluator synchronously runs a test process with a
-                // 120-second budget, and holding BEGIN IMMEDIATE that long
-                // would block every other memory/claim/backfill writer.
+            beforeMutate: async () => {
+                // Evaluation happens outside the write transaction AND off
+                // the event loop: the default evaluator runs a test process
+                // with a 120-second budget, and holding BEGIN IMMEDIATE (or
+                // the harness thread) that long would block every other
+                // memory/claim/backfill writer and hook.
                 const digestBefore = sha256Bytes(canonical.absolutePath);
                 const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
-                evaluation = evaluate(canonical.absolutePath, kind, deps.projectRoot);
+                evaluation = await evaluate(canonical.absolutePath, kind, deps.projectRoot);
                 // The recorded digest must be the bytes the evaluator actually
                 // ran: a concurrent rewrite between hash and evaluation would
                 // otherwise bind a result to bytes that never passed (KTD6).

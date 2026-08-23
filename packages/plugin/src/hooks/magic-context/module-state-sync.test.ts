@@ -357,13 +357,14 @@ describe("module state sync section deltas", () => {
         state: ModuleStateSyncState;
         sessionId: string;
         force?: boolean;
+        projectPath?: string;
     }): Promise<Record<string, unknown>> {
         const payload = await buildModuleStateSyncPayload({
             state: args.state,
             pass: {
                 db: args.db,
                 sessionId: args.sessionId,
-                projectPath: "/tmp/project",
+                projectPath: args.projectPath ?? "/tmp/project",
                 nowMs: 1,
             },
             force: args.force ?? false,
@@ -418,8 +419,16 @@ describe("module state sync section deltas", () => {
     it("an epoch-only change sends a full replace snapshot instead of the id-gated increment", async () => {
         const db = createContextDb();
         const sessionId = "ses-epoch-replace";
-        setProjectState(db, "/tmp/project", { projectMemoryEpoch: 1 });
-        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: "/tmp/project" });
+        const projectPath = "dir:/tmp/epoch-replace";
+        // Explicit-user origin memories are immediately auto-eligible, so
+        // they cross the mirror boundary and must appear in the snapshot.
+        const eligible = insertMemory(db, {
+            projectPath: projectPath,
+            category: "CONSTRAINTS",
+            content: "policy-eligible baseline row",
+            sourceType: "user",
+        });
+        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: projectPath });
         const state = {
             ...syncState(),
             lastAckedWatermarks: baseline,
@@ -427,27 +436,50 @@ describe("module state sync section deltas", () => {
         };
 
         // A policy transition bumps the epoch without minting a new memory
-        // id; the payload must carry replace semantics so the module prunes
-        // rows the policy now hides.
-        setProjectState(db, "/tmp/project", { projectMemoryEpoch: 2 });
-        const params = await buildDeltaPayload({ db, state, sessionId });
-        expect(params.memories_replace_projects).toEqual(["/tmp/project"]);
-        expect(Array.isArray(params.memories)).toBeTrue();
+        // id; the payload must carry replace semantics and the full eligible
+        // set so the module prunes rows the policy now hides.
+        setProjectState(db, projectPath, {
+            projectMemoryEpoch: baseline.project_memory_epoch + 1,
+        });
+        const params = await buildDeltaPayload({ db, state, sessionId, projectPath });
+        expect(params.memories_replace_projects).toEqual([projectPath]);
+        const snapshotIds = (params.memories as Array<{ id: number }>).map((row) => row.id);
+        expect(snapshotIds).toContain(eligible.id);
 
-        // An ordinary id-gated increment keeps upsert-only semantics.
+        // A new eligible memory bumps the epoch at link time, so it arrives
+        // as another replace snapshot carrying both rows.
         state.lastAckedWatermarks = loadModuleWatermarks({
             db,
             sessionId,
-            projectPath: "/tmp/project",
+            projectPath: projectPath,
+        });
+        const added = insertMemory(db, {
+            projectPath: projectPath,
+            category: "CONSTRAINTS",
+            content: "second eligible row",
+            sourceType: "user",
+        });
+        const second = await buildDeltaPayload({ db, state, sessionId, projectPath });
+        expect(second.memories_replace_projects).toEqual([projectPath]);
+        const secondIds = (second.memories as Array<{ id: number }>).map((row) => row.id);
+        expect(secondIds).toContain(eligible.id);
+        expect(secondIds).toContain(added.id);
+
+        // A pure id advance with no epoch change keeps upsert-only
+        // semantics (raw kernel insert; no eligibility flip, no bump).
+        state.lastAckedWatermarks = loadModuleWatermarks({
+            db,
+            sessionId,
+            projectPath: projectPath,
         });
         runInMemoryClaimsWriteTransaction(db, () => {
             db.prepare(
                 `INSERT INTO memories (project_path, category, content, normalized_hash,
                     first_seen_at, created_at, updated_at, last_seen_at)
-                 VALUES ('/tmp/project', 'CONSTRAINTS', 'new row', 'hash-epoch-test', 1, 1, 1, 1)`,
+                 VALUES ('dir:/tmp/epoch-replace', 'CONSTRAINTS', 'new row', 'hash-epoch-test', 1, 1, 1, 1)`,
             ).run();
         });
-        const incremental = await buildDeltaPayload({ db, state, sessionId });
+        const incremental = await buildDeltaPayload({ db, state, sessionId, projectPath });
         expect(incremental).not.toHaveProperty("memories_replace_projects");
     });
 

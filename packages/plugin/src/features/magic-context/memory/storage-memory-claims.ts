@@ -1499,8 +1499,12 @@ function ensureRevisionPolicyInCurrentTransaction(
 }
 
 /** Verification writes feed the effective reducer, so every event refreshes
- * the revision's ladder and projection in the same transaction (R27). */
-function addVerificationEvent(
+ * the revision's ladder and projection in the same transaction (R27).
+ * Exported for the adoption paths (v84 backfill, relocation, identity merge)
+ * that carry legacy verification onto a freshly linked revision: writing the
+ * raw event alone would leave the revision's projection at CANDIDATE with no
+ * epoch bump, and the seeder never revisits a revision whose subject exists. */
+export function addVerificationEventInCurrentTransaction(
     db: Database,
     args: Parameters<typeof addVerificationEventRaw>[1],
 ): ReturnType<typeof addVerificationEventRaw> {
@@ -1508,6 +1512,8 @@ function addVerificationEvent(
     refreshRevisionMaturityInCurrentTransaction(db, args.revisionId);
     return result;
 }
+
+const addVerificationEvent = addVerificationEventInCurrentTransaction;
 
 // ---------------------------------------------------------------------------
 // Kernel operations (Mutation Transition Matrix)

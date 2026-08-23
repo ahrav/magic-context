@@ -57,7 +57,7 @@ export function registerCtxApproveCommand(
 				return;
 			}
 			try {
-				const result = executeClaimApprovalCommand(
+				const result = await executeClaimApprovalCommand(
 					{
 						db: deps.db,
 						projectPath: project.projectIdentity,

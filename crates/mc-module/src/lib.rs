@@ -13608,9 +13608,9 @@ fn assemble_state_sync_seed(
         seed_boundary_id: final_batch.seed_boundary_id,
         compartments,
         memories,
-        // Seed batches are additive slices of one snapshot; the sender never
-        // attaches replace semantics to them.
-        memories_replace_projects: None,
+        // Replace scope rides the completing batch and applies to the whole
+        // assembled snapshot; earlier batches never carry it.
+        memories_replace_projects: final_batch.memories_replace_projects,
         memory_mutations,
         user_profile,
         workspace: final_batch.workspace,

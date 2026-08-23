@@ -835,13 +835,24 @@ async function searchMemories(args: {
             parent: rootSpanId,
             dependsOn: hydrationDeps,
         }) ?? null;
+    const candidateLimit = args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT;
+    // The FTS table ranks rows before the policy filter sees them, so hidden
+    // matches would consume candidate slots and — because a nonempty match
+    // set restricts the semantic lane to matched ids — could pin the semantic
+    // candidates to rows that are later discarded. Over-fetch, drop rows
+    // absent from the eligible set, then apply the candidate bound.
+    // ponytail: 4x over-fetch bound; a policy-aware FTS join replaces it if
+    // hidden-heavy corpora exhaust the margin.
+    const eligibleMemoryIds = new Set(memories.map((memory) => memory.id));
     const ftsMatches = getFtsMatches({
         db: args.db,
         projectPath: args.projectPath,
         query: args.query,
-        limit: args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT,
+        limit: candidateLimit * 4,
         workspace: args.workspace,
-    });
+    })
+        .filter((match) => eligibleMemoryIds.has(match.id))
+        .slice(0, candidateLimit);
     lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
     const ftsScores = getFtsScores(ftsMatches);
     const semanticCandidates = selectSemanticCandidates({

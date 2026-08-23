@@ -40,7 +40,7 @@ export function registerCtxEnforceCommand(
 			if (sessionMeta.isSubagent) {
 				sendCtxStatusMessage(pi, {
 					title: "/ctx-enforce",
-					text: "## Claim Enforcement — Refused\n\nApproval commands are user-only and unavailable to subagent sessions.",
+					text: "## Claim Enforcement — Refused\n\nEnforcement commands are user-only and unavailable to subagent sessions.",
 					level: "warning",
 				});
 				return;
@@ -58,7 +58,7 @@ export function registerCtxEnforceCommand(
 				return;
 			}
 			try {
-				const result = executeClaimEnforceCommand(
+				const result = await executeClaimEnforceCommand(
 					{
 						db: deps.db,
 						projectPath: project.projectIdentity,

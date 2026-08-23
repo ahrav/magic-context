@@ -626,8 +626,18 @@ export function refreshEffectivePolicyInCurrentTransaction(
     const decision = computePolicyDecisionForRevision(db, revisionId);
     // A revision without a frozen subject stays absent from the projection:
     // absence is the fail-closed contract, and writing a row would need a
-    // fabricated taint value the CHECK constraint has no word for.
-    if (readPolicySubject(db, revisionId) == null) return decision;
+    // fabricated taint value the CHECK constraint has no word for. A subject
+    // written by a NEWER policy version is likewise not interpretable here:
+    // overwriting its projection would stamp the current policy_version and a
+    // fabricated taint over the row, erasing the very signal
+    // (`policy_version > CLAIM_POLICY_VERSION`) readers use to treat it as
+    // unknown. Keep the newer build's row untouched.
+    if (
+        readPolicySubject(db, revisionId) == null ||
+        decision.reasonCodes.includes("policy_version_unsupported")
+    ) {
+        return decision;
+    }
     updateEffectivePolicyProjectionInCurrentTransaction(
         db,
         identity,

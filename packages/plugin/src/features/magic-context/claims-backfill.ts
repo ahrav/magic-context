@@ -30,8 +30,9 @@
  */
 
 import type { Database } from "../../shared/sqlite";
-import { addVerificationEvent, sha256Utf8Hex } from "./memory/storage-claims";
+import { sha256Utf8Hex } from "./memory/storage-claims";
 import {
+    addVerificationEventInCurrentTransaction,
     canonicalMemoryProjectPathSql,
     computeClaimRequestDigest,
     ensureMemoryClaimLinkInCurrentTransaction,
@@ -592,7 +593,11 @@ export function recordAdoptedMemoryVerifiedEventInCurrentTransaction(
     if (!memoryRowHasPositiveVerification(db, row)) {
         return false;
     }
-    addVerificationEvent(db, {
+    // The policy-aware writer refreshes the revision's maturity ladder and
+    // projection in the same transaction: the raw event alone would leave a
+    // freshly adopted, already-verified revision automatically hidden with
+    // no seeder pass left to repair it (its subject already exists).
+    addVerificationEventInCurrentTransaction(db, {
         revisionId: readClaimCurrentRevisionId(db, claimId),
         outcome: "verified",
         verifier,

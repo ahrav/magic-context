@@ -671,7 +671,7 @@ export function createMagicContextCommandHandler(deps: {
                 if (!deps.projectPath || !deps.projectRoot) {
                     result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Unavailable\n\nNo active project is configured for this session.`;
                 } else if (isSubagentSession(deps.db, sessionId)) {
-                    result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Refused\n\nApproval commands are user-only and unavailable to subagent sessions.`;
+                    result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Refused\n\n${isApprove ? "Approval" : "Enforcement"} commands are user-only and unavailable to subagent sessions.`;
                 } else {
                     const commandDeps = {
                         db: deps.db,
@@ -682,8 +682,8 @@ export function createMagicContextCommandHandler(deps: {
                     };
                     try {
                         result = isApprove
-                            ? executeClaimApprovalCommand(commandDeps, input.arguments).text
-                            : executeClaimEnforceCommand(commandDeps, input.arguments).text;
+                            ? (await executeClaimApprovalCommand(commandDeps, input.arguments)).text
+                            : (await executeClaimEnforceCommand(commandDeps, input.arguments)).text;
                     } catch (error) {
                         result = `## Claim ${isApprove ? "Approval" : "Enforcement"} — Failed\n\n${error instanceof Error ? error.message : String(error)}`;
                     }
