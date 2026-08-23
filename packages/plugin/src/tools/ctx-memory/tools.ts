@@ -65,6 +65,7 @@ import {
     toolCallIdFromContext,
 } from "../../plugin/rust-tool-backends";
 import { sessionLog } from "../../shared/logger";
+import type { Database } from "../../shared/sqlite";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
 import {
@@ -313,6 +314,36 @@ function getValidatedCategory(category: string | undefined): MemoryCategory | nu
     return trimmedCategory;
 }
 
+/**
+ * Map native `module_row_id` values to TypeScript `memories.id` through the
+ * mirror. The two id spaces are allowed to differ (`mirror_identity` records
+ * the pairing per project), so a module-lane id must be translated before any
+ * claims-database lookup. An id without an identity row maps to nothing: it
+ * names a native row the mirror has not synced back, which has no claim or
+ * policy row to consult yet. When the mirror table does not exist (module
+ * authority was never prepared on this database) ids map to themselves.
+ */
+function translateModuleMemoryIds(
+    db: Database,
+    projectPath: string,
+    ids: readonly number[],
+): Map<number, number> {
+    const hasMirror = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mirror_identity'")
+        .get();
+    if (!hasMirror) return new Map(ids.map((id) => [id, id]));
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = db
+        .prepare(
+            `SELECT module_row_id AS moduleId, context_row_id AS contextId
+               FROM mirror_identity
+              WHERE domain = 'memories' AND module_project = ?
+                AND module_row_id IN (${placeholders})`,
+        )
+        .all(projectPath, ...ids) as Array<{ moduleId: number; contextId: number }>;
+    return new Map(rows.map((row) => [row.moduleId, row.contextId]));
+}
+
 function getDisabledMessage(): string {
     return "Cross-session memory is disabled for this project.";
 }
@@ -524,14 +555,29 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         // TypeScript claims database stays the policy
                         // authority. Gate id-based targets here so a row the
                         // policy hides after mirroring cannot be read or
-                        // mutated through the module lane.
+                        // mutated through the module lane. Agent-visible ids
+                        // under MODULE authority are native module_row_id
+                        // values, so translate them through the mirror before
+                        // keying the claims database.
                         if (args.ids && args.ids.length > 0 && hasClaimEffectivePolicy(deps.db)) {
-                            const policyRows = readMemoryPolicyRows(deps.db, args.ids);
-                            const denied = args.ids.find(
-                                (id) =>
-                                    !decideMemoryPolicy(policyRows.get(id), "explicit_search")
-                                        .eligible,
+                            const contextIdByModuleId = translateModuleMemoryIds(
+                                deps.db,
+                                projectPath,
+                                args.ids,
                             );
+                            const policyRows = readMemoryPolicyRows(deps.db, [
+                                ...contextIdByModuleId.values(),
+                            ]);
+                            const denied = args.ids.find((id) => {
+                                const contextId = contextIdByModuleId.get(id);
+                                return (
+                                    contextId !== undefined &&
+                                    !decideMemoryPolicy(
+                                        policyRows.get(contextId),
+                                        "explicit_search",
+                                    ).eligible
+                                );
+                            });
                             if (denied !== undefined) {
                                 return args.action === "merge"
                                     ? "Error: One or more source memories were not found."

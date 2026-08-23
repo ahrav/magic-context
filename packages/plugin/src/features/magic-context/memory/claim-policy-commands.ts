@@ -24,6 +24,7 @@ import {
 } from "./storage-claim-policy";
 import { sha256Utf8Hex } from "./storage-claims";
 import {
+    bumpEpochForClaimProjectInCurrentTransaction,
     type MemoryClaimEffect,
     readMemoryClaimLink,
     resolveMemoryClaimProjectInCurrentTransaction,
@@ -175,7 +176,9 @@ interface ConfirmedMutationArgs<T> {
  * bound to session, args, revision, and digest and returns `pending`; a
  * matching repeat within the window rechecks the target inside the write
  * transaction, runs the mutation under the idempotent operation envelope,
- * and bumps the project-memory epoch in the same transaction so no stale m0
+ * and bumps the claim project's memory epoch — across every identity
+ * attached to the project, canonical and aliases alike — in the same
+ * transaction so no stale m0
  * cache keeps serving the old decision (R27).
  */
 async function runConfirmedClaimMutation<T>(
@@ -226,24 +229,11 @@ async function runConfirmedClaimMutation<T>(
                     return args.mutate(nonce);
                 },
             );
-            bumpProjectMemoryEpochInCurrentTransaction(deps);
+            bumpEpochForClaimProjectInCurrentTransaction(deps.db, args.target.claimId);
             return operation;
         }),
     );
     return { pending: false, result: outcome.result };
-}
-
-function bumpProjectMemoryEpochInCurrentTransaction(deps: ClaimCommandDeps): void {
-    deps.db
-        .prepare(
-            `INSERT INTO project_state
-                (project_path, project_memory_epoch, project_user_profile_version, updated_at)
-             VALUES (?, 1, 0, ?)
-             ON CONFLICT(project_path) DO UPDATE SET
-                project_memory_epoch = project_memory_epoch + 1,
-                updated_at = excluded.updated_at`,
-        )
-        .run(deps.projectPath, deps.nowMs ?? Date.now());
 }
 
 const APPROVE_USAGE = [
@@ -383,7 +373,12 @@ function defaultEvaluateArtifact(
         });
     }
     return new Promise((resolve) => {
-        const run = spawn("bun", ["test", snapshotPath], { cwd: projectRoot });
+        // `detached` puts the runner at the head of its own process group so
+        // the timeout can kill the whole tree: a test that spawns servers,
+        // watchers, or shell children must not leave them running — holding
+        // inherited output descriptors and mutating the project — past the
+        // advertised budget.
+        const run = spawn("bun", ["test", snapshotPath], { cwd: projectRoot, detached: true });
         // Only the diagnostic tail is ever surfaced; retaining full streams
         // for a noisy 120-second run would grow the shared plugin process
         // without bound.
@@ -395,6 +390,15 @@ function defaultEvaluateArtifact(
         run.stdout.on("data", appendTail);
         run.stderr.on("data", appendTail);
         const timer = setTimeout(() => {
+            if (run.pid != null) {
+                try {
+                    process.kill(-run.pid, "SIGKILL");
+                    return;
+                } catch {
+                    // Group already gone or unsupported: fall back to the
+                    // direct child below.
+                }
+            }
             run.kill("SIGKILL");
         }, 120_000);
         const settle = (result: "pass" | "fail", detail?: string) => {

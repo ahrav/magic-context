@@ -2158,6 +2158,70 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
         expect(routed).toEqual(["write"]);
     });
 
+    it("translates module-lane ids through the mirror before the policy gate", async () => {
+        const write = await tools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Mirror-mapped hidden row." },
+            toolContext(),
+        );
+        expect(write).toContain("Saved memory [ID:");
+        const [memory] = getMemoriesByProject(db, OWN_PROJECT);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+        if (!claim) throw new Error("expected claim link");
+        const {
+            recordDispositionEventInCurrentTransaction,
+            refreshEffectivePolicyInCurrentTransaction,
+        } = await import("../../features/magic-context/memory/storage-claim-policy");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: claim.revisionId,
+                projectId: claim.projectId,
+                disposition: "quarantined",
+                action: "assert",
+                actor: "host",
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
+            return undefined;
+        });
+        // The two id spaces are allowed to differ: the mirror maps a native
+        // module row id to the hidden TypeScript row.
+        const moduleId = memory.id + 9000;
+        db.prepare(
+            "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+        ).run(OWN_PROJECT, moduleId, memory.id);
+
+        const routed: Array<readonly number[] | undefined> = [];
+        const moduleTools = createCtxMemoryTools({
+            db,
+            resolveProjectPath: () => OWN_PROJECT,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                memory: async (request) => {
+                    routed.push(request.ids);
+                    return { content: [{ type: "text", text: `module ${request.action}` }] };
+                },
+            },
+        });
+        // The module id resolves through the mirror to the hidden row and is
+        // refused before dispatch — keying the claims database by the raw
+        // module id would consult the wrong (or no) policy row.
+        const denied = await moduleTools.ctx_memory.execute(
+            { action: "get", ids: [moduleId] },
+            toolContext(),
+        );
+        expect(denied).toBe(`Error: Memory with ID ${moduleId} was not found.`);
+        expect(routed).toEqual([]);
+        // An id with no identity row names a fresh native row the mirror has
+        // not synced back; there is no claim to protect and it dispatches.
+        const passed = await moduleTools.ctx_memory.execute(
+            { action: "get", ids: [moduleId + 1] },
+            toolContext(),
+        );
+        expect(passed).toContain("module get");
+        expect(routed).toEqual([[moduleId + 1]]);
+    });
+
     it("writing the same content twice keeps one projection row and one revision while telemetry increments", async () => {
         const write = await tools.ctx_memory.execute(
             { action: "write", category: "CONSTRAINTS", content: "Use bun for scripts." },
