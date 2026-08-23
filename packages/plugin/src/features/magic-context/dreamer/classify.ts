@@ -21,6 +21,7 @@ import {
     type Memory,
     setMemoryClassification,
 } from "../memory";
+import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
 import { recordChildInvocation } from "../subagent-token-capture";
 import {
     buildClassifyPrompt,
@@ -152,7 +153,14 @@ function isModuleRoute(args: ClassifyArgs): boolean {
  * the exact value checked by memory.set_classification.
  */
 function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
-    const active = getMemoriesByProject(args.db, args.projectIdentity);
+    // Classification prompts are automatic child-model calls: policy-hidden
+    // content stays out of them, and a hidden row is simply classified on a
+    // later pass if it becomes eligible again.
+    const active = filterMemoriesByPolicy(
+        args.db,
+        getMemoriesByProject(args.db, args.projectIdentity),
+        "auto_inject",
+    ).memories;
     if (!isModuleRoute(args) || active.length === 0) {
         return active.map((memory) => ({
             contextMemory: memory,

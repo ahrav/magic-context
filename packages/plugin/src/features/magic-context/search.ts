@@ -839,20 +839,27 @@ async function searchMemories(args: {
     // The FTS table ranks rows before the policy filter sees them, so hidden
     // matches would consume candidate slots and — because a nonempty match
     // set restricts the semantic lane to matched ids — could pin the semantic
-    // candidates to rows that are later discarded. Over-fetch, drop rows
-    // absent from the eligible set, then apply the candidate bound.
-    // ponytail: 4x over-fetch bound; a policy-aware FTS join replaces it if
-    // hidden-heavy corpora exhaust the margin.
+    // candidates to rows that are later discarded. Fetch, drop rows absent
+    // from the eligible set, and widen the fetch until the bound is satisfied
+    // or the table is exhausted, so a hidden-heavy corpus cannot starve an
+    // eligible lower-ranked match.
     const eligibleMemoryIds = new Set(memories.map((memory) => memory.id));
-    const ftsMatches = getFtsMatches({
-        db: args.db,
-        projectPath: args.projectPath,
-        query: args.query,
-        limit: candidateLimit * 4,
-        workspace: args.workspace,
-    })
-        .filter((match) => eligibleMemoryIds.has(match.id))
-        .slice(0, candidateLimit);
+    let ftsFetchLimit = candidateLimit * 4;
+    let ftsMatches: Memory[] = [];
+    for (;;) {
+        const fetched = getFtsMatches({
+            db: args.db,
+            projectPath: args.projectPath,
+            query: args.query,
+            limit: ftsFetchLimit,
+            workspace: args.workspace,
+        });
+        ftsMatches = fetched
+            .filter((match) => eligibleMemoryIds.has(match.id))
+            .slice(0, candidateLimit);
+        if (ftsMatches.length >= candidateLimit || fetched.length < ftsFetchLimit) break;
+        ftsFetchLimit *= 4;
+    }
     lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
     const ftsScores = getFtsScores(ftsMatches);
     const semanticCandidates = selectSemanticCandidates({

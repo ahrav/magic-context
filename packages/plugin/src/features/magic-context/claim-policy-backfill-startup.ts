@@ -26,7 +26,10 @@ export async function runClaimPolicySeedStartup(
 ): Promise<ClaimPolicySeedRunSummary | null> {
     const emit = options.log ?? log;
     const status = getClaimPolicySeedStatus(db);
-    if (!status.applicable || status.phase !== "pending") return null;
+    // A "complete" phase still runs: the seeder's own anti-join probe catches
+    // revisions a held-open v85 writer appended after completion published
+    // (it returns a cheap noop when completion holds).
+    if (!status.applicable || status.phase === null) return null;
     const run = options.runSeed ?? runClaimPolicySeed;
     const summary = await run(db);
     if (summary.status === "complete") {

@@ -382,6 +382,38 @@ describe("claim policy seed", () => {
         }
     });
 
+    test("a revision appended after completion is reconciled by the next run", async () => {
+        const fx = fixture();
+        try {
+            seedAe9Corpus(fx);
+            runMigrations(fx.db);
+            expect((await runClaimPolicySeed(fx.db)).status).toBe("complete");
+            // A held-open v85 writer appends a revision AFTER completion
+            // published: no policy subject exists and no live writer will
+            // create one.
+            const straggler = addClaimRevision(fx, "post-completion", [
+                addObservation(fx, {
+                    independenceKey: "k9",
+                    runId: "run9",
+                    content: "x9",
+                    trust: "model_inference",
+                }),
+            ]);
+            const summary = await runClaimPolicySeed(fx.db);
+            expect(summary.status).toBe("complete");
+            expect(summary.seeded).toBe(1);
+            expect(
+                fx.db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM claim_revision_policy_subjects WHERE revision_id = ?",
+                    )
+                    .get(straggler),
+            ).toEqual({ count: 1 });
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
     test("startup runs the pending seed once and no-ops when complete", async () => {
         const fx = fixture();
         try {
@@ -395,7 +427,9 @@ describe("claim policy seed", () => {
             expect(
                 messages.some((line) => line.includes("moved out of automatic visibility")),
             ).toBe(true);
-            expect(await runClaimPolicySeedStartup(fx.db)).toBeNull();
+            // A completed seed still probes for stragglers a held-open v85
+            // writer appended after completion; with none, it reports noop.
+            expect((await runClaimPolicySeedStartup(fx.db))?.status).toBe("noop");
         } finally {
             closeQuietly(fx.db);
         }

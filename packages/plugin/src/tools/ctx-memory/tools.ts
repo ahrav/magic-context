@@ -672,8 +672,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         const replay = readMemoryClaimOperationResult<{
                             memoryId: number;
                             duplicate?: boolean;
+                            denied?: boolean;
                         }>(deps.db, envelope);
                         if (replay) {
+                            if (replay.result.denied) {
+                                return `Error: Memory could not be saved in ${category}.`;
+                            }
                             return replay.result.duplicate
                                 ? `Memory already exists [ID: ${replay.result.memoryId}] in ${category} (seen count incremented).`
                                 : `Saved memory [ID: ${replay.result.memoryId}] in ${category}.`;
@@ -688,6 +692,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                     runMemoryClaimOperationInCurrentTransaction<{
                                         memoryId: number;
                                         duplicate: boolean;
+                                        denied?: boolean;
                                     }>(deps.db, envelope, () => {
                                         const existing = getMemoryByHash(
                                             deps.db,
@@ -696,6 +701,21 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                             normalizedHash,
                                         );
                                         if (existing) {
+                                            // A policy-hidden duplicate returns
+                                            // uniform refusal: the UNIQUE row
+                                            // cannot be re-inserted, and both
+                                            // its id and its seen count must
+                                            // stay undisclosed and untouched.
+                                            if (memoryPolicyDeniesToolTarget([existing.id])) {
+                                                return {
+                                                    result: {
+                                                        memoryId: existing.id,
+                                                        duplicate: true,
+                                                        denied: true,
+                                                    },
+                                                    effects: [],
+                                                };
+                                            }
                                             updateMemorySeenCount(deps.db, existing.id);
                                             return {
                                                 result: { memoryId: existing.id, duplicate: true },
@@ -723,6 +743,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 ),
                             )
                             .immediate();
+                        if (outcome.result.denied) {
+                            return `Error: Memory could not be saved in ${category}.`;
+                        }
                         if (outcome.result.duplicate) {
                             if (!outcome.replayed) {
                                 requestRustMemorySync(deps, toolContext.sessionID);
@@ -749,6 +772,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         normalizedHash,
                     );
                     if (existingMemory) {
+                        if (memoryPolicyDeniesToolTarget([existingMemory.id])) {
+                            return `Error: Memory could not be saved in ${category}.`;
+                        }
                         updateMemorySeenCount(deps.db, existingMemory.id);
                         requestRustMemorySync(deps, toolContext.sessionID);
                         return `Memory already exists [ID: ${existingMemory.id}] in ${category} (seen count incremented).`;
@@ -769,6 +795,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         writeIdentity,
                     );
                     if (!insertResult.inserted) {
+                        if (memoryPolicyDeniesToolTarget([insertResult.memory.id])) {
+                            return `Error: Memory could not be saved in ${category}.`;
+                        }
                         requestRustMemorySync(deps, toolContext.sessionID);
                         return `Memory already exists [ID: ${insertResult.memory.id}] in ${category} (seen count incremented).`;
                     }
@@ -885,7 +914,11 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         normalizedHash,
                     );
                     if (duplicate && duplicate.id !== memory.id) {
-                        return `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`;
+                        // Never disclose a policy-hidden duplicate's id; the
+                        // UNIQUE constraint forces a refusal either way.
+                        return memoryPolicyDeniesToolTarget([duplicate.id])
+                            ? "Error: Memory content already exists; choose different content."
+                            : `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`;
                     }
 
                     const projectIdentity = targetIdentityForStoredPath(rawProjectPath);
@@ -1136,7 +1169,11 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                         ? lockedDuplicate
                                         : null;
                                 if (lockedDuplicate && !canonicalExisting) {
-                                    mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+                                    mergeConflict = memoryPolicyDeniesToolTarget([
+                                        lockedDuplicate.id,
+                                    ])
+                                        ? "Error: Memory content already exists; choose different content."
+                                        : `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
                                     return null;
                                 }
 

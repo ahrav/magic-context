@@ -74,7 +74,7 @@ arguments:
 describe("createDreamTaskExecutor — curate", () => {
     test("runs whole-pool curation without verification gate or watermark patch", async () => {
         db = freshDb();
-        const project = "/repo/project";
+        const project = "dir:/repo/project";
         const first = insertMemory(db, {
             sourceType: "user",
             projectPath: project,
@@ -134,7 +134,7 @@ describe("createDreamTaskExecutor — curate", () => {
 
     test("rejects a textual pseudo-tool-call and retries with the fallback model", async () => {
         db = freshDb();
-        const project = "/repo/curate-pseudo-tool-call";
+        const project = "dir:/repo/curate-pseudo-tool-call";
         insertMemory(db, {
             sourceType: "user",
             projectPath: project,
@@ -186,7 +186,7 @@ describe("createDreamTaskExecutor — curate", () => {
 
     test("adds the content language directive to curated prose tasks", async () => {
         db = freshDb();
-        const project = "/repo/language-project";
+        const project = "dir:/repo/language-project";
         insertMemory(db, {
             sourceType: "user",
             projectPath: project,
@@ -234,7 +234,7 @@ describe("createDreamTaskExecutor — curate", () => {
 describe("createDreamTaskExecutor — verify-broad disposition", () => {
     test("records cycle progress as a completed run result instead of an error status", async () => {
         db = freshDb();
-        const project = "/repo/verify-broad-result";
+        const project = "dir:/repo/verify-broad-result";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
         const memories = [];
         for (let i = 0; i < 51; i += 1) {
@@ -319,7 +319,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
 
     test("surfaces provider-outage completions as transient task failures", async () => {
         db = freshDb();
-        const project = "/repo/verify-broad-provider-outage";
+        const project = "dir:/repo/verify-broad-provider-outage";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
         const memory = insertMemory(db, {
             sourceType: "user",
@@ -372,7 +372,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
 
     test("keeps a zero-progress broad run failed", async () => {
         db = freshDb();
-        const project = "/repo/verify-broad-zero";
+        const project = "dir:/repo/verify-broad-zero";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
         const memory = insertMemory(db, {
             sourceType: "user",
@@ -419,7 +419,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
 describe("createDreamTaskExecutor — parent session resolution", () => {
     test("concurrent task runs all create children under the resolved parentID (no race-NULL)", async () => {
         db = freshDb();
-        const project = "/repo/project";
+        const project = "dir:/repo/project";
         for (let i = 0; i < 3; i += 1) {
             insertMemory(db, {
                 sourceType: "user",
@@ -483,7 +483,7 @@ describe("createDreamTaskExecutor — parent session resolution", () => {
 describe("createDreamTaskExecutor — lease setup fence", () => {
     test("aborts after a pre-heartbeat TTL stall lets an interloper acquire and release", async () => {
         db = freshDb();
-        const project = "/repo/lease-setup-stall";
+        const project = "dir:/repo/lease-setup-stall";
         const leaseKey = leaseKeyFor("curate", project);
         const realNow = Date.now();
         const clock = { value: realNow };
@@ -536,7 +536,7 @@ describe("createDreamTaskExecutor — lease setup fence", () => {
 describe("createDreamTaskExecutor — classify-memories", () => {
     test("runs the non-agentic XML transform and applies the manifest host-side", async () => {
         db = freshDb();
-        const project = "/repo/project";
+        const project = "dir:/repo/project";
         // Stage 2 needs >= 10 memories in the pool to classify at all.
         const ids: number[] = [];
         for (let i = 0; i < 12; i += 1) {
@@ -611,7 +611,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 
     test("provider-outage chunk aborts the run without advancing lastRunAt", async () => {
         db = freshDb();
-        const project = "/repo/classify-provider-outage";
+        const project = "dir:/repo/classify-provider-outage";
         const ids: number[] = [];
         for (let index = 0; index < 201; index += 1) {
             ids.push(
@@ -680,7 +680,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 
     test("direct authority.status selects rust MODULE without a prior transform", async () => {
         db = freshDb();
-        const project = "/repo/rust-classify";
+        const project = "dir:/repo/rust-classify";
         ensureContextStoreUuid(db);
         const sensitive = insertMemory(db, {
             sourceType: "user",
@@ -779,7 +779,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
     });
     test("module failures are transient and never fall back to a TypeScript child", async () => {
         db = freshDb();
-        const project = "/repo/rust-classify-failure";
+        const project = "dir:/repo/rust-classify-failure";
         ensureContextStoreUuid(db);
         for (let i = 0; i < 12; i += 1) {
             const memory = insertMemory(db, {
@@ -959,7 +959,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
 
     test("defers cue mutation while Rust authority is draining", async () => {
         db = freshDb();
-        const project = "/repo/draining-cues";
+        const project = "dir:/repo/draining-cues";
         ensureContextStoreUuid(db);
         const memory = insertMemory(db, {
             sourceType: "user",
@@ -1046,7 +1046,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
 
     test("reports a fully drained cue set as completed", async () => {
         db = freshDb();
-        const project = "/repo/complete-cues";
+        const project = "dir:/repo/complete-cues";
         const memory = insertMemory(db, {
             sourceType: "user",
             projectPath: project,
@@ -1087,7 +1087,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
 describe("createDreamTaskExecutor — retrospective", () => {
     test("retrospective memory insert leaves project memory epoch unchanged", () => {
         db = freshDb();
-        const project = "/repo/project";
+        const project = "dir:/repo/project";
         ensureProjectState(db, project, 1);
         const epochBefore = getProjectState(db, project)?.projectMemoryEpoch;
 
@@ -1113,7 +1113,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
 
     test("gate returns 'n' → one gate turn, child created+deleted, watermark advances, no deepen", async () => {
         db = freshDb();
-        const project = "/repo/project";
+        const project = "dir:/repo/project";
         const provider = {
             listProjectSessions: mock(() => [{ sessionId: "s1" }]),
             readUserMessagesSince: mock(() => ({
@@ -1175,7 +1175,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
 
     test("signal deepens, parses XML, host-applies memory and gated observation", async () => {
         db = freshDb();
-        const project = "/repo/project";
+        const project = "dir:/repo/project";
         const provider = {
             listProjectSessions: mock(() => [{ sessionId: "s1" }]),
             readUserMessagesSince: mock(() => ({
@@ -1290,7 +1290,7 @@ describe("createDreamTaskExecutor — retrospective", () => {
 
     test("drops observation learnings when user-memory collection is disabled", async () => {
         db = freshDb();
-        const project = "/repo/project";
+        const project = "dir:/repo/project";
         const provider = {
             listProjectSessions: mock(() => [{ sessionId: "s1" }]),
             readUserMessagesSince: mock(() => ({

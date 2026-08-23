@@ -577,8 +577,14 @@ export function createCtxMemoryTool(
 						const replay = readMemoryClaimOperationResult<{
 							memoryId: number;
 							duplicate?: boolean;
+							denied?: boolean;
 						}>(deps.db, envelope);
 						if (replay) {
+							if (replay.result.denied) {
+								return err(
+									`Error: Memory could not be saved in ${rawCategory}.`,
+								);
+							}
 							return ok(
 								replay.result.duplicate
 									? `Memory already exists [ID: ${replay.result.memoryId}] in ${rawCategory} (seen count incremented).`
@@ -597,6 +603,7 @@ export function createCtxMemoryTool(
 										runMemoryClaimOperationInCurrentTransaction<{
 											memoryId: number;
 											duplicate: boolean;
+											denied?: boolean;
 										}>(deps.db, envelope, () => {
 											const existing = getMemoryByHash(
 												deps.db,
@@ -605,6 +612,20 @@ export function createCtxMemoryTool(
 												normalizedHash,
 											);
 											if (existing) {
+												// A policy-hidden duplicate returns uniform
+												// refusal: the UNIQUE row cannot be
+												// re-inserted, and both its id and its seen
+												// count stay undisclosed and untouched.
+												if (memoryPolicyDeniesToolTarget([existing.id])) {
+													return {
+														result: {
+															memoryId: existing.id,
+															duplicate: true,
+															denied: true,
+														},
+														effects: [],
+													};
+												}
 												updateMemorySeenCount(deps.db, existing.id);
 												return {
 													result: { memoryId: existing.id, duplicate: true },
@@ -629,6 +650,9 @@ export function createCtxMemoryTool(
 								),
 							)
 							.immediate();
+						if (outcome.result.denied) {
+							return err(`Error: Memory could not be saved in ${rawCategory}.`);
+						}
 						if (outcome.result.duplicate) {
 							return ok(
 								`Memory already exists [ID: ${outcome.result.memoryId}] in ${rawCategory} (seen count incremented).`,
@@ -654,6 +678,9 @@ export function createCtxMemoryTool(
 						normalizedHash,
 					);
 					if (existing) {
+						if (memoryPolicyDeniesToolTarget([existing.id])) {
+							return err(`Error: Memory could not be saved in ${rawCategory}.`);
+						}
 						updateMemorySeenCount(deps.db, existing.id);
 						return ok(
 							`Memory already exists [ID: ${existing.id}] in ${rawCategory} (seen count incremented).`,
@@ -672,6 +699,9 @@ export function createCtxMemoryTool(
 						writeIdentity,
 					);
 					if (!insertResult.inserted) {
+						if (memoryPolicyDeniesToolTarget([insertResult.memory.id])) {
+							return err(`Error: Memory could not be saved in ${rawCategory}.`);
+						}
 						return ok(
 							`Memory already exists [ID: ${insertResult.memory.id}] in ${rawCategory} (seen count incremented).`,
 						);
@@ -818,8 +848,12 @@ export function createCtxMemoryTool(
 						normalizedHash,
 					);
 					if (duplicate && duplicate.id !== memory.id) {
+						// Never disclose a policy-hidden duplicate's id; the UNIQUE
+						// constraint forces a refusal either way.
 						return err(
-							`Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`,
+							memoryPolicyDeniesToolTarget([duplicate.id])
+								? "Error: Memory content already exists; choose different content."
+								: `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`,
 						);
 					}
 
@@ -1091,7 +1125,11 @@ export function createCtxMemoryTool(
 											? lockedDuplicate
 											: null;
 									if (lockedDuplicate && !canonicalExisting) {
-										mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+										mergeConflict = memoryPolicyDeniesToolTarget([
+											lockedDuplicate.id,
+										])
+											? "Error: Memory content already exists; choose different content."
+											: `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
 										return;
 									}
 									let canonicalMemory: Memory;

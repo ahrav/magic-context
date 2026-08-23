@@ -24,6 +24,7 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
+import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
 import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
@@ -181,7 +182,13 @@ function loadActiveMemoryPromptMemories(
     db: Database,
     projectIdentity: string,
 ): CuratePromptMemory[] {
-    const memories = getMemoriesByProject(db, projectIdentity);
+    // Curate prompts are automatic child-model calls: policy-hidden content
+    // stays out of them.
+    const memories = filterMemoriesByPolicy(
+        db,
+        getMemoriesByProject(db, projectIdentity),
+        "auto_inject",
+    ).memories;
     const verificationById = getMemoryVerifications(
         db,
         memories.map((memory) => memory.id),

@@ -20,6 +20,7 @@ import {
     normalizeVerificationFiles,
     recordMemoryMapping,
 } from "../memory";
+import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
@@ -124,7 +125,13 @@ export function selectMapMemoryInputs(
     projectIdentity: string,
     repoDir: string,
 ): MapMemoryInput[] {
-    const active = getMemoriesByProject(db, projectIdentity);
+    // Mapping prompts are automatic child-model calls: policy-hidden content
+    // stays out of them; an eligible-again row maps on a later pass.
+    const active = filterMemoriesByPolicy(
+        db,
+        getMemoriesByProject(db, projectIdentity),
+        "auto_inject",
+    ).memories;
     const activeIds = active.map((m) => m.id);
     const unmapped = new Set(getUnmappedMemoryIds(db, activeIds));
     const verifications = getMemoryVerifications(db, activeIds);

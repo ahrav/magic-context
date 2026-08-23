@@ -226,7 +226,7 @@ export async function runClaimPolicySeed(
 ): Promise<ClaimPolicySeedRunSummary> {
     const status = getClaimPolicySeedStatus(db);
     const emptyCounts: Record<string, number> = { CANDIDATE: 0, CORROBORATED: 0, VERIFIED: 0 };
-    if (!status.applicable || status.phase === "complete") {
+    if (!status.applicable) {
         return {
             status: "noop",
             batches: 0,
@@ -234,6 +234,23 @@ export async function runClaimPolicySeed(
             seededCounts: status.seededCounts ?? emptyCounts,
             autoHidden: 0,
         };
+    }
+    if (status.phase === "complete") {
+        // A v85 process that stayed open across the migration can append a
+        // revision AFTER completion published; its writer creates no policy
+        // subject, and nothing else ever would. One indexed anti-join probe
+        // decides whether completion still holds; when it does not, seeding
+        // resumes and completion republishes after the usual reconciliation.
+        const straggler = selectUnseededBatch(db, 0, 1);
+        if (straggler.length === 0) {
+            return {
+                status: "noop",
+                batches: 0,
+                seeded: 0,
+                seededCounts: status.seededCounts ?? emptyCounts,
+                autoHidden: 0,
+            };
+        }
     }
     const batchSize = Math.max(1, options.batchSize ?? DEFAULT_BATCH_SIZE);
     const maxBatches = options.maxBatches ?? Number.POSITIVE_INFINITY;

@@ -793,6 +793,7 @@ describe("magic-context hook", () => {
             memories.push(
                 insertMemory(db, {
                     projectPath,
+                    sourceType: "user",
                     category: "ARCHITECTURE",
                     content: `Manual classify memory ${i}.`,
                 }),
