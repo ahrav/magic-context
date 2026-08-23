@@ -209,6 +209,78 @@ describe("claim policy seed", () => {
         }
     });
 
+    test("a later revision's retained user stamp cannot seed USER_EXPLICIT taint", async () => {
+        const fx = fixture();
+        try {
+            // A pre-v86 model rewrite: revision 1 came from the user;
+            // revision 2 holds model-authored replacement bytes, but the old
+            // rewrite path copied the retained `user` source type onto both
+            // the new observation and the revision metadata.
+            const originObservation = addObservation(fx, {
+                independenceKey: "k-rw1",
+                runId: "rw1",
+                content: "original user directive",
+                trust: "explicit_user",
+            });
+            const firstRevisionId = addClaimRevision(fx, "rewrite-subject", [originObservation]);
+            const claimId = Number(
+                (
+                    fx.db
+                        .prepare("SELECT claim_id AS id FROM claim_revisions WHERE id = ?")
+                        .get(firstRevisionId) as { id: number }
+                ).id,
+            );
+            fx.db
+                .prepare(
+                    `INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at)
+                     VALUES (?, 2, 'model-authored replacement', ?, 1000)`,
+                )
+                .run(claimId, "c".repeat(64));
+            const rewriteRevisionId = Number(
+                (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
+                    .id,
+            );
+            const rewriteObservation = addObservation(fx, {
+                independenceKey: "k-rw2",
+                runId: "rw2",
+                content: "model-authored replacement",
+                trust: "explicit_user",
+            });
+            fx.db
+                .prepare(
+                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 1000)",
+                )
+                .run(rewriteRevisionId, rewriteObservation);
+            fx.db
+                .prepare(
+                    `INSERT INTO claim_revision_memory_metadata
+                        (revision_id, category, normalized_hash, importance, memory_scope, shareable, source_type, created_at)
+                     VALUES (?, 'CONSTRAINTS', 'hash:rewrite', 60, 'project', 0, 'user', 1000)`,
+                )
+                .run(rewriteRevisionId);
+            fx.db
+                .prepare("UPDATE claims SET current_revision_id = ? WHERE id = ?")
+                .run(rewriteRevisionId, claimId);
+            runMigrations(fx.db);
+            expect((await runClaimPolicySeed(fx.db)).status).toBe("complete");
+            const taintOf = (revisionId: number) =>
+                (
+                    fx.db
+                        .prepare(
+                            "SELECT origin_taint AS taint FROM claim_revision_policy_subjects WHERE revision_id = ?",
+                        )
+                        .get(revisionId) as { taint: string }
+                ).taint;
+            // The first revision keeps its stated provenance; the rewrite
+            // must not inherit it, or a model-authored replacement could
+            // originate directives with frozen USER_EXPLICIT taint.
+            expect(taintOf(firstRevisionId)).toBe("USER_EXPLICIT");
+            expect(taintOf(rewriteRevisionId)).not.toBe("USER_EXPLICIT");
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
     test("copies of one source stay one independence group and do not corroborate", async () => {
         const fx = fixture();
         try {

@@ -62,6 +62,7 @@ import {
     type MemoryProjectionRow,
     readMemoryProjectionRow,
 } from "./memory/storage-memory-projection";
+import { readSchemaMeta as readMeta, writeSchemaMeta as writeMeta } from "./schema-meta";
 import { CLAIMS_AND_EVIDENCE_TABLES } from "./storage-claims-schema";
 import {
     CLAIMS_BACKFILL_META_KEYS,
@@ -213,21 +214,6 @@ export function computeClaimsBackfillEvidenceDigest(measurements: unknown): stri
 // ---------------------------------------------------------------------------
 // Meta state
 // ---------------------------------------------------------------------------
-
-function readMeta(db: Database, key: string): string | null {
-    const row = db.prepare("SELECT value FROM schema_migrations_meta WHERE key = ?").get(key) as
-        | { value: string }
-        | undefined;
-    return row?.value ?? null;
-}
-
-function writeMeta(db: Database, key: string, value: string): void {
-    db.prepare(
-        `INSERT INTO schema_migrations_meta (key, value)
-         VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    ).run(key, value);
-}
 
 function readIntMeta(db: Database, key: string): number {
     const parsed = Number.parseInt(readMeta(db, key) ?? "0", 10);

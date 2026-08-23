@@ -860,7 +860,13 @@ function appendMemoryClaimRevision(
                     )
                     .get(outcome.revisionId) as { auto: number } | null | undefined
             )?.auto ?? 0;
-        if (successorEligible !== predecessorEligible) {
+        // The 0->1 direction already bumped inside ensureRevisionPolicy: the
+        // successor's projection was created eligible, which the reducer's
+        // own before/after diff detects. Only the eligible-predecessor ->
+        // ineligible-successor handoff is invisible to it (the successor's
+        // projection never changes after creation), so only that direction
+        // bumps here.
+        if (predecessorEligible === 1 && successorEligible === 0) {
             bumpEpochForClaimProjectInCurrentTransaction(db, args.claimId);
         }
     }

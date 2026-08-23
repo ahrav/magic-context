@@ -66,14 +66,22 @@ export interface MemoryPolicyDecision {
     label: string | null;
 }
 
+// Positive results are memoized per connection: tables are never dropped
+// after migration, so `true` is stable for a database's lifetime, while a
+// `false` (mid-migration probe) must stay uncached. One hook render pass
+// consults this at several call sites.
+const claimEffectivePolicyPresent = new WeakMap<Database, true>();
+
 export function hasClaimEffectivePolicy(db: Database): boolean {
-    return (
+    if (claimEffectivePolicyPresent.has(db)) return true;
+    const present =
         db
             .prepare(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_effective_policy'",
             )
-            .get() != null
-    );
+            .get() != null;
+    if (present) claimEffectivePolicyPresent.set(db, true);
+    return present;
 }
 
 /** Indexed policy rows for a set of memory ids through the crosswalk. Ids

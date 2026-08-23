@@ -31,6 +31,7 @@ import {
     bumpEpochForClaimProjectInCurrentTransaction,
     refreshRevisionMaturityInCurrentTransaction,
 } from "./memory/storage-memory-claims.ts";
+import { readSchemaMeta as readMeta, writeSchemaMeta as writeMeta } from "./schema-meta.ts";
 import type { SourceTrustClass } from "./storage-claim-applicability-schema.ts";
 import {
     CLAIM_POLICY_SEED_META_KEYS,
@@ -56,21 +57,6 @@ export interface ClaimPolicySeedStatus {
     expectedCount: number;
     cursor: number;
     seededCounts: Record<string, number> | null;
-}
-
-function readMeta(db: Database, key: string): string | null {
-    const row = db.prepare("SELECT value FROM schema_migrations_meta WHERE key = ?").get(key) as
-        | { value: string }
-        | null
-        | undefined;
-    return row?.value ?? null;
-}
-
-function writeMeta(db: Database, key: string, value: string): void {
-    db.prepare(
-        `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    ).run(key, value);
 }
 
 export function getClaimPolicySeedStatus(db: Database): ClaimPolicySeedStatus {
@@ -110,6 +96,7 @@ interface SeedRevisionRow {
     revisionId: number;
     claimId: number;
     projectId: number;
+    revision: number;
     originObservationId: number | null;
     sourceTrustClass: SourceTrustClass | null;
     extractor: string | null;
@@ -123,10 +110,24 @@ function seedTaint(row: SeedRevisionRow): FineTaint {
     // here, so `classifyFineTaint` stays the only coarse-to-fine authority —
     // the taint this returns is frozen in an append-only table and cannot be
     // repaired in place if the two ever disagree.
+    //
+    // The explicit-user elevation holds only for the claim's FIRST revision,
+    // mirroring `hasExplicitUserEvidence`: the pre-v86 rewrite path copied
+    // the retained `user` source type onto later revisions' metadata and
+    // observations even when the bytes were model-authored replacements, and
+    // every unseeded revision here predates this build (the seed boundary or
+    // a held-open v85 writer). A later revision's user stamp is therefore
+    // untrustworthy — taking it would let a model rewrite originate
+    // directives with USER_EXPLICIT taint, frozen forever.
+    const observedClass: SourceTrustClass = row.sourceTrustClass ?? "model_inference";
     const sourceTrustClass: SourceTrustClass =
-        row.metadataSourceType === "user"
-            ? "explicit_user"
-            : (row.sourceTrustClass ?? "model_inference");
+        row.revision === 1
+            ? row.metadataSourceType === "user"
+                ? "explicit_user"
+                : observedClass
+            : observedClass === "explicit_user"
+              ? "model_inference"
+              : observedClass;
     return classifyFineTaint({ sourceTrustClass, extractor: row.extractor });
 }
 
@@ -161,6 +162,7 @@ function selectUnseededBatch(
                 claim_revisions.id AS revisionId,
                 claims.id AS claimId,
                 claims.project_id AS projectId,
+                claim_revisions.revision AS revision,
                 origin_observation.id AS originObservationId,
                 origin_observation.source_trust_class AS sourceTrustClass,
                 origin_observation.extractor AS extractor,
