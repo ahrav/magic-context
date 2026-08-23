@@ -526,8 +526,14 @@ export function readPolicySupport(db: Database, revisionId: number): PolicySuppo
     };
 }
 
-/** Evaluate the pure policy decision from authoritative rows (KTD7). */
-export function computePolicyDecisionForRevision(db: Database, revisionId: number): PolicyDecision {
+/** Evaluate the pure policy decision from authoritative rows (KTD7). Callers
+ * on the per-write hot path pass their already-gathered `support` so the
+ * multi-query fact read runs once per revision write, not twice. */
+export function computePolicyDecisionForRevision(
+    db: Database,
+    revisionId: number,
+    precomputed: { support?: PolicySupport } = {},
+): PolicyDecision {
     const subject = readPolicySubject(db, revisionId);
     return evaluateClaimPolicy({
         subject: {
@@ -535,7 +541,7 @@ export function computePolicyDecisionForRevision(db: Database, revisionId: numbe
             originTaint: subject?.originTaint ?? null,
             policyVersion: subject?.policyVersion ?? null,
         },
-        support: readPolicySupport(db, revisionId),
+        support: precomputed.support ?? readPolicySupport(db, revisionId),
         dispositions: readActiveDispositions(db, revisionId),
     });
 }
@@ -570,6 +576,17 @@ export function updateEffectivePolicyProjectionInCurrentTransaction(
     generation: number,
     nowMs?: number,
 ): void {
+    // An "unknown" taint only arises for a missing subject or an unsupported
+    // policy version, and `refreshEffectivePolicyInCurrentTransaction` skips
+    // the write for both. Persisting it would require inventing a concrete
+    // taint (the CHECK constraint has no "unknown" word), and any substitute
+    // is directive-capable — a silent trust upgrade for a claim of unproven
+    // origin. Fail closed instead of relying on every caller to pre-check.
+    if (decision.originTaint === "unknown") {
+        throw new Error(
+            `refusing to project an unknown origin taint for revision ${identity.revisionId}`,
+        );
+    }
     db.prepare(
         `INSERT INTO claim_effective_policy
             (revision_id, claim_id, project_id, effective_maturity, origin_taint,
@@ -592,7 +609,7 @@ export function updateEffectivePolicyProjectionInCurrentTransaction(
         identity.claimId,
         identity.projectId,
         decision.effectiveMaturity,
-        decision.originTaint === "unknown" ? "ASSISTANT_INFERENCE" : decision.originTaint,
+        decision.originTaint,
         decision.surfaces.auto_inject.eligible ? 1 : 0,
         decision.surfaces.explicit_search.eligible ? 1 : 0,
         decision.hardHidden ? 1 : 0,
@@ -619,11 +636,13 @@ export function currentProjectPolicyGeneration(db: Database, projectId: number):
 export function refreshEffectivePolicyInCurrentTransaction(
     db: Database,
     revisionId: number,
-    options: { generation?: number; nowMs?: number } = {},
+    options: { generation?: number; nowMs?: number; support?: PolicySupport } = {},
 ): PolicyDecision {
     const identity = readRevisionIdentity(db, revisionId);
     if (!identity) throw new Error(`claim revision ${revisionId} does not exist`);
-    const decision = computePolicyDecisionForRevision(db, revisionId);
+    const decision = computePolicyDecisionForRevision(db, revisionId, {
+        support: options.support,
+    });
     // A revision without a frozen subject stays absent from the projection:
     // absence is the fail-closed contract, and writing a row would need a
     // fabricated taint value the CHECK constraint has no word for. A subject

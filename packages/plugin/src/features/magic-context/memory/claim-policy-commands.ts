@@ -9,7 +9,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Database } from "../../../shared/sqlite";
 import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
@@ -31,6 +31,7 @@ import {
     runMemoryClaimOperationInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./storage-memory-claims";
+import { isWithin, safeRealpath } from "./verification-paths";
 
 export interface ClaimCommandResult {
     text: string;
@@ -381,13 +382,16 @@ function defaultEvaluateArtifact(
     }
     return new Promise((resolve) => {
         const run = spawn("bun", ["test", canonicalPath], { cwd: projectRoot });
+        // Only the diagnostic tail is ever surfaced; retaining full streams
+        // for a noisy 120-second run would grow the shared plugin process
+        // without bound.
+        const OUTPUT_TAIL_CHARS = 4_096;
         let output = "";
-        run.stdout.on("data", (chunk: Buffer) => {
-            output += chunk.toString("utf8");
-        });
-        run.stderr.on("data", (chunk: Buffer) => {
-            output += chunk.toString("utf8");
-        });
+        const appendTail = (chunk: Buffer) => {
+            output = (output + chunk.toString("utf8")).slice(-OUTPUT_TAIL_CHARS);
+        };
+        run.stdout.on("data", appendTail);
+        run.stderr.on("data", appendTail);
         const timer = setTimeout(() => {
             run.kill("SIGKILL");
         }, 120_000);
@@ -411,26 +415,24 @@ function defaultEvaluateArtifact(
 }
 
 /** Canonicalize an artifact path inside the owning project: aliases, absolute
- * inputs, `..` escapes, and symlink escapes are rejected (KTD6). */
+ * inputs, `..` escapes, and symlink escapes are rejected (KTD6). Escape
+ * checking reuses the shared predicates in `verification-paths.ts`. */
 function canonicalizeArtifactPath(
     projectRoot: string,
     input: string,
 ): { canonicalPath: string; absolutePath: string } | { error: string } {
     if (isAbsolute(input)) return { error: "Artifact paths must be project-relative." };
-    const rootReal = realpathSync(resolve(projectRoot));
+    const rootReal = safeRealpath(resolve(projectRoot)) ?? resolve(projectRoot);
     const absolute = resolve(rootReal, input);
-    let real: string;
-    try {
-        real = realpathSync(absolute);
-    } catch {
+    const real = safeRealpath(absolute);
+    if (real === null) {
         return { error: `Artifact not found: ${input}` };
     }
-    const rel = relative(rootReal, real);
-    if (rel.startsWith("..") || isAbsolute(rel)) {
+    if (!isWithin(rootReal, real)) {
         return { error: "Artifact path escapes the owning project." };
     }
     if (!statSync(real).isFile()) return { error: "Artifact must be a regular file." };
-    return { canonicalPath: rel.split(sep).join("/"), absolutePath: real };
+    return { canonicalPath: relative(rootReal, real).split(sep).join("/"), absolutePath: real };
 }
 
 function sha256Bytes(path: string): string {

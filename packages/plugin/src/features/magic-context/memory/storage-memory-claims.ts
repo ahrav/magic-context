@@ -1011,7 +1011,12 @@ export function recordMemoryClaimSupersessionOutcomeInCurrentTransaction(
             rightRevisionId: sourceRevisionId,
         });
         if (hasClaimPolicySchema(db)) {
-            refreshEffectivePolicyInCurrentTransaction(db, sourceRevisionId);
+            // The full maturity refresh (not the bare projection write) diffs
+            // auto-eligibility and bumps the project memory epoch: a
+            // supersession flips the source revision out of automatic
+            // visibility, and without the bump the native mirror keeps
+            // serving it until an unrelated epoch change.
+            refreshRevisionMaturityInCurrentTransaction(db, sourceRevisionId);
         }
         return "recorded";
     }
@@ -1402,7 +1407,8 @@ function refreshRevisionMaturityInCurrentTransaction(db: Database, revisionId: n
         verified: support.verified,
         explicitUserEvidence: support.explicitUserEvidence,
     };
-    for (const step of automaticLadderSteps(support.historicalMaturity, transition)) {
+    const steps = automaticLadderSteps(support.historicalMaturity, transition);
+    for (const step of steps) {
         appendMaturityAssertionInCurrentTransaction(db, {
             revisionId,
             projectId: identity.projectId,
@@ -1413,7 +1419,12 @@ function refreshRevisionMaturityInCurrentTransaction(db: Database, revisionId: n
     const before = db
         .prepare("SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?")
         .get(revisionId) as { auto: number } | null | undefined;
-    const decision = refreshEffectivePolicyInCurrentTransaction(db, revisionId);
+    // Reuse the already-gathered support facts on the no-step common case;
+    // an appended ladder step advances the maturity head, making the
+    // pre-append snapshot stale, so the refresh re-reads it then.
+    const decision = refreshEffectivePolicyInCurrentTransaction(db, revisionId, {
+        support: steps.length === 0 ? support : undefined,
+    });
     const autoAfter = decision.surfaces.auto_inject.eligible ? 1 : 0;
     if ((before?.auto ?? 0) !== autoAfter) {
         // Crossing the automatic boundary invalidates every derived

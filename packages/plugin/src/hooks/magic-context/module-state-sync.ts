@@ -1392,11 +1392,18 @@ export async function buildModuleStateSyncPayload(args: {
     };
     const compartmentsChanged =
         args.force || currentWatermarks.compartment_sequence > acked.compartment_sequence;
+    // In a workspace, a FOREIGN member's policy transition changes only the
+    // workspace fingerprint (which hashes every member's epoch), never the
+    // root project's epoch, so fingerprint drift must reach the memory lane.
+    const workspacePolicyDrift =
+        workspace.workspace != null &&
+        (currentWatermarks.workspace_fingerprint ?? null) !== (acked.workspace_fingerprint ?? null);
     const memoryChanged =
         !omitAuthorityMemorySections &&
         (args.force ||
             currentWatermarks.memory_id > acked.memory_id ||
-            currentWatermarks.project_memory_epoch !== acked.project_memory_epoch);
+            currentWatermarks.project_memory_epoch !== acked.project_memory_epoch ||
+            workspacePolicyDrift);
     const memoryMutationsChanged =
         !omitAuthorityMemorySections &&
         (args.force || currentWatermarks.memory_mutation_id > acked.memory_mutation_id);
@@ -1444,14 +1451,14 @@ export async function buildModuleStateSyncPayload(args: {
 
     // A policy transition (approval, verification, revocation) changes rows
     // the memory-id watermark cannot see: pre-existing memories flip in or
-    // out of automatic eligibility with no new row id. The epoch watermark
-    // carries exactly that signal, so an epoch change sends the FULL
-    // policy-filtered snapshot with replace semantics instead of the id-gated
-    // increment — the receiver prunes mirrored rows absent from the snapshot.
+    // out of automatic eligibility with no new row id. The root project's
+    // epoch carries that signal directly; workspace fingerprint drift covers
+    // foreign members' transitions.
     const epochChanged =
         memoryChanged &&
         !args.force &&
-        currentWatermarks.project_memory_epoch !== acked.project_memory_epoch;
+        (currentWatermarks.project_memory_epoch !== acked.project_memory_epoch ||
+            workspacePolicyDrift);
     const allMemories =
         (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
             ? workspace.workspace
@@ -1485,11 +1492,16 @@ export async function buildModuleStateSyncPayload(args: {
     // upserts, so without a prune scope a policy-hidden row already mirrored
     // in the durable module store would survive a forced resync (which also
     // acknowledges the current epoch, blocking any later epoch-driven
-    // replacement until the next policy change).
+    // replacement until the next policy change). The scope names ONLY the
+    // session's OWN identities: the workspace snapshot carries a foreign
+    // member's rows filtered by share category, so naming that member would
+    // let this session prune the member's non-shared rows from the global
+    // native store. Foreign members prune their own rows from their own
+    // sessions' syncs.
     const memoriesReplaceProjects =
         (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
             ? workspace.workspace
-                ? workspace.expandedIdentities
+                ? workspace.ownIdentities
                 : [args.pass.projectPath]
             : undefined;
     // The module mirror is a host-computed snapshot: only policy-eligible

@@ -56,12 +56,17 @@ function toPosixPath(value: string): string {
     return value.split(path.sep).join("/");
 }
 
-function isWithin(root: string, candidate: string): boolean {
+/** True when `candidate` stays at or below `root` (no `..` escape). Shared
+ * with the enforcement-artifact canonicalizer so the security-sensitive
+ * escape predicate has exactly one implementation. */
+export function isWithin(root: string, candidate: string): boolean {
     const rel = path.relative(root, candidate);
     return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-function safeRealpath(value: string): string | null {
+/** Resolve symlinks, or null when the path does not exist. Shared with the
+ * enforcement-artifact canonicalizer. */
+export function safeRealpath(value: string): string | null {
     try {
         return realpathSync.native(value);
     } catch {

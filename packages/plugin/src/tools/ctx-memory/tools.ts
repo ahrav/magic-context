@@ -28,6 +28,7 @@ import { computeNormalizedHash } from "../../features/magic-context/memory/norma
 import {
     decideMemoryPolicy,
     filterMemoriesByPolicy,
+    hasClaimEffectivePolicy,
     readMemoryPolicyRows,
 } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
@@ -512,6 +513,24 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         const memoryBackend = deps.rustToolBackends?.memory;
                         if (!memoryBackend) {
                             return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
+                        }
+                        // The native store carries no claim-policy fields; the
+                        // TypeScript claims database stays the policy
+                        // authority. Gate id-based targets here so a row the
+                        // policy hides after mirroring cannot be read or
+                        // mutated through the module lane.
+                        if (args.ids && args.ids.length > 0 && hasClaimEffectivePolicy(deps.db)) {
+                            const policyRows = readMemoryPolicyRows(deps.db, args.ids);
+                            const denied = args.ids.find(
+                                (id) =>
+                                    !decideMemoryPolicy(policyRows.get(id), "explicit_search")
+                                        .eligible,
+                            );
+                            if (denied !== undefined) {
+                                return args.action === "merge"
+                                    ? "Error: One or more source memories were not found."
+                                    : `Error: Memory with ID ${denied} was not found.`;
+                            }
                         }
                         try {
                             const text = moduleMemoryText(

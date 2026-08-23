@@ -10,7 +10,12 @@ import {
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
-import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
+import {
+    decideMemoryPolicy,
+    filterMemoriesByPolicy,
+    hasClaimEffectivePolicy,
+    readMemoryPolicyRows,
+} from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
@@ -386,15 +391,48 @@ export function prepareCompartmentInjection(
         // hot path (every transform) for a table we fully control.
         const cachedMemory = db
             .prepare(
-                "SELECT memory_block_cache, memory_block_count FROM session_meta WHERE session_id = ?",
+                "SELECT memory_block_cache, memory_block_count, memory_block_ids FROM session_meta WHERE session_id = ?",
             )
-            .get(sessionId) as { memory_block_cache: string; memory_block_count: number } | null;
+            .get(sessionId) as {
+            memory_block_cache: string;
+            memory_block_count: number;
+            memory_block_ids: string | null;
+        } | null;
 
-        if (cachedMemory?.memory_block_cache) {
+        // A cached block replays only while every rendered id is still
+        // automatic-eligible: a policy transition (quarantine, contradiction,
+        // rejection, supersession) must not keep serving hidden content
+        // through this legacy render path until a historian pass happens to
+        // clear the cache.
+        const cachedBlockStillEligible = (): boolean => {
+            if (!hasClaimEffectivePolicy(db)) return true;
+            let cachedIds: number[] = [];
+            try {
+                const parsed = JSON.parse(cachedMemory?.memory_block_ids ?? "[]") as unknown;
+                cachedIds = Array.isArray(parsed)
+                    ? parsed.filter((id): id is number => typeof id === "number")
+                    : [];
+            } catch {
+                return false;
+            }
+            if (cachedIds.length === 0) return true;
+            const rows = readMemoryPolicyRows(db, cachedIds);
+            return cachedIds.every(
+                (id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible,
+            );
+        };
+
+        if (cachedMemory?.memory_block_cache && cachedBlockStillEligible()) {
             memoryBlock = cachedMemory.memory_block_cache;
             memoryCount = cachedMemory.memory_block_count;
         } else {
-            let memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+            // The legacy render is an automatic injection surface exactly like
+            // the m0/m1 lanes below; policy-hidden rows never reach it.
+            let memories = filterMemoriesByPolicy(
+                db,
+                getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+                "auto_inject",
+            ).memories;
             if (injectionBudgetTokens && memories.length > 0) {
                 memories = trimMemoriesToBudget(sessionId, memories, injectionBudgetTokens);
             }

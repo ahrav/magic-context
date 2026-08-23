@@ -22,6 +22,7 @@ import {
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     getMemoriesByProject,
     ModuleMemoryAuthorityError,
@@ -417,7 +418,14 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // No temp-file offload needed — the bounded blocks stay well within
         // serialization limits.
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        // The historian's reference block is an automatic model prompt:
+        // policy-hidden content must not reach it, or a hidden fact can
+        // steer newly generated summaries.
+        const memories = filterMemoriesByPolicy(
+            db,
+            getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+            "auto_inject",
+        ).memories;
         const projectMemory = renderMemoryBlock(memories) ?? "";
 
         const references = buildReferenceBlocks({

@@ -76,11 +76,13 @@ describe("createDreamTaskExecutor — curate", () => {
         db = freshDb();
         const project = "/repo/project";
         const first = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "First memory uses src/first.ts because it is load-bearing.",
         });
         const second = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "PROJECT_RULES",
             content: "Second memory is a project workflow rule.",
@@ -134,6 +136,7 @@ describe("createDreamTaskExecutor — curate", () => {
         db = freshDb();
         const project = "/repo/curate-pseudo-tool-call";
         insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "PROJECT_RULES",
             content: "Use the shared release checklist before publishing.",
@@ -185,6 +188,7 @@ describe("createDreamTaskExecutor — curate", () => {
         db = freshDb();
         const project = "/repo/language-project";
         insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "The project stores prompts in src/prompts.ts.",
@@ -235,6 +239,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         const memories = [];
         for (let i = 0; i < 51; i += 1) {
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: project,
                 category: "ARCHITECTURE",
                 content: `Mapped broad fact ${i}.`,
@@ -317,6 +322,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         const project = "/repo/verify-broad-provider-outage";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
         const memory = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "Mapped fact blocked by a provider outage.",
@@ -369,6 +375,7 @@ describe("createDreamTaskExecutor — verify-broad disposition", () => {
         const project = "/repo/verify-broad-zero";
         seedTaskScheduleState(db, project, "verify-broad", null, null, "0 3 * * 0");
         const memory = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "Mapped fact that cannot be verified yet.",
@@ -415,6 +422,7 @@ describe("createDreamTaskExecutor — parent session resolution", () => {
         const project = "/repo/project";
         for (let i = 0; i < 3; i += 1) {
             insertMemory(db, {
+                sourceType: "user",
                 projectPath: project,
                 category: "ARCHITECTURE",
                 content: `Memory ${i} backed by src/file${i}.ts.`,
@@ -533,6 +541,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         const ids: number[] = [];
         for (let i = 0; i < 12; i += 1) {
             const m = insertMemory(db, {
+                sourceType: "user",
                 projectPath: project,
                 category: "ARCHITECTURE",
                 content: `Memory ${i}: the transform lives in src/file${i}.ts.`,
@@ -607,6 +616,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         for (let index = 0; index < 201; index += 1) {
             ids.push(
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: project,
                     category: "ARCHITECTURE",
                     content: `Provider outage classification fixture ${index}.`,
@@ -673,6 +683,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         const project = "/repo/rust-classify";
         ensureContextStoreUuid(db);
         const sensitive = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "PROJECT_RULES",
             content: "Use token sk-test-secret only on my localhost machine.",
@@ -681,6 +692,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         for (let i = 0; i < 11; i += 1) {
             contextMemories.push(
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: project,
                     category: "ARCHITECTURE",
                     content: `The cache-neutral classification path is module-owned (${i}).`,
@@ -771,6 +783,7 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         ensureContextStoreUuid(db);
         for (let i = 0; i < 12; i += 1) {
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: project,
                 category: "ARCHITECTURE",
                 content: `Module classification failure fixture ${i}.`,
@@ -838,9 +851,10 @@ describe("createDreamTaskExecutor — classify-memories", () => {
 describe("createDreamTaskExecutor — compress-cues", () => {
     test("rust-authority fixture routes cues through memory.set_mural_cue and leaves no parked facade path", async () => {
         db = freshDb();
-        const project = "/repo/module-cues";
+        const project = "dir:/repo/module-cues";
         const contextStoreUuid = ensureContextStoreUuid(db);
         const memory = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "A cue candidate routed through the module facade.",
@@ -948,6 +962,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         const project = "/repo/draining-cues";
         ensureContextStoreUuid(db);
         const memory = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "A cue candidate must wait for module drain replay.",
@@ -993,8 +1008,9 @@ describe("createDreamTaskExecutor — compress-cues", () => {
 
     test("reports a structural membership failure as transient", async () => {
         db = freshDb();
-        const project = "/repo/malformed-cues";
+        const project = "dir:/repo/malformed-cues";
         insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "A cue candidate omitted by the manifest.",
@@ -1032,6 +1048,7 @@ describe("createDreamTaskExecutor — compress-cues", () => {
         db = freshDb();
         const project = "/repo/complete-cues";
         const memory = insertMemory(db, {
+            sourceType: "user",
             projectPath: project,
             category: "ARCHITECTURE",
             content: "A cue candidate completed by the manifest.",
