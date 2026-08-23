@@ -90,7 +90,8 @@ exists.
 
 Environment: dev-dsk 128×CPU, kernel 6.12.95, rustc 1.97.1, shared box
 (1-min load 39–42 at run start; treat single-digit-percent deltas as noise).
-Raw runs: `docs/perf/runs/baseline-99a12e8e/` and `docs/perf/runs/candidate-opt1/`.
+Raw runs: `docs/perf/runs/baseline-99a12e8e/` and `docs/perf/runs/candidate-opt1/`,
+kept on the measurement host (`docs/perf/runs/` is git-ignored).
 
 Candidate changes: buffered connection reads (64 KiB), uninitialized body
 read via `read_buf`+`take`, split large-frame writes (no header-prepend

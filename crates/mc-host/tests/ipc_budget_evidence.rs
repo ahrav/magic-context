@@ -361,6 +361,20 @@ fn gap_join_requires_matching_block_and_pair() {
         &[20_000],
         serde_json::json!({"p50_ns": 20_000.0}),
     );
+    // Same block and pair but a different topology class: no join. One
+    // physical pair can validate for both classes (nodes sharing an L3
+    // under sub-NUMA clustering), and the two classes' observations are
+    // not comparable.
+    let mut cross = manifest(ARM_TCP_SERIAL, 1, Some((0, 1)));
+    cross.arm.class = Some("cross-numa".to_owned());
+    let mut attempt = Attempt::begin(dir.path(), "serial-cross-b01", cross).unwrap();
+    attempt
+        .add_histogram("issue_to_terminal.hist", &small_histogram(&[20_000]))
+        .unwrap();
+    attempt.manifest_mut().histogram = Some(HistogramConfig::default());
+    attempt.manifest_mut().results = Some(serde_json::json!({"p50_ns": 20_000.0}));
+    attempt.finalize(State::Complete).unwrap();
+
     let loaded = evidence::load_attempts(dir.path()).unwrap();
     assert!(evidence::paired_gaps(&loaded).unwrap().is_empty());
 }

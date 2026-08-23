@@ -99,23 +99,31 @@ pub fn read_topology(root: &Path) -> Result<Topology, String> {
 
     let mut node_of = BTreeMap::new();
     let node_base = root.join("sys/devices/system/node");
-    let entries =
-        std::fs::read_dir(&node_base).map_err(|err| format!("{}: {err}", node_base.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|err| err.to_string())?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(id) = name
-            .strip_prefix("node")
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let cpulist = entry.path().join("cpulist");
-        if !cpulist.exists() {
-            continue;
+    // Kernels built without CONFIG_NUMA expose no node directory; every
+    // online CPU then belongs to the single logical node 0.
+    if !node_base.is_dir() {
+        for cpu in &online {
+            node_of.insert(*cpu, 0u32);
         }
-        for cpu in parse_cpu_list(&read_trimmed(&cpulist)?)? {
-            node_of.insert(cpu, id);
+    } else {
+        let entries = std::fs::read_dir(&node_base)
+            .map_err(|err| format!("{}: {err}", node_base.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name
+                .strip_prefix("node")
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let cpulist = entry.path().join("cpulist");
+            if !cpulist.exists() {
+                continue;
+            }
+            for cpu in parse_cpu_list(&read_trimmed(&cpulist)?)? {
+                node_of.insert(cpu, id);
+            }
         }
     }
 

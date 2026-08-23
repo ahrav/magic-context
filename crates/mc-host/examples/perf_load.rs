@@ -423,9 +423,16 @@ async fn run_conn(
     // would otherwise wait forever on a saturated window.
     inflight.close();
 
+    result.inflight_full = sender.await.map(|(count, _write_half)| count).unwrap_or(0);
+    // The sender has exited, so the meta channel is complete. This drain
+    // runs unconditionally and after the sender: a write-failure or
+    // missed-slot marker can be enqueued without forcing the reader
+    // through its drain paths (the reader exits normally once every
+    // successfully written request resolves), and a drain racing a live
+    // sender could miss a marker enqueued after it finished.
+    drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
     // A closed connection resolves every remaining in-flight request.
     if result.closed_early {
-        drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
         for (_, (_, issue)) in pending.drain() {
             if issue >= warmup_ns {
                 result.outcomes.record(Outcome::PeerClosed);
@@ -433,7 +440,6 @@ async fn run_conn(
         }
     }
 
-    result.inflight_full = sender.await.map(|(count, _write_half)| count).unwrap_or(0);
     result.sent = sent_count.load(Ordering::Acquire);
     result.measured_scheduled = measured_sent.load(Ordering::Acquire);
     result

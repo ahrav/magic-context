@@ -123,7 +123,7 @@ pub fn run_ping_pong(cfg: PingPongConfig) -> Result<PingPongOutput, String> {
         })
     };
 
-    let run_initiator = || -> Result<(Vec<f64>, u64, ObservedCpus), String> {
+    let run_initiator = move || -> Result<(Vec<f64>, u64, ObservedCpus), String> {
         if let Err(err) = pin_current_thread(cfg.initiator_cpu) {
             abort.store(true, Ordering::Release);
             ready.wait();
@@ -163,10 +163,30 @@ pub fn run_ping_pong(cfg: PingPongConfig) -> Result<PingPongOutput, String> {
         ))
     };
 
-    let initiator_result = run_initiator();
+    // The initiator gets its own thread so `pin_current_thread` never
+    // confines the caller: pinning the calling thread would leave it
+    // restricted to `initiator_cpu` for everything that runs after this
+    // function returns, including spawned child processes that inherit
+    // the affinity mask.
+    let initiator_result = std::thread::spawn(run_initiator)
+        .join()
+        .map_err(|_| "initiator panicked")?;
     let responder_result = responder.join().map_err(|_| "responder panicked")?;
-    let (batch_means, measured_ns, initiator_cpus) = initiator_result?;
-    let responder_cpus = responder_result?;
+    // "aborted before exchange" from one thread is the symptom of the
+    // other thread's pin failure; surface the error naming the root
+    // cause instead of the abort marker.
+    let ((batch_means, measured_ns, initiator_cpus), responder_cpus) =
+        match (initiator_result, responder_result) {
+            (Ok(initiator), Ok(responder_cpus)) => (initiator, responder_cpus),
+            (Err(err), Ok(_)) | (Ok(_), Err(err)) => return Err(err),
+            (Err(initiator_err), Err(responder_err)) => {
+                return Err(if initiator_err.contains("aborted") {
+                    responder_err
+                } else {
+                    initiator_err
+                });
+            }
+        };
 
     Ok(PingPongOutput {
         batch_mean_rtt_ns: batch_means,

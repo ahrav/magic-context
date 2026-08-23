@@ -387,8 +387,11 @@ pub struct GapRow {
 }
 
 /// Joins complete atomic-floor and serial-TCP attempts by (run block,
-/// ordered pair) within one compatible build/host set. Blocks missing
-/// either side produce no row.
+/// topology class, ordered pair) within one compatible build/host set.
+/// Blocks missing either side produce no row. The class belongs in the
+/// key because one physical pair can be valid for both classes (nodes
+/// sharing an L3 under sub-NUMA clustering), and cross-class joins would
+/// pair non-comparable observations or silently overwrite one another.
 pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     let complete: Vec<&LoadedAttempt> = attempts
         .iter()
@@ -397,8 +400,9 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     let Some(reference) = complete.first() else {
         return Ok(Vec::new());
     };
-    let mut atomic: BTreeMap<(u32, (u32, u32)), f64> = BTreeMap::new();
-    let mut tcp: BTreeMap<(u32, (u32, u32)), f64> = BTreeMap::new();
+    type GapKey = (u32, Option<String>, (u32, u32));
+    let mut atomic: BTreeMap<GapKey, f64> = BTreeMap::new();
+    let mut tcp: BTreeMap<GapKey, f64> = BTreeMap::new();
     for attempt in &complete {
         if !compatible(&reference.manifest, &attempt.manifest) {
             return Err(format!(
@@ -408,7 +412,7 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
         }
         let m = &attempt.manifest;
         let Some(pair) = m.arm.pair else { continue };
-        let key = (m.run_block, pair);
+        let key = (m.run_block, m.arm.class.clone(), pair);
         let results = m.results.as_ref();
         match m.arm.name.as_str() {
             ARM_ATOMIC => {
@@ -433,7 +437,7 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
         if let Some(tcp_p50) = tcp.get(key) {
             rows.push(GapRow {
                 run_block: key.0,
-                pair: key.1,
+                pair: key.2,
                 atomic_rtt_ns: *atomic_rtt,
                 tcp_p50_ns: *tcp_p50,
                 gap_ns: tcp_p50 - atomic_rtt,

@@ -7,11 +7,13 @@ non-comparable (see its erratum). No value here is a pass/fail
 threshold: correctness, configuration validity, evidence integrity, and
 the sample floor are the only gates.
 
-Retained evidence: [`runs/ipc-budget-20260823T202243Z-ed82528a/`](./runs/ipc-budget-20260823T202243Z-ed82528a/)
+Retained evidence: `runs/ipc-budget-20260823T202243Z-ed82528a/`
 (60 complete manifests, 20 structured cross-NUMA skips, checksummed
-HdrHistogram sidecars, byte-stable `summary.json`). Re-running
-`scripts/perf-mc-host.sh <run-dir> budget-summarize` on the committed
-sidecars reproduces every table below without rerunning the benchmark.
+HdrHistogram sidecars, byte-stable `summary.json`), kept on the
+measurement host. `docs/perf/runs/` is git-ignored, so the run
+directory is not in repository history; on a checkout that holds a copy
+of it, `scripts/perf-mc-host.sh <run-dir> budget-summarize` reproduces
+every table below from the sidecars without rerunning the benchmark.
 
 ## Measurement contract
 
@@ -129,7 +131,8 @@ Timestamp-minimal closed loop, medians across 10 blocks:
 # frozen final contract (this document's numbers)
 ./scripts/perf-mc-host.sh docs/perf/runs/ipc-budget-<UTC>-<commit> budget-final
 
-# regenerate this document's tables from retained sidecars
+# regenerate this document's tables from retained sidecars (requires a
+# local copy of the git-ignored run directory)
 ./scripts/perf-mc-host.sh docs/perf/runs/ipc-budget-20260823T202243Z-ed82528a budget-summarize
 ```
 

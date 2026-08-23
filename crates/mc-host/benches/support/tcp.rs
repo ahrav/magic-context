@@ -404,13 +404,19 @@ impl OpenLoopState {
         }
         match classify_terminal(frame.ty, &self.body) {
             Outcome::Success => {
-                let _ = self.lag_hist.record(issue_ns.saturating_sub(scheduled_ns));
-                let _ = self.issue_hist.record(now_ns.saturating_sub(issue_ns));
+                // sched-to-completion spans both the lag and the
+                // issue-to-completion intervals, so it is the largest of
+                // the three values and its bounds check gates all three:
+                // on overflow none of the distributions record and the
+                // record is terminal as HistogramOverflow, keeping every
+                // histogram's sample count equal to `success`.
                 if self
                     .sched_hist
                     .record(now_ns.saturating_sub(scheduled_ns))
                     .is_ok()
                 {
+                    let _ = self.lag_hist.record(issue_ns.saturating_sub(scheduled_ns));
+                    let _ = self.issue_hist.record(now_ns.saturating_sub(issue_ns));
                     self.outcomes.record(Outcome::Success);
                 } else {
                     self.outcomes.record(Outcome::HistogramOverflow);
