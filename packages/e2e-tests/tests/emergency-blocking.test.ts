@@ -162,10 +162,36 @@ describe("emergency >=95%", () => {
             // mock provider, which on GitHub-hosted runners is 3-5x slower
             // than local hardware; the test's own budget below stays the
             // real bound.
-            await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
-                timeoutMs: 90_000,
-                label: "emergency historian compartment",
-            });
+            try {
+                await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
+                    timeoutMs: 90_000,
+                    label: "emergency historian compartment",
+                });
+            } catch (error) {
+                // Diagnostics before rethrow: pinpoint which stage of the
+                // emergency pipeline stalled (scheduling, the historian
+                // request, or compartment publish).
+                const historianRequests = h.mock
+                    .requests()
+                    .filter((r) => isHistorianRequest(r.body)).length;
+                const inProgress = h
+                    .contextDb()
+                    .prepare(
+                        "SELECT COUNT(*) AS c FROM compartment_in_progress WHERE session_id = ?",
+                    )
+                    .get(sessionId) as { c: number } | null;
+                const pct = h
+                    .contextDb()
+                    .prepare(
+                        "SELECT last_context_percentage FROM session_meta WHERE session_id = ?",
+                    )
+                    .get(sessionId) as { last_context_percentage: number } | null;
+                console.log(
+                    `[TEST] emergency timeout: historianRequests=${historianRequests} totalRequests=${h.mock.requests().length} compartments=${h.countCompartments(sessionId)} inProgress=${inProgress?.c} lastPct=${pct?.last_context_percentage}`,
+                );
+                console.log(`[TEST] opencode stderr tail:\n${h.opencode.stderr().slice(-3000)}`);
+                throw error;
+            }
             expect(h.countCompartments(sessionId)).toBeGreaterThanOrEqual(1);
 
             // The shared pressure observation above also proves the plugin saw
