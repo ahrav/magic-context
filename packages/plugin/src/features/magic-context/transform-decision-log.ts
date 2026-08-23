@@ -429,9 +429,43 @@ function writeTransformDecisionRowOnDatabase(
     );
     // Enforce the per-(session,harness) retention cap so a long session's
     // cache-affecting passes can't grow this telemetry table unbounded (the
-    // dashboard loads all matching rows for cause attribution). Keep the
-    // newest TRANSFORM_DECISIONS_RETENTION rows by (ts_ms, rowid). Best-effort
-    // on the same non-blocking handle; a failure just defers the prune.
+    // dashboard loads all matching rows for cause attribution). A write adds at
+    // most one row, so the steady state overshoots by at most one: evicting the
+    // oldest ts_ms directly (ties included) keeps the cap without sorting the
+    // whole retained set on every write. A larger overshoot only exists on
+    // databases pruned by older builds; those take the one-time sorted prune.
+    const cap = retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION;
+    const probe = db
+        .prepare(
+            `SELECT COUNT(*) AS c, MIN(ts_ms) AS m FROM transform_decisions
+             WHERE session_id = ? AND harness = ?`,
+        )
+        .get(row.sessionId, row.harness) as { c: number; m: number | null } | undefined;
+    let over = (probe?.c ?? 0) - cap;
+    if (over <= 0) return;
+    if (over <= 8) {
+        let oldestTs = probe?.m ?? null;
+        while (over > 0 && oldestTs !== null) {
+            const res = db
+                .prepare(
+                    `DELETE FROM transform_decisions
+                     WHERE session_id = ? AND harness = ? AND ts_ms = ?`,
+                )
+                .run(row.sessionId, row.harness, oldestTs);
+            const changes = Number((res as { changes?: number | bigint }).changes ?? 0);
+            if (changes <= 0) break;
+            over -= changes;
+            if (over <= 0) break;
+            const next = db
+                .prepare(
+                    `SELECT MIN(ts_ms) AS m FROM transform_decisions
+                     WHERE session_id = ? AND harness = ?`,
+                )
+                .get(row.sessionId, row.harness) as { m: number | null } | undefined;
+            oldestTs = next?.m ?? null;
+        }
+        return;
+    }
     db.prepare(
         `DELETE FROM transform_decisions
              WHERE session_id = ? AND harness = ?
@@ -441,13 +475,7 @@ function writeTransformDecisionRowOnDatabase(
                  ORDER BY ts_ms DESC, rowid DESC
                  LIMIT ?
                )`,
-    ).run(
-        row.sessionId,
-        row.harness,
-        row.sessionId,
-        row.harness,
-        retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION,
-    );
+    ).run(row.sessionId, row.harness, row.sessionId, row.harness, cap);
 }
 
 export const __test = {
