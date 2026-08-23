@@ -7,11 +7,12 @@ use std::collections::HashSet;
 use std::process::Command;
 use std::time::Duration;
 
+use mc_host::{ResourceDeclaration, RouteClass, StaticComposite};
 use support::raw_client::{
     RawFrame, FLAGS_INTERACTIVE, FLAGS_PURE_HEADER, TY_CANCEL, TY_ERROR, TY_GOODBYE, TY_REQUEST,
     TY_RESPONSE, TY_STREAM_DATA, TY_STREAM_END,
 };
-use support::{mode_body, TestHost, LINKED_MODULE_ID};
+use support::{mode_body, CompositeTestHost, TestHost, LINKED_MODULE_ID};
 
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
@@ -954,4 +955,201 @@ async fn concurrent_requests_never_interleave_frame_bytes() {
     }
 
     host.shutdown_gracefully().await;
+}
+
+/// The direct profile's Broca declaration (R13): 96 reserved pending slots
+/// and 96 reserved handler tasks on the reserved class.
+fn broca_reservation() -> ResourceDeclaration {
+    ResourceDeclaration {
+        reserved_handler_tasks: 96,
+        reserved_pending_requests: 96,
+        retained_resident_bytes: 0,
+        route_class: RouteClass::Reserved,
+    }
+}
+
+/// Saturating every reserved permit through blocked settlement rejects the
+/// next reserved-class request while a general request still dispatches and
+/// settles (plan KTD2, AE9).
+#[tokio::test]
+async fn saturated_broca_reserve_cannot_consume_a_general_slot() {
+    let (mc, synapse, broca) = support::stub_trio();
+    let broca = broca.with_resources(broca_reservation());
+    let composite = StaticComposite::new(mc.clone(), synapse, broca.clone()).expect("distinct ids");
+    let host = CompositeTestHost::start(composite, |config| {
+        // Exactly one general slot in each pool beside the 96-slot reserve.
+        config.limits.max_pending_requests = 97;
+        config.limits.max_handler_tasks = 97;
+    })
+    .await;
+    let mut client = host.client().await;
+    let (br_channel, br_epoch) = client
+        .route_open_target("management_surface", "broca", ROOT, "opencode", "s1")
+        .await
+        .expect("broca binds");
+    let (mc_channel, mc_epoch) = client
+        .route_open_target("tool_provider", "magic-context", ROOT, "opencode", "s1")
+        .await
+        .expect("magic-context binds");
+
+    // 64 subscription-shaped plus 32 command-shaped unsettled requests: all
+    // 96 reserved pending and task permits held by hanging handler tasks.
+    for _ in 0..96 {
+        let corr = client.next_corr();
+        client
+            .send_frame(
+                TY_REQUEST,
+                FLAGS_INTERACTIVE,
+                br_channel,
+                br_epoch,
+                corr,
+                &mode_body(serde_json::json!({"mode": "hang"})),
+            )
+            .await
+            .expect("send reserved hang");
+    }
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while broca.dispatch_count() < 96 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reserved handlers never occupied their permits"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Request 97 on the reserved class fails fast without dispatch.
+    let rejected = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            br_channel,
+            br_epoch,
+            rejected,
+            &mode_body(serde_json::json!({"mode": "echo"})),
+        )
+        .await
+        .expect("send overflow");
+    let (skipped, frame) = client
+        .frames_until_corr(rejected, BUDGET)
+        .await
+        .expect("busy terminal");
+    assert!(skipped.is_empty());
+    assert_eq!(frame.error_code(), "server_busy");
+    assert_eq!(
+        broca.dispatch_count(),
+        96,
+        "the rejected reserved request must never dispatch"
+    );
+
+    // The general class is untouched: a Magic Context request settles.
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            mc_channel,
+            mc_epoch,
+            corr,
+            &mode_body(serde_json::json!({"mode": "echo"})),
+        )
+        .await
+        .expect("send general request");
+    let (skipped, frame) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("general terminal");
+    assert!(skipped.is_empty());
+    assert_eq!(frame.ty, TY_RESPONSE);
+    assert_eq!(frame.json()["served_by"], "magic-context");
+
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// The converse isolation: exhausting the general class rejects further
+/// general requests while a reserved-class request still dispatches.
+#[tokio::test]
+async fn saturated_general_capacity_cannot_consume_the_broca_reserve() {
+    let (mc, synapse, broca) = support::stub_trio();
+    let broca = broca.with_resources(broca_reservation());
+    let composite = StaticComposite::new(mc.clone(), synapse, broca.clone()).expect("distinct ids");
+    let host = CompositeTestHost::start(composite, |config| {
+        config.limits.max_pending_requests = 97;
+        config.limits.max_handler_tasks = 97;
+    })
+    .await;
+    let mut client = host.client().await;
+    let (mc_channel, mc_epoch) = client
+        .route_open_target("tool_provider", "magic-context", ROOT, "opencode", "s1")
+        .await
+        .expect("magic-context binds");
+    let (br_channel, br_epoch) = client
+        .route_open_target("management_surface", "broca", ROOT, "opencode", "s1")
+        .await
+        .expect("broca binds");
+
+    // Occupy the single general slot with a request that never settles.
+    let holding = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            mc_channel,
+            mc_epoch,
+            holding,
+            &mode_body(serde_json::json!({"mode": "hang"})),
+        )
+        .await
+        .expect("send general hang");
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while mc.dispatch_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the general handler never occupied its permit"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let rejected = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            mc_channel,
+            mc_epoch,
+            rejected,
+            &mode_body(serde_json::json!({"mode": "echo"})),
+        )
+        .await
+        .expect("send general overflow");
+    let (skipped, frame) = client
+        .frames_until_corr(rejected, BUDGET)
+        .await
+        .expect("busy terminal");
+    assert!(skipped.is_empty());
+    assert_eq!(frame.error_code(), "server_busy");
+    assert_eq!(mc.dispatch_count(), 1);
+
+    // The reserved class stays available to Broca.
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            br_channel,
+            br_epoch,
+            corr,
+            &mode_body(serde_json::json!({"mode": "echo"})),
+        )
+        .await
+        .expect("send reserved request");
+    let (skipped, frame) = client
+        .frames_until_corr(corr, BUDGET)
+        .await
+        .expect("reserved terminal");
+    assert!(skipped.is_empty());
+    assert_eq!(frame.ty, TY_RESPONSE);
+    assert_eq!(frame.json()["served_by"], "broca");
+
+    host.shutdown().await.expect("graceful shutdown");
 }

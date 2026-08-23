@@ -85,16 +85,19 @@ pub struct HostLimits {
     /// budgets. The cap includes inbound bodies, handler-owned request
     /// bodies, parser scratch, request-derived input ownership (Synapse
     /// query text, queued batch items, retained job metadata), encoded
-    /// frames, and writer queues. An accounting cap over named logical
-    /// payloads, not an exact process-RSS claim.
+    /// frames, writer queues, and handler-declared retained bytes (plan
+    /// KTD2). An accounting cap over named logical payloads, not an exact
+    /// process-RSS claim.
     ///
-    /// Split into three independent pools: [`EGRESS_RESERVED_BYTES`] for
+    /// Split into independent pools: [`EGRESS_RESERVED_BYTES`] for
     /// encoded output, [`SCRATCH_RESERVED_BYTES`] for request scratch and
     /// request-derived ownership, and the remainder (less the resident
-    /// catalog) for inbound frame admission. Raising this raises only the
-    /// admission pool, so a deployment that needs larger request scratch
-    /// than the reserved slice must be served by a component whose own
-    /// limits fit it. Must be at least [`MIN_RESIDENT_BYTES`].
+    /// catalog and every declared retained-byte reservation) for inbound
+    /// frame admission. Raising this raises only the admission pool, so a
+    /// deployment that needs larger request scratch than the reserved slice
+    /// must be served by a component whose own limits fit it. Must be at
+    /// least [`MIN_RESIDENT_BYTES`]; startup additionally requires the
+    /// catalog and retained reservations to leave one maximum ingress body.
     pub max_resident_bytes: u64,
     /// Encoded frames queued per connection writer.
     pub writer_queue_frames: usize,
@@ -108,7 +111,11 @@ impl Default for HostLimits {
             max_routes: 1024,
             max_pending_requests: 1024,
             max_handler_tasks: 256,
-            max_resident_bytes: 256 * 1024 * 1024,
+            // 256 MiB served the two-component profile; the third (Broca)
+            // component declares 64 MiB of retained replay that the runtime
+            // subtracts from ingress, so the default grows by exactly that
+            // reservation to preserve the former ingress headroom.
+            max_resident_bytes: 320 * 1024 * 1024,
             writer_queue_frames: 64,
         }
     }
@@ -460,8 +467,9 @@ mod tests {
             admission_at_default > frame,
             "the default must leave admission headroom above the floor"
         );
-        // The catalog is subtracted from admission only (runtime.rs), so it
-        // can never eat the scratch or egress guarantees.
+        // The catalog and declared retained bytes are subtracted from
+        // admission only (runtime.rs), so they can never eat the scratch or
+        // egress guarantees.
         assert!(
             admission_at_default - frame > 0,
             "catalog headroom comes out of admission, not the reserved slices"

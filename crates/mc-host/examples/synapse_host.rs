@@ -15,7 +15,7 @@ use mc_host::synapse::{SynapseComponent, SynapseConfig, SynapseLimits};
 use mc_host::{
     BindOutcome, CancellationToken, CompositeComponent, HealthReport, HostConfig, HostInit,
     InitError, ManifestSnapshot, PrimaryComponent, RequestCtx, RequestOutcome, RouteHandle,
-    RouteIdentity, StaticComposite,
+    RouteIdentity, SecondaryComponent, ShutdownError, StaticComposite,
 };
 
 struct EchoPrimary;
@@ -62,11 +62,56 @@ impl CompositeComponent for EchoPrimary {
         HealthReport::ok()
     }
 
-    async fn shutdown(&self) {}
+    async fn shutdown(&self) -> Result<(), ShutdownError> {
+        Ok(())
+    }
 }
 
 impl PrimaryComponent for EchoPrimary {
     async fn initialize(&self, _init: HostInit) -> Result<(), InitError> {
+        Ok(())
+    }
+}
+
+struct PlaceholderBroca;
+
+impl CompositeComponent for PlaceholderBroca {
+    fn manifest(&self) -> ManifestSnapshot {
+        ManifestSnapshot {
+            module_id: "broca".to_owned(),
+            module_version: env!("CARGO_PKG_VERSION").to_owned(),
+            provides: vec![serde_json::json!({"role": "management_surface"})],
+            control_ops: Vec::new(),
+        }
+    }
+
+    async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
+        BindOutcome::Reject {
+            code: "artifact_invalid".to_owned(),
+            message: "broca is unavailable in this smoke host".to_owned(),
+        }
+    }
+
+    async fn handle(&self, _ctx: RequestCtx) -> RequestOutcome {
+        RequestOutcome::Error {
+            code: "internal_error".to_owned(),
+            message: "unreachable: broca binds are rejected".to_owned(),
+        }
+    }
+
+    async fn route_gone(&self, _route: RouteHandle) {}
+
+    async fn health(&self) -> HealthReport {
+        HealthReport::ok()
+    }
+
+    async fn shutdown(&self) -> Result<(), ShutdownError> {
+        Ok(())
+    }
+}
+
+impl SecondaryComponent for PlaceholderBroca {
+    async fn initialize(&self) -> Result<(), InitError> {
         Ok(())
     }
 }
@@ -87,8 +132,8 @@ async fn main() {
         limits: SynapseLimits::default(),
     });
     let synapse = SynapseComponent::new(synapse_config);
-    let composite =
-        StaticComposite::new(EchoPrimary, synapse).expect("composite module IDs are distinct");
+    let composite = StaticComposite::new(EchoPrimary, synapse, PlaceholderBroca)
+        .expect("composite module IDs are distinct");
 
     let config = HostConfig {
         data_dir: Some(data_dir.clone()),

@@ -23868,19 +23868,20 @@ mod tests {
                 ),
             },
         ];
-        let mut snapshots = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex");
-        let generation = snapshots.begin("ses");
-        snapshots.finish_ready(
-            "ses",
-            generation,
-            Arc::new(transform_request(raw_messages, 45_000, 50_000)),
-            0,
-            0,
-        );
-        drop(snapshots);
+        {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let generation = snapshots.begin("ses");
+            snapshots.finish_ready(
+                "ses",
+                generation,
+                Arc::new(transform_request(raw_messages, 45_000, 50_000)),
+                0,
+                0,
+            );
+        }
 
         let verbose = tool_text(
             call_facade(
@@ -27384,17 +27385,6 @@ mod tests {
         assert_eq!(second["action"], "HARD");
         assert!(m0_text(&second).contains("autonomous summary"));
     }
-
-    /// Imported compartments whose anchor mids never appear in the live array
-    /// must refuse at the bootstrap fold: the minted boundary has to name a real
-    /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
-    /// depend on (a synthetic-anchor seed can never compose, regardless of ranges).
-
-    /// Desk rehearsal of the drive's final seed shape: 20 live messages with a
-    /// role=system message mid-span at ordinal 1, four imported compartments
-    /// partitioning 0..=16 on real live block ids, live tail 17..=19. Must
-    /// bootstrap-HARD-fold with the last covered block as the minted boundary —
-    /// and the mid-span system ordinal must be absorbed, not rejected.
 
     /// Desk rehearsal of the round-3 drive seed: 18 live messages (system at
     /// ordinal 1 mid-span), four imported compartments partitioning 0..=14 on

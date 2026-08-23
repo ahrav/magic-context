@@ -714,7 +714,7 @@ pub async fn dispatch_request<H: McHostHandler>(
     // `register_dispatch` below is the authoritative recheck. The tracker
     // wraps the dispatch future so route close can wait for it to STOP even
     // if the waiting future is later dropped.
-    let Some(route_tracker) = shared.registry.route_tracker(route, gen.id) else {
+    let Some((route_tracker, class)) = shared.registry.route_tracker(route, gen.id) else {
         drop(frame);
         emit_rejection(
             shared,
@@ -726,11 +726,18 @@ pub async fn dispatch_request<H: McHostHandler>(
         .await;
         return;
     };
+    let (pending_pool, task_pool) = match class {
+        crate::handler::RouteClass::General => (&shared.pending_permits, &shared.task_permits),
+        crate::handler::RouteClass::Reserved => (
+            &shared.reserved_pending_permits,
+            &shared.reserved_task_permits,
+        ),
+    };
 
     // Admission is synchronous with the read loop: acquiring permits inside
     // the spawned task would let a client pipeline unbounded dispatch tasks
     // ahead of the capacity gate.
-    let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
+    let Ok(pending_permit) = pending_pool.clone().try_acquire_owned() else {
         drop(frame);
         emit_rejection(
             shared,
@@ -742,7 +749,7 @@ pub async fn dispatch_request<H: McHostHandler>(
         .await;
         return;
     };
-    let Ok(task_permit) = shared.task_permits.clone().try_acquire_owned() else {
+    let Ok(task_permit) = task_pool.clone().try_acquire_owned() else {
         drop(frame);
         emit_rejection(
             shared,
@@ -960,7 +967,11 @@ pub async fn open_route<H: McHostHandler>(
         .await;
         return;
     }
-    let Some(handle) = shared.registry.reserve(&gen) else {
+    let class = shared
+        .targets
+        .class_of(&target.module_id)
+        .expect("validated route.open target is indexed");
+    let Some(handle) = shared.registry.reserve(&gen, class) else {
         emit_error_terminal(
             &shared.egress_budget,
             &gen,

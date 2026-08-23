@@ -17,12 +17,14 @@ mod routing;
 mod runtime;
 mod wire;
 
-pub use composite::{CompositeComponent, PrimaryComponent, SecondaryComponent, StaticComposite};
+pub use composite::{
+    CompositeComponent, PrimaryComponent, SecondaryComponent, ShutdownError, StaticComposite,
+};
 pub use config::{ConfigError, HostConfig, HostInit, HostLimits, HostTiming, LivenessPolicy};
 pub use handler::{
     BindOutcome, HealthReport, HealthStatus, InitError, ManifestSnapshot, McHostHandler,
-    OutputBuffer, RequestCtx, RequestOutcome, RouteHandle, RouteIdentity, RouteTarget,
-    StreamClosed, TargetKind,
+    OutputBuffer, RequestCtx, RequestOutcome, ResourceDeclaration, RouteClass, RouteHandle,
+    RouteIdentity, RouteTarget, StreamClosed, TargetKind,
 };
 pub use instance::{runtime_dir_path, InstanceError, CONNECTION_FILE_NAME};
 pub use lifecycle::{
