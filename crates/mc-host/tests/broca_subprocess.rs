@@ -55,7 +55,9 @@ fn main() {
         fixture::run(&mode);
         return;
     }
-    let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let filter = args.iter().find(|arg| !arg.starts_with('-')).cloned();
+    let exact = args.iter().any(|arg| arg == "--exact");
     let tests: &[(&str, fn())] = &[
         (
             "opencode_argv_env_stdin_contract",
@@ -126,11 +128,23 @@ fn main() {
         ),
         ("merge_cleanup_contract", merge_cleanup_contract),
     ];
+    // cargo-nextest requires each `--list --format terse` output line to end in `: test`.
+    if args.iter().any(|arg| arg == "--list") {
+        for (name, _) in tests {
+            println!("{name}: test");
+        }
+        return;
+    }
     let mut failed = Vec::new();
     let mut ran = 0usize;
     for (name, test) in tests {
         if let Some(filter) = &filter {
-            if !name.contains(filter.as_str()) {
+            let matched = if exact {
+                name == filter
+            } else {
+                name.contains(filter.as_str())
+            };
+            if !matched {
                 continue;
             }
         }
