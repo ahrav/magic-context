@@ -1284,6 +1284,46 @@ describe("deadline-independent setup coalescing", () => {
         expect(conn.frames.filter(isRouteOpen).length).toBe(1);
         expect(conn.frames.filter(isRoutedFrame)).toEqual([]);
     });
+
+    test("a connection-file expiry during the owner's snapshot replaces the route flight", async () => {
+        let nowMs = 0;
+        let expireDuringSnapshot = false;
+        const { client, peer } = await retiredHarness({
+            clock: () => nowMs,
+            connectionFileAfterOpen: () => {
+                if (!expireDuringSnapshot) return;
+                expireDuringSnapshot = false;
+                // Expire the short owner inside the snapshot: after the
+                // descriptor opens, before the next deadline check.
+                nowMs += 300;
+            },
+        });
+        expireDuringSnapshot = true;
+        const ownerErr = rejection(
+            client.call("magic-context", "own", undefined, { timeoutMs: 250 }),
+        );
+        const joiner = client.call("magic-context", "join");
+
+        // The owner's budget is the failure authority: not_sent, never
+        // terminal, with the snapshot expiry as the cause.
+        const failure = expectCallError(await ownerErr, "not_sent", "deadline_expired");
+        expect((failure.cause as Error).name).toBe("ConnectionFileError");
+
+        // The surviving joiner coalesces one replacement dial and route.
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        const cursor = frameCursor(conn2);
+        const open = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn2, open.corr, 7, 77);
+        const body = await cursor.next(isRoutedRequest(7));
+        expect(bodyJson(body)).toEqual({ method: "join" });
+        await sendResponse(conn2, body.corr, { ok: true }, 7, 77);
+        expect(await joiner).toEqual({ ok: true });
+        // The owner never dialed: the only connections are the retired
+        // original and the joiner's single replacement.
+        expect(peer.connections.length).toBe(2);
+        expect(conn2.frames.filter(isRouteOpen).length).toBe(1);
+    });
 });
 
 describe("facade helpers", () => {

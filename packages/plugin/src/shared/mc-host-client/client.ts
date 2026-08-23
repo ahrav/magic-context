@@ -105,6 +105,11 @@ export interface SubcClientOptions extends ConnectOptions {
     /** Opt-in for the trusted-symlink connection-file form (wire doc 4.2). */
     trustedSymlink?: boolean;
     /**
+     * Test seam forwarded to the connection-file read's `afterOpen` hook;
+     * lets tests race a snapshot against deadlines deterministically.
+     */
+    connectionFileAfterOpen?: () => void | Promise<void>;
+    /**
      * Read-only diagnostics observer (KTD12). Events are frozen, size- and
      * rate-bounded, and redacted; observer exceptions are swallowed and
      * excess events are dropped rather than blocking protocol work.
@@ -304,6 +309,7 @@ export class SubcClient {
     private readonly clock: MonotonicClock | undefined;
     private readonly sleep: (ms: number) => Promise<void>;
     private readonly trustedSymlink: boolean;
+    private readonly connectionFileAfterOpen: (() => void | Promise<void>) | undefined;
     private readonly generationOptions: SubcClientOptions["generationOptions"];
     private readonly diagnostics: SubcDiagnosticsObserver | undefined;
     private readonly maxDiagnosticEventsPerSecond: number;
@@ -332,6 +338,7 @@ export class SubcClient {
         this.sleep =
             options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
         this.trustedSymlink = options.trustedSymlink ?? false;
+        this.connectionFileAfterOpen = options.connectionFileAfterOpen;
         this.generationOptions = options.generationOptions;
         this.diagnostics = options.diagnostics;
         this.maxDiagnosticEventsPerSecond =
@@ -557,6 +564,7 @@ export class SubcClient {
             snapshot = await readConnectionFile(this.connectionFile, {
                 deadline: stage,
                 trustedSymlink: this.trustedSymlink,
+                afterOpen: this.connectionFileAfterOpen,
             });
         } catch (error) {
             // KTD3: the connection-file stage budget is the failure authority.
@@ -932,6 +940,19 @@ export class SubcClient {
                 active = await this.ensureConnection(deadline);
             } catch (error) {
                 if (error instanceof SubcCallError) throw error;
+                // KTD3: a connection-file snapshot that outlives the owner's
+                // route-open budget is owner-budget exhaustion, not a file
+                // fault; survivors may coalesce one replacement. Every other
+                // connection-file failure stays terminal.
+                if (error instanceof ConnectionFileError && error.code === "deadline_expired") {
+                    flight.replaceable = true;
+                    throw new SubcCallError(
+                        "not_sent",
+                        `route.open could not run because connect failed${causeMessage(error)}`,
+                        errorCode(error),
+                        error,
+                    );
+                }
                 const transient = isConsumerReconnectTransient(error);
                 if (transient && !this.closeStarted) {
                     if (await backoff()) continue;
