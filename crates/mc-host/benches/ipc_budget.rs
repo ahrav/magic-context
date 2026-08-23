@@ -610,6 +610,16 @@ fn collect_tcp_open(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
     if let Err(err) = conservation_check(&result.outcomes, result.scheduled_slots) {
         return arm_err(attempt, err);
     }
+    if result.outcomes.success == 0 {
+        return arm_err(
+            attempt,
+            format!(
+                "offered-rate point {rate}/s produced no successful measured observation \
+                 (outcomes: {:?}); the point is invalid for this host",
+                result.outcomes
+            ),
+        );
+    }
     for (file, hist) in [
         ("sched_to_completion.hist", &result.sched_to_completion),
         ("issue_to_completion.hist", &result.issue_to_completion),

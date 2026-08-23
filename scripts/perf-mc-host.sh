@@ -122,7 +122,7 @@ case "${2:-}" in
 budget-smoke | budget-pilot | budget-final)
   BUDGET_OUT="${1:?outdir}"
   BUDGET_PAIR="${BUDGET_PAIR:-}"
-  BUDGET_RATES="${BUDGET_RATES:-20000 60000 120000}"
+  BUDGET_RATES="${BUDGET_RATES:-20000 50000 80000}"
   case "$2" in
   budget-smoke)
     BUDGET_RATES="${BUDGET_SMOKE_RATES:-20000}"
