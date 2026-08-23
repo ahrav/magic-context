@@ -27,7 +27,10 @@ import {
     readPolicySupport,
     refreshEffectivePolicyInCurrentTransaction,
 } from "./memory/storage-claim-policy.ts";
-import { bumpEpochForClaimProjectInCurrentTransaction } from "./memory/storage-memory-claims.ts";
+import {
+    bumpEpochForClaimProjectInCurrentTransaction,
+    refreshRevisionMaturityInCurrentTransaction,
+} from "./memory/storage-memory-claims.ts";
 import type { SourceTrustClass } from "./storage-claim-applicability-schema.ts";
 import {
     CLAIM_POLICY_SEED_META_KEYS,
@@ -386,6 +389,43 @@ function seedRevisionInCurrentTransaction(
     });
     const decision = refreshEffectivePolicyInCurrentTransaction(db, row.revisionId, { nowMs });
     return { maturity, autoEligible: decision.surfaces.auto_inject.eligible };
+}
+
+/**
+ * Refresh projections a policy-unaware writer left behind. A held-open v85
+ * process can append a positive `verified` event without running the ladder
+ * reducer; the read path deliberately lets only NEGATIVE authoritative facts
+ * override the projection (a positive override would need a second evaluator
+ * — the KTD10 trust bypass), so the newly verified revision stays
+ * automatic-hidden until something refreshes it. One bounded startup pass
+ * re-runs the reducer for current revisions whose latest verification
+ * outcome is `verified` but whose projection still reads
+ * automatic-ineligible; the refresh is idempotent and a row ineligible for
+ * other reasons keeps its value.
+ */
+export function reconcileCompatibilityVerificationsAtStartup(db: Database): number {
+    if (!hasClaimPolicySchema(db)) return 0;
+    const divergent = db
+        .prepare(
+            `SELECT policy.revision_id AS revisionId
+             FROM claim_effective_policy policy
+             JOIN claims ON claims.current_revision_id = policy.revision_id
+             WHERE policy.auto_eligible = 0
+               AND (
+                   SELECT outcome FROM verification_events
+                   WHERE revision_id = policy.revision_id
+                     AND outcome IN ('verified', 'stale', 'flagged')
+                   ORDER BY id DESC LIMIT 1
+               ) = 'verified'`,
+        )
+        .all() as Array<{ revisionId: number }>;
+    if (divergent.length === 0) return 0;
+    db.transaction(() => {
+        for (const row of divergent) {
+            refreshRevisionMaturityInCurrentTransaction(db, row.revisionId);
+        }
+    }).immediate();
+    return divergent.length;
 }
 
 /** Publish completion only after count and anti-join reconciliation (KTD11).

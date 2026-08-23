@@ -1420,9 +1420,15 @@ const MEMORY_POLICY_ACTOR = "reducer:mc-memory-v1";
  * Recompute the automated maturity ladder and effective projection for one
  * revision from current authoritative rows (R6-R8, R15). No-op until the
  * revision has a frozen policy subject: a missing subject stays readable as
- * conservative unknown (R26).
+ * conservative unknown (R26). Exported for the startup reconciler: a
+ * held-open v85 writer can append verification facts without running this
+ * reducer, and the read path only lets NEGATIVE authoritative facts override
+ * the projection.
  */
-function refreshRevisionMaturityInCurrentTransaction(db: Database, revisionId: number): void {
+export function refreshRevisionMaturityInCurrentTransaction(
+    db: Database,
+    revisionId: number,
+): void {
     if (!hasClaimPolicySchema(db)) return;
     const subject = readPolicySubject(db, revisionId);
     if (!subject) return;

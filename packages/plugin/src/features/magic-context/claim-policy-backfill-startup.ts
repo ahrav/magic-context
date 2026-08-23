@@ -3,6 +3,7 @@ import type { Database } from "../../shared/sqlite";
 import {
     type ClaimPolicySeedRunSummary,
     getClaimPolicySeedStatus,
+    reconcileCompatibilityVerificationsAtStartup,
     runClaimPolicySeed,
 } from "./claim-policy-backfill";
 
@@ -41,6 +42,15 @@ export async function runClaimPolicySeedStartup(
     } else if (summary.status === "pending") {
         emit(
             `[claim-policy-seed] ${summary.batches} batch(es) left work pending; resumes next start`,
+        );
+    }
+    // Positive verification events from a held-open v85 writer never run the
+    // ladder reducer, and the read path only lets negative facts override the
+    // projection — reconcile them here, where every host already runs.
+    const reconciled = reconcileCompatibilityVerificationsAtStartup(db);
+    if (reconciled > 0) {
+        emit(
+            `[claim-policy-seed] refreshed ${reconciled} revision(s) with unreconciled compatibility verification`,
         );
     }
     return summary;

@@ -3,7 +3,11 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { getClaimPolicySeedStatus, runClaimPolicySeed } from "./claim-policy-backfill";
+import {
+    getClaimPolicySeedStatus,
+    reconcileCompatibilityVerificationsAtStartup,
+    runClaimPolicySeed,
+} from "./claim-policy-backfill";
 import { runClaimPolicySeedStartup } from "./claim-policy-backfill-startup";
 import { runInMemoryClaimsWriteTransaction } from "./memory/storage-memory-claims";
 import { runMigrations } from "./migrations";
@@ -409,6 +413,38 @@ describe("claim policy seed", () => {
                     )
                     .get(straggler),
             ).toEqual({ count: 1 });
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
+    test("a raw compatibility verified event reconciles at startup", async () => {
+        const fx = fixture();
+        try {
+            const ids = seedAe9Corpus(fx);
+            runMigrations(fx.db);
+            expect((await runClaimPolicySeed(fx.db)).status).toBe("complete");
+            const eligibility = () =>
+                (
+                    fx.db
+                        .prepare(
+                            "SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+                        )
+                        .get(ids.corroborated) as { auto: number }
+                ).auto;
+            expect(eligibility()).toBe(0);
+            // A held-open v85 writer appends the positive event without
+            // running the ladder reducer.
+            fx.db
+                .prepare(
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'verified', 'held-open-writer', 9_000)",
+                )
+                .run(ids.corroborated);
+            expect(eligibility()).toBe(0);
+            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(1);
+            expect(eligibility()).toBe(1);
+            // Idempotent: a reconciled projection stops matching the probe.
+            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(0);
         } finally {
             closeQuietly(fx.db);
         }
