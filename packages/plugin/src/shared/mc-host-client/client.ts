@@ -107,6 +107,7 @@ export interface SubcClientOptions extends ConnectOptions {
     /**
      * Test seam forwarded to the connection-file read's `afterOpen` hook;
      * lets tests race a snapshot against deadlines deterministically.
+     * @internal Not part of the consumer contract.
      */
     connectionFileAfterOpen?: () => void | Promise<void>;
     /**
