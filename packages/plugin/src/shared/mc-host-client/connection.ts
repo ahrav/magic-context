@@ -414,7 +414,17 @@ export class ConnectionGeneration {
             await this.setup(deadline);
         } catch (error) {
             if (!this.retiredInfo) {
-                this.retire(error instanceof AuthError ? "auth_failed" : "setup_failed", error);
+                // An auth-layer deadline observation is the same owner-budget
+                // exhaustion the setup timer reports: auth I/O that completes
+                // after expiry but before the timer callback runs must not
+                // masquerade as an authentication failure.
+                const reason: RetirementReason =
+                    error instanceof AuthError
+                        ? error.code === "deadline_expired"
+                            ? "setup_deadline"
+                            : "auth_failed"
+                        : "setup_failed";
+                this.retire(reason, error);
             }
             throw error;
         }
