@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod broca;
 pub mod raw_client;
 pub mod synapse;
 

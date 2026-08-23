@@ -28,7 +28,7 @@ pub struct RequestError {
     pub message: String,
 }
 
-fn schema(message: impl Into<String>) -> RequestError {
+pub(crate) fn schema(message: impl Into<String>) -> RequestError {
     let mut message = message.into();
     if message.len() > MAX_DIAGNOSTIC_BYTES {
         let mut end = MAX_DIAGNOSTIC_BYTES;
@@ -87,9 +87,9 @@ pub enum Request {
 /// subtree without allocating or recursing.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MethodEnvelope<'a> {
+pub(crate) struct MethodEnvelope<'a> {
     #[serde(borrow)]
-    method: Cow<'a, str>,
+    pub(crate) method: Cow<'a, str>,
     #[serde(default, rename = "params")]
     _params: serde::de::IgnoredAny,
 }
@@ -97,7 +97,7 @@ struct MethodEnvelope<'a> {
 /// Forces the object form. A derived `Deserialize` also accepts a JSON
 /// sequence, filling fields positionally, which would admit an array in place
 /// of the request body, its params, or a batch item.
-struct MapOnly<T>(T);
+pub(crate) struct MapOnly<T>(pub(crate) T);
 
 impl<T: Default> Default for MapOnly<T> {
     fn default() -> Self {
@@ -130,7 +130,7 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for MapOnly<T> {
 /// Envelope for an operation whose parameters may be omitted entirely.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OptionalParams<P> {
+pub(crate) struct OptionalParams<P> {
     #[serde(rename = "method")]
     _method: serde::de::IgnoredAny,
     #[serde(default, rename = "params")]
@@ -142,15 +142,15 @@ struct OptionalParams<P> {
 /// defaulted — and therefore substituted — set of constraints.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RequiredParams<P> {
+pub(crate) struct RequiredParams<P> {
     #[serde(rename = "method")]
     _method: serde::de::IgnoredAny,
-    params: MapOnly<P>,
+    pub(crate) params: MapOnly<P>,
 }
 
 #[derive(serde::Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct NoParams {}
+pub(crate) struct NoParams {}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -513,7 +513,7 @@ fn decode_batch<'a>(body: &'a [u8], max_items: usize) -> Result<BatchParams<'a>,
 /// key's value at the same level. Strings are skipped with backslash parity
 /// so delimiters inside them never count. Deliberately not a validator:
 /// syntax, UTF-8, duplicate keys, and schema stay with serde.
-fn depth_exceeds(body: &[u8], max_depth: usize) -> bool {
+pub(crate) fn depth_exceeds(body: &[u8], max_depth: usize) -> bool {
     let mut open = 0usize;
     let mut index = 0usize;
     while index < body.len() {

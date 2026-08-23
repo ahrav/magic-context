@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod broca;
 pub mod composite;
 pub mod config;
 pub mod handler;
