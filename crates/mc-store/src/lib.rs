@@ -2612,6 +2612,18 @@ const MIGRATIONS: &[Migration] = &[
         );
         ",
     },
+    Migration {
+        version: 53,
+        // The visible-memory candidate and content-search reads order the per-project
+        // visible pool by recency (`ORDER BY updated_at DESC, id ASC`). No index carries
+        // `updated_at`, so both queries sort the whole per-project pool through a temp
+        // b-tree on every call. This index lets the scan walk in output order and stop
+        // at the LIMIT.
+        statements: "
+        CREATE INDEX IF NOT EXISTS idx_mc_memories_project_updated
+            ON mc_memories(project_path, updated_at DESC, id ASC);
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
