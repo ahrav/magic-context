@@ -2612,6 +2612,42 @@ const MIGRATIONS: &[Migration] = &[
         );
         ",
     },
+    Migration {
+        version: 53,
+        // The visible-memory candidate and content-search reads order the per-project
+        // visible pool by recency (`ORDER BY updated_at DESC, id ASC`). No index carries
+        // `updated_at`, so both queries sort the whole per-project pool through a temp
+        // b-tree on every call. This index lets the scan walk in output order and stop
+        // at the LIMIT.
+        statements: "
+        CREATE INDEX IF NOT EXISTS idx_mc_memories_project_updated
+            ON mc_memories(project_path, updated_at DESC, id ASC);
+        ",
+    },
+    Migration {
+        version: 54,
+        // Primer-candidate reads and session cleanups filter by session_id, but the only
+        // index leads with project_path, so every load and per-session delete scans the
+        // whole table. (session_id, id) also satisfies the read's ORDER BY id.
+        statements: "
+        CREATE INDEX IF NOT EXISTS idx_mc_primer_candidates_session
+            ON mc_primer_candidates(session_id, id);
+        ",
+    },
+    Migration {
+        version: 55,
+        // Every render-pool read carries a top-level `status IN ('active','permanent')`
+        // term, so the render-order index only ever serves that subset. Making it
+        // partial skips archived/superseded rows during the ordered walk and shrinks
+        // index maintenance for non-visible rows. Same name, so callers and the
+        // schema-shape tests are unchanged.
+        statements: "
+        DROP INDEX IF EXISTS idx_mc_memories_project_render_order;
+        CREATE INDEX idx_mc_memories_project_render_order
+            ON mc_memories(project_path, COALESCE(importance, 50) DESC, id ASC)
+            WHERE status IN ('active', 'permanent');
+        ",
+    },
 ];
 
 /// The highest `mc_cache` schema migration this binary ships.
@@ -2736,7 +2772,7 @@ fn workspace_membership_from_connection(
         return Ok(None);
     };
 
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare_cached(
         "SELECT project_path, display_name FROM mc_workspace_members
           WHERE workspace_id = ?1 ORDER BY project_path ASC",
     )?;
@@ -5541,7 +5577,7 @@ fn session_has_durable_state(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> rusqlite::Result<bool> {
-    let exists: i64 = conn.query_row(
+    let exists: i64 = conn.prepare_cached(
         "SELECT EXISTS(
              SELECT 1 FROM mc_cache_state WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_compartments WHERE session_id = ?1
@@ -5561,9 +5597,8 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM mc_user_memory_candidates WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
          )",
-        params![session_id],
-        |row| row.get(0),
-    )?;
+    )?
+    .query_row(params![session_id], |row| row.get(0))?;
     Ok(exists != 0)
 }
 
@@ -6585,6 +6620,13 @@ impl McStore {
             )
         })?;
         inner.migrate(NS, MIGRATIONS)?;
+        // Per-pass statements run through prepare_cached; the rusqlite default cache
+        // holds 16 statements, which the hot set alone exceeds. 128 keeps every hot
+        // shape resident without meaningful memory cost.
+        inner.with_conn(|conn| {
+            conn.set_prepared_statement_cache_capacity(128);
+            Ok(())
+        })?;
         let store = McStore {
             inner,
             tag_cache_namespace: NEXT_TAG_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed),
@@ -6651,7 +6693,7 @@ impl McStore {
                 // Older stores may contain symlink spellings. Load the tiny per-session set and
                 // canonicalize both sides in Rust rather than relying on SQL string equality;
                 // this keeps migration compatibility without changing the durable schema.
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare_cached(
                     "SELECT project_root
                        FROM mc_transform_session_roots
                       WHERE session_id = ?1",
@@ -6817,7 +6859,7 @@ impl McStore {
     /// open, including stores that already recorded the upgraded schema version.
     fn repair_migration_30_authority_routes(&self) -> Result<(), McStoreError> {
         let bindings = self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT binding.context_store_uuid, binding.project, binding.route_project_root
                    FROM mc_authority_route_bindings binding
                   WHERE EXISTS (
@@ -6857,7 +6899,7 @@ impl McStore {
             return Ok(());
         }
         let projects = self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT DISTINCT project_path FROM mc_notes
                   WHERE compiled_check IS NOT NULL AND compiled_source_revision IS NULL
                   ORDER BY project_path",
@@ -7196,11 +7238,10 @@ impl McStore {
     pub fn has_cache_state(&self, session_id: &str) -> Result<bool, McStoreError> {
         self.inner
             .with_conn(|conn| {
-                conn.query_row(
+                conn.prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM mc_cache_state WHERE session_id = ?1)",
-                    params![session_id],
-                    |row| row.get::<_, i64>(0),
-                )
+                )?
+                .query_row(params![session_id], |row| row.get::<_, i64>(0))
             })
             .map(|exists| exists != 0)
             .map_err(Into::into)
@@ -7271,7 +7312,7 @@ impl McStore {
     ) -> Result<usize, McStoreError> {
         self.with_note_conn_fenced(project_path, |tx| {
             let tables = {
-                let mut stmt = tx.prepare(
+                let mut stmt = tx.prepare_cached(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
                 )?;
                 let rows = stmt
@@ -7283,6 +7324,8 @@ impl McStore {
             for table in tables {
                 let quoted = format!("\"{}\"", table.replace('"', "\"\""));
                 let has_session_id = {
+                    // Not prepare_cached: the SQL text embeds the table name, so
+                    // each entry is one-shot and would only churn the LRU cache.
                     let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
                     let columns = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
@@ -7314,8 +7357,10 @@ impl McStore {
     pub fn load(&self, session_id: &str) -> Result<LoadedState, McStoreError> {
         let row = self.inner.with_conn(|conn| {
             Ok(conn
-                .query_row(
+                .prepare_cached(
                     "SELECT row_version, core_state, meta FROM mc_cache_state WHERE session_id = ?1",
+                )?
+                .query_row(
                     params![session_id],
                     |r| {
                         Ok((
@@ -7617,7 +7662,7 @@ impl McStore {
     /// observability write never contends with or extends the pass commit.
     pub fn trace_pass_received(&self, session_id: &str, now_ms: i64) -> Result<(), McStoreError> {
         self.inner.with_conn(|conn| {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO mc_pass_trace (
                      session_id,
                      last_received_at_ms,
@@ -7632,8 +7677,8 @@ impl McStore {
                      last_received_at_ms = excluded.last_received_at_ms,
                      receive_count = mc_pass_trace.receive_count + 1,
                      first_divergence = NULL",
-                params![session_id, now_ms],
-            )?;
+            )?
+            .execute(params![session_id, now_ms])?;
             Ok(())
         })?;
         Ok(())
@@ -7826,7 +7871,7 @@ impl McStore {
             return Ok(Vec::new());
         }
         Ok(self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT history.value
                    FROM mc_pass_trace AS trace,
                         json_each(trace.scheduler_history) AS history
@@ -7864,7 +7909,7 @@ impl McStore {
             return Ok(Vec::new());
         }
         Ok(self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT history.value
                    FROM mc_pass_trace AS trace,
                         json_each(trace.scheduler_interesting_history) AS history
@@ -7897,7 +7942,7 @@ impl McStore {
     ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
         let request_observed_at_ms = request_observed_at_ms.to_string();
         Ok(self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT history.value
                    FROM mc_pass_trace AS trace,
                         json_each(trace.scheduler_interesting_history) AS history
@@ -7930,7 +7975,7 @@ impl McStore {
         full_array_fingerprint: &str,
     ) -> Result<Vec<InterestingPassSchedulerObservation>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT history.value
                    FROM mc_pass_trace AS trace,
                         json_each(trace.scheduler_interesting_history) AS history
@@ -8100,27 +8145,28 @@ impl McStore {
                     continue;
                 }
                 if let Some(row) = tx
-                    .query_row(
+                    .prepare_cached(
                         "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                          FROM mc_tags
                          WHERE session_id = ?1 AND block_id = ?2",
-                        params![session_id, block_id],
-                        tag_row_from_sql,
-                    )
+                    )?
+                    .query_row(params![session_id, block_id], tag_row_from_sql)
                     .optional()?
                 {
                     out.push(row);
                     continue;
                 }
-                let next = tx.query_row(
-                    "SELECT COALESCE(MAX(tag_number), 0) + 1 FROM mc_tags WHERE session_id = ?1",
-                    params![session_id],
-                    |r| r.get::<_, i64>(0),
-                )?;
-                tx.execute(
+                let next = tx
+                    .prepare_cached(
+                        "SELECT COALESCE(MAX(tag_number), 0) + 1 FROM mc_tags WHERE session_id = ?1",
+                    )?
+                    .query_row(params![session_id], |r| r.get::<_, i64>(0))?;
+                tx.prepare_cached(
                     "INSERT INTO mc_tags
                          (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(
                     params![
                         session_id,
                         next,
@@ -8147,7 +8193,7 @@ impl McStore {
     /// Load all minted tags for a session in tag-number order. This is the cold baseline fill.
     pub fn load_tags_for_session(&self, session_id: &str) -> Result<Vec<McTagRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                  FROM mc_tags
                  WHERE session_id = ?1
@@ -8169,7 +8215,7 @@ impl McStore {
         after_tag_number: i64,
     ) -> Result<Vec<McTagRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT tag_number, block_id, kind, token_count, created_at_ms, source_bytes
                  FROM mc_tags
                  WHERE session_id = ?1 AND tag_number > ?2
@@ -8187,10 +8233,12 @@ impl McStore {
     /// scanning immutable tag payloads.
     pub fn tag_cache_summary(&self, session_id: &str) -> Result<TagCacheSummary, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            conn.query_row(
+            conn.prepare_cached(
                 "SELECT generation, tag_count, max_tag_number
                    FROM mc_tag_cache_generations
                   WHERE session_id = ?1",
+            )?
+            .query_row(
                 params![session_id],
                 |row| {
                     Ok(TagCacheSummary {
@@ -8214,7 +8262,7 @@ impl McStore {
         self.tag_number_query_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT block_id, tag_number FROM mc_tags
                  WHERE session_id = ?1 ORDER BY tag_number ASC",
             )?;
@@ -8238,7 +8286,7 @@ impl McStore {
         self.tag_number_query_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT block_id, tag_number FROM mc_tags
                  WHERE session_id = ?1 AND tag_number > ?2
                  ORDER BY tag_number ASC",
@@ -8313,7 +8361,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<Channel1AppendRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT block_id, reminder_text, fired_at_ms
                  FROM mc_channel1_appends
                  WHERE session_id = ?1
@@ -8505,7 +8553,7 @@ impl McStore {
     /// Load exact auto-search overlay bytes and durable empty decisions.
     pub fn load_user_hints(&self, session_id: &str) -> Result<Vec<UserHintRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT block_id, hint_text, created_at
                  FROM mc_user_hints
                  WHERE session_id = ?1
@@ -8532,7 +8580,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<TemporalMarkRow>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT block_id, marker_text, created_at
                  FROM mc_temporal_marks
                  WHERE session_id = ?1
@@ -9611,25 +9659,24 @@ impl McStore {
                     continue;
                 }
                 let exists = tx
-                    .query_row(
-                        "SELECT 1 FROM mc_tags WHERE session_id = ?1 AND block_id = ?2",
-                        params![session_id, block_id],
-                        |_| Ok(()),
-                    )
+                    .prepare_cached("SELECT 1 FROM mc_tags WHERE session_id = ?1 AND block_id = ?2")?
+                    .query_row(params![session_id, block_id], |_| Ok(()))
                     .optional()?
                     .is_some();
                 if exists {
                     continue;
                 }
-                let next_tag = tx.query_row(
-                    "SELECT COALESCE(MAX(tag_number), 0) + 1 FROM mc_tags WHERE session_id = ?1",
-                    params![session_id],
-                    |row| row.get::<_, i64>(0),
-                )?;
-                tx.execute(
+                let next_tag = tx
+                    .prepare_cached(
+                        "SELECT COALESCE(MAX(tag_number), 0) + 1 FROM mc_tags WHERE session_id = ?1",
+                    )?
+                    .query_row(params![session_id], |row| row.get::<_, i64>(0))?;
+                tx.prepare_cached(
                     "INSERT INTO mc_tags
                          (session_id, tag_number, block_id, kind, token_count, created_at_ms, source_bytes)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(
                     params![
                         session_id,
                         next_tag,
@@ -10155,7 +10202,7 @@ impl McStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
                             start_date, end_date, title, content, p1, p2, p3, p4, importance,
                             episode_type, legacy, created_at
@@ -10193,7 +10240,7 @@ impl McStore {
                     |row| row.get::<_, Option<i64>>(0),
                 )?
                 .map_or(after_sequence, |max| max.max(after_sequence));
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
                         start_date, end_date, title, content, p1, p2, p3, p4, importance,
                         episode_type, legacy, created_at
@@ -10230,7 +10277,7 @@ impl McStore {
                         |r| r.get::<_, String>(0),
                     )
                     .optional()?;
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT sequence, start_message, end_message, start_message_id, end_message_id,
                         start_date, end_date, title, content, p1, p2, p3, p4, importance,
                         episode_type, legacy, created_at
@@ -10637,7 +10684,7 @@ impl McStore {
                 }));
             }
 
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare_cached(
                 "SELECT sequence, start_message, end_message
                    FROM mc_compartments
                   WHERE session_id = ?1
@@ -10787,7 +10834,7 @@ impl McStore {
             // Session notes follow the descended conversation key. Do not copy smart notes:
             // their project-wide visibility is independent of one lineage's retained history.
             let note_projects = {
-                let mut statement = tx.prepare(
+                let mut statement = tx.prepare_cached(
                     "SELECT DISTINCT project_path FROM mc_notes
                       WHERE session_id = ?1 AND type = 'session'",
                 )?;
@@ -11460,6 +11507,8 @@ impl McStore {
                 AND ({visibility})"
         );
         let rows = self.inner.with_conn(|conn| {
+            // Not prepare_cached: the IN-list arity varies per call, so each
+            // shape is a near-unique SQL text that would churn the LRU cache.
             let mut stmt = conn.prepare(&sql)?;
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
@@ -12451,7 +12500,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<HistorianEventCandidate>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT kind, at_compartment, compartment_id, fields_json, created_at, harness
                    FROM mc_compartment_events
                   WHERE session_id = ?1 ORDER BY id",
@@ -12475,7 +12524,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<HistorianPrimerCandidate>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT project_path, session_id, question, source_compartment_start,
                         source_compartment_end, source_start_message_id, source_end_message_id,
                         source_message_time, created_at
@@ -12504,7 +12553,7 @@ impl McStore {
         session_id: &str,
     ) -> Result<Vec<HistorianUserMemoryCandidate>, McStoreError> {
         Ok(self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT content, session_id, source_compartment_start,
                         source_compartment_end, created_at
                    FROM mc_user_memory_candidates
@@ -12536,7 +12585,7 @@ impl McStore {
         now_ms: i64,
     ) -> Result<Vec<StoredMemory>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, project_path, category, content, importance, status, expires_at,
                         superseded_by_memory_id, updated_at
                  FROM mc_memories
@@ -12607,6 +12656,8 @@ impl McStore {
             visibility_binds.push(rusqlite::types::Value::from(
                 MEMORY_VISIBILITY_MUTATION_CATEGORY.to_string(),
             ));
+            // Not prepare_cached: the IN-list arity varies with projects.len(),
+            // so the SQL text is unstable across calls and would churn the cache.
             let mut visibility_stmt = tx.prepare(&visibility_sql)?;
             let visibility_targets = visibility_stmt
                 .query_map(rusqlite::params_from_iter(visibility_binds.iter()), |row| {
@@ -12650,6 +12701,8 @@ impl McStore {
                         .iter()
                         .map(|target| rusqlite::types::Value::from(*target)),
                 );
+                // Not prepare_cached: the frontier shrinks each iteration, so
+                // the IN-list arity (and SQL text) is unique nearly every time.
                 let mut stmt = tx.prepare(&sql)?;
                 let batch = stmt
                     .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
@@ -12805,7 +12858,7 @@ impl McStore {
                   WHERE {pool_filter}
                   ORDER BY COALESCE(importance, 50) DESC, id ASC"
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare_cached(&sql)?;
             let mapped = stmt
                 .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     Ok(StoredMemory {
@@ -12854,7 +12907,7 @@ impl McStore {
                   WHERE {pool_filter}
                   ORDER BY COALESCE(importance, 50) DESC, id ASC"
             );
-            let mut stmt = tx.prepare(&sql)?;
+            let mut stmt = tx.prepare_cached(&sql)?;
             let memories = stmt
                 .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
                     Ok(StoredMemory {
@@ -12931,7 +12984,7 @@ impl McStore {
                   ORDER BY updated_at DESC, id ASC
                   LIMIT ?"
             );
-            let mut statement = conn.prepare(&sql)?;
+            let mut statement = conn.prepare_cached(&sql)?;
             let mut all_binds = binds.clone();
             all_binds.push(rusqlite::types::Value::from(limit));
             let rows = statement
@@ -12961,7 +13014,7 @@ impl McStore {
         }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT sequence, title, content, p1, p2, p3, p4, created_at
                    FROM mc_compartments
                   WHERE session_id = ?1
@@ -13016,7 +13069,7 @@ impl McStore {
                   ORDER BY updated_at DESC, id ASC
                   LIMIT 100"
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare_cached(&sql)?;
             let mut all_binds = binds.clone();
             all_binds.push(rusqlite::types::Value::from(pattern));
             let mapped = stmt
@@ -13048,7 +13101,7 @@ impl McStore {
         }
         let pattern = sql_like_pattern(query);
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT sequence, title, content, p1, p2, p3, p4, created_at
                    FROM mc_compartments
                   WHERE session_id = ?1
@@ -13104,7 +13157,7 @@ impl McStore {
         }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT compartment_seq, start_ordinal, end_ordinal, transcript_deflate,
                         raw_messages_deflate, created_at_ms
                    FROM mc_chunk_transcripts
@@ -13226,7 +13279,7 @@ impl McStore {
         );
         self.inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 let mut values = Vec::with_capacity(statuses.len() + 3);
                 values.push(SqlValue::Text(project_path.to_string()));
                 for status in &statuses {
@@ -13377,7 +13430,7 @@ impl McStore {
         );
         self.inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 4);
                 values.push(SqlValue::Text(project_path.to_string()));
                 for status in &statuses {
@@ -13422,7 +13475,7 @@ impl McStore {
         );
         self.inner
             .with_conn(|conn| {
-                let mut statement = conn.prepare(&sql)?;
+                let mut statement = conn.prepare_cached(&sql)?;
                 let mut values: Vec<SqlValue> = Vec::with_capacity(statuses.len() + 3);
                 values.push(SqlValue::Text(project_path.to_string()));
                 for status in statuses {
@@ -13870,7 +13923,7 @@ impl McStore {
     ) -> Result<Vec<(StoredNote, NoteDelivery)>, McStoreError> {
         self.with_note_conn_fenced(project_path, |tx| {
             let notes = {
-                let mut stmt = tx.prepare(&format!(
+                let mut stmt = tx.prepare_cached(&format!(
                     "SELECT {NOTE_SELECT_COLUMNS} FROM mc_notes
                      WHERE project_path = ?1 AND type = 'smart' AND
                        (status = 'ready' OR status = 'surfacing' OR status = 'surfaced')
@@ -14057,7 +14110,7 @@ impl McStore {
         }
         let pattern = sql_like_pattern(query);
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, content, status, surface_condition, updated_at_ms
                    FROM mc_notes
                   WHERE project_path = ?1
@@ -14089,7 +14142,7 @@ impl McStore {
     /// bytes between passes. Returns just the contents (the render is `- <content>`).
     pub fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
         let rows = self.inner.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT content FROM mc_user_memories WHERE status = 'active'
                  ORDER BY promoted_at ASC, id ASC",
             )?;
@@ -15012,7 +15065,7 @@ impl McStore {
     ) -> Result<String, McStoreError> {
         validate_authority_domain(domain)?;
         let rows = self.inner.with_conn(|conn| {
-            let mut statement = conn.prepare(
+            let mut statement = conn.prepare_cached(
                 "SELECT source_row_id, snapshot_json FROM mc_authority_seed_rows WHERE context_store_uuid = ?1 AND project = ?2 AND domain = ?3 ORDER BY source_row_id ASC",
             )?;
             let rows = statement
@@ -15119,18 +15172,18 @@ impl McStore {
 
         self.inner
             .with_conn_fenced(|tx| {
-                let mut memory_by_identity = tx.prepare(
+                let mut memory_by_identity = tx.prepare_cached(
                     "SELECT id, project_path, category, normalized_hash
                        FROM mc_memories
                       WHERE context_store_uuid = ?1 AND context_row_id = ?2",
                 )?;
-                let mut memory_by_natural_key = tx.prepare(
+                let mut memory_by_natural_key = tx.prepare_cached(
                     "SELECT id FROM mc_memories
                       WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                       ORDER BY updated_at DESC, id DESC
                       LIMIT 1",
                 )?;
-                let mut memory_merge_into_survivor = tx.prepare(
+                let mut memory_merge_into_survivor = tx.prepare_cached(
                     "UPDATE mc_memories AS survivor
                         SET content = COALESCE((
                                 SELECT candidate.content
@@ -15168,7 +15221,7 @@ impl McStore {
                             )
                       WHERE survivor.id = ?4",
                 )?;
-                let mut mapping_delete_twins = tx.prepare(
+                let mut mapping_delete_twins = tx.prepare_cached(
                     "DELETE FROM mc_memory_mappings
                       WHERE memory_id != ?4
                         AND memory_id IN (
@@ -15176,12 +15229,12 @@ impl McStore {
                              WHERE project_path = ?1 AND category = ?2 AND normalized_hash = ?3
                         )",
                 )?;
-                let mut memory_delete_twins = tx.prepare(
+                let mut memory_delete_twins = tx.prepare_cached(
                     "DELETE FROM mc_memories
                       WHERE id != ?4
                         AND project_path = ?1 AND category = ?2 AND normalized_hash = ?3",
                 )?;
-                let mut memory_adopt_by_id = tx.prepare(
+                let mut memory_adopt_by_id = tx.prepare_cached(
                     "UPDATE mc_memories
                         SET project_path=?1, category=?2,
                             content=CASE WHEN ?27 != 0 OR ?14 >= updated_at THEN ?3 ELSE content END,
@@ -15205,7 +15258,7 @@ impl McStore {
                             context_store_uuid=?25, context_row_id=?26
                       WHERE id=?28",
                 )?;
-                let mut memory_upsert = tx.prepare(
+                let mut memory_upsert = tx.prepare_cached(
                     "INSERT INTO mc_memories
                         (project_path, category, content, normalized_hash, importance, scope, shareable,
                          source_session_id, source_type, seen_count, retrieval_count, first_seen_at,
@@ -15237,23 +15290,23 @@ impl McStore {
                         superseded_by_memory_id=excluded.superseded_by_memory_id,
                         merged_from=excluded.merged_from, metadata_json=excluded.metadata_json",
                 )?;
-                let mut memory_by_source = tx.prepare(
+                let mut memory_by_source = tx.prepare_cached(
                     "SELECT id FROM mc_memories
                        WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
                 )?;
-                let mut pending_upsert = tx.prepare(
+                let mut pending_upsert = tx.prepare_cached(
                     "INSERT INTO mc_authority_pending_memory_references(
                          context_store_uuid, project, domain, source_context_row_id, target_context_row_id
                      ) VALUES (?1, ?2, 'memories', ?3, ?4)
                      ON CONFLICT(context_store_uuid, project, domain, source_context_row_id)
                      DO UPDATE SET target_context_row_id = excluded.target_context_row_id",
                 )?;
-                let mut pending_delete = tx.prepare(
+                let mut pending_delete = tx.prepare_cached(
                     "DELETE FROM mc_authority_pending_memory_references
                        WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'
                          AND source_context_row_id = ?3",
                 )?;
-                let mut mapping_upsert = tx.prepare(
+                let mut mapping_upsert = tx.prepare_cached(
                     "INSERT INTO mc_memory_mappings(memory_id, project_path, mapped_files_json, updated_at)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(memory_id) DO UPDATE SET
@@ -15262,8 +15315,8 @@ impl McStore {
                          updated_at = excluded.updated_at",
                 )?;
                 let mut mapping_delete =
-                    tx.prepare("DELETE FROM mc_memory_mappings WHERE memory_id = ?1")?;
-                let mut seed_row_upsert = tx.prepare(
+                    tx.prepare_cached("DELETE FROM mc_memory_mappings WHERE memory_id = ?1")?;
+                let mut seed_row_upsert = tx.prepare_cached(
                     "INSERT INTO mc_authority_seed_rows(
                          context_store_uuid, project, domain, source_row_id, snapshot_json
                      ) VALUES (?1, ?2, 'memories', ?3, ?4)
@@ -15570,7 +15623,7 @@ impl McStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         self.with_note_conn_fenced(project, |tx| {
-            let mut note_upsert = tx.prepare(&format!(
+            let mut note_upsert = tx.prepare_cached(&format!(
                 "INSERT INTO mc_notes ({NOTE_INSERT_COLUMNS}) VALUES (
                      ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                      ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
@@ -15603,11 +15656,11 @@ impl McStore {
                     compiled_config=excluded.compiled_config,
                     compiled_at=excluded.compiled_at, compile_status=excluded.compile_status"
             ))?;
-            let mut note_by_source = tx.prepare(
+            let mut note_by_source = tx.prepare_cached(
                 "SELECT id FROM mc_notes
                    WHERE context_store_uuid = ?1 AND project_path = ?2 AND context_row_id = ?3",
             )?;
-            let mut seed_row_upsert = tx.prepare(
+            let mut seed_row_upsert = tx.prepare_cached(
                 "INSERT INTO mc_authority_seed_rows(
                      context_store_uuid, project, domain, source_row_id, snapshot_json
                  ) VALUES (?1, ?2, 'notes', ?3, ?4)
@@ -15706,7 +15759,7 @@ impl McStore {
             .map_err(|_| McStoreError::Serde("feed limit exceeds i64".to_string()))?;
         self.inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT feed_seq, domain, op, module_row_id, full_row_snapshot, content_hash
                        FROM mc_changefeed WHERE domain = ?1 AND feed_seq > ?2
                        ORDER BY feed_seq ASC LIMIT ?3",
@@ -15757,7 +15810,7 @@ impl McStore {
             .with_conn(|conn| {
                 // The resnapshot consumer heals mirror rows from these snapshots, so each row
                 // carries both the complete memory and its current mapping state.
-                let mut stmt = conn.prepare(&format!(
+                let mut stmt = conn.prepare_cached(&format!(
                     "{MEMORY_FULL_SELECT_COLUMNS} FROM mc_memories WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
                 ))?;
                 let memories = stmt
@@ -16471,7 +16524,7 @@ fn append_compartments_tx(
     }
 
     let next_sequence = next_compartment_sequence_tx(tx, session_id)?;
-    let mut statement = tx.prepare(
+    let mut statement = tx.prepare_cached(
         "SELECT sequence, start_message, end_message
          FROM mc_compartments WHERE session_id = ?1",
     )?;
@@ -17143,7 +17196,7 @@ impl McStore {
                 );
             }
             let candidates = {
-                let mut stmt = tx.prepare(&format!(
+                let mut stmt = tx.prepare_cached(&format!(
                     "SELECT {NOTE_EVAL_CANDIDATE_COLUMNS} FROM mc_notes
                       WHERE project_path = ?1 AND type = 'smart' AND status = 'pending'
                         AND id NOT IN (SELECT note_id FROM mc_note_eval_claims
@@ -17648,7 +17701,7 @@ fn repair_note_artifacts_tx(
         source_revision: i64,
     }
     let candidates = {
-        let mut statement = tx.prepare(
+        let mut statement = tx.prepare_cached(
             "SELECT id, surface_condition, compiled_check, manifest_json, check_hash,
                     check_cron, source_revision
                FROM mc_notes
@@ -17719,7 +17772,7 @@ fn promote_facts_tx(
 ) -> rusqlite::Result<Vec<PromotedRef>> {
     let mut active_content = HashSet::new();
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "SELECT content FROM mc_memories
              WHERE project_path = ?1 AND status IN ('active', 'permanent')",
         )?;
@@ -18585,11 +18638,11 @@ fn assert_memory_feed_snapshots_complete(store: &McStore) {
     let (columns, snapshots) = store
         .inner
         .with_conn(|conn| {
-            let mut columns_statement = conn.prepare("PRAGMA table_info(mc_memories)")?;
+            let mut columns_statement = conn.prepare_cached("PRAGMA table_info(mc_memories)")?;
             let columns = columns_statement
                 .query_map([], |row| row.get::<_, String>(1))?
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut snapshots_statement = conn.prepare(
+            let mut snapshots_statement = conn.prepare_cached(
                 "SELECT full_row_snapshot FROM mc_changefeed WHERE domain = 'memories' ORDER BY feed_seq",
             )?;
             let snapshots = snapshots_statement
@@ -18700,7 +18753,7 @@ mod tests {
         store
             .inner
             .with_conn(|conn| {
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare_cached(
                     "SELECT command_id, disposition
                      FROM mc_reduce_command_ledger
                      WHERE session_id = ?1
@@ -18813,7 +18866,7 @@ mod tests {
         let remaining_note_types = store
             .inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare_cached(
                     "SELECT type FROM mc_notes WHERE session_id = 'ses_delete' ORDER BY id",
                 )?;
                 let rows = stmt
@@ -21408,7 +21461,7 @@ mod tests {
         let fresh_versions = fresh
             .inner
             .with_conn(|conn| {
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare_cached(
                     "SELECT version FROM cortexkit_schema_version
                      WHERE namespace = ?1 ORDER BY version",
                 )?;
@@ -21422,7 +21475,7 @@ mod tests {
         let render_indexes = fresh
             .inner
             .with_conn(|conn| {
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare_cached(
                     "SELECT name FROM sqlite_master
                       WHERE type = 'index'
                         AND name IN (
@@ -21748,7 +21801,7 @@ mod tests {
         let remaining_classes = migrated
             .inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare("SELECT class FROM shadow_divergences ORDER BY id")?;
+                let mut stmt = conn.prepare_cached("SELECT class FROM shadow_divergences ORDER BY id")?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -22068,7 +22121,7 @@ mod tests {
         let details = store
             .inner
             .with_conn(|conn| {
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare_cached(
                     "EXPLAIN QUERY PLAN
                      SELECT COALESCE(MAX(end_message), 0)
                        FROM mc_compartments WHERE session_id = ?1",
@@ -22265,7 +22318,7 @@ mod tests {
         let (memory_details, note_details, outbox_details) = store
             .inner
             .with_conn(|conn| {
-                let mut memory = conn.prepare(
+                let mut memory = conn.prepare_cached(
                     "EXPLAIN QUERY PLAN
                      SELECT id, project_path, category, content, importance, status,
                             expires_at, superseded_by_memory_id, updated_at
@@ -22278,7 +22331,7 @@ mod tests {
                 let memory_details = memory
                     .query_map(params!["git:render", 0], |row| row.get::<_, String>(3))?
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut notes = conn.prepare(
+                let mut notes = conn.prepare_cached(
                     "EXPLAIN QUERY PLAN
                      SELECT id, project_path, type, session_id, content, status,
                             updated_at_ms
@@ -22292,7 +22345,7 @@ mod tests {
                         row.get::<_, String>(3)
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut outbox = conn.prepare(
+                let mut outbox = conn.prepare_cached(
                     "EXPLAIN QUERY PLAN
                      SELECT firing_seq, source_start, source_end, item_index, payload_json,
                             attempt_count
@@ -26514,7 +26567,7 @@ mod shadow_tests {
         let versions = store
             .inner
             .with_conn(|conn| {
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare_cached(
                     "SELECT version FROM cortexkit_schema_version
                      WHERE namespace = ?1 ORDER BY version",
                 )?;
@@ -26815,7 +26868,7 @@ mod shadow_tests {
         let rows = store
             .inner
             .with_conn(|conn| {
-                let mut statement = conn.prepare(
+                let mut statement = conn.prepare_cached(
                     "SELECT id, project_path, context_store_uuid, context_row_id
                        FROM mc_memories
                       WHERE category = 'CONFIG_VALUES' AND normalized_hash = 'same-hash'
@@ -27653,7 +27706,7 @@ mod shadow_tests {
                     }
                 }
                 let pending = {
-                    let mut statement = tx.prepare(
+                    let mut statement = tx.prepare_cached(
                         "SELECT source_context_row_id, target_context_row_id
                            FROM mc_authority_pending_memory_references
                           WHERE context_store_uuid = ?1 AND project = ?2 AND domain = 'memories'",

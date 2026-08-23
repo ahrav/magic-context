@@ -115,6 +115,8 @@ pub struct HostShared<H> {
     /// spawn would overlap the handler's shutdown with itself.
     shutdown_callback_ran: AtomicBool,
     pub shutdown: CancellationToken,
+    /// `host.shutdown` commit latch shared by every connection (plan KTD4).
+    pub shutdown_latch: Arc<crate::lifecycle::ShutdownLatch>,
     pub draining: AtomicBool,
     pub fatal: FatalCell,
     pub gen_counter: AtomicU64,
@@ -273,10 +275,14 @@ fn retain_lock_until_drained<H: McHostHandler>(shared: Arc<HostShared<H>>, guard
 /// the guard anyway would release the fence while handler code still runs,
 /// and the lock dies with the process regardless.
 fn retain_lock_until_stopped<H: McHostHandler, T: Send + 'static>(
-    guard: InstanceGuard,
+    mut guard: InstanceGuard,
     handler: Arc<H>,
     task: tokio_util::task::AbortOnDropHandle<T>,
 ) {
+    // Teardown is underway: demote the phase so probes report `stopping`
+    // (not `starting`) for however long the unbounded drain below runs
+    // (protocol §12: every teardown path demotes before cleanup).
+    guard.begin_stopping();
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
             let _ = task.await;
@@ -329,6 +335,12 @@ impl<H: McHostHandler> PrePublicationCleanup<H> {
     }
 
     async fn finish(mut self) {
+        // Every `finish` is a teardown: demote the phase before the drain so
+        // probes report `stopping` rather than a stale `starting` that would
+        // expire to `wedged` under a slow handler shutdown (protocol §12).
+        if let Some(guard) = self.guard.as_mut() {
+            guard.begin_stopping();
+        }
         self.shutdown = Some(spawn_handler_shutdown(
             self.handler.take().expect("armed startup cleanup"),
         ));
@@ -348,9 +360,12 @@ impl<H: McHostHandler> PrePublicationCleanup<H> {
 
 impl<H: McHostHandler> Drop for PrePublicationCleanup<H> {
     fn drop(&mut self) {
-        let Some(guard) = self.guard.take() else {
+        let Some(mut guard) = self.guard.take() else {
             return;
         };
+        // Unwind is a teardown too: same demote-before-drain rule as
+        // `finish`.
+        guard.begin_stopping();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let shutdown = self.shutdown.take().unwrap_or_else(|| {
                 spawn_handler_shutdown(self.handler.take().expect("armed startup cleanup"))
@@ -406,8 +421,11 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
         shared.abort_all();
         // The listener died with the dropped future: unpublish immediately so
         // discovery stops advertising a dead endpoint, instead of waiting out
-        // the lifecycle cleanup chain below. Idempotent and fenced.
-        guard.remove_publication();
+        // the lifecycle cleanup chain below. Idempotent and fenced. The phase
+        // demotion travels with it, so an observer sees `stopping` rather than
+        // the `wedged` a publication-less `running` record would report for
+        // this path's whole (unbounded) drain.
+        guard.begin_stopping();
         // Route cleanup is async (route-gone callbacks must run before the
         // handler drops), so the guard moves into the cleanup task and drops
         // last — the lock releases only after handler-visible routes got
@@ -519,7 +537,37 @@ pub async fn run<H: McHostHandler>(
 ) -> Result<(), HostError> {
     crate::panic_boundary::install();
     config.validate().map_err(HostError::Config)?;
-    let guard = InstanceGuard::acquire(config.data_dir.as_deref()).map_err(HostError::Instance)?;
+    // The first attempt runs inline, so startup ordering and latency are
+    // unchanged. Only the wait between attempts is async: parking an executor
+    // thread here would stall a same-process predecessor drain whose
+    // completion releases the lock being waited on. The ~75ms budget only
+    // rides out a probe's momentary shared hold; a predecessor still draining
+    // (bounded by the callback and shutdown deadlines) exhausts it and yields
+    // `AlreadyRunning`, and the caller decides whether to retry the start.
+    let guard = {
+        let mut acquired = None;
+        for attempt in 0..crate::instance::LOCK_RETRY_ATTEMPTS {
+            match InstanceGuard::acquire(config.data_dir.as_deref()) {
+                Ok(guard) => {
+                    acquired = Some(guard);
+                    break;
+                }
+                Err(InstanceError::AlreadyRunning)
+                    if attempt + 1 < crate::instance::LOCK_RETRY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(crate::instance::LOCK_RETRY_DELAY).await;
+                }
+                Err(e) => return Err(HostError::Instance(e)),
+            }
+        }
+        match acquired {
+            Some(guard) => guard,
+            None => return Err(HostError::Instance(InstanceError::AlreadyRunning)),
+        }
+    };
+    guard
+        .write_lifecycle_record(crate::lifecycle::LifecyclePhase::Starting)
+        .map_err(HostError::Instance)?;
 
     let handler = Arc::new(handler);
     let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
@@ -646,6 +694,12 @@ pub async fn run<H: McHostHandler>(
             .guard_mut()
             .publish(port, &config.daemon_ver)
             .map_err(HostError::Instance)?;
+        // Best effort: transport is already published, so a failed phase
+        // rewrite must not tear down a serving host — probes then observe a
+        // fresh `starting` record, which ages to `wedged` honestly.
+        let _ = cleanup
+            .guard_mut()
+            .write_lifecycle_record(crate::lifecycle::LifecyclePhase::Running);
         Ok(Some(listener))
     }
     .await;
@@ -692,6 +746,7 @@ pub async fn run<H: McHostHandler>(
         abort_handles: Mutex::new(AbortRegistry::new()),
         shutdown_callback_ran: AtomicBool::new(false),
         shutdown: shutdown.clone(),
+        shutdown_latch: Arc::new(crate::lifecycle::ShutdownLatch::new()),
         draining: AtomicBool::new(false),
         fatal: FatalCell::new(),
         gen_counter: AtomicU64::new(1),
@@ -835,8 +890,9 @@ async fn shutdown_sequence<H: McHostHandler>(
         .store(true, std::sync::atomic::Ordering::SeqCst);
     shared.registry.freeze_admission();
 
-    // 2. Fenced publication removal while the lock is held.
-    guard.remove_publication();
+    // 2. Demote the phase to `stopping`, then remove the publication — both
+    // fenced, both while the lock is held.
+    guard.begin_stopping();
 
     // 3-5. Settle each route's admitted work (emitting its terminals) and run
     // its route-gone while read loops are still available to refuse work

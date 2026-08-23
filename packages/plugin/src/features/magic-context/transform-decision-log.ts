@@ -380,13 +380,33 @@ function writeTransformDecisionBestEffort(dbPath: string, row: TransformDecision
     }
 }
 
-function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
-    const db = new Database(dbPath);
-    try {
-        writeTransformDecisionRowOnDatabase(db, row, true);
-    } finally {
-        closeQuietly(db);
+// One long-lived non-blocking telemetry handle per database path. Opening a
+// connection per write costs a file open, schema read, and close on every
+// cache-affecting pass; the handle is separate from the main plugin connection
+// so busy_timeout=0 keeps telemetry writes non-blocking (a locked DB throws
+// SQLITE_BUSY immediately and the row is dropped by the best-effort caller).
+// If the DB file is ever replaced on disk, writes land on the old inode until
+// restart — acceptable for drop-on-contention telemetry.
+const telemetryDbByPath = new Map<string, Database>();
+
+function telemetryDatabase(dbPath: string): Database {
+    let db = telemetryDbByPath.get(dbPath);
+    if (!db) {
+        db = new Database(dbPath);
+        try {
+            db.exec("PRAGMA busy_timeout=0");
+        } catch (err) {
+            // The handle is not in the map yet, so nothing else closes it.
+            closeQuietly(db);
+            throw err;
+        }
+        telemetryDbByPath.set(dbPath, db);
     }
+    return db;
+}
+
+function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
+    writeTransformDecisionRowOnDatabase(telemetryDatabase(dbPath), row, false);
 }
 
 function writeTransformDecisionRowOnDatabase(
@@ -415,25 +435,28 @@ function writeTransformDecisionRowOnDatabase(
     );
     // Enforce the per-(session,harness) retention cap so a long session's
     // cache-affecting passes can't grow this telemetry table unbounded (the
-    // dashboard loads all matching rows for cause attribution). Keep the
-    // newest TRANSFORM_DECISIONS_RETENTION rows by (ts_ms, rowid). Best-effort
-    // on the same non-blocking handle; a failure just defers the prune.
+    // dashboard loads all matching rows for cause attribution). Deleting
+    // exactly `over` rowids in (ts_ms, rowid) order evicts the oldest entries
+    // without over-deleting when many rows share the minimum timestamp; the
+    // rowid tie-breaker matches the ordering the dashboard relies on.
+    const cap = retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION;
+    const probe = db
+        .prepare(
+            `SELECT COUNT(*) AS c FROM transform_decisions
+             WHERE session_id = ? AND harness = ?`,
+        )
+        .get(row.sessionId, row.harness) as { c: number } | undefined;
+    const over = (probe?.c ?? 0) - cap;
+    if (over <= 0) return;
     db.prepare(
         `DELETE FROM transform_decisions
-             WHERE session_id = ? AND harness = ?
-               AND rowid NOT IN (
-                 SELECT rowid FROM transform_decisions
-                 WHERE session_id = ? AND harness = ?
-                 ORDER BY ts_ms DESC, rowid DESC
-                 LIMIT ?
-               )`,
-    ).run(
-        row.sessionId,
-        row.harness,
-        row.sessionId,
-        row.harness,
-        retentionOverrideForTests ?? TRANSFORM_DECISIONS_RETENTION,
-    );
+             WHERE rowid IN (
+               SELECT rowid FROM transform_decisions
+               WHERE session_id = ? AND harness = ?
+               ORDER BY ts_ms ASC, rowid ASC
+               LIMIT ?
+             )`,
+    ).run(row.sessionId, row.harness, over);
 }
 
 export const __test = {
@@ -450,6 +473,8 @@ export const __test = {
         scheduledWriteTokensBySession.clear();
         writerOverrideForTests = null;
         retentionOverrideForTests = null;
+        for (const db of telemetryDbByPath.values()) closeQuietly(db);
+        telemetryDbByPath.clear();
     },
     setWriterForTests(writer: TransformDecisionWriter | null): void {
         writerOverrideForTests = writer;

@@ -91,6 +91,20 @@ describe("transform_decisions retention cap", () => {
         expect(rowCount()).toBe(TEST_CAP - 1);
     });
 
+    it("evicts only the overage when oldest timestamps tie", () => {
+        // Fill to cap with rows sharing one timestamp, then land one newer
+        // write: exactly one tied row must go, not the whole timestamp group.
+        for (let i = 0; i < TEST_CAP; i++) {
+            __test.writeRow(dbPath, baseRow(`tie-${i}`, 1000));
+        }
+        __test.writeRow(dbPath, baseRow("newer", 2000));
+        expect(rowCount()).toBe(TEST_CAP);
+        const newer = db
+            .prepare("SELECT 1 FROM transform_decisions WHERE message_id = 'newer'")
+            .get();
+        expect(newer ?? null).not.toBeNull();
+    });
+
     it("keeps the production retention constant sane", () => {
         // Guard against accidental drift of the real cap.
         expect(TRANSFORM_DECISIONS_RETENTION).toBe(2000);

@@ -505,6 +505,140 @@ pub async fn emit_rejection<H: McHostHandler>(
     }
 }
 
+/// Serves one authenticated `host.shutdown` request against the host-owned
+/// commit latch (plan KTD4).
+///
+/// The owner enqueues the correlated success response carrying a
+/// [`crate::lifecycle::CommitOnAck`] hook: commit and host cancellation run
+/// inside the writer task at full-frame write completion, and every earlier
+/// failure — charge, encode, enqueue, writer retirement, partial write —
+/// drops the hook unrun, reopening ownership for a later requester.
+/// Contenders wait for the active attempt's outcome; only a committed
+/// attempt answers them without a second commit.
+pub async fn handle_host_shutdown<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    gen: &Arc<GenerationCore>,
+    corr: u64,
+) {
+    loop {
+        // `notify_waiters` wakes only enabled or polled futures, so a reopen
+        // between the check and the first poll would otherwise be missed
+        // forever.
+        let changed = shared.shutdown_latch.changed();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        match shared.shutdown_latch.try_own() {
+            crate::lifecycle::LatchDecision::Owner => break,
+            crate::lifecycle::LatchDecision::Committed => {
+                // A prior attempt already linearized the stop; this request
+                // still settles with its own correlated success.
+                if emit_frame(
+                    &shared.egress_budget,
+                    gen,
+                    FrameType::Response,
+                    response_flags(false, true),
+                    FrameId::control(corr),
+                    crate::control::host_shutdown_response_json(),
+                )
+                .await
+                .is_err()
+                {
+                    gen.token.cancel();
+                }
+                return;
+            }
+            crate::lifecycle::LatchDecision::Wait => {
+                tokio::select! {
+                    biased;
+                    () = gen.token.cancelled() => return,
+                    () = &mut changed => continue,
+                }
+            }
+        }
+    }
+
+    // Owner path. Constructed before any fallible step so every early return
+    // (or panic unwind) reopens the latch via Drop.
+    let commit = crate::lifecycle::CommitOnAck::new(
+        Arc::clone(&shared.shutdown_latch),
+        shared.shutdown.clone(),
+    );
+    let body = crate::control::host_shutdown_response_json();
+    if gen.writer.is_retired() || gen.token.is_cancelled() {
+        return;
+    }
+    let deadline = gen.writer.admission_deadline();
+    let frame_bytes =
+        u32::try_from(body.len() + subc_protocol::HEADER_LEN).expect("fixed-size body");
+    let charge = tokio::select! {
+        biased;
+        () = gen.token.cancelled() => return,
+        charge = timeout_at(deadline, shared.egress_budget.charge(frame_bytes)) => match charge {
+            Ok(charge) => charge,
+            Err(_) => {
+                gen.token.cancel();
+                return;
+            }
+        },
+    };
+    let Ok(bytes) = encode_owned_frame(
+        FrameType::Response,
+        response_flags(false, true),
+        FrameId::control(corr),
+        body,
+    ) else {
+        // Unreachable for the fixed-size shutdown body, but tear the
+        // generation down like every sibling failure branch rather than
+        // stranding the requester without a response or a cancellation.
+        gen.token.cancel();
+        return;
+    };
+    let _ = gen
+        .writer
+        .send_before(
+            OutboundFrame {
+                bytes,
+                tail: Vec::new(),
+                charge,
+                written: Some(Box::new({
+                    let shared = Arc::clone(shared);
+                    move |_completed_at| {
+                        // The write acknowledgement IS the commit point, so
+                        // the admission fence must flip here, atomically with
+                        // it: `shutdown_sequence` stores these again only
+                        // after the accept loop observes cancellation, and a
+                        // dispatch that passed the flag checks before the
+                        // commit must find the registry already frozen.
+                        shared.draining.store(true, Ordering::SeqCst);
+                        shared.registry.freeze_admission();
+                        commit.acknowledge();
+                    }
+                })),
+            },
+            deadline,
+        )
+        .await;
+    // Admission into the writer queue is not delivery: behind a slow reader,
+    // the committing response could otherwise sit queued for the whole
+    // per-frame stall budget of every earlier frame while the latch holds
+    // `ResponseInFlight` and healthy requesters can only wait. Hold the same
+    // absolute deadline through write completion: if the commit has not
+    // happened by then, retire the winning generation, which drops the
+    // acknowledgement hook unfired and reopens the latch for a successor.
+    let shutdown = shared.shutdown.clone();
+    let gen_watch = Arc::clone(gen);
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {}
+            () = gen_watch.token.cancelled() => {}
+            () = tokio::time::sleep_until(deadline) => {
+                gen_watch.token.cancel();
+            }
+        }
+    });
+}
+
 /// Queues one §7.1-authoritative rejection terminal and reports (via
 /// `written_tx`) when its bytes fully reach the socket, so the caller can
 /// fence an otherwise-silent close around exactly this frame. The sender
@@ -559,7 +693,11 @@ pub async fn dispatch_request<H: McHostHandler>(
     };
     let corr = header.corr;
 
-    if shared.draining.load(Ordering::SeqCst) {
+    // `draining` is stored by the shutdown sequence, which starts only after
+    // the accept loop observes cancellation; a request pipelined behind a
+    // committed `host.shutdown` response can reach here first. The token
+    // check makes the admission fence coincide with the commit point.
+    if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
         drop(frame);
         emit_rejection(
             shared,
@@ -775,19 +913,24 @@ pub async fn dispatch_request<H: McHostHandler>(
     {
         let _ = start_tx.send(());
     } else {
-        // The route left Live between the advisory check and registration.
         // No dispatch crossed the registry's live-route linearization point,
         // so this rejection proves zero handler invocation; the spawned task
         // observes the dropped start signal and removes the pending entry.
+        // Registration refuses for two distinct reasons that need different
+        // codes: frozen admission (the shutdown fence won the race after the
+        // advisory check above) is retryable-elsewhere `server_busy`, while
+        // a route that left Live is `unknown_channel`.
         drop(start_tx);
-        emit_rejection(
-            shared,
-            gen,
-            FrameId::routed(route, corr),
-            CODE_UNKNOWN_CHANNEL,
-            "no live route for this channel and epoch",
-        )
-        .await;
+        let (code, message) =
+            if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
+                (CODE_SERVER_BUSY, "host is shutting down")
+            } else {
+                (
+                    CODE_UNKNOWN_CHANNEL,
+                    "no live route for this channel and epoch",
+                )
+            };
+        emit_rejection(shared, gen, FrameId::routed(route, corr), code, message).await;
     }
 }
 
@@ -804,7 +947,9 @@ pub async fn open_route<H: McHostHandler>(
     target: crate::handler::RouteTarget,
     identity: crate::handler::RouteIdentity,
 ) {
-    if shared.draining.load(Ordering::SeqCst) {
+    // Same fence as routed dispatch: reject at the shutdown commit point,
+    // not only once the later shutdown sequence stores `draining`.
+    if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
         emit_error_terminal(
             &shared.egress_budget,
             &gen,
