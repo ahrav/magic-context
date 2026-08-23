@@ -1471,28 +1471,51 @@ export function refreshRevisionMaturityInCurrentTransaction(
 
 /** Bump the owning project's memory epoch for a claim so every derived
  * project-memory cache (including the native module mirror) rematerializes.
- * Resolves the project identity through the `legacy_memory_claims`
- * crosswalk; a claim with no memory link feeds no memory surface and
- * no-ops. */
+ * A claim with no memory link feeds no memory surface and no-ops.
+ *
+ * Sessions key `project_state` by the identity they resolve TODAY, which can
+ * differ from the path stored on a linked memory row: a canonical-identity
+ * change keeps the old identity only as a `project_aliases` row, and a
+ * never-rekeyed legacy path survives on the memory itself. Bumping only the
+ * stored path would leave the canonical reader's watermark intact and its
+ * caches serving the pre-change visibility set, so every identity attached
+ * to the claim's project — canonical, aliases, and linked memory paths — is
+ * bumped. */
 export function bumpEpochForClaimProjectInCurrentTransaction(db: Database, claimId: number): void {
     if (!tableExists(db, "project_state")) return;
-    const row = db
+    const identities = db
         .prepare(
             `SELECT memories.project_path AS projectPath
-             FROM legacy_memory_claims lmc
-             JOIN memories ON memories.id = lmc.canonical_memory_id
-             WHERE lmc.claim_id = ? LIMIT 1`,
+               FROM legacy_memory_claims lmc
+               JOIN memories ON memories.id = lmc.canonical_memory_id
+              WHERE lmc.claim_id = ?
+             UNION
+             SELECT projects.canonical_identity
+               FROM claims
+               JOIN projects ON projects.id = claims.project_id
+              WHERE claims.id = ?
+                AND EXISTS (SELECT 1 FROM legacy_memory_claims WHERE claim_id = claims.id)
+             UNION
+             SELECT aliases.alias_identity
+               FROM claims
+               JOIN project_aliases aliases ON aliases.project_id = claims.project_id
+              WHERE claims.id = ?
+                AND EXISTS (SELECT 1 FROM legacy_memory_claims WHERE claim_id = claims.id)`,
         )
-        .get(claimId) as { projectPath: string } | null | undefined;
-    if (!row) return;
-    db.prepare(
+        .all(claimId, claimId, claimId) as Array<{ projectPath: string }>;
+    if (identities.length === 0) return;
+    const bump = db.prepare(
         `INSERT INTO project_state
             (project_path, project_memory_epoch, project_user_profile_version, updated_at)
          VALUES (?, 1, 0, ?)
          ON CONFLICT(project_path) DO UPDATE SET
             project_memory_epoch = project_memory_epoch + 1,
             updated_at = excluded.updated_at`,
-    ).run(row.projectPath, Date.now());
+    );
+    const now = Date.now();
+    for (const identity of identities) {
+        bump.run(identity.projectPath, now);
+    }
 }
 
 function tableExists(db: Database, name: string): boolean {

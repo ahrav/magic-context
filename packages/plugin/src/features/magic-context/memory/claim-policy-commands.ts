@@ -9,8 +9,8 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Database } from "../../../shared/sqlite";
 import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
 import {
@@ -55,9 +55,11 @@ export interface ClaimCommandDeps {
     sessionId: string;
     nowMs?: number;
     /** Injectable artifact evaluator; the default runs `bun test` for test
-     * artifacts and rejects other kinds. */
+     * artifacts and rejects other kinds. Receives the absolute path of an
+     * immutable same-directory snapshot of the artifact, not the live
+     * artifact path (KTD6). */
     evaluateArtifact?: (
-        canonicalPath: string,
+        snapshotPath: string,
         kind: EnforcementArtifactKind,
         projectRoot: string,
     ) => ArtifactEvaluation | Promise<ArtifactEvaluation>;
@@ -368,7 +370,7 @@ const ENFORCE_USAGE = [
  * The child process runs detached from the event loop so a slow or hanging
  * test cannot freeze the host that serves every other hook and transform. */
 function defaultEvaluateArtifact(
-    canonicalPath: string,
+    snapshotPath: string,
     kind: EnforcementArtifactKind,
     projectRoot: string,
 ): Promise<ArtifactEvaluation> {
@@ -381,7 +383,7 @@ function defaultEvaluateArtifact(
         });
     }
     return new Promise((resolve) => {
-        const run = spawn("bun", ["test", canonicalPath], { cwd: projectRoot });
+        const run = spawn("bun", ["test", snapshotPath], { cwd: projectRoot });
         // Only the diagnostic tail is ever surfaced; retaining full streams
         // for a noisy 120-second run would grow the shared plugin process
         // without bound.
@@ -510,14 +512,32 @@ export async function executeClaimEnforceCommand(
                 // with a 120-second budget, and holding BEGIN IMMEDIATE (or
                 // the harness thread) that long would block every other
                 // memory/claim/backfill writer and hook.
-                const digestBefore = sha256Bytes(canonical.absolutePath);
-                const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
-                evaluation = await evaluate(canonical.absolutePath, kind, deps.projectRoot);
-                // The recorded digest must be the bytes the evaluator actually
-                // ran: a concurrent rewrite between hash and evaluation would
-                // otherwise bind a result to bytes that never passed (KTD6).
-                bytesDigest = sha256Bytes(canonical.absolutePath);
-                if (bytesDigest !== digestBefore) {
+                //
+                // The evaluator runs an immutable snapshot, never the live
+                // path: endpoint hashing alone cannot see a
+                // replace-then-restore during the run, which would bind a
+                // pass to bytes that were never evaluated (KTD6). The
+                // snapshot sits next to the artifact so relative imports and
+                // test-runner naming rules resolve identically, and its
+                // digest — the bytes that provably ran — is the digest
+                // recorded.
+                const bytes = readFileSync(canonical.absolutePath);
+                bytesDigest = createHash("sha256").update(bytes).digest("hex");
+                const snapshotPath = join(
+                    dirname(canonical.absolutePath),
+                    `mc-enforce-${randomUUID().slice(0, 8)}.${basename(canonical.absolutePath)}`,
+                );
+                writeFileSync(snapshotPath, bytes);
+                try {
+                    const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
+                    evaluation = await evaluate(snapshotPath, kind, deps.projectRoot);
+                } finally {
+                    rmSync(snapshotPath, { force: true });
+                }
+                // A live artifact that drifted during the run cannot be
+                // recorded: the digest would describe bytes no longer on
+                // disk.
+                if (sha256Bytes(canonical.absolutePath) !== bytesDigest) {
                     throw new Error("the artifact changed during evaluation; rerun the command");
                 }
             },

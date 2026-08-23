@@ -14,6 +14,7 @@ import {
 import { sha256Utf8Hex } from "./storage-claims";
 import {
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
+    bumpEpochForClaimProjectInCurrentTransaction,
     ClaimOperationKeyReuseError,
     canonicalMemoryProjectPathSql,
     claimStateFromMemoryStatus,
@@ -3684,5 +3685,34 @@ describe("memory/claims kernel: claim trust policy companions", () => {
             .all() as Array<{ revisionId: number; maturity: string }>;
         const original = heads.find((row) => row.revisionId === seed.revisionId);
         expect(original?.maturity).toBe("CANDIDATE");
+    });
+});
+
+describe("memory/claims kernel: project epoch invalidation", () => {
+    function epochOf(db: Database, projectPath: string): number {
+        const row = db
+            .prepare(
+                "SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
+            )
+            .get(projectPath) as { epoch: number } | null | undefined;
+        return row?.epoch ?? 0;
+    }
+
+    test("a bump lands on the canonical identity even when the linked memory keeps an older path", () => {
+        const db = track(migratedDb());
+        const seed = createSeedMemory(db, "epoch-alias", "epoch alias content");
+        // The project's canonical identity moves on (e.g. a dir:->git:
+        // upgrade); the linked memory row keeps the identity it was created
+        // under, which survives only as an alias.
+        const moved = "git:kernel-project-moved";
+        db.prepare(
+            "UPDATE projects SET canonical_identity = ? WHERE id = (SELECT project_id FROM claims WHERE id = ?)",
+        ).run(moved, seed.claimId);
+        const storedBefore = epochOf(db, PROJECT);
+        const canonicalBefore = epochOf(db, moved);
+        bumpEpochForClaimProjectInCurrentTransaction(db, seed.claimId);
+        // Sessions reading either identity observe the change.
+        expect(epochOf(db, PROJECT)).toBe(storedBefore + 1);
+        expect(epochOf(db, moved)).toBe(canonicalBefore + 1);
     });
 });

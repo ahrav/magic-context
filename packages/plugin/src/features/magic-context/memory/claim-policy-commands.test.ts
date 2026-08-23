@@ -1,7 +1,15 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    symlinkSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database, isInTransaction } from "../../../shared/sqlite";
@@ -426,6 +434,41 @@ describe("claim enforcement command workflow", () => {
                 ).count,
             ).toBe(0);
             expect(effectiveMaturityOf(db, seed.revisionId)).not.toBe("ENFORCED");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("the evaluator runs an immutable snapshot, so a swap-and-restore cannot bind unevaluated bytes", async () => {
+        const db = migratedDb();
+        try {
+            const commandDeps = deps(db);
+            const seed = await approvedSeed(db, commandDeps, "enf-snapshot");
+            const artifactPath = join(commandDeps.projectRoot, "gate.test.ts");
+            writeFileSync(artifactPath, "original bytes");
+            let evaluatedPath = "";
+            let evaluatedBytes = "";
+            commandDeps.evaluateArtifact = (snapshotPath) => {
+                evaluatedPath = snapshotPath;
+                // Swap the live artifact mid-run and restore it before the
+                // run finishes — the endpoint-hash race the snapshot closes.
+                writeFileSync(artifactPath, "swapped bytes");
+                evaluatedBytes = readFileSync(snapshotPath, "utf8");
+                writeFileSync(artifactPath, "original bytes");
+                return passEvaluator();
+            };
+            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
+            const second = await executeClaimEnforceCommand(
+                commandDeps,
+                `${seed.memoryId} gate.test.ts`,
+            );
+            expect(second.level).toBe("info");
+            // The evaluator saw a snapshot holding the digested bytes, not
+            // the live path or the transient replacement.
+            expect(evaluatedPath).not.toBe(artifactPath);
+            expect(evaluatedBytes).toBe("original bytes");
+            expect(existsSync(evaluatedPath)).toBe(false);
+            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("ENFORCED");
         } finally {
             closeQuietly(db);
         }

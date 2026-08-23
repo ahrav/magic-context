@@ -397,14 +397,33 @@ function seedRevisionInCurrentTransaction(
  * reducer; the read path deliberately lets only NEGATIVE authoritative facts
  * override the projection (a positive override would need a second evaluator
  * — the KTD10 trust bypass), so the newly verified revision stays
- * automatic-hidden until something refreshes it. One bounded startup pass
- * re-runs the reducer for current revisions whose latest verification
- * outcome is `verified` but whose projection still reads
- * automatic-ineligible; the refresh is idempotent and a row ineligible for
- * other reasons keeps its value.
+ * automatic-hidden until something refreshes it. Each startup re-runs the
+ * reducer for current revisions whose latest verification outcome is
+ * `verified` but whose projection still reads automatic-ineligible; the
+ * refresh is idempotent and a row ineligible for other reasons keeps its
+ * value.
+ *
+ * Two bounds keep the pass cheap on a large corpus. An event-id watermark
+ * skips revisions whose newest `verified` event a previous pass already
+ * examined — every in-process eligibility change runs the reducer itself, so
+ * only unexamined raw events can create new divergence, and a legitimately
+ * ineligible verified row (an untrusted directive that must stay CANDIDATE)
+ * stops re-matching on every startup. Refreshes commit in fixed-size
+ * batches so the pass never holds the shared write lock for the whole
+ * corpus; the watermark advances only after every batch commits, and a
+ * crash mid-pass re-probes idempotently from the old watermark.
  */
 export function reconcileCompatibilityVerificationsAtStartup(db: Database): number {
     if (!hasClaimPolicySchema(db)) return 0;
+    const watermark = Number(
+        readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
+    );
+    const maxEventId = (
+        db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM verification_events").get() as {
+            id: number;
+        }
+    ).id;
+    if (maxEventId <= watermark) return 0;
     const divergent = db
         .prepare(
             `SELECT policy.revision_id AS revisionId
@@ -416,15 +435,25 @@ export function reconcileCompatibilityVerificationsAtStartup(db: Database): numb
                    WHERE revision_id = policy.revision_id
                      AND outcome IN ('verified', 'stale', 'flagged')
                    ORDER BY id DESC LIMIT 1
-               ) = 'verified'`,
+               ) = 'verified'
+               AND (
+                   SELECT MAX(id) FROM verification_events
+                   WHERE revision_id = policy.revision_id AND outcome = 'verified'
+               ) > ?`,
         )
-        .all() as Array<{ revisionId: number }>;
-    if (divergent.length === 0) return 0;
-    db.transaction(() => {
-        for (const row of divergent) {
-            refreshRevisionMaturityInCurrentTransaction(db, row.revisionId);
-        }
-    }).immediate();
+        .all(watermark) as Array<{ revisionId: number }>;
+    const RECONCILE_BATCH_SIZE = 100;
+    for (let start = 0; start < divergent.length; start += RECONCILE_BATCH_SIZE) {
+        const batch = divergent.slice(start, start + RECONCILE_BATCH_SIZE);
+        db.transaction(() => {
+            for (const row of batch) {
+                refreshRevisionMaturityInCurrentTransaction(db, row.revisionId);
+            }
+        }).immediate();
+    }
+    db.transaction(() =>
+        writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark, String(maxEventId)),
+    ).immediate();
     return divergent.length;
 }
 

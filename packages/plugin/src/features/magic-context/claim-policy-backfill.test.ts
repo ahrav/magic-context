@@ -445,6 +445,24 @@ describe("claim policy seed", () => {
             expect(eligibility()).toBe(1);
             // Idempotent: a reconciled projection stops matching the probe.
             expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(0);
+            // Event-watermarked: a projection that reads ineligible while its
+            // newest verified event was already examined (the legitimately
+            // ineligible shape) never re-matches on later startups...
+            fx.db
+                .prepare(
+                    "UPDATE claim_effective_policy SET auto_eligible = 0 WHERE revision_id = ?",
+                )
+                .run(ids.corroborated);
+            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(0);
+            expect(eligibility()).toBe(0);
+            // ...until a new raw event re-opens examination.
+            fx.db
+                .prepare(
+                    "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'verified', 'held-open-writer', 9_100)",
+                )
+                .run(ids.corroborated);
+            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(1);
+            expect(eligibility()).toBe(1);
         } finally {
             closeQuietly(fx.db);
         }

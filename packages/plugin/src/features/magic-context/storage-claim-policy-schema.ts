@@ -108,6 +108,7 @@ export const CLAIM_POLICY_SEED_META_KEYS = {
     phase: "claim_policy_seed_phase",
     completionWatermark: "claim_policy_seed_completion_watermark",
     seededCounts: "claim_policy_seed_counts",
+    reconcileEventWatermark: "claim_policy_reconcile_event_watermark",
 } as const;
 
 const sqlList = (values: readonly string[]): string =>
