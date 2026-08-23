@@ -11,7 +11,10 @@
 
 pub mod backend;
 pub mod config;
+pub mod opencode;
+pub mod pi;
 pub mod protocol;
+pub mod subprocess;
 pub mod supervisor;
 
 use std::collections::HashMap;

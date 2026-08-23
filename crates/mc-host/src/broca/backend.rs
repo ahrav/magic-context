@@ -182,7 +182,7 @@ pub struct EventSink {
 }
 
 impl EventSink {
-    pub(crate) fn new(deliver: Arc<dyn Fn(BackendEvent) -> SinkStatus + Send + Sync>) -> Self {
+    pub fn new(deliver: Arc<dyn Fn(BackendEvent) -> SinkStatus + Send + Sync>) -> Self {
         Self { deliver }
     }
 

@@ -261,6 +261,19 @@ pub enum HistorianProducerError {
     MissingSession,
     UnexpectedStreamEnd,
     TimedOut,
+    /// The runner answered with bytes outside the closed wire contract (an
+    /// undocumented `run.status` state, a status for a different run, ...).
+    /// Guessing a recovery state for such a reply could silently re-fire a
+    /// billable run, so the producer fails loud instead.
+    Protocol(String),
+    /// Neither a primary failure nor a cleanup (cancel/delete/close) failure
+    /// may mask the other, so both ride one structured error. `primary: None`
+    /// means the operation itself succeeded and only cleanup failed.
+    CleanupFailed {
+        operation: &'static str,
+        primary: Option<Box<HistorianProducerError>>,
+        cleanup: Box<HistorianProducerError>,
+    },
     RunFailed {
         run_id: String,
         detail: String,
@@ -314,6 +327,12 @@ impl HistorianProducerError {
             HistorianProducerError::Subc(body) => body.classification(),
             HistorianProducerError::RunFailed { classification, .. }
             | HistorianProducerError::RunPaused { classification, .. } => *classification,
+            // Retry policy must follow the PRIMARY failure; a cleanup failure
+            // never changes what the run itself did.
+            HistorianProducerError::CleanupFailed {
+                primary: Some(primary),
+                ..
+            } => primary.classification(),
             _ => None,
         }
     }
@@ -329,6 +348,10 @@ impl HistorianProducerError {
                 class_field_present,
                 ..
             } => *class_field_present,
+            HistorianProducerError::CleanupFailed {
+                primary: Some(primary),
+                ..
+            } => primary.has_class_field(),
             _ => false,
         }
     }
@@ -359,14 +382,22 @@ impl HistorianProducerError {
     }
 
     pub fn is_unknown_module(&self) -> bool {
-        matches!(
-            self,
-            HistorianProducerError::Subc(body) if body.code == "unknown_module"
-        )
+        match self {
+            HistorianProducerError::Subc(body) => body.code == "unknown_module",
+            HistorianProducerError::CleanupFailed {
+                primary: Some(primary),
+                ..
+            } => primary.is_unknown_module(),
+            _ => false,
+        }
     }
 
     fn heuristic_decision(&self) -> DeprecatedHeuristicDecision {
         match self {
+            HistorianProducerError::CleanupFailed {
+                primary: Some(primary),
+                ..
+            } => primary.heuristic_decision(),
             HistorianProducerError::Subc(body) => DeprecatedHeuristicDecision {
                 retryable_model_failure: retryable_code(&body.code)
                     || retryable_code(&body.message),
@@ -390,6 +421,7 @@ impl HistorianProducerError {
             HistorianProducerError::RunFailed { .. } => "run_failed",
             HistorianProducerError::RunPaused { .. } => "run_paused",
             HistorianProducerError::TimedOut => "timed_out",
+            HistorianProducerError::CleanupFailed { .. } => "cleanup_failed",
             _ => "producer_error",
         }
     }
@@ -450,6 +482,19 @@ impl fmt::Display for HistorianProducerError {
                 "subscribe stream ended before the run terminal control unit"
             ),
             HistorianProducerError::TimedOut => write!(f, "historian producer timed out"),
+            HistorianProducerError::Protocol(detail) => {
+                write!(f, "runner protocol violation: {detail}")
+            }
+            HistorianProducerError::CleanupFailed {
+                operation,
+                primary,
+                cleanup,
+            } => match primary {
+                Some(primary) => {
+                    write!(f, "{primary} ({operation} cleanup also failed: {cleanup})")
+                }
+                None => write!(f, "{operation} cleanup failed after success: {cleanup}"),
+            },
             HistorianProducerError::RunFailed { run_id, detail, .. } => {
                 write!(f, "run {run_id} failed: {detail}")
             }
@@ -480,6 +525,9 @@ impl Error for HistorianProducerError {
             HistorianProducerError::FrameIo(e) => Some(e),
             HistorianProducerError::FrameBuild(e) => Some(e),
             HistorianProducerError::Json(e) => Some(e),
+            // The cleanup error is the chained cause: the primary, when
+            // present, already renders inside Display.
+            HistorianProducerError::CleanupFailed { cleanup, .. } => Some(cleanup.as_ref()),
             HistorianProducerError::NoEndpoint { .. }
             | HistorianProducerError::Subc(_)
             | HistorianProducerError::UnexpectedControlResponse
@@ -487,6 +535,7 @@ impl Error for HistorianProducerError {
             | HistorianProducerError::MissingSession
             | HistorianProducerError::UnexpectedStreamEnd
             | HistorianProducerError::TimedOut
+            | HistorianProducerError::Protocol(_)
             | HistorianProducerError::RunFailed { .. }
             | HistorianProducerError::TerminalRunMismatch { .. }
             | HistorianProducerError::RunPaused { .. } => None,
@@ -509,6 +558,39 @@ impl From<FrameBuildError> for HistorianProducerError {
 impl From<serde_json::Error> for HistorianProducerError {
     fn from(e: serde_json::Error) -> Self {
         HistorianProducerError::Json(e)
+    }
+}
+
+/// Returns `CleanupFailed` whenever cleanup fails, preserving any primary
+/// error.
+pub fn with_cleanup<T>(
+    primary: Result<T, HistorianProducerError>,
+    cleanup: Result<(), HistorianProducerError>,
+    operation: &'static str,
+) -> Result<T, HistorianProducerError> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(HistorianProducerError::CleanupFailed {
+            operation,
+            primary: None,
+            cleanup: Box::new(cleanup),
+        }),
+        (Err(primary), cleanup) => Err(attach_cleanup(primary, cleanup, operation)),
+    }
+}
+
+pub fn attach_cleanup(
+    primary: HistorianProducerError,
+    cleanup: Result<(), HistorianProducerError>,
+    operation: &'static str,
+) -> HistorianProducerError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => HistorianProducerError::CleanupFailed {
+            operation,
+            primary: Some(Box::new(primary)),
+            cleanup: Box::new(cleanup),
+        },
     }
 }
 
@@ -600,7 +682,6 @@ impl HistorianProducer {
         temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
         self.bind_session(session_id.to_string());
-        let route = self.ensure_command_route().await?;
         // The route identity is the session. Keeping `session` out of this body avoids
         // a second, diverging source of truth for the run lineage.
         //
@@ -643,7 +724,17 @@ impl HistorianProducer {
             "method": "session.send",
             "params": params
         });
-        let response = self.unary_json(route, body).await?;
+        // Any different byte sequence for this session is an idempotency conflict at the runner, never the original run_id. commentlint: allow(JUDGE)
+        let frozen = serde_json::to_vec(&body)?;
+        let response = match self.send_frozen(&frozen).await {
+            Ok(response) => response,
+            // Resending after an answered (application) error could start a second billable run under a fresh route. commentlint: allow(JUDGE)
+            Err(err) if send_outcome_unknown(&err) => {
+                self.reconnect().await?;
+                self.send_frozen(&frozen).await?
+            }
+            Err(err) => return Err(err),
+        };
         let run_id = response
             .get("run_id")
             .and_then(Value::as_str)
@@ -699,7 +790,7 @@ impl HistorianProducer {
                 json!({ "method": "run.status", "params": { "run_id": run_id } }),
             )
             .await?;
-        Ok(classify_run_state(run_id, &response))
+        classify_run_state(run_id, &response)
     }
 
     pub async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError> {
@@ -717,20 +808,34 @@ impl HistorianProducer {
     /// sessions contain memory-pool snapshots, so retention settings never apply.
     pub async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
         self.bind_session(session_id.to_string());
-        let route = self.ensure_command_route().await?;
-        let _ = self
-            .unary_json(route, json!({ "method": "session.delete", "params": {} }))
-            .await?;
-        self.close().await;
-        Ok(())
+        let delete = async {
+            let route = self.ensure_command_route().await?;
+            self.unary_json(route, json!({ "method": "session.delete", "params": {} }))
+                .await
+                .map(|_| ())
+        }
+        .await;
+        let close = self.close().await;
+        with_cleanup(delete, close, "close")
     }
 
-    pub async fn close(&mut self) {
+    pub async fn close(&mut self) -> Result<(), HistorianProducerError> {
+        // Both routes are always released; the first failure is reported so a
+        // wedged transport cannot silently leak the second route either.
+        let mut first_error = None;
         if let Some(route) = self.subscribe_route.take() {
-            let _ = self.send_goodbye(route).await;
+            if let Err(err) = self.send_goodbye(route).await {
+                first_error.get_or_insert(err);
+            }
         }
         if let Some(route) = self.command_route.take() {
-            let _ = self.send_goodbye(route).await;
+            if let Err(err) = self.send_goodbye(route).await {
+                first_error.get_or_insert(err);
+            }
+        }
+        match first_error {
+            None => Ok(()),
+            Some(err) => Err(err),
         }
     }
 
@@ -750,6 +855,40 @@ impl HistorianProducer {
             Ok(result) => result,
             Err(_) => Err(HistorianProducerError::TimedOut),
         }
+    }
+
+    /// One transmission of the frozen `session.send` bytes, split from
+    /// `start_with_generation` so the recovery resend cannot accidentally
+    /// re-serialize a different body.
+    async fn send_frozen(&mut self, frozen: &[u8]) -> Result<Value, HistorianProducerError> {
+        let route = self.ensure_command_route().await?;
+        let corr = self.next_corr();
+        self.write_frame(
+            FrameType::Request,
+            route.channel,
+            route.epoch,
+            corr,
+            frozen.to_vec(),
+        )
+        .await?;
+        let frame = self
+            .read_terminal_for(route, corr, self.config.request_timeout)
+            .await?;
+        match frame.header.ty {
+            FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
+            FrameType::StreamEnd => Ok(Value::Null),
+            FrameType::Error => Err(HistorianProducerError::Subc(error_body(&frame.body))),
+            _ => Err(HistorianProducerError::UnexpectedControlResponse),
+        }
+    }
+
+    /// The config is reused unchanged because the runner deduplicates the frozen resend only under the same project/harness/session route identity. commentlint: allow(JUDGE)
+    async fn reconnect(&mut self) -> Result<(), HistorianProducerError> {
+        let mut fresh = Self::connect(self.config.clone()).await?;
+        std::mem::swap(&mut self.stream, &mut fresh.stream);
+        self.command_route = None;
+        self.subscribe_route = None;
+        Ok(())
     }
 
     async fn ensure_command_route(&mut self) -> Result<OpenedRoute, HistorianProducerError> {
@@ -1007,44 +1146,42 @@ impl Drop for HistorianProducer {
     }
 }
 
-fn classify_run_state(run_id: &str, value: &Value) -> RunState {
+fn classify_run_state(run_id: &str, value: &Value) -> Result<RunState, HistorianProducerError> {
     let value = value.get("result").unwrap_or(value);
-    let state = value
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
     let response_run_id = value.get("run_id").and_then(Value::as_str);
     if response_run_id.is_some_and(|id| id != run_id) {
-        return RunState::Missing {
-            detail: Some("run.status returned a different run_id".to_string()),
-        };
+        return Err(HistorianProducerError::Protocol(format!(
+            "run.status answered for run {response_run_id:?}, not {run_id}"
+        )));
     }
-    if state.contains("terminal")
-        || state.contains("interrupted")
-        || state == "completed"
-        || state == "finished"
-    {
-        RunState::Terminal
-    } else if state.contains("active")
-        || state.contains("paused")
-        || state.contains("pending")
-        || state.contains("running")
-    {
-        RunState::Active
-    } else if state.contains("error") {
-        RunState::Missing {
+    let Some(state) = value.get("state").and_then(Value::as_str) else {
+        return Err(HistorianProducerError::Protocol(
+            "run.status response has no state string".to_string(),
+        ));
+    };
+    match state {
+        "queued" | "running" => Ok(RunState::Active),
+        "completed" | "failed" | "cancelled" => Ok(RunState::Terminal),
+        "missing" => Ok(RunState::Missing {
             detail: value
-                .get("last_error")
-                .or_else(|| value.get("detail"))
+                .get("detail")
+                .or_else(|| value.get("last_error"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-        }
-    } else {
-        RunState::Missing {
-            detail: Some(state),
-        }
+        }),
+        other => Err(HistorianProducerError::Protocol(format!(
+            "undocumented run state {other:?}"
+        ))),
     }
+}
+
+fn send_outcome_unknown(err: &HistorianProducerError) -> bool {
+    matches!(
+        err,
+        HistorianProducerError::FrameIo(_)
+            | HistorianProducerError::TimedOut
+            | HistorianProducerError::UnexpectedStreamEnd
+    )
 }
 
 fn control_unit(event: &Value) -> Option<&Value> {
@@ -1326,7 +1463,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct ServerLog {
         route_sessions: Vec<String>,
+        route_harnesses: Vec<String>,
         sends: Vec<Value>,
+        send_bodies: Vec<Vec<u8>>,
         subscribes: Vec<Value>,
         goodbyes: Vec<u16>,
     }
@@ -1392,6 +1531,7 @@ mod tests {
                             next_route += 1;
                             route_sessions.insert(route, identity.session.clone());
                             log_task.lock().await.route_sessions.push(identity.session);
+                            log_task.lock().await.route_harnesses.push(identity.harness);
                             send_response_frame(
                                 &mut stream,
                                 frame.header.channel,
@@ -1411,6 +1551,7 @@ mod tests {
                         match req.get("method").and_then(Value::as_str) {
                             Some("session.send") => {
                                 log_task.lock().await.sends.push(req["params"].clone());
+                                log_task.lock().await.send_bodies.push(frame.body.clone());
                                 send_response_frame(
                                     &mut stream,
                                     frame.header.channel,
@@ -1447,7 +1588,7 @@ mod tests {
                                     frame.header.epoch,
                                     frame.header.corr,
                                     serde_json::to_vec(
-                                        &json!({"state":"terminal","run_id":"run-1","head":"h"}),
+                                        &json!({"state":"completed","run_id":"run-1"}),
                                     )
                                     .unwrap(),
                                 )
@@ -1545,6 +1686,18 @@ mod tests {
         .unwrap()
     }
 
+    /// A fixed post-close sleep races TCP delivery of the second goodbye
+    /// frame; polling for the expected count does not. commentlint: allow(JUDGE)
+    async fn wait_for_goodbyes(server: &FakeServer, expected: usize) {
+        for _ in 0..400 {
+            if server.log.lock().await.goodbyes.len() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("server never observed {expected} goodbye frames");
+    }
+
     #[tokio::test]
     async fn start_binds_session_at_route_open_and_omits_session_param() {
         let server = fake_server(json!({"state":"active","run_id":"run-1"}), Vec::new()).await;
@@ -1559,8 +1712,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(handle.run_id, "run-1");
-        client.close().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        client.close().await.unwrap();
+        wait_for_goodbyes(&server, 1).await;
 
         let log = server.log.lock().await;
         assert_eq!(log.route_sessions, vec!["mc-historian:proj:1"]);
@@ -1603,7 +1756,7 @@ mod tests {
             .start("mc-historian:proj:9", "", "prompt", "prov/model-a")
             .await
             .unwrap();
-        client.close().await;
+        client.close().await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         let log = server.log.lock().await;
         assert_eq!(log.sends.len(), 1);
@@ -1648,8 +1801,8 @@ mod tests {
             .await
             .unwrap();
         let output = client.await_output("run-1").await.unwrap();
-        client.close().await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        client.close().await.unwrap();
+        wait_for_goodbyes(&server, 2).await;
 
         assert_eq!(output.text, terminal_text);
         let log = server.log.lock().await;
@@ -1710,5 +1863,471 @@ mod tests {
                 ..
             } if run_id == "run-1" && reason == "auth_required"
         ));
+    }
+    #[test]
+    fn run_state_mapping_is_closed_over_the_exact_wire_vocabulary() {
+        let state = |state: &str| {
+            classify_run_state("run-1", &json!({ "run_id": "run-1", "state": state }))
+        };
+        assert!(matches!(state("queued"), Ok(RunState::Active)));
+        assert!(matches!(state("running"), Ok(RunState::Active)));
+        assert!(matches!(state("completed"), Ok(RunState::Terminal)));
+        assert!(matches!(state("failed"), Ok(RunState::Terminal)));
+        assert!(matches!(state("cancelled"), Ok(RunState::Terminal)));
+        assert!(matches!(state("missing"), Ok(RunState::Missing { .. })));
+        for undocumented in [
+            "terminal",
+            "active",
+            "finished",
+            "interrupted",
+            "paused",
+            "pending",
+            "COMPLETED",
+            "Running",
+            "cancel",
+            "error",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    state(undocumented),
+                    Err(HistorianProducerError::Protocol(_))
+                ),
+                "state {undocumented:?} must be a protocol error, not a guessed recovery state"
+            );
+        }
+        assert!(matches!(
+            classify_run_state("run-1", &json!({ "run_id": "run-1" })),
+            Err(HistorianProducerError::Protocol(_))
+        ));
+        assert!(matches!(
+            classify_run_state("run-1", &json!({ "run_id": "other", "state": "completed" })),
+            Err(HistorianProducerError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn cleanup_helper_preserves_primary_and_cleanup_diagnostics() {
+        assert_eq!(
+            with_cleanup(Ok(7), Ok(()), "session.delete").unwrap(),
+            7,
+            "clean success stays untouched"
+        );
+
+        let cleanup_only = with_cleanup(
+            Ok(7),
+            Err(HistorianProducerError::TimedOut),
+            "session.delete",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &cleanup_only,
+            HistorianProducerError::CleanupFailed { primary: None, .. }
+        ));
+        assert!(cleanup_only
+            .to_string()
+            .contains("session.delete cleanup failed after success"));
+
+        let both = with_cleanup::<()>(
+            Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "rate limit window",
+                ErrorClass::Transient,
+                Some(9),
+            )),
+            Err(HistorianProducerError::TimedOut),
+            "session.delete",
+        )
+        .unwrap_err();
+        assert_eq!(
+            both.classification(),
+            Some(ErrorClassification {
+                class: ErrorClass::Transient,
+                retry_after_secs: Some(9),
+            }),
+            "retry policy must keep following the primary failure"
+        );
+        assert!(both.has_class_field());
+        let rendered = both.to_string();
+        assert!(rendered.contains("rate limit window"));
+        assert!(rendered.contains("cleanup also failed"));
+
+        assert!(matches!(
+            attach_cleanup(HistorianProducerError::TimedOut, Ok(()), "session.delete"),
+            HistorianProducerError::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_preserves_length_finish_reason_on_assistant_steps() {
+        let events = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"assistant_message","run_id":"run-1","finish_reason":"length","message":{"role":"assistant","content":[{"type":"text","text":"partial output"}]}}}),
+            json!({"kind":"control","unit":{"type":"run_finished","run_id":"run-1","finish_reason":"completed"}}),
+        ];
+        let server = fake_server(json!({"run_id":"run-1"}), events).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:5", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+
+        let output = client.await_output("run-1").await.unwrap();
+        assert_eq!(output.text, "partial output");
+        assert!(
+            output.length_capped,
+            "a length-class step finish reason must survive a completed terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_retains_error_class_and_retry_delay_from_the_terminal() {
+        let events = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"error","run_id":"run-1","error":{"class":"transient","message":"rate limited","retry_after_secs":42,"provider_code":"rate_limit"}}}),
+        ];
+        let server = fake_server(json!({"run_id":"run-1"}), events).await;
+        let mut client = client(&server).await;
+        client
+            .start("mc-historian:proj:6", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+
+        let err = client.await_output("run-1").await.unwrap_err();
+        let HistorianProducerError::RunFailed {
+            run_id,
+            detail,
+            classification,
+            ..
+        } = err
+        else {
+            panic!("expected RunFailed, got {err:?}");
+        };
+        assert_eq!(run_id, "run-1");
+        assert_eq!(detail, "rate limited");
+        assert_eq!(
+            classification,
+            Some(ErrorClassification {
+                class: ErrorClass::Transient,
+                retry_after_secs: Some(42),
+            })
+        );
+    }
+
+    enum SendAction {
+        Respond(Value),
+        DropConnection,
+        Error(Value),
+    }
+
+    /// Unlike [`fake_server`], keeps accepting connections so a client that
+    /// reconnects after a dropped send reaches the same scripted state.
+    async fn scripted_server(
+        actions: Vec<SendAction>,
+        reject_harness: Option<&'static str>,
+    ) -> FakeServer {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let key = generate_key().unwrap();
+        let daemon_id = generate_daemon_id().unwrap();
+        let connection_file = temp.path().join("subc-connection.json");
+        write_atomic(
+            &connection_file,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                }],
+                key: key.clone(),
+                daemon_id,
+                pid: std::process::id(),
+                daemon_ver: "fake".to_string(),
+            },
+        )
+        .unwrap();
+        let log = Arc::new(Mutex::new(ServerLog::default()));
+        let log_task = Arc::clone(&log);
+        tokio::spawn(async move {
+            let mut actions: VecDeque<SendAction> = actions.into();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                if authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "fake",
+                    Duration::from_secs(2),
+                )
+                .await
+                .is_err()
+                {
+                    continue;
+                }
+                let mut next_route = 10u16;
+                'conn: loop {
+                    let frame = match read_frame(&mut stream).await {
+                        Ok(Some(frame)) => frame,
+                        _ => break 'conn,
+                    };
+                    match frame.header.ty {
+                        FrameType::Request if frame.header.channel == 0 => {
+                            let req: ClientControlRequest =
+                                serde_json::from_slice(&frame.body).unwrap();
+                            let ClientControlRequest::RouteOpen { identity, .. } = req else {
+                                continue;
+                            };
+                            log_task
+                                .lock()
+                                .await
+                                .route_sessions
+                                .push(identity.session.clone());
+                            log_task
+                                .lock()
+                                .await
+                                .route_harnesses
+                                .push(identity.harness.clone());
+                            if reject_harness == Some(identity.harness.as_str()) {
+                                send_error_frame(
+                                    &mut stream,
+                                    frame.header.channel,
+                                    frame.header.epoch,
+                                    frame.header.corr,
+                                    json!({
+                                        "code": "unsupported_harness",
+                                        "message": "harness must be opencode or pi",
+                                    }),
+                                )
+                                .await;
+                                continue;
+                            }
+                            let route = next_route;
+                            next_route += 1;
+                            send_response_frame(
+                                &mut stream,
+                                frame.header.channel,
+                                frame.header.epoch,
+                                frame.header.corr,
+                                serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                    route_channel: route,
+                                    route_epoch: 1,
+                                })
+                                .unwrap(),
+                            )
+                            .await;
+                        }
+                        FrameType::Request => {
+                            let req: Value = serde_json::from_slice(&frame.body).unwrap();
+                            if req.get("method").and_then(Value::as_str) != Some("session.send") {
+                                continue;
+                            }
+                            log_task.lock().await.sends.push(req["params"].clone());
+                            log_task.lock().await.send_bodies.push(frame.body.clone());
+                            match actions.pop_front() {
+                                Some(SendAction::Respond(body)) => {
+                                    send_response_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        serde_json::to_vec(&body).unwrap(),
+                                    )
+                                    .await;
+                                }
+                                Some(SendAction::Error(body)) => {
+                                    send_error_frame(
+                                        &mut stream,
+                                        frame.header.channel,
+                                        frame.header.epoch,
+                                        frame.header.corr,
+                                        body,
+                                    )
+                                    .await;
+                                }
+                                // Dropping the connection leaves the send
+                                // outcome unknown to the client.
+                                Some(SendAction::DropConnection) | None => break 'conn,
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        FakeServer {
+            connection_file,
+            log,
+            _temp: temp,
+        }
+    }
+
+    async fn send_error_frame(
+        stream: &mut TcpStream,
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+        body: Value,
+    ) {
+        let frame = Frame::build(
+            FrameType::Error,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        write_frame(stream, &frame).await.unwrap();
+    }
+
+    async fn scripted_client(server: &FakeServer, harness: &str) -> HistorianProducer {
+        HistorianProducer::connect(HistorianProducerConfig {
+            connection_file: server.connection_file.clone(),
+            project_root: std::env::current_dir().unwrap(),
+            harness: harness.to_string(),
+            module_id: "broca".to_string(),
+            handshake_timeout: Duration::from_secs(2),
+            // Short so the DropConnection scripts fail over quickly.
+            request_timeout: Duration::from_millis(500),
+            await_timeout: Duration::from_secs(2),
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lost_send_response_reconnects_once_with_byte_identical_body() {
+        let server = scripted_server(
+            vec![
+                SendAction::DropConnection,
+                SendAction::Respond(json!({"run_id":"run-orig"})),
+            ],
+            None,
+        )
+        .await;
+        let mut client = scripted_client(&server, "opencode").await;
+
+        let handle = client
+            .start("ses-recover", "sys", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle.run_id, "run-orig",
+            "the deduplicated resend must surface the original run id"
+        );
+        let log = server.log.lock().await;
+        assert_eq!(log.send_bodies.len(), 2);
+        assert_eq!(
+            log.send_bodies[0], log.send_bodies[1],
+            "recovery must resend the frozen bytes verbatim"
+        );
+        assert_eq!(
+            log.route_sessions,
+            vec!["ses-recover", "ses-recover"],
+            "the rebind must carry the same route identity"
+        );
+        assert_eq!(log.route_harnesses, vec!["opencode", "opencode"]);
+    }
+
+    #[tokio::test]
+    async fn application_send_error_is_not_resent() {
+        let server = scripted_server(
+            vec![SendAction::Error(
+                json!({"code":"idempotency_conflict","message":"different bytes"}),
+            )],
+            None,
+        )
+        .await;
+        let mut client = scripted_client(&server, "opencode").await;
+
+        let err = client
+            .start("ses-conflict", "", "prompt", "prov/model-a")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &err,
+            HistorianProducerError::Subc(body) if body.code == "idempotency_conflict"
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(server.log.lock().await.send_bodies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn second_unknown_send_outcome_fails_without_a_third_send() {
+        let server = scripted_server(
+            vec![SendAction::DropConnection, SendAction::DropConnection],
+            None,
+        )
+        .await;
+        let mut client = scripted_client(&server, "opencode").await;
+
+        let err = client
+            .start("ses-twice", "", "prompt", "prov/model-a")
+            .await
+            .unwrap_err();
+
+        assert!(send_outcome_unknown(&err), "got {err:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(server.log.lock().await.send_bodies.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unsupported_harness_reaches_bind_rejection_untranslated() {
+        let server = scripted_server(Vec::new(), Some("weird")).await;
+        let mut client = scripted_client(&server, "weird").await;
+
+        let err = client
+            .start("ses-weird", "", "prompt", "prov/model-a")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &err,
+            HistorianProducerError::Subc(body) if body.code == "unsupported_harness"
+        ));
+        let log = server.log.lock().await;
+        assert_eq!(
+            log.route_harnesses,
+            vec!["weird"],
+            "the harness value must reach the bind untranslated"
+        );
+        assert!(log.send_bodies.is_empty(), "a rejected bind must not send");
+    }
+
+    #[tokio::test]
+    async fn real_factory_binds_routes_with_the_route_bound_harness() {
+        let server = scripted_server(
+            vec![
+                SendAction::Respond(json!({"run_id":"run-oc"})),
+                SendAction::Respond(json!({"run_id":"run-pi"})),
+            ],
+            None,
+        )
+        .await;
+        let factory = crate::RealHistorianProducerFactory {
+            connection_file: server.connection_file.clone(),
+        };
+        for harness in ["opencode", "pi"] {
+            let mut producer = crate::HistorianProducerFactory::connect(
+                &factory,
+                std::path::Path::new("/proj"),
+                harness,
+            )
+            .await
+            .unwrap();
+            producer
+                .start(&format!("ses-{harness}"), "", "prompt", "prov/model-a")
+                .await
+                .unwrap();
+            producer.close().await.unwrap();
+        }
+        let log = server.log.lock().await;
+        assert_eq!(log.route_harnesses, vec!["opencode", "pi"]);
     }
 }

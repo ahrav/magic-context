@@ -18,8 +18,8 @@ use mc_store::{
 };
 
 use crate::historian_producer::{
-    ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError, ProducerOutput,
-    RunHandle, RunState,
+    attach_cleanup, ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError,
+    ProducerOutput, RunHandle, RunState,
 };
 use crate::historian_validate::{
     validate_historian_output, HistorianChunk, HistorianValidationError, StoredCompartmentRange,
@@ -794,12 +794,12 @@ pub trait HistorianProducerDriver: Send {
     }
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
-    async fn close(&mut self);
+    async fn close(&mut self) -> Result<(), HistorianProducerError>;
     /// Delete the provider session on every terminal path. The default calls close()
     /// for compatibility with older test producers, while production producers override
     /// this method to explicitly delete session data before closing.
-    async fn purge_session(&mut self, _session_id: &str) {
-        self.close().await;
+    async fn purge_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
+        self.close().await
     }
 }
 
@@ -879,17 +879,12 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::cancel(self, run_id).await
     }
 
-    async fn close(&mut self) {
-        HistorianProducer::close(self).await;
+    async fn close(&mut self) -> Result<(), HistorianProducerError> {
+        HistorianProducer::close(self).await
     }
 
-    async fn purge_session(&mut self, session_id: &str) {
-        if HistorianProducer::purge_session(self, session_id)
-            .await
-            .is_err()
-        {
-            HistorianProducer::close(self).await;
-        }
+    async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
+        HistorianProducer::purge_session(self, session_id).await
     }
 }
 
@@ -1199,6 +1194,19 @@ fn prefixed_detail(prefix: Option<&str>, detail: String) -> String {
     }
 }
 
+/// The caller persists the durable transition before invoking
+/// `log_cleanup_failure`, so logging a cleanup failure cannot corrupt the
+/// transition.
+fn log_cleanup_failure(
+    session_id: &str,
+    operation: &str,
+    result: &Result<(), HistorianProducerError>,
+) {
+    if let Err(err) = result {
+        eprintln!("mc-module: historian {operation} cleanup failed for {session_id}: {err}");
+    }
+}
+
 pub async fn run_historian_firing<P>(
     producer: &mut P,
     request: HistorianFireRequest<'_>,
@@ -1275,11 +1283,16 @@ where
                         )),
                     ),
                 )?;
-                producer.close().await;
+                let close_result = producer.close().await;
                 if decision.try_next_model {
+                    log_cleanup_failure(request.session_id, "close", &close_result);
                     continue;
                 }
-                return Err(HistorianDriveError::Producer(err));
+                return Err(HistorianDriveError::Producer(attach_cleanup(
+                    err,
+                    close_result,
+                    "close",
+                )));
             }
         };
 
@@ -1293,7 +1306,7 @@ where
                 match producer.redrain_output(&handle.run_id).await {
                     Ok(output) => output,
                     Err(recovery_err) => {
-                        let _ = producer.cancel(&handle.run_id).await;
+                        let cancel_result = producer.cancel(&handle.run_id).await;
                         let detail = format!(
                             "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
                         );
@@ -1307,13 +1320,17 @@ where
                             request.session_id,
                             abandon_with_detail(&awaiting, failure_backoff_at_ms, Some(detail)),
                         )?;
-                        producer.close().await;
-                        return Err(HistorianDriveError::Producer(recovery_err));
+                        let close_result = producer.close().await;
+                        return Err(HistorianDriveError::Producer(attach_cleanup(
+                            attach_cleanup(recovery_err, cancel_result, "cancel"),
+                            close_result,
+                            "close",
+                        )));
                     }
                 }
             }
             Err(err) => {
-                let _ = producer.cancel(&handle.run_id).await;
+                let cancel_result = producer.cancel(&handle.run_id).await;
                 let completed_at_ms = (request.completion_now_ms)();
                 let failure_backoff_at_ms = completion_failure_backoff_at_ms(
                     request.now_ms,
@@ -1341,11 +1358,17 @@ where
                         )),
                     ),
                 )?;
-                producer.close().await;
+                let close_result = producer.close().await;
                 if decision.try_next_model {
+                    log_cleanup_failure(request.session_id, "cancel", &cancel_result);
+                    log_cleanup_failure(request.session_id, "close", &close_result);
                     continue;
                 }
-                return Err(HistorianDriveError::Producer(err));
+                return Err(HistorianDriveError::Producer(attach_cleanup(
+                    attach_cleanup(err, cancel_result, "cancel"),
+                    close_result,
+                    "close",
+                )));
             }
         };
 
@@ -1371,7 +1394,7 @@ where
             completion_now_ms: request.completion_now_ms,
             publication_fence: request.publication_fence,
         });
-        producer.close().await;
+        log_cleanup_failure(request.session_id, "close", &producer.close().await);
         let row_version = match publish_result {
             Ok(row_version) => row_version,
             Err(HistorianDriveError::Validation(err)) => {
@@ -1433,7 +1456,7 @@ where
                 (request.completion_now_ms)(),
             );
             abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
-            producer.close().await;
+            log_cleanup_failure(request.session_id, "close", &producer.close().await);
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
     };
@@ -1447,7 +1470,7 @@ where
                 (request.completion_now_ms)(),
             );
             abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
-            producer.close().await;
+            log_cleanup_failure(request.session_id, "close", &producer.close().await);
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
     }
@@ -1457,7 +1480,7 @@ where
     let output = match producer.await_output(&producer_run_id).await {
         Ok(output) => output,
         Err(err) => {
-            let _ = producer.cancel(&producer_run_id).await;
+            let cancel_result = producer.cancel(&producer_run_id).await;
             let detail_prefix = match err
                 .classification()
                 .map(|classification| classification.class)
@@ -1496,8 +1519,12 @@ where
                     format!("producer reattach output ({producer_run_id}): {err:?}"),
                 )),
             )?;
-            producer.close().await;
-            return Err(HistorianDriveError::Producer(err));
+            let close_result = producer.close().await;
+            return Err(HistorianDriveError::Producer(attach_cleanup(
+                attach_cleanup(err, cancel_result, "cancel"),
+                close_result,
+                "close",
+            )));
         }
     };
 
@@ -1522,7 +1549,7 @@ where
         completion_now_ms: request.completion_now_ms,
         publication_fence: request.publication_fence,
     });
-    producer.close().await;
+    log_cleanup_failure(request.session_id, "close", &producer.close().await);
     let row_version = publish_result?;
     Ok(HistorianReattachOutcome::Published(HistorianRunSuccess {
         row_version,
@@ -2051,6 +2078,8 @@ mod tests {
         starts: VecDeque<Result<RunHandle, HistorianProducerError>>,
         outputs: VecDeque<Result<ProducerOutput, HistorianProducerError>>,
         statuses: VecDeque<Result<RunState, HistorianProducerError>>,
+        cancel_results: VecDeque<Result<(), HistorianProducerError>>,
+        close_results: VecDeque<Result<(), HistorianProducerError>>,
         observed_starts: Vec<(String, String)>,
         observed_sessions: Vec<String>,
         observed_systems: Vec<String>,
@@ -2073,6 +2102,16 @@ mod tests {
 
         fn with_status(mut self, result: Result<RunState, HistorianProducerError>) -> Self {
             self.statuses.push_back(result);
+            self
+        }
+
+        fn with_cancel_result(mut self, result: Result<(), HistorianProducerError>) -> Self {
+            self.cancel_results.push_back(result);
+            self
+        }
+
+        fn with_close_result(mut self, result: Result<(), HistorianProducerError>) -> Self {
+            self.close_results.push_back(result);
             self
         }
 
@@ -2126,11 +2165,12 @@ mod tests {
 
         async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError> {
             self.cancels.push(run_id.to_string());
-            Ok(())
+            self.cancel_results.pop_front().unwrap_or(Ok(()))
         }
 
-        async fn close(&mut self) {
+        async fn close(&mut self) -> Result<(), HistorianProducerError> {
             self.closes += 1;
+            self.close_results.pop_front().unwrap_or(Ok(()))
         }
     }
 
@@ -3222,6 +3262,92 @@ mod tests {
                 && detail.contains("prov/model-a"),
             "durable failure detail keeps the timeout + recovery cause: {detail}"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_and_close_failures_surface_without_corrupting_abandon() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "model gone",
+                ErrorClass::Permanent,
+                None,
+            )))
+            .with_cancel_result(Err(HistorianProducerError::TimedOut))
+            .with_close_result(Err(HistorianProducerError::TimedOut));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        let HistorianDriveError::Producer(producer_err) = err else {
+            panic!("expected producer error, got {err:?}");
+        };
+        assert_eq!(
+            producer_err.classification().map(|c| c.class),
+            Some(ErrorClass::Permanent),
+            "cleanup failures must not change the primary retry policy"
+        );
+        let rendered = producer_err.to_string();
+        assert!(
+            rendered.contains("model gone") && rendered.contains("cleanup also failed"),
+            "both diagnostics must survive: {rendered}"
+        );
+        assert_eq!(producer.cancels, vec!["run-1"]);
+        assert_eq!(producer.closes, 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.state,
+            HistorianPhase::Idle,
+            "the durable abandon transition survives cleanup failures"
+        );
+        assert!(state.failure_backoff_at_ms.is_some());
+        assert!(state
+            .last_failure
+            .expect("failure detail recorded")
+            .contains("producer output"));
+    }
+
+    #[tokio::test]
+    async fn close_failure_after_publish_keeps_the_completed_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("published summary"))))
+            .with_close_result(Err(HistorianProducerError::TimedOut));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, HistorianDriveOutcome::Completed(_)),
+            "a route-release failure after publish must not refire published work"
+        );
+        assert_eq!(producer.closes, 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.last_failure, None);
+        let published = store.load_compartments("ses").unwrap().pop().unwrap();
+        assert_eq!(published.p1.as_deref(), Some("published summary"));
     }
 
     #[tokio::test]

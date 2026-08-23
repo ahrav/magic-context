@@ -69,6 +69,13 @@ import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 
 const server: Plugin = async (ctx) => {
+    // Broca child processes must not initialize Magic Context.
+    if (process.env.MAGIC_CONTEXT_BROCA_CHILD === "1") {
+        log(
+            "[magic-context] broca child detected (MAGIC_CONTEXT_BROCA_CHILD=1); skipping plugin startup",
+        );
+        return {};
+    }
     beginBootQuietPeriod();
     // Move config from the legacy per-harness locations to the shared CortexKit
     // location BEFORE loading (hard cutover: the loader reads only CortexKit).
@@ -138,6 +145,7 @@ const server: Plugin = async (ctx) => {
                 type SessionListFn = () => Promise<
                     { data?: Array<{ id?: string }> } | Array<{ id?: string }>
                 >;
+                // SAFETY: probe guards every access at runtime. commentlint: allow(JUDGE)
                 const clientWithSessions = ctx.client as unknown as {
                     session?: { list?: SessionListFn };
                 };
@@ -463,6 +471,7 @@ const server: Plugin = async (ctx) => {
         if (fence) {
             void import("./plugin/conflict-warning-hook").then(({ sendSchemaFenceWarning }) =>
                 sendSchemaFenceWarning(
+                    // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
                     ctx.client as unknown as Record<string, unknown>,
                     ctx.directory,
                     fence,
@@ -476,6 +485,7 @@ const server: Plugin = async (ctx) => {
     if (conflictResult?.hasConflict) {
         // Fire-and-forget: send warning to the last active session for this project
         void sendConflictWarning(
+            // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
             ctx.client as unknown as Record<string, unknown>,
             ctx.directory,
             conflictResult,
@@ -486,6 +496,7 @@ const server: Plugin = async (ctx) => {
         const serverUrlStr =
             serverUrl instanceof URL ? serverUrl.toString().replace(/\/$/, "") : undefined;
         void cleanupConflictWarnings(
+            // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
             ctx.client as unknown as Record<string, unknown>,
             ctx.directory,
             serverUrlStr,
@@ -521,6 +532,7 @@ const server: Plugin = async (ctx) => {
                     void import("./plugin/conflict-warning-hook")
                         .then(({ sendStartupAnnouncement }) =>
                             sendStartupAnnouncement(
+                                // SAFETY: helper duck-types the client at runtime. commentlint: allow(JUDGE)
                                 ctx.client as unknown as Record<string, unknown>,
                                 ctx.directory,
                                 ANNOUNCEMENT_VERSION,
@@ -617,6 +629,7 @@ const server: Plugin = async (ctx) => {
             compactionOff: !isCompactionEnabled(pluginConfig),
             internalChildSessions: liveSessionState.internalChildSessions,
             tryReopenStorage,
+            // SAFETY: wrapper matches the hook's runtime call shape. commentlint: allow(JUDGE)
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(

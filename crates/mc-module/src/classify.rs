@@ -61,14 +61,20 @@ pub fn has_manifest_envelope(text: &str) -> bool {
     text.contains("<classify>") && text.contains("</classify>")
 }
 
-/// Mint an opaque child id without exposing the command id or project path in
-/// provider/session diagnostics. The registry, rather than this prefix, is the
-/// transform exemption authority.
-pub fn child_session_id(project: &str, command_id: &str) -> String {
+pub fn attempt_child_session_id(
+    project: &str,
+    command_id: &str,
+    attempt: usize,
+    model: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(project.as_bytes());
     hasher.update([0]);
     hasher.update(command_id.as_bytes());
+    hasher.update([0]);
+    hasher.update((attempt as u64).to_le_bytes());
+    hasher.update([0]);
+    hasher.update(model.as_bytes());
     let digest = hasher.finalize();
     format!("mc-dreamer:classify:{}", hex_prefix(&digest, 16))
 }
@@ -99,15 +105,36 @@ mod tests {
     }
 
     #[test]
-    fn child_ids_are_stable_but_lineage_scoped() {
+    fn child_ids_are_stable_per_attempt_and_distinct_across_attempt_identity() {
         assert_eq!(
-            child_session_id("project", "command"),
-            child_session_id("project", "command")
+            attempt_child_session_id("project", "command", 0, "prov/model-a"),
+            attempt_child_session_id("project", "command", 0, "prov/model-a"),
+            "a retry of the same attempt must reuse its session"
+        );
+        let base = attempt_child_session_id("project", "command", 0, "prov/model-a");
+        assert_ne!(
+            base,
+            attempt_child_session_id("project", "command", 1, "prov/model-b"),
+            "fallback attempts must use distinct sessions"
         );
         assert_ne!(
-            child_session_id("project", "command"),
-            child_session_id("other", "command")
+            base,
+            attempt_child_session_id("project", "command", 1, "prov/model-a"),
+            "the attempt slot alone must separate sessions"
         );
-        assert!(child_session_id("project", "command").starts_with("mc-dreamer:classify:"));
+        assert_ne!(
+            base,
+            attempt_child_session_id("project", "command", 0, "prov/model-b"),
+            "the model alone must separate sessions"
+        );
+        assert_ne!(
+            base,
+            attempt_child_session_id("other", "command", 0, "prov/model-a")
+        );
+        assert_ne!(
+            base,
+            attempt_child_session_id("project", "other", 0, "prov/model-a")
+        );
+        assert!(base.starts_with("mc-dreamer:classify:"));
     }
 }

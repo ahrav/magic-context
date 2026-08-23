@@ -17,7 +17,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 fastembed = { version = "=6.0.0", default-features = false, features = ["ort-load-dynamic"] }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 getrandom = "0.2"
@@ -26,3 +26,7 @@ getrandom = "0.2"
 hmac = "0.12"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "signal"] }
+
+[[test]]
+name = "broca_subprocess"
+harness = false
