@@ -91,6 +91,63 @@ impl HeaderReader {
     }
 }
 
+/// Reads one complete frame (header plus body) with cancellation-safe
+/// incremental progress: every await is a single `read` into a retained
+/// buffer, so a future dropped by `timeout` mid-frame loses no bytes and
+/// the next call resumes exactly where the stream left off. `read_exact`
+/// under `timeout` would instead discard a partial header or body and
+/// desynchronize every later read on the connection.
+struct FrameReceiver {
+    header: HeaderReader,
+    frame: Option<raw_client::RawFrame>,
+    body_filled: usize,
+}
+
+impl FrameReceiver {
+    fn new() -> Self {
+        Self {
+            header: HeaderReader::new(),
+            frame: None,
+            body_filled: 0,
+        }
+    }
+
+    /// Drives the receive one step; returns the decoded frame once its
+    /// body is fully buffered in `body`. An oversized length field is an
+    /// `InvalidData` error before any allocation: the length is untrusted
+    /// 32-bit input and the stream cannot resync past an unread body.
+    async fn step<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+        body: &mut Vec<u8>,
+    ) -> std::io::Result<Option<raw_client::RawFrame>> {
+        if self.frame.is_none() {
+            let Some(frame) = self.header.step(reader).await? else {
+                return Ok(None);
+            };
+            if frame.len > MAX_BODY_LEN {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            body.resize(frame.len as usize, 0);
+            self.body_filled = 0;
+            self.frame = Some(frame);
+        }
+        let len = self.frame.as_ref().map_or(0, |f| f.len as usize);
+        if self.body_filled < len {
+            let n = reader.read(&mut body[self.body_filled..len]).await?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            self.body_filled += n;
+            if self.body_filled < len {
+                return Ok(None);
+            }
+        }
+        self.body_filled = 0;
+        Ok(self.frame.take())
+    }
+}
+
 /// One authenticated connection with one open route to the echo module.
 async fn open_route(publication: &Path, session: &str) -> Result<(TcpStream, u16, u32), String> {
     let info = raw_client::discover(publication)?;
@@ -541,7 +598,6 @@ async fn run_throughput_inner(
         return Err("throughput arm requires a nonzero measurement window".to_owned());
     }
     let (mut stream, channel, epoch) = open_route(publication, "budget-throughput").await?;
-    let mut header = [0u8; raw_client::HEADER_LEN];
     let mut body = Vec::new();
     let mut outcomes = OutcomeCounts::default();
     let mut corr = CORR_BASE;
@@ -570,30 +626,20 @@ async fn run_throughput_inner(
     // The window deadline bounds every receive: a host that delays one
     // response past the deadline cannot stretch the fixed measurement
     // window's denominator, and a live-but-silent host cannot hang the
-    // run with an unbounded read.
+    // run with an unbounded read. The receiver's incremental state
+    // survives an expired timeout, so a window that closes mid-frame
+    // hands the partial frame to the drain instead of desynchronizing
+    // the stream.
+    let mut receiver = FrameReceiver::new();
     let window_deadline = start + cfg.warmup + cfg.measure;
     loop {
         let remaining = window_deadline.saturating_duration_since(Instant::now());
-        let received: Option<std::io::Result<raw_client::RawFrame>> = if remaining.is_zero() {
+        let received = if remaining.is_zero() {
             None
         } else {
-            tokio::time::timeout(remaining, async {
-                stream.read_exact(&mut header).await?;
-                let decoded = raw_client::decode_header(&header);
-                if decoded.len > MAX_BODY_LEN {
-                    // Untrusted 32-bit length: refuse the allocation and
-                    // fail the connection; the stream cannot resync past
-                    // an unread body.
-                    return Err(std::io::ErrorKind::InvalidData.into());
-                }
-                body.resize(decoded.len as usize, 0);
-                if decoded.len > 0 {
-                    stream.read_exact(&mut body).await?;
-                }
-                Ok(decoded)
-            })
-            .await
-            .ok()
+            tokio::time::timeout(remaining, receiver.step(&mut stream, &mut body))
+                .await
+                .ok()
         };
         let decoded = match received {
             None => {
@@ -616,7 +662,8 @@ async fn run_throughput_inner(
                 }
                 break;
             }
-            Some(Ok(decoded)) => decoded,
+            Some(Ok(None)) => continue,
+            Some(Ok(Some(decoded))) => decoded,
         };
         if decoded.ty == raw_client::TY_PING {
             continue;
@@ -696,27 +743,14 @@ async fn run_throughput_inner(
             if remaining.is_zero() {
                 return Err(undrained(outstanding.len()));
             }
-            // The deadline bounds the whole receive, body included, so a
-            // peer that sends a valid header and stalls mid-body cannot
-            // hang the drain.
-            let read = tokio::time::timeout(remaining, async {
-                stream.read_exact(&mut header).await?;
-                let decoded = raw_client::decode_header(&header);
-                if decoded.len > MAX_BODY_LEN {
-                    // Untrusted 32-bit length: refuse the allocation and
-                    // fail the connection; the stream cannot resync past
-                    // an unread body.
-                    return Err(std::io::ErrorKind::InvalidData.into());
-                }
-                body.resize(decoded.len as usize, 0);
-                if decoded.len > 0 {
-                    stream.read_exact(&mut body).await?;
-                }
-                std::io::Result::Ok(decoded)
-            })
-            .await;
+            // The deadline bounds the whole receive, body included, and
+            // the receiver resumes any frame the window loop left
+            // partially read, so a peer that stalls mid-body cannot hang
+            // the drain and the handoff never desynchronizes the stream.
+            let read = tokio::time::timeout(remaining, receiver.step(&mut stream, &mut body)).await;
             match read {
-                Ok(Ok(decoded)) => {
+                Ok(Ok(None)) => {}
+                Ok(Ok(Some(decoded))) => {
                     // Pings and frames naming no outstanding request are
                     // skipped exactly as in the measurement loop.
                     if decoded.ty != raw_client::TY_PING && outstanding.remove(&decoded.corr) {
