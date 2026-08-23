@@ -1324,6 +1324,34 @@ describe("deadline-independent setup coalescing", () => {
         expect(peer.connections.length).toBe(2);
         expect(conn2.frames.filter(isRouteOpen).length).toBe(1);
     });
+
+    test("a joiner whose stage expires before the shared flight settles never adopts it", async () => {
+        let nowMs = 0;
+        const { client, conn, peer } = await connected({
+            identity: IDENTITY,
+            clock: () => nowMs,
+        });
+        const cursor = frameCursor(conn);
+        const owner = client.call("magic-context", "own", undefined, { timeoutMs: 200_000 });
+        const joinerErr = rejection(
+            client.call("magic-context", "join", undefined, { timeoutMs: 100_000 }),
+        );
+        const open = await cursor.next(isRouteOpen);
+        // The joiner's stage expires on the fake clock while its real expiry
+        // timer stays pending; the flight then settles first, queueing the
+        // fulfillment ahead of any timer callback.
+        nowMs = 100_001;
+        await sendRouteOpenOk(conn, open.corr, 7, 77);
+        expectCallError(await joinerErr, "not_sent", "deadline_expired");
+        const body = await cursor.next(isRoutedRequest(7));
+        expect(bodyJson(body)).toEqual({ method: "own" });
+        await sendResponse(conn, body.corr, { ok: true }, 7, 77);
+        expect(await owner).toEqual({ ok: true });
+        // The expired joiner never adopted the route: one open, one body.
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isRouteOpen).length).toBe(1);
+        expect(conn.frames.filter(isRoutedFrame).length).toBe(1);
+    });
 });
 
 describe("facade helpers", () => {

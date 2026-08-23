@@ -168,9 +168,11 @@ interface SetupFlight<T> {
 
 /**
  * Race a shared flight against the caller's own stage deadline (KTD2). The
- * rejection implies `stage.isExpired()` via `armExpiryTimer`. `flight` has a
- * creation-time rejection observer, preventing unhandled rejections when a
- * caller abandons it after losing the race.
+ * rejection implies `stage.isExpired()`: `armExpiryTimer` re-arms until the
+ * clock provably crosses the end, and a fulfillment that settles after
+ * expiry is rejected rather than adopted. `flight` has a creation-time
+ * rejection observer, preventing unhandled rejections when a caller
+ * abandons it after losing the race.
  */
 async function raceAgainstStage<T>(
     flight: Promise<T>,
@@ -179,12 +181,17 @@ async function raceAgainstStage<T>(
 ): Promise<T> {
     let cancelTimer: (() => void) | undefined;
     try {
-        return await Promise.race([
+        const result = await Promise.race([
             flight,
             new Promise<never>((_resolve, reject) => {
                 cancelTimer = armExpiryTimer(stage, () => reject(makeError()));
             }),
         ]);
+        // A fulfillment queued ahead of an overdue timer callback must not
+        // let the caller adopt setup that exceeded its own stage budget;
+        // the stage is authoritative over timer delivery order.
+        if (stage.isExpired()) throw makeError();
+        return result;
     } finally {
         cancelTimer?.();
     }
