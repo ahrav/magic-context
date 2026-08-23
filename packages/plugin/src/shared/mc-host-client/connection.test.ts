@@ -890,6 +890,30 @@ describe("setup failures", () => {
         expect(generation.stats().activeTimers).toBe(0);
     });
 
+    test("an auth deadline observed mid-handshake retires as setup_deadline", async () => {
+        let nowMs = 0;
+        const peer = await h.startPeer({ authMode: "stall" });
+        const retirements: RetirementInfo[] = [];
+        const generation = h.createGeneration(peer, {
+            onRetired: (info) => retirements.push(info),
+        });
+        const failure = rejection(generation.start(Deadline.start(60_000, () => nowMs)));
+        const connection = await peer.waitForConnection();
+        await waitUntil(() => connection.authMessages.length === 1);
+        // The budget expires on the fake clock while the real 60s setup
+        // timer stays pending, so the auth reader observes expiry first —
+        // the same shape as auth I/O landing ahead of a lagging timer
+        // callback. Budget exhaustion must not read as an auth failure.
+        nowMs = 60_001;
+        await connection.sendRaw(Buffer.from([8, 0, 0, 0]));
+        const error = await failure;
+        expect((error as Error).name).toBe("AuthError");
+        expect((error as { code?: string }).code).toBe("deadline_expired");
+        expect(retirements.length).toBe(1);
+        expect(retirements[0]?.reason).toBe("setup_deadline");
+        expect(generation.stats().activeTimers).toBe(0);
+    });
+
     test("a dial to a closed port retires exactly once", async () => {
         const peer = await h.startPeer();
         const port = peer.port;
