@@ -8,8 +8,6 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
-
 use sha2::{Digest, Sha256};
 
 /// Version label for the committed compact JSON workload fixture.
@@ -157,22 +155,6 @@ pub fn open_loop_interval_ns(rate_per_sec: u64) -> Result<u64, String> {
         _ => Err(format!(
             "offered rate {rate_per_sec}/s has no representable nanosecond interval"
         )),
-    }
-}
-
-/// Explicit warmup and measurement windows over observed monotonic time
-/// since run start.
-#[derive(Debug, Clone, Copy)]
-pub struct Windows {
-    pub warmup: Duration,
-    pub measure: Duration,
-}
-
-impl Windows {
-    /// True when an observation issued at `since_start` falls inside the
-    /// measurement window (warmup excluded, post-window drain excluded).
-    pub fn in_measurement(&self, since_start: Duration) -> bool {
-        since_start >= self.warmup && since_start < self.warmup + self.measure
     }
 }
 

@@ -5,11 +5,9 @@
 #[path = "support/perf_measurement.rs"]
 mod perf_measurement;
 
-use std::time::Duration;
-
 use perf_measurement::{
     fixture_workload, nearest_rank, open_loop_interval_ns, tail_publishable, LatencySummary,
-    Outcome, OutcomeCounts, Windows, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
+    Outcome, OutcomeCounts, FIXTURE_BODY, TAIL_SAMPLE_FLOOR,
 };
 
 #[test]
@@ -118,18 +116,6 @@ fn unrepresentable_offered_rate_fails_validation() {
     assert!(open_loop_interval_ns(2_000_000_000).is_err());
     assert_eq!(open_loop_interval_ns(1_000_000_000).unwrap(), 1);
     assert_eq!(open_loop_interval_ns(20_000).unwrap(), 50_000);
-}
-
-#[test]
-fn measurement_window_excludes_warmup_and_post_window() {
-    let windows = Windows {
-        warmup: Duration::from_secs(2),
-        measure: Duration::from_secs(10),
-    };
-    assert!(!windows.in_measurement(Duration::from_secs(1)));
-    assert!(windows.in_measurement(Duration::from_secs(2)));
-    assert!(windows.in_measurement(Duration::from_millis(11_999)));
-    assert!(!windows.in_measurement(Duration::from_secs(12)));
 }
 
 #[test]

@@ -659,13 +659,9 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
 // --- plan / aggregate / finalize ----------------------------------------
 
 fn plan_arms() -> Vec<String> {
-    env_var("MC_IPC_BUDGET_ARMS")
-        .unwrap_or_else(|| {
-            format!("{ARM_ATOMIC},{ARM_TCP_SERIAL},{ARM_TCP_OPEN},{ARM_TCP_THROUGHPUT}")
-        })
-        .split(',')
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
+    [ARM_ATOMIC, ARM_TCP_SERIAL, ARM_TCP_OPEN, ARM_TCP_THROUGHPUT]
+        .iter()
+        .map(|s| (*s).to_owned())
         .collect()
 }
 

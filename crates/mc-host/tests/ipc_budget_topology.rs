@@ -72,7 +72,7 @@ fn synth(root: &Path, cpus: &[SynthCpu], nodes: &[(u32, &str)]) {
     }
 }
 
-fn cpu(cpu: u32, core: u32, _node: u32, l3: &str) -> SynthCpu {
+fn cpu(cpu: u32, core: u32, l3: &str) -> SynthCpu {
     SynthCpu {
         cpu,
         package: 0,
@@ -100,7 +100,7 @@ fn classifies_same_l3_pair() {
     let dir = tempfile::tempdir().unwrap();
     synth(
         dir.path(),
-        &[cpu(0, 0, 0, "0-3"), cpu(1, 1, 0, "0-3")],
+        &[cpu(0, 0, "0-3"), cpu(1, 1, "0-3")],
         &[(0, "0-1")],
     );
     let topo = read_topology(dir.path()).unwrap();
@@ -116,7 +116,7 @@ fn classifies_cross_numa_pair_and_preserves_order() {
     let dir = tempfile::tempdir().unwrap();
     synth(
         dir.path(),
-        &[cpu(0, 0, 0, "0"), cpu(4, 4, 1, "4")],
+        &[cpu(0, 0, "0"), cpu(4, 4, "4")],
         &[(0, "0"), (1, "4")],
     );
     let topo = read_topology(dir.path()).unwrap();
@@ -152,8 +152,8 @@ fn explicit_pair_failures_are_configuration_errors() {
                 siblings: "0-1".to_owned(),
                 l3_shared: Some("0-2".to_owned()),
             },
-            cpu(2, 1, 0, "0-2"),
-            cpu(8, 8, 1, "8"),
+            cpu(2, 1, "0-2"),
+            cpu(8, 8, "8"),
         ],
         &[(0, "0-2"), (1, "8")],
     );
@@ -187,7 +187,7 @@ fn one_node_allowed_set_skips_cross_numa_auto_selection() {
     let dir = tempfile::tempdir().unwrap();
     synth(
         dir.path(),
-        &[cpu(0, 0, 0, "0-1"), cpu(1, 1, 0, "0-1")],
+        &[cpu(0, 0, "0-1"), cpu(1, 1, "0-1")],
         &[(0, "0-1")],
     );
     let topo = read_topology(dir.path()).unwrap();
