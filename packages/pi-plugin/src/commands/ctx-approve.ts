@@ -19,7 +19,6 @@ export function registerCtxApproveCommand(
 		description:
 			"Approve (or --revoke) the exact current revision of a project memory claim",
 		handler: async (args, ctx) => {
-			void ctx;
 			const sessionId = resolveSessionId(ctx);
 			if (!sessionId) {
 				sendCtxStatusMessage(pi, {
