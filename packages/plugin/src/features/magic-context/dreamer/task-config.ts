@@ -44,6 +44,15 @@ export function buildDreamTaskRuntimeConfigs(
     });
 }
 
+/** Built from dreamer-level inputs only so historian model settings cannot select a classify model. commentlint: allow(JUDGE) */
+export function buildClassifyModelChain(
+    taskModel: string | undefined,
+    dreamerModel: string | undefined,
+    fallbackModels: readonly string[] | undefined,
+): string[] {
+    return resolveFallbackChain([taskModel ?? "", dreamerModel ?? "", ...(fallbackModels ?? [])]);
+}
+
 /**
  * The collection privacy gate (Option C): user-behavior observation candidates
  * are stored during historian runs ONLY when the user has scheduled the

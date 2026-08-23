@@ -13,6 +13,7 @@ import {
     applyClassifications,
     type ClassifyArgs,
     type ClassifyModuleCallArgs,
+    ClassifyModuleFailureError,
     runClassify,
 } from "./classify";
 import { acquireLease } from "./lease";
@@ -240,8 +241,34 @@ describe("module-backed classification", () => {
         args.moduleProjectRoot = "/repo";
         args.moduleContextStoreUuid = "store";
         args.moduleAuthorityGeneration = 3;
+        args.modelChain = ["test/classify-model"];
         args.moduleClient = { call: async (call) => onCall(call) };
         return args;
+    }
+
+    function manifestForItems(call: ClassifyModuleCallArgs): { result: object } {
+        const items = (call.body as { payload: { items: Array<{ memory_id: number }> } }).payload
+            .items;
+        const manifest = items
+            .map(
+                (item) =>
+                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
+            )
+            .join("\n");
+        return { result: { manifest_text: `<classify>${manifest}</classify>` } };
+    }
+
+    function acceptAllRows(call: ClassifyModuleCallArgs): { result: object } {
+        const rows = (call.body as { arguments: { rows: Array<{ memory_id: number }> } }).arguments
+            .rows;
+        return { result: { accepted: rows.map((row) => row.memory_id), rejected: [] } };
+    }
+
+    function mirrorAll(db: Database, projectIdentity: string, contextIds: number[]): void {
+        for (const [index, contextId] of contextIds.entries()) {
+            addMirrorMapping(db, projectIdentity, contextId, 9500 + index, `hash-${index}`);
+        }
+        installAuthorityManagedMarker(db, projectIdentity, "store");
     }
 
     function addMemories(db: Database, projectIdentity: string, count: number): number[] {
@@ -366,6 +393,207 @@ describe("module-backed classification", () => {
 
             expect(itemIds).toHaveLength(10);
             expect(itemIds).not.toContain(contextIds[10]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("sends the classify-owned model chain to dreamer.run_task only", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-chain";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.modelChain = ["prov/override", "prov/default", "prov/fb"];
+
+            await runClassify(args);
+
+            const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            const applyCall = calls.find((call) => call.method === "memory.set_classification");
+            const payload = (
+                taskCall?.body as { payload: { model_chain: string[]; timeout_ms: number } }
+            ).payload;
+            expect(payload.model_chain).toEqual(["prov/override", "prov/default", "prov/fb"]);
+            expect(Number.isInteger(payload.timeout_ms)).toBe(true);
+            expect(payload.timeout_ms).toBeGreaterThan(0);
+            expect(JSON.stringify(applyCall?.body)).not.toContain("model_chain");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rejects an empty effective model chain before any module call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-empty-chain";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.modelChain = [];
+
+            await expect(runClassify(args)).rejects.toThrow(/model chain/);
+            expect(calls).toHaveLength(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("caps a short slice to the live remainder instead of the fixed ceiling", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-short-slice";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 30_000;
+
+            await runClassify(args);
+
+            const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            expect(taskCall?.timeoutMs).toBeGreaterThan(0);
+            expect(taskCall?.timeoutMs).toBeLessThanOrEqual(30_000);
+            const payload = (taskCall?.body as { payload: { timeout_ms: number } }).payload;
+            expect(payload.timeout_ms).toBeGreaterThan(0);
+            expect(payload.timeout_ms).toBeLessThanOrEqual(30_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("caps a long slice at the module ceiling", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-long-slice";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 10 * 660_000;
+
+            await runClassify(args);
+
+            const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            expect(taskCall?.timeoutMs).toBe(660_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a slice that expires during prompt construction starts no module call and leaves the chunk unbanked", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-expired-slice";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            // The loop admission check sees time remaining, but by the recompute
+            // just before the module call (after prompt construction) the budget
+            // has expired — the getter models the wall clock passing in between.
+            let deadlineReads = 0;
+            Object.defineProperty(args, "deadline", {
+                get: () => {
+                    deadlineReads += 1;
+                    return deadlineReads === 1 ? Date.now() + 60_000 : Date.now() - 1;
+                },
+            });
+
+            const result = await runClassify(args);
+
+            expect(calls).toHaveLength(0);
+            expect(result.classified).toBe(0);
+            expect(result.remaining).toBe(10);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("later chunks recompute their own remaining shares after earlier work consumes time", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-multi-chunk";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 120));
+
+            const taskCalls: Array<{ timeoutMs: number | undefined }> = [];
+            const args = moduleArgs(db, projectIdentity, async (call) => {
+                if (call.method === "dreamer.run_task") {
+                    taskCalls.push({ timeoutMs: call.timeoutMs });
+                    if (taskCalls.length === 1) {
+                        await new Promise((resolve) => setTimeout(resolve, 200));
+                    }
+                    return manifestForItems(call);
+                }
+                return acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 10_000;
+
+            await runClassify(args);
+
+            expect(taskCalls).toHaveLength(2);
+            // Chunk 1 gets half the budget; chunk 2, as the last chunk, gets the
+            // live remainder — larger than its original half share but reduced by
+            // the 200ms chunk 1 consumed.
+            expect(taskCalls[0].timeoutMs).toBeLessThanOrEqual(5_000);
+            expect(taskCalls[1].timeoutMs).toBeGreaterThan(5_000);
+            expect(taskCalls[1].timeoutMs).toBeLessThanOrEqual(9_900);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a module failure stays transient and never falls back to the TypeScript child", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-no-fallback";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            let childSessionsCreated = 0;
+            const args = moduleArgs(db, projectIdentity, () => {
+                throw new Error("producer run aborted: lease lost");
+            });
+            args.client = {
+                session: {
+                    create: async () => {
+                        childSessionsCreated += 1;
+                        return { data: { id: "unexpected-child" } };
+                    },
+                },
+            } as never;
+
+            const rejection = await runClassify(args).catch((error: unknown) => error);
+            expect(rejection).toBeInstanceOf(ClassifyModuleFailureError);
+            expect((rejection as ClassifyModuleFailureError).transient).toBe(true);
+            expect(childSessionsCreated).toBe(0);
         } finally {
             closeQuietly(db);
         }

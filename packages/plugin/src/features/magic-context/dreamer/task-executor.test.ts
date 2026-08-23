@@ -748,7 +748,12 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         const leaseKey = leaseKeyFor("classify-memories", project);
         expect(acquireLease(db, "holder-rust-classify", leaseKey)).toBe(true);
         const result = await executor(
-            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
+            {
+                task: "classify-memories",
+                schedule: "0 6 * * *",
+                timeoutMinutes: 20,
+                model: "test/classify-model",
+            },
             { db, projectIdentity: project, holderId: "holder-rust-classify", leaseKey },
         );
         expect(result.status).toBe("completed");
@@ -818,7 +823,12 @@ describe("createDreamTaskExecutor — classify-memories", () => {
         expect(acquireLease(db, "holder-rust-classify-failure", leaseKey)).toBe(true);
 
         const result = await executor(
-            { task: "classify-memories", schedule: "0 6 * * *", timeoutMinutes: 20 },
+            {
+                task: "classify-memories",
+                schedule: "0 6 * * *",
+                timeoutMinutes: 20,
+                model: "test/classify-model",
+            },
             {
                 db,
                 projectIdentity: project,

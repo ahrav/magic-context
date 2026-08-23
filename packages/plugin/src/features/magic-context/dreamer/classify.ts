@@ -65,6 +65,8 @@ const CLASSIFY_CHUNK_SIZE = 100;
 
 // Module-side classify awaits a full broca producer run (CLASSIFY_AWAIT_TIMEOUT is
 // 600s in the module); the transport request must outlive it plus dispatch slack.
+// This is a ceiling, not the request timeout: each call is further capped by its
+// chunk's live slice remainder.
 const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
 
 export interface ClassifyModuleCallArgs {
@@ -108,6 +110,10 @@ export interface ClassifyArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: string;
     fallbackModels?: readonly string[];
+    /** Ordered classify model chain (task override → dreamer default → fallbacks)
+     *  the module route sends verbatim; the TypeScript provider path keeps using
+     *  model/fallbackModels instead. */
+    modelChain?: readonly string[];
     /** Present only for rust-mode projects whose memories authority is MODULE. */
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
@@ -337,7 +343,16 @@ async function classifyOneChunk(
             anchors,
         });
         if (moduleRoute) {
-            const run = await runClassifyThroughModule(args, chunk, anchors, signal);
+            const run = await runClassifyThroughModule(
+                args,
+                chunk,
+                anchors,
+                startedAt + sliceMs,
+                signal,
+            );
+            // A null run means the slice expired before the module call could
+            // start: the chunk stays unbanked and is not a completed invocation.
+            if (run === null) return { classified: 0, changed: 0 };
             recordInvocation(args, startedAt, { status: "completed" });
             return run;
         }
@@ -453,13 +468,26 @@ async function runClassifyThroughModule(
     args: ClassifyArgs,
     chunk: ClassifyCandidate[],
     anchors: ClassifyAnchorMemory[],
+    sliceDeadline: number,
     signal: AbortSignal,
-): Promise<{ classified: number; changed: number }> {
+): Promise<{ classified: number; changed: number } | null> {
+    const modelChain = args.modelChain ?? [];
+    if (modelChain.length === 0) {
+        throw new Error(
+            "classify has no effective model chain (task model, dreamer model, and fallback_models are all unset or malformed)",
+        );
+    }
     const prompt = buildClassifyPrompt({
         projectPath: args.projectIdentity,
         memories: chunk.map(toPromptMemory),
         anchors,
     });
+    // Prompt construction consumes the slice budget.
+    const remainingMs = Math.min(sliceDeadline, args.deadline) - Date.now();
+    if (remainingMs <= 0) {
+        log("[dreamer] classify: slice budget expired before the module call; chunk left unbanked");
+        return null;
+    }
     const response = await args.moduleClient?.call({
         sessionId: args.moduleSessionId as string,
         projectRoot: args.moduleProjectRoot as string,
@@ -479,6 +507,8 @@ async function runClassifyThroughModule(
             authority_generation: args.moduleAuthorityGeneration,
             payload: {
                 prompt_body: prompt,
+                model_chain: [...modelChain],
+                timeout_ms: remainingMs,
                 items: chunk.map((candidate) => ({
                     memory_id: candidate.id,
                     content_hash: candidate.normalizedHash,
@@ -488,7 +518,7 @@ async function runClassifyThroughModule(
         signal,
         // The module drives a full producer run (model call included) before replying,
         // so this request carries the classify slice budget, not the transport default.
-        timeoutMs: CLASSIFY_MODULE_RUN_TIMEOUT_MS,
+        timeoutMs: Math.min(CLASSIFY_MODULE_RUN_TIMEOUT_MS, remainingMs),
     });
     const result = (response as { result?: unknown } | null)?.result ?? response;
     if (!result || typeof result !== "object")
