@@ -248,10 +248,12 @@ async function jamWriter(
  * Arrange to pause the NEXT accepted connection's reads before the client's
  * auth hello is processed (the pause runs in a microtask ahead of any socket
  * 'data' event), deterministically stalling setup until `resumeReading()`.
- * Must be called before the dial is triggered.
+ * Index-based selection: connections accepted before this call are never
+ * returned, even when their peer-side sockets have not observed destruction
+ * yet. Must be called before the dial is triggered.
  */
 function stallNextConnection(peer: FakePeer): Promise<FakePeerConnection> {
-    return peer.waitForConnection().then((conn) => {
+    return peer.waitForConnectionAfter(peer.connections.length).then((conn) => {
         conn.pauseReading();
         return conn;
     });
@@ -1205,7 +1207,13 @@ describe("deadline-independent setup coalescing", () => {
     });
 
     test("a stale route success is re-evaluated before adoption and keeps the replay token", async () => {
-        const { client, conn, peer } = await connected({ identity: IDENTITY });
+        const sleeps: number[] = [];
+        const { client, conn, peer } = await connected({
+            identity: IDENTITY,
+            sleep: async (ms) => {
+                sleeps.push(ms);
+            },
+        });
         const cursor = frameCursor(conn);
         const callA = client.call("magic-context", "a");
         const callB = client.call("magic-context", "b");
@@ -1255,6 +1263,42 @@ describe("deadline-independent setup coalescing", () => {
         expect(conn.frames.filter(isRoutedFrame)).toEqual([]);
         expect(peer.connections.length).toBe(2);
         expect(conn2.frames.filter(isRouteOpen).length).toBe(2);
+        // Each surviving caller paced its stale-success re-entry once; no
+        // other retry path slept.
+        expect(sleeps).toEqual([100, 100]);
+    });
+
+    test("stale connection adoptions pace replacement dials instead of spinning", async () => {
+        let nowMs = 0;
+        const sleeps: number[] = [];
+        const { client, peer } = await retiredHarness({
+            clock: () => nowMs,
+            sleep: async (ms) => {
+                sleeps.push(ms);
+                nowMs += ms;
+            },
+        });
+        // Every replacement dial completes auth and retires in the same
+        // read chunk: a Goodbye coalesced with the ServerHello. Setup then
+        // resolves on an already-retired generation, so adoption fails and
+        // the caller must re-dial.
+        peer.helloTrailer = encodePeerFrame({
+            ty: PeerFrameType.Goodbye,
+            channel: 0,
+            epoch: 0,
+            corr: 0n,
+        });
+
+        const error = expectCallError(
+            await rejection(client.call("mod-a", "m", undefined, { timeoutMs: 400 })),
+            "not_sent",
+        );
+        expect(error.message).toContain("connect failed");
+        // Exactly three paced dials (fake-clock 0ms, 100ms, 300ms) fit the
+        // 400ms stage; an unpaced loop would redial at socket speed and
+        // never advance this fake clock.
+        expect(peer.connections.length).toBe(4);
+        expect(sleeps.filter((ms) => ms > 0)).toEqual([100, 200, 100]);
     });
 
     test("owner close during a shared route opening fences the late success without replacement", async () => {

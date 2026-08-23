@@ -152,6 +152,8 @@ export class FakePeerConnection {
         private readonly options: Required<Pick<FakePeerOptions, "authMode" | "daemonVer">> & {
             key: Buffer;
             daemonId: Buffer;
+            /** Sampled at ServerHello time so tests can flip it per dial. */
+            helloTrailer: () => Buffer | null;
         },
     ) {
         this.socket = socket;
@@ -267,14 +269,17 @@ export class FakePeerConnection {
                     proof[0] = (proof[0] as number) ^ 0x01;
                 }
                 this.stage = "auth-client";
-                this.socket.write(
-                    encodePeerAuthMessage({
-                        daemon_id: Array.from(this.options.daemonId),
-                        server_nonce: Array.from(this.serverNonce),
-                        daemon_ver: this.options.daemonVer,
-                        server_proof: Array.from(proof),
-                    }),
-                );
+                const hello = encodePeerAuthMessage({
+                    daemon_id: Array.from(this.options.daemonId),
+                    server_nonce: Array.from(this.serverNonce),
+                    daemon_ver: this.options.daemonVer,
+                    server_proof: Array.from(proof),
+                });
+                // A trailer rides the same write as the ServerHello, so the
+                // client sees both in one read chunk: auth completes and the
+                // trailer frame dispatches before setup returns.
+                const trailer = this.options.helloTrailer();
+                this.socket.write(trailer ? Buffer.concat([hello, trailer]) : hello);
                 return;
             }
         }
@@ -391,6 +396,13 @@ export class FakePeer {
     readonly connections: FakePeerConnection[] = [];
     readonly key: Buffer;
     readonly daemonId: Buffer;
+    /**
+     * Raw bytes coalesced into the same write as every subsequent
+     * ServerHello (for example an encoded Goodbye frame), so the client's
+     * setup retires synchronously before it returns. Mutable so a test can
+     * enable it after an initial clean connection.
+     */
+    helloTrailer: Buffer | null = null;
 
     private readonly server: Server;
     private readonly connectionWaiters: ((connection: FakePeerConnection) => void)[] = [];
@@ -408,6 +420,7 @@ export class FakePeer {
             daemonVer: options.daemonVer ?? "fake-peer/0.0.1",
             key: this.key,
             daemonId: this.daemonId,
+            helloTrailer: () => this.helloTrailer,
         };
         server.on("connection", (socket: Socket) => {
             const connection = new FakePeerConnection(socket, connectionOptions);
@@ -447,6 +460,36 @@ export class FakePeer {
             const timer = setTimeout(() => {
                 // Remove the expired waiter so it cannot consume the next
                 // connection ahead of a live waiter.
+                const index = this.connectionWaiters.indexOf(waiter);
+                if (index >= 0) this.connectionWaiters.splice(index, 1);
+                reject(new Error("fake peer timed out waiting for a connection"));
+            }, timeoutMs);
+            this.connectionWaiters.push(waiter);
+        });
+    }
+
+    /**
+     * Resolve with the connection at zero-based accept index `count`.
+     * Called with the current `connections.length`, this is exactly the
+     * next accepted connection, regardless of whether earlier peer-side
+     * sockets have observed their destruction yet — the guarantee
+     * `waitForConnection`'s newest-live selection cannot give.
+     */
+    waitForConnectionAfter(count: number, timeoutMs = 5_000): Promise<FakePeerConnection> {
+        const existing = this.connections[count];
+        if (existing) return Promise.resolve(existing);
+        return new Promise((resolve, reject) => {
+            const waiter = (): void => {
+                const target = this.connections[count];
+                if (!target) {
+                    // Accepts before the requested index re-arm the waiter.
+                    this.connectionWaiters.push(waiter);
+                    return;
+                }
+                clearTimeout(timer);
+                resolve(target);
+            };
+            const timer = setTimeout(() => {
                 const index = this.connectionWaiters.indexOf(waiter);
                 if (index >= 0) this.connectionWaiters.splice(index, 1);
                 reject(new Error("fake peer timed out waiting for a connection"));

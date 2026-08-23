@@ -59,8 +59,12 @@ const DEFAULT_ROUTE_OPEN_DEADLINE_MS = 30_000;
 const DEFAULT_SHUTDOWN_DEADLINE_MS = 5_000;
 /** Channel-0 control bodies are capped below the frame limit (wire doc 7.1). */
 const MAX_CONTROL_BODY_LEN = 65_536;
-const ROUTE_RETRY_BASE_MS = 100;
-const ROUTE_RETRY_CAP_MS = 2_000;
+/**
+ * Escalating retry schedule shared by the allowlisted route.open retry
+ * backoff and the stale-success replacement pacing in both setup loops.
+ */
+const SETUP_RETRY_BASE_MS = 100;
+const SETUP_RETRY_CAP_MS = 2_000;
 const DEFAULT_MAX_DIAGNOSTIC_EVENTS_PER_SECOND = 500;
 const MAX_DIAGNOSTIC_STRING_LEN = 128;
 
@@ -214,6 +218,25 @@ function routeStageError(): SubcCallError {
         "route.open deadline expired before a route was opened",
         "deadline_expired",
     );
+}
+
+/**
+ * Escalating bounded pacer for the stale-success re-entry (KTD4
+ * fall-through) in a setup loop. A stale success settles without consuming
+ * the caller's budget, so an unpaced re-entry would replace flights at
+ * socket speed while the daemon keeps retiring fresh setup (for example a
+ * Goodbye coalesced into the same read chunk as the final setup bytes).
+ * Each wait is clamped to the caller's stage, so pacing never extends it.
+ */
+function makeReplacementPacer(
+    stage: Deadline,
+    sleep: (ms: number) => Promise<void>,
+): () => Promise<void> {
+    let delayMs = SETUP_RETRY_BASE_MS;
+    return async () => {
+        await sleep(stage.stageBudgetMs(delayMs));
+        delayMs = Math.min(delayMs * 2, SETUP_RETRY_CAP_MS);
+    };
 }
 
 /**
@@ -525,6 +548,7 @@ export class SubcClient {
         // R1: one immutable handshake stage per caller, derived once from its
         // own operation deadline and kept through every join and replacement.
         const stage = deadline.stage(this.handshakeTimeoutMs);
+        const pace = makeReplacementPacer(stage, this.sleep);
         for (;;) {
             if (this.closeStarted) throw new SubcError("client closed", "client_closed");
             const active = this.active;
@@ -562,6 +586,13 @@ export class SubcClient {
             // stale success re-enters recovery under the unchanged stage.
             if (this.active === conn && !conn.generation.isRetired()) return conn;
             if (stage.isExpired()) throw connectionStageError();
+            // Pace the replacement dial unless a live candidate is already
+            // installed (the loop head adopts it without new I/O).
+            const candidate = this.active;
+            if (!candidate || candidate.generation.isRetired()) {
+                await pace();
+                if (stage.isExpired()) throw connectionStageError();
+            }
         }
     }
 
@@ -863,6 +894,7 @@ export class SubcClient {
         // R1: one immutable route-open stage per caller, derived once and
         // kept through every join and replacement decision.
         const stage = deadline.stage(this.routeOpenDeadlineMs);
+        const pace = makeReplacementPacer(stage, this.sleep);
         for (;;) {
             let cached = this.routes.get(key);
             if (!cached) {
@@ -914,6 +946,13 @@ export class SubcClient {
                 return handle;
             }
             if (stage.isExpired()) throw routeStageError();
+            // Pace the replacement open unless a live handle is already
+            // installed (the loop head adopts it without new I/O).
+            const current = this.routes.get(key);
+            if (!(current?.handle && this.isLiveHandle(current.handle))) {
+                await pace();
+                if (stage.isExpired()) throw routeStageError();
+            }
         }
     }
 
@@ -928,10 +967,10 @@ export class SubcClient {
         deadline: Deadline,
         flight: SetupFlight<RouteHandle>,
     ): Promise<RouteHandle> {
-        let delayMs = ROUTE_RETRY_BASE_MS;
+        let delayMs = SETUP_RETRY_BASE_MS;
         const backoff = async (): Promise<boolean> => {
             await this.sleep(deadline.stageBudgetMs(delayMs));
-            delayMs = Math.min(delayMs * 2, ROUTE_RETRY_CAP_MS);
+            delayMs = Math.min(delayMs * 2, SETUP_RETRY_CAP_MS);
             return !deadline.isExpired();
         };
         for (;;) {
