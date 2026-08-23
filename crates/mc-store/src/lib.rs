@@ -7320,7 +7320,9 @@ impl McStore {
             for table in tables {
                 let quoted = format!("\"{}\"", table.replace('"', "\"\""));
                 let has_session_id = {
-                    let mut stmt = tx.prepare_cached(&format!("PRAGMA table_info({quoted})"))?;
+                    // Not prepare_cached: the SQL text embeds the table name, so
+                    // each entry is one-shot and would only churn the LRU cache.
+                    let mut stmt = tx.prepare(&format!("PRAGMA table_info({quoted})"))?;
                     let columns = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
                         .collect::<Result<Vec<_>, _>>()?;

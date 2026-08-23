@@ -393,7 +393,13 @@ function telemetryDatabase(dbPath: string): Database {
     let db = telemetryDbByPath.get(dbPath);
     if (!db) {
         db = new Database(dbPath);
-        db.exec("PRAGMA busy_timeout=0");
+        try {
+            db.exec("PRAGMA busy_timeout=0");
+        } catch (err) {
+            // The handle is not in the map yet, so nothing else closes it.
+            closeQuietly(db);
+            throw err;
+        }
         telemetryDbByPath.set(dbPath, db);
     }
     return db;
