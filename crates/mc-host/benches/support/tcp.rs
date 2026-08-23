@@ -38,6 +38,51 @@ fn record(hist: &mut Histogram<u64>, outcomes: &mut OutcomeCounts, value_ns: u64
     }
 }
 
+/// Classifies one non-ping terminal frame against the fixture contract.
+fn classify_terminal(ty: u8, body: &[u8]) -> Outcome {
+    match ty {
+        TY_RESPONSE if body == FIXTURE_BODY => Outcome::Success,
+        TY_RESPONSE => Outcome::BodyMismatch,
+        TY_ERROR => Outcome::ProtocolError,
+        _ => Outcome::UnexpectedFrame,
+    }
+}
+
+/// Incremental header reader whose progress survives `select!`
+/// cancellation: each await is one `read` call, so a cancelled branch
+/// never discards partially read header bytes (`read_exact` is not
+/// cancellation-safe and would desync the stream).
+struct HeaderReader {
+    buf: [u8; raw_client::HEADER_LEN],
+    filled: usize,
+}
+
+impl HeaderReader {
+    fn new() -> Self {
+        Self {
+            buf: [0u8; raw_client::HEADER_LEN],
+            filled: 0,
+        }
+    }
+
+    /// Reads at most once; returns the decoded frame header when complete.
+    async fn step<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> std::io::Result<Option<raw_client::RawFrame>> {
+        let n = reader.read(&mut self.buf[self.filled..]).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.filled += n;
+        if self.filled < raw_client::HEADER_LEN {
+            return Ok(None);
+        }
+        self.filled = 0;
+        Ok(Some(raw_client::decode_header(&self.buf)))
+    }
+}
+
 /// One authenticated connection with one open route to the echo module.
 async fn open_route(publication: &Path, session: &str) -> Result<(TcpStream, u16, u32), String> {
     let info = raw_client::discover(publication)?;
@@ -138,11 +183,9 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
             if !measured {
                 break;
             }
-            match decoded.ty {
-                TY_RESPONSE if body == FIXTURE_BODY => record(&mut hist, &mut outcomes, rtt_ns),
-                TY_RESPONSE => outcomes.record(Outcome::BodyMismatch),
-                TY_ERROR => outcomes.record(Outcome::ProtocolError),
-                _ => outcomes.record(Outcome::UnexpectedFrame),
+            match classify_terminal(decoded.ty, &body) {
+                Outcome::Success => record(&mut hist, &mut outcomes, rtt_ns),
+                other => outcomes.record(other),
             }
             break;
         }
@@ -207,19 +250,20 @@ async fn run_open_loop_inner(
     let (stream, channel, epoch) = open_route(publication, "budget-open").await?;
     let (mut read_half, mut write_half) = stream.into_split();
 
-    let mut sched_hist = cfg.histogram.build()?;
-    let mut issue_hist = cfg.histogram.build()?;
-    let mut lag_hist = cfg.histogram.build()?;
-    let mut outcomes = OutcomeCounts::default();
-
     let start = Instant::now();
-    let warmup_ns = cfg.warmup.as_nanos() as u64;
+    let mut state = OpenLoopState {
+        sched_hist: cfg.histogram.build()?,
+        issue_hist: cfg.histogram.build()?,
+        lag_hist: cfg.histogram.build()?,
+        outcomes: OutcomeCounts::default(),
+        pending: HashMap::new(),
+        start,
+        warmup_ns: cfg.warmup.as_nanos() as u64,
+        body: Vec::new(),
+    };
     let deadline_ns = (cfg.warmup + cfg.measure).as_nanos() as u64;
-    let mut pending: HashMap<u64, (u64, u64)> = HashMap::new();
     let mut scheduled_slots = 0u64;
-    let mut inflight = 0usize;
-    let mut header = [0u8; raw_client::HEADER_LEN];
-    let mut body = Vec::new();
+    let mut header = HeaderReader::new();
     let mut slot = 0u64;
 
     'sender: loop {
@@ -237,32 +281,30 @@ async fn run_open_loop_inner(
             }
             tokio::select! {
                 () = tokio::time::sleep_until(at.into()) => break,
-                read = read_half.read_exact(&mut header) => {
-                    if read.is_err() {
-                        drain_failure(&mut pending, &mut outcomes, warmup_ns, Outcome::PeerClosed);
-                        break 'sender;
+                step = header.step(&mut read_half) => {
+                    match step {
+                        Ok(None) => {}
+                        Ok(Some(frame)) => {
+                            if state.consume(&mut read_half, frame).await.is_err() {
+                                state.fail_pending(Outcome::PeerClosed);
+                                break 'sender;
+                            }
+                        }
+                        Err(_) => {
+                            state.fail_pending(Outcome::PeerClosed);
+                            break 'sender;
+                        }
                     }
-                    if consume_frame(
-                        &mut read_half, &header, &mut body, &mut pending, start, warmup_ns,
-                        &mut sched_hist, &mut issue_hist, &mut lag_hist, &mut outcomes,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        drain_failure(&mut pending, &mut outcomes, warmup_ns, Outcome::PeerClosed);
-                        break 'sender;
-                    }
-                    inflight = pending.len();
                 }
             }
         }
-        let measured = scheduled_ns >= warmup_ns;
+        let measured = scheduled_ns >= state.warmup_ns;
         if measured {
             scheduled_slots += 1;
         }
-        if inflight >= cfg.inflight_cap {
+        if state.pending.len() >= cfg.inflight_cap {
             if measured {
-                outcomes.record(Outcome::MissedSlot);
+                state.outcomes.record(Outcome::MissedSlot);
             }
             continue;
         }
@@ -271,137 +313,113 @@ async fn run_open_loop_inner(
         let issue_ns = start.elapsed().as_nanos() as u64;
         if write_half.write_all(&frame).await.is_err() {
             if measured {
-                outcomes.record(Outcome::WriteFailure);
+                state.outcomes.record(Outcome::WriteFailure);
             }
-            drain_failure(&mut pending, &mut outcomes, warmup_ns, Outcome::PeerClosed);
+            state.fail_pending(Outcome::PeerClosed);
             break;
         }
-        pending.insert(corr, (scheduled_ns, issue_ns));
-        inflight = pending.len();
+        state.pending.insert(corr, (scheduled_ns, issue_ns));
     }
 
     // Bounded drain: every in-flight request resolves or is counted
     // unresolved; the loop cannot hang on a lost response.
     let drain_deadline = Instant::now() + DRAIN_BUDGET;
-    while !pending.is_empty() {
+    while !state.pending.is_empty() {
         let remaining = drain_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            drain_failure(
-                &mut pending,
-                &mut outcomes,
-                warmup_ns,
-                Outcome::UnresolvedAtDrain,
-            );
+            state.fail_pending(Outcome::UnresolvedAtDrain);
             break;
         }
-        let read = tokio::time::timeout(remaining, read_half.read_exact(&mut header)).await;
-        match read {
-            Ok(Ok(_)) => {
-                if consume_frame(
-                    &mut read_half,
-                    &header,
-                    &mut body,
-                    &mut pending,
-                    start,
-                    warmup_ns,
-                    &mut sched_hist,
-                    &mut issue_hist,
-                    &mut lag_hist,
-                    &mut outcomes,
-                )
-                .await
-                .is_err()
-                {
-                    drain_failure(&mut pending, &mut outcomes, warmup_ns, Outcome::PeerClosed);
+        match tokio::time::timeout(remaining, header.step(&mut read_half)).await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(frame))) => {
+                if state.consume(&mut read_half, frame).await.is_err() {
+                    state.fail_pending(Outcome::PeerClosed);
                     break;
                 }
             }
             Ok(Err(_)) => {
-                drain_failure(&mut pending, &mut outcomes, warmup_ns, Outcome::PeerClosed);
+                state.fail_pending(Outcome::PeerClosed);
                 break;
             }
             Err(_) => {
-                drain_failure(
-                    &mut pending,
-                    &mut outcomes,
-                    warmup_ns,
-                    Outcome::UnresolvedAtDrain,
-                );
+                state.fail_pending(Outcome::UnresolvedAtDrain);
                 break;
             }
         }
     }
 
     Ok(OpenLoopResult {
-        sched_to_completion: sched_hist,
-        issue_to_completion: issue_hist,
-        scheduler_lag: lag_hist,
-        outcomes,
+        sched_to_completion: state.sched_hist,
+        issue_to_completion: state.issue_hist,
+        scheduler_lag: state.lag_hist,
+        outcomes: state.outcomes,
         scheduled_slots,
         elapsed: start.elapsed(),
     })
 }
 
-/// Resolves every pending measured request with one failure outcome.
-fn drain_failure(
-    pending: &mut HashMap<u64, (u64, u64)>,
-    outcomes: &mut OutcomeCounts,
-    warmup_ns: u64,
-    outcome: Outcome,
-) {
-    for (_, (scheduled_ns, _)) in pending.drain() {
-        if scheduled_ns >= warmup_ns {
-            outcomes.record(outcome);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn consume_frame(
-    read_half: &mut tokio::net::tcp::OwnedReadHalf,
-    header: &[u8; raw_client::HEADER_LEN],
-    body: &mut Vec<u8>,
-    pending: &mut HashMap<u64, (u64, u64)>,
+/// Reader-side bookkeeping for one open-loop run: the three retained
+/// distributions, outcome counters, and in-flight request metadata.
+struct OpenLoopState {
+    sched_hist: Histogram<u64>,
+    issue_hist: Histogram<u64>,
+    lag_hist: Histogram<u64>,
+    outcomes: OutcomeCounts,
+    pending: HashMap<u64, (u64, u64)>,
     start: Instant,
     warmup_ns: u64,
-    sched_hist: &mut Histogram<u64>,
-    issue_hist: &mut Histogram<u64>,
-    lag_hist: &mut Histogram<u64>,
-    outcomes: &mut OutcomeCounts,
-) -> Result<(), ()> {
-    let decoded = raw_client::decode_header(header);
-    body.resize(decoded.len as usize, 0);
-    if decoded.len > 0 && read_half.read_exact(body).await.is_err() {
-        return Err(());
+    body: Vec<u8>,
+}
+
+impl OpenLoopState {
+    /// Reads the frame body and resolves its pending slot to one outcome.
+    async fn consume(
+        &mut self,
+        read_half: &mut tokio::net::tcp::OwnedReadHalf,
+        frame: raw_client::RawFrame,
+    ) -> Result<(), ()> {
+        self.body.resize(frame.len as usize, 0);
+        if frame.len > 0 && read_half.read_exact(&mut self.body).await.is_err() {
+            return Err(());
+        }
+        if frame.ty == raw_client::TY_PING {
+            return Ok(());
+        }
+        let now_ns = self.start.elapsed().as_nanos() as u64;
+        let Some((scheduled_ns, issue_ns)) = self.pending.remove(&frame.corr) else {
+            return Ok(());
+        };
+        if scheduled_ns < self.warmup_ns {
+            return Ok(());
+        }
+        match classify_terminal(frame.ty, &self.body) {
+            Outcome::Success => {
+                let _ = self.lag_hist.record(issue_ns.saturating_sub(scheduled_ns));
+                let _ = self.issue_hist.record(now_ns.saturating_sub(issue_ns));
+                if self
+                    .sched_hist
+                    .record(now_ns.saturating_sub(scheduled_ns))
+                    .is_ok()
+                {
+                    self.outcomes.record(Outcome::Success);
+                } else {
+                    self.outcomes.record(Outcome::HistogramOverflow);
+                }
+            }
+            other => self.outcomes.record(other),
+        }
+        Ok(())
     }
-    if decoded.ty == raw_client::TY_PING {
-        return Ok(());
-    }
-    let now_ns = start.elapsed().as_nanos() as u64;
-    let Some((scheduled_ns, issue_ns)) = pending.remove(&decoded.corr) else {
-        return Ok(());
-    };
-    if scheduled_ns < warmup_ns {
-        return Ok(());
-    }
-    match decoded.ty {
-        TY_RESPONSE if body.as_slice() == FIXTURE_BODY => {
-            let _ = lag_hist.record(issue_ns.saturating_sub(scheduled_ns));
-            let _ = issue_hist.record(now_ns.saturating_sub(issue_ns));
-            if sched_hist
-                .record(now_ns.saturating_sub(scheduled_ns))
-                .is_ok()
-            {
-                outcomes.record(Outcome::Success);
-            } else {
-                outcomes.record(Outcome::HistogramOverflow);
+
+    /// Resolves every pending measured request with one failure outcome.
+    fn fail_pending(&mut self, outcome: Outcome) {
+        for (_, (scheduled_ns, _)) in self.pending.drain() {
+            if scheduled_ns >= self.warmup_ns {
+                self.outcomes.record(outcome);
             }
         }
-        TY_RESPONSE => outcomes.record(Outcome::BodyMismatch),
-        TY_ERROR => outcomes.record(Outcome::ProtocolError),
-        _ => outcomes.record(Outcome::UnexpectedFrame),
     }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -478,12 +496,7 @@ async fn run_throughput_inner(
             continue;
         }
         if measuring {
-            match decoded.ty {
-                TY_RESPONSE if body.as_slice() == FIXTURE_BODY => outcomes.record(Outcome::Success),
-                TY_RESPONSE => outcomes.record(Outcome::BodyMismatch),
-                TY_ERROR => outcomes.record(Outcome::ProtocolError),
-                _ => outcomes.record(Outcome::UnexpectedFrame),
-            }
+            outcomes.record(classify_terminal(decoded.ty, &body));
         }
         let elapsed = start.elapsed();
         if !measuring && elapsed >= cfg.warmup {
@@ -579,7 +592,7 @@ impl SerialProbe {
                             .map_err(|err| format!("read body: {err}"))?;
                     }
                     if decoded.corr == *corr && decoded.ty != raw_client::TY_PING {
-                        if decoded.ty != TY_RESPONSE || body.as_slice() != FIXTURE_BODY {
+                        if classify_terminal(decoded.ty, &body) != Outcome::Success {
                             return Err("unexpected terminal during probe".to_owned());
                         }
                         break;

@@ -161,25 +161,38 @@ impl ChildHost {
         };
         let mut child = cmd.spawn().map_err(|err| format!("spawn host: {err}"))?;
         let stdout = child.stdout.take().expect("piped stdout");
-        let mut lines = BufReader::new(stdout).lines();
+        // The receiver enforces the deadline because BufReader::lines can
+        // block indefinitely.
+        let (line_tx, line_rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let publication = loop {
-            if std::time::Instant::now() > deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err("child host never printed READY".to_owned());
             }
-            match lines.next() {
-                Some(Ok(line)) if line.starts_with("READY ") => {
+            match line_rx.recv_timeout(remaining) {
+                Ok(Ok(line)) if line.starts_with("READY ") => {
                     break PathBuf::from(line.trim_start_matches("READY ").to_owned());
                 }
-                Some(Ok(_)) => continue,
-                Some(Err(err)) => {
+                Ok(Ok(_)) => continue,
+                Ok(Err(err)) => {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return Err(format!("child host stdout: {err}"));
                 }
-                None => {
+                Err(_) => {
                     let _ = child.kill();
-                    return Err("child host stdout closed before READY".to_owned());
+                    let _ = child.wait();
+                    return Err("child host never printed READY".to_owned());
                 }
             }
         };
@@ -359,125 +372,117 @@ fn run_collect() -> i32 {
             return 1;
         }
     };
-    let topology = match read_topology(Path::new("/")) {
-        Ok(t) => t,
+    let pair = match resolve_pair(&cfg) {
+        Ok(PairResolution::Pair(pair)) => pair,
+        Ok(PairResolution::Skip(reason)) => return finalize_skip(&cfg, &reason),
+        Ok(PairResolution::Invalid(pair, reason)) => {
+            return run_attempt(&cfg, pair, |_, _| Err(reason.clone()))
+        }
         Err(err) => {
-            eprintln!("topology: {err}");
+            eprintln!("configuration: {err}");
             return 1;
         }
     };
-    let allowed = match effective_affinity() {
-        Ok(a) => a,
-        Err(err) => {
-            eprintln!("affinity: {err}");
-            return 1;
-        }
-    };
-
-    // Resolve the pair before creating the attempt so an explicit
-    // configuration error fails before measurement.
-    let pair = match cfg.explicit_pair {
-        Some(pair) => {
-            if let Err(err) = linux_topology::validate_pair(&topology, &allowed, pair, cfg.class) {
-                let attempt = Attempt::begin(
-                    &cfg.out,
-                    &attempt_name(&cfg),
-                    base_manifest(&cfg, Some(pair)),
-                );
-                return fail_attempt(attempt, &format!("explicit pair invalid: {err}"));
-            }
-            pair
-        }
-        None => match auto_select(&topology, &allowed, cfg.class) {
-            AutoSelection::Pair(a, b) => {
-                // Auto-selection is a convenience; revalidate like an
-                // explicit pair.
-                if let Err(err) =
-                    linux_topology::validate_pair(&topology, &allowed, (a, b), cfg.class)
-                {
-                    let attempt = Attempt::begin(
-                        &cfg.out,
-                        &attempt_name(&cfg),
-                        base_manifest(&cfg, Some((a, b))),
-                    );
-                    return fail_attempt(attempt, &format!("auto pair invalid: {err}"));
-                }
-                (a, b)
-            }
-            AutoSelection::Unavailable(reason) => {
-                let attempt =
-                    Attempt::begin(&cfg.out, &attempt_name(&cfg), base_manifest(&cfg, None));
-                let Ok(mut attempt) = report(attempt) else {
-                    return 1;
-                };
-                attempt.manifest_mut().skip_reason = Some(reason.clone());
-                match attempt.finalize(State::Skipped) {
-                    Ok(path) => {
-                        println!("SKIPPED {} ({reason})", path.display());
-                        return 0;
-                    }
-                    Err(err) => {
-                        eprintln!("finalize: {err}");
-                        return 1;
-                    }
-                }
-            }
-        },
-    };
-
-    let attempt = Attempt::begin(
-        &cfg.out,
-        &attempt_name(&cfg),
-        base_manifest(&cfg, Some(pair)),
-    );
-    let Ok(attempt) = report(attempt) else {
-        return 1;
-    };
-    let result = match cfg.arm.as_str() {
-        ARM_ATOMIC => collect_atomic(attempt, pair),
-        ARM_TCP_SERIAL => collect_tcp_serial(attempt, pair),
-        ARM_TCP_OPEN => collect_tcp_open(attempt, pair),
-        ARM_TCP_THROUGHPUT => collect_tcp_throughput(attempt, pair),
+    match cfg.arm.as_str() {
+        ARM_ATOMIC => run_attempt(&cfg, pair, collect_atomic),
+        ARM_TCP_SERIAL => run_attempt(&cfg, pair, collect_tcp_serial),
+        ARM_TCP_OPEN => run_attempt(&cfg, pair, collect_tcp_open),
+        ARM_TCP_THROUGHPUT => run_attempt(&cfg, pair, collect_tcp_throughput),
         _ => unreachable!("arm validated at parse"),
+    }
+}
+
+enum PairResolution {
+    Pair((u32, u32)),
+    /// Auto-selected class unavailable on this host: structured skip.
+    Skip(String),
+    /// Explicit pair rejected: configuration failure, recorded on a
+    /// failed attempt.
+    Invalid((u32, u32), String),
+}
+
+/// Resolves the ordered pair before any attempt directory exists, so a
+/// malformed configuration fails before measurement.
+fn resolve_pair(cfg: &CollectConfig) -> Result<PairResolution, String> {
+    let topology = read_topology(Path::new("/")).map_err(|err| format!("topology: {err}"))?;
+    let allowed = effective_affinity().map_err(|err| format!("affinity: {err}"))?;
+    Ok(match cfg.explicit_pair {
+        Some(pair) => match linux_topology::validate_pair(&topology, &allowed, pair, cfg.class) {
+            Ok(()) => PairResolution::Pair(pair),
+            Err(err) => PairResolution::Invalid(pair, format!("explicit pair invalid: {err}")),
+        },
+        // auto_select only returns pairs that already pass validate_pair.
+        None => match auto_select(&topology, &allowed, cfg.class) {
+            AutoSelection::Pair(a, b) => PairResolution::Pair((a, b)),
+            AutoSelection::Unavailable(reason) => PairResolution::Skip(reason),
+        },
+    })
+}
+
+fn finalize_skip(cfg: &CollectConfig, reason: &str) -> i32 {
+    let attempt = Attempt::begin(&cfg.out, &attempt_name(cfg), base_manifest(cfg, None));
+    let mut attempt = match attempt {
+        Ok(attempt) => attempt,
+        Err(err) => {
+            eprintln!("attempt: {err}");
+            return 1;
+        }
     };
-    match result {
+    attempt.manifest_mut().skip_reason = Some(reason.to_owned());
+    match attempt.finalize(State::Skipped) {
         Ok(path) => {
-            println!("COMPLETE {}", path.display());
+            println!("SKIPPED {} ({reason})", path.display());
             0
         }
-        Err((attempt, reason)) => match attempt {
-            Some(attempt) => fail_attempt(Ok(*attempt), &reason),
-            None => {
-                eprintln!("failure: {reason}");
-                1
-            }
-        },
+        Err(err) => {
+            eprintln!("finalize: {err}");
+            1
+        }
     }
 }
 
-fn report(attempt: Result<Attempt, String>) -> Result<Attempt, ()> {
-    attempt.map_err(|err| eprintln!("attempt: {err}"))
-}
-
-fn fail_attempt(attempt: Result<Attempt, String>, reason: &str) -> i32 {
-    eprintln!("failure: {reason}");
-    let Ok(mut attempt) = report(attempt) else {
-        return 1;
+/// Owns the attempt lifecycle around one arm body: begin, measure, stamp,
+/// then finalize to exactly one of Complete or Failed.
+fn run_attempt(
+    cfg: &CollectConfig,
+    pair: (u32, u32),
+    body: impl Fn(&mut Attempt, (u32, u32)) -> Result<(), String>,
+) -> i32 {
+    let attempt = Attempt::begin(&cfg.out, &attempt_name(cfg), base_manifest(cfg, Some(pair)));
+    let mut attempt = match attempt {
+        Ok(attempt) => attempt,
+        Err(err) => {
+            eprintln!("attempt: {err}");
+            return 1;
+        }
     };
-    attempt.manifest_mut().fail_reason = Some(reason.to_owned());
-    if let Err(err) = attempt.finalize(State::Failed) {
-        eprintln!("finalize: {err}");
+    match body(&mut attempt, pair) {
+        Ok(()) => {
+            stamp_end_load(&mut attempt);
+            match attempt.finalize(State::Complete) {
+                Ok(path) => {
+                    println!("COMPLETE {}", path.display());
+                    0
+                }
+                Err(err) => {
+                    eprintln!("finalize: {err}");
+                    1
+                }
+            }
+        }
+        Err(reason) => {
+            eprintln!("failure: {reason}");
+            attempt.manifest_mut().fail_reason = Some(reason);
+            stamp_end_load(&mut attempt);
+            if let Err(err) = attempt.finalize(State::Failed) {
+                eprintln!("finalize: {err}");
+            }
+            1
+        }
     }
-    1
 }
 
-type ArmResult = Result<PathBuf, (Option<Box<Attempt>>, String)>;
-
-fn arm_err(attempt: Attempt, reason: String) -> ArmResult {
-    Err((Some(Box::new(attempt)), reason))
-}
-
-fn collect_atomic(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
+fn collect_atomic(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
     let cfg = PingPongConfig {
         initiator_cpu: pair.0,
         responder_cpu: pair.1,
@@ -485,31 +490,18 @@ fn collect_atomic(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         batches: env_parse("MC_IPC_BUDGET_BATCHES", 200),
         exchanges_per_batch: env_parse("MC_IPC_BUDGET_EXCHANGES", 10_000),
     };
-    let output = match run_ping_pong(cfg) {
-        Ok(output) => output,
-        Err(err) => return arm_err(attempt, format!("atomic arm: {err}")),
-    };
+    let output = run_ping_pong(cfg).map_err(|err| format!("atomic arm: {err}"))?;
     let hist_cfg = HistogramConfig::default();
-    let mut hist = match hist_cfg.build() {
-        Ok(hist) => hist,
-        Err(err) => return arm_err(attempt, err),
-    };
+    let mut hist = hist_cfg.build()?;
     let mut rejected = 0u64;
     for &mean in &output.batch_mean_rtt_ns {
         if hist.record(mean.round() as u64).is_err() {
             rejected += 1;
         }
     }
-    let raw = match serde_json::to_vec_pretty(&output) {
-        Ok(raw) => raw,
-        Err(err) => return arm_err(attempt, err.to_string()),
-    };
-    if let Err(err) = attempt.add_sidecar("batches.json", &raw) {
-        return arm_err(attempt, err);
-    }
-    if let Err(err) = attempt.add_histogram("batch_mean_rtt.hist", &hist) {
-        return arm_err(attempt, err);
-    }
+    let raw = serde_json::to_vec_pretty(&output).map_err(|err| err.to_string())?;
+    attempt.add_sidecar("batches.json", &raw)?;
+    attempt.add_histogram("batch_mean_rtt.hist", &hist)?;
     let mut means = output.batch_mean_rtt_ns.clone();
     let median = evidence::median(&mut means).unwrap_or(0.0);
     let manifest = attempt.manifest_mut();
@@ -530,8 +522,7 @@ fn collect_atomic(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "batches": output.batch_mean_rtt_ns.len(),
         "exchanges_per_batch": cfg.exchanges_per_batch,
     }));
-    stamp_end_load(&mut attempt);
-    attempt.finalize(State::Complete).map_err(|err| (None, err))
+    Ok(())
 }
 
 /// Pins the collector (load side) and spawns the pinned child host,
@@ -547,43 +538,34 @@ fn tcp_arm_setup(attempt: &mut Attempt, pair: (u32, u32)) -> Result<ChildHost, S
     Ok(host)
 }
 
-fn conservation_check(
+fn check_host_and_conservation(
+    host: &mut ChildHost,
     outcomes: &perf_measurement::OutcomeCounts,
     scheduled: u64,
 ) -> Result<(), String> {
-    if outcomes.conserved(scheduled) {
-        Ok(())
-    } else {
-        Err(format!(
+    if !host.alive() {
+        return Err("child host exited during measurement".to_owned());
+    }
+    if !outcomes.conserved(scheduled) {
+        return Err(format!(
             "outcome-accounting loss: {} outcomes for {scheduled} scheduled slots",
             outcomes.total()
-        ))
+        ));
     }
+    Ok(())
 }
 
-fn collect_tcp_serial(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
+fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
     let cfg = tcp::SerialConfig {
         warmup_ops: env_parse("MC_IPC_BUDGET_WARMUP_OPS", 20_000),
         measured_ops: env_parse("MC_IPC_BUDGET_MEASURED_OPS", 120_000),
         histogram: HistogramConfig::default(),
     };
-    let mut host = match tcp_arm_setup(&mut attempt, pair) {
-        Ok(host) => host,
-        Err(err) => return arm_err(attempt, err),
-    };
-    let result = match tcp::run_serial(host.publication(), &cfg) {
-        Ok(result) => result,
-        Err(err) => return arm_err(attempt, format!("serial arm: {err}")),
-    };
-    if !host.alive() {
-        return arm_err(attempt, "child host exited during measurement".to_owned());
-    }
-    if let Err(err) = conservation_check(&result.outcomes, result.scheduled) {
-        return arm_err(attempt, err);
-    }
-    if let Err(err) = attempt.add_histogram("issue_to_terminal.hist", &result.histogram) {
-        return arm_err(attempt, err);
-    }
+    let mut host = tcp_arm_setup(attempt, pair)?;
+    let result =
+        tcp::run_serial(host.publication(), &cfg).map_err(|err| format!("serial arm: {err}"))?;
+    check_host_and_conservation(&mut host, &result.outcomes, result.scheduled)?;
+    attempt.add_histogram("issue_to_terminal.hist", &result.histogram)?;
     let hist = &result.histogram;
     let manifest = attempt.manifest_mut();
     manifest.histogram = Some(cfg.histogram.clone());
@@ -602,11 +584,10 @@ fn collect_tcp_serial(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "scheduled": result.scheduled,
         "elapsed_secs": result.elapsed.as_secs_f64(),
     }));
-    stamp_end_load(&mut attempt);
-    attempt.finalize(State::Complete).map_err(|err| (None, err))
+    Ok(())
 }
 
-fn collect_tcp_open(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
+fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
     let rate = env_parse("MC_IPC_BUDGET_RATE", 0u64);
     let cfg = tcp::OpenLoopConfig {
         rate_per_sec: rate,
@@ -615,38 +596,22 @@ fn collect_tcp_open(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         inflight_cap: env_parse("MC_IPC_BUDGET_INFLIGHT_CAP", 1024),
         histogram: HistogramConfig::default(),
     };
-    let mut host = match tcp_arm_setup(&mut attempt, pair) {
-        Ok(host) => host,
-        Err(err) => return arm_err(attempt, err),
-    };
-    let result = match tcp::run_open_loop(host.publication(), &cfg) {
-        Ok(result) => result,
-        Err(err) => return arm_err(attempt, format!("open-loop arm: {err}")),
-    };
-    if !host.alive() {
-        return arm_err(attempt, "child host exited during measurement".to_owned());
-    }
-    if let Err(err) = conservation_check(&result.outcomes, result.scheduled_slots) {
-        return arm_err(attempt, err);
-    }
+    let mut host = tcp_arm_setup(attempt, pair)?;
+    let result = tcp::run_open_loop(host.publication(), &cfg)
+        .map_err(|err| format!("open-loop arm: {err}"))?;
+    check_host_and_conservation(&mut host, &result.outcomes, result.scheduled_slots)?;
     if result.outcomes.success == 0 {
-        return arm_err(
-            attempt,
-            format!(
-                "offered-rate point {rate}/s produced no successful measured observation \
-                 (outcomes: {:?}); the point is invalid for this host",
-                result.outcomes
-            ),
-        );
+        return Err(format!(
+            "offered-rate point {rate}/s produced no successful measured observation              (outcomes: {:?}); the point is invalid for this host",
+            result.outcomes
+        ));
     }
     for (file, hist) in [
         ("sched_to_completion.hist", &result.sched_to_completion),
         ("issue_to_completion.hist", &result.issue_to_completion),
         ("scheduler_lag.hist", &result.scheduler_lag),
     ] {
-        if let Err(err) = attempt.add_histogram(file, hist) {
-            return arm_err(attempt, err);
-        }
+        attempt.add_histogram(file, hist)?;
     }
     let manifest = attempt.manifest_mut();
     manifest.histogram = Some(cfg.histogram.clone());
@@ -663,27 +628,19 @@ fn collect_tcp_open(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "scheduled_slots": result.scheduled_slots,
         "elapsed_secs": result.elapsed.as_secs_f64(),
     }));
-    stamp_end_load(&mut attempt);
-    attempt.finalize(State::Complete).map_err(|err| (None, err))
+    Ok(())
 }
 
-fn collect_tcp_throughput(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
+fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String> {
     let cfg = tcp::ThroughputConfig {
         depth: env_parse("MC_IPC_BUDGET_DEPTH", 32),
         warmup: Duration::from_secs(env_parse("MC_IPC_BUDGET_WARMUP_SECS", 2)),
         measure: Duration::from_secs(env_parse("MC_IPC_BUDGET_MEASURE_SECS", 10)),
     };
-    let mut host = match tcp_arm_setup(&mut attempt, pair) {
-        Ok(host) => host,
-        Err(err) => return arm_err(attempt, err),
-    };
-    let result = match tcp::run_throughput(host.publication(), &cfg) {
-        Ok(result) => result,
-        Err(err) => return arm_err(attempt, format!("throughput arm: {err}")),
-    };
-    if !host.alive() {
-        return arm_err(attempt, "child host exited during measurement".to_owned());
-    }
+    let mut host = tcp_arm_setup(attempt, pair)?;
+    let result = tcp::run_throughput(host.publication(), &cfg)
+        .map_err(|err| format!("throughput arm: {err}"))?;
+    check_host_and_conservation(&mut host, &result.outcomes, result.terminal)?;
     let manifest = attempt.manifest_mut();
     manifest.outcomes = Some(result.outcomes.clone());
     manifest.recorded_samples = Some(result.successful);
@@ -696,8 +653,7 @@ fn collect_tcp_throughput(mut attempt: Attempt, pair: (u32, u32)) -> ArmResult {
         "goodput_bytes_per_sec": result.goodput_bytes_per_sec,
         "measured_secs": result.measured.as_secs_f64(),
     }));
-    stamp_end_load(&mut attempt);
-    attempt.finalize(State::Complete).map_err(|err| (None, err))
+    Ok(())
 }
 
 // --- plan / aggregate / finalize ----------------------------------------
@@ -783,19 +739,21 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         let hist_file = match arm.name.as_str() {
             ARM_ATOMIC => Some("batch_mean_rtt.hist"),
             ARM_TCP_SERIAL => Some("issue_to_terminal.hist"),
-            ARM_TCP_OPEN => Some("sched_to_completion.hist"),
             _ => None,
         };
         if let Some(file) = hist_file {
             let merged = evidence::merge_arm_histograms(&attempts, arm, file)?;
             let total: u64 = merged.len();
+            let headline_ok = complete.iter().all(|a| {
+                a.manifest.recorded_samples.unwrap_or(0) >= perf_measurement::HEADLINE_TAIL_FLOOR
+            });
             entry.insert(
                 "merged".to_owned(),
                 serde_json::json!({
                     "samples": total,
                     "p50_ns": merged.value_at_quantile(0.50),
                     "p99_ns": merged.value_at_quantile(0.99),
-                    "p999_ns": if perf_measurement::tail_publishable(total) {
+                    "p999_ns": if perf_measurement::tail_publishable(total) && headline_ok {
                         serde_json::json!(merged.value_at_quantile(0.999))
                     } else {
                         serde_json::Value::Null

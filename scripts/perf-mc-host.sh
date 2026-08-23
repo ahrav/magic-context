@@ -34,7 +34,8 @@ budget_env() {
 budget_trap() {
   # Interrupts kill children, then finalize the active manifest as
   # interrupted so the attempt stays retained and out of the aggregate.
-  trap 'kill 0 2>/dev/null || true; sleep 0.5; \
+  # Masking INT/TERM first keeps kill 0 from re-entering this handler.
+  trap 'trap "" INT TERM; kill 0 2>/dev/null || true; sleep 0.5; \
     MC_IPC_BUDGET_MODE=finalize-interrupted MC_IPC_BUDGET_OUT="$BUDGET_OUT" \
     "$BUDGET_BENCH" || true; exit 130' INT TERM
 }

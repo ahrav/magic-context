@@ -161,16 +161,22 @@ fn explicit_pair_failures_are_configuration_errors() {
     let all = allowed(&[0, 1, 2, 8]);
 
     // Duplicate CPU.
-    assert!(validate_pair(&topo, &all, (0, 0), Class::SameL3).is_err());
+    let err = validate_pair(&topo, &all, (0, 0), Class::SameL3).unwrap_err();
+    assert!(err.contains("same CPU twice"), "{err}");
     // SMT siblings.
-    assert!(validate_pair(&topo, &all, (0, 1), Class::SameL3).is_err());
+    let err = validate_pair(&topo, &all, (0, 1), Class::SameL3).unwrap_err();
+    assert!(err.contains("SMT siblings"), "{err}");
     // Offline CPU.
-    assert!(validate_pair(&topo, &all, (0, 6), Class::SameL3).is_err());
+    let err = validate_pair(&topo, &all, (0, 6), Class::SameL3).unwrap_err();
+    assert!(err.contains("not online"), "{err}");
     // Disallowed CPU.
-    assert!(validate_pair(&topo, &allowed(&[0]), (0, 2), Class::SameL3).is_err());
+    let err = validate_pair(&topo, &allowed(&[0]), (0, 2), Class::SameL3).unwrap_err();
+    assert!(err.contains("allowed affinity"), "{err}");
     // Class mismatch both directions.
-    assert!(validate_pair(&topo, &all, (0, 8), Class::SameL3).is_err());
-    assert!(validate_pair(&topo, &all, (0, 2), Class::CrossNuma).is_err());
+    let err = validate_pair(&topo, &all, (0, 8), Class::SameL3).unwrap_err();
+    assert!(err.contains("spans NUMA nodes"), "{err}");
+    let err = validate_pair(&topo, &all, (0, 2), Class::CrossNuma).unwrap_err();
+    assert!(err.contains("one NUMA node"), "{err}");
     // The valid explicit pairs still pass.
     validate_pair(&topo, &all, (0, 2), Class::SameL3).unwrap();
     validate_pair(&topo, &all, (0, 8), Class::CrossNuma).unwrap();

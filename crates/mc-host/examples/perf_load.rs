@@ -244,6 +244,13 @@ async fn run_conn(
                 );
                 frame.extend_from_slice(&body);
                 if write_half.write_all(&frame).await.is_err() {
+                    // The slot is scheduled and terminal: mark it so the
+                    // reader records WriteFailure instead of letting the
+                    // stale meta entry rot into UnresolvedAtDrain.
+                    if issue_ns >= warmup_ns {
+                        measured_sent.fetch_add(1, Ordering::Release);
+                    }
+                    let _ = meta_tx.send((corr, u64::MAX, issue_ns));
                     break;
                 }
                 sent_count.fetch_add(1, Ordering::Release);
@@ -269,16 +276,34 @@ async fn run_conn(
     };
     let mut read_half = read_half;
     let mut pending: HashMap<u64, (u64, u64)> = HashMap::new();
+    let drain_meta = |meta_rx: &mut mpsc::UnboundedReceiver<(u64, u64, u64)>,
+                      pending: &mut HashMap<u64, (u64, u64)>,
+                      outcomes: &mut OutcomeCounts| {
+        while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
+            if sched == u64::MAX {
+                pending.remove(&corr);
+                if issue >= warmup_ns {
+                    outcomes.record(Outcome::WriteFailure);
+                }
+            } else {
+                pending.insert(corr, (sched, issue));
+            }
+        }
+    };
     let mut header = [0u8; raw_client::HEADER_LEN];
+    let mut header_filled = 0usize;
     let mut body_buf: Vec<u8> = Vec::new();
     let mut done_wait = false;
     let mut resolved: u64 = 0;
     let mut drain_deadline: Option<Instant> = None;
 
     loop {
+        // `read` (unlike `read_exact`) is cancellation-safe: a cancelled
+        // branch loses no partially read header bytes, so the other
+        // select arms can win without desyncing the frame stream.
         let read = tokio::select! {
             biased;
-            read = read_half.read_exact(&mut header) => Some(read),
+            read = read_half.read(&mut header[header_filled..]) => Some(read),
             () = sender_done.notified(), if !done_wait => {
                 done_wait = true;
                 drain_deadline = Some(Instant::now() + DRAIN_BUDGET);
@@ -292,9 +317,7 @@ async fn run_conn(
             }, if done_wait => {
                 // Drain budget exhausted: everything still pending is a
                 // terminal unresolved outcome.
-                while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
-                    pending.insert(corr, (sched, issue));
-                }
+                drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
                 for (_, (_, issue)) in pending.drain() {
                     if issue >= warmup_ns {
                         result.outcomes.record(Outcome::UnresolvedAtDrain);
@@ -309,9 +332,18 @@ async fn run_conn(
             }
             continue;
         };
-        if read.is_err() {
-            result.closed_early = true;
-            break;
+        match read {
+            Ok(0) | Err(_) => {
+                result.closed_early = true;
+                break;
+            }
+            Ok(n) => {
+                header_filled += n;
+                if header_filled < raw_client::HEADER_LEN {
+                    continue;
+                }
+                header_filled = 0;
+            }
         }
         let frame = raw_client::decode_header(&header);
         body_buf.resize(frame.len as usize, 0);
@@ -320,9 +352,7 @@ async fn run_conn(
             break;
         }
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
-        while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
-            pending.insert(corr, (sched, issue));
-        }
+        drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
         let Some((sched, issue)) = pending.remove(&frame.corr) else {
             continue;
         };
@@ -366,11 +396,13 @@ async fn run_conn(
         }
     }
 
+    // The reader owns permit returns; once it exits, a parked sender
+    // would otherwise wait forever on a saturated window.
+    inflight.close();
+
     // A closed connection resolves every remaining in-flight request.
     if result.closed_early {
-        while let Ok((corr, sched, issue)) = meta_rx.try_recv() {
-            pending.insert(corr, (sched, issue));
-        }
+        drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
         for (_, (_, issue)) in pending.drain() {
             if issue >= warmup_ns {
                 result.outcomes.record(Outcome::PeerClosed);

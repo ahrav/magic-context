@@ -51,6 +51,7 @@ fn manifest(arm: &str, block: u32, pair: Option<(u32, u32)>) -> Manifest {
             cpu_count: 2,
         },
         histogram: None,
+        host_load: None,
         affinity: None,
         outcomes: None,
         recorded_samples: None,
@@ -209,38 +210,57 @@ fn sidecar_corruption_blocks_aggregation() {
 
 #[test]
 fn incompatible_manifests_never_merge_or_pair() {
-    let dir = tempfile::tempdir().unwrap();
-    write_complete(
-        dir.path(),
-        ARM_ATOMIC,
-        1,
-        (0, 1),
-        "batch_mean_rtt.hist",
-        &[500],
-        serde_json::json!({"median_batch_rtt_ns": 500.0}),
-    );
+    // Each incompatibility axis must independently reject histogram
+    // merging and gap pairing.
+    for (name, mutate) in [
+        (
+            "build",
+            Box::new(|m: &mut Manifest| m.build.commit = "other-commit".to_owned())
+                as Box<dyn Fn(&mut Manifest)>,
+        ),
+        (
+            "workload",
+            Box::new(|m: &mut Manifest| m.workload.sha256 = "0".repeat(64)),
+        ),
+        (
+            "host",
+            Box::new(|m: &mut Manifest| m.host.hostname = "other-host".to_owned()),
+        ),
+        ("schema", Box::new(|m: &mut Manifest| m.schema += 1)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_complete(
+            dir.path(),
+            ARM_ATOMIC,
+            1,
+            (0, 1),
+            "batch_mean_rtt.hist",
+            &[500],
+            serde_json::json!({"median_batch_rtt_ns": 500.0}),
+        );
 
-    // Same arm, different build commit.
-    let mut other = manifest(ARM_ATOMIC, 2, Some((0, 1)));
-    other.build.commit = "different-commit".to_owned();
-    let mut attempt = Attempt::begin(dir.path(), "atomic-b02", other).unwrap();
-    attempt
-        .add_histogram("batch_mean_rtt.hist", &small_histogram(&[700]))
-        .unwrap();
-    attempt.manifest_mut().histogram = Some(HistogramConfig::default());
-    attempt.manifest_mut().results = Some(serde_json::json!({"median_batch_rtt_ns": 700.0}));
-    attempt.finalize(State::Complete).unwrap();
+        let mut other = manifest(ARM_ATOMIC, 2, Some((0, 1)));
+        mutate(&mut other);
+        let mut attempt = Attempt::begin(dir.path(), "atomic-b02", other).unwrap();
+        attempt
+            .add_histogram("batch_mean_rtt.hist", &small_histogram(&[700]))
+            .unwrap();
+        attempt.manifest_mut().histogram = Some(HistogramConfig::default());
+        attempt.manifest_mut().results = Some(serde_json::json!({"median_batch_rtt_ns": 700.0}));
+        attempt.finalize(State::Complete).unwrap();
 
-    let loaded = evidence::load_attempts(dir.path()).unwrap();
-    let arm = ArmId {
-        name: ARM_ATOMIC.to_owned(),
-        class: Some("same-l3".to_owned()),
-        pair: Some((0, 1)),
-    };
-    let err = evidence::merge_arm_histograms(&loaded, &arm, "batch_mean_rtt.hist").unwrap_err();
-    assert!(err.contains("incompatible"), "{err}");
-    let err = evidence::paired_gaps(&loaded).unwrap_err();
-    assert!(err.contains("incompatible"), "{err}");
+        let loaded = evidence::load_attempts(dir.path()).unwrap();
+        let arm = ArmId {
+            name: ARM_ATOMIC.to_owned(),
+            class: Some("same-l3".to_owned()),
+            pair: Some((0, 1)),
+        };
+        let err =
+            evidence::merge_arm_histograms(&loaded, &arm, "batch_mean_rtt.hist").expect_err(name);
+        assert!(err.contains("incompatible"), "{name}: {err}");
+        let err = evidence::paired_gaps(&loaded).expect_err(name);
+        assert!(err.contains("incompatible"), "{name}: {err}");
+    }
 }
 
 #[test]
@@ -341,7 +361,12 @@ fn bootstrap_interval_is_deterministic_and_bounded() {
     let b = evidence::bootstrap_interval(&values, 2000, 42).unwrap();
     assert_eq!(a, b, "same seed, same interval");
     assert!(a.0 <= a.1);
-    assert!(a.0 >= 9.0 && a.1 <= 14.0, "interval within observed range");
+    // A resampled-median interval sits strictly inside the observed range;
+    // a degenerate (min, max) implementation returns exactly (9, 14).
+    assert!(
+        a.0 > 9.0 && a.1 < 14.0,
+        "interval {a:?} not strictly inside"
+    );
     assert!(evidence::bootstrap_interval(&[], 100, 1).is_none());
 }
 

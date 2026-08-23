@@ -106,6 +106,22 @@ fn open_loop_preserves_schedule_and_records_missed_slots() {
         result.scheduled_slots
     );
     assert!(result.outcomes.success > 0);
+
+    // Issue-time discrimination: with a saturated one-deep window the
+    // generator runs behind schedule, so recorded lag is large and
+    // mean(sched-to-completion) = mean(issue-to-completion) + mean(lag)
+    // (identical timestamps per request). An implementation that timed
+    // issue from the scheduled slot would record lag but identical
+    // sched/issue distributions and fail this.
+    let sched_mean = result.sched_to_completion.mean();
+    let issue_mean = result.issue_to_completion.mean();
+    let lag_mean = result.scheduler_lag.mean();
+    assert!(lag_mean > 1_000.0, "saturation must produce real lag");
+    let reconstructed = issue_mean + lag_mean;
+    assert!(
+        (sched_mean - reconstructed).abs() / sched_mean < 0.05,
+        "sched mean {sched_mean} != issue mean {issue_mean} + lag mean {lag_mean}"
+    );
 }
 
 #[test]
@@ -168,16 +184,53 @@ fn serial_arm_stays_one_in_flight() {
     assert_eq!(result.outcomes.success, 200);
     assert!(result.outcomes.conserved(result.scheduled));
     // Serial: one request in flight, so measured wall time is at least
-    // the sum of recorded RTTs.
+    // the sum of recorded RTTs; a depth-2 pipeline would halve the wall
+    // time and fail.
     let sum_rtt_ns: u64 = result
         .histogram
         .iter_recorded()
         .map(|v| v.value_iterated_to() * v.count_at_value())
         .sum();
     assert!(
-        result.elapsed.as_nanos() as u64 >= sum_rtt_ns / 2,
+        result.elapsed.as_nanos() as u64 >= sum_rtt_ns,
         "elapsed {:?} vs recorded sum {}ns",
         result.elapsed,
         sum_rtt_ns
+    );
+}
+
+#[test]
+fn host_death_mid_run_conserves_outcomes() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let host = echo_host::InProcessHost::start(data_dir.path());
+    let publication = host.publication.clone();
+
+    // Kill the host mid-measurement from another thread.
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        drop(host);
+    });
+
+    let cfg = tcp::OpenLoopConfig {
+        rate_per_sec: 2_000,
+        warmup: Duration::from_millis(100),
+        measure: Duration::from_secs(5),
+        inflight_cap: 64,
+        histogram: HistogramConfig::default(),
+    };
+    let result = tcp::run_open_loop(&publication, &cfg).unwrap();
+    killer.join().unwrap();
+
+    // The failure paths (peer close, write failure, unresolved drain)
+    // must still resolve every measured slot exactly once.
+    let o = &result.outcomes;
+    assert!(
+        o.peer_closed + o.write_failure + o.unresolved_at_drain > 0,
+        "host death must surface as failure outcomes: {o:?}"
+    );
+    assert!(
+        o.conserved(result.scheduled_slots),
+        "conservation across failure paths: {o:?} for {} slots",
+        result.scheduled_slots
     );
 }
