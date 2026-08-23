@@ -174,21 +174,25 @@ describe("emergency >=95%", () => {
                 const historianRequests = h.mock
                     .requests()
                     .filter((r) => isHistorianRequest(r.body)).length;
-                const inProgress = h
-                    .contextDb()
-                    .prepare(
-                        "SELECT COUNT(*) AS c FROM compartment_in_progress WHERE session_id = ?",
-                    )
-                    .get(sessionId) as { c: number } | null;
-                const pct = h
-                    .contextDb()
-                    .prepare(
-                        "SELECT last_context_percentage FROM session_meta WHERE session_id = ?",
-                    )
-                    .get(sessionId) as { last_context_percentage: number } | null;
                 console.log(
-                    `[TEST] emergency timeout: historianRequests=${historianRequests} totalRequests=${h.mock.requests().length} compartments=${h.countCompartments(sessionId)} inProgress=${inProgress?.c} lastPct=${pct?.last_context_percentage}`,
+                    `[TEST] emergency timeout: historianRequests=${historianRequests} totalRequests=${h.mock.requests().length} compartments=${h.countCompartments(sessionId)}`,
                 );
+                try {
+                    const state = h
+                        .contextDb()
+                        .prepare(
+                            "SELECT compartment_in_progress, last_context_percentage FROM session_meta WHERE session_id = ?",
+                        )
+                        .get(sessionId) as {
+                        compartment_in_progress: number;
+                        last_context_percentage: number;
+                    } | null;
+                    console.log(
+                        `[TEST] session_meta: inProgress=${state?.compartment_in_progress} lastPct=${state?.last_context_percentage}`,
+                    );
+                } catch (dbError) {
+                    console.log(`[TEST] session_meta probe failed: ${dbError}`);
+                }
                 console.log(`[TEST] opencode stderr tail:\n${h.opencode.stderr().slice(-3000)}`);
                 throw error;
             }
