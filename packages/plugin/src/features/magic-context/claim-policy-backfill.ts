@@ -312,18 +312,18 @@ function seedBatchInCurrentTransaction(
     // Seeding can flip a legacy revision into automatic visibility after the
     // migration's one-time epoch bump was already acknowledged; without a
     // fresh bump per affected project, cached m0/module snapshots keep
-    // omitting the memory until an unrelated mutation lands. One bump per
-    // project per batch suffices — consumers compare epochs, they do not
-    // count them.
-    const eligibleClaimByProject = new Map<number, number>();
+    // omitting the memory until an unrelated mutation lands. The bump
+    // resolves the project through the memory crosswalk, so it runs per
+    // eligible claim: unlinked claims no-op, and repeat bumps for one
+    // project are harmless — consumers compare epochs, they do not count
+    // them.
     const outcomes: Array<{ maturity: MaturityLevel; autoEligible: boolean }> = [];
     for (const row of rows) {
         const outcome = seedRevisionInCurrentTransaction(db, row, nowMs);
         outcomes.push(outcome);
-        if (outcome.autoEligible) eligibleClaimByProject.set(row.projectId, row.claimId);
-    }
-    for (const claimId of eligibleClaimByProject.values()) {
-        bumpEpochForClaimProjectInCurrentTransaction(db, claimId);
+        if (outcome.autoEligible) {
+            bumpEpochForClaimProjectInCurrentTransaction(db, row.claimId);
+        }
     }
     writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.cursor, String(rows[rows.length - 1].revisionId));
     return { kind: "seeded", outcomes };
