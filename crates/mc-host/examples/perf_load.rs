@@ -350,17 +350,30 @@ async fn run_conn(
     let mut header = [0u8; raw_client::HEADER_LEN];
     let mut header_filled = 0usize;
     let mut body_buf: Vec<u8> = Vec::new();
+    let mut pending_frame: Option<raw_client::RawFrame> = None;
+    let mut body_filled = 0usize;
     let mut done_wait = false;
     let mut resolved: u64 = 0;
     let mut drain_deadline: Option<Instant> = None;
 
     loop {
         // `read` (unlike `read_exact`) is cancellation-safe: a cancelled
-        // branch loses no partially read header bytes, so the other
-        // select arms can win without desyncing the frame stream.
+        // branch loses no partially read header or body bytes, so the
+        // other select arms can win without desyncing the frame stream —
+        // and a peer that stalls mid-body cannot pin the reader past the
+        // sender-completion and drain-deadline arms.
         let read = tokio::select! {
             biased;
-            read = read_half.read(&mut header[header_filled..]) => Some(read),
+            read = async {
+                match &pending_frame {
+                    Some(frame) => {
+                        read_half
+                            .read(&mut body_buf[body_filled..frame.len as usize])
+                            .await
+                    }
+                    None => read_half.read(&mut header[header_filled..]).await,
+                }
+            } => Some(read),
             () = sender_done.notified(), if !done_wait => {
                 done_wait = true;
                 drain_deadline = Some(Instant::now() + DRAIN_BUDGET);
@@ -395,25 +408,35 @@ async fn run_conn(
                 break;
             }
             Ok(n) => {
-                header_filled += n;
-                if header_filled < raw_client::HEADER_LEN {
-                    continue;
+                if let Some(frame_len) = pending_frame.as_ref().map(|f| f.len as usize) {
+                    body_filled += n;
+                    if body_filled < frame_len {
+                        continue;
+                    }
+                    body_filled = 0;
+                } else {
+                    header_filled += n;
+                    if header_filled < raw_client::HEADER_LEN {
+                        continue;
+                    }
+                    header_filled = 0;
+                    let frame = raw_client::decode_header(&header);
+                    // Untrusted 32-bit length: refuse the allocation and
+                    // fail the connection, since the stream cannot resync
+                    // past an unread body.
+                    if frame.len > perf_measurement::MAX_BODY_LEN {
+                        result.closed_early = true;
+                        break;
+                    }
+                    body_buf.resize(frame.len as usize, 0);
+                    pending_frame = Some(frame);
+                    if !body_buf.is_empty() {
+                        continue;
+                    }
                 }
-                header_filled = 0;
             }
         }
-        let frame = raw_client::decode_header(&header);
-        // Untrusted 32-bit length: refuse the allocation and fail the
-        // connection, since the stream cannot resync past an unread body.
-        if frame.len > perf_measurement::MAX_BODY_LEN {
-            result.closed_early = true;
-            break;
-        }
-        body_buf.resize(frame.len as usize, 0);
-        if frame.len > 0 && read_half.read_exact(&mut body_buf).await.is_err() {
-            result.closed_early = true;
-            break;
-        }
+        let frame = pending_frame.take().expect("frame body completed");
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
         drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
         let Some((sched, issue)) = pending.remove(&frame.corr) else {
@@ -422,11 +445,12 @@ async fn run_conn(
         inflight.add_permits(1);
         resolved += 1;
         let measured = in_window(sched, issue);
-        // Route identity: the pending identity on the wire is
+        // Route and wire identity: the pending identity on the wire is
         // (channel, epoch, corr), so a frame that resolves an
-        // outstanding correlation on the wrong channel or epoch is a
-        // routing failure, never a success.
-        if (frame.channel, frame.epoch) != (channel, epoch) {
+        // outstanding correlation on the wrong channel, epoch, or wire
+        // version is a routing or protocol failure, never a success.
+        if (frame.channel, frame.epoch) != (channel, epoch) || frame.ver != raw_client::WIRE_VERSION
+        {
             if measured {
                 result.outcomes.record(Outcome::UnexpectedFrame);
             }
@@ -437,7 +461,10 @@ async fn run_conn(
         }
         match frame.ty {
             TY_RESPONSE => {
-                let valid = !expect_fixture || body_buf.as_slice() == FIXTURE_BODY;
+                // A success requires the terminal-response flag shape
+                // (non-binary, last) alongside the body contract.
+                let valid = frame.flags == raw_client::FLAGS_RESPONSE_TEXT_LAST
+                    && (!expect_fixture || body_buf.as_slice() == FIXTURE_BODY);
                 if !valid {
                     if measured {
                         result.outcomes.record(Outcome::BodyMismatch);
@@ -667,6 +694,19 @@ async fn main() {
 
     if !conserved {
         eprintln!("outcome-accounting loss: aborting with failure status");
+        std::process::exit(1);
+    }
+    // Correctness is a gate for the retained results, exactly as in the
+    // IPC-budget collectors: a run whose host answered with wrong
+    // bodies, protocol errors, or unexpected frames must not exit
+    // successfully on the strength of the surviving subset.
+    let correctness_failures =
+        outcomes.protocol_error + outcomes.body_mismatch + outcomes.unexpected_frame;
+    if correctness_failures > 0 {
+        eprintln!(
+            "{correctness_failures} correctness violation(s) in measured outcomes: \
+             aborting with failure status"
+        );
         std::process::exit(1);
     }
 }

@@ -39,6 +39,10 @@ pub const TY_GOODBYE: u8 = 11;
 pub const FLAGS_INTERACTIVE: u8 = 0b0000_0010;
 /// Passive priority, Normal admission: the shape host pure-header frames use.
 pub const FLAGS_PURE_HEADER: u8 = 0b0000_0000;
+/// The flags a terminal non-binary response carries (protocol flag layout:
+/// bit0 BINARY, bits1-2 PRIORITY, bit3 LAST, bits4-5 ADMISSION, bits6-7
+/// reserved): Interactive priority, Normal admission, binary 0, last 1.
+pub const FLAGS_RESPONSE_TEXT_LAST: u8 = 0b0000_1010;
 
 /// A frame as it appears on the wire, decoded by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]

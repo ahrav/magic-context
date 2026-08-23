@@ -320,8 +320,20 @@ fn host_id() -> HostId {
         .unwrap_or_else(|| std::env::consts::ARCH.to_owned());
     HostId {
         // Manifests are retained in the repository, so the hostname field
-        // carries an operator-chosen label rather than the machine's FQDN.
-        hostname: env_var("MC_IPC_BUDGET_HOST_LABEL").unwrap_or_else(|| "redacted".to_owned()),
+        // carries an operator-chosen label, falling back to a hashed
+        // machine fingerprint rather than a shared constant: `compatible`
+        // treats host-identity equality as proof of one machine, and a
+        // shared default would merge histograms across physically
+        // different hosts that happen to share kernel and CPU strings.
+        hostname: env_var("MC_IPC_BUDGET_HOST_LABEL").unwrap_or_else(|| {
+            let id = std::fs::read_to_string("/etc/machine-id")
+                .or_else(|_| std::fs::read_to_string("/proc/sys/kernel/hostname"))
+                .unwrap_or_default();
+            format!(
+                "host-{}",
+                &perf_measurement::sha256_hex(id.trim().as_bytes())[..12]
+            )
+        }),
         kernel: read("/proc/sys/kernel/osrelease"),
         cpu_model,
         cpu_count: std::thread::available_parallelism()

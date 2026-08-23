@@ -40,15 +40,21 @@ fn record(hist: &mut Histogram<u64>, outcomes: &mut OutcomeCounts, value_ns: u64
     }
 }
 
-/// Classifies one non-ping terminal frame against the fixture and route
-/// contract. The pending identity on the wire is (channel, epoch, corr):
-/// a frame that resolves a pending correlation on the wrong channel or
-/// epoch is a routing failure, never a success.
+/// Classifies one non-ping terminal frame against the fixture, route, and
+/// wire contract. The pending identity on the wire is (channel, epoch,
+/// corr): a frame that resolves a pending correlation on the wrong channel
+/// or epoch is a routing failure. A success additionally requires the
+/// supported wire version and the exact terminal-response flag shape
+/// (non-binary, last): a version or flag regression must not produce
+/// successful evidence for a text fixture echo.
 fn classify_terminal(frame: &raw_client::RawFrame, route: (u16, u32), body: &[u8]) -> Outcome {
-    if (frame.channel, frame.epoch) != route {
+    if (frame.channel, frame.epoch) != route || frame.ver != raw_client::WIRE_VERSION {
         return Outcome::UnexpectedFrame;
     }
     match frame.ty {
+        TY_RESPONSE if frame.flags != raw_client::FLAGS_RESPONSE_TEXT_LAST => {
+            Outcome::UnexpectedFrame
+        }
         TY_RESPONSE if body == FIXTURE_BODY => Outcome::Success,
         TY_RESPONSE => Outcome::BodyMismatch,
         TY_ERROR => Outcome::ProtocolError,
@@ -681,7 +687,11 @@ async fn run_throughput_inner(
         let elapsed = start.elapsed();
         if !measuring && elapsed >= cfg.warmup {
             measuring = true;
-            measure_start = Instant::now();
+            // Anchored to the nominal warmup boundary, not this
+            // response's arrival time: a delayed first post-warmup
+            // response must not shrink the measured window below its
+            // configured length while the fixed deadline stays put.
+            measure_start = start + cfg.warmup;
         } else if measuring && measure_start.elapsed() >= cfg.measure {
             measured_elapsed = measure_start.elapsed();
             break;
@@ -754,6 +764,17 @@ async fn run_throughput_inner(
                     // Pings and frames naming no outstanding request are
                     // skipped exactly as in the measurement loop.
                     if decoded.ty != raw_client::TY_PING && outstanding.remove(&decoded.corr) {
+                        // Every drained response passes the same terminal
+                        // validation as an in-window frame: the window
+                        // boundary does not exempt the final measured
+                        // requests from the correctness contract.
+                        let outcome = classify_terminal(&decoded, (channel, epoch), &body);
+                        if outcome != Outcome::Success {
+                            return Err(format!(
+                                "drained response for corr {} failed validation ({outcome:?})",
+                                decoded.corr
+                            ));
+                        }
                         drained += 1;
                     }
                 }

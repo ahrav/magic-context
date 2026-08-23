@@ -419,12 +419,44 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
                     .ok_or_else(|| {
                         format!("{}: missing median_batch_rtt_ns", attempt.dir.display())
                     })?;
+                // The scalar feeding the gap must agree with the
+                // checksummed sidecar it derives from: sidecar checksums
+                // alone do not protect the manifest's `results` fields,
+                // so an edited or corrupted scalar could otherwise steer
+                // gap statistics while every checksum still verifies.
+                verify_sidecars(attempt)?;
+                let raw = std::fs::read(attempt.dir.join("batches.json"))
+                    .map_err(|err| format!("{}: batches.json: {err}", attempt.dir.display()))?;
+                let parsed: serde_json::Value = serde_json::from_slice(&raw)
+                    .map_err(|err| format!("{}: batches.json: {err}", attempt.dir.display()))?;
+                let mut means: Vec<f64> = parsed["batch_mean_rtt_ns"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(serde_json::Value::as_f64).collect())
+                    .unwrap_or_default();
+                let recomputed = median(&mut means).unwrap_or(0.0);
+                if recomputed != rtt {
+                    return Err(format!(
+                        "{}: median_batch_rtt_ns {rtt} disagrees with the verified \
+                         batches.json median {recomputed}",
+                        attempt.dir.display()
+                    ));
+                }
                 atomic.insert(key, rtt);
             }
             ARM_TCP_SERIAL => {
                 let p50 = results
                     .and_then(|r| r["p50_ns"].as_f64())
                     .ok_or_else(|| format!("{}: missing p50_ns", attempt.dir.display()))?;
+                verify_sidecars(attempt)?;
+                let hist = read_histogram(attempt, "issue_to_terminal.hist")?;
+                let recomputed = hist.value_at_quantile(0.5) as f64;
+                if recomputed != p50 {
+                    return Err(format!(
+                        "{}: p50_ns {p50} disagrees with the verified \
+                         issue_to_terminal.hist median {recomputed}",
+                        attempt.dir.display()
+                    ));
+                }
                 tcp.insert(key, p50);
             }
             _ => {}
