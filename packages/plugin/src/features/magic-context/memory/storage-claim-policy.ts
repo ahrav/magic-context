@@ -448,23 +448,42 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
  * recorded seed boundary only — retained raw `user` source provenance on the
  * revision's memory metadata. Post-boundary revisions must carry the trust
  * class on the observation itself, so retained legacy metadata cannot
- * qualify later rewrites. */
+ * qualify later rewrites.
+ *
+ * At or below the boundary BOTH branches are further restricted to the
+ * claim's FIRST revision: the pre-v86 rewrite path passed the retained
+ * `user` source type into the new observation and left the revision
+ * metadata untouched, so a later revision's explicit-user stamp can be
+ * model-authored replacement bytes. First revisions come from the original
+ * user write or legacy adoption and keep their stated provenance. A missing
+ * boundary key reads as 0 (never seeded): every revision on such a database
+ * was written by a build that classifies rewrites as model inference. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
     const byObservation = db
         .prepare(
             `SELECT 1 FROM claim_evidence e
              JOIN observations o ON o.id = e.observation_id
+             JOIN claim_revisions cr ON cr.id = e.revision_id
              WHERE e.revision_id = ? AND e.relation = 'supports'
                AND o.source_trust_class = 'explicit_user'
+               AND (
+                   e.revision_id > COALESCE((
+                       SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
+                       WHERE key = 'claim_policy_seed_boundary_revision_id'
+                   ), 0)
+                   OR cr.revision = 1
+               )
              LIMIT 1`,
         )
         .get(revisionId);
     if (byObservation) return true;
     const byMetadata = db
         .prepare(
-            `SELECT 1 FROM claim_revision_memory_metadata
-             WHERE revision_id = ? AND source_type = 'user'
-               AND revision_id <= (
+            `SELECT 1 FROM claim_revision_memory_metadata m
+             JOIN claim_revisions cr ON cr.id = m.revision_id
+             WHERE m.revision_id = ? AND m.source_type = 'user'
+               AND cr.revision = 1
+               AND m.revision_id <= (
                    SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
                    WHERE key = 'claim_policy_seed_boundary_revision_id'
                )

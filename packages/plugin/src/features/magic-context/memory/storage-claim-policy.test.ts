@@ -471,6 +471,58 @@ describe("claim policy storage kernel", () => {
         }
     });
 
+    test("pre-boundary rewrite revisions cannot inherit explicit-user trust", () => {
+        const fx = fixture();
+        try {
+            const first = addRevision(fx, [addObservation(fx, { trust: "explicit_user" })]);
+            const claimId = Number(
+                (
+                    fx.db
+                        .prepare("SELECT claim_id AS id FROM claim_revisions WHERE id = ?")
+                        .get(first) as { id: number }
+                ).id,
+            );
+            // A v85 rewrite appended revision 2 with the retained `user`
+            // stamp on both the observation and the revision metadata even
+            // though the replacement bytes were model-authored.
+            fx.db
+                .prepare(
+                    `INSERT INTO claim_revisions (claim_id, revision, content, content_sha256, created_at)
+                     VALUES (?, 2, 'model rewrite', ?, 2)`,
+                )
+                .run(claimId, "c".repeat(64));
+            const rewrite = Number(
+                (fx.db.prepare("SELECT MAX(id) AS id FROM claim_revisions").get() as { id: number })
+                    .id,
+            );
+            fx.db
+                .prepare(
+                    "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'supports', 2)",
+                )
+                .run(rewrite, addObservation(fx, { trust: "explicit_user" }));
+            fx.db
+                .prepare(
+                    `INSERT INTO claim_revision_memory_metadata
+                        (revision_id, category, normalized_hash, importance, memory_scope,
+                         shareable, source_type, created_at)
+                     VALUES (?, 'CONSTRAINTS', 'hash-rewrite', 50, 'project', 0, 'user', 2)`,
+                )
+                .run(rewrite);
+            fx.db
+                .prepare(
+                    "UPDATE schema_migrations_meta SET value = ? WHERE key = 'claim_policy_seed_boundary_revision_id'",
+                )
+                .run(String(rewrite));
+            // Below the boundary only the claim's first revision keeps its
+            // stated user provenance; the rewrite qualifies through neither
+            // the observation nor the retained metadata.
+            expect(hasExplicitUserEvidence(fx.db, rewrite)).toBeFalse();
+            expect(hasExplicitUserEvidence(fx.db, first)).toBeTrue();
+        } finally {
+            closeQuietly(fx.db);
+        }
+    });
+
     test("the effective projection materializes the pure decision and rebuilds identically", () => {
         const fx = fixture();
         try {
