@@ -1,0 +1,11 @@
+[package]
+name = "subc-control"
+version = "0.1.2"
+edition = "2021"
+publish = false
+description = "STRICT compile-closure stub. Surface = verified subc API inventory rows only. Never run."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subc-protocol = { path = "../subc-protocol" }

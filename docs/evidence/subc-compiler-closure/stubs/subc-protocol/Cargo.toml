@@ -1,0 +1,10 @@
+[package]
+name = "subc-protocol"
+version = "0.12.0"
+edition = "2021"
+publish = false
+description = "STRICT compile-closure stub. Surface = docs/subc-api-surface-inventory-2026-08-17.md rows only. Never run."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

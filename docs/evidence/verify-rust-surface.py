@@ -42,6 +42,7 @@ ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
         ("Frame::build", "    pub fn build("),
         ("FrameBuildError", "pub enum FrameBuildError"),
         ("FrameType", "pub enum FrameType"),
+        ("FrameType::Ping", "    Ping = 7,"),
         ("EnvelopeHeader", "pub struct EnvelopeHeader"),
         ("Priority::Interactive", "    Interactive"),
         ("PROTOCOL_VERSION", "pub const PROTOCOL_VERSION"),
@@ -54,6 +55,12 @@ ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
         ("manifest::TrustTier", "pub enum TrustTier"),
         ("manifest::ProviderRole", "pub enum ProviderRole"),
         ("manifest::ConsumerRole", "pub enum ConsumerRole"),
+        (
+            "ConsumerRole PartialEq",
+            "#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]\n"
+            '#[serde(tag = "role", rename_all = "snake_case")]\n'
+            "pub enum ConsumerRole",
+        ),
         ("ConsumerRole::ServiceClient", "ServiceClient { of: Vec<String> }"),
         ("manifest::Bindings", "pub struct Bindings"),
         ("manifest::StorageBinding", "pub struct StorageBinding"),

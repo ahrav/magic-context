@@ -5,6 +5,8 @@ use std::{net::SocketAddr, time::Duration};
 
 use subc_client_rs::{CallOptions, ConsumerOptions, RetryBackoff, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
+use subc_protocol::manifest::ConsumerRole;
+use subc_protocol::FrameType;
 use subc_transport::{
     authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic,
     ConnectionInfo, Endpoint, SCHEMA_VERSION,
@@ -13,6 +15,21 @@ use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn test_only_items_have_published_shapes() {
+    // Compiler-closure ledger entry 1: Ping exists and supports the
+    // producer's `!=`/`==` comparisons. commentlint: allow(JUDGE)
+    assert!(FrameType::Ping == FrameType::Ping);
+
+    // Compiler-closure ledger entry 2: ConsumerRole is PartialEq. commentlint: allow(JUDGE)
+    let consumes = ConsumerRole::ServiceClient {
+        of: vec!["thalamus".to_string()],
+    };
+    assert!(
+        consumes
+            == ConsumerRole::ServiceClient {
+                of: vec!["thalamus".to_string()],
+            }
+    );
+
     let temp = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();

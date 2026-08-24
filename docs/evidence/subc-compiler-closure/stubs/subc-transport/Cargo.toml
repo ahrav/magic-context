@@ -1,0 +1,10 @@
+[package]
+name = "subc-transport"
+version = "0.5.1"
+edition = "2021"
+publish = false
+description = "STRICT compile-closure stub. Surface = verified subc API inventory rows only. Never run."
+
+[dependencies]
+subc-protocol = { path = "../subc-protocol" }
+tokio = { version = "1", features = ["net"] }
