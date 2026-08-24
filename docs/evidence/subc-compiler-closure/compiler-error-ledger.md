@@ -76,7 +76,7 @@ so **every row stays `exact` and the totals are unchanged**.
 | `manifest::ExecutionMode` | `Debug` (test) | `prompt_surface.rs:338` `assert_eq!` | E0277, iter-4 |
 | `subc_client_rs::HandlerOutcome` | `Debug` (test) | lib unit tests format `{other:?}` (lib.rs:17261 + siblings) | E0277, iter-4 |
 | `subc_client_rs::HealthStatus` | `Debug` (test) | lib.rs:17067 `assert_eq!` | E0277, iter-4 |
-| `subc_control::ClientControlResponse` | `Debug` (test) | `tests/broca_roundtrip.rs:591` `.expect()` on `Result<Self, _>` | E0277, iter-6 |
+| `subc_control::ClientControlResponse` | `Debug` (test) | `tests/broca_roundtrip.rs:591:58` `panic!("unexpected control response {other:?}")` | E0277, iter-6 |
 | `AuthError`, `ConnectionFileError`, `FrameIoError`, `FrameBuildError` | `std::error::Error` | `historian_producer.rs:522-526` `source()` casts to `&dyn StdError` | E0277, iter-8 |
 
 Serde impls retained without individual diagnostics are wire-contract rows
@@ -100,7 +100,10 @@ proved two impls **un-demanded** and removed them: `std::error::Error` for
   names; adding speculative variants would violate the no-unverified-surface
   rule (R6). No API item is missing.
 - No demanded item was private-only or behavior-heavy, so the R13/AE4 stop
-  condition never triggered and the thin-shim decision stands.
+  condition never triggered; the closure leaves the original c50.1
+  shim-vs-rewrite analysis unchanged. The operative decision remains the
+  direct mc-host port with no `subc-*` compatibility shims
+  (`magic-context-c50.1` as of 2026-08-22, executed by `magic-context-c50.4`).
 
 ## Totals
 

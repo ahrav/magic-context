@@ -6,6 +6,14 @@ Plan: `2026-08-17-0505-subc-api-surface-spike-plan.md`
 
 ## Decision
 
+> **Superseded (2026-08-22).** The shim-adoption decision below is the original
+> c50.1 analysis, preserved as the record of that spike. `magic-context-c50.1`
+> has since decided the boundary is ported directly to the mc-host SDK with no
+> `subc-*` compatibility shims (executed by `magic-context-c50.4`). The
+> inventory and its compiler-closure proof
+> (`docs/evidence/subc-compiler-closure/`) remain the authoritative enumeration
+> of the surface that port must cover.
+
 **Option (a): compatible local `subc-*` crates, so `mc-module` compiles unmodified.**
 Option (b), rewriting the `mc-module` boundary against a repo-owned SDK, is rejected.
 
@@ -156,7 +164,7 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | --- | --- | --- | --- | --- | --- |
 | `ClientControlRequest` | `historian_producer.rs` (+ its unit-test fake daemon) | prod + test | serde-tagged control envelope on channel 0 | exact | P |
 | `ClientControlRequest::RouteOpen` | same | prod + test | `{ target, identity, consumer_identity, consumer_capabilities, admission_facts }` | exact | P |
-| `ClientControlResponse::RouteOpen` | same | prod + test | `{ route_channel: u16, route_epoch: u32 }`; the producer binds every later frame to that pair; `Debug` (test `.expect()` on `Result<Self, _>`) | exact | L |
+| `ClientControlResponse::RouteOpen` | same | prod + test | `{ route_channel: u16, route_epoch: u32 }`; the producer binds every later frame to that pair; `Debug` (test `panic!("… {other:?}")` at `tests/broca_roundtrip.rs:591:58`) | exact | L |
 | `ConsumerIdentity` | `historian_producer.rs` | prod | `{ module_id, launch_nonce }`, sent only when both env vars are non-empty | exact | L |
 | `RouteOpen.admission_facts` | `historian_producer.rs` | prod | `Option<Value>`, sent as `None` | exact | T |
 

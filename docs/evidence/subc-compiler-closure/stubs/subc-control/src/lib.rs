@@ -30,9 +30,9 @@ pub enum ClientControlRequest {
 }
 
 /// Row: `ClientControlResponse::RouteOpen` — `{ route_channel: u16,
-/// route_epoch: u32 }`. `Debug` demanded by the
-/// `tests/broca_roundtrip.rs:591` `.expect()` on a `Result<_,
-/// serde_json::Error>` of this type (E0277).
+/// route_epoch: u32 }`. `Debug` demanded by the catch-all match arm at
+/// `tests/broca_roundtrip.rs:591:58`, which formats the response with
+/// `panic!("unexpected control response {other:?}")` (E0277).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientControlResponse {

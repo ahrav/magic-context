@@ -17,7 +17,11 @@ Two gaps were found and reconciled (see `compiler-error-ledger.md`):
 `FrameType::Ping` (the deliberate positive-control omission, demanded by
 `tests/broca_roundtrip.rs:544`) and `PartialEq` on `manifest::ConsumerRole`
 (demanded by a lib unit test). Both are satisfied by the published MIT crates,
-so the shim-vs-rewrite decision is unchanged.
+so the closure does not alter the original c50.1 shim-vs-rewrite analysis.
+Note the operative decision has since been superseded (`magic-context-c50.1`,
+2026-08-22): the boundary is being ported directly to the mc-host SDK with no
+`subc-*` compatibility shims (`magic-context-c50.4`); this pass proves the
+inventory that port relies on is complete.
 
 ## Environment
 
@@ -78,9 +82,11 @@ so the shim-vs-rewrite decision is unchanged.
 
 ## Execution safety
 
-No binary or test linked against the stubs was ever run: every stub function
-body is `unimplemented!()`, and all verification used `build` or
-`test --no-run`.
+No binary or test linked against the stubs was ever run: all verification used
+`build` or `test --no-run`. Every stub function body is
+`unimplemented!()` except the pure `ErrorBody::new` constructor
+(`stubs/subc-protocol/src/lib.rs`), which carries its trivial field-assignment
+body; it was never executed, like the rest of the stubs.
 
 ## Result
 
