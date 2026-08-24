@@ -20402,7 +20402,7 @@ pub(crate) mod tests {
                 }
             ]
         });
-        let decoded = crate::codec::decode_opencode(&[native_tool_message.clone()]);
+        let decoded = crate::codec::decode_opencode(std::slice::from_ref(&native_tool_message));
         let mut tool_message = decoded.messages[0].clone();
         // The live CK ingress is projected by the host independently of the native sidecar, so it
         // does not carry the Rust decoder's private block-origin stamps.
@@ -29032,11 +29032,13 @@ pub(crate) mod tests {
             },
             &SelectionConfig::default(),
         );
-        let mut core = CoreState::default();
-        core.frozen_units = decisions
-            .iter()
-            .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
-            .collect();
+        let core = CoreState {
+            frozen_units: decisions
+                .iter()
+                .map(|decision| red_unit(&decision.target_id, &decision.kind, &decision.payload))
+                .collect(),
+            ..Default::default()
+        };
         let served = build_output(
             &core,
             &ModuleMeta::default(),
@@ -29179,11 +29181,13 @@ pub(crate) mod tests {
             reasoning_adjacency_fixture(true, true, true),
         );
         let projection = project_messages(&request.messages).unwrap();
-        let mut core = CoreState::default();
-        core.frozen_units = vec![
-            red_unit("reasoning-adjacency-left#2", "drop", "[dropped]"),
-            red_unit("reasoning-adjacency-result#0", "drop", "[dropped]"),
-        ];
+        let core = CoreState {
+            frozen_units: vec![
+                red_unit("reasoning-adjacency-left#2", "drop", "[dropped]"),
+                red_unit("reasoning-adjacency-result#0", "drop", "[dropped]"),
+            ],
+            ..Default::default()
+        };
         let meta = ModuleMeta::default();
         let first = build_output_with_tags(
             &core,

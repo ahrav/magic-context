@@ -2931,6 +2931,15 @@ pub struct HistorianDurableState {
     pub producer_session_id: Option<String>,
     #[serde(default)]
     pub producer_run_id: Option<String>,
+    /// The harness the producer run was started under. Broca scopes a run's
+    /// identity by `(project_root, harness, session)`, so recovery must
+    /// reattach with THIS harness rather than whatever the resuming route is
+    /// bound to: after a cross-harness handoff the current binding would
+    /// resolve to `missing` and abandon-then-refire a run the original
+    /// harness may still be executing. `None` is a state written before this
+    /// field existed; recovery falls back to the resuming binding there.
+    #[serde(default)]
+    pub producer_harness: Option<String>,
     #[serde(default)]
     pub fired_at_ms: Option<i64>,
     /// Session-level revert epoch observed when the chunk was assembled. It is copied
@@ -2973,6 +2982,7 @@ impl Default for HistorianDurableState {
             selected_range_identities: Vec::new(),
             producer_session_id: None,
             producer_run_id: None,
+            producer_harness: None,
             fired_at_ms: None,
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration::default(),
@@ -23643,6 +23653,7 @@ mod tests {
                 selected_range_identities,
                 producer_session_id: Some("producer-session".into()),
                 producer_run_id: Some("run-1".into()),
+                producer_harness: None,
                 fired_at_ms: Some(123),
                 expected_revert_epoch: 0,
                 compartment_set_generation: CompartmentSetGeneration::default(),

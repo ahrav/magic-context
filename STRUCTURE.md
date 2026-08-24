@@ -114,8 +114,8 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
   - `crates/mc-core/`: Core cache-stability transform and classification logic.
   - `crates/mc-store/`: Durable SQLite session database schema, metadata, and CAS transitions.
   - `crates/mc-tokenizer/`: tiktoken BPE-based token count estimator.
-  - `crates/mc-host/`: Generic direct-linked host library. Owns secure instance publication, HMAC authentication, wire-v2 framing, control/catalog handling for the fixed two-target profile, process-global routes and epochs, bounded request settlement, Ping/Pong capability, and ordered shutdown behind repo-owned handler types. `src/composite.rs` dispatches routes across the two static components, and `src/synapse/` serves the certified offline embedding lane (bundle validation, dynamic ONNX Runtime, four-operation protocol, bounded ephemeral jobs). Production `McHandler` adaptation and client cutover are not in this crate.
-  - `crates/mc-module/`: The current `subc` protocol adapter, autonomous historian coordinator, and client; a later task adds the one-way adapter from `mc-module` to `mc-host`.
+  - `crates/mc-host/`: Generic direct-linked host library. Owns secure instance publication, HMAC authentication, wire-v2 framing, control/catalog handling for the fixed three-target profile, process-global routes and epochs, bounded request settlement split into general and reserved pending/task permit classes, Ping/Pong capability, and ordered shutdown behind repo-owned handler types. `src/composite.rs` dispatches routes across the three static components, `src/synapse/` serves the certified offline embedding lane (bundle validation, dynamic ONNX Runtime, four-operation protocol, bounded ephemeral jobs), and `src/broca/` serves the five-operation LLM run lane (strict protocol, bounded process-local run supervisor with ordered replay, hardened OpenCode/Pi subprocess adapters behind one `LlmExecutionBackend` seam, and the bundled Pi payload hook in `assets/`). Production `McHandler` adaptation and client cutover are not in this crate.
+  - `crates/mc-module/`: The current `subc` protocol adapter, autonomous historian coordinator, and client, including the harness-bound `HistorianProducer` that consumes the Broca route; a later task adds the one-way adapter from `mc-module` to `mc-host`.
 
 **Pi Sibling Package (`packages/pi-plugin/`):**
 
@@ -135,8 +135,9 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `packages/cli/src/commands/migrate.ts`: Migrate OpenCode sessions to Pi or OMP format with phase-tracked `migration_pending` recovery journaling.
 - `packages/cli/src/lib/embedding-runtime.ts`: Probe the presence of the `onnxruntime-node` package and native platform binaries to verify local embedding runtime health.
 - `packages/pi-plugin/src/index.ts`: Entry point for the Pi-specific plugin registering context handlers and hooks.
-- `crates/mc-host/src/`: Generic host ownership boundaries (`instance`, `wire`, `control`, `routing`, `dispatch`, `connection`, `runtime`, and `composite`) plus the public handler and limit contracts; `synapse/` holds the embedding lane (`bundle`, `inference`, `protocol`, `jobs`).
-- `crates/mc-host/tests/`: Independent raw-client, protocol-vector, filesystem-security, routing, dispatch, lifecycle, composite-routing, synapse bundle/protocol/job, and real-loopback composition tests, with the committed `fixtures/synapse-tiny/` model bundle.
+- `crates/mc-host/src/`: Generic host ownership boundaries (`instance`, `wire`, `control`, `routing`, `dispatch`, `connection`, `runtime`, and `composite`) plus the public handler and limit contracts; `synapse/` holds the embedding lane (`bundle`, `inference`, `protocol`, `jobs`) and `broca/` holds the LLM run lane (`protocol`, `supervisor`, `backend`, `config`, `subprocess`, `opencode`, `pi`).
+- `crates/mc-host/tests/`: Independent raw-client, protocol-vector, filesystem-security, routing, dispatch, lifecycle, composite-routing, synapse bundle/protocol/job, broca protocol/supervisor/subprocess, and real-loopback composition tests, with the committed `fixtures/synapse-tiny/` model bundle.
+- `crates/mc-module/tests/broca_roundtrip.rs`: Authenticated cross-crate round-trip proof — the real `HistorianProducer` and module classify path against a real in-process `mc-host` with a deterministic backend, covering both harness selections.
 - `crates/mc-module/src/main.rs`: Entry point for the current `subc` daemon module; direct-host production wiring remains deferred.
 
 **Configuration:**
@@ -265,7 +266,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 
 **New Rust transform logic or state mutation:** add it in `crates/mc-core/src/` if it is general cache-stability or classification math, or `crates/mc-store/src/` if it affects durable schemas or database mutations, or `crates/mc-module/src/transform.rs` if it is a transform pass operation.
 
-**New Rust handler operation:** add module business logic in `crates/mc-module/src/lib.rs`. Keep socket framing, authentication, route allocation, correlations, settlement, and shutdown ownership in `crates/mc-host/`. Production adapter or binary wiring belongs in `mc-module`; `mc-host` must not depend on `mc-module`.
+**New Rust handler operation:** add module business logic in `crates/mc-module/src/lib.rs`. Keep socket framing, authentication, route allocation, correlations, settlement, and shutdown ownership in `crates/mc-host/`. Production adapter or binary wiring belongs in `mc-module`; `mc-host` must not depend on `mc-module` (the reverse direction exists only as a dev-dependency for `crates/mc-module/tests/broca_roundtrip.rs`).
 
 **New direct-host protocol behavior:** add it at the owning boundary in `crates/mc-host/src/` and prove it with the independent raw client under `crates/mc-host/tests/`. Do not add client-only retry policy or module business logic to the host.
 

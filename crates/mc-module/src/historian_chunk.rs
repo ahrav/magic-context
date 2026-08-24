@@ -516,12 +516,14 @@ impl AssembledHistorianFiring {
         session_id: &'a str,
         project_path: &'a str,
         project_slug: &'a str,
+        harness: &'a str,
     ) -> HistorianFireRequest<'a> {
         HistorianFireRequest {
             store,
             session_id,
             project_path,
             project_slug,
+            harness,
             // The role-scoped historian system prompt. The assembler builds the USER
             // prompt (chunk + references); the system prompt is the vendored constant —
             // per-firing static, byte-identical across firings.

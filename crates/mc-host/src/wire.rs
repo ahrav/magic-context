@@ -88,8 +88,7 @@ impl ByteBudget {
             })
     }
 
-    #[cfg(test)]
-    pub fn available(&self) -> usize {
+    pub(crate) fn available(&self) -> usize {
         self.semaphore.available_permits()
     }
 }

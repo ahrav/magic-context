@@ -618,7 +618,8 @@ fn a_dropped_initialize_keeps_shutdown_waiting_for_the_blocking_load() {
         gate.await.expect("gate closure joins");
         tokio::time::timeout(Duration::from_secs(10), component.shutdown())
             .await
-            .expect("shutdown completes once the blocking load stopped");
+            .expect("shutdown completes once the blocking load stopped")
+            .expect("synapse shutdown returns cleanly");
 
         // The dropped initialize never installed a lane: the load's result
         // was discarded at the tracked wrapper.
@@ -638,8 +639,13 @@ fn host_config(data_root: &Path) -> mc_host::HostConfig {
     }
 }
 
-fn probe_composite() -> StaticComposite<EchoPrimary, SynapseComponent> {
-    StaticComposite::new(EchoPrimary, SynapseComponent::new(None)).expect("distinct component ids")
+fn probe_composite() -> StaticComposite<EchoPrimary, SynapseComponent, support::StubComponent> {
+    StaticComposite::new(
+        EchoPrimary,
+        SynapseComponent::new(None),
+        support::StubComponent::new("broca", "management_surface"),
+    )
+    .expect("distinct component ids")
 }
 
 #[test]
@@ -652,7 +658,12 @@ fn an_aborted_initialization_holds_the_instance_lock_until_the_blocking_load_sto
 
         let synapse =
             SynapseComponent::new(Some(config_for(bundle_dir.path(), &pre_ort_identity())));
-        let composite = StaticComposite::new(EchoPrimary, synapse).expect("distinct component ids");
+        let composite = StaticComposite::new(
+            EchoPrimary,
+            synapse,
+            support::StubComponent::new("broca", "management_surface"),
+        )
+        .expect("distinct component ids");
         let shutdown = mc_host::CancellationToken::new();
         let run_shutdown = shutdown.clone();
         let config = host_config(data_root.path());

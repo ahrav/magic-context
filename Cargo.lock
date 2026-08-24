@@ -980,6 +980,7 @@ dependencies = [
  "cortexkit-store-types",
  "filetime",
  "mc-core",
+ "mc-host",
  "mc-store",
  "mc-tokenizer",
  "regex",

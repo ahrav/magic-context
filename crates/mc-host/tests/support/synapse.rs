@@ -16,7 +16,7 @@ use mc_host::synapse::{
 use mc_host::{
     BindOutcome, CancellationToken, CompositeComponent, HealthReport, HostConfig, HostError,
     HostInit, HostLimits, InitError, ManifestSnapshot, PrimaryComponent, RequestCtx,
-    RequestOutcome, RouteHandle, RouteIdentity, StaticComposite,
+    RequestOutcome, RouteHandle, RouteIdentity, ShutdownError, StaticComposite,
 };
 
 pub const ROOT: &str = "/workspace/project";
@@ -134,7 +134,9 @@ impl CompositeComponent for EchoPrimary {
         HealthReport::ok()
     }
 
-    async fn shutdown(&self) {}
+    async fn shutdown(&self) -> Result<(), ShutdownError> {
+        Ok(())
+    }
 }
 
 impl PrimaryComponent for EchoPrimary {
@@ -159,7 +161,12 @@ impl SynapseHost {
         synapse: SynapseComponent,
         tweak: impl FnOnce(&mut HostConfig),
     ) -> Self {
-        let composite = StaticComposite::new(EchoPrimary, synapse).expect("distinct component ids");
+        let composite = StaticComposite::new(
+            EchoPrimary,
+            synapse,
+            super::StubComponent::new("broca", "management_surface"),
+        )
+        .expect("distinct component ids");
         let data_root = tempfile::tempdir().expect("temp data root");
         let mut config = HostConfig {
             data_dir: Some(data_root.path().to_path_buf()),

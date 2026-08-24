@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod broca;
 pub mod raw_client;
 pub mod synapse;
 
@@ -12,9 +13,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use mc_host::{
-    BindOutcome, CancellationToken, HealthReport, HealthStatus, HostConfig, HostError, HostLimits,
-    InitError, ManifestSnapshot, McHostHandler, RequestCtx, RequestOutcome, RouteHandle,
-    RouteIdentity, RouteTarget,
+    BindOutcome, CancellationToken, CompositeComponent, HealthReport, HealthStatus, HostConfig,
+    HostError, HostLimits, InitError, ManifestSnapshot, McHostHandler, PrimaryComponent,
+    RequestCtx, RequestOutcome, ResourceDeclaration, RouteHandle, RouteIdentity, RouteTarget,
+    SecondaryComponent, ShutdownError,
 };
 
 use raw_client::Discovered;
@@ -709,6 +711,201 @@ pub fn echo_body(payload: &str) -> Vec<u8> {
 
 pub fn mode_body(value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&value).expect("body serializes")
+}
+
+/// Minimal scriptable composite child for three-component hosts. Per-request
+/// behavior is chosen by the request body, like [`TestHandler`]: mode `hang`
+/// parks the handler task forever (holding its pending and task permits, the
+/// capacity-isolation fixture); anything else answers `{"served_by": id}`.
+#[derive(Clone)]
+pub struct StubComponent {
+    id: &'static str,
+    role: &'static str,
+    resources: ResourceDeclaration,
+    dispatches: Arc<AtomicUsize>,
+}
+
+impl StubComponent {
+    pub fn new(id: &'static str, role: &'static str) -> Self {
+        Self {
+            id,
+            role,
+            resources: ResourceDeclaration::default(),
+            dispatches: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn with_resources(mut self, resources: ResourceDeclaration) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    pub fn dispatch_count(&self) -> usize {
+        self.dispatches.load(Ordering::SeqCst)
+    }
+}
+
+impl CompositeComponent for StubComponent {
+    fn manifest(&self) -> ManifestSnapshot {
+        ManifestSnapshot {
+            module_id: self.id.to_owned(),
+            module_version: "0.0.1".to_owned(),
+            provides: vec![serde_json::json!({"role": self.role})],
+            control_ops: Vec::new(),
+        }
+    }
+
+    fn resources(&self) -> ResourceDeclaration {
+        self.resources
+    }
+
+    async fn bind(&self, _route: RouteHandle, _identity: RouteIdentity) -> BindOutcome {
+        BindOutcome::Accept
+    }
+
+    async fn handle(&self, ctx: RequestCtx) -> RequestOutcome {
+        self.dispatches.fetch_add(1, Ordering::SeqCst);
+        let request: serde_json::Value =
+            serde_json::from_slice(&ctx.body).unwrap_or(serde_json::Value::Null);
+        if request["mode"].as_str() == Some("hang") {
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+        json_response(&ctx, serde_json::json!({"served_by": self.id})).await
+    }
+
+    async fn route_gone(&self, _route: RouteHandle) {}
+
+    async fn health(&self) -> HealthReport {
+        HealthReport::ok()
+    }
+
+    async fn shutdown(&self) -> Result<(), ShutdownError> {
+        Ok(())
+    }
+}
+
+impl PrimaryComponent for StubComponent {
+    async fn initialize(&self, _init: mc_host::HostInit) -> Result<(), InitError> {
+        Ok(())
+    }
+}
+
+impl SecondaryComponent for StubComponent {
+    async fn initialize(&self) -> Result<(), InitError> {
+        Ok(())
+    }
+}
+
+/// The direct profile's three stub children in catalog order, for tests
+/// whose subject is the host runtime rather than any one component.
+pub fn stub_trio() -> (StubComponent, StubComponent, StubComponent) {
+    (
+        StubComponent::new("magic-context", "tool_provider"),
+        StubComponent::new("synapse", "management_surface"),
+        StubComponent::new("broca", "management_surface"),
+    )
+}
+
+/// Real-loopback host over an arbitrary linked handler, for three-child
+/// composite tests that [`TestHost`]'s fixed [`TestHandler`] cannot express.
+pub struct CompositeTestHost {
+    pub info: Discovered,
+    shutdown: CancellationToken,
+    join: Option<tokio::task::JoinHandle<Result<(), HostError>>>,
+    _data_root: tempfile::TempDir,
+}
+
+impl CompositeTestHost {
+    /// Starts `handler`, returning the harness once the publication appears
+    /// or the runtime's startup error otherwise.
+    pub async fn try_start<H: McHostHandler>(
+        handler: H,
+        tweak: impl FnOnce(&mut HostConfig),
+    ) -> Result<Self, HostError> {
+        let data_root = tempfile::tempdir().expect("temp data root");
+        let mut config = HostConfig {
+            data_dir: Some(data_root.path().to_path_buf()),
+            daemon_ver: "mc-host/test".to_owned(),
+            limits: HostLimits {
+                // Small but still interoperable: one 64 MiB frame must fit
+                // beside the largest real component declaration (Broca's),
+                // so composites embedding the production component start
+                // with ingress to spare.
+                max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2
+                    + mc_host::broca::config::DECLARED_RETAINED_RESIDENT_BYTES,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.timing.frame_deadline = Duration::from_secs(5);
+        config.timing.shutdown_deadline = Duration::from_secs(5);
+        config.timing.route_close_budget = Duration::from_secs(2);
+        config.timing.lifecycle_callback_deadline = Duration::from_secs(2);
+        tweak(&mut config);
+
+        let publication = connection_file(
+            config
+                .data_dir
+                .as_deref()
+                .expect("the harness always configures a data root"),
+        );
+        let shutdown = CancellationToken::new();
+        let run_shutdown = shutdown.clone();
+        let join = tokio::spawn(async move { mc_host::run(handler, config, run_shutdown).await });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if join.is_finished() {
+                return Err(join
+                    .await
+                    .expect("run task joins")
+                    .expect_err("run returned success without publishing"));
+            }
+            if std::fs::read(&publication).is_ok() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                shutdown.cancel();
+                panic!("host did not publish within its startup budget");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let info = raw_client::discover(&publication).expect("publication must validate");
+        Ok(Self {
+            info,
+            shutdown,
+            join: Some(join),
+            _data_root: data_root,
+        })
+    }
+
+    pub async fn start<H: McHostHandler>(handler: H, tweak: impl FnOnce(&mut HostConfig)) -> Self {
+        Self::try_start(handler, tweak)
+            .await
+            .expect("host must publish")
+    }
+
+    pub async fn client(&self) -> raw_client::RawClient {
+        raw_client::RawClient::connect(&self.info)
+            .await
+            .expect("authenticated connection")
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), HostError> {
+        self.shutdown.cancel();
+        let join = self.join.take().expect("host runs once");
+        tokio::time::timeout(Duration::from_secs(20), join)
+            .await
+            .expect("host must finish within its shutdown budget")
+            .expect("run task joins")
+    }
+}
+
+impl Drop for CompositeTestHost {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 /// Asserts every catalog module's `control_ops` equals `expected` exactly, so

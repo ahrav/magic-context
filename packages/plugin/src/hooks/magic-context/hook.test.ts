@@ -740,6 +740,9 @@ describe("magic-context hook", () => {
             ...deps.config,
             transform_mode: "rust",
             dreamer: {
+                // An empty classify chain is refused before transport, so
+                // module routing is only observable with a model configured.
+                model: "test/classify-model",
                 tasks: {
                     "classify-memories": {
                         schedule: "0 3 * * *",

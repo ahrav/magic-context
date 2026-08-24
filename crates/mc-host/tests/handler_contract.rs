@@ -4,11 +4,13 @@ mod support;
 
 use std::time::Duration;
 
-use mc_host::{ConfigError, HostLimits};
+use mc_host::{
+    ConfigError, HostError, HostLimits, ResourceDeclaration, RouteClass, StaticComposite,
+};
 use support::raw_client::{
     FLAGS_INTERACTIVE, TY_REQUEST, TY_RESPONSE, TY_STREAM_DATA, TY_STREAM_END,
 };
-use support::{mode_body, BindPolicy, Event, TestHost, LINKED_MODULE_ID};
+use support::{mode_body, BindPolicy, CompositeTestHost, Event, TestHost, LINKED_MODULE_ID};
 
 const BUDGET: Duration = Duration::from_secs(5);
 const ROOT: &str = "/workspace/project";
@@ -295,4 +297,263 @@ fn limit_defaults_are_finite_and_validated() {
     tightened
         .validate()
         .expect("minimal but interoperable limits are valid");
+}
+
+fn broca_declaration(retained_resident_bytes: u64) -> ResourceDeclaration {
+    ResourceDeclaration {
+        reserved_handler_tasks: 96,
+        reserved_pending_requests: 96,
+        retained_resident_bytes,
+        route_class: RouteClass::Reserved,
+    }
+}
+
+fn three_child_composite(
+    declaration: ResourceDeclaration,
+) -> StaticComposite<support::StubComponent, support::StubComponent, support::StubComponent> {
+    let (mc, synapse, broca) = support::stub_trio();
+    StaticComposite::new(mc, synapse, broca.with_resources(declaration)).expect("distinct ids")
+}
+
+/// A 96-slot declaration must leave at least one general slot in each pool:
+/// startup fails when either limit is at most the reservation and starts
+/// when both are one above it (R13, plan KTD2).
+#[tokio::test]
+async fn reservations_must_leave_one_general_slot_in_each_pool() {
+    for (pending, tasks) in [(96, 200), (200, 96), (96, 96)] {
+        let result =
+            CompositeTestHost::try_start(three_child_composite(broca_declaration(0)), |config| {
+                config.limits.max_pending_requests = pending;
+                config.limits.max_handler_tasks = tasks;
+            })
+            .await;
+        assert!(
+            matches!(result, Err(HostError::InitFailed(_))),
+            "limits ({pending}, {tasks}) must fail against a 96-slot reservation"
+        );
+    }
+
+    let host = CompositeTestHost::start(three_child_composite(broca_declaration(0)), |config| {
+        config.limits.max_pending_requests = 97;
+        config.limits.max_handler_tasks = 97;
+    })
+    .await;
+    // One general slot exists in each pool: an ordinary request dispatches.
+    let mut client = host.client().await;
+    let (channel, epoch) = client
+        .route_open_target(
+            "tool_provider",
+            "magic-context",
+            "/workspace/project",
+            "opencode",
+            "s1",
+        )
+        .await
+        .expect("magic-context binds");
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            channel,
+            epoch,
+            corr,
+            &mode_body(serde_json::json!({"mode": "echo"})),
+        )
+        .await
+        .expect("send");
+    let frame = client.frame_within(BUDGET).await.expect("terminal");
+    assert_eq!(frame.corr, corr);
+    assert_eq!(frame.ty, TY_RESPONSE);
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// A reserved-class module must reserve permits, and a general-class module
+/// must not: both mismatches are impossible accounting and fail startup.
+#[tokio::test]
+async fn class_and_reservation_mismatches_fail_startup() {
+    let mismatches = [
+        ResourceDeclaration {
+            reserved_handler_tasks: 0,
+            reserved_pending_requests: 0,
+            retained_resident_bytes: 0,
+            route_class: RouteClass::Reserved,
+        },
+        ResourceDeclaration {
+            reserved_handler_tasks: 4,
+            reserved_pending_requests: 4,
+            retained_resident_bytes: 0,
+            route_class: RouteClass::General,
+        },
+    ];
+    for declaration in mismatches {
+        let result =
+            CompositeTestHost::try_start(three_child_composite(declaration), |_config| {}).await;
+        assert!(
+            matches!(result, Err(HostError::InitFailed(_))),
+            "declaration {declaration:?} must fail startup"
+        );
+    }
+}
+
+/// A 64 MiB retained declaration raises the resident floor: one byte below
+/// the handler-dependent floor fails startup, the exact floor starts and
+/// still admits one maximum-size ingress body, so ingress, scratch, egress,
+/// catalog, and declared retention exactly sum to the configured cap.
+#[tokio::test]
+async fn retained_declaration_raises_the_resident_floor_exactly() {
+    const RETAINED: u64 = 64 * 1024 * 1024;
+    let try_resident = |bytes: u64| async move {
+        CompositeTestHost::try_start(
+            three_child_composite(broca_declaration(RETAINED)),
+            move |config| {
+                config.limits.max_resident_bytes = bytes;
+            },
+        )
+        .await
+    };
+
+    // The floor is MIN_RESIDENT_BYTES + retained + the serialized catalog's
+    // resident length, which only the runtime knows; bisect the boundary.
+    // `lo` always fails (the catalog is nonempty) and `hi` must pass.
+    let mut lo = mc_host::config::MIN_RESIDENT_BYTES + RETAINED;
+    let mut hi = lo + 64 * 1024;
+    assert!(
+        matches!(try_resident(lo).await, Err(HostError::InitFailed(_))),
+        "the floor without catalog headroom must fail"
+    );
+    match try_resident(hi).await {
+        Ok(host) => host.shutdown().await.expect("graceful shutdown"),
+        Err(err) => panic!("64 KiB of catalog headroom must start: {err}"),
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        match try_resident(mid).await {
+            Ok(host) => {
+                host.shutdown().await.expect("graceful shutdown");
+                hi = mid;
+            }
+            Err(HostError::InitFailed(_)) => lo = mid,
+            Err(err) => panic!("unexpected startup failure: {err}"),
+        }
+    }
+    let floor = hi;
+
+    assert!(
+        matches!(try_resident(floor - 1).await, Err(HostError::InitFailed(_))),
+        "one byte below the handler-dependent floor must be rejected"
+    );
+
+    // At the exact floor the ingress pool is exactly one maximum body: a
+    // 64 MiB frame is still interoperable (protocol V12/V28).
+    let host = match try_resident(floor).await {
+        Ok(host) => host,
+        Err(err) => panic!("the exact floor must be accepted: {err}"),
+    };
+    let mut client = host.client().await;
+    let (channel, epoch) = client
+        .route_open_target(
+            "tool_provider",
+            "magic-context",
+            "/workspace/project",
+            "opencode",
+            "big",
+        )
+        .await
+        .expect("route");
+    let prefix = br#"{"mode":"echo","pad":""#;
+    let suffix = br#""}"#;
+    let max_body = 64 * 1024 * 1024usize;
+    let mut body = Vec::with_capacity(max_body);
+    body.extend_from_slice(prefix);
+    body.extend(std::iter::repeat_n(
+        b'a',
+        max_body - prefix.len() - suffix.len(),
+    ));
+    body.extend_from_slice(suffix);
+    let corr = client.next_corr();
+    client
+        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, channel, epoch, corr, &body)
+        .await
+        .expect("send maximum-size frame");
+    let frame = client
+        .frame_within(Duration::from_secs(60))
+        .await
+        .expect("maximum-size frame answered at the exact floor");
+    assert_eq!(frame.corr, corr);
+    assert_eq!(frame.ty, TY_RESPONSE);
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// The default resident cap absorbs the whole Broca declaration: it is the
+/// former two-component 256 MiB default plus exactly the declared retained
+/// reservation (the 64 MiB supervisor budget plus the route-map and
+/// backend-capture headroom), so ingress headroom is preserved, and the
+/// default-limit three-component host starts.
+#[tokio::test]
+async fn the_default_resident_cap_absorbs_the_broca_reservation() {
+    const RETAINED: u64 = 64 * 1024 * 1024
+        + 1024 * (4096 + 256 + 128)
+        + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024)
+        + 256 * ((4096 + 256) * 3 + 128)
+        + (1 + 3 * 8) * 1536 * 1024
+        + 3 * 8 * (96 * 1024 + 8 * 1024);
+    let defaults = HostLimits::default();
+    assert_eq!(
+        defaults.max_resident_bytes - RETAINED,
+        256 * 1024 * 1024,
+        "the default grew by exactly the declared retained reservation"
+    );
+
+    let host = CompositeTestHost::start(
+        three_child_composite(broca_declaration(RETAINED)),
+        |config| {
+            // Default limits: the production declaration must fit them.
+            config.limits = HostLimits::default();
+        },
+    )
+    .await;
+    host.shutdown().await.expect("graceful shutdown");
+}
+
+/// A zero-reservation handler keeps single-pool behavior: the tightest
+/// interoperable limits still serve a request because nothing was carved out
+/// of the general pools.
+#[tokio::test]
+async fn zero_reservation_handlers_keep_single_pool_admission() {
+    let (mc, synapse, broca) = support::stub_trio();
+    let composite = StaticComposite::new(mc, synapse, broca).expect("distinct ids");
+    let host = CompositeTestHost::start(composite, |config| {
+        config.limits.max_pending_requests = 1;
+        config.limits.max_handler_tasks = 1;
+    })
+    .await;
+    let mut client = host.client().await;
+    let (channel, epoch) = client
+        .route_open_target(
+            "management_surface",
+            "broca",
+            "/workspace/project",
+            "opencode",
+            "s1",
+        )
+        .await
+        .expect("broca binds");
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            TY_REQUEST,
+            FLAGS_INTERACTIVE,
+            channel,
+            epoch,
+            corr,
+            &mode_body(serde_json::json!({"mode": "echo"})),
+        )
+        .await
+        .expect("send");
+    let frame = client.frame_within(BUDGET).await.expect("terminal");
+    assert_eq!(frame.corr, corr);
+    assert_eq!(frame.ty, TY_RESPONSE);
+    assert_eq!(frame.json()["served_by"], "broca");
+    host.shutdown().await.expect("graceful shutdown");
 }

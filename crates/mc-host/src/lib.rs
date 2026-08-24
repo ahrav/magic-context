@@ -1,7 +1,13 @@
 //! Host runtime for the wire contract in `docs/mc-host-wire-protocol.md`.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`: the Broca subprocess spawner carries the one
+// permitted `unsafe` block in this crate — a `pre_exec` hook that arms
+// `PR_SET_PDEATHSIG` so harness children cannot outlive a crashed host.
+// Every other module remains unsafe-free; new `unsafe` requires its own
+// scoped `allow` and a safety justification.
+#![deny(unsafe_code)]
 
+pub mod broca;
 pub mod composite;
 pub mod config;
 pub mod handler;
@@ -17,12 +23,14 @@ mod routing;
 mod runtime;
 mod wire;
 
-pub use composite::{CompositeComponent, PrimaryComponent, SecondaryComponent, StaticComposite};
+pub use composite::{
+    CompositeComponent, PrimaryComponent, SecondaryComponent, ShutdownError, StaticComposite,
+};
 pub use config::{ConfigError, HostConfig, HostInit, HostLimits, HostTiming, LivenessPolicy};
 pub use handler::{
     BindOutcome, HealthReport, HealthStatus, InitError, ManifestSnapshot, McHostHandler,
-    OutputBuffer, RequestCtx, RequestOutcome, RouteHandle, RouteIdentity, RouteTarget,
-    StreamClosed, TargetKind,
+    OutputBuffer, RequestCtx, RequestOutcome, ResourceDeclaration, RouteClass, RouteHandle,
+    RouteIdentity, RouteTarget, StreamClosed, TargetKind,
 };
 pub use instance::{runtime_dir_path, InstanceError, CONNECTION_FILE_NAME};
 pub use lifecycle::{

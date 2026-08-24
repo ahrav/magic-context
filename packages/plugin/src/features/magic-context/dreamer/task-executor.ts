@@ -70,6 +70,7 @@ import {
     isRetrospectiveWindowProcessed,
     recordRetrospectiveWindowProcessed,
 } from "./storage-task-schedule";
+import { buildClassifyModelChain } from "./task-config";
 import { getDreamTaskBacklog } from "./task-gates";
 import {
     buildDreamTaskPrompt,
@@ -592,6 +593,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    modelChain: buildClassifyModelChain(
+                        config.model,
+                        deps.dreamerModel,
+                        config.fallbackModels,
+                    ),
                     ...moduleArgs,
                     onProgress: (processed) => reportProgress(processed),
                 });

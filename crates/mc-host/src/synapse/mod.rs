@@ -917,12 +917,13 @@ impl CompositeComponent for SynapseComponent {
     /// then every started native call is joined through the incarnation
     /// tracker, and only then is retained state released. Never aborts a
     /// native call.
-    async fn shutdown(&self) {
+    async fn shutdown(&self) -> Result<(), crate::composite::ShutdownError> {
         self.inner.closing.cancel();
         self.inner.jobs.close_admission();
         self.inner.tracker.close();
         self.inner.tracker.wait().await;
         self.inner.jobs.clear();
+        Ok(())
     }
 }
 
