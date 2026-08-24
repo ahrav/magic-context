@@ -44,6 +44,81 @@ pub const FLAGS_PURE_HEADER: u8 = 0b0000_0000;
 /// reserved): Interactive priority, Normal admission, binary 0, last 1.
 pub const FLAGS_RESPONSE_TEXT_LAST: u8 = 0b0000_1010;
 
+/// Every flag bit a pure-header frame must clear (binary, last,
+/// admission, reserved); priority may be any valid value.
+pub const FLAGS_PURE_HEADER_FORBIDDEN: u8 = 0b1111_1001;
+
+/// Validates a host-originated connection frame (ping, push, goodbye)
+/// against the wire contract's structural rules before a receiver skips
+/// it: supported version; pure-header shape and `0/0/nonzero` identity
+/// for ping; pure-header shape, zero correlation, and a route-shaped or
+/// connection-shaped identity for goodbye; a route-shaped identity with
+/// zero correlation and clear reserved bits for push. Accepting a
+/// malformed frame solely by type would let a wire regression coexist
+/// with an otherwise successful run.
+pub fn connection_frame_violation(frame: &RawFrame) -> Option<String> {
+    if frame.ver != WIRE_VERSION {
+        return Some(format!(
+            "connection frame type {} with unsupported wire version {}",
+            frame.ty, frame.ver
+        ));
+    }
+    match frame.ty {
+        TY_PING => {
+            if frame.len != 0 {
+                return Some(format!("ping carries body length {}", frame.len));
+            }
+            if frame.flags & FLAGS_PURE_HEADER_FORBIDDEN != 0 {
+                return Some(format!(
+                    "ping with non-pure-header flags {:#04x}",
+                    frame.flags
+                ));
+            }
+            if frame.channel != 0 || frame.epoch != 0 || frame.corr == 0 {
+                return Some(format!(
+                    "ping with illegal identity {}/{}/{}",
+                    frame.channel, frame.epoch, frame.corr
+                ));
+            }
+        }
+        TY_GOODBYE => {
+            if frame.len != 0 {
+                return Some(format!("goodbye carries body length {}", frame.len));
+            }
+            if frame.flags & FLAGS_PURE_HEADER_FORBIDDEN != 0 {
+                return Some(format!(
+                    "goodbye with non-pure-header flags {:#04x}",
+                    frame.flags
+                ));
+            }
+            if frame.corr != 0 {
+                return Some(format!("goodbye with nonzero correlation {}", frame.corr));
+            }
+            let route_shaped = frame.channel != 0 && frame.epoch != 0;
+            let connection_shaped = frame.channel == 0 && frame.epoch == 0;
+            if !route_shaped && !connection_shaped {
+                return Some(format!(
+                    "goodbye with mixed identity {}/{}",
+                    frame.channel, frame.epoch
+                ));
+            }
+        }
+        TY_PUSH => {
+            if frame.flags & 0b1100_0000 != 0 {
+                return Some(format!("push with reserved flag bits {:#04x}", frame.flags));
+            }
+            if frame.channel == 0 || frame.epoch == 0 || frame.corr != 0 {
+                return Some(format!(
+                    "push with illegal identity {}/{}/{}",
+                    frame.channel, frame.epoch, frame.corr
+                ));
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// A frame as it appears on the wire, decoded by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawFrame {

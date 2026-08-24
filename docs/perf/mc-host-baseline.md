@@ -40,10 +40,10 @@ decisions on `crates/mc-host` only.
 
 ## Metrics and semantics
 
-- **Completion latency**: terminal receipt minus *scheduled* send time
-  (open-loop arms) — coordinated-omission honest. Closed-loop arms measure
-  from actual send and are labeled closed-loop; they estimate ceilings, not
-  latency.
+- **Completion latency**: terminal receipt minus *scheduled* send time —
+  in every arm, including closed-loop (see erratum item 1). Closed-loop
+  values therefore include in-flight permit queueing and estimate
+  ceilings, not serial RTT.
 - **Throughput**: completed terminals / wall seconds of send window.
 - Percentiles computed over all requests of one run (exact, sorted vector).
 - Steady state: first 10% of the send window discarded as warmup.

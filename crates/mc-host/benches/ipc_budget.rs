@@ -1095,7 +1095,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             run_dir.display()
         ));
     }
-    {
+    let planned: std::collections::BTreeSet<String> = {
         let raw =
             std::fs::read(&plan_path).map_err(|err| format!("{}: {err}", plan_path.display()))?;
         let plan: serde_json::Value = serde_json::from_slice(&raw)
@@ -1103,6 +1103,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         let expected = plan["attempts"]
             .as_array()
             .ok_or_else(|| format!("{}: missing attempts array", plan_path.display()))?;
+        let mut names = std::collections::BTreeSet::new();
         for name in expected {
             let name = name
                 .as_str()
@@ -1112,42 +1113,60 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                     "planned attempt {name} has no finalized manifest; the run is incomplete"
                 ));
             }
+            names.insert(name.to_owned());
         }
-    }
+        names
+    };
     let attempts: Vec<evidence::LoadedAttempt> = evidence::load_attempts(run_dir)?;
-    // Every complete attempt's directory name must match the identity
-    // its manifest records: presence alone would let a renamed or
-    // copied attempt satisfy the plan while measuring a different
-    // operating point (an r80000 directory posing as r20000).
+    // Every attempt directory must be bound to the plan and to the
+    // identity its manifest records: an extra unplanned attempt would
+    // silently join the aggregates, and a renamed or copied directory
+    // (an r80000 attempt posing as r20000, or a skip renamed onto a
+    // planned path) would satisfy the plan while measuring nothing or
+    // the wrong operating point.
     for a in &attempts {
-        if a.manifest.state != State::Complete {
-            continue;
-        }
-        let m = &a.manifest;
-        let mut expected = format!(
-            "{}-{}-b{:02}",
-            m.arm.name,
-            m.arm.class.clone().unwrap_or_default(),
-            m.run_block
-        );
-        if m.arm.name == ARM_TCP_OPEN {
-            let rate = m
-                .collection
-                .as_ref()
-                .and_then(|c| c["rate_per_sec"].as_u64())
-                .ok_or_else(|| {
-                    format!("{}: open-loop manifest records no rate", a.dir.display())
-                })?;
-            expected.push_str(&format!("-r{rate}"));
-        }
         let actual = a
             .dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if actual != expected {
+        if !planned.contains(&actual) {
             return Err(format!(
-                "{}: directory name does not match its manifest identity (expected {expected})",
+                "{}: attempt is not in the persisted run plan",
+                a.dir.display()
+            ));
+        }
+        let m = &a.manifest;
+        let base = format!(
+            "{}-{}-b{:02}",
+            m.arm.name,
+            m.arm.class.clone().unwrap_or_default(),
+            m.run_block
+        );
+        let name_ok = if m.arm.name == ARM_TCP_OPEN {
+            match m
+                .collection
+                .as_ref()
+                .and_then(|c| c["rate_per_sec"].as_u64())
+            {
+                // A complete open-loop attempt names its exact rate; a
+                // skipped or failed one records no collection, so any
+                // rate suffix on the planned base is acceptable.
+                Some(rate) => actual == format!("{base}-r{rate}"),
+                None if m.state == State::Complete => {
+                    return Err(format!(
+                        "{}: complete open-loop manifest records no rate",
+                        a.dir.display()
+                    ));
+                }
+                None => actual.starts_with(&format!("{base}-r")),
+            }
+        } else {
+            actual == base
+        };
+        if !name_ok {
+            return Err(format!(
+                "{}: directory name does not match its manifest identity (expected {base})",
                 a.dir.display()
             ));
         }
