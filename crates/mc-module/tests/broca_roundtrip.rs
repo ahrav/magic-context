@@ -836,6 +836,7 @@ async fn classify_round_trip_applies_seeded_ids_and_deletes_attempt_sessions() {
     assert_eq!(seen.len(), 1);
     let child_session = attempt_child_session_id(
         CLASSIFY_PROJECT,
+        "dreamer-parent",
         "rt-classify",
         0,
         "prov-one/classifier-primary",
@@ -963,11 +964,23 @@ async fn transient_first_model_advances_session_and_keeps_retry_metadata() {
     assert_eq!(seen.len(), 2, "one backend run per attempt");
     assert_eq!(
         seen[0].session,
-        attempt_child_session_id(CLASSIFY_PROJECT, "rt-fallback", 0, "prov/flaky-classifier")
+        attempt_child_session_id(
+            CLASSIFY_PROJECT,
+            "dreamer-parent",
+            "rt-fallback",
+            0,
+            "prov/flaky-classifier"
+        )
     );
     assert_eq!(
         seen[1].session,
-        attempt_child_session_id(CLASSIFY_PROJECT, "rt-fallback", 1, "prov/steady-classifier")
+        attempt_child_session_id(
+            CLASSIFY_PROJECT,
+            "dreamer-parent",
+            "rt-fallback",
+            1,
+            "prov/steady-classifier"
+        )
     );
     assert_ne!(seen[0].session, seen[1].session);
 

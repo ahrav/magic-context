@@ -9775,8 +9775,13 @@ impl McHandler {
                 break;
             }
             attempts += 1;
-            let child_session =
-                attempt_child_session_id(&authority_project, command_id, attempt, model);
+            let child_session = attempt_child_session_id(
+                &authority_project,
+                &ledger_session,
+                command_id,
+                attempt,
+                model,
+            );
             let _dreamer_run_guard = self.register_dreamer_run(&child_session);
             let mut producer = match self
                 .producer_factory
@@ -26329,12 +26334,14 @@ mod tests {
             vec![
                 attempt_child_session_id(
                     "git:identity",
+                    "ses",
                     "model-chain-command",
                     0,
                     "test/bad-model"
                 ),
                 attempt_child_session_id(
                     "git:identity",
+                    "ses",
                     "model-chain-command",
                     1,
                     "test/good-model"
@@ -26364,7 +26371,7 @@ mod tests {
             .unwrap()
             .generation;
         let child_session =
-            attempt_child_session_id("git:identity", "cancel-command", 0, "test/model");
+            attempt_child_session_id("git:identity", "parent", "cancel-command", 0, "test/model");
         let handler = Arc::new(handler);
         let running_handler = Arc::clone(&handler);
         let task = tokio::spawn(async move {
@@ -26557,7 +26564,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(attempt, model)| {
-                attempt_child_session_id("git:identity", "purge-outcomes", attempt, model)
+                attempt_child_session_id("git:identity", "ses", "purge-outcomes", attempt, model)
             })
             .collect();
         assert_eq!(

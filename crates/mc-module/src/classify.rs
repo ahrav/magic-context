@@ -66,14 +66,22 @@ pub fn has_manifest_envelope(text: &str) -> bool {
     text.contains("<classify>") && text.contains("</classify>")
 }
 
+/// Derives the deterministic Broca child session for one classify attempt.
+/// `ledger_session` is part of the identity because the durable ledger
+/// scopes commands to `(ledger_session, command_id)`: two module sessions
+/// in the same authority project may reuse a `command_id`, and their
+/// attempts must never attach to (or purge) each other's runs.
 pub fn attempt_child_session_id(
     project: &str,
+    ledger_session: &str,
     command_id: &str,
     attempt: usize,
     model: &str,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(project.as_bytes());
+    hasher.update([0]);
+    hasher.update(ledger_session.as_bytes());
     hasher.update([0]);
     hasher.update(command_id.as_bytes());
     hasher.update([0]);
@@ -112,33 +120,39 @@ mod tests {
     #[test]
     fn child_ids_are_stable_per_attempt_and_distinct_across_attempt_identity() {
         assert_eq!(
-            attempt_child_session_id("project", "command", 0, "prov/model-a"),
-            attempt_child_session_id("project", "command", 0, "prov/model-a"),
+            attempt_child_session_id("project", "ses", "command", 0, "prov/model-a"),
+            attempt_child_session_id("project", "ses", "command", 0, "prov/model-a"),
             "a retry of the same attempt must reuse its session"
         );
-        let base = attempt_child_session_id("project", "command", 0, "prov/model-a");
+        let base = attempt_child_session_id("project", "ses", "command", 0, "prov/model-a");
         assert_ne!(
             base,
-            attempt_child_session_id("project", "command", 1, "prov/model-b"),
+            attempt_child_session_id("project", "ses", "command", 1, "prov/model-b"),
             "fallback attempts must use distinct sessions"
         );
         assert_ne!(
             base,
-            attempt_child_session_id("project", "command", 1, "prov/model-a"),
+            attempt_child_session_id("project", "ses", "command", 1, "prov/model-a"),
             "the attempt slot alone must separate sessions"
         );
         assert_ne!(
             base,
-            attempt_child_session_id("project", "command", 0, "prov/model-b"),
+            attempt_child_session_id("project", "ses", "command", 0, "prov/model-b"),
             "the model alone must separate sessions"
         );
         assert_ne!(
             base,
-            attempt_child_session_id("other", "command", 0, "prov/model-a")
+            attempt_child_session_id("other", "ses", "command", 0, "prov/model-a")
         );
         assert_ne!(
             base,
-            attempt_child_session_id("project", "other", 0, "prov/model-a")
+            attempt_child_session_id("project", "other", "command", 0, "prov/model-a"),
+            "the ledger session alone must separate sessions: commands are \
+             scoped to (ledger_session, command_id)"
+        );
+        assert_ne!(
+            base,
+            attempt_child_session_id("project", "ses", "other", 0, "prov/model-a")
         );
         assert!(base.starts_with("mc-dreamer:classify:"));
     }
