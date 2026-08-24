@@ -261,10 +261,18 @@ async function mapOneBatch(
             args.db,
             batch.map((input) => input.id),
         );
+        // Policy again AFTER the digest read (two autocommit snapshots): a
+        // hide committed between them leaves the digest unchanged.
+        const stillEligibleAfter = maintenanceEligibleIdSet(
+            args.db,
+            batch.map((input) => input.id),
+            "verification",
+        );
         const eligibleBatch = batch.filter(
             (input) =>
                 stillEligible.has(input.id) &&
-                oracle.get(input.id) === sha256Utf8Hex(input.content),
+                oracle.get(input.id) === sha256Utf8Hex(input.content) &&
+                stillEligibleAfter.has(input.id),
         );
         if (eligibleBatch.length < batch.length) {
             log(
@@ -415,8 +423,16 @@ export async function applyBatchMappings(
             args.db,
             planned.map((item) => item.id),
         );
-        const modulePlanned = planned.filter((item) =>
-            stillApplicable(item.id, eligibleForModule, digestsForModule),
+        // Policy again AFTER the digest read (two autocommit snapshots).
+        const eligibleForModuleAfter = maintenanceEligibleIdSet(
+            args.db,
+            planned.map((item) => item.id),
+            "verification",
+        );
+        const modulePlanned = planned.filter(
+            (item) =>
+                stillApplicable(item.id, eligibleForModule, digestsForModule) &&
+                eligibleForModuleAfter.has(item.id),
         );
         if (modulePlanned.length < planned.length) {
             log(

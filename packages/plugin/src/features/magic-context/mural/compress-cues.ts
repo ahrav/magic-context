@@ -395,11 +395,22 @@ async function compressOneChunk(
             args.db,
             chunk.map((candidate) => candidate.memory.id),
         );
+        // Policy again AFTER the digest read: the two reads are separate
+        // autocommit snapshots, and a hide committed between them leaves
+        // the digest unchanged.
+        const stillEligibleAfter = new Set(
+            filterMemoriesByPolicy(
+                args.db,
+                chunk.map((candidate) => candidate.memory),
+                "auto_inject",
+            ).memories.map((memory) => memory.id),
+        );
         const eligibleChunk = chunk.filter(
             (candidate) =>
                 stillEligible.has(candidate.memory.id) &&
                 digestsAtPrompt.get(candidate.memory.id) ===
-                    sha256Utf8Hex(candidate.memory.content),
+                    sha256Utf8Hex(candidate.memory.content) &&
+                stillEligibleAfter.has(candidate.memory.id),
         );
         if (eligibleChunk.length < chunk.length) {
             log(

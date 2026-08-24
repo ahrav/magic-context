@@ -61,10 +61,17 @@ export async function ensureMemoryEmbeddings(args: {
             args.db,
             missingMemories.map((memory) => memory.id),
         );
+        // Policy again AFTER the digest read (two autocommit snapshots): a
+        // hide committed between them leaves the digest unchanged.
+        const eligibleAfterCall = memoriesEligibleForEmbedding(
+            args.db,
+            missingMemories.map((memory) => memory.id),
+        );
         const boundMissing = missingMemories.filter(
             (memory) =>
                 eligibleAtCall.has(memory.id) &&
-                digestsAtCall.get(memory.id) === sha256Utf8Hex(memory.content),
+                digestsAtCall.get(memory.id) === sha256Utf8Hex(memory.content) &&
+                eligibleAfterCall.has(memory.id),
         );
         if (boundMissing.length === 0) {
             return args.existingEmbeddings;

@@ -137,6 +137,11 @@ async function embedAndStoreMemory(
         if (exactMemoryContentDigests(db, [memoryId]).get(memoryId) !== sha256Utf8Hex(content)) {
             return;
         }
+        // Policy again AFTER the digest read (two autocommit snapshots): a
+        // hide committed between them leaves the digest unchanged.
+        if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
+            return;
+        }
         // Capture the row's content hash BEFORE the async provider call: the
         // vector it returns is only valid for the content stored right now. If
         // the memory is edited while the call is in flight, the row's

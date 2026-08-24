@@ -2385,6 +2385,33 @@ export async function syncModuleState(args: {
                     continue;
                 }
             }
+            // Reapply the automatic policy itself to every id this payload
+            // installed: a held-open v85 writer can record a claim_conflicts
+            // supersession (or another authoritative fact) mid-flight that
+            // bumps no epoch and changes no digest — the reconcile above
+            // only projects verification events. readMemoryPolicyRows reads
+            // the authoritative conflict/disposition subqueries, so a
+            // now-hidden id here forces the rebuild that removes it.
+            const installedIds = new Set<number>([
+                ...(payload.memorySnapshotDigests?.keys() ?? []),
+                ...[...(payload.memoryMutationDigests?.values() ?? [])].map(
+                    (entry) => entry.targetMemoryId,
+                ),
+            ]);
+            if (installedIds.size > 0) {
+                const eligibleNow = new Set(
+                    filterMemoryIdsByPolicy(args.pass.db, [...installedIds], "auto_inject"),
+                );
+                const hiddenNow = [...installedIds].filter((id) => !eligibleNow.has(id));
+                if (hiddenNow.length > 0) {
+                    sessionLog(
+                        args.pass.sessionId,
+                        `module state sync rebuilding after send: ${hiddenNow.length} installed row(s) no longer auto-eligible`,
+                    );
+                    force = true;
+                    continue;
+                }
+            }
         }
         args.state.lastAckedWatermarks = payload.watermarks;
         args.state.lastAckedSeq += 1;

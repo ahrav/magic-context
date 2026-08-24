@@ -372,16 +372,21 @@ async function classifyOneChunk(
         // to the claim's current revision digest, as verify and
         // compress-cues do.
         const oracle = exactMemoryContentDigests(args.db, contextIds);
+        // Policy again AFTER the digest read (two autocommit snapshots): a
+        // hide committed between them leaves the digest unchanged.
+        const stillEligibleAfter = maintenanceEligibleIdSet(args.db, contextIds, "hygiene");
         const eligibleChunk = chunk.filter(
             (candidate) =>
                 stillEligible.has(candidate.contextMemory.id) &&
                 oracle.get(candidate.contextMemory.id) ===
-                    sha256Utf8Hex(candidate.contextMemory.content),
+                    sha256Utf8Hex(candidate.contextMemory.content) &&
+                stillEligibleAfter.has(candidate.contextMemory.id),
         );
         const eligibleAnchors = anchors.filter(
             (candidate) =>
                 stillEligible.has(candidate.contextId) &&
-                oracle.get(candidate.contextId) === sha256Utf8Hex(candidate.anchor.content),
+                oracle.get(candidate.contextId) === sha256Utf8Hex(candidate.anchor.content) &&
+                stillEligibleAfter.has(candidate.contextId),
         );
         const dropped =
             chunk.length - eligibleChunk.length + anchors.length - eligibleAnchors.length;

@@ -1348,6 +1348,19 @@ function countShadowBackfillMissing(
         shadowModelId,
         projectIdentity,
     );
+    if (scope === "memory") {
+        // Same policy predicate the selector applies: a quarantined or
+        // rejected row is deliberately never drained, so counting it here
+        // would leave a permanent nonzero "Remaining" with no queued work
+        // that can reduce it.
+        const rows = db.prepare(sql).all(...params) as Array<{ id: number }>;
+        if (rows.length === 0) return 0;
+        const eligible = memoriesEligibleForEmbedding(
+            db,
+            rows.map((row) => row.id),
+        );
+        return rows.filter((row) => eligible.has(row.id)).length;
+    }
     return (
         db.prepare(`SELECT COUNT(*) AS count FROM (${sql})`).get(...params) as { count: number }
     ).count;
@@ -1800,10 +1813,17 @@ async function embedMemoryRowsDetailed(
         db,
         memories.map((memory) => memory.id),
     );
+    // Policy again AFTER the digest read (two autocommit snapshots): a hide
+    // committed between them leaves the digest unchanged.
+    const eligibleAfterDrain = memoriesEligibleForEmbedding(
+        db,
+        memories.map((memory) => memory.id),
+    );
     memories = memories.filter(
         (memory) =>
             eligibleAtDrain.has(memory.id) &&
-            digestsAtDrain.get(memory.id) === sha256Utf8Hex(memory.content),
+            digestsAtDrain.get(memory.id) === sha256Utf8Hex(memory.content) &&
+            eligibleAfterDrain.has(memory.id),
     );
     if (memories.length === 0) return new Map();
     const specs = [...memories]

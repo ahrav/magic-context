@@ -420,8 +420,14 @@ export async function applyVerifyManifest(
         eligible.has(id) && digests.get(id) === promptDigestById.get(id);
     const eligibleAtApply = maintenanceEligibleIdSet(args.db, [...batchIds], "verification");
     const digestsAtApply = exactMemoryContentDigests(args.db, [...batchIds]);
+    // Policy again AFTER the digest read (two autocommit snapshots): a hide
+    // committed between them leaves the digest unchanged.
+    const eligibleAfterApply = maintenanceEligibleIdSet(args.db, [...batchIds], "verification");
     const applicableIds = new Set(
-        [...batchIds].filter((id) => stillApplicable(id, eligibleAtApply, digestsAtApply)),
+        [...batchIds].filter(
+            (id) =>
+                stillApplicable(id, eligibleAtApply, digestsAtApply) && eligibleAfterApply.has(id),
+        ),
     );
     const droppedIds = [...batchIds].filter((id) => !applicableIds.has(id));
     if (droppedIds.length > 0) {
@@ -487,8 +493,16 @@ export async function applyVerifyManifest(
             args.db,
             writes.map((write) => write.id),
         );
-        const moduleWrites = writes.filter((write) =>
-            stillApplicable(write.id, eligibleForModule, digestsForModule),
+        // Policy again AFTER the digest read (two autocommit snapshots).
+        const eligibleForModuleAfter = maintenanceEligibleIdSet(
+            args.db,
+            writes.map((write) => write.id),
+            "verification",
+        );
+        const moduleWrites = writes.filter(
+            (write) =>
+                stillApplicable(write.id, eligibleForModule, digestsForModule) &&
+                eligibleForModuleAfter.has(write.id),
         );
         if (moduleWrites.length < writes.length) {
             log(
