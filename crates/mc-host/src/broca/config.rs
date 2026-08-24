@@ -60,10 +60,12 @@ pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = (MAX_BOUND_ROUTES as u64) * (4096
 /// transcript-sized values at once on the worst path — the owned JSON value
 /// deserialized from a line, the extracted message text, the lowercase copy
 /// the failure classifier scans, and a pathological all-digit retry-delay
-/// scan — hence the factor of five. Declared alongside the retained budget
-/// for the same reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
-pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 =
-    (MAX_BACKEND_PROCESSES as u64) * (4 * 1024 * 1024 + 64 * 1024) * 5;
+/// scan — hence the factor of five. One extra request body per backend
+/// covers the original the Pi provider-fallback wrapper retains across its
+/// aliased first attempt. Declared alongside the retained budget for the
+/// same reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 = (MAX_BACKEND_PROCESSES as u64)
+    * ((4 * 1024 * 1024 + 64 * 1024) * 5 + MAX_SEND_BODY_BYTES as u64);
 
 /// The complete retained-byte reservation the component declares to the
 /// host: the supervisor's enforced budget plus the two retention classes

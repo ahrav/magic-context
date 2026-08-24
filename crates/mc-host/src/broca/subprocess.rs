@@ -253,10 +253,17 @@ pub async fn run(
                     stdout.extend_from_slice(&stdout_chunk[..n]);
                     if !terminal_seen {
                         if let Some(probe) = terminal_probe {
-                            if let Some(last_newline) =
-                                stdout[probed_to..].iter().rposition(|byte| *byte == b'\n')
+                            // Only the newly appended bytes are searched for
+                            // a line end: everything between `probed_to` and
+                            // this chunk was already searched on its own
+                            // arrival and held no newline, so a single long
+                            // line cannot make the search quadratic.
+                            let appended_at = stdout.len() - n;
+                            if let Some(last_newline) = stdout[appended_at..]
+                                .iter()
+                                .rposition(|byte| *byte == b'\n')
                             {
-                                let end = probed_to + last_newline + 1;
+                                let end = appended_at + last_newline + 1;
                                 if probe(&stdout[probed_to..end]) {
                                     terminal_seen = true;
                                     let drain_deadline =

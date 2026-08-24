@@ -554,10 +554,11 @@ impl Supervisor {
                     _charge: charge,
                 }),
             );
-            // The fresh tombstone grew the retained-session count by
-            // one, so the cap is re-enforced here instead of waiting
-            // for the next terminal commit.
-            enforce_terminal_cap(&self.inner, &mut index, &run.run_id, &mut released);
+            // No synchronous cap pass here: with every other entry pinned,
+            // the freshly inserted tombstone would be the only eviction
+            // candidate and delete would undo the guard it just installed.
+            // The sweep-side enforcement on subsequent commands re-applies
+            // the cap oldest-first, so the fresh guard is the last to go.
         } else if let Some(charge) = reserved_tombstone {
             released.charges.push(charge);
         }

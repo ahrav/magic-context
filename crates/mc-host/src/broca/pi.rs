@@ -138,6 +138,21 @@ async fn run_pi_with_provider_fallback(
 ) -> BackendTerminal {
     let aliased = pi_model_ref(&request.provider, &request.model);
     let canonical = format!("{}/{}", request.provider, request.model);
+    // No alias means no possible retry: the request moves straight through
+    // with no clone, so the common path holds one prompt copy, not two.
+    if aliased == canonical {
+        return run_pi(
+            descriptor,
+            thinking_level,
+            limits,
+            env,
+            request,
+            events,
+            cancel,
+            aliased,
+        )
+        .await;
+    }
     let started = tokio::time::Instant::now();
     let first = run_pi(
         descriptor.clone(),
@@ -147,7 +162,7 @@ async fn run_pi_with_provider_fallback(
         request.clone(),
         events.clone(),
         cancel.clone(),
-        aliased.clone(),
+        aliased,
     )
     .await;
     // "cleanup failed" is the spelling `merge_cleanup` pins (and its
@@ -159,7 +174,7 @@ async fn run_pi_with_provider_fallback(
         BackendTerminal::Failed(error) if error.class == ErrorClass::AuthRequired
             && !error.message.contains("cleanup failed")
     );
-    if aliased == canonical || !credential_failure || cancel.is_cancelled() {
+    if !credential_failure || cancel.is_cancelled() {
         return first;
     }
     let Some(remaining) = limits.run_timeout.checked_sub(started.elapsed()) else {
@@ -288,8 +303,10 @@ async fn run_pi(
         executable: descriptor.executable,
         args,
         env: child_env,
-        working_dir: request.project_root.clone(),
-        stdin: request.prompt.clone().into_bytes(),
+        working_dir: request.project_root,
+        // Moved, not cloned: the prompt is the request's dominant byte cost
+        // and nothing after spec construction reads it.
+        stdin: request.prompt.into_bytes(),
     };
 
     let result = match subprocess::run(spec, &limits, &cancel, Some(pi_terminal_probe)).await {
