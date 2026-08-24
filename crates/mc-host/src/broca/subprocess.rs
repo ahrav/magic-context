@@ -1409,7 +1409,10 @@ pub mod group_registry {
             let (Ok(pid), Ok(start)) = (pid.parse::<i32>(), start.parse::<u64>()) else {
                 continue;
             };
-            if proc_start_time(pid)? == Some(start) {
+            // Zombie owners count as dead, exactly as in the group sweep: a
+            // crashed host can linger unreaped with its pid and start time
+            // intact, and it cannot be using these files.
+            if proc_live_start_time(pid)? == Some(start) {
                 continue;
             }
             match fs::remove_dir_all(&path) {
