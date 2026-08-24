@@ -378,8 +378,9 @@ pub async fn run(
             // sweep runs — a reaped leader with no surviving descendants
             // frees the pgid for reuse, and a post-reap sweep could SIGKILL
             // an unrelated recycled process group.
-            if wait_exited_unreaped(group, limits.drain_grace).await {
-                kill_group(group, rustix::process::Signal::KILL);
+            let exit = wait_exited_unreaped(group, limits.drain_grace).await;
+            if exit != LeaderExit::Running {
+                kill_group_fenced(group, exit, rustix::process::Signal::KILL);
                 child
                     .wait()
                     .await
@@ -423,16 +424,30 @@ fn kill_group(group: Option<rustix::process::Pid>, signal: rustix::process::Sign
     }
 }
 
+/// Whether the leader has exited, and whether its pgid is still fenced
+/// against reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaderExit {
+    /// Still running at the deadline (or no pid to poll).
+    Running,
+    /// Exited and NOT reaped: the zombie holds the pgid, so a group signal
+    /// provably cannot reach a recycled group.
+    ExitedFenced,
+    /// Already reaped by someone else — `SIGCHLD=SIG_IGN`,
+    /// `SA_NOCLDWAIT`, or another in-process reaper — so no zombie fences
+    /// the pgid and it may already belong to an unrelated group.
+    ExitedUnfenced,
+}
+
 /// Waits up to `budget` for the leader to exit WITHOUT reaping it, via
 /// `waitid(..., WNOWAIT)`: the unreaped zombie keeps the process group id
 /// pinned, which is what makes the callers' descendant sweep race-free
-/// against pid/pgid recycling. Returns false when the leader is still
-/// running at the deadline (or when no pid is available to poll).
-async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Duration) -> bool {
+/// against pid/pgid recycling.
+async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Duration) -> LeaderExit {
     let Some(pid) = group else {
         // No pid means no pgid to sweep either, so the caller's fallback
         // (direct kill-and-reap) is already race-free.
-        return false;
+        return LeaderExit::Running;
     };
     // ponytail: 10ms poll instead of SIGCHLD plumbing — tokio owns the
     // child's SIGCHLD handling, and a bounded poll is a few syscalls per
@@ -444,21 +459,45 @@ async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Durat
             | rustix::process::WaitIdOptions::NOWAIT
             | rustix::process::WaitIdOptions::NOHANG;
         match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
-            Ok(Some(_)) => return true,
+            Ok(Some(_)) => return LeaderExit::ExitedFenced,
             // Only "not our waitable child anymore" proves the leader is
             // gone. Any other errno (EINTR under concurrent SIGCHLD, for
             // instance) proves nothing: reporting exited there would skip
             // the documented SIGTERM-then-grace path for a child that is
             // still shutting down cleanly, so keep polling until the
             // deadline decides.
-            Err(rustix::io::Errno::CHILD | rustix::io::Errno::SRCH) => return true,
+            Err(rustix::io::Errno::CHILD | rustix::io::Errno::SRCH) => {
+                return LeaderExit::ExitedUnfenced
+            }
             Err(_) | Ok(None) => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return LeaderExit::Running;
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+/// Signals the group, but only when the pgid is provably still this run's.
+///
+/// With a zombie leader the pgid cannot be reused, so the signal is safe. If
+/// the leader was already reaped (no fence), the numeric pgid may belong to
+/// an unrelated group, so the signal goes out only while `/proc` still
+/// shows a member — the residual window is the instant between that check
+/// and the signal, versus leaking this run's descendants if we never signal.
+fn kill_group_fenced(
+    group: Option<rustix::process::Pid>,
+    exit: LeaderExit,
+    signal: rustix::process::Signal,
+) {
+    if exit == LeaderExit::ExitedUnfenced {
+        let Some(pid) = group else { return };
+        let live = group_registry::group_has_members(pid.as_raw_nonzero().get()).unwrap_or(false);
+        if !live {
+            return;
+        }
+    }
+    kill_group(group, signal);
 }
 
 /// Graceful group termination: SIGTERM the whole group, escalate to SIGKILL
@@ -475,14 +514,15 @@ async fn terminate_group(
     if group.is_none() {
         let _ = child.start_kill();
     }
-    if !wait_exited_unreaped(group, grace).await {
+    let mut exit = wait_exited_unreaped(group, grace).await;
+    if exit == LeaderExit::Running {
         kill_group(group, rustix::process::Signal::KILL);
         let _ = child.start_kill();
         // SIGKILL cannot be caught, so the leader dies promptly; the bound
         // only guards against pathological kernel states wedging the run.
-        let _ = wait_exited_unreaped(group, grace).await;
+        exit = wait_exited_unreaped(group, grace).await;
     }
-    kill_group(group, rustix::process::Signal::KILL);
+    kill_group_fenced(group, exit, rustix::process::Signal::KILL);
     let _ = child.wait().await;
 }
 
@@ -1121,7 +1161,7 @@ pub mod group_registry {
     /// cannot be completed is an error, never "no members" — that answer
     /// would both skip the kill and delete the record proving the orphan
     /// exists.
-    fn group_has_members(pgid: i32) -> io::Result<bool> {
+    pub(crate) fn group_has_members(pgid: i32) -> io::Result<bool> {
         for proc_entry in fs::read_dir("/proc")? {
             let Some(pid) = proc_entry?
                 .file_name()

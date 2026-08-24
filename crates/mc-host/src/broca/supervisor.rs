@@ -604,11 +604,16 @@ impl Supervisor {
                     _charge: charge,
                 }),
             );
-            // No synchronous cap pass here: with every other entry pinned,
-            // the freshly inserted tombstone would be the only eviction
-            // candidate and delete would undo the guard it just installed.
-            // The sweep-side enforcement on subsequent commands re-applies
-            // the cap oldest-first, so the fresh guard is the last to go.
+            // The cap runs here with the fresh guard PROTECTED, so this
+            // branch cannot overshoot `max_terminal_sessions`: concurrent
+            // deletes that each lose their run to an eviction would
+            // otherwise add one retained entry apiece — up to the command
+            // permit count — and those entries can be uncharged tombstones,
+            // which would put the retained total past what
+            // `DELETION_TOMBSTONE_HEADROOM_BYTES` declares. Protecting the
+            // guard is what makes the pass safe: without it, delete would
+            // evict the entry its own tombstone just installed.
+            enforce_terminal_cap(&self.inner, &mut index, "", Some(key), &mut released);
         } else if let Some(charge) = reserved_tombstone {
             released.charges.push(charge);
         }
@@ -699,7 +704,7 @@ impl Supervisor {
         // candidate would otherwise persist until the next terminal
         // commit, even after those pins drained. No run is protected here
         // — the empty id matches none.
-        enforce_terminal_cap(&self.inner, index, "", released);
+        enforce_terminal_cap(&self.inner, index, "", None, released);
     }
 
     fn spawn_run(&self, run: Arc<Run>, request: SendRequest) {
@@ -1039,7 +1044,7 @@ fn finish(inner: &Arc<Inner>, run: &Arc<Run>, outcome: TerminalOutcome) {
                 .push(state.base_charge.split_excess(retained));
         }
     }
-    enforce_terminal_cap(inner, &mut index, &run.run_id, &mut released);
+    enforce_terminal_cap(inner, &mut index, &run.run_id, None, &mut released);
     drop(index);
     run.notify.notify_waiters();
 }
@@ -1051,6 +1056,7 @@ fn enforce_terminal_cap(
     inner: &Arc<Inner>,
     index: &mut Index,
     keep_run_id: &str,
+    keep_key: Option<&SessionKey>,
     released: &mut Released,
 ) {
     // ponytail: O(sessions) scans per eviction; the cap bounds sessions at
@@ -1060,7 +1066,12 @@ fn enforce_terminal_cap(
         let mut oldest: Option<(SessionKey, Instant)> = None;
         for (key, entry) in &index.sessions {
             let (at, evictable) = match entry {
-                SessionEntry::Tombstone(tombstone) => (Some(tombstone.created_at), true),
+                SessionEntry::Tombstone(tombstone) => {
+                    // A freshly installed resurrection guard is protected:
+                    // evicting it would undo the guard its own delete just
+                    // installed.
+                    (Some(tombstone.created_at), keep_key != Some(key))
+                }
                 SessionEntry::Live(run) => {
                     let state = lock_run(run);
                     if !state.terminal_appended {
