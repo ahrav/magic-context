@@ -582,6 +582,12 @@ async function runClassifyThroughModule(
         return {
             memory_id: entry.id,
             content_hash_at_prompt: candidate.normalizedHash,
+            // Exact prompted bytes: recheckChunk proved this content matches
+            // the claim's current revision, and the native handler compares
+            // it against the row's exact content inside its transaction —
+            // the normalized hash alone cannot reject a case/whitespace-only
+            // rewrite landing while the model ran.
+            content_sha256_at_prompt: sha256Utf8Hex(candidate.contextMemory.content),
             importance: entry.importance,
             scope: entry.scope,
             // The host forces shareable to false whenever the memory text is sensitive,

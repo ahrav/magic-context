@@ -1427,6 +1427,7 @@ mod tests {
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash.clone(),
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: Some("project".to_string()),
                     shareable: Some(true),
@@ -1462,6 +1463,7 @@ mod tests {
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash,
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: None,
                     shareable: Some(false),

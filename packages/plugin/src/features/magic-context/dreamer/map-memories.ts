@@ -439,6 +439,14 @@ export async function applyBatchMappings(
             return {
                 memory_id: identity.moduleId,
                 content_hash_at_prompt: identity.normalizedHash,
+                // Exact prompted bytes: `stillApplicable` proved the
+                // claim-revision digest equals the prompted content, and the
+                // native handler compares it inside its transaction —
+                // closing the case/whitespace window the normalized hash
+                // cannot see.
+                ...(digestsForModule.get(item.id) !== undefined
+                    ? { content_sha256_at_prompt: digestsForModule.get(item.id) }
+                    : {}),
                 mapped_files: item.independent ? null : item.files,
             };
         });

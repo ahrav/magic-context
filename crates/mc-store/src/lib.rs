@@ -4745,6 +4745,11 @@ pub struct DreamTaskCommandRow {
 pub struct ClassificationUpdate {
     pub memory_id: i64,
     pub content_hash_at_prompt: String,
+    /// SHA-256 hex of the exact bytes the model was prompted with; the
+    /// normalized hash folds case and whitespace, so it alone cannot reject
+    /// a rewrite that changed only those bytes. Compared against the row's
+    /// exact content inside the apply transaction when present.
+    pub content_sha256_at_prompt: Option<String>,
     pub importance: Option<i32>,
     pub scope: Option<String>,
     pub shareable: Option<bool>,
@@ -4813,6 +4818,8 @@ pub struct VerificationApplyResult {
 pub struct MappingUpdate {
     pub memory_id: i64,
     pub content_hash_at_prompt: String,
+    /// SHA-256 hex of the exact prompted bytes (see `ClassificationUpdate`).
+    pub content_sha256_at_prompt: Option<String>,
     pub mapped_files: Option<Vec<String>>,
 }
 
@@ -8958,6 +8965,16 @@ impl McStore {
                         reason: "stale".to_string(),
                     });
                     continue;
+                }
+                if let Some(expected) = update.content_sha256_at_prompt.as_deref() {
+                    let actual = format!("{:x}", Sha256::digest(memory.content.as_bytes()));
+                    if actual != expected {
+                        rejected.push(ClassificationRejected {
+                            memory_id: update.memory_id,
+                            reason: "stale".to_string(),
+                        });
+                        continue;
+                    }
                 }
                 if let Some(scope) = update.scope.as_deref() {
                     if !matches!(scope, "project" | "ecosystem" | "universe") {
@@ -18556,6 +18573,16 @@ fn set_memory_mapping_tx(
             });
             continue;
         }
+        if let Some(expected) = update.content_sha256_at_prompt.as_deref() {
+            let actual = format!("{:x}", Sha256::digest(memory.content.as_bytes()));
+            if actual != expected {
+                rejected.push(MappingRejected {
+                    memory_id: update.memory_id,
+                    reason: "stale".to_string(),
+                });
+                continue;
+            }
+        }
         let files = serde_json::to_string(&update.mapped_files)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         tx.execute(
@@ -22892,6 +22919,7 @@ mod tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: content_hash.clone(),
+                    content_sha256_at_prompt: None,
                     importance: Some(75),
                     scope: Some("ecosystem".to_string()),
                     shareable: None,
@@ -22926,6 +22954,7 @@ mod tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: content_hash.clone(),
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: None,
                     shareable: Some(false),
@@ -22951,6 +22980,7 @@ mod tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: content_hash,
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: None,
                     shareable: Some(true),
@@ -27798,6 +27828,7 @@ mod shadow_tests {
                 &[ClassificationUpdate {
                     memory_id: classified_id,
                     content_hash_at_prompt: classified_hash,
+                    content_sha256_at_prompt: None,
                     importance: Some(77),
                     scope: None,
                     shareable: None,
@@ -29116,6 +29147,7 @@ mod shadow_tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash(1),
+                    content_sha256_at_prompt: None,
                     importance: Some(88),
                     scope: Some("project".into()),
                     shareable: Some(false),
@@ -29132,6 +29164,7 @@ mod shadow_tests {
                 &[MappingUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash(1),
+                    content_sha256_at_prompt: None,
                     mapped_files: Some(vec!["src/old.rs".to_string()]),
                 }],
                 5,
@@ -29252,6 +29285,7 @@ mod shadow_tests {
                 &[MappingUpdate {
                     memory_id: 2,
                     content_hash_at_prompt: hash(2),
+                    content_sha256_at_prompt: None,
                     mapped_files: Some(vec!["src/lib.rs".into()]),
                 }],
                 4,
@@ -29316,6 +29350,7 @@ mod shadow_tests {
                 &[MappingUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash.clone(),
+                    content_sha256_at_prompt: None,
                     mapped_files: Some(vec!["src/lib.rs".to_string()]),
                 }],
                 2,

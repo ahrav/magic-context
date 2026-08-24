@@ -1597,6 +1597,16 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         );
                     });
                     if (archiveReplay) {
+                        // The stored outcomes predate any later quarantine or
+                        // rejection: refuse instead of re-confirming a
+                        // now-hidden id on retry — the same gate fresh
+                        // archives and the update replay apply.
+                        const deniedId = archiveIds.find((memoryId) =>
+                            memoryPolicyDeniesToolTarget([memoryId]),
+                        );
+                        if (deniedId !== undefined) {
+                            return `Error: Memory with ID ${deniedId} was not found.`;
+                        }
                         const idList = archiveIds.join(", ");
                         const plural = archiveIds.length > 1 ? "memories" : "memory";
                         return args.reason?.trim()

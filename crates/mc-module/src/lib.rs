@@ -9927,6 +9927,10 @@ impl McHandler {
             updates.push(mc_store::ClassificationUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 importance: row
                     .get("importance")
                     .and_then(Value::as_i64)
@@ -10263,6 +10267,10 @@ impl McHandler {
             updates.push(MappingUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 mapped_files,
             });
         }
