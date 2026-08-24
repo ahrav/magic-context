@@ -667,14 +667,25 @@ impl Supervisor {
                 return;
             };
             // The select above can resolve its permit branch while `closing`
-            // fires concurrently; recheck so shutdown never starts a fresh
-            // harness subprocess that would extend the drain.
+            // or the run's own cancel fires concurrently; recheck both so a
+            // stopped run never spawns a fresh harness subprocess whose
+            // termination grace would only delay the settled outcome.
             if inner.closing.is_cancelled() {
                 finish(
                     &inner,
                     &run,
                     TerminalOutcome::Cancelled {
                         message: "host shutdown",
+                    },
+                );
+                return;
+            }
+            if run.cancel.is_cancelled() {
+                finish(
+                    &inner,
+                    &run,
+                    TerminalOutcome::Cancelled {
+                        message: "run cancelled",
                     },
                 );
                 return;

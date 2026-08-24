@@ -828,7 +828,12 @@ impl CompositeTestHost {
             data_dir: Some(data_root.path().to_path_buf()),
             daemon_ver: "mc-host/test".to_owned(),
             limits: HostLimits {
-                max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2,
+                // Small but still interoperable: one 64 MiB frame must fit
+                // beside the largest real component declaration (Broca's),
+                // so composites embedding the production component start
+                // with ingress to spare.
+                max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2
+                    + mc_host::broca::config::DECLARED_RETAINED_RESIDENT_BYTES,
                 ..Default::default()
             },
             ..Default::default()

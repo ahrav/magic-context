@@ -285,12 +285,13 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
 /// Parses the closed Pi print-mode JSON vocabulary (R18). The terminal
 /// assistant `message_end` (stopReason `stop`, `length`, `error`, or
 /// `aborted` with no tool calls — the run is tool-less) decides the run.
-/// Every other documented `--mode json` event (lifecycle, tool execution,
-/// compaction, retry, queue, and session-state notifications) is ignored:
-/// Pi emits them on ordinary runs (`--thinking` emits
-/// `thinking_level_changed`, provider retries emit `auto_retry_*`), so
-/// rejecting them would fail otherwise valid transcripts. Lines that do not
-/// claim to be JSON objects are extension stdout noise (a co-loaded
+/// Documented nonterminal events that occur on ordinary tool-less runs
+/// (lifecycle, compaction, retry, queue, and session-state notifications;
+/// `--thinking` emits `thinking_level_changed`) are ignored, but
+/// `tool_execution_*` events are rejected: this path is a zero-tool
+/// transform, so observed tool activity is a transcript-contract failure —
+/// the same rule the OpenCode parser applies to `tool_use`. Lines that do
+/// not claim to be JSON objects are extension stdout noise (a co-loaded
 /// provider extension printing "[Worker] Ready" — the classification
 /// `subagent-runner.ts` uses) and are skipped; a line that starts with `{`
 /// but fails to parse, or any undocumented event, still fails to one
@@ -328,9 +329,6 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
             | "turn_end"
             | "message_start"
             | "message_update"
-            | "tool_execution_start"
-            | "tool_execution_update"
-            | "tool_execution_end"
             | "compaction_start"
             | "compaction_end"
             | "auto_retry_start"
@@ -338,6 +336,11 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
             | "queue_update"
             | "session_info_changed"
             | "thinking_level_changed" => {}
+            "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
+                return Err(format!(
+                    "tool execution event in a tool-less run at line {line_no}"
+                ));
+            }
             "message_end" => {
                 let Some(message) = value.get("message") else {
                     return Err(format!("message_end without message at line {line_no}"));

@@ -1149,7 +1149,10 @@ impl Drop for HistorianProducer {
 fn classify_run_state(run_id: &str, value: &Value) -> Result<RunState, HistorianProducerError> {
     let value = value.get("result").unwrap_or(value);
     let response_run_id = value.get("run_id").and_then(Value::as_str);
-    if response_run_id.is_some_and(|id| id != run_id) {
+    // Absence is as disqualifying as a mismatch: a response that does not
+    // name the run has not been proven to describe it, and misreading it as
+    // `missing` would authorize a second billable run.
+    if response_run_id != Some(run_id) {
         return Err(HistorianProducerError::Protocol(format!(
             "run.status answered for run {response_run_id:?}, not {run_id}"
         )));
@@ -1902,6 +1905,12 @@ mod tests {
         ));
         assert!(matches!(
             classify_run_state("run-1", &json!({ "run_id": "other", "state": "completed" })),
+            Err(HistorianProducerError::Protocol(_))
+        ));
+        // A response that names no run has not been proven to describe this
+        // one; reading it as `missing` would authorize a refire.
+        assert!(matches!(
+            classify_run_state("run-1", &json!({ "state": "missing" })),
             Err(HistorianProducerError::Protocol(_))
         ));
     }

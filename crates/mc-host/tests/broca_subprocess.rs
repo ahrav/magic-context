@@ -1630,6 +1630,19 @@ fn malformed_outputs_one_bounded_failure() {
     // Unknown event types fail closed (risk table: JSON vocabulary drift).
     let (terminal, _) = run_pi_transcript(&[serde_json::json!({"type": "wire_novelty"})]);
     assert_bounded(&terminal, "unknown event type at line 1");
+
+    // Pi tool activity in a zero-tool run is a contract failure, matching
+    // the OpenCode tool_use rule.
+    let mut lines = pi_success_lines("tooled", "stop");
+    lines.insert(
+        2,
+        serde_json::json!({"type": "tool_execution_start", "toolCallId": "t1", "toolName": "read", "args": {}}),
+    );
+    let (terminal, _) = run_pi_transcript(&lines);
+    assert_bounded(
+        &terminal,
+        "tool execution event in a tool-less run at line 3",
+    );
 }
 
 fn output_flood_stopped_and_redacted() {

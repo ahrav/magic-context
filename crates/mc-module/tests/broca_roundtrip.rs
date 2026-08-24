@@ -263,8 +263,11 @@ impl RoundTripHost {
             data_dir: Some(data_root.to_path_buf()),
             daemon_ver: "mc-host/broca-roundtrip".to_owned(),
             limits: HostLimits {
-                // Small but interoperable: one 64 MiB frame must still fit.
-                max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2,
+                // Small but interoperable: one 64 MiB frame must still fit
+                // beside the production Broca component's declared retained
+                // reservation.
+                max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2
+                    + mc_host::broca::config::DECLARED_RETAINED_RESIDENT_BYTES,
                 ..Default::default()
             },
             ..Default::default()

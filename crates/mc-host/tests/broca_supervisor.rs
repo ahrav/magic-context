@@ -117,11 +117,12 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     // The supervisor's 64 MiB budget plus the two retention classes outside
     // it: the route-identity map (1024 routes x (4096-byte root + 256-byte
     // session + 128-byte key overhead)) and live backend transcript capture
-    // (8 backends x (4 MiB stdout + 64 KiB stderr), tripled for the parsed
-    // JSON value and the event clone held while the capture is still live).
+    // (8 backends x (4 MiB stdout + 64 KiB stderr), times five for the
+    // parsed JSON value, message text, classifier lowercase copy, and
+    // retry-delay digit scan held while the capture is still live).
     assert_eq!(
         resources.retained_resident_bytes,
-        64 * 1024 * 1024 + 1024 * (4096 + 256 + 128) + 8 * (4 * 1024 * 1024 + 64 * 1024) * 3
+        64 * 1024 * 1024 + 1024 * (4096 + 256 + 128) + 8 * (4 * 1024 * 1024 + 64 * 1024) * 5
     );
     assert_eq!(resources.route_class, mc_host::RouteClass::Reserved);
 }

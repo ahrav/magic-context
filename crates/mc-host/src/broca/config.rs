@@ -49,13 +49,14 @@ pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = 1024 * (4096 + 256 + 128);
 /// Worst case for live backend transcript capture, also outside the
 /// supervisor's budget: each of the [`MAX_BACKEND_PROCESSES`] concurrent
 /// subprocesses buffers up to 4 MiB of stdout plus 64 KiB of stderr (the
-/// subprocess capture bounds), and transcript parsing first deserializes a
-/// line into an owned JSON value and then clones its text into an event
-/// while the captured stdout is still live — hence the factor of three.
-/// Declared alongside the retained budget for the same reason as
-/// [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+/// subprocess capture bounds). Transcript parsing holds up to four more
+/// transcript-sized values at once on the worst path — the owned JSON value
+/// deserialized from a line, the extracted message text, the lowercase copy
+/// the failure classifier scans, and a pathological all-digit retry-delay
+/// scan — hence the factor of five. Declared alongside the retained budget
+/// for the same reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
 pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 =
-    (MAX_BACKEND_PROCESSES as u64) * (4 * 1024 * 1024 + 64 * 1024) * 3;
+    (MAX_BACKEND_PROCESSES as u64) * (4 * 1024 * 1024 + 64 * 1024) * 5;
 
 /// The complete retained-byte reservation the component declares to the
 /// host: the supervisor's enforced budget plus the two retention classes
