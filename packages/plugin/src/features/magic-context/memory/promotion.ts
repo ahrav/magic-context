@@ -94,7 +94,18 @@ export async function embedPromotedFacts(
     projectPath: string,
     refs: PromotedMemoryRef[],
 ): Promise<void> {
+    // One batched eligibility read for the whole promotion batch: the
+    // underlying policy-row query already chunks an IN list, and the surface
+    // is identical for every ref. Each ref still re-checks membership at its
+    // own turn below (the loop awaits provider calls, so eligibility is
+    // re-read per ref against this stale-but-conservative snapshot only for
+    // the initial skip; the hash-guarded save rejects mid-flight edits).
+    const eligible = memoriesEligibleForEmbedding(
+        db,
+        refs.map((ref) => ref.memoryId),
+    );
     for (const ref of refs) {
+        if (!eligible.has(ref.memoryId)) continue;
         await embedAndStoreMemory(db, sessionId, projectPath, ref.memoryId, ref.content);
     }
 }
@@ -108,7 +119,8 @@ async function embedAndStoreMemory(
 ): Promise<void> {
     try {
         // Hard-hidden / rejected content never leaves the process, remote
-        // embedding providers included.
+        // embedding providers included. Re-checked here (cheap single-id
+        // read) because earlier refs' provider calls yield arbitrarily long.
         if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
             return;
         }

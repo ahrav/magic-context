@@ -73,6 +73,19 @@ export interface CreatePolicySubjectInput {
     nowMs?: number;
 }
 
+/** Load the revision's exact content digest or refuse the write: every
+ *  authority row (policy subject, approval, enforcement artifact) binds to
+ *  the revision's exact bytes, and a missing revision must fail the write
+ *  rather than bind against unchecked data. Shared so a future change to
+ *  this binding (extra validation, column change) lands once. */
+function loadRevisionDigestOrThrow(db: Database, revisionId: number): string {
+    const revision = db
+        .prepare("SELECT content_sha256 AS digest FROM claim_revisions WHERE id = ?")
+        .get(revisionId) as { digest: string } | null | undefined;
+    if (!revision) throw new Error(`claim revision ${revisionId} does not exist`);
+    return revision.digest;
+}
+
 /**
  * Freeze one immutable policy subject for a revision (R1, KTD2). The bound
  * digest is read from the revision row itself so callers cannot bind foreign
@@ -86,10 +99,7 @@ export function createPolicySubjectInCurrentTransaction(
 ): PolicySubjectRow {
     const existing = readPolicySubject(db, input.revisionId);
     if (existing) return existing;
-    const revision = db
-        .prepare("SELECT content_sha256 AS digest FROM claim_revisions WHERE id = ?")
-        .get(input.revisionId) as { digest: string } | null | undefined;
-    if (!revision) throw new Error(`claim revision ${input.revisionId} does not exist`);
+    const revision = { digest: loadRevisionDigestOrThrow(db, input.revisionId) };
     db.prepare(
         `INSERT INTO claim_revision_policy_subjects
             (revision_id, project_id, claim_kind, origin_observation_id, origin_taint,
@@ -270,10 +280,7 @@ export function recordApprovalActionInCurrentTransaction(
         }
         return { actionId: existing.id, replayed: true };
     }
-    const revision = db
-        .prepare("SELECT content_sha256 AS digest FROM claim_revisions WHERE id = ?")
-        .get(input.revisionId) as { digest: string } | null | undefined;
-    if (!revision) throw new Error(`claim revision ${input.revisionId} does not exist`);
+    const revision = { digest: loadRevisionDigestOrThrow(db, input.revisionId) };
     const result = db
         .prepare(
             `INSERT INTO claim_approval_actions
@@ -315,10 +322,7 @@ export function recordEnforcementArtifactInCurrentTransaction(
     db: Database,
     input: RecordEnforcementArtifactInput,
 ): number {
-    const revision = db
-        .prepare("SELECT content_sha256 AS digest FROM claim_revisions WHERE id = ?")
-        .get(input.revisionId) as { digest: string } | null | undefined;
-    if (!revision) throw new Error(`claim revision ${input.revisionId} does not exist`);
+    const revision = { digest: loadRevisionDigestOrThrow(db, input.revisionId) };
     const result = db
         .prepare(
             `INSERT INTO claim_enforcement_artifacts

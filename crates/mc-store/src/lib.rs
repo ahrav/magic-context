@@ -48,6 +48,33 @@ pub fn canonical_root(path: impl AsRef<Path>) -> PathBuf {
 
 /// Canonical foreign-memory visibility predicate used by module SQL consumers.
 /// The plugin mirrors this literal to keep cache visibility and workspace policy aligned.
+/// Content-rewrite projection update shared by the `Tx` and `McStore`
+/// twins. Exact-revision verification attests the OLD bytes, so a rewrite
+/// withdraws a verified projection ('unverified' with a retained
+/// verified_at is the documented withdrawn shape; the TypeScript harness
+/// twin writes the same). A user-sourced row demotes to 'agent': the stored
+/// bytes are no longer user-authored, and after mirror-back a same-content
+/// revision keyed on this column would otherwise carry explicit_user
+/// provenance and promote the replacement to VERIFIED.
+const UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL: &str = "UPDATE mc_memories
+    SET content = ?1,
+        normalized_hash = ?2,
+        updated_at = ?3,
+        shareable = 0,
+        classified_at = NULL,
+        verified_at = CASE
+            WHEN verification_status = 'verified'
+                THEN COALESCE(verified_at, ?3)
+            ELSE verified_at END,
+        verification_status = CASE
+            WHEN verification_status = 'verified'
+                THEN 'unverified'
+            ELSE verification_status END,
+        source_type = CASE
+            WHEN source_type = 'user' THEN 'agent'
+            ELSE source_type END
+  WHERE id = ?4";
+
 pub const FOREIGN_VISIBLE_SQL: &str = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM mc_workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
 
 /// Internal mutation category used to carry foreign-visibility transitions across state sync.
@@ -5822,39 +5849,11 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
-                // Exact-revision verification attests the OLD bytes: a content
-                // rewrite withdraws a verified projection instead of carrying
-                // it, so arbitrary replacement content cannot inherit VERIFIED
-                // maturity. 'unverified' with a positive verified_at is the
-                // documented withdrawn shape (the TypeScript harness twin
-                // writes the same shape); verifier-authored rewrites go
-                // through the verification applier, which re-verifies
-                // explicitly.
-                "UPDATE mc_memories
-                    SET content = ?1,
-                        normalized_hash = ?2,
-                        updated_at = ?3,
-                        shareable = 0,
-                        classified_at = NULL,
-                        verified_at = CASE
-                            WHEN verification_status = 'verified'
-                                THEN COALESCE(verified_at, ?3)
-                            ELSE verified_at END,
-                        verification_status = CASE
-                            WHEN verification_status = 'verified'
-                                THEN 'unverified'
-                            ELSE verification_status END,
-                        -- A user-sourced row demotes to 'agent' on rewrite:
-                        -- the stored bytes are no longer user-authored, and
-                        -- after mirror-back a same-content revision keyed on
-                        -- this column would otherwise carry explicit_user
-                        -- provenance and promote the replacement to VERIFIED
-                        -- (the TypeScript projection writer demotes the same
-                        -- way).
-                        source_type = CASE
-                            WHEN source_type = 'user' THEN 'agent'
-                            ELSE source_type END
-                  WHERE id = ?4",
+                // See UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL: withdrawal and
+                // provenance-demotion semantics live with the shared
+                // statement; verifier-authored rewrites go through the
+                // verification applier, which re-verifies explicitly.
+                UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL,
                 params![content, normalized_hash, now_ms, id],
             )
             .map_err(|error| error.to_string())?;
@@ -9943,29 +9942,27 @@ impl McStore {
             let mut auto_search_hint_skipped = request.auto_search_hint_skipped;
             if request.user_hints_replace_session {
                 // The host's decision list is the complete policy authority
-                // for this session's overlays. Targeted deletes (not
-                // delete-all) keep the kept rows' created_at stable.
-                let kept: std::collections::HashSet<&str> = request
-                    .user_hint_seeds
-                    .iter()
-                    .map(|seed| seed.block_id.as_str())
-                    .collect();
-                let existing: Vec<String> = {
-                    let mut stmt = tx.prepare(
-                        "SELECT block_id FROM mc_user_hints WHERE session_id = ?1",
+                // for this session's overlays. One batched NOT IN delete (the
+                // same json_each shape the scope prune uses) keeps the kept
+                // rows' created_at stable and avoids a round-trip per stale
+                // row.
+                // Serializing a Vec<&str> cannot fail in practice; if it
+                // ever does, SKIP the replace-delete (fail closed toward
+                // retention) rather than deleting every hint with an empty
+                // kept set.
+                if let Ok(kept_json) = serde_json::to_string(
+                    &request
+                        .user_hint_seeds
+                        .iter()
+                        .map(|seed| seed.block_id.as_str())
+                        .collect::<Vec<_>>(),
+                ) {
+                    tx.execute(
+                        "DELETE FROM mc_user_hints
+                          WHERE session_id = ?1
+                            AND block_id NOT IN (SELECT value FROM json_each(?2))",
+                        params![request.session_id, kept_json],
                     )?;
-                    let rows = stmt
-                        .query_map(params![request.session_id], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()?;
-                    rows
-                };
-                for block_id in existing {
-                    if !kept.contains(block_id.as_str()) {
-                        tx.execute(
-                            "DELETE FROM mc_user_hints WHERE session_id = ?1 AND block_id = ?2",
-                            params![request.session_id, block_id],
-                        )?;
-                    }
                 }
             }
             for seed in request.user_hint_seeds {
@@ -11695,31 +11692,7 @@ impl McStore {
                 // rewrite must not carry a verified projection onto bytes the
                 // verification never attested. 'unverified' with a positive
                 // verified_at is the documented withdrawn shape.
-                "UPDATE mc_memories
-                    SET content = ?1,
-                        normalized_hash = ?2,
-                        updated_at = ?3,
-                        shareable = 0,
-                        classified_at = NULL,
-                        verified_at = CASE
-                            WHEN verification_status = 'verified'
-                                THEN COALESCE(verified_at, ?3)
-                            ELSE verified_at END,
-                        verification_status = CASE
-                            WHEN verification_status = 'verified'
-                                THEN 'unverified'
-                            ELSE verification_status END,
-                        -- A user-sourced row demotes to 'agent' on rewrite:
-                        -- the stored bytes are no longer user-authored, and
-                        -- after mirror-back a same-content revision keyed on
-                        -- this column would otherwise carry explicit_user
-                        -- provenance and promote the replacement to VERIFIED
-                        -- (the TypeScript projection writer demotes the same
-                        -- way).
-                        source_type = CASE
-                            WHEN source_type = 'user' THEN 'agent'
-                            ELSE source_type END
-                  WHERE id = ?4",
+                UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL,
                 params![content, normalized_hash, now_ms, id],
             )?;
             append_memory_mutation_tx(
@@ -16084,11 +16057,38 @@ fn prune_absent_authority_memories_tx(
     memories: &[ModuleMemoryRow],
 ) -> rusqlite::Result<()> {
     let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
+    // Batch the id translation: a full policy snapshot can carry many rows,
+    // and one query_row round-trip per row dwarfs the single json_each join
+    // the DELETEs below already use. Untranslated ids fall back to the
+    // source id, matching the per-row helper's unwrap_or.
+    let source_json = format!(
+        "[{}]",
+        memories
+            .iter()
+            .map(|memory| memory.id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let mut keep_ids: Vec<i64> = Vec::with_capacity(memories.len());
-    for memory in memories {
-        let translated =
-            authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), memory.id)?;
-        keep_ids.push(translated.unwrap_or(memory.id));
+    if let Some(context_store_uuid) = context_store_uuid.as_deref() {
+        let mut translated: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut stmt = tx.prepare(
+            "SELECT context_row_id, id FROM mc_memories
+              WHERE context_store_uuid = ?1
+                AND context_row_id IN (SELECT value FROM json_each(?2))",
+        )?;
+        let rows = stmt.query_map(params![context_store_uuid, source_json], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (source, target) = row?;
+            translated.insert(source, target);
+        }
+        for memory in memories {
+            keep_ids.push(*translated.get(&memory.id).unwrap_or(&memory.id));
+        }
+    } else {
+        keep_ids.extend(memories.iter().map(|memory| memory.id));
     }
     let keep_json = format!(
         "[{}]",

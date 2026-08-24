@@ -17,7 +17,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, normalize, sep } from "node:path";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite.ts";
-import { isRetryableSqliteBusyError } from "./claims-backfill.ts";
+import {
+    DEFAULT_BUSY_RETRY_DELAYS_MS,
+    runImmediateTransactionWithBusyRetry,
+} from "./claims-backfill.ts";
 import {
     automaticMaturityTarget,
     classifyFineTaint,
@@ -54,7 +57,6 @@ const SEED_ACTOR = "claim-policy-seed:v1";
  * docs/evidence/claims-backfill/v84-threshold.json).
  */
 const DEFAULT_BATCH_SIZE = 25;
-const DEFAULT_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
 
 export interface ClaimPolicySeedStatus {
     applicable: boolean;
@@ -109,7 +111,15 @@ interface SeedRevisionRow {
     metadataSourceType: string | null;
 }
 
-function seedTaint(row: SeedRevisionRow): FineTaint {
+/** Validated non-negative integer meta read (the sibling backfill's shape):
+ *  a corrupted value reads as 0 instead of NaN, which would make every
+ *  comparison silently false. */
+function readIntMeta(db: Database, key: string): number {
+    const parsed = Number.parseInt(readMeta(db, key) ?? "0", 10);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function seedTaint(row: SeedRevisionRow, boundaryRevisionId: number): FineTaint {
     // Retained raw `user` provenance predates the v85 trust column; the v85
     // contract keeps it exactly so a later policy can re-derive channel
     // confidence (R25). Feed it in as the coarse class rather than mapping it
@@ -126,9 +136,14 @@ function seedTaint(row: SeedRevisionRow): FineTaint {
     // untrustworthy — taking it would let a model rewrite originate
     // directives with USER_EXPLICIT taint, frozen forever.
     const observedClass: SourceTrustClass = row.sourceTrustClass ?? "model_inference";
+    // The metadata elevation is additionally gated to AT OR BELOW the seed
+    // boundary, mirroring `hasExplicitUserEvidence`'s metadata branch: a
+    // post-boundary straggler comes from a held-open pre-v86 writer, and its
+    // retained `user` metadata stamp must not freeze USER_EXPLICIT taint the
+    // live evidence reader would refuse for the same revision.
     const sourceTrustClass: SourceTrustClass =
         row.revision === 1
-            ? row.metadataSourceType === "user"
+            ? row.metadataSourceType === "user" && row.revisionId <= boundaryRevisionId
                 ? "explicit_user"
                 : observedClass
             : observedClass === "explicit_user"
@@ -279,20 +294,12 @@ export async function runClaimPolicySeed(
     const counts: Record<string, number> =
         status.seededCounts != null ? { ...emptyCounts, ...status.seededCounts } : emptyCounts;
 
-    const runBatch = async (): Promise<SeedBatchStep | "busy"> => {
-        for (let attempt = 0; ; attempt += 1) {
-            try {
-                return db
-                    .transaction(() => seedBatchInCurrentTransaction(db, batchSize, nowMs))
-                    .immediate() as SeedBatchStep;
-            } catch (error) {
-                if (!isRetryableSqliteBusyError(error)) throw error;
-                const delayMs = retryDelaysMs[attempt];
-                if (delayMs === undefined) return "busy";
-                await sleep(delayMs);
-            }
-        }
-    };
+    const runBatch = (): Promise<SeedBatchStep | "busy"> =>
+        runImmediateTransactionWithBusyRetry(
+            db,
+            () => seedBatchInCurrentTransaction(db, batchSize, nowMs),
+            { retryDelaysMs, sleep },
+        );
 
     while (batches < maxBatches) {
         const step = await runBatch();
@@ -374,7 +381,7 @@ function seedRevisionInCurrentTransaction(
     row: SeedRevisionRow,
     nowMs: number,
 ): { maturity: MaturityLevel; autoEligible: boolean } {
-    const taint = seedTaint(row);
+    const taint = seedTaint(row, readIntMeta(db, CLAIM_POLICY_SEED_META_KEYS.boundaryRevisionId));
     createPolicySubjectInCurrentTransaction(db, {
         revisionId: row.revisionId,
         projectId: row.projectId,
@@ -561,13 +568,32 @@ let lateSeedInFlight = false;
  * automatic-hidden until seeded. The startup runner's completed-phase
  * anti-join only fires when the runner is invoked, and startup is its only
  * scheduled invocation — this probe gives ongoing lanes a cheap way to
- * notice stragglers (one indexed single-row anti-join when idle) and kick
+ * notice stragglers (one O(1) MAX(id) read when idle; the anti-join runs
+ * only when a new revision appeared since the last clean probe) and kick
  * the bounded async seeder without blocking the calling pass.
  */
+/** Highest claim-revision id proven fully seeded per database handle: the
+ *  anti-join probe below is NOT cheap when everything is seeded (every row
+ *  fails NOT EXISTS, so LIMIT 1 never short-circuits and the whole table is
+ *  walked), so hot-path calls first compare MAX(id) — an O(1) primary-key
+ *  read — against this watermark and skip the anti-join entirely until a
+ *  new revision appears. Seeding never un-seeds, so a clean probe at
+ *  MAX(id)=N proves every id <= N stays seeded. */
+const lateSeedVerifiedMaxRevisionId = new WeakMap<Database, number>();
+
 export function seedLateCompatibilityRevisions(db: Database): void {
     if (lateSeedInFlight) return;
     if (!hasClaimPolicySchema(db)) return;
-    if (selectUnseededBatch(db, 0, 1).length === 0) return;
+    const maxRevisionId = (
+        db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM claim_revisions").get() as {
+            id: number;
+        }
+    ).id;
+    if (maxRevisionId <= (lateSeedVerifiedMaxRevisionId.get(db) ?? -1)) return;
+    if (selectUnseededBatch(db, 0, 1).length === 0) {
+        lateSeedVerifiedMaxRevisionId.set(db, maxRevisionId);
+        return;
+    }
     lateSeedInFlight = true;
     void runClaimPolicySeed(db)
         .catch((error) => {
@@ -672,8 +698,11 @@ export function reconcileCompatibilityVerifications(db: Database): number {
  * Seeded counts are persisted per committed batch, so this only publishes the
  * phase and completion watermark. */
 function publishSeedCompletion(db: Database): void {
-    const boundary = Number(readMeta(db, CLAIM_POLICY_SEED_META_KEYS.boundaryRevisionId) ?? 0);
-    const expected = Number(readMeta(db, CLAIM_POLICY_SEED_META_KEYS.expectedCount) ?? 0);
+    // Validated integer reads: `Number(...)` on a corrupted meta value
+    // yields NaN, and NaN comparisons are always false, so the fail-closed
+    // completion guard below would silently pass instead of throwing.
+    const boundary = readIntMeta(db, CLAIM_POLICY_SEED_META_KEYS.boundaryRevisionId);
+    const expected = readIntMeta(db, CLAIM_POLICY_SEED_META_KEYS.expectedCount);
     const subjectsAtBoundary = (
         db
             .prepare(

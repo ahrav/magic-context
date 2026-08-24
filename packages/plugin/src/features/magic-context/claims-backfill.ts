@@ -1145,7 +1145,37 @@ export function isRetryableSqliteBusyError(error: unknown): boolean {
     return typeof candidate.errcode === "number" && (candidate.errcode & 0xff) === 5;
 }
 
-const DEFAULT_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
+export const DEFAULT_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
+
+/**
+ * One whole-batch immediate transaction with bounded SQLITE_BUSY backoff —
+ * the retry scaffolding both backfills (v84 claims, v86 claim policy)
+ * share, extracted so a backoff-schedule tuning lands once. Returns "busy"
+ * after the delay schedule is exhausted; every other error rethrows.
+ */
+export async function runImmediateTransactionWithBusyRetry<T>(
+    db: Database,
+    work: () => T,
+    options: {
+        retryDelaysMs?: readonly number[];
+        sleep?: (delayMs: number) => Promise<void>;
+    } = {},
+): Promise<T | "busy"> {
+    const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_BUSY_RETRY_DELAYS_MS;
+    const sleep =
+        options.sleep ??
+        ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            return db.transaction(work).immediate() as T;
+        } catch (error) {
+            if (!isRetryableSqliteBusyError(error)) throw error;
+            const delayMs = retryDelaysMs[attempt];
+            if (delayMs === undefined) return "busy";
+            await sleep(delayMs);
+        }
+    }
+}
 
 export interface ClaimsBackfillRunOptions {
     batchSize?: number;
@@ -1238,22 +1268,13 @@ export async function runClaimsBackfill(
 
     /** Whole-batch immediate transaction with bounded busy backoff (R9). */
     const runBatch = async (work: () => BatchStep): Promise<BatchStep | "busy"> => {
-        for (let attempt = 0; ; attempt += 1) {
-            try {
-                const step = db
-                    .transaction(() =>
-                        withMemoryClaimGenerationContextInCurrentTransaction(db, work),
-                    )
-                    .immediate();
-                hitFailpoint("claims-backfill.020.batch-commit.after");
-                return step;
-            } catch (error) {
-                if (!isRetryableSqliteBusyError(error)) throw error;
-                const delayMs = retryDelaysMs[attempt];
-                if (delayMs === undefined) return "busy";
-                await sleep(delayMs);
-            }
-        }
+        const step = await runImmediateTransactionWithBusyRetry(
+            db,
+            () => withMemoryClaimGenerationContextInCurrentTransaction(db, work),
+            { retryDelaysMs, sleep },
+        );
+        if (step !== "busy") hitFailpoint("claims-backfill.020.batch-commit.after");
+        return step;
     };
 
     const rowsBatch = (): BatchStep => {
