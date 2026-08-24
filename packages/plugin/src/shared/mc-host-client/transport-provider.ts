@@ -28,6 +28,7 @@ import {
     NEGOTIATION_VERSION,
     NegotiationError,
     type OpaqueObject,
+    serializeOpaqueBounded,
     TRANSPORT_TCP,
     type TransportOffer,
 } from "./transport-negotiation";
@@ -103,7 +104,11 @@ export class ClientTransportRegistry {
                     // undefined) is an invalid opaque object, never an
                     // absent one.
                     hasParameters,
-                    serializedParameters: hasParameters ? JSON.stringify(parameters) : undefined,
+                    // Bounded serialization: an oversized provider value is
+                    // rejected during traversal, never materialized in full.
+                    serializedParameters: hasParameters
+                        ? serializeOpaqueBounded(parameters, "parameters")
+                        : undefined,
                     provider,
                 };
             });

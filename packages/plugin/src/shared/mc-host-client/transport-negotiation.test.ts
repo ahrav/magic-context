@@ -621,6 +621,13 @@ describe("encode-side validation", () => {
         // strict UTF-8 decoder rejects them; fail locally instead.
         expectCode(() => encode({ s: "\uD800" }), "invalid_type");
         expectCode(() => encode({ "\uDC00": 1 }), "invalid_type");
+        // Integral numbers beyond the double-safe range are already rounded,
+        // so the advertised identifier is not the one the caller meant.
+        const unsafeInteger = Number.MAX_SAFE_INTEGER + 1;
+        expectCode(() => encode({ id: unsafeInteger }), "invalid_type");
+        expectCode(() => encode({ nested: [{ id: unsafeInteger }] }), "invalid_type");
+        // The largest safe integer still encodes.
+        encode({ id: Number.MAX_SAFE_INTEGER });
         const error = expectCode(
             () =>
                 encodeNegotiateResponse({

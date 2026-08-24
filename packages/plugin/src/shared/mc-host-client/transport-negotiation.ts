@@ -784,7 +784,48 @@ function plainDepth(value: unknown): number {
  * {@link checkOpaqueSerialized} instead.
  */
 export function checkOpaquePlain(value: unknown, path: string): OpaqueObject {
-    return checkOpaqueSerialized(JSON.stringify(value), path);
+    return checkOpaqueSerialized(serializeOpaqueBounded(value, path), path);
+}
+
+/**
+ * Hard ceiling on the string `serializeBounded` will materialize. Slack over
+ * {@link MAX_OPAQUE_BYTES} is deliberate: the accumulator below estimates
+ * emitted size rather than measuring it, so the guard must not reject a
+ * value that is genuinely under the exact bound. The exact byte check in
+ * {@link checkOpaqueSerialized} stays authoritative; this only stops an
+ * arbitrarily large provider value from being materialized at all.
+ */
+const SERIALIZE_HARD_LIMIT = MAX_OPAQUE_BYTES * 4;
+
+/** Marks the estimate tripping, so a provider `toJSON` throw stays distinct. */
+class OpaqueSerializationBound extends Error {}
+
+/**
+ * `JSON.stringify` with a conservative running size estimate that aborts
+ * past {@link SERIALIZE_HARD_LIMIT}, so an oversized value is rejected
+ * during traversal instead of allocating its full text. Returns `undefined`
+ * for a non-serializable value (the caller reports `invalid_type`), throws
+ * `opaque_too_large` when the estimate trips, and lets any other throw —
+ * notably a provider-authored `toJSON` — propagate to its own containment.
+ */
+export function serializeOpaqueBounded(value: unknown, path: string): string | undefined {
+    let estimate = 0;
+    try {
+        return JSON.stringify(value, (key, entry: unknown) => {
+            estimate += key.length + 4;
+            if (typeof entry === "string") estimate += entry.length + 2;
+            else if (typeof entry !== "object" || entry === null) estimate += 24;
+            if (estimate > SERIALIZE_HARD_LIMIT) {
+                throw new OpaqueSerializationBound();
+            }
+            return entry;
+        });
+    } catch (error) {
+        if (error instanceof OpaqueSerializationBound) {
+            throw new NegotiationError("opaque_too_large", path);
+        }
+        throw error;
+    }
 }
 
 /**
@@ -811,7 +852,7 @@ export function checkOpaqueSerialized(serialized: string | undefined, path: stri
     if (plainDepth(parsed) > MAX_OPAQUE_DEPTH) {
         throw new NegotiationError("opaque_too_deep", path);
     }
-    assertWellFormedStrings(parsed, path);
+    assertOpaqueLeaves(parsed, path);
     return parsed as OpaqueObject;
 }
 
@@ -825,15 +866,29 @@ const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF
  * client must fail locally instead of burning the authenticated generation
  * on the host's reject.
  */
-function assertWellFormedStrings(value: unknown, path: string): void {
+/**
+ * Rejects opaque leaves this client cannot carry faithfully: strings with
+ * lone surrogates (`JSON.stringify` escapes them, but the host's strict
+ * UTF-8 decoder rejects unpaired surrogate escapes) and integral numbers
+ * outside the double-safe range (already rounded, so the advertised
+ * identifier would not be the one the peer meant). Mirrors the decode-side
+ * guards so both directions reject the same values.
+ */
+function assertOpaqueLeaves(value: unknown, path: string): void {
     if (typeof value === "string") {
         if (LONE_SURROGATE_RE.test(value)) {
             throw new NegotiationError("invalid_type", path);
         }
         return;
     }
+    if (typeof value === "number") {
+        if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+            throw new NegotiationError("invalid_type", path);
+        }
+        return;
+    }
     if (Array.isArray(value)) {
-        for (const item of value) assertWellFormedStrings(item, path);
+        for (const item of value) assertOpaqueLeaves(item, path);
         return;
     }
     if (typeof value === "object" && value !== null) {
@@ -841,7 +896,7 @@ function assertWellFormedStrings(value: unknown, path: string): void {
             if (LONE_SURROGATE_RE.test(key)) {
                 throw new NegotiationError("invalid_type", path);
             }
-            assertWellFormedStrings(entry, path);
+            assertOpaqueLeaves(entry, path);
         }
     }
 }
