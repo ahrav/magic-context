@@ -6,6 +6,7 @@ import {
 import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
     autoSearchHintFragmentsStillEligible,
+    bindMemoriesToCurrentRevision,
     exactMemoryContentDigests,
     filterMemoriesByPolicy,
     filterMemoryIdsByPolicy,
@@ -14,6 +15,7 @@ import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claim
 import {
     buildWorkspaceMemorySqlFilter,
     getMaxMemoryIdForProjects,
+    getMemoriesByIds,
     getMemoriesByProject,
     getMemoriesByProjects,
     readNewMemoriesForM1Union,
@@ -1090,7 +1092,7 @@ function readCompartmentsAfterSequence(
 function readForeignCoverageMemoryIds(args: {
     db: ContextDatabase;
     workspace: ModuleWorkspaceContext;
-}): number[] {
+}): Array<{ id: number; shareVisible: boolean }> {
     const identities = args.workspace.expandedIdentities;
     if (identities.length === 0) return [];
     const filter = buildWorkspaceMemorySqlFilter({
@@ -1100,10 +1102,14 @@ function readForeignCoverageMemoryIds(args: {
         tableName: "m",
         // Coverage must name FORMERLY visible rows, not only rows matching
         // the current share filter: a foreign row reclassified shareable=0
-        // or private-scope leaves the kept snapshot, and if it also left
-        // coverage it would never be deleted from the native store. The
-        // category restriction stays, so this session still cannot prune a
-        // member's non-shared categories.
+        // or private-scope leaves the kept snapshot, and without coverage
+        // its stale shareable copy would keep serving foreign readers. The
+        // classification predicate rides along as a SELECT flag instead of
+        // a WHERE clause: classification departures are CLASSIFICATION
+        // PROPAGATION (the owner keeps the row; the native reader's own
+        // share filter hides it), while only policy-hidden rows are
+        // DELETED. The category restriction stays, so this session still
+        // cannot touch a member's non-shared categories.
         includeClassificationFields: false,
     });
     const ownIdentities = args.workspace.ownIdentities;
@@ -1116,15 +1122,21 @@ function readForeignCoverageMemoryIds(args: {
         .prepare(
             // Interpolation is a compile-time placeholder list, not caller input.
             // pi-lens-ignore: sql-injection
-            `SELECT m.id
+            `SELECT m.id,
+                    (m.shareable = 1 AND m.scope IN ('project','ecosystem','universe')) AS shareVisible
                FROM memories AS m
               WHERE m.project_path IN (${placeholders})
                 ${ownClause}
                 ${filter.clause}
               ORDER BY m.id ASC`,
         )
-        .all(...identities, ...ownIdentities, ...filter.params) as Array<{ id?: unknown }>;
-    return rows.flatMap((row) => (typeof row.id === "number" ? [row.id] : []));
+        .all(...identities, ...ownIdentities, ...filter.params) as Array<{
+        id?: unknown;
+        shareVisible?: unknown;
+    }>;
+    return rows.flatMap((row) =>
+        typeof row.id === "number" ? [{ id: row.id, shareVisible: row.shareVisible === 1 }] : [],
+    );
 }
 
 function readRenderedMemoryIds(args: {
@@ -1682,16 +1694,48 @@ export async function buildModuleStateSyncPayload(args: {
     // bloat every force or epoch-driven sync for nothing. Non-shared foreign
     // categories are outside the coverage scope entirely, so the session
     // still cannot prune a member's non-shared rows.
-    const memoriesDeleteIds = (() => {
-        if (!(args.force || epochChanged) || omitAuthorityMemorySections) return undefined;
-        if (!args.pass.projectPath) return undefined;
-        if (!workspace.workspace) return undefined;
+    const foreignCoverage = (() => {
+        if (!(args.force || epochChanged) || omitAuthorityMemorySections) return null;
+        if (!args.pass.projectPath) return null;
+        if (!workspace.workspace) return null;
         const keptIds = new Set(memoryRows.map((memory) => memory.id));
         const covered = readForeignCoverageMemoryIds({ db: args.pass.db, workspace });
-        const hidden = covered.filter((id) => !keptIds.has(id));
-        return hidden.length > 0 ? hidden : undefined;
+        const departed = covered.filter((row) => !keptIds.has(row.id));
+        // A CLASSIFICATION departure (shareable=0 / private scope) is the
+        // owner's row leaving the shared view, not leaving existence: the
+        // native store applies shareable/scope itself when selecting
+        // foreign rows, so upserting the current classification hides it
+        // from foreign readers while the owner's own native injection keeps
+        // it. Deleting it globally would erase the owner's private memory
+        // from native injection until an unrelated force sync. Only rows
+        // the POLICY hides (still share-classified but not kept) are
+        // deleted — uniform absence applies to everyone including the
+        // owner.
+        const reclassifyIds = departed.filter((row) => !row.shareVisible).map((row) => row.id);
+        const reclassifyEligible = new Set(
+            filterMemoryIdsByPolicy(args.pass.db, reclassifyIds, "auto_inject"),
+        );
+        const deleteIds = departed
+            .filter((row) => row.shareVisible || !reclassifyEligible.has(row.id))
+            .map((row) => row.id);
+        const reclassifyRows = bindMemoriesToCurrentRevision(
+            args.pass.db,
+            getMemoriesByIds(
+                args.pass.db,
+                reclassifyIds.filter((id) => reclassifyEligible.has(id)),
+            ),
+        );
+        return { deleteIds, reclassifyRows };
     })();
-    const memories = memoryRows.map((memory) => ({
+    const memoriesDeleteIds =
+        foreignCoverage !== null && foreignCoverage.deleteIds.length > 0
+            ? foreignCoverage.deleteIds
+            : undefined;
+    const snapshotRows =
+        foreignCoverage !== null && foreignCoverage.reclassifyRows.length > 0
+            ? [...memoryRows, ...foreignCoverage.reclassifyRows]
+            : memoryRows;
+    const memories = snapshotRows.map((memory) => ({
         id: memory.id,
         project_path: memory.projectPath,
         category: memory.category,
@@ -1938,8 +1982,18 @@ export async function buildModuleStateSyncPayload(args: {
             ...(channel2NudgeState !== undefined
                 ? { channel2_nudge_state: channel2NudgeState }
                 : {}),
-            ...(autoSearchHintSeedState && autoSearchHintSeedState.seeds.length > 0
-                ? { auto_search_hint_decisions: autoSearchHintSeedState.seeds }
+            ...(autoSearchHintSeedState !== null
+                ? {
+                      // The decision list is COMPLETE whenever it was built
+                      // (force or epoch-driven): send it — even empty — with
+                      // replace semantics, so a stored native hint whose
+                      // decision can no longer be resolved (a migrated
+                      // tombstone with no raw block and no recorded id) is
+                      // deleted on the same epoch bump that revoked it,
+                      // not only on the next paged force sync.
+                      auto_search_hint_decisions: autoSearchHintSeedState.seeds,
+                      user_hints_replace_session: true,
+                  }
                 : {}),
         },
         watermarks: currentWatermarks,

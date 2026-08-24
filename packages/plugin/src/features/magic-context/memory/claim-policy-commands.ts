@@ -673,9 +673,16 @@ export async function executeClaimEnforceCommand(
                 // This is hardening, not proof: a local adversary with
                 // project-directory write access sits in the same trust
                 // domain as the artifact and the database themselves.
-                writeFileSync(snapshotPath, bytes, { flag: "wx", mode: 0o444 });
-                if (carrySnapshots) copyFileSync(committedSnap, copiedSnap);
+                // The snapshot write and the carried-copy setup run INSIDE
+                // the cleanup region: a failing copy (read-only or removed
+                // __snapshots__, full disk) must not strand the read-only
+                // mc-enforce-* test where broad test discovery would later
+                // execute it.
+                let snapshotCreated = false;
                 try {
+                    writeFileSync(snapshotPath, bytes, { flag: "wx", mode: 0o444 });
+                    snapshotCreated = true;
+                    if (carrySnapshots) copyFileSync(committedSnap, copiedSnap);
                     const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
                     evaluation = await evaluate(snapshotPath, kind, deps.projectRoot);
                     // The recorded digest must describe the bytes the
@@ -687,10 +694,14 @@ export async function executeClaimEnforceCommand(
                         );
                     }
                 } finally {
-                    rmSync(snapshotPath, { force: true });
-                    // Remove the carried copy AND any snapshot the run
-                    // created fresh under the copy's name.
-                    rmSync(copiedSnap, { force: true });
+                    // Remove nothing when the `wx` create itself refused: the
+                    // pre-existing path was not ours to delete.
+                    if (snapshotCreated) {
+                        rmSync(snapshotPath, { force: true });
+                        // Remove the carried copy AND any snapshot the run
+                        // created fresh under the copy's name.
+                        rmSync(copiedSnap, { force: true });
+                    }
                 }
                 // A live artifact that drifted during the run cannot be
                 // recorded: the digest would describe bytes no longer on

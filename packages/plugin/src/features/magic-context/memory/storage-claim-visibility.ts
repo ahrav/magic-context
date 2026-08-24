@@ -337,16 +337,25 @@ export function exactMemoryContentDigests(
     db: Database,
     memoryIds: readonly number[],
 ): Map<number, string> {
-    if (memoryIds.length === 0) return new Map();
-    const placeholders = memoryIds.map(() => "?").join(", ");
-    const rows = db
-        .prepare(
-            // Interpolation is a compile-time placeholder list, not caller input.
-            // pi-lens-ignore: sql-injection
-            `SELECT id, content FROM memories WHERE id IN (${placeholders})`,
-        )
-        .all(...memoryIds) as Array<{ id: number; content: string }>;
-    return new Map(rows.map((row) => [row.id, sha256Utf8Hex(row.content)]));
+    const out = new Map<number, string>();
+    if (memoryIds.length === 0) return out;
+    // Full module snapshots legitimately carry arbitrarily many rows; one
+    // placeholder per id would exceed the adapter's bound-parameter limit.
+    // Same 400-id pages as readMemoryPolicyRows.
+    const CHUNK = 400;
+    for (let index = 0; index < memoryIds.length; index += CHUNK) {
+        const chunk = memoryIds.slice(index, index + CHUNK);
+        const placeholders = chunk.map(() => "?").join(", ");
+        const rows = db
+            .prepare(
+                // Interpolation is a compile-time placeholder list, not caller input.
+                // pi-lens-ignore: sql-injection
+                `SELECT id, content FROM memories WHERE id IN (${placeholders})`,
+            )
+            .all(...chunk) as Array<{ id: number; content: string }>;
+        for (const row of rows) out.set(row.id, sha256Utf8Hex(row.content));
+    }
+    return out;
 }
 
 /**

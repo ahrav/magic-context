@@ -15,6 +15,7 @@ import {
 } from "../../features/magic-context/compartment-storage";
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import {
+    bindMemoriesToCurrentRevision,
     decideMemoryPolicy,
     exactMemoryContentDigests,
     filterMemoriesByPolicy,
@@ -600,12 +601,28 @@ export function prepareCompartmentInjection(
             memoryCount = cachedMemory.memory_block_count;
         } else {
             // The legacy render is an automatic injection surface exactly like
-            // the m0/m1 lanes below; policy-hidden rows never reach it.
-            let memories = filterMemoriesByPolicy(
-                db,
-                getMemoriesByProject(db, projectPath, ["active", "permanent"]),
-                "auto_inject",
-            ).memories;
+            // the m0/m1 lanes below; policy-hidden rows never reach it. The
+            // persisted epoch stamp only protects FUTURE passes — this loop
+            // protects the block being returned NOW: each attempt loads and
+            // policy-filters fresh rows, binds them to the current revision's
+            // exact bytes (a rewrite between load and policy read must not
+            // ride the successor's eligibility), and re-reads the epoch; a
+            // bump during the build retries once so a quarantine landing
+            // mid-build cannot reach the current prompt unchecked.
+            let memories: Memory[] = [];
+            let buildEpoch = buildProjectMemoryEpoch;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                buildEpoch = getProjectMemoryEpoch(db, projectPath);
+                memories = bindMemoriesToCurrentRevision(
+                    db,
+                    filterMemoriesByPolicy(
+                        db,
+                        getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+                        "auto_inject",
+                    ).memories,
+                );
+                if (getProjectMemoryEpoch(db, projectPath) === buildEpoch) break;
+            }
             if (injectionBudgetTokens && memories.length > 0) {
                 memories = trimMemoriesToBudget(sessionId, memories, injectionBudgetTokens);
             }
@@ -636,7 +653,7 @@ export function prepareCompartmentInjection(
                     memoryCount,
                     JSON.stringify(renderedIds),
                     JSON.stringify(renderedHashes),
-                    buildProjectMemoryEpoch,
+                    buildEpoch,
                     sessionId,
                 );
             } catch (error) {
