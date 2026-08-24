@@ -1,12 +1,17 @@
 import type { Database } from "../../../shared/sqlite";
 import { hasMemoryClassifiedAtColumn, hasMemoryStatsTable } from "../memory/storage-memory";
 import { hasMuralCueColumns } from "../mural/storage-mural-cues";
+import { getProjectEmbeddingSnapshot } from "../project-embedding-registry";
 import {
     getSmartNotesNeedingCompilation,
     getStaleCompiledSmartNotes,
 } from "../smart-notes/storage";
 import { getPendingSmartNotes } from "../storage-notes";
-import { countPrimerCandidatesForProject, getActivePrimers } from "../storage-primers";
+import {
+    countPrimerCandidatesForProject,
+    getActivePrimers,
+    getPrimerCandidatesForPromotion,
+} from "../storage-primers";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { getTaskScheduleState } from "./storage-task-schedule";
 import {
@@ -386,8 +391,33 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // Candidate observations are GLOBAL (cross-project user profile).
             return getUserMemoryCandidates(db).length >= ctx.promotionThreshold;
 
-        case "promote-primers":
-            return countPrimerCandidatesForProject(db, project) >= (ctx.promotionThreshold ?? 2);
+        case "promote-primers": {
+            if (countPrimerCandidatesForProject(db, project) >= (ctx.promotionThreshold ?? 2)) {
+                return true;
+            }
+            // The promotion pass also owns re-embedding primers and candidates
+            // whose vectors were produced under a retired provider identity —
+            // search skips those vectors outright, so a project with active
+            // primers but too few candidates would otherwise keep semantic
+            // primer retrieval disabled indefinitely. Open the gate when stale
+            // rows exist. An unregistered project has no current identity to
+            // compare against (and nobody searching it); it stays closed until
+            // registration.
+            const snapshot = getProjectEmbeddingSnapshot(project);
+            if (!snapshot?.enabled) return false;
+            const isStale = (
+                embedding: Float32Array | null | undefined,
+                modelId: string | null | undefined,
+            ): boolean => Boolean(embedding) && (!modelId || modelId !== snapshot.modelId);
+            return (
+                getActivePrimers(db, project).some((primer) =>
+                    isStale(primer.questionEmbedding, primer.questionEmbeddingModelId),
+                ) ||
+                getPrimerCandidatesForPromotion(db, project).some((candidate) =>
+                    isStale(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
+                )
+            );
+        }
 
         case "refresh-primers":
             return getActivePrimers(db, project).some(
