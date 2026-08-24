@@ -24,7 +24,11 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
-import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
+import {
+    exactMemoryContentDigests,
+    filterMemoriesForMaintenance,
+} from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
 import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
@@ -186,11 +190,28 @@ function loadActiveMemoryPromptMemories(
     // dispositions: candidates stay in the pool, while soft-hidden and
     // uniform-absence rows never reach the child-model prompt — and the
     // ctx_memory gate refuses hidden rows as mutation targets.
-    const memories = filterMemoriesForMaintenance(
+    const loaded = filterMemoriesForMaintenance(
         db,
         getMemoriesByProject(db, projectIdentity),
         "hygiene",
     );
+    // Exact-byte binding: the maintenance filter evaluates CURRENT policy by
+    // id, but the loaded rows carry bytes read before that policy read —
+    // another process rewriting a row in that window would disclose the
+    // superseded bytes to the curate child. Keep only rows whose loaded
+    // bytes still match the claim's current revision digest.
+    const oracle = exactMemoryContentDigests(
+        db,
+        loaded.map((memory) => memory.id),
+    );
+    const memories = loaded.filter(
+        (memory) => oracle.get(memory.id) === sha256Utf8Hex(memory.content),
+    );
+    if (memories.length < loaded.length) {
+        log(
+            `[dreamer] curate pool dropped ${loaded.length - memories.length} member(s) rewritten since load`,
+        );
+    }
     const verificationById = getMemoryVerifications(
         db,
         memories.map((memory) => memory.id),

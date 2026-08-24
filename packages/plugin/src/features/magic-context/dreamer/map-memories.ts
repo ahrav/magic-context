@@ -253,10 +253,22 @@ async function mapOneBatch(
             batch.map((input) => input.id),
             "verification",
         );
-        const eligibleBatch = batch.filter((input) => stillEligible.has(input.id));
+        // Eligibility keys on ids, but the frozen batch bytes may predate a
+        // rewrite that left the successor eligible; the id-only check would
+        // then ship the superseded bytes. Exact-bind every row to the
+        // claim's current revision digest before the prompt is built.
+        const oracle = exactMemoryContentDigests(
+            args.db,
+            batch.map((input) => input.id),
+        );
+        const eligibleBatch = batch.filter(
+            (input) =>
+                stillEligible.has(input.id) &&
+                oracle.get(input.id) === sha256Utf8Hex(input.content),
+        );
         if (eligibleBatch.length < batch.length) {
             log(
-                `[dreamer] map-memories batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since pool selection`,
+                `[dreamer] map-memories batch dropped ${batch.length - eligibleBatch.length} member(s) hidden or rewritten since pool selection`,
             );
         }
         if (eligibleBatch.length === 0) return { mapped: 0, independent: 0 };

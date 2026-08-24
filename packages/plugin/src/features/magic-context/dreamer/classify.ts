@@ -361,19 +361,27 @@ async function classifyOneChunk(
     // module id on the module route); the policy recheck keys on the context
     // row's id. Runs immediately before each route's provider call.
     const recheckChunk = (): { chunk: ClassifyCandidate[]; anchors: ClassifyAnchorMemory[] } => {
-        const stillEligible = maintenanceEligibleIdSet(
-            args.db,
-            [
-                ...chunk.map((candidate) => candidate.contextMemory.id),
-                ...anchors.map((candidate) => candidate.contextId),
-            ],
-            "hygiene",
+        const contextIds = [
+            ...chunk.map((candidate) => candidate.contextMemory.id),
+            ...anchors.map((candidate) => candidate.contextId),
+        ];
+        const stillEligible = maintenanceEligibleIdSet(args.db, contextIds, "hygiene");
+        // Eligibility keys on ids, but the frozen member/anchor bytes may
+        // predate a rewrite that left the successor eligible; the id-only
+        // check would then ship the superseded bytes. Exact-bind every row
+        // to the claim's current revision digest, as verify and
+        // compress-cues do.
+        const oracle = exactMemoryContentDigests(args.db, contextIds);
+        const eligibleChunk = chunk.filter(
+            (candidate) =>
+                stillEligible.has(candidate.contextMemory.id) &&
+                oracle.get(candidate.contextMemory.id) ===
+                    sha256Utf8Hex(candidate.contextMemory.content),
         );
-        const eligibleChunk = chunk.filter((candidate) =>
-            stillEligible.has(candidate.contextMemory.id),
-        );
-        const eligibleAnchors = anchors.filter((candidate) =>
-            stillEligible.has(candidate.contextId),
+        const eligibleAnchors = anchors.filter(
+            (candidate) =>
+                stillEligible.has(candidate.contextId) &&
+                oracle.get(candidate.contextId) === sha256Utf8Hex(candidate.anchor.content),
         );
         const dropped =
             chunk.length - eligibleChunk.length + anchors.length - eligibleAnchors.length;

@@ -13,7 +13,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync, readFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, sep } from "node:path";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite.ts";
@@ -536,6 +537,15 @@ async function revalidateEnforcementArtifactsNow(
         bytesDigest: string;
         claimId: number;
     }>;
+    // Resolve the owning root once: per-artifact containment compares live
+    // resolved paths, so a legitimately symlinked root must not itself read
+    // as an escape. An unresolvable root leaves nothing to validate.
+    let rootReal: string;
+    try {
+        rootReal = await realpath(projectRoot);
+    } catch {
+        return;
+    }
     for (const artifact of artifacts) {
         // canonical_path is recorded project-relative and traversal-checked
         // at record time; re-guard here so a corrupted row cannot make the
@@ -547,12 +557,22 @@ async function revalidateEnforcementArtifactsNow(
         const absolute = join(projectRoot, relative);
         let drifted: string | null = null;
         try {
-            // Streamed hash: reading AND hashing yield per chunk, so a large
-            // artifact never pins the event loop. ENOENT means the file is
-            // gone (a drift); any other read error is indistinguishable from
-            // transient I/O.
-            const digest = await sha256FileStreaming(absolute);
-            if (digest !== artifact.bytesDigest) drifted = "artifact bytes drifted";
+            // The lexical guard above cannot see symlinks: the artifact or a
+            // parent directory replaced by a link out of the owning root
+            // would pass the join and hash an external file that happens to
+            // hold the recorded bytes. Require the LIVE resolved path to
+            // stay under the resolved root before trusting any digest.
+            const live = await realpath(absolute);
+            if (live !== rootReal && !live.startsWith(`${rootReal}${sep}`)) {
+                drifted = "artifact escapes the owning root";
+            } else {
+                // Streamed hash: reading AND hashing yield per chunk, so a
+                // large artifact never pins the event loop. ENOENT means the
+                // file is gone (a drift); any other read error is
+                // indistinguishable from transient I/O.
+                const digest = await sha256FileStreaming(live);
+                if (digest !== artifact.bytesDigest) drifted = "artifact bytes drifted";
+            }
         } catch (error) {
             const code = (error as { code?: string } | null)?.code;
             if (code === "ENOENT") {
@@ -577,18 +597,26 @@ async function revalidateEnforcementArtifactsNow(
                 // bytes-at-commit discipline the enforcement command applies
                 // before recording.
                 try {
+                    const live = realpathSync(absolute);
                     if (
-                        existsSync(absolute) &&
-                        createHash("sha256").update(readFileSync(absolute)).digest("hex") ===
+                        (live === rootReal || live.startsWith(`${rootReal}${sep}`)) &&
+                        statSync(live).isFile() &&
+                        createHash("sha256").update(readFileSync(live)).digest("hex") ===
                             artifact.bytesDigest
                     ) {
                         return;
                     }
-                } catch {
-                    // Unreadable at commit time is indistinguishable from
-                    // transient I/O; keep the artifact and retry on a later
-                    // probe.
-                    return;
+                } catch (error) {
+                    // ENOENT/EISDIR/ENOTDIR at commit time confirm the drift
+                    // being committed (missing file or a path replaced by a
+                    // non-file) — fall through to revoke, or the permanent
+                    // type change would keep the claim ENFORCED on every
+                    // recurring probe. Anything else is indistinguishable
+                    // from transient I/O; keep the artifact and retry later.
+                    const code = (error as { code?: string } | null)?.code;
+                    if (code !== "ENOENT" && code !== "EISDIR" && code !== "ENOTDIR") {
+                        return;
+                    }
                 }
                 // Re-check inside the transaction: a concurrent revocation
                 // must not be doubled. Every drifted artifact is revoked —

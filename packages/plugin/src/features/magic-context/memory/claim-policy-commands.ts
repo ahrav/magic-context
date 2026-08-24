@@ -93,6 +93,27 @@ interface ResolvedTarget {
     preview: string;
 }
 
+/** Translate an agent-visible memory id into context row space. Under
+ * MODULE memory authority the ids the agent sees are the native store's row
+ * ids, and mirror-back may map a module id to a DIFFERENT context row
+ * (collision renumbering, module-created rows). Runs ONCE at command entry:
+ * `resolveTarget` itself stays context-space pure, so the confirmation-time
+ * recheck can re-resolve an already-translated id without a second mapping
+ * pass redirecting it to an unrelated row. */
+function translateAgentVisibleMemoryId(deps: ClaimCommandDeps, memoryId: number): number {
+    if (!getAuthorityManagedMarker(deps.db, deps.projectPath)) return memoryId;
+    const mapped = deps.db
+        .prepare(
+            `SELECT context_row_id AS contextRowId FROM mirror_identity
+              WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?`,
+        )
+        .get(deps.projectPath, memoryId) as { contextRowId?: number } | null | undefined;
+    if (mapped != null && Number.isInteger(mapped.contextRowId)) {
+        return mapped.contextRowId as number;
+    }
+    return memoryId;
+}
+
 /** Resolve a memory id to its claim revision INSIDE the active project only:
  * foreign and workspace-shared rows are rejected before any confirmation
  * detail is revealed (R10). */
@@ -100,23 +121,6 @@ function resolveTarget(
     deps: ClaimCommandDeps,
     memoryId: number,
 ): ResolvedTarget | { error: string } {
-    // Under MODULE memory authority the agent-visible ids are the native
-    // store's row ids, and mirror-back may map a module id to a DIFFERENT
-    // context row (collision renumbering, module-created rows). Translate
-    // through the mirror identity before the claim lookup, or the command
-    // would report no claim — or start confirmation for whatever context
-    // row happens to carry that number.
-    if (getAuthorityManagedMarker(deps.db, deps.projectPath)) {
-        const mapped = deps.db
-            .prepare(
-                `SELECT context_row_id AS contextRowId FROM mirror_identity
-                  WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?`,
-            )
-            .get(deps.projectPath, memoryId) as { contextRowId?: number } | null | undefined;
-        if (mapped != null && Number.isInteger(mapped.contextRowId)) {
-            memoryId = mapped.contextRowId as number;
-        }
-    }
     const link = readMemoryClaimLink(deps.db, memoryId);
     if (!link) return { error: `Memory ${memoryId} has no claim link in this project.` };
     // Membership is decided by resolved project id, not stored-path bytes: a
@@ -293,7 +297,7 @@ export async function executeClaimApprovalCommand(
     if (!Number.isSafeInteger(memoryId) || memoryId <= 0) {
         return { text: `## Claim Approval\n\n${APPROVE_USAGE}`, level: "error" };
     }
-    const target = resolveTarget(deps, memoryId);
+    const target = resolveTarget(deps, translateAgentVisibleMemoryId(deps, memoryId));
     if ("error" in target) {
         return { text: `## Claim Approval — Failed\n\n${target.error}`, level: "error" };
     }
@@ -544,7 +548,10 @@ export async function executeClaimEnforceCommand(
         if (!Number.isSafeInteger(revokeMemoryId) || revokeMemoryId <= 0) {
             return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
         }
-        const revokeTarget = resolveTarget(deps, revokeMemoryId);
+        const revokeTarget = resolveTarget(
+            deps,
+            translateAgentVisibleMemoryId(deps, revokeMemoryId),
+        );
         if ("error" in revokeTarget) {
             return {
                 text: `## Claim Enforcement — Failed\n\n${revokeTarget.error}`,
@@ -657,7 +664,7 @@ export async function executeClaimEnforceCommand(
     if (parts.length !== 2 || !Number.isSafeInteger(memoryId) || memoryId <= 0 || !artifactInput) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
-    const target = resolveTarget(deps, memoryId);
+    const target = resolveTarget(deps, translateAgentVisibleMemoryId(deps, memoryId));
     if ("error" in target) {
         return { text: `## Claim Enforcement — Failed\n\n${target.error}`, level: "error" };
     }

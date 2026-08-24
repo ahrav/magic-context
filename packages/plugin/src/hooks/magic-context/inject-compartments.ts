@@ -2770,9 +2770,29 @@ function renderMemoryUpdatesBlock(args: {
           );
     if (mutations.length === 0) return { block: "", count: 0, forcedMemoryIds: [] };
 
+    // Bind content-carrying mutations to the claim revision the policy
+    // read evaluated: a held-open pre-v86 compatibility writer can rewrite the
+    // target after the eligibility load without bumping the policy epoch, so
+    // the materialization stability check cannot reject the mixed snapshot. A
+    // mutation whose bytes no longer match the claim's current revision is
+    // dropped; the successor reaches the prompt only through a policy-checked
+    // snapshot rebuild.
+    const oracleDigests = exactMemoryContentDigests(
+        args.db,
+        mutations
+            .filter((mutation) => mutation.newContent !== null)
+            .map((mutation) => mutation.targetMemoryId),
+    );
+    const boundMutations = mutations.filter(
+        (mutation) =>
+            mutation.newContent === null ||
+            oracleDigests.get(mutation.targetMemoryId) === sha256Utf8Hex(mutation.newContent),
+    );
+    if (boundMutations.length === 0) return { block: "", count: 0, forcedMemoryIds: [] };
+
     const forcedIds = new Set<number>();
     const lines = ["These memories changed since the snapshot below — trust these:"];
-    for (const mutation of mutations) {
+    for (const mutation of boundMutations) {
         if (mutation.mutationType === "superseded") {
             const replacementId = mutation.supersededById;
             if (
