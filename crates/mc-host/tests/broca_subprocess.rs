@@ -2412,7 +2412,7 @@ fn merge_cleanup_contract() {
 /// a live host survive untouched, so concurrent hosts never sweep each
 /// other's live runs.
 fn group_registry_sweep_kills_only_dead_owner_groups() {
-    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::os::unix::process::CommandExt;
 
     use mc_host::broca::subprocess::group_registry::{sweep_orphaned_groups, GroupRecord};
 
@@ -2422,6 +2422,18 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
         cmd.process_group(0);
         cmd.spawn().expect("spawn sleep leader")
     };
+    fn wait_sigkilled(child: &mut std::process::Child, what: &str) {
+        use std::os::unix::process::ExitStatusExt;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait child") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "{what} survived the sweep");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(9), "{what} must die by SIGKILL");
+    }
 
     // Orphan: recorded by a stand-in host (the record_group fixture) that
     // exits without cleanup, exactly like a crashed host.
@@ -2442,23 +2454,7 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
         sweep_orphaned_groups() >= 1,
         "sweep must kill at least the orphaned group"
     );
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let orphan_status = loop {
-        if let Some(status) = orphan.try_wait().expect("wait orphan") {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "orphan leader survived the sweep"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert_eq!(
-        orphan_status.signal(),
-        Some(9),
-        "the orphan leader must die by SIGKILL"
-    );
+    wait_sigkilled(&mut orphan, "the orphan leader");
 
     assert!(
         survivor.try_wait().expect("poll survivor").is_none(),
@@ -2468,6 +2464,39 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
     drop(survivor_record);
     let _ = survivor.kill();
     let _ = survivor.wait();
+
+    // Zombie owner: the recording host exited but stays unreaped — a
+    // crashed host can linger as a zombie while its supervisor already
+    // runs the replacement. The sweep must treat it as dead.
+    let mut zombie_orphan = spawn_leader();
+    let mut recorder = std::process::Command::new(std::env::current_exe().expect("current exe"))
+        .env(FIXTURE_MODE_ENV, "record_group")
+        .env(GROUP_PID_ENV, zombie_orphan.id().to_string())
+        .spawn()
+        .expect("spawn record_group fixture");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = fs::read_to_string(format!("/proc/{}/stat", recorder.id()))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_ascii_whitespace().next().map(str::to_owned))
+            });
+        if state.as_deref() == Some("Z") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recorder never became a zombie: {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        sweep_orphaned_groups() >= 1,
+        "a zombie owner must count as dead"
+    );
+    wait_sigkilled(&mut zombie_orphan, "the zombie-owned leader");
+    let _ = recorder.wait();
 
     // Leaderless orphan: the leader exits after forking a grandchild into
     // its group — the shape pdeathsig leaves behind when it kills only the

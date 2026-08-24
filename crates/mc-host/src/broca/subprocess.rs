@@ -946,6 +946,20 @@ pub mod group_registry {
         proc_stat_field(pid, 19)
     }
 
+    /// Like [`proc_start_time`], but treats a zombie as dead: a crashed
+    /// host can linger unreaped (same pid, same start time) while its
+    /// supervisor already runs the replacement, and a zombie cannot be
+    /// holding runs.
+    fn proc_live_start_time(pid: i32) -> Option<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = stat.rsplit_once(')')?.1;
+        let mut fields = rest.split_ascii_whitespace();
+        if fields.next()? == "Z" {
+            return None;
+        }
+        fields.nth(18)?.parse().ok()
+    }
+
     /// Reads one whitespace-delimited `/proc/<pid>/stat` field by its
     /// 0-based index AFTER the comm field (which may itself contain spaces
     /// and parentheses; everything after the LAST ')' is unambiguous).
@@ -1100,7 +1114,7 @@ pub mod group_registry {
                 let _ = fs::remove_file(&path);
                 continue;
             }
-            if proc_start_time(entry.owner_pid) == Some(entry.owner_start) {
+            if proc_live_start_time(entry.owner_pid) == Some(entry.owner_start) {
                 continue;
             }
             let group_live = match proc_start_time(entry.leader_pid) {

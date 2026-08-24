@@ -9864,6 +9864,20 @@ impl McHandler {
                     }
                 },
                 Err(primary) => {
+                    // An idempotency conflict means a concurrent command
+                    // with the same (ledger_session, command_id) owns this
+                    // child session and its live, billable run: purging
+                    // would cancel the other caller's run, and advancing
+                    // the chain would start a duplicate billable attempt
+                    // for a command already executing. Back off instead —
+                    // a retry replays the winner's ledgered response.
+                    if matches!(
+                        &primary,
+                        HistorianProducerError::Subc(body) if body.code == "idempotency_conflict"
+                    ) {
+                        last_error = primary.to_string();
+                        break;
+                    }
                     let purge_result = producer.purge_session(&child_session).await;
                     let purge_failed = purge_result.is_err();
                     last_error =
@@ -26669,6 +26683,47 @@ mod tests {
         assert!(
             message.contains("model gone") && message.contains("cleanup also failed"),
             "both the provider failure and the cleanup failure must survive: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_backs_off_on_idempotency_conflict_without_purging() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .unwrap()
+            .push_back(Err(HistorianProducerError::tagged_subc(
+                "idempotency_conflict",
+                "a byte-different send holds this session",
+                ErrorClass::Permanent,
+                None,
+            )));
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/model-a", "test/model-b"],
+            }),
+            "conflict-command",
+        )
+        .await;
+        let HandlerOutcome::Error { code, .. } = outcome else {
+            panic!("an idempotency conflict must fail the command");
+        };
+        assert_eq!(code, "dreamer_run_failed");
+        // The conflicting session belongs to a concurrent command's live
+        // run: purging would cancel it, and a chain advance would start a
+        // duplicate billable attempt for a command already executing.
+        assert!(
+            producer.purges.lock().unwrap().is_empty(),
+            "the losing caller must not purge the winner's session"
+        );
+        assert_eq!(
+            producer.starts.load(Ordering::SeqCst),
+            1,
+            "the chain must not advance past an idempotency conflict"
         );
     }
 
