@@ -591,6 +591,7 @@ mod tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,

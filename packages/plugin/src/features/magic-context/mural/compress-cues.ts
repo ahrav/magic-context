@@ -25,7 +25,11 @@ import {
     providerOutputFailureFromInvalidManifest,
 } from "../dreamer/provider-output-failure";
 import { getMemoriesByProject, type Memory } from "../memory";
-import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
+import {
+    exactMemoryContentDigests,
+    filterMemoriesByPolicy,
+} from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
 import {
     buildCompressCuesPrompt,
     COMPRESS_CUES_SYSTEM_PROMPT,
@@ -353,34 +357,9 @@ async function compressOneChunk(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<ChunkOutcome> {
-    // The candidate pool was frozen once at run start; later chunks can wait
-    // behind several provider calls, and a memory quarantined, rejected, or
-    // superseded in the meantime must not have its content sent to the
-    // child-model prompt. Re-apply the automatic-surface policy to this
-    // chunk's rows immediately before prompting.
-    const stillEligible = new Set(
-        filterMemoriesByPolicy(
-            args.db,
-            chunk.map((candidate) => candidate.memory),
-            "auto_inject",
-        ).memories.map((memory) => memory.id),
-    );
-    const eligibleChunk = chunk.filter((candidate) => stillEligible.has(candidate.memory.id));
-    if (eligibleChunk.length < chunk.length) {
-        log(
-            `[dreamer] compress-cues chunk dropped ${chunk.length - eligibleChunk.length} member(s) hidden since pool selection`,
-        );
-    }
-    if (eligibleChunk.length === 0) return { compressed: 0, skipped: 0 };
-    chunk = eligibleChunk;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
-        const prompt = buildCompressCuesPrompt({
-            projectPath: args.projectIdentity,
-            memories: chunk.map(toPromptMemory),
-        });
-
         const createResponse = await createChildSessionWithFence({
             client: args.client,
             db: args.db,
@@ -397,6 +376,43 @@ async function compressOneChunk(
         );
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create compress-cues session.");
+
+        // The candidate pool was frozen once at run start; later chunks wait
+        // behind provider calls, and child-session creation above is itself
+        // an await. A memory quarantined, rejected, or superseded in the
+        // meantime must not have its content sent to the child-model prompt,
+        // and a REWRITTEN member's frozen bytes must not be disclosed
+        // either. Re-apply the automatic-surface policy and bind each member
+        // to its loaded bytes immediately before the prompt is built.
+        const stillEligible = new Set(
+            filterMemoriesByPolicy(
+                args.db,
+                chunk.map((candidate) => candidate.memory),
+                "auto_inject",
+            ).memories.map((memory) => memory.id),
+        );
+        const digestsAtPrompt = exactMemoryContentDigests(
+            args.db,
+            chunk.map((candidate) => candidate.memory.id),
+        );
+        const eligibleChunk = chunk.filter(
+            (candidate) =>
+                stillEligible.has(candidate.memory.id) &&
+                digestsAtPrompt.get(candidate.memory.id) ===
+                    sha256Utf8Hex(candidate.memory.content),
+        );
+        if (eligibleChunk.length < chunk.length) {
+            log(
+                `[dreamer] compress-cues chunk dropped ${chunk.length - eligibleChunk.length} member(s) hidden or rewritten since pool selection`,
+            );
+        }
+        if (eligibleChunk.length === 0) return { compressed: 0, skipped: 0 };
+        chunk = eligibleChunk;
+
+        const prompt = buildCompressCuesPrompt({
+            projectPath: args.projectIdentity,
+            memories: chunk.map(toPromptMemory),
+        });
 
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,

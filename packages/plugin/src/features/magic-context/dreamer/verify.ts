@@ -248,36 +248,6 @@ async function verifyOneBatch(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<VerifyBatchResult> {
-    // The scope was partitioned once at run start; later batches can wait
-    // behind several provider calls. A memory quarantined, rejected, or
-    // superseded in the meantime must not reach the child-model prompt, and
-    // a memory REWRITTEN in the meantime must not be prompted with the
-    // frozen revision's bytes (the manifest would then verify or overwrite
-    // the new revision the model never saw). Re-apply the maintenance policy
-    // and bind each member to its loaded bytes immediately before prompting.
-    const stillInScope = maintenanceEligibleIdSet(
-        args.db,
-        batch.map((memory) => memory.id),
-        "verification",
-    );
-    const digestsBeforePrompt = exactMemoryContentDigests(
-        args.db,
-        batch.map((memory) => memory.id),
-    );
-    const eligibleBatch = batch.filter(
-        (memory) =>
-            stillInScope.has(memory.id) &&
-            digestsBeforePrompt.get(memory.id) === sha256Utf8Hex(memory.content),
-    );
-    if (eligibleBatch.length < batch.length) {
-        log(
-            `[dreamer] verify batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since scope partition`,
-        );
-    }
-    if (eligibleBatch.length === 0) {
-        return { verified: 0, updated: 0, archived: 0 };
-    }
-    batch = eligibleBatch;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
@@ -297,6 +267,39 @@ async function verifyOneBatch(
         );
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create verify session.");
+
+        // The scope was partitioned once at run start; later batches wait
+        // behind provider calls, and child-session creation above is itself
+        // an await. A memory quarantined, rejected, or superseded in the
+        // meantime must not reach the child-model prompt, and a memory
+        // REWRITTEN in the meantime must not be prompted with the frozen
+        // revision's bytes (the manifest would then verify or overwrite the
+        // new revision the model never saw). Re-apply the maintenance policy
+        // and bind each member to its loaded bytes immediately before the
+        // prompt is built and submitted.
+        const stillInScope = maintenanceEligibleIdSet(
+            args.db,
+            batch.map((memory) => memory.id),
+            "verification",
+        );
+        const digestsBeforePrompt = exactMemoryContentDigests(
+            args.db,
+            batch.map((memory) => memory.id),
+        );
+        const eligibleBatch = batch.filter(
+            (memory) =>
+                stillInScope.has(memory.id) &&
+                digestsBeforePrompt.get(memory.id) === sha256Utf8Hex(memory.content),
+        );
+        if (eligibleBatch.length < batch.length) {
+            log(
+                `[dreamer] verify batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since scope partition`,
+            );
+        }
+        if (eligibleBatch.length === 0) {
+            return { verified: 0, updated: 0, archived: 0 };
+        }
+        batch = eligibleBatch;
 
         const prompt = buildVerifyPrompt(args.projectIdentity, batch);
         const run = await shared.promptSyncWithValidatedOutputRetry(

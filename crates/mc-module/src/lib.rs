@@ -718,6 +718,11 @@ struct ModuleStateSyncWire {
     auto_search_hint_decisions: Vec<UserHintSeedWire>,
     #[serde(default)]
     auto_search_hint_skipped: usize,
+    /// When true, the host sent its COMPLETE hint-decision list for this
+    /// session: stored hint blocks absent from the list have no backing
+    /// decision the host can still validate and are deleted.
+    #[serde(default)]
+    user_hints_replace_session: bool,
     #[serde(default)]
     todo_synthetic_anchor: Option<Option<TodoSyntheticAnchorSeedWire>>,
     #[serde(default)]
@@ -9278,6 +9283,7 @@ impl McHandler {
             pending_agent_drops_skipped: parsed.pending_agent_drops_skipped,
             user_hint_seeds: &user_hint_seeds,
             auto_search_hint_skipped: parsed.auto_search_hint_skipped,
+            user_hints_replace_session: parsed.user_hints_replace_session,
             note_nudge_anchors: note_nudge_anchors.as_deref(),
             todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
             todo_synthetic_anchor_present,
@@ -13648,6 +13654,7 @@ fn assemble_state_sync_seed(
         note_nudge_anchors: note_nudge_anchors_present.then_some(note_nudge_anchors),
         auto_search_hint_decisions,
         auto_search_hint_skipped: final_batch.auto_search_hint_skipped,
+        user_hints_replace_session: final_batch.user_hints_replace_session,
         todo_synthetic_anchor: final_batch.todo_synthetic_anchor,
         emergency_latches: final_batch.emergency_latches,
         pending_compaction_marker: final_batch.pending_compaction_marker,

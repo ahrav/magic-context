@@ -2034,9 +2034,26 @@ export function resolveMemoriesByIdsForSearch(args: {
     // Direct-ID lookup routes through the same explicit-surface decision as
     // text search: hard-hidden rows return uniform absence.
     const policyFilter = filterMemoriesByPolicy(args.db, fetched, "explicit_search");
+    // Exact-bind the fetched bytes to the revision the policy evaluated: a
+    // rewrite committed between the load above and the policy read resolves
+    // the id through the NEW revision, whose eligibility (and label) must
+    // not lend itself to the superseded bytes this lane loaded — including
+    // revealing old content after a hidden target was rewritten.
+    const currentHashById = hasClaimEffectivePolicy(args.db)
+        ? exactMemoryContentDigests(
+              args.db,
+              policyFilter.memories.map((memory) => memory.id),
+          )
+        : null;
     const ordered: Memory[] = [];
     for (const memory of policyFilter.memories) {
         if (args.visibleMemoryIds?.has(memory.id)) continue;
+        if (
+            currentHashById !== null &&
+            currentHashById.get(memory.id) !== sha256Utf8Hex(memory.content)
+        ) {
+            continue;
+        }
         ordered.push(memory);
         if (ordered.length >= args.limit) break;
     }

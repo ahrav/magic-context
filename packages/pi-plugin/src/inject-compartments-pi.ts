@@ -25,6 +25,10 @@
  *     historyRefreshSessions signal.
  */
 
+import {
+	reconcileCompatibilityVerifications,
+	seedLateCompatibilityRevisions,
+} from "@magic-context/core/features/magic-context/claim-policy-backfill";
 import { filterMemoriesByPolicy } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import {
 	getMaxMemoryIdForProjects,
@@ -2379,6 +2383,29 @@ export function injectM0M1Pi(
 	entryIds?: readonly (string | undefined)[],
 	recomputeM1ThisPass = false,
 ): PiM0M1InjectionResult {
+	// A held-open v85 writer can append compatibility verification events or
+	// whole revisions at any time, not just before startup. Run the same
+	// guarded probes as the OpenCode injection lane before any cache replay:
+	// a reconciled event bumps the project epoch this pass observes, and an
+	// unseeded revision kicks the bounded async seeder. Both are watermark/
+	// anti-join guarded (one probe each when idle) and must not fail the
+	// injection.
+	try {
+		reconcileCompatibilityVerifications(db);
+	} catch (error) {
+		logSession(
+			state.sessionId,
+			`compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	try {
+		seedLateCompatibilityRevisions(db);
+	} catch (error) {
+		logSession(
+			state.sessionId,
+			`late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 	// One compartment snapshot for the WHOLE decision: the materialize decision
 	// and every cached-marker reload below normalize against this same set, so a
 	// concurrent count change can't flip markers to null mid-decision and escape

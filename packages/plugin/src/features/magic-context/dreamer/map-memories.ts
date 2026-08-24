@@ -221,22 +221,6 @@ async function mapOneBatch(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<{ mapped: number; independent: number }> {
-    // The input pool was frozen once at run start; later batches can wait
-    // behind several provider calls, and a memory quarantined, rejected, or
-    // superseded in the meantime must not reach the child-model prompt.
-    const stillEligible = maintenanceEligibleIdSet(
-        args.db,
-        batch.map((input) => input.id),
-        "verification",
-    );
-    const eligibleBatch = batch.filter((input) => stillEligible.has(input.id));
-    if (eligibleBatch.length < batch.length) {
-        log(
-            `[dreamer] map-memories batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since pool selection`,
-        );
-    }
-    if (eligibleBatch.length === 0) return { mapped: 0, independent: 0 };
-    batch = eligibleBatch;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
@@ -256,6 +240,25 @@ async function mapOneBatch(
         );
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create map-memories session.");
+
+        // The input pool was frozen once at run start; later batches wait
+        // behind provider calls, and child-session creation above is itself
+        // an await. A memory quarantined, rejected, or superseded in the
+        // meantime must not reach the child-model prompt; recheck
+        // immediately before the prompt is built and submitted.
+        const stillEligible = maintenanceEligibleIdSet(
+            args.db,
+            batch.map((input) => input.id),
+            "verification",
+        );
+        const eligibleBatch = batch.filter((input) => stillEligible.has(input.id));
+        if (eligibleBatch.length < batch.length) {
+            log(
+                `[dreamer] map-memories batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since pool selection`,
+            );
+        }
+        if (eligibleBatch.length === 0) return { mapped: 0, independent: 0 };
+        batch = eligibleBatch;
 
         const prompt = buildMapMemoriesPrompt(args.projectIdentity, batch);
         const run = await shared.promptSyncWithValidatedOutputRetry(

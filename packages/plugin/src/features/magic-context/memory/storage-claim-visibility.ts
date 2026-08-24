@@ -188,7 +188,13 @@ export function readMemoryPolicyRows(
         for (const row of rows) {
             let dispositions: string[] = [];
             try {
-                dispositions = JSON.parse(row.dispositionsJson ?? "[]") as string[];
+                // A future-version writer may store shapes this build does
+                // not expect; a valid non-array JSON value would otherwise
+                // pass the cast and throw later when spread.
+                const parsed = JSON.parse(row.dispositionsJson ?? "[]") as unknown;
+                dispositions = Array.isArray(parsed)
+                    ? parsed.filter((value): value is string => typeof value === "string")
+                    : [];
             } catch {
                 dispositions = [];
             }
@@ -248,7 +254,13 @@ export function decideMemoryPolicy(
         if (!unprojected && !row.explicitEligible) {
             return { eligible: false, label: null };
         }
-        const dispositions = [...(row?.dispositions ?? [])];
+        // An unprojected row's stored dispositions are untrusted: a future
+        // policy version can record values this build does not understand,
+        // and the label must stay the sanitized `policy:unknown` shape
+        // instead of echoing raw future-version strings to the agent. Only
+        // the authoritative disposition names derived from raw event tables
+        // are included.
+        const dispositions = unprojected ? [] : [...(row?.dispositions ?? [])];
         if (authoritativeStale && !dispositions.includes("stale")) dispositions.push("stale");
         if (authoritativeDisputed && !dispositions.includes("disputed")) {
             dispositions.push("disputed");

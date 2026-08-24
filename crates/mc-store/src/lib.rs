@@ -4959,6 +4959,12 @@ pub struct ModuleStateSyncRequest<'a> {
     pub pending_agent_drops_skipped: usize,
     pub user_hint_seeds: &'a [UserHintSeedRow],
     pub auto_search_hint_skipped: usize,
+    /// When true, the seed batch is the host's COMPLETE hint-decision list
+    /// for this session: any stored hint block absent from the batch has no
+    /// backing decision the host can still validate (a pre-policy hint whose
+    /// raw message is gone), and keeping it would replay unvalidated overlay
+    /// bytes forever. Rows in the batch are upserted; absent rows deleted.
+    pub user_hints_replace_session: bool,
     pub note_nudge_anchors: Option<&'a [NoteNudgeAnchorSeed]>,
     pub todo_synthetic_anchor: Option<&'a FrozenSyntheticTodoPair>,
     pub todo_synthetic_anchor_present: bool,
@@ -9925,6 +9931,33 @@ impl McStore {
             }
             let mut user_hint_seeds_seeded = 0usize;
             let mut auto_search_hint_skipped = request.auto_search_hint_skipped;
+            if request.user_hints_replace_session {
+                // The host's decision list is the complete policy authority
+                // for this session's overlays. Targeted deletes (not
+                // delete-all) keep the kept rows' created_at stable.
+                let kept: std::collections::HashSet<&str> = request
+                    .user_hint_seeds
+                    .iter()
+                    .map(|seed| seed.block_id.as_str())
+                    .collect();
+                let existing: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT block_id FROM mc_user_hints WHERE session_id = ?1",
+                    )?;
+                    let rows = stmt
+                        .query_map(params![request.session_id], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    rows
+                };
+                for block_id in existing {
+                    if !kept.contains(block_id.as_str()) {
+                        tx.execute(
+                            "DELETE FROM mc_user_hints WHERE session_id = ?1 AND block_id = ?2",
+                            params![request.session_id, block_id],
+                        )?;
+                    }
+                }
+            }
             for seed in request.user_hint_seeds {
                 if !valid_drop_seed_block_id(&seed.block_id) {
                     auto_search_hint_skipped = auto_search_hint_skipped.saturating_add(1);
@@ -26838,6 +26871,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -27019,6 +27053,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -27094,6 +27129,7 @@ mod shadow_tests {
                     pending_agent_drops_skipped: 0,
                     user_hint_seeds: &[],
                     auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
                     note_nudge_anchors: None,
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
@@ -27177,6 +27213,7 @@ mod shadow_tests {
                     pending_agent_drops_skipped: 0,
                     user_hint_seeds: &[],
                     auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
                     note_nudge_anchors: None,
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
@@ -27362,6 +27399,7 @@ mod shadow_tests {
                     pending_agent_drops_skipped: 0,
                     user_hint_seeds: &[],
                     auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
                     note_nudge_anchors: None,
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
@@ -27468,6 +27506,7 @@ mod shadow_tests {
                     pending_agent_drops_skipped: 0,
                     user_hint_seeds: &[],
                     auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
                     note_nudge_anchors: None,
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
@@ -28784,6 +28823,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -28823,6 +28863,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,

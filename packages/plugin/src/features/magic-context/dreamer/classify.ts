@@ -22,9 +22,11 @@ import {
     setMemoryClassification,
 } from "../memory";
 import {
+    exactMemoryContentDigests,
     filterMemoriesForMaintenance,
     maintenanceEligibleIdSet,
 } from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
 import { recordChildInvocation } from "../subagent-token-capture";
 import {
     buildClassifyPrompt,
@@ -351,42 +353,48 @@ async function classifyOneChunk(
     signal: AbortSignal,
 ): Promise<{ classified: number; changed: number }> {
     // The candidate pool and the stage-3 anchor sample were frozen once at
-    // run start; later chunks can wait behind several provider calls, and a
-    // memory quarantined, rejected, or superseded in the meantime must not
-    // reach the child-model prompt — anchors carry memory content into every
-    // prompt exactly like chunk members. `candidate.id`/`anchor.id` are the
-    // authority's id space (the module id on the module route); the policy
-    // recheck keys on the context row's id.
-    const stillEligible = maintenanceEligibleIdSet(
-        args.db,
-        [
-            ...chunk.map((candidate) => candidate.contextMemory.id),
-            ...anchors.map((candidate) => candidate.contextId),
-        ],
-        "hygiene",
-    );
-    const eligibleChunk = chunk.filter((candidate) =>
-        stillEligible.has(candidate.contextMemory.id),
-    );
-    const eligibleAnchors = anchors.filter((candidate) => stillEligible.has(candidate.contextId));
-    const dropped = chunk.length - eligibleChunk.length + anchors.length - eligibleAnchors.length;
-    if (dropped > 0) {
-        log(`[dreamer] classify chunk dropped ${dropped} member(s) hidden since pool selection`);
-    }
-    if (eligibleChunk.length === 0) return { classified: 0, changed: 0 };
-    chunk = eligibleChunk;
-    const promptAnchors = eligibleAnchors.map((candidate) => candidate.anchor);
+    // run start; later chunks wait behind provider calls, and child-session
+    // creation is itself an await. A memory quarantined, rejected, or
+    // superseded in the meantime must not reach the child-model prompt —
+    // anchors carry memory content into every prompt exactly like chunk
+    // members. `candidate.id`/`anchor.id` are the authority's id space (the
+    // module id on the module route); the policy recheck keys on the context
+    // row's id. Runs immediately before each route's provider call.
+    const recheckChunk = (): { chunk: ClassifyCandidate[]; anchors: ClassifyAnchorMemory[] } => {
+        const stillEligible = maintenanceEligibleIdSet(
+            args.db,
+            [
+                ...chunk.map((candidate) => candidate.contextMemory.id),
+                ...anchors.map((candidate) => candidate.contextId),
+            ],
+            "hygiene",
+        );
+        const eligibleChunk = chunk.filter((candidate) =>
+            stillEligible.has(candidate.contextMemory.id),
+        );
+        const eligibleAnchors = anchors.filter((candidate) =>
+            stillEligible.has(candidate.contextId),
+        );
+        const dropped =
+            chunk.length - eligibleChunk.length + anchors.length - eligibleAnchors.length;
+        if (dropped > 0) {
+            log(
+                `[dreamer] classify chunk dropped ${dropped} member(s) hidden since pool selection`,
+            );
+        }
+        return {
+            chunk: eligibleChunk,
+            anchors: eligibleAnchors.map((candidate) => candidate.anchor),
+        };
+    };
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);
     try {
-        const prompt = buildClassifyPrompt({
-            projectPath: args.projectIdentity,
-            memories: chunk.map(toPromptMemory),
-            anchors: promptAnchors,
-        });
         if (moduleRoute) {
-            const run = await runClassifyThroughModule(args, chunk, promptAnchors, signal);
+            const live = recheckChunk();
+            if (live.chunk.length === 0) return { classified: 0, changed: 0 };
+            const run = await runClassifyThroughModule(args, live.chunk, live.anchors, signal);
             recordInvocation(args, startedAt, { status: "completed" });
             return run;
         }
@@ -407,6 +415,15 @@ async function classifyOneChunk(
         );
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create classify session.");
+
+        const live = recheckChunk();
+        if (live.chunk.length === 0) return { classified: 0, changed: 0 };
+        chunk = live.chunk;
+        const prompt = buildClassifyPrompt({
+            projectPath: args.projectIdentity,
+            memories: chunk.map(toPromptMemory),
+            anchors: live.anchors,
+        });
 
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,
@@ -656,9 +673,26 @@ export function applyClassifications(
     let classified = 0;
     let changed = 0;
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+        // The verdicts describe the PROMPTED bytes: a memory rewritten while
+        // the classifier ran must not have another revision's classification
+        // (a shareable=true verdict for benign content A would otherwise
+        // mark a sensitive successor B shareable), and a target the policy
+        // hid meanwhile must not be touched at all. Re-evaluate policy and
+        // exact content identity while holding the write lock.
+        const eligibleInTx = maintenanceEligibleIdSet(
+            args.db,
+            parsed.map((entry) => entry.id),
+            "hygiene",
+        );
+        const digestsInTx = exactMemoryContentDigests(
+            args.db,
+            parsed.map((entry) => entry.id),
+        );
         for (const p of parsed) {
             const memory = byId.get(p.id);
             if (!memory) continue;
+            if (!eligibleInTx.has(p.id)) continue;
+            if (digestsInTx.get(p.id) !== sha256Utf8Hex(memory.content)) continue;
             // Fail closed: secret/credential/personal-path text is forced private
             // regardless of the model's verdict.
             const shareable =

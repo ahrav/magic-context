@@ -6,9 +6,11 @@ import {
 import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
     autoSearchHintFragmentsStillEligible,
+    exactMemoryContentDigests,
     filterMemoriesByPolicy,
     filterMemoryIdsByPolicy,
 } from "../../features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
 import {
     buildWorkspaceMemorySqlFilter,
     getMaxMemoryIdForProjects,
@@ -194,6 +196,11 @@ export interface ModuleStateSyncPayload {
         note_nudge_anchors?: ModuleNoteNudgeAnchorSeed[];
         auto_search_hint_decisions?: ModuleAutoSearchHintSeed[];
         auto_search_hint_skipped?: number;
+        /** True when auto_search_hint_decisions is the COMPLETE decision
+         * list for the session: the native store deletes stored hint blocks
+         * absent from the list (no backing decision the host can still
+         * validate — e.g. a pre-policy hint whose raw message is gone). */
+        user_hints_replace_session?: boolean;
         todo_synthetic_anchor?: ModuleTodoSyntheticAnchorSeed | null;
         emergency_latches?: ModuleEmergencyLatchSeed;
         pending_compaction_marker?: ModulePendingCompactionMarkerSeed | null;
@@ -1329,6 +1336,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       ...(args.autoSearchHintSkipped !== undefined
                           ? { auto_search_hint_skipped: args.autoSearchHintSkipped }
                           : {}),
+                      ...(args.autoSearchHintSeeds !== undefined
+                          ? { user_hints_replace_session: true }
+                          : {}),
                       ...(args.todoSyntheticAnchor !== undefined
                           ? { todo_synthetic_anchor: args.todoSyntheticAnchor }
                           : {}),
@@ -1638,11 +1648,22 @@ export async function buildModuleStateSyncPayload(args: {
     // The module mirror is a host-computed snapshot: only policy-eligible
     // automatic rows cross the boundary, so the native memory lane can never
     // serve content the policy hides. Rust stays free of policy derivation.
-    const memoryRows = filterMemoriesByPolicy(
+    // Exact-bind each loaded row to the revision the policy evaluated: a
+    // rewrite committed between the snapshot load and the policy read
+    // resolves the id through the NEW revision, and the superseded bytes
+    // must not be persisted into the native store under its eligibility.
+    const policyFiltered = filterMemoriesByPolicy(
         args.pass.db,
         args.force || epochChanged ? allMemories : incrementalMemories,
         "auto_inject",
     ).memories;
+    const snapshotDigests = exactMemoryContentDigests(
+        args.pass.db,
+        policyFiltered.map((memory) => memory.id),
+    );
+    const memoryRows = policyFiltered.filter(
+        (memory) => snapshotDigests.get(memory.id) === sha256Utf8Hex(memory.content),
+    );
     // The replace scope above cannot cover foreign workspace members, so a
     // previously mirrored foreign row that the policy now hides — or that was
     // archived or expired since it was mirrored — would survive in the native
