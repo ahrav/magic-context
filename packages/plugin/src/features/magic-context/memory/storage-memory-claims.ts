@@ -2250,22 +2250,28 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                     effectType: "upsert" as const,
                 });
             }
-            // A verified preimage carries its verified status onto the
-            // adopted claim as evidence — the fresh (or dedup-reused) claim
-            // has no verified event for this row yet.
-            if (memoryRowHasPositiveVerification(db, row)) {
-                addVerificationEvent(db, {
-                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
-                    outcome: "verified",
-                    verifier: envelope.producer,
-                });
-                effects.push({
-                    effectKey: `memory:${row.id}:evidence`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "evidence" as const,
-                });
-            }
+        }
+        // A verified preimage carries its verified status onto the adopted
+        // claim as evidence — the fresh (or dedup-reused) claim has no
+        // verified event for this row yet. The same carry applies to a
+        // metadata-only successor (e.g. an archive reason): the appended
+        // revision holds the exact bytes the verification attested, so it
+        // owes its own verified event — the status-kernel twin of the
+        // classification kernel's same-content carry. Content rewrites are
+        // not reachable here (this kernel never changes bytes), so this
+        // never resurrects verification onto replaced content.
+        if ((revisionId !== null || !wasLinked) && memoryRowHasPositiveVerification(db, row)) {
+            addVerificationEvent(db, {
+                revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                outcome: "verified",
+                verifier: envelope.producer,
+            });
+            effects.push({
+                effectKey: `memory:${row.id}:evidence`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "evidence" as const,
+            });
         }
         // A shared canonical claim (several crosswalk rows, one claim, via
         // the dedup branch) holds the max-rank state across its surviving

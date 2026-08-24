@@ -483,6 +483,50 @@ describe("module state sync section deltas", () => {
         expect(incremental).not.toHaveProperty("memories_replace_projects");
     });
 
+    it("a replace snapshot names policy-hidden rows as explicit delete ids", async () => {
+        const db = createContextDb();
+        const sessionId = "ses-epoch-delete-ids";
+        const projectPath = "dir:/tmp/epoch-delete-ids";
+        const eligible = insertMemory(db, {
+            projectPath: projectPath,
+            category: "CONSTRAINTS",
+            content: "policy-eligible baseline row",
+            sourceType: "user",
+        });
+        // A raw kernel insert has no claim link, so the policy hides it from
+        // the automatic mirror. The replace scope covers this project's own
+        // rows, but a foreign workspace member's rows would not be covered —
+        // the explicit id list is the lane that prunes those, so the payload
+        // must name every covered row the policy filtered out.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memories (project_path, category, content, normalized_hash,
+                    first_seen_at, created_at, updated_at, last_seen_at)
+                 VALUES (?, 'CONSTRAINTS', 'hidden unlinked row', 'hash-delete-ids-test', 1, 1, 1, 1)`,
+            ).run(projectPath);
+        });
+        const hiddenId = (
+            db
+                .prepare("SELECT id FROM memories WHERE normalized_hash = 'hash-delete-ids-test'")
+                .get() as { id: number }
+        ).id;
+        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: projectPath });
+        const state = {
+            ...syncState(),
+            lastAckedWatermarks: baseline,
+            seedPassPending: false,
+        };
+        setProjectState(db, projectPath, {
+            projectMemoryEpoch: baseline.project_memory_epoch + 1,
+        });
+        const params = await buildDeltaPayload({ db, state, sessionId, projectPath });
+        expect(params.memories_replace_projects).toEqual([projectPath]);
+        const snapshotIds = (params.memories as Array<{ id: number }>).map((row) => row.id);
+        expect(snapshotIds).toContain(eligible.id);
+        expect(snapshotIds).not.toContain(hiddenId);
+        expect(params.memories_delete_ids).toEqual([hiddenId]);
+    });
+
     it("uses omitted sections only after the module advertises the delta capability", async () => {
         const db = createContextDb();
         const sessionId = "ses-state-sync-capability";

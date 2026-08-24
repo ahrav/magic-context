@@ -100,8 +100,22 @@ export interface PreparedCompartmentInjection {
  */
 const INJECTION_CACHE_MAX = 100;
 type InjectionCacheEntry =
-    | { db: Database; kind: "empty"; compartmentEndMessageId: string; renderedBytes: number }
-    | { db: Database; kind: "populated"; injection: PreparedCompartmentInjection };
+    | {
+          db: Database;
+          kind: "empty";
+          compartmentEndMessageId: string;
+          renderedBytes: number;
+          /** Project memory epoch at build time; a later bump means a policy
+           * transition may have made a memory newly eligible, so a
+           * zero-memory entry must rebuild instead of replaying absence. */
+          projectMemoryEpoch: number;
+      }
+    | {
+          db: Database;
+          kind: "populated";
+          injection: PreparedCompartmentInjection;
+          projectMemoryEpoch: number;
+      };
 
 const injectionCache = new BoundedSessionMap<InjectionCacheEntry>(INJECTION_CACHE_MAX);
 
@@ -387,6 +401,18 @@ export function prepareCompartmentInjection(
     ) {
         clearInjectionCache(sessionId);
     }
+    // The zero-memory twin: a policy transition can also make a memory NEWLY
+    // eligible, and an entry that rendered no memories has no recorded ids to
+    // re-check — the epoch it was built under is the signal. A changed epoch
+    // rebuilds; an unchanged epoch replays byte-stable absence.
+    if (
+        !isCacheBusting &&
+        usableCached !== undefined &&
+        (usableCached.kind === "empty" || usableCached.injection.memoryCount === 0) &&
+        usableCached.projectMemoryEpoch !== getProjectMemoryEpoch(db, projectPath)
+    ) {
+        clearInjectionCache(sessionId);
+    }
     const revalidatedCached = injectionCache.get(sessionId);
     const replayableCached = revalidatedCached?.db === db ? revalidatedCached : undefined;
 
@@ -512,11 +538,16 @@ export function prepareCompartmentInjection(
         }
     }
 
+    // Epoch stamp for the zero-memory replay gate: captured before the entry
+    // is stored so a concurrent bump forces a rebuild rather than being lost.
+    const buildProjectMemoryEpoch = getProjectMemoryEpoch(db, projectPath);
+
     // Nothing to inject if we have no compartments, no facts, and no memories
     if (compartments.length === 0 && facts.length === 0 && !memoryBlock) {
         injectionCache.set(sessionId, {
             db,
             kind: "empty",
+            projectMemoryEpoch: buildProjectMemoryEpoch,
             compartmentEndMessageId: "",
             renderedBytes: 0,
         });
@@ -560,7 +591,12 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        injectionCache.set(sessionId, { db, kind: "populated", injection: result });
+        injectionCache.set(sessionId, {
+            db,
+            kind: "populated",
+            injection: result,
+            projectMemoryEpoch: buildProjectMemoryEpoch,
+        });
         return result;
     }
 
@@ -625,7 +661,12 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        injectionCache.set(sessionId, { db, kind: "populated", injection: result });
+        injectionCache.set(sessionId, {
+            db,
+            kind: "populated",
+            injection: result,
+            projectMemoryEpoch: buildProjectMemoryEpoch,
+        });
         return result;
     }
 
@@ -712,7 +753,12 @@ export function prepareCompartmentInjection(
     if (needsFreshMaterialization) {
         result.needsFreshMaterialization = true;
     }
-    injectionCache.set(sessionId, { db, kind: "populated", injection: result });
+    injectionCache.set(sessionId, {
+        db,
+        kind: "populated",
+        injection: result,
+        projectMemoryEpoch: buildProjectMemoryEpoch,
+    });
     return result;
 }
 

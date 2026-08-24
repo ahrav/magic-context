@@ -4975,6 +4975,11 @@ pub struct ModuleStateSyncRequest<'a> {
     /// mirrored rows absent from the payload are pruned within this scope
     /// before the upsert. Absent means incremental upsert-only semantics.
     pub memories_replace_projects: Option<&'a [String]>,
+    /// Explicit prune ids applied before the snapshot upsert. Covers
+    /// policy-hidden rows the replace scope cannot name — a foreign
+    /// workspace member's rows — without granting a project-wide prune over
+    /// that member's non-shared rows.
+    pub memories_delete_ids: Option<&'a [i64]>,
     pub memory_mutations: &'a [ModuleMemoryMutationRow],
     pub user_profile: &'a [String],
     /// False means the sender omitted the profile section; true includes Some(empty) clears.
@@ -10027,6 +10032,13 @@ impl McStore {
                         scope,
                         request.memories,
                     )?;
+                }
+                // Explicit deletions run before the upsert so a translated id
+                // that unexpectedly collides with a snapshot row cannot
+                // remove content the payload carries: the upsert below
+                // re-creates any such row.
+                if let Some(delete_ids) = request.memories_delete_ids {
+                    delete_authority_memories_by_id_tx(tx, request.project_path, delete_ids)?;
                 }
                 replace_authority_memories_tx(tx, request.project_path, request.memories)?;
                 replace_authority_memory_mutations_tx(
@@ -16049,6 +16061,52 @@ fn prune_absent_authority_memories_tx(
             params![project, context_store_uuid, keep_json],
         )?;
     }
+    Ok(())
+}
+
+/// Delete explicitly named mirrored memory rows. The host names ids the
+/// policy hides from the native lane but that the replace scope cannot
+/// reach — a foreign workspace member's rows — so the guard is the same
+/// context-store ownership check the scope prune applies, not a project
+/// scope: with no route binding only unadopted mirror rows (NULL uuid) are
+/// eligible; with a binding, this store's adopted rows are eligible too.
+fn delete_authority_memories_by_id_tx(
+    tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
+    ids: &[i64],
+) -> rusqlite::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
+    let mut delete_ids: Vec<i64> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let translated = authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), *id)?;
+        delete_ids.push(translated.unwrap_or(*id));
+    }
+    let ids_json = format!(
+        "[{}]",
+        delete_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    tx.execute(
+        "DELETE FROM mc_memory_mappings
+          WHERE memory_id IN (
+              SELECT id FROM mc_memories
+               WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
+                 AND id IN (SELECT value FROM json_each(?2))
+          )",
+        params![context_store_uuid, ids_json],
+    )?;
+    tx.execute(
+        "DELETE FROM mc_memories
+          WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
+            AND id IN (SELECT value FROM json_each(?2))",
+        params![context_store_uuid, ids_json],
+    )?;
     Ok(())
 }
 
@@ -26758,6 +26816,7 @@ mod shadow_tests {
                 compartments: &[],
                 memories: &[],
                 memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: user_profile.unwrap_or(&[]),
                 user_profile_present: user_profile.is_some(),
@@ -26912,6 +26971,7 @@ mod shadow_tests {
                 compartments: &[],
                 memories: &[incoming],
                 memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
@@ -26986,6 +27046,7 @@ mod shadow_tests {
                     compartments: &[],
                     memories,
                     memories_replace_projects: scope,
+                    memories_delete_ids: None,
                     memory_mutations: &[],
                     user_profile: &[],
                     user_profile_present: false,
@@ -27049,6 +27110,90 @@ mod shadow_tests {
     }
 
     #[test]
+    fn state_sync_delete_ids_prune_named_rows_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request =
+            |seq: u64, memories: &'static [ModuleMemoryRow], delete_ids: Option<&'static [i64]>| {
+                ModuleStateSyncRequest {
+                    session_id: "mirror-session",
+                    project_path: "shadow:real",
+                    shadow_generation: 0,
+                    expected_shadow_seq: seq,
+                    seed_boundary_id: None,
+                    drop_seeds: &[],
+                    drop_seed_skipped: 0,
+                    strip_seeds: &[],
+                    strip_seed_skipped: 0,
+                    reasoning_cleared_through_tag: None,
+                    compartments: &[],
+                    memories,
+                    memories_replace_projects: None,
+                    memories_delete_ids: delete_ids,
+                    memory_mutations: &[],
+                    user_profile: &[],
+                    user_profile_present: false,
+                    workspace: None,
+                    workspace_present: false,
+                    last_todo_state: None,
+                    project_memory_epoch: None,
+                    user_profile_version: None,
+                    pending_agent_drops: &[],
+                    pending_agent_drops_skipped: 0,
+                    user_hint_seeds: &[],
+                    auto_search_hint_skipped: 0,
+                    note_nudge_anchors: None,
+                    todo_synthetic_anchor: None,
+                    todo_synthetic_anchor_present: false,
+                    emergency_latches: None,
+                    pending_compaction_marker: None,
+                    deferred_execute_state: None,
+                    channel2_nudge_state: None,
+                    acked_watermarks: serde_json::Value::Null,
+                }
+            };
+        let mut foreign = memory(202, "foreign member row now policy-hidden");
+        foreign.project_path = "shadow:member".to_string();
+        let seeded: &'static [ModuleMemoryRow] =
+            Box::leak(Box::new([memory(201, "eligible row"), foreign]));
+        store
+            .apply_authority_state_sync(request(0, seeded, None))
+            .unwrap();
+
+        // Explicit delete ids prune exactly the named rows — here a foreign
+        // member's row the replace scope could not cover — and leave every
+        // other row untouched.
+        let delete_ids: &'static [i64] = Box::leak(Box::new([202i64]));
+        store
+            .apply_authority_state_sync(request(1, &[], Some(delete_ids)))
+            .unwrap();
+
+        let ids = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT id, project_path FROM mc_memories ORDER BY id")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(ids, vec![(201, "shadow:real".to_string())]);
+        let mapping_count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memory_mappings WHERE memory_id = 202",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(mapping_count, 0);
+    }
+
+    #[test]
     fn authority_state_sync_fences_module_owned_memory_rows() {
         for authority_state in ["PREPARING", "MODULE", "DRAINING"] {
             let dir = tempfile::tempdir().unwrap();
@@ -27103,6 +27248,7 @@ mod shadow_tests {
                     compartments: &[],
                     memories: &[incoming],
                     memories_replace_projects: None,
+                    memories_delete_ids: None,
                     memory_mutations: &[],
                     user_profile: &[],
                     user_profile_present: true,
@@ -27208,6 +27354,7 @@ mod shadow_tests {
                     compartments: &[],
                     memories: &[incoming],
                     memories_replace_projects: None,
+                    memories_delete_ids: None,
                     memory_mutations: &[],
                     user_profile: &[],
                     user_profile_present: true,
@@ -28523,6 +28670,7 @@ mod shadow_tests {
                 compartments: &[comp(0, 0, "first#0")],
                 memories: &[],
                 memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
@@ -28561,6 +28709,7 @@ mod shadow_tests {
                 compartments: &[comp(1, 1, "second#0")],
                 memories: &[],
                 memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,

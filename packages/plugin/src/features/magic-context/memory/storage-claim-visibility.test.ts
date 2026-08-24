@@ -339,6 +339,38 @@ describe("claim policy surface enforcement", () => {
         }
     });
 
+    test("maintenance lanes fail closed on missing policy state", () => {
+        const db = migratedDb();
+        try {
+            const clean = seedMemory(db, "maint-fc-clean", "clean candidate stays");
+            const unprojected = seedMemory(db, "maint-fc-unproj", "linked but unprojected row");
+            // A held-open compat writer can append a revision with no
+            // projection row; the maintenance pool must not surface it.
+            db.prepare("DELETE FROM claim_effective_policy WHERE revision_id = ?").run(
+                unprojected.revisionId,
+            );
+            // A row whose claims adoption failed has no link at all; the
+            // automatic surfaces treat it as unknown and hide it, so the
+            // maintenance prompts must too.
+            runInMemoryClaimsWriteTransaction(db, () => {
+                db.prepare(
+                    `INSERT INTO memories (project_path, category, content, normalized_hash,
+                        first_seen_at, created_at, updated_at, last_seen_at)
+                     VALUES (?, 'CONSTRAINTS', 'unlinked adoption-failure row', 'maint-fc-unlinked', 1, 1, 1, 1)`,
+                ).run(PROJECT);
+            });
+            const memories = getMemoriesByProject(db, PROJECT);
+            expect(memories.length).toBe(3);
+            for (const lane of ["verification", "hygiene"] as const) {
+                expect(filterMemoriesForMaintenance(db, memories, lane).map((m) => m.id)).toEqual([
+                    clean.memoryId,
+                ]);
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("a contradicted row with no projection row is absent from explicit search", () => {
         const db = migratedDb();
         try {

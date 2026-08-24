@@ -273,13 +273,39 @@ export function decideMemoryPolicy(
 }
 
 /**
+ * Replay gate for a persisted auto-search hint: the hint text was computed
+ * from these memories' fragments under the policy of an earlier pass, and a
+ * later policy transition (quarantine, contradiction, rejection) must not
+ * keep serving those fragments through the persisted decision. `undefined`
+ * means the contributing set is unknown (a pre-field decision or a reseed
+ * that dropped it) and fails closed — an unknown set cannot prove the text
+ * holds no hidden fragment, the same discipline as an unknown rendered-id
+ * record on the injection path.
+ */
+export function autoSearchHintFragmentsStillEligible(
+    db: Database,
+    memoryIds: readonly number[] | undefined,
+): boolean {
+    if (!hasClaimEffectivePolicy(db)) return true;
+    if (memoryIds === undefined) return false;
+    if (memoryIds.length === 0) return true;
+    const rows = readMemoryPolicyRows(db, memoryIds);
+    return memoryIds.every((id) => decideMemoryPolicy(rows.get(id), "auto_search").eligible);
+}
+
+/**
  * Maintenance pools keep the rows their lane can heal and exclude everything
  * else the policy hides from automatic prompts. The verification lane owns
  * the stale/disputed facts (they are its own outcomes) and must observe
  * those rows to heal them; the hygiene lane (classify/curate) has no healing
  * authority and excludes every soft-hidden row. Both always exclude the
  * uniform-absence class (hard-hidden, rejected) and superseded rows, which
- * no maintenance lane may resurrect. Unlinked rows pass: nothing hides them.
+ * no maintenance lane may resurrect. Missing policy state fails closed
+ * (mirroring `decideMemoryPolicy`'s `unprojected`): a row with no claim
+ * link, no projection row, or an unsupported policy version is hidden from
+ * automatic surfaces, and maintenance prompts are automatic surfaces —
+ * content injection and search treat as unknown must not flow to
+ * child-model prompts either.
  */
 export function filterMemoriesForMaintenance(
     db: Database,
@@ -293,7 +319,9 @@ export function filterMemoriesForMaintenance(
     );
     return memories.filter((memory) => {
         const row = rows.get(memory.id);
-        if (row == null) return true;
+        if (row == null || !row.projected || row.policyVersion > CLAIM_POLICY_VERSION) {
+            return false;
+        }
         if (row.hardHidden || row.contradicted || row.quarantined || row.rejected) return false;
         if (row.superseded) return false;
         if (lane === "hygiene" && (row.stale || row.disputed)) return false;

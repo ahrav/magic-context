@@ -23,12 +23,14 @@ import {
     embedTextForProject,
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
+import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
 import type {
     UnifiedSearchOptions,
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
 import { unifiedSearch } from "../../features/magic-context/search";
 import {
+    type AutoSearchHintDecision,
     type AutoSearchHintNoHintReason,
     appendAutoSearchHintDecision,
     getAutoSearchHintDecisions,
@@ -299,12 +301,26 @@ export async function runAutoSearchHint(args: {
     if (!userMsg || typeof userMsg.info.id !== "string") return AUTO_SEARCH_OK;
     const userMsgId = userMsg.info.id;
 
+    // A persisted hint replays only while every contributing memory is still
+    // auto_search-eligible: the initial policy filter ran once at compute
+    // time, and a later quarantine/contradiction/rejection must not keep
+    // sending the fragment on defer/retry passes through the stored text.
+    const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
+        if (decision.decision !== "hint") return;
+        if (!autoSearchHintFragmentsStillEligible(db, decision.memoryIds)) {
+            sessionLog(
+                sessionId,
+                `auto-search: suppressing persisted hint for ${decision.messageId} — a contributing memory is no longer eligible`,
+            );
+            return;
+        }
+        appendReminderToUserMessageById(messages, decision.messageId, decision.text);
+    };
+
     const existing = getAutoSearchHintDecisions(db, sessionId);
     const existingForMessage = existing.find((decision) => decision.messageId === userMsgId);
     if (existingForMessage) {
-        if (existingForMessage.decision === "hint") {
-            appendReminderToUserMessageById(messages, userMsgId, existingForMessage.text);
-        }
+        replayHintIfEligible(existingForMessage);
         return AUTO_SEARCH_OK;
     }
 
@@ -329,8 +345,8 @@ export async function runAutoSearchHint(args: {
             reason,
         });
         if (!outcome.ok) return { ok: false, kind: "cas-exhaustion" };
-        if (outcome.kind === "already-present" && outcome.decision.decision === "hint") {
-            appendReminderToUserMessageById(messages, userMsgId, outcome.decision.text);
+        if (outcome.kind === "already-present") {
+            replayHintIfEligible(outcome.decision);
         }
         return AUTO_SEARCH_OK;
     };
@@ -435,16 +451,28 @@ export async function runAutoSearchHint(args: {
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.
     const payload = `\n\n${hintText}`;
+    // Record which memories contributed fragments so replay passes can
+    // re-check them against the live policy.
+    const deliveredMemoryIds = [
+        ...new Set(
+            delivery.delivered
+                .filter((result) => result.source === "memory")
+                .map((result) => result.memoryId),
+        ),
+    ];
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
         text: payload,
+        memoryIds: deliveredMemoryIds,
     });
     if (!outcome.ok) {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);
         return { ok: false, kind: "cas-exhaustion" };
     }
-    if (outcome.decision.decision === "hint") {
+    if (outcome.kind === "already-present") {
+        replayHintIfEligible(outcome.decision);
+    } else if (outcome.decision.decision === "hint") {
         appendReminderToUserMessageById(messages, userMsgId, outcome.decision.text);
     }
     sessionLog(

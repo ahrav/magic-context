@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { runMigrations } from "../../features/magic-context/migrations";
 import * as searchModule from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { getAutoSearchHintDecisions } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { extractBoundedAutoSearchQuery } from "./auto-search-prompt";
@@ -608,6 +609,67 @@ describe("auto-search-runner", () => {
             // …and the ignored announcement is NOT.
             expect(capturedQuery ?? "").not.toContain("Magic Context");
             expect(capturedQuery ?? "").not.toContain("announcement bullet");
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    test("persisted hints record contributing memory ids and stop replaying when one is hidden", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+            async () =>
+                [
+                    {
+                        source: "memory",
+                        content: "the historian runs on overflow",
+                        score: 0.9,
+                        memoryId: 4242,
+                        category: "ARCHITECTURE",
+                        matchType: "fts",
+                    },
+                ] as unknown as Awaited<ReturnType<typeof searchModule.unifiedSearch>>,
+        );
+        try {
+            const messages: MessageLike[] = [
+                makeUserMsg(
+                    "u-hint-policy",
+                    "please explain how the historian decides when to run",
+                ),
+            ];
+            await runAutoSearchHint({
+                sessionId: "s-hint-policy",
+                db,
+                messages,
+                options: baseOptions,
+            });
+            const decisions = getAutoSearchHintDecisions(db, "s-hint-policy");
+            expect(decisions).toHaveLength(1);
+            const decision = decisions[0];
+            if (decision.decision !== "hint") throw new Error("expected a hint decision");
+            // The decision binds the contributing memory ids for replay gates.
+            expect(decision.memoryIds).toEqual([4242]);
+            expect(findUserPromptText(messages[0])).toContain("historian runs on overflow");
+
+            // Memory 4242 has no claim link, so the policy treats it as
+            // unknown: the replay pass must suppress the persisted hint
+            // instead of re-serving the fragment.
+            const replayMessages: MessageLike[] = [
+                makeUserMsg(
+                    "u-hint-policy",
+                    "please explain how the historian decides when to run",
+                ),
+            ];
+            await runAutoSearchHint({
+                sessionId: "s-hint-policy",
+                db,
+                messages: replayMessages,
+                options: baseOptions,
+            });
+            expect(findUserPromptText(replayMessages[0])).not.toContain(
+                "historian runs on overflow",
+            );
+            expect(findUserPromptText(replayMessages[0])).not.toContain("<ctx-search-hint>");
+            // No second search: the persisted decision still owns the message.
+            expect(spy).toHaveBeenCalledTimes(1);
         } finally {
             spy.mockRestore();
         }

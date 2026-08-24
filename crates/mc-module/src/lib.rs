@@ -683,6 +683,12 @@ struct ModuleStateSyncWire {
     /// scope. Absent means incremental upsert-only semantics.
     #[serde(default)]
     memories_replace_projects: Option<Vec<String>>,
+    /// Explicit prune: mirrored rows with these ids are deleted before the
+    /// snapshot upsert. Covers policy-hidden rows the replace scope cannot
+    /// name — a foreign workspace member's rows — without granting a
+    /// project-wide prune over that member's non-shared rows.
+    #[serde(default)]
+    memories_delete_ids: Option<Vec<i64>>,
     #[serde(default)]
     memory_mutations: Vec<ModuleMemoryMutationWire>,
     #[serde(default)]
@@ -9298,6 +9304,7 @@ impl McHandler {
             compartments: &compartments,
             memories: &memories,
             memories_replace_projects: memories_replace_projects.as_deref(),
+            memories_delete_ids: parsed.memories_delete_ids.as_deref(),
             memory_mutations: &memory_mutations,
             user_profile: &user_profile,
             user_profile_present,
@@ -13611,6 +13618,8 @@ fn assemble_state_sync_seed(
         // Replace scope rides the completing batch and applies to the whole
         // assembled snapshot; earlier batches never carry it.
         memories_replace_projects: final_batch.memories_replace_projects,
+        // Explicit delete ids ride the completing batch with the replace scope.
+        memories_delete_ids: final_batch.memories_delete_ids,
         memory_mutations,
         user_profile,
         workspace: final_batch.workspace,

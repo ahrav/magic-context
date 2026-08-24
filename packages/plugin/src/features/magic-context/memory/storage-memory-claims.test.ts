@@ -1140,6 +1140,42 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
         expect(count(db, "claim_change_outbox", "effect_type = 'lifecycle'")).toBe(1);
     });
 
+    test("archive with a reason carries verification onto the metadata-only successor", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "archive-verified-seed", "verified archive target");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+            ).run(seeded.memoryId);
+        });
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("archive-verified-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    status: "archived",
+                    metadataJson: JSON.stringify({ archive_reason: "done" }),
+                },
+            ),
+        );
+        // The metadata replacement appends a same-content successor; the
+        // exact bytes the verification attested are unchanged, so the new
+        // current revision owes its own verified event — otherwise restoring
+        // the memory later leaves unchanged content hidden until it is
+        // verified again. The archive event still lands with the state
+        // change.
+        expect(outcome.result.revisionId).not.toBeNull();
+        expect(
+            db
+                .prepare(
+                    "SELECT outcome FROM verification_events WHERE revision_id = ? ORDER BY id",
+                )
+                .all(outcome.result.revisionId)
+                .map((row) => (row as { outcome: string }).outcome),
+        ).toEqual(["verified", "archive"]);
+    });
+
     test("delete retires the claim, removes the projection, and retains the crosswalk", () => {
         const db = track(migratedDb());
         const seeded = createSeedMemory(db, "delete-seed", "delete target");

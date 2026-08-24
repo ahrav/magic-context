@@ -88,7 +88,20 @@ export type AutoSearchHintNoHintReason =
     | "too-short";
 
 export type AutoSearchHintDecision =
-    | { messageId: string; decision: "hint"; text: string }
+    | {
+          messageId: string;
+          decision: "hint";
+          text: string;
+          /**
+           * Memory ids whose fragments the hint text carries. Replay gates
+           * re-check these against the live policy so a memory hidden after
+           * the hint was computed stops being served; a decision without the
+           * field (written before the field existed, or reseeded through a
+           * lane that drops it) cannot prove its fragments are clean and
+           * fails closed under an effective claim policy.
+           */
+          memoryIds?: number[];
+      }
     | { messageId: string; decision: "no-hint"; reason: AutoSearchHintNoHintReason };
 
 export type NoteNudgeDeliveryOutcome =
@@ -235,7 +248,11 @@ function isValidAutoSearchHintDecision(value: unknown): value is AutoSearchHintD
     const row = value as Record<string, unknown>;
     if (typeof row.messageId !== "string" || row.messageId.length === 0) return false;
     if (row.decision === "hint") {
-        return typeof row.text === "string" && row.text.length > 0;
+        if (typeof row.text !== "string" || row.text.length === 0) return false;
+        return (
+            row.memoryIds === undefined ||
+            (Array.isArray(row.memoryIds) && row.memoryIds.every((id) => Number.isInteger(id)))
+        );
     }
     if (row.decision === "no-hint") {
         return typeof row.reason === "string" && AUTO_SEARCH_NO_HINT_REASONS.has(row.reason);

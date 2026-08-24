@@ -45,6 +45,7 @@ import {
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import {
 	clearSessionTracking,
 	scheduleIncrementalIndex,
@@ -5749,6 +5750,12 @@ function applyNoteNudges(args: {
 	}
 	for (const decision of getAutoSearchHintDecisions(db, sessionId)) {
 		if (decision.decision === "hint") {
+			// A persisted hint replays only while every contributing memory is
+			// still auto_search-eligible: a later policy transition must not
+			// keep serving the fragment through the sticky replay.
+			if (!autoSearchHintFragmentsStillEligible(db, decision.memoryIds)) {
+				continue;
+			}
 			appendReminderToUserMessageByIdPi(
 				messages,
 				replayMessageIdByIndex,

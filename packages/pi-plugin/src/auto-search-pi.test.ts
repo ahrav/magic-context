@@ -44,8 +44,20 @@ describe("runAutoSearchHintForPi", () => {
 
 	it("reuses the per-turn cached hint for the same user message id", async () => {
 		const db = createTestDb();
+		// A message-source fragment carries no memory ids, so the persisted
+		// hint replays without a policy lookup; memory-backed replay gating
+		// is covered by the persisted-hints policy test below.
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
-			async () => [memoryResult()],
+			async () => [
+				{
+					source: "message",
+					content: "historian cache wiring details",
+					score: 0.9,
+					messageOrdinal: 1,
+					messageId: "m-hist",
+					role: "assistant",
+				},
+			],
 		);
 		try {
 			const firstMessages = [
@@ -70,6 +82,43 @@ describe("runAutoSearchHintForPi", () => {
 
 			expect(spy).toHaveBeenCalledTimes(1);
 			expect(textOf(replayMessages[0])).toContain("<ctx-search-hint>");
+		} finally {
+			spy.mockRestore();
+			closeQuietly(db);
+		}
+	});
+
+	it("suppresses a persisted hint whose contributing memory is no longer eligible", async () => {
+		const db = createTestDb();
+		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
+			async () => [memoryResult()],
+		);
+		try {
+			const firstMessages = [
+				userMessage("explain the historian cache wiring", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: firstMessages,
+				options: baseOptions,
+			});
+			expect(textOf(firstMessages[0])).toContain("<ctx-search-hint>");
+
+			// The mocked memory id has no claim link, so the policy treats it
+			// as unknown: the replay pass must suppress the persisted hint
+			// instead of re-serving the fragment.
+			const replayMessages = [
+				userMessage("explain the historian cache wiring", 1),
+			];
+			await runAutoSearchHintForPi({
+				sessionId: "ses-auto",
+				db,
+				messages: replayMessages,
+				options: baseOptions,
+			});
+			expect(spy).toHaveBeenCalledTimes(1);
+			expect(textOf(replayMessages[0])).not.toContain("<ctx-search-hint>");
 		} finally {
 			spy.mockRestore();
 			closeQuietly(db);
@@ -109,6 +158,8 @@ describe("runAutoSearchHintForPi", () => {
 				messageId: "entry-replay",
 				decision: "hint",
 				text: "\n\n<ctx-search-hint>stored hint</ctx-search-hint>",
+				// No memory fragments contributed, so replay needs no policy check.
+				memoryIds: [],
 			});
 			const replay = [
 				{ ...userMessage("explain cached hint", 1), id: "entry-replay" },

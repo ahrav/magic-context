@@ -160,6 +160,11 @@ export interface ModuleStateSyncPayload {
          * receiver prunes mirrored rows absent from the payload within this
          * scope. Absent means incremental upsert-only semantics. */
         memories_replace_projects?: string[];
+        /** Explicit prune: mirrored rows with these ids are deleted. Covers
+         * policy-hidden rows the replace scope cannot name — a foreign
+         * workspace member's rows — without granting a project-wide prune
+         * over that member's non-shared rows. */
+        memories_delete_ids?: number[];
         memory_mutations?: unknown[];
         user_profile?: string[];
         workspace?: ModuleWorkspacePayload | null;
@@ -1100,6 +1105,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
     /** Full-snapshot replace scope; rides the completing batch so the module
      * prunes after assembling every page's memories. */
     memoriesReplaceProjects?: string[];
+    /** Explicit prune ids for policy-hidden rows the replace scope cannot
+     * name (foreign workspace members); rides the completing batch. */
+    memoriesDeleteIds?: number[];
 }): ModuleStateSyncPayload[] {
     const items: SeedItem[] = [
         ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
@@ -1219,6 +1227,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       ...(args.memoriesReplaceProjects !== undefined &&
                       !args.omitAuthorityMemorySections
                           ? { memories_replace_projects: args.memoriesReplaceProjects }
+                          : {}),
+                      ...(args.memoriesDeleteIds !== undefined && !args.omitAuthorityMemorySections
+                          ? { memories_delete_ids: args.memoriesDeleteIds }
                           : {}),
                       ...(args.dropSeedSkipped !== undefined
                           ? { drop_seed_skipped: args.dropSeedSkipped }
@@ -1512,6 +1523,22 @@ export async function buildModuleStateSyncPayload(args: {
         args.force || epochChanged ? allMemories : incrementalMemories,
         "auto_inject",
     ).memories;
+    // The replace scope above cannot cover foreign workspace members, so a
+    // previously mirrored foreign row that the policy now hides would survive
+    // in the native store until one of the member's own sessions syncs.
+    // Explicit id deletions close that gap: every row this snapshot covers
+    // that the policy filtered OUT is named individually, which prunes stale
+    // hidden rows in any member's project without granting this session a
+    // project-wide prune over a foreign member's non-shared rows.
+    const memoriesDeleteIds = (() => {
+        if (!(args.force || epochChanged) || omitAuthorityMemorySections) return undefined;
+        if (!args.pass.projectPath) return undefined;
+        const keptIds = new Set(memoryRows.map((memory) => memory.id));
+        const hidden = allMemories
+            .filter((memory) => !keptIds.has(memory.id))
+            .map((memory) => memory.id);
+        return hidden.length > 0 ? hidden : undefined;
+    })();
     const memories = memoryRows.map((memory) => ({
         id: memory.id,
         project_path: memory.projectPath,
@@ -1694,6 +1721,7 @@ export async function buildModuleStateSyncPayload(args: {
         watermarks: currentWatermarks,
         omitAuthorityMemorySections,
         memoriesReplaceProjects,
+        memoriesDeleteIds,
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
@@ -1708,6 +1736,9 @@ export async function buildModuleStateSyncPayload(args: {
             ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
             ...(memoriesReplaceProjects !== undefined
                 ? { memories_replace_projects: memoriesReplaceProjects }
+                : {}),
+            ...(memoriesDeleteIds !== undefined && !omitAuthorityMemorySections
+                ? { memories_delete_ids: memoriesDeleteIds }
                 : {}),
             ...(includeUserProfile ? { user_profile: userProfile } : {}),
             ...(includeWorkspace ? { workspace: workspace.workspace } : {}),

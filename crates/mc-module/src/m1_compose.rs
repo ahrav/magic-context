@@ -604,6 +604,7 @@ mod tests {
                 compartments: &[],
                 memories: &[],
                 memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: profile,
                 user_profile_present: true,
