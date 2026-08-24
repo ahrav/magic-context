@@ -565,7 +565,39 @@ export class ConnectionGeneration {
             ),
         );
         try {
-            const result = await this.channel.start(deadline);
+            // Raced against retirement: a provider channel whose start()
+            // never settles — or ignores the close() that retirement issues
+            // — must not strand setup after the timer above has already
+            // retired this generation. Both branches attach handlers, so
+            // the losing promise can never surface as an unhandled
+            // rejection.
+            const result = await new Promise<{ daemonVer: string }>((resolve, reject) => {
+                let settled = false;
+                void this.retired.then((info) => {
+                    if (!settled) {
+                        settled = true;
+                        reject(
+                            new SocketClosedError(
+                                `connection retired during setup: ${info.reason}`,
+                            ),
+                        );
+                    }
+                });
+                this.channel.start(deadline).then(
+                    (value) => {
+                        if (!settled) {
+                            settled = true;
+                            resolve(value);
+                        }
+                    },
+                    (error: unknown) => {
+                        if (!settled) {
+                            settled = true;
+                            reject(error instanceof Error ? error : new Error(String(error)));
+                        }
+                    },
+                );
+            });
             if (this.retiredInfo) {
                 throw new SocketClosedError(
                     `connection retired during setup: ${this.retiredInfo.reason}`,

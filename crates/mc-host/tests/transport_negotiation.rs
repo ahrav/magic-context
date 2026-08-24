@@ -392,6 +392,10 @@ fn opaque_value_bounds_are_exact() {
         )),
         NegotiationErrorCode::OpaqueTooDeep
     );
+    // A scalar in the deepest container adds no level (§7.1 counting).
+    let scalar_leaf = nested_objects(MAX_OPAQUE_DEPTH).replace("{}", r#"{"v":1}"#);
+    decode_negotiate_request(request_with_parameters(&scalar_leaf).as_bytes())
+        .expect("depth 8 parameters with a scalar leaf");
 
     // Compact size: a {"p":"<pad>"} object serializes to pad + 8 bytes.
     let at_cap = format!(r#"{{"p":"{}"}}"#, "x".repeat(MAX_OPAQUE_BYTES - 8));
@@ -590,7 +594,7 @@ fn parse_failures_expose_bounded_codes_and_paths_without_provider_bytes() {
 
     // A failing body whose opaque value carries a sentinel: too deep.
     let too_deep = format!(
-        r#"{{"op":"transport.negotiate","negotiation_version":1,"offers":[{{"transport":"tcp","capability_version":1,"parameters":{{"a":{{"b":{{"c":{{"d":{{"e":{{"f":{{"g":{{"h":"{SENTINEL}"}}}}}}}}}}}}}}}}}}]}}"#
+        r#"{{"op":"transport.negotiate","negotiation_version":1,"offers":[{{"transport":"tcp","capability_version":1,"parameters":{{"a":{{"b":{{"c":{{"d":{{"e":{{"f":{{"g":{{"h":{{"i":"{SENTINEL}"}}}}}}}}}}}}}}}}}}}}]}}"#
     );
     let err = decode_negotiate_request(too_deep.as_bytes()).expect_err("must reject");
     assert_eq!(err.code, NegotiationErrorCode::OpaqueTooDeep);

@@ -297,6 +297,9 @@ describe("opaque value bounds", () => {
                 ),
             "opaque_too_deep",
         );
+        // A scalar in the deepest container adds no level (§7.1 counting).
+        const scalarLeaf = nestedObjects(MAX_OPAQUE_DEPTH).replace("{}", '{"v":1}');
+        decodeNegotiateRequest(bytes(requestWithParameters(scalarLeaf)));
     });
 
     test("compact 8 KiB passes; one more byte fails", () => {
@@ -514,7 +517,7 @@ describe("error hygiene", () => {
     const SENTINEL = "SENTINEL-PROVIDER-SECRET";
 
     test("failures expose a bounded code and structural path without provider bytes", () => {
-        const tooDeep = `{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":"${SENTINEL}"}}}}}}}}}]}`;
+        const tooDeep = `{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":{"i":"${SENTINEL}"}}}}}}}}}}]}`;
         const error = expectCode(() => decodeNegotiateRequest(bytes(tooDeep)), "opaque_too_deep");
         expect(error.path).toBe("offers[0].parameters");
         expect(error.message).not.toContain(SENTINEL);

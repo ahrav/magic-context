@@ -467,7 +467,10 @@ function strictToPlain(value: StrictValue, path: string): PlainJson {
     }
 }
 
-/** Depth of a value: 1 at the subtree root, +1 per nested object/array. */
+/**
+ * Container depth (wire doc §7.1): 1 at the subtree root, +1 per nested
+ * object/array. Scalar leaves add no level, so `{"a":1}` is depth 1.
+ */
 function strictDepth(value: StrictValue): number {
     switch (value.kind) {
         case "array":
@@ -480,7 +483,7 @@ function strictDepth(value: StrictValue): number {
             return 1 + max;
         }
         default:
-            return 1;
+            return 0;
     }
 }
 
@@ -751,6 +754,7 @@ function checkVersionRange(version: number, path: string): void {
     }
 }
 
+/** Container depth of a plain value; same §7.1 counting as `strictDepth`. */
 function plainDepth(value: unknown): number {
     if (Array.isArray(value)) {
         return 1 + value.reduce((max: number, item) => Math.max(max, plainDepth(item)), 0);
@@ -762,7 +766,7 @@ function plainDepth(value: unknown): number {
         }
         return 1 + max;
     }
-    return 1;
+    return 0;
 }
 
 /**

@@ -1923,6 +1923,23 @@ describe("transport negotiation", () => {
         expect(peer.connections.length).toBe(1);
     });
 
+    test("AE5: a provider start() that never settles cannot strand candidate setup", async () => {
+        const provider = createFakePairedProvider({ startHang: true });
+        const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody({})) });
+        const { error } = await connectRejected({
+            peer,
+            transportProviders: [provider],
+            handshakeTimeoutMs: 300,
+        });
+        // The generation's setup timer retires the candidate; the raced
+        // start observes retirement instead of stranding activateCandidate
+        // on a promise the provider never settles.
+        expect((error as Error).name).toBe("SocketClosedError");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
     test("AE5: an invalid commit response closes candidate and bootstrap", async () => {
         const provider = createFakePairedProvider();
         provider.host.onFrame = (frame, host) => {

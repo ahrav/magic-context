@@ -147,9 +147,12 @@ function sanitizedChannelFailure(
  * Wrap a provider's candidate construction so every provider-originated
  * error surface — constructor throw, `start()` rejection, channel-detected
  * close errors — is sanitized per R14 before it can enter generation error
- * graphs, retirement info, or diagnostics.
+ * graphs, retirement info, or diagnostics. `transport` is the cached
+ * registry name, never a live provider getter: failure paths must not
+ * re-enter provider code to describe a provider failure.
  */
 export function sanitizedCandidateFactory(
+    transport: string,
     provider: ClientTransportProvider,
     descriptor: OpaqueObject,
 ): (args: CandidateChannelArgs) => SetupFrameChannel {
@@ -157,17 +160,14 @@ export function sanitizedCandidateFactory(
         const handlers: FrameChannelHandlers = {
             onFrame: args.handlers.onFrame,
             onClosed: (reason, _error) =>
-                args.handlers.onClosed(
-                    reason,
-                    sanitizedProviderError(provider.transport, "channel"),
-                ),
+                args.handlers.onClosed(reason, sanitizedProviderError(transport, "channel")),
             onDiagnostic: args.handlers.onDiagnostic,
         };
         let channel: SetupFrameChannel;
         try {
             channel = provider.connect(descriptor, { ...args, handlers });
         } catch {
-            throw sanitizedProviderError(provider.transport, "connect");
+            throw sanitizedProviderError(transport, "connect");
         }
         // Every provider-reachable failure surface is sanitized: send,
         // sendControl, and flush forward through the same bounded-error
@@ -177,35 +177,35 @@ export function sanitizedCandidateFactory(
                 try {
                     return await channel.start(deadline);
                 } catch {
-                    throw sanitizedProviderError(provider.transport, "start");
+                    throw sanitizedProviderError(transport, "start");
                 }
             },
             beginFrames: () => {
                 try {
                     channel.beginFrames();
                 } catch {
-                    throw sanitizedProviderError(provider.transport, "channel");
+                    throw sanitizedProviderError(transport, "channel");
                 }
             },
             send: (frame, hooks) => {
                 try {
                     return channel.send(frame, hooks);
                 } catch (error) {
-                    throw sanitizedChannelFailure(provider.transport, "send", error);
+                    throw sanitizedChannelFailure(transport, "send", error);
                 }
             },
             sendControl: (header) => {
                 try {
                     channel.sendControl(header);
                 } catch (error) {
-                    throw sanitizedChannelFailure(provider.transport, "send", error);
+                    throw sanitizedChannelFailure(transport, "send", error);
                 }
             },
             flush: async (deadline) => {
                 try {
                     return await channel.flush(deadline);
                 } catch (error) {
-                    throw sanitizedChannelFailure(provider.transport, "flush", error);
+                    throw sanitizedChannelFailure(transport, "flush", error);
                 }
             },
             close: (error) => {

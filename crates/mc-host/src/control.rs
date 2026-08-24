@@ -375,11 +375,14 @@ pub(crate) fn check_string(
 /// Depth of a JSON value: 1 at the subtree root, +1 per nested object/array
 /// level (protocol §7.1). Shared with the negotiation decoder so both read
 /// the same §7.1 counting rule.
+/// Container depth (protocol §7.1): 1 at the subtree root, +1 per nested
+/// object/array. Scalar leaves add no level, so `{"a":1}` is depth 1 and
+/// `{"a":{"b":1}}` is depth 2.
 pub(crate) fn value_depth(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
         serde_json::Value::Object(map) => 1 + map.values().map(value_depth).max().unwrap_or(0),
-        _ => 1,
+        _ => 0,
     }
 }
 
@@ -833,8 +836,10 @@ mod tests {
     #[test]
     fn admission_facts_bounds_are_exact() {
         fn nested(depth: usize) -> serde_json::Value {
+            // `depth` containers around a scalar leaf; the leaf adds no
+            // level (protocol §7.1 counting).
             let mut value = serde_json::json!(1);
-            for _ in 1..depth {
+            for _ in 0..depth {
                 value = serde_json::json!([value]);
             }
             value
@@ -860,8 +865,10 @@ mod tests {
     #[test]
     fn ignored_field_nesting_is_bounded() {
         fn nested(depth: usize) -> serde_json::Value {
+            // `depth` containers around a scalar leaf; the leaf adds no
+            // level (protocol §7.1 counting).
             let mut value = serde_json::json!(1);
-            for _ in 1..depth {
+            for _ in 0..depth {
                 value = serde_json::json!([value]);
             }
             value

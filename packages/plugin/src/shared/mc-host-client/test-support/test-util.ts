@@ -228,6 +228,8 @@ export class FakeCandidateHost {
 
 interface FakeCandidateChannelOptions {
     startError?: Error;
+    /** `start()` returns a promise that never settles and ignores close. */
+    startHang?: boolean;
     closeError?: Error;
 }
 
@@ -249,6 +251,7 @@ class FakeCandidateChannel implements SetupFrameChannel {
     ) {}
 
     async start(_deadline: Deadline): Promise<{ daemonVer: string }> {
+        if (this.options.startHang) return new Promise(() => {});
         if (this.options.startError) throw this.options.startError;
         return { daemonVer: "fake-candidate/1" };
     }
@@ -324,6 +327,8 @@ export interface FakeProviderOptions {
     connectError?: Error;
     /** Rejected from the channel's `start` for the same boundary. */
     startError?: Error;
+    /** The channel's `start` never settles, exercising the retirement race. */
+    startHang?: boolean;
 }
 
 export interface FakePairedProvider extends ClientTransportProvider {
@@ -348,6 +353,7 @@ export function createFakePairedProvider(options: FakeProviderOptions = {}): Fak
             if (options.connectError) throw options.connectError;
             const channel = new FakeCandidateChannel(host, args.handlers, {
                 startError: options.startError,
+                startHang: options.startHang,
             });
             host.attach(channel);
             return channel;

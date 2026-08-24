@@ -848,7 +848,11 @@ export class SubcClient {
                 host: snapshot.endpoint.host,
                 port: snapshot.endpoint.port,
                 credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
-                channelFactory: sanitizedCandidateFactory(provider, grant.descriptor),
+                channelFactory: sanitizedCandidateFactory(
+                    grant.selected.transport,
+                    provider,
+                    grant.descriptor,
+                ),
                 firstCorrelation: ACTIVATION_CORRELATION,
                 onRetired: (info) => {
                     if (conn) this.onGenerationRetired(conn, info);
