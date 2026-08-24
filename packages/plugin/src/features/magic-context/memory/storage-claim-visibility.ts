@@ -496,3 +496,84 @@ export function filterMemoryIdsByPolicy(
     const rows = readMemoryPolicyRows(db, memoryIds);
     return memoryIds.filter((id) => decideMemoryPolicy(rows.get(id), surface).eligible);
 }
+
+/**
+ * Parse the id list a render recorded in `memory_block_ids`. Returns `null`
+ * when no trustworthy record exists — a NULL column, malformed JSON, or a
+ * non-array shape — which callers must treat as ineligible: "the render
+ * recorded zero ids" (`[]`) replays safely, but "the rendered set is
+ * unknown" cannot prove the cached block holds no policy-hidden content.
+ */
+export function parseRecordedMemoryBlockIds(raw: string | null | undefined): number[] | null {
+    if (raw == null) return null;
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        return Array.isArray(parsed)
+            ? parsed.filter((id): id is number => typeof id === "number")
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Hash twin of `parseRecordedMemoryBlockIds` for `memory_block_hashes`. */
+export function parseRecordedMemoryBlockHashes(raw: string | null | undefined): string[] | null {
+    if (raw == null || raw === "") return null;
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        return Array.isArray(parsed) && parsed.every((value) => typeof value === "string")
+            ? (parsed as string[])
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * A recorded memory block replays only while every rendered id is still
+ * automatic-eligible AND still carries the exact content that was rendered
+ * (SHA-256 of the exact bytes). The ids resolve through each claim's current
+ * revision, so eligibility alone cannot see a rewrite-in-place — and the
+ * normalized hash cannot either, since it lowercases and collapses
+ * whitespace before hashing. A superseded revision's cached bytes must not
+ * regain visibility because a later revision of the same memory id became
+ * eligible. Missing or misaligned hash records fail closed — the rendered
+ * content cannot be proven, so the block recomputes.
+ */
+export function recordedMemoryBlockStillBacked(
+    db: Database,
+    rawIds: string | null | undefined,
+    rawHashes: string | null | undefined,
+): boolean {
+    const ids = parseRecordedMemoryBlockIds(rawIds);
+    if (ids === null) return false;
+    if (ids.length === 0) return true;
+    const hashes = parseRecordedMemoryBlockHashes(rawHashes);
+    if (hashes === null || hashes.length !== ids.length) return false;
+    const rows = readMemoryPolicyRows(db, ids);
+    if (!ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible)) {
+        return false;
+    }
+    const currentHashById = exactMemoryContentDigests(db, ids);
+    return ids.every((id, index) => currentHashById.get(id) === hashes[index]);
+}
+
+/**
+ * A cached memory block replays only while every rendered id is still
+ * automatic-eligible and content-identical: policy transitions and in-place
+ * rewrites must not replay stale content from the process-local injection
+ * cache or the session_meta snapshot. Reads the ids and hashes the render
+ * recorded in `session_meta`.
+ */
+export function sessionMemoryBlockStillEligible(db: Database, sessionId: string): boolean {
+    if (!hasClaimEffectivePolicy(db)) return true;
+    const row = db
+        .prepare(
+            "SELECT memory_block_ids, memory_block_hashes FROM session_meta WHERE session_id = ?",
+        )
+        .get(sessionId) as {
+        memory_block_ids: string | null;
+        memory_block_hashes: string | null;
+    } | null;
+    return recordedMemoryBlockStillBacked(db, row?.memory_block_ids, row?.memory_block_hashes);
+}

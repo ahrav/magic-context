@@ -33,6 +33,7 @@ import {
 	bindMemoriesToCurrentRevision,
 	exactMemoryContentDigests,
 	filterMemoriesByPolicy,
+	sessionMemoryBlockStillEligible,
 } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
 import {
@@ -1717,11 +1718,24 @@ export function materializeM0Pi(
 		// path, so they'd stay frozen at the last legacy value — wrong sidebar
 		// "Injected" count AND a stale ctx_search hide-already-visible filter after
 		// any memory change (e.g. migration delete+reinserts with new ids).
+		// Hashes ride the same record (OpenCode parity): the replay gate in
+		// injectM0M1Pi proves the cached block against current policy AND the
+		// exact rendered bytes, so a rewrite-in-place that keeps the id
+		// eligible cannot replay superseded content.
+		const renderedHashById = new Map(
+			snapshotMemories.map((memory) => [
+				memory.id,
+				sha256Utf8Hex(memory.content),
+			]),
+		);
 		db.prepare(
-			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
+			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ? WHERE session_id = ?",
 		).run(
 			renderedMemoryIds.length,
 			JSON.stringify(renderedMemoryIds),
+			JSON.stringify(
+				renderedMemoryIds.map((id) => renderedHashById.get(id) ?? ""),
+			),
 			state.sessionId,
 		);
 
@@ -1914,27 +1928,52 @@ function renderM1PiWithMetadata(
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
 
 	const memPath = memoryProjectPath(state);
-	const eligibleMemories = filterMemoriesByPolicy(
-		db,
-		memPath
-			? workspace.isWorkspaced
-				? getMemoriesByProjects(
-						db,
-						workspace.expandedIdentities,
-						["active", "permanent"],
-						markers.materializedAt,
-						workspace.ownIdentities,
-						workspace.shareCategories,
-					)
-				: getMemoriesByProject(
-						db,
-						memPath,
-						["active", "permanent"],
-						markers.materializedAt,
-					)
-			: [],
-		"auto_inject",
-	).memories;
+	// Stabilized rebuild: this pool is loaded independently of the M0
+	// snapshot (the non-persisted fallback pair has no phase-3 marker check
+	// downstream), so bind the bytes to their current revisions and require
+	// the memory epoch/workspace fingerprint to hold across the load; fail
+	// closed with an empty pool on exhaustion.
+	const m1StabilityMarker = (): string =>
+		workspace.isWorkspaced
+			? `ws:${computeWorkspaceEpochFingerprint(db, workspace.identities)}`
+			: `ep:${(memPath ? getProjectState(db, memPath) : undefined)?.projectMemoryEpoch ?? 0}`;
+	let eligibleMemories: Memory[] = [];
+	let m1PoolStable = !memPath;
+	for (let attempt = 0; attempt < 2 && !m1PoolStable; attempt += 1) {
+		const markerAtLoad = m1StabilityMarker();
+		eligibleMemories = bindMemoriesToCurrentRevision(
+			db,
+			filterMemoriesByPolicy(
+				db,
+				memPath
+					? workspace.isWorkspaced
+						? getMemoriesByProjects(
+								db,
+								workspace.expandedIdentities,
+								["active", "permanent"],
+								markers.materializedAt,
+								workspace.ownIdentities,
+								workspace.shareCategories,
+							)
+						: getMemoriesByProject(
+								db,
+								memPath,
+								["active", "permanent"],
+								markers.materializedAt,
+							)
+					: [],
+				"auto_inject",
+			).memories,
+		);
+		m1PoolStable = m1StabilityMarker() === markerAtLoad;
+	}
+	if (!m1PoolStable) {
+		logSession(
+			state.sessionId,
+			"pi m1 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+		);
+		eligibleMemories = [];
+	}
 	const eligibleMemoryIds = new Set(
 		eligibleMemories.map((memory) => memory.id),
 	);
@@ -2471,6 +2510,21 @@ export function injectM0M1Pi(
 	// the guarded fallback (TOCTOU).
 	const currentCompartments = getRenderableCompartmentsPi(db, state);
 	let decision = mustMaterializePi(state, db, currentCompartments);
+	// Publication-time policy gate (OpenCode parity): the cache decision
+	// consumed the epoch it read, so a quarantine that never bumps it — or
+	// one landing after the marker read — would replay the recorded block.
+	// The ids and exact digests persisted at materialize time are re-proved
+	// against current policy and current revisions; any mismatch (including
+	// a missing hash record) fails closed into a fresh materialization.
+	if (
+		!decision.value &&
+		!sessionMemoryBlockStillEligible(db, state.sessionId)
+	) {
+		decision = {
+			value: true,
+			reason: "cached memory block no longer policy-backed",
+		};
+	}
 	if (decision.value) {
 		const mismatch = decision.mismatch
 			? ` mismatch=${JSON.stringify(decision.mismatch)}`

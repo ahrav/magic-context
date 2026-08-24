@@ -847,7 +847,12 @@ export async function executeClaimEnforceCommand(
                     // Revalidation only rehashes from this checkout: clones
                     // and worktrees share the project identity, and another
                     // checkout legitimately lacks the same relative path.
-                    enforcedFromRoot: deps.projectRoot,
+                    // CANONICAL real root, not the lexical spelling: the
+                    // revalidation probe selects rows by exact root equality,
+                    // and a symlinked alias would otherwise orphan the
+                    // artifact from every future probe.
+                    enforcedFromRoot:
+                        safeRealpath(resolve(deps.projectRoot)) ?? resolve(deps.projectRoot),
                     evaluator: evaluated.evaluator,
                     evaluatorVersion: evaluated.evaluatorVersion,
                     evaluatorResult: evaluated.result,

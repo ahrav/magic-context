@@ -40,7 +40,12 @@ import {
     refreshRevisionMaturityInCurrentTransaction,
     runInMemoryClaimsWriteTransaction,
 } from "./memory/storage-memory-claims.ts";
-import { isWithin, sha256FileStreaming, sha256FileSync } from "./memory/verification-paths.ts";
+import {
+    isWithin,
+    safeRealpath,
+    sha256FileStreaming,
+    sha256FileSync,
+} from "./memory/verification-paths.ts";
 import {
     readIntMeta,
     readSchemaMeta as readMeta,
@@ -470,11 +475,16 @@ export function revalidateEnforcementArtifacts(
     nowMs = Date.now(),
 ): void {
     if (!hasClaimPolicySchema(db)) return;
+    // Canonicalize the checkout root first: enforcement records the real
+    // root, and probing under a symlinked alias spelling would neither match
+    // the recorded rows nor share the alias's throttle window.
+    const canonicalRoot = safeRealpath(projectRoot);
+    if (canonicalRoot === null) return;
     // The throttle key carries the CHECKOUT root, not just the identity:
     // worktrees and clones share one identity, artifacts are scoped by
     // enforced_from_root, and an identity-only key would let whichever
     // checkout runs first after each interval starve the others' probes.
-    const throttleKey = `${projectIdentity}\u0000${projectRoot}`;
+    const throttleKey = `${projectIdentity}\u0000${canonicalRoot}`;
     const last = artifactRevalidationLastRunMs.get(throttleKey) ?? 0;
     if (nowMs - last < ARTIFACT_REVALIDATION_INTERVAL_MS) return;
     artifactRevalidationLastRunMs.set(throttleKey, nowMs);
@@ -503,6 +513,17 @@ async function revalidateEnforcementArtifactsNow(
         .prepare("SELECT id FROM projects WHERE canonical_identity = ?")
         .get(projectIdentity) as { id: number } | null | undefined;
     if (!projectRow) return;
+    // Resolve the owning root once: per-artifact containment compares live
+    // resolved paths, a legitimately symlinked root must not itself read as
+    // an escape, and the row selection below matches the canonical spelling
+    // (what enforcement records) alongside the lexical one (legacy rows).
+    // An unresolvable root leaves nothing to validate.
+    let rootReal: string;
+    try {
+        rootReal = await realpath(projectRoot);
+    } catch {
+        return;
+    }
     const artifacts = db
         .prepare(
             // Scoped to artifacts THIS checkout enforced: clones and
@@ -517,28 +538,19 @@ async function revalidateEnforcementArtifactsNow(
                JOIN claim_revisions ON claim_revisions.id = artifact.revision_id
               WHERE artifact.project_id = ?
                 AND artifact.evaluator_result = 'pass'
-                AND artifact.enforced_from_root = ?
+                AND artifact.enforced_from_root IN (?, ?)
                 AND NOT EXISTS (
                     SELECT 1 FROM claim_enforcement_artifact_events event
                     WHERE event.artifact_id = artifact.id AND event.action = 'revoked'
                 )`,
         )
-        .all(projectRow.id, projectRoot) as Array<{
+        .all(projectRow.id, projectRoot, rootReal) as Array<{
         id: number;
         revisionId: number;
         canonicalPath: string;
         bytesDigest: string;
         claimId: number;
     }>;
-    // Resolve the owning root once: per-artifact containment compares live
-    // resolved paths, so a legitimately symlinked root must not itself read
-    // as an escape. An unresolvable root leaves nothing to validate.
-    let rootReal: string;
-    try {
-        rootReal = await realpath(projectRoot);
-    } catch {
-        return;
-    }
     for (const artifact of artifacts) {
         // canonical_path is recorded project-relative and traversal-checked
         // at record time; re-guard here so a corrupted row cannot make the

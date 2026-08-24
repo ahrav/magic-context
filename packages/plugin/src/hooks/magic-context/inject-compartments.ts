@@ -16,11 +16,11 @@ import {
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import {
     bindMemoriesToCurrentRevision,
-    decideMemoryPolicy,
     exactMemoryContentDigests,
     filterMemoriesByPolicy,
     hasClaimEffectivePolicy,
-    readMemoryPolicyRows,
+    recordedMemoryBlockStillBacked,
+    sessionMemoryBlockStillEligible,
 } from "../../features/magic-context/memory/storage-claim-visibility";
 import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
 import {
@@ -133,87 +133,6 @@ export function clearInjectionCache(sessionId: string): void {
     // flush), so any in-flight degraded-mode bookkeeping for the OLD boundary is
     // stale. Reset it so the re-anchor countdown restarts against the new state.
     resetDegradedReanchorState(sessionId);
-}
-
-/**
- * Parse the id list a render recorded in `memory_block_ids`. Returns `null`
- * when no trustworthy record exists — a NULL column, malformed JSON, or a
- * non-array shape — which callers must treat as ineligible: "the render
- * recorded zero ids" (`[]`) replays safely, but "the rendered set is
- * unknown" cannot prove the cached block holds no policy-hidden content.
- */
-function parseRecordedMemoryBlockIds(raw: string | null | undefined): number[] | null {
-    if (raw == null) return null;
-    try {
-        const parsed = JSON.parse(raw) as unknown;
-        return Array.isArray(parsed)
-            ? parsed.filter((id): id is number => typeof id === "number")
-            : null;
-    } catch {
-        return null;
-    }
-}
-
-/** Hash twin of `parseRecordedMemoryBlockIds` for `memory_block_hashes`. */
-function parseRecordedMemoryBlockHashes(raw: string | null | undefined): string[] | null {
-    if (raw == null || raw === "") return null;
-    try {
-        const parsed = JSON.parse(raw) as unknown;
-        return Array.isArray(parsed) && parsed.every((value) => typeof value === "string")
-            ? (parsed as string[])
-            : null;
-    } catch {
-        return null;
-    }
-}
-
-/**
- * A recorded memory block replays only while every rendered id is still
- * automatic-eligible AND still carries the exact content that was rendered
- * (SHA-256 of the exact bytes). The ids resolve through each claim's current
- * revision, so eligibility alone cannot see a rewrite-in-place — and the
- * normalized hash cannot either, since it lowercases and collapses
- * whitespace before hashing. A superseded revision's cached bytes must not
- * regain visibility because a later revision of the same memory id became
- * eligible. Missing or misaligned hash records fail closed — the rendered
- * content cannot be proven, so the block recomputes.
- */
-function recordedMemoryBlockStillBacked(
-    db: Database,
-    rawIds: string | null | undefined,
-    rawHashes: string | null | undefined,
-): boolean {
-    const ids = parseRecordedMemoryBlockIds(rawIds);
-    if (ids === null) return false;
-    if (ids.length === 0) return true;
-    const hashes = parseRecordedMemoryBlockHashes(rawHashes);
-    if (hashes === null || hashes.length !== ids.length) return false;
-    const rows = readMemoryPolicyRows(db, ids);
-    if (!ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible)) {
-        return false;
-    }
-    const currentHashById = exactMemoryContentDigests(db, ids);
-    return ids.every((id, index) => currentHashById.get(id) === hashes[index]);
-}
-
-/**
- * A cached memory block replays only while every rendered id is still
- * automatic-eligible and content-identical: policy transitions and in-place
- * rewrites must not replay stale content from the process-local injection
- * cache or the session_meta snapshot. Reads the ids and hashes the render
- * recorded in `session_meta`.
- */
-function sessionMemoryBlockStillEligible(db: Database, sessionId: string): boolean {
-    if (!hasClaimEffectivePolicy(db)) return true;
-    const row = db
-        .prepare(
-            "SELECT memory_block_ids, memory_block_hashes FROM session_meta WHERE session_id = ?",
-        )
-        .get(sessionId) as {
-        memory_block_ids: string | null;
-        memory_block_hashes: string | null;
-    } | null;
-    return recordedMemoryBlockStillBacked(db, row?.memory_block_ids, row?.memory_block_hashes);
 }
 
 // ── Degraded-mode re-anchor (#263/#264) ─────────────────────────
@@ -2864,27 +2783,52 @@ function renderM1WithMetadata(
         workspaceIdentitySet: options.workspaceIdentitySet,
     });
 
-    const eligibleMemories = filterMemoriesByPolicy(
-        options.db,
-        options.projectPath
-            ? workspace.isWorkspaced
-                ? getMemoriesByProjects(
-                      options.db,
-                      workspace.expandedIdentities,
-                      ["active", "permanent"],
-                      markers.materializedAt,
-                      workspace.ownIdentities,
-                      workspace.shareCategories,
-                  )
-                : getMemoriesByProject(
-                      options.db,
-                      options.projectPath,
-                      ["active", "permanent"],
-                      markers.materializedAt,
-                  )
-            : [],
-        "auto_inject",
-    ).memories;
+    // Stabilized rebuild: this pool is loaded independently of the M0
+    // snapshot (the non-persisted fallback pair has no phase-3 marker check
+    // downstream), so bind the bytes to their current revisions and require
+    // the memory epoch/workspace fingerprint to hold across the load; fail
+    // closed with an empty pool on exhaustion.
+    const m1StabilityMarker = (): string =>
+        workspace.isWorkspaced
+            ? `ws:${computeWorkspaceEpochFingerprint(options.db, workspace.identities)}`
+            : `ep:${(options.projectPath ? getProjectState(options.db, options.projectPath) : undefined)?.projectMemoryEpoch ?? 0}`;
+    let eligibleMemories: Memory[] = [];
+    let m1PoolStable = !options.projectPath;
+    for (let attempt = 0; attempt < 2 && !m1PoolStable; attempt += 1) {
+        const markerAtLoad = m1StabilityMarker();
+        eligibleMemories = bindMemoriesToCurrentRevision(
+            options.db,
+            filterMemoriesByPolicy(
+                options.db,
+                options.projectPath
+                    ? workspace.isWorkspaced
+                        ? getMemoriesByProjects(
+                              options.db,
+                              workspace.expandedIdentities,
+                              ["active", "permanent"],
+                              markers.materializedAt,
+                              workspace.ownIdentities,
+                              workspace.shareCategories,
+                          )
+                        : getMemoriesByProject(
+                              options.db,
+                              options.projectPath,
+                              ["active", "permanent"],
+                              markers.materializedAt,
+                          )
+                    : [],
+                "auto_inject",
+            ).memories,
+        );
+        m1PoolStable = m1StabilityMarker() === markerAtLoad;
+    }
+    if (!m1PoolStable) {
+        sessionLog(
+            options.sessionId,
+            "m1 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+        );
+        eligibleMemories = [];
+    }
     const eligibleMemoryIds = new Set(eligibleMemories.map((memory) => memory.id));
     const memoryUpdates = renderMemoryUpdatesBlock({
         db: options.db,

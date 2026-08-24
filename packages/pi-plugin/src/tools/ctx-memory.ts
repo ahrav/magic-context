@@ -813,17 +813,19 @@ export function createCtxMemoryTool(
 						filtered2,
 						"explicit_search",
 					);
-					// Bind loaded bytes to the revision the policy evaluated:
-					// a rewrite between load and policy read must not render
-					// superseded content under the successor's eligibility.
+					// Bind loaded bytes to the revision the policy evaluated,
+					// then REAPPLY the policy on the bound rows: a rewrite
+					// between load and policy read must not render superseded
+					// content, and a quarantine or label transition between
+					// the first policy read and the bind must not publish the
+					// hidden row or the stale label.
+					const recheck = filterMemoriesByPolicy(
+						deps.db,
+						bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories),
+						"explicit_search",
+					);
 					return ok(
-						formatMemoryList(
-							bindMemoriesToCurrentRevision(
-								deps.db,
-								policyFiltered.memories,
-							).slice(0, limit),
-							policyFiltered.labels,
-						),
+						formatMemoryList(recheck.memories.slice(0, limit), recheck.labels),
 					);
 				}
 
@@ -852,19 +854,25 @@ export function createCtxMemoryTool(
 						fetched.filter((memory) => memoryVisibleToTool(memory)),
 						"explicit_search",
 					);
-					// Bind loaded bytes to the revision the policy evaluated:
-					// a held-open writer's rewrite from a hidden revision to
-					// an eligible successor must not render the hidden bytes.
+					// Bind loaded bytes to the revision the policy evaluated,
+					// then REAPPLY the policy on the bound rows: a held-open
+					// writer's rewrite must not render hidden bytes, and a
+					// quarantine or label transition between the first policy
+					// read and the bind must not publish the hidden row or
+					// the stale label.
+					const recheck = filterMemoriesByPolicy(
+						deps.db,
+						bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories),
+						"explicit_search",
+					);
 					const memoriesById = new Map<number, Memory>(
-						bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories).map(
-							(memory) => [memory.id, memory],
-						),
+						recheck.memories.map((memory) => [memory.id, memory]),
 					);
 					return ok(
 						formatGetOutput({
 							requestedIds: uniqueIds,
 							memoriesById,
-							policyLabels: policyFiltered.labels,
+							policyLabels: recheck.labels,
 						}),
 					);
 				}
