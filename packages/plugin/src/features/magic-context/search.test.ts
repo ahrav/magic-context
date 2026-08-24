@@ -2443,7 +2443,7 @@ describe("resolveMemoriesByIdsForSearch (R35)", () => {
         expect(memoryReads[0].sql).toContain(
             "CROSS JOIN memories ON memories.id = requested.value",
         );
-        expect(memoryReads[1].sql).toContain("WHERE id IN");
+        expect(memoryReads[1].sql).toContain("WHERE m.id IN");
         expect(counter.matching(/FROM memories\s+WHERE project_path/).length).toBe(0);
     });
 });

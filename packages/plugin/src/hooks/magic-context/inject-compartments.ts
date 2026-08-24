@@ -3312,27 +3312,46 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     // Use the SAME frozen cutoff for the baseline memory read as m[1] does, so a
     // memory crossing expires_at between two fallback passes can't shift the m[0]
     // baseline bytes either (live Date.now() default would reintroduce drift).
-    const memories = filterMemoriesByPolicy(
-        options.db,
-        projectPath
-            ? workspace.isWorkspaced
-                ? getMemoriesByProjects(
-                      options.db,
-                      workspace.expandedIdentities,
-                      ["active", "permanent"],
-                      snapshotMarkers.materializedAt,
-                      workspace.ownIdentities,
-                      workspace.shareCategories,
-                  )
-                : getMemoriesByProject(
-                      options.db,
-                      projectPath,
-                      ["active", "permanent"],
-                      snapshotMarkers.materializedAt,
-                  )
-            : [],
-        "auto_inject",
-    ).memories;
+    // Same stabilized rebuild discipline as the legacy block path: load,
+    // policy-filter, exact-bind, and verify the epoch did not move — the
+    // fallback publishes without a persisted snapshot, so this loop is the
+    // only thing standing between a mid-build rewrite/quarantine and the
+    // current prompt. On exhaustion, fail closed with an empty pool.
+    let memories: Memory[] = [];
+    let fallbackPoolStable = !projectPath;
+    for (let attempt = 0; attempt < 2 && projectPath && !fallbackPoolStable; attempt += 1) {
+        const epochAtLoad = getProjectMemoryEpoch(options.db, projectPath);
+        memories = bindMemoriesToCurrentRevision(
+            options.db,
+            filterMemoriesByPolicy(
+                options.db,
+                workspace.isWorkspaced
+                    ? getMemoriesByProjects(
+                          options.db,
+                          workspace.expandedIdentities,
+                          ["active", "permanent"],
+                          snapshotMarkers.materializedAt,
+                          workspace.ownIdentities,
+                          workspace.shareCategories,
+                      )
+                    : getMemoriesByProject(
+                          options.db,
+                          projectPath,
+                          ["active", "permanent"],
+                          snapshotMarkers.materializedAt,
+                      ),
+                "auto_inject",
+            ).memories,
+        );
+        fallbackPoolStable = getProjectMemoryEpoch(options.db, projectPath) === epochAtLoad;
+    }
+    if (!fallbackPoolStable) {
+        sessionLog(
+            options.sessionId,
+            "fallback m0 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+        );
+        memories = [];
+    }
     const userMemories = safeGetActiveUserMemories(options.db);
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const memoryRenderOptions: MemoryRenderOptions = {

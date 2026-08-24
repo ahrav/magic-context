@@ -332,13 +332,20 @@ export function bindMemoriesToCurrentRevision(db: Database, memories: readonly M
     return memories.filter((memory) => digests.get(memory.id) === sha256Utf8Hex(memory.content));
 }
 
-/** Exact SHA-256 content digests for a bounded id set (replay-gate oracle). */
+/** Exact SHA-256 content digests for a bounded id set (replay-gate oracle).
+ *  For a claim-linked memory the oracle is the CLAIM's current revision
+ *  digest, not a rehash of the memory row: policy decisions evaluate the
+ *  claim's current revision, and a shared deduplicated claim is explicitly
+ *  allowed to diverge from an untouched sibling projection — rehashing the
+ *  sibling's own row would compare its bytes with themselves and always
+ *  pass. Unlinked rows fall back to the row's own content hash. */
 export function exactMemoryContentDigests(
     db: Database,
     memoryIds: readonly number[],
 ): Map<number, string> {
     const out = new Map<number, string>();
     if (memoryIds.length === 0) return out;
+    const linked = hasClaimEffectivePolicy(db);
     // Full module snapshots legitimately carry arbitrarily many rows; one
     // placeholder per id would exceed the adapter's bound-parameter limit.
     // Same 400-id pages as readMemoryPolicyRows.
@@ -348,12 +355,28 @@ export function exactMemoryContentDigests(
         const placeholders = chunk.map(() => "?").join(", ");
         const rows = db
             .prepare(
-                // Interpolation is a compile-time placeholder list, not caller input.
-                // pi-lens-ignore: sql-injection
-                `SELECT id, content FROM memories WHERE id IN (${placeholders})`,
+                linked
+                    ? // Interpolation is a compile-time placeholder list, not caller input.
+                      // pi-lens-ignore: sql-injection
+                      `SELECT m.id AS id, m.content AS content,
+                              revision.content_sha256 AS revisionDigest
+                         FROM memories m
+                         LEFT JOIN legacy_memory_claims lmc ON lmc.memory_id = m.id
+                         LEFT JOIN claims ON claims.id = lmc.claim_id
+                         LEFT JOIN claim_revisions revision
+                             ON revision.id = claims.current_revision_id
+                        WHERE m.id IN (${placeholders})`
+                    : // pi-lens-ignore: sql-injection
+                      `SELECT id, content, NULL AS revisionDigest FROM memories WHERE id IN (${placeholders})`,
             )
-            .all(...chunk) as Array<{ id: number; content: string }>;
-        for (const row of rows) out.set(row.id, sha256Utf8Hex(row.content));
+            .all(...chunk) as Array<{
+            id: number;
+            content: string;
+            revisionDigest: string | null;
+        }>;
+        for (const row of rows) {
+            out.set(row.id, row.revisionDigest ?? sha256Utf8Hex(row.content));
+        }
     }
     return out;
 }
