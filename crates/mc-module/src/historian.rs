@@ -1449,27 +1449,19 @@ where
     producer.bind_session(&producer_session_id).await?;
     let state = match producer.status(&producer_run_id).await {
         Ok(state) => state,
-        // A protocol violation means the status answer cannot be trusted,
-        // not that the run is gone: abandoning here would authorize a
-        // refire while the original run may still be active. Propagate and
-        // leave the durable awaiting state for the next reattach.
-        Err(err @ HistorianProducerError::Protocol(_)) => {
+        // Every status failure is inconclusive about the run — transport
+        // timeouts, EOF, and protocol violations alike — and the original
+        // run may still be active. Abandoning here would authorize a second
+        // billable firing; propagate instead and keep the durable awaiting
+        // state so a later reattach can ask again. Only an explicit
+        // `missing` answer below authorizes a refire.
+        Err(err) => {
             let close_result = producer.close().await;
             return Err(HistorianDriveError::Producer(attach_cleanup(
                 err,
                 close_result,
                 "close",
             )));
-        }
-        Err(_) => {
-            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
-                request.now_ms,
-                request.failure_backoff_at_ms,
-                (request.completion_now_ms)(),
-            );
-            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
-            log_cleanup_failure(request.session_id, "close", &producer.close().await);
-            return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
     };
 
@@ -1489,7 +1481,15 @@ where
 
     let loaded = request.store.load(request.session_id)?;
     let awaiting = loaded.meta.historian.clone();
-    let output = match producer.await_output(&producer_run_id).await {
+    // The initial firing path covers the gap between the producer's await
+    // window and Broca's longer run allowance with a recovery re-drain;
+    // reattachment gets the same grace so a run completing inside that gap
+    // is not cancelled and discarded.
+    let awaited = match producer.await_output(&producer_run_id).await {
+        Err(HistorianProducerError::TimedOut) => producer.redrain_output(&producer_run_id).await,
+        other => other,
+    };
+    let output = match awaited {
         Ok(output) => output,
         Err(err) => {
             let cancel_result = producer.cancel(&producer_run_id).await;

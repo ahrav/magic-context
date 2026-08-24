@@ -485,18 +485,20 @@ async fn retained_declaration_raises_the_resident_floor_exactly() {
     host.shutdown().await.expect("graceful shutdown");
 }
 
-/// The 320 MiB default absorbs the Broca declaration: it is the former
-/// 256 MiB default plus exactly the 64 MiB retained reservation, so ingress
-/// headroom is preserved, and the default-limit three-component host starts.
+/// The default resident cap absorbs the whole Broca declaration: it is the
+/// former two-component 256 MiB default plus exactly the declared retained
+/// reservation (the 64 MiB supervisor budget plus the route-map and
+/// backend-capture headroom), so ingress headroom is preserved, and the
+/// default-limit three-component host starts.
 #[tokio::test]
 async fn the_default_resident_cap_absorbs_the_broca_reservation() {
-    const RETAINED: u64 = 64 * 1024 * 1024;
+    const RETAINED: u64 =
+        64 * 1024 * 1024 + 1024 * (4096 + 256 + 128) + 8 * (4 * 1024 * 1024 + 64 * 1024) * 3;
     let defaults = HostLimits::default();
-    assert_eq!(defaults.max_resident_bytes, 320 * 1024 * 1024);
     assert_eq!(
         defaults.max_resident_bytes - RETAINED,
         256 * 1024 * 1024,
-        "the default grew by exactly the retained reservation"
+        "the default grew by exactly the declared retained reservation"
     );
 
     let host = CompositeTestHost::start(

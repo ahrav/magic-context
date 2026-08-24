@@ -57,6 +57,14 @@ pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = 1024 * (4096 + 256 + 128);
 pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 =
     (MAX_BACKEND_PROCESSES as u64) * (4 * 1024 * 1024 + 64 * 1024) * 3;
 
+/// The complete retained-byte reservation the component declares to the
+/// host: the supervisor's enforced budget plus the two retention classes
+/// that live outside it. The host subtracts this whole amount from ingress,
+/// so anything sizing ingress headroom around Broca must use this sum, not
+/// [`MAX_RETAINED_BYTES`] alone.
+pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 =
+    MAX_RETAINED_BYTES + ROUTE_IDENTITY_HEADROOM_BYTES + BACKEND_CAPTURE_HEADROOM_BYTES;
+
 /// Most sessions retained in a terminal or deletion-tombstone state (R12);
 /// beyond it the oldest eligible entry is evicted.
 pub const MAX_TERMINAL_SESSIONS: usize = 256;

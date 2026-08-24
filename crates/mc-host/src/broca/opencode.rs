@@ -210,7 +210,9 @@ async fn run_opencode(
 }
 
 /// Parses the closed `opencode run --format json` vocabulary (R18):
-/// `step_start`, `tool_use`, `text`, `step_finish`, and `error`. Anything
+/// `step_start`, `text`, `step_finish`, and `error`. A `tool_use` event is
+/// recognized but rejected — this path is a zero-tool transform, so a tool
+/// invocation is a contract failure, not lifecycle metadata. Anything
 /// else — malformed JSON, non-UTF-8, unknown types, unknown finish reasons,
 /// contradictory terminals, or a missing terminal — is rejected with a
 /// structural detail that never quotes the line (R19).
@@ -234,7 +236,15 @@ fn parse_opencode_transcript(
             return Err(format!("missing event type at line {line_no}"));
         };
         match event_type {
-            "step_start" | "tool_use" => {}
+            "step_start" => {}
+            // Broca advertises this path as a zero-tool prompt-to-text
+            // transform: a tool invocation means the run executed something
+            // the contract forbids, so its text must not be published.
+            "tool_use" => {
+                return Err(format!(
+                    "tool_use event in a tool-less run at line {line_no}"
+                ));
+            }
             "text" => {
                 // A completed or failed run cannot grow its answer: content
                 // after the terminal is transcript corruption, and appending

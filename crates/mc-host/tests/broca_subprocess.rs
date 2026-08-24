@@ -1612,6 +1612,21 @@ fn malformed_outputs_one_bounded_failure() {
     let (terminal, _) = run_opencode_transcript(&lines);
     assert_bounded(&terminal, "text event after the terminal at line 4");
 
+    // A tool invocation in a zero-tool run is a contract failure, not
+    // lifecycle metadata.
+    let mut lines = opencode_success_lines("ok");
+    lines.insert(
+        1,
+        serde_json::json!({
+            "type": "tool_use",
+            "timestamp": 2,
+            "sessionID": "ses_x",
+            "part": {"type": "tool-use", "name": "read"},
+        }),
+    );
+    let (terminal, _) = run_opencode_transcript(&lines);
+    assert_bounded(&terminal, "tool_use event in a tool-less run at line 2");
+
     // Unknown event types fail closed (risk table: JSON vocabulary drift).
     let (terminal, _) = run_pi_transcript(&[serde_json::json!({"type": "wire_novelty"})]);
     assert_bounded(&terminal, "unknown event type at line 1");

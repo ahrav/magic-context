@@ -112,10 +112,13 @@ impl Default for HostLimits {
             max_pending_requests: 1024,
             max_handler_tasks: 256,
             // 256 MiB served the two-component profile; the third (Broca)
-            // component declares 64 MiB of retained replay that the runtime
-            // subtracts from ingress, so the default grows by exactly that
-            // reservation to preserve the former ingress headroom.
-            max_resident_bytes: 320 * 1024 * 1024,
+            // component's declared retained reservation is subtracted from
+            // ingress by the runtime, so the default grows by exactly that
+            // whole declaration — supervisor budget plus route-map and
+            // backend-capture headroom — to preserve the former ingress
+            // headroom.
+            max_resident_bytes: 256 * 1024 * 1024
+                + crate::broca::config::DECLARED_RETAINED_RESIDENT_BYTES,
             writer_queue_frames: 64,
         }
     }
