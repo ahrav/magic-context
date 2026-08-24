@@ -1,5 +1,4 @@
 import type { Database } from "../../../shared/sqlite";
-import { getMemoriesByProject } from "../memory";
 import { getMemoryCategoryOrder } from "../memory/constants";
 import type { Memory } from "../memory/types";
 import { DEFAULT_MURAL_MEMORY_BUDGET, muralOverflowMemories } from "./mural-selection";
@@ -34,11 +33,12 @@ export interface MuralCoverage {
 /**
  * The memory pool a mural is built from.
  *
- * Callers that inject the mural into model context MUST pass a pool already
- * filtered by the automatic-surface policy gate (see `ensureMuralRendered`):
- * the mural is folded into m[0] as an image, so it is an automatic injection
- * channel and may not carry policy-hidden content. This module stays a
- * memories-only reader and never derives policy itself.
+ * Callers MUST pass a pool already filtered by the automatic-surface policy
+ * gate (see `ensureMuralRendered`): the mural is folded into m[0] as an
+ * image, so it is an automatic injection channel and may not carry
+ * policy-hidden content. The parameter is required — no unfiltered fallback
+ * read exists — so a new caller cannot silently bypass the gate. This module
+ * stays a memories-only reader and never derives policy itself.
  */
 export type MuralMemoryPool = readonly Memory[];
 
@@ -47,9 +47,9 @@ export type MuralMemoryPool = readonly Memory[];
 export function getMuralCoverage(
     db: Database,
     projectIdentity: string,
-    pool?: MuralMemoryPool,
+    pool: MuralMemoryPool,
 ): MuralCoverage {
-    const memories = pool ?? getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+    const memories = pool;
     const cueState = getMuralCueState(
         db,
         memories.map((memory) => memory.id),
@@ -89,9 +89,9 @@ export function resolveMural(
     db: Database,
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
-    pool?: MuralMemoryPool,
+    pool: MuralMemoryPool,
 ): ResolvedMuralEntry[] {
-    const memories = pool ?? getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+    const memories = pool;
     const overflow = muralOverflowMemories(memories, budgetTokens);
     if (overflow.length === 0) return [];
 

@@ -42,6 +42,19 @@ export const CLAIM_KINDS = ["descriptive", "directive", "unknown"] as const;
 export type ClaimKind = (typeof CLAIM_KINDS)[number];
 
 /** Fine observation-level taint classes (R3). */
+/** The BEFORE UPDATE / BEFORE DELETE append-only guard pair every v86
+ * ledger table carries. One template so the seven copies cannot drift on a
+ * future edit; each table's insert-collision trigger stays written out
+ * individually because its WHEN clause differs by key shape. */
+function appendOnlyTriggers(triggerPrefix: string, table: string): string {
+    return `    CREATE TRIGGER ${triggerPrefix}_append_only_update
+    BEFORE UPDATE ON ${table}
+    BEGIN SELECT RAISE(ABORT, '${table} is append-only: updates are not allowed'); END;
+    CREATE TRIGGER ${triggerPrefix}_append_only_delete
+    BEFORE DELETE ON ${table}
+    BEGIN SELECT RAISE(ABORT, '${table} is append-only: deletes are not allowed'); END;`;
+}
+
 export const FINE_TAINTS = [
     "USER_EXPLICIT",
     "USER_INFERRED",
@@ -331,12 +344,7 @@ export function createClaimPolicySchema(db: Database): void {
     // Interpolation is a compile-time const allowlist, not caller input.
     // pi-lens-ignore: sql-injection
     db.exec(`
-    CREATE TRIGGER claim_policy_subjects_append_only_update
-    BEFORE UPDATE ON claim_revision_policy_subjects
-    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects is append-only: updates are not allowed'); END;
-    CREATE TRIGGER claim_policy_subjects_append_only_delete
-    BEFORE DELETE ON claim_revision_policy_subjects
-    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects is append-only: deletes are not allowed'); END;
+${appendOnlyTriggers("claim_policy_subjects", "claim_revision_policy_subjects")}
     CREATE TRIGGER claim_policy_subjects_append_only_insert_collision
     BEFORE INSERT ON claim_revision_policy_subjects
     WHEN EXISTS (SELECT 1 FROM claim_revision_policy_subjects WHERE revision_id = NEW.revision_id)
@@ -366,23 +374,29 @@ export function createClaimPolicySchema(db: Database): void {
     -- the origin, and merged lineage ('merged_from') is provenance of a
     -- different observation, not evidence supporting this revision — an
     -- importer or merge path must not freeze a merged observation's taint
-    -- as the revision origin.
+    -- as the revision origin. The second branch couples the ABSENCE of a
+    -- named origin to inference taints for live writes: with no observation
+    -- to back it, a higher trust class would freeze an unbacked taint
+    -- forever. Legacy-seed subjects (classification method ':seed') are
+    -- exempt — the pre-v86 corpus legitimately elevates boundary-gated
+    -- metadata provenance whose observations were never linked as evidence.
     CREATE TRIGGER claim_policy_subjects_origin_guard
     BEFORE INSERT ON claim_revision_policy_subjects
-    WHEN NEW.origin_observation_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM claim_evidence
-        WHERE revision_id = NEW.revision_id
-          AND observation_id = NEW.origin_observation_id
-          AND relation = 'supports'
+    WHEN (
+        NEW.origin_observation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM claim_evidence
+            WHERE revision_id = NEW.revision_id
+              AND observation_id = NEW.origin_observation_id
+              AND relation = 'supports'
+        )
+    ) OR (
+        NEW.origin_observation_id IS NULL
+        AND NEW.classification_method NOT LIKE '%:seed'
+        AND NEW.origin_taint NOT IN ('ASSISTANT_INFERENCE', 'DREAMER_INFERENCE')
     )
-    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be supporting evidence for the same revision'); END;
+    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be supporting evidence for the same revision, and a live write without a named origin only carries an inference taint'); END;
 
-    CREATE TRIGGER claim_maturity_streams_append_only_update
-    BEFORE UPDATE ON claim_maturity_streams
-    BEGIN SELECT RAISE(ABORT, 'claim_maturity_streams is append-only: updates are not allowed'); END;
-    CREATE TRIGGER claim_maturity_streams_append_only_delete
-    BEFORE DELETE ON claim_maturity_streams
-    BEGIN SELECT RAISE(ABORT, 'claim_maturity_streams is append-only: deletes are not allowed'); END;
+${appendOnlyTriggers("claim_maturity_streams", "claim_maturity_streams")}
     CREATE TRIGGER claim_maturity_streams_append_only_insert_collision
     BEFORE INSERT ON claim_maturity_streams
     WHEN EXISTS (
@@ -408,12 +422,7 @@ export function createClaimPolicySchema(db: Database): void {
     )
     BEGIN SELECT RAISE(ABORT, 'claim_maturity_streams require an existing policy subject for the revision'); END;
 
-    CREATE TRIGGER claim_maturity_assertions_append_only_update
-    BEFORE UPDATE ON claim_maturity_assertions
-    BEGIN SELECT RAISE(ABORT, 'claim_maturity_assertions is append-only: updates are not allowed'); END;
-    CREATE TRIGGER claim_maturity_assertions_append_only_delete
-    BEFORE DELETE ON claim_maturity_assertions
-    BEGIN SELECT RAISE(ABORT, 'claim_maturity_assertions is append-only: deletes are not allowed'); END;
+${appendOnlyTriggers("claim_maturity_assertions", "claim_maturity_assertions")}
     CREATE TRIGGER claim_maturity_assertions_append_only_insert_collision
     BEFORE INSERT ON claim_maturity_assertions
     WHEN EXISTS (
@@ -477,12 +486,7 @@ export function createClaimPolicySchema(db: Database): void {
     )
     BEGIN SELECT RAISE(ABORT, 'maturity assertion artifact must be a passing artifact for the same revision'); END;
 
-    CREATE TRIGGER claim_disposition_events_append_only_update
-    BEFORE UPDATE ON claim_disposition_events
-    BEGIN SELECT RAISE(ABORT, 'claim_disposition_events is append-only: updates are not allowed'); END;
-    CREATE TRIGGER claim_disposition_events_append_only_delete
-    BEFORE DELETE ON claim_disposition_events
-    BEGIN SELECT RAISE(ABORT, 'claim_disposition_events is append-only: deletes are not allowed'); END;
+${appendOnlyTriggers("claim_disposition_events", "claim_disposition_events")}
     CREATE TRIGGER claim_disposition_events_append_only_insert_collision
     BEFORE INSERT ON claim_disposition_events
     WHEN EXISTS (SELECT 1 FROM claim_disposition_events WHERE id = NEW.id)
@@ -507,12 +511,7 @@ export function createClaimPolicySchema(db: Database): void {
     ), 'clear') = 'clear'
     BEGIN SELECT RAISE(ABORT, 'claim_disposition_events clear requires a currently asserted disposition'); END;
 
-    CREATE TRIGGER claim_approval_actions_append_only_update
-    BEFORE UPDATE ON claim_approval_actions
-    BEGIN SELECT RAISE(ABORT, 'claim_approval_actions is append-only: updates are not allowed'); END;
-    CREATE TRIGGER claim_approval_actions_append_only_delete
-    BEFORE DELETE ON claim_approval_actions
-    BEGIN SELECT RAISE(ABORT, 'claim_approval_actions is append-only: deletes are not allowed'); END;
+${appendOnlyTriggers("claim_approval_actions", "claim_approval_actions")}
     CREATE TRIGGER claim_approval_actions_append_only_insert_collision
     BEFORE INSERT ON claim_approval_actions
     WHEN EXISTS (
@@ -548,12 +547,7 @@ export function createClaimPolicySchema(db: Database): void {
     ), 'revoke') = 'revoke'
     BEGIN SELECT RAISE(ABORT, 'claim_approval_actions revoke requires a currently effective approval'); END;
 
-    CREATE TRIGGER claim_enforcement_artifacts_append_only_update
-    BEFORE UPDATE ON claim_enforcement_artifacts
-    BEGIN SELECT RAISE(ABORT, 'claim_enforcement_artifacts is append-only: updates are not allowed'); END;
-    CREATE TRIGGER claim_enforcement_artifacts_append_only_delete
-    BEFORE DELETE ON claim_enforcement_artifacts
-    BEGIN SELECT RAISE(ABORT, 'claim_enforcement_artifacts is append-only: deletes are not allowed'); END;
+${appendOnlyTriggers("claim_enforcement_artifacts", "claim_enforcement_artifacts")}
     CREATE TRIGGER claim_enforcement_artifacts_append_only_insert_collision
     BEFORE INSERT ON claim_enforcement_artifacts
     WHEN EXISTS (SELECT 1 FROM claim_enforcement_artifacts WHERE id = NEW.id)
@@ -594,12 +588,7 @@ export function createClaimPolicySchema(db: Database): void {
     ), 'revoke') <> 'approve'
     BEGIN SELECT RAISE(ABORT, 'claim_enforcement_artifacts require a currently effective approval for the revision'); END;
 
-    CREATE TRIGGER claim_artifact_events_append_only_update
-    BEFORE UPDATE ON claim_enforcement_artifact_events
-    BEGIN SELECT RAISE(ABORT, 'claim_enforcement_artifact_events is append-only: updates are not allowed'); END;
-    CREATE TRIGGER claim_artifact_events_append_only_delete
-    BEFORE DELETE ON claim_enforcement_artifact_events
-    BEGIN SELECT RAISE(ABORT, 'claim_enforcement_artifact_events is append-only: deletes are not allowed'); END;
+${appendOnlyTriggers("claim_artifact_events", "claim_enforcement_artifact_events")}
     CREATE TRIGGER claim_artifact_events_append_only_insert_collision
     BEFORE INSERT ON claim_enforcement_artifact_events
     WHEN EXISTS (SELECT 1 FROM claim_enforcement_artifact_events WHERE id = NEW.id)

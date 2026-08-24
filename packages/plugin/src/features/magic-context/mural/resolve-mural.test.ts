@@ -115,6 +115,10 @@ describe("resolveMural", () => {
             const memory = seedCuedMemory(db, project, "ARCHITECTURE", content, 73);
             expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(content);
 
+            // The pool is policy-filtered by the CALLER (that read touches
+            // claim tables by design); the assertion below is that the mural
+            // resolver itself stays a memories-only reader.
+            const pool = muralPool(db, project);
             const statements: string[] = [];
             const originalPrepare = db.prepare.bind(db);
             db.prepare = ((sql: string) => {
@@ -123,7 +127,7 @@ describe("resolveMural", () => {
             }) as typeof db.prepare;
             let entries: ReturnType<typeof resolveMural>;
             try {
-                entries = resolveMural(db, project, 1);
+                entries = resolveMural(db, project, 1, pool);
             } finally {
                 db.prepare = originalPrepare;
             }
@@ -168,7 +172,7 @@ describe("resolveMural", () => {
                 );
                 ids.push(m.id);
             }
-            const entries = resolveMural(db, project, 200);
+            const entries = resolveMural(db, project, 200, muralPool(db, project));
             // Some memories fit the 200-token budget (excluded from the mural),
             // the rest overflow (included). So the mural is a strict subset.
             expect(entries.length).toBeGreaterThan(0);
@@ -207,7 +211,7 @@ describe("resolveMural", () => {
                 computeCueContentHash("OLD content"),
             );
 
-            const entries = resolveMural(db, project, 1);
+            const entries = resolveMural(db, project, 1, muralPool(db, project));
             const idsOut = entries.map((entry) => entry.id);
             expect(idsOut).toContain(cued.id);
             expect(idsOut).not.toContain(unCued.id);
@@ -227,7 +231,7 @@ describe("resolveMural", () => {
             const archHigh = seedCuedMemory(db, project, "ARCHITECTURE", "arch high imp", 90);
             const naming = seedCuedMemory(db, project, "NAMING", "naming fact", 90);
 
-            const entries = resolveMural(db, project, 1);
+            const entries = resolveMural(db, project, 1, muralPool(db, project));
             const order = entries.map((entry) => entry.id);
             // ARCHITECTURE band first (high before low), then NAMING band.
             expect(order.indexOf(archHigh.id)).toBeLessThan(order.indexOf(archLow.id));
@@ -236,7 +240,9 @@ describe("resolveMural", () => {
             // Append-stability: inserting a NEW same-band, same-importance memory
             // (a higher id) must land AFTER the existing one, never reshuffle it.
             const archHigh2 = seedCuedMemory(db, project, "ARCHITECTURE", "arch high 2", 90);
-            const after = resolveMural(db, project, 1).map((entry) => entry.id);
+            const after = resolveMural(db, project, 1, muralPool(db, project)).map(
+                (entry) => entry.id,
+            );
             expect(after.indexOf(archHigh.id)).toBeLessThan(after.indexOf(archHigh2.id));
             // The pre-existing relative order (archHigh before archLow) is intact.
             expect(after.indexOf(archHigh.id)).toBeLessThan(after.indexOf(archLow.id));

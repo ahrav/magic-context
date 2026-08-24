@@ -3559,6 +3559,41 @@ export const MIGRATIONS: Migration[] = [
             ensureColumn(db, "claim_enforcement_artifacts", "enforced_from_root", "TEXT");
         },
     },
+    {
+        version: 89,
+        description:
+            "claim trust policy: a live policy subject without a named origin only carries an inference taint (seed writes exempt)",
+        up(db: Database): void {
+            // The v87 guard validated only NAMED origins; with
+            // origin_observation_id NULL any taint — including USER_EXPLICIT
+            // — could be frozen with nothing backing it. Recreate the
+            // trigger (same name, so the v86 replay guard's object inventory
+            // is unchanged) with a second branch coupling a NULL origin to
+            // inference taints for live writes. Legacy-seed subjects
+            // (classification method ':seed') are exempt: the pre-v86 corpus
+            // legitimately elevates boundary-gated metadata provenance whose
+            // observations were never linked as evidence.
+            if (!tableExists(db, "claim_revision_policy_subjects")) return;
+            db.exec(`
+    DROP TRIGGER IF EXISTS claim_policy_subjects_origin_guard;
+    CREATE TRIGGER claim_policy_subjects_origin_guard
+    BEFORE INSERT ON claim_revision_policy_subjects
+    WHEN (
+        NEW.origin_observation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM claim_evidence
+            WHERE revision_id = NEW.revision_id
+              AND observation_id = NEW.origin_observation_id
+              AND relation = 'supports'
+        )
+    ) OR (
+        NEW.origin_observation_id IS NULL
+        AND NEW.classification_method NOT LIKE '%:seed'
+        AND NEW.origin_taint NOT IN ('ASSISTANT_INFERENCE', 'DREAMER_INFERENCE')
+    )
+    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be supporting evidence for the same revision, and a live write without a named origin only carries an inference taint'); END;
+            `);
+        },
+    },
 ];
 
 /**

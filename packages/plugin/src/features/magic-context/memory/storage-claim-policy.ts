@@ -599,9 +599,12 @@ export function readPolicySupport(db: Database, revisionId: number): PolicySuppo
 export function computePolicyDecisionForRevision(
     db: Database,
     revisionId: number,
-    precomputed: { support?: PolicySupport } = {},
+    precomputed: { support?: PolicySupport; subject?: PolicySubjectRow | null } = {},
 ): PolicyDecision {
-    const subject = readPolicySubject(db, revisionId);
+    // `undefined` means "not precomputed"; an explicit null is the known
+    // absence of a subject and must not trigger a re-read.
+    const subject =
+        precomputed.subject === undefined ? readPolicySubject(db, revisionId) : precomputed.subject;
     return evaluateClaimPolicy({
         subject: {
             present: subject != null,
@@ -707,8 +710,13 @@ export function refreshEffectivePolicyInCurrentTransaction(
 ): PolicyDecision {
     const identity = readRevisionIdentity(db, revisionId);
     if (!identity) throw new Error(`claim revision ${revisionId} does not exist`);
+    // Read the subject once and share it with the decision computation and
+    // the projection guard below; this runs on the per-write hot path and
+    // every corpus-wide backfill pass.
+    const subject = readPolicySubject(db, revisionId);
     const decision = computePolicyDecisionForRevision(db, revisionId, {
         support: options.support,
+        subject,
     });
     // A revision without a frozen subject stays absent from the projection:
     // absence is the fail-closed contract, and writing a row would need a
@@ -718,10 +726,7 @@ export function refreshEffectivePolicyInCurrentTransaction(
     // fabricated taint over the row, erasing the very signal
     // (`policy_version > CLAIM_POLICY_VERSION`) readers use to treat it as
     // unknown. Keep the newer build's row untouched.
-    if (
-        readPolicySubject(db, revisionId) == null ||
-        decision.reasonCodes.includes("policy_version_unsupported")
-    ) {
+    if (subject == null || decision.reasonCodes.includes("policy_version_unsupported")) {
         return decision;
     }
     updateEffectivePolicyProjectionInCurrentTransaction(

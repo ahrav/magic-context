@@ -12,8 +12,7 @@
  * automatic visibility.
  */
 
-import { createHash } from "node:crypto";
-import { createReadStream, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, sep } from "node:path";
 import { log } from "../../shared/logger";
@@ -41,7 +40,12 @@ import {
     refreshRevisionMaturityInCurrentTransaction,
     runInMemoryClaimsWriteTransaction,
 } from "./memory/storage-memory-claims.ts";
-import { readSchemaMeta as readMeta, writeSchemaMeta as writeMeta } from "./schema-meta.ts";
+import { isWithin, sha256FileStreaming, sha256FileSync } from "./memory/verification-paths.ts";
+import {
+    readIntMeta,
+    readSchemaMeta as readMeta,
+    writeSchemaMeta as writeMeta,
+} from "./schema-meta.ts";
 import type { SourceTrustClass } from "./storage-claim-applicability-schema.ts";
 import {
     CLAIM_POLICY_SEED_META_KEYS,
@@ -110,14 +114,6 @@ interface SeedRevisionRow {
     sourceTrustClass: SourceTrustClass | null;
     extractor: string | null;
     metadataSourceType: string | null;
-}
-
-/** Validated non-negative integer meta read (the sibling backfill's shape):
- *  a corrupted value reads as 0 instead of NaN, which would make every
- *  comparison silently false. */
-function readIntMeta(db: Database, key: string): number {
-    const parsed = Number.parseInt(readMeta(db, key) ?? "0", 10);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
 }
 
 function seedTaint(row: SeedRevisionRow, boundaryRevisionId: number): FineTaint {
@@ -394,7 +390,8 @@ function seedRevisionInCurrentTransaction(
         classificationMethod: `${TAINT_CLASSIFIER_METHOD}:seed`,
         nowMs,
     });
-    const maturity = seedMaturity(readPolicySupport(db, row.revisionId), taint);
+    const support = readPolicySupport(db, row.revisionId);
+    const maturity = seedMaturity(support, taint);
     appendMaturityAssertionInCurrentTransaction(db, {
         revisionId: row.revisionId,
         projectId: row.projectId,
@@ -403,7 +400,14 @@ function seedRevisionInCurrentTransaction(
         evidenceJson: null,
         nowMs,
     });
-    const decision = refreshEffectivePolicyInCurrentTransaction(db, row.revisionId, { nowMs });
+    // Reuse the support facts read above instead of a second multi-query
+    // read per revision: inside this transaction the only fact the assertion
+    // just changed is the maturity head — an unseeded revision has no prior
+    // stream, so the head IS the maturity appended here.
+    const decision = refreshEffectivePolicyInCurrentTransaction(db, row.revisionId, {
+        nowMs,
+        support: { ...support, historicalMaturity: maturity },
+    });
     return { maturity, autoEligible: decision.surfaces.auto_inject.eligible };
 }
 
@@ -488,17 +492,6 @@ export function revalidateEnforcementArtifacts(
     );
 }
 
-/** Streamed SHA-256: read and hash yield per chunk, so hashing a large
- *  artifact never pins the event loop the way a whole-buffer
- *  createHash().update() would. */
-async function sha256FileStreaming(absolutePath: string): Promise<string> {
-    const hash = createHash("sha256");
-    for await (const chunk of createReadStream(absolutePath)) {
-        hash.update(chunk as Buffer);
-    }
-    return hash.digest("hex");
-}
-
 async function revalidateEnforcementArtifactsNow(
     db: Database,
     projectIdentity: string,
@@ -563,7 +556,7 @@ async function revalidateEnforcementArtifactsNow(
             // hold the recorded bytes. Require the LIVE resolved path to
             // stay under the resolved root before trusting any digest.
             const live = await realpath(absolute);
-            if (live !== rootReal && !live.startsWith(`${rootReal}${sep}`)) {
+            if (!isWithin(rootReal, live)) {
                 drifted = "artifact escapes the owning root";
             } else {
                 // Streamed hash: reading AND hashing yield per chunk, so a
@@ -600,10 +593,9 @@ async function revalidateEnforcementArtifactsNow(
                 try {
                     const live = realpathSync(absolute);
                     if (
-                        (live === rootReal || live.startsWith(`${rootReal}${sep}`)) &&
+                        isWithin(rootReal, live) &&
                         statSync(live).isFile() &&
-                        createHash("sha256").update(readFileSync(live)).digest("hex") ===
-                            artifact.bytesDigest
+                        sha256FileSync(live) === artifact.bytesDigest
                     ) {
                         return;
                     }

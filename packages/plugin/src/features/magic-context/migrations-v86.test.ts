@@ -101,19 +101,23 @@ function insertSubject(
         projectId: number;
         originObservationId: number | null;
         sourceDigest: string;
+        originTaint: string;
+        classificationMethod: string;
     }> = {},
 ): void {
     db.prepare(
         `INSERT INTO claim_revision_policy_subjects
             (revision_id, project_id, claim_kind, origin_observation_id, origin_taint,
              classification_method, source_digest, policy_version, created_at)
-         VALUES (?, ?, 'unknown', ?, 'ASSISTANT_INFERENCE', 'test', ?, 1, 1)`,
+         VALUES (?, ?, 'unknown', ?, ?, ?, ?, 1, 1)`,
     ).run(
         graph.revisionId,
         overrides.projectId ?? graph.projectId,
         overrides.originObservationId === undefined
             ? graph.observationId
             : overrides.originObservationId,
+        overrides.originTaint ?? "ASSISTANT_INFERENCE",
+        overrides.classificationMethod ?? "test",
         overrides.sourceDigest ?? "c".repeat(64),
     );
 }
@@ -360,6 +364,37 @@ describe("migration v86: claim trust policy authority", () => {
         }
     });
 
+    test("a live write without a named origin only carries an inference taint; seed writes are exempt", () => {
+        const db = migratedDb();
+        try {
+            const graph = seedClaimGraph(db);
+            // Live write (non-seed method) with no backing observation must
+            // not freeze a high-trust taint.
+            expect(() =>
+                insertSubject(db, graph, {
+                    originObservationId: null,
+                    originTaint: "USER_EXPLICIT",
+                }),
+            ).toThrow(/without a named origin only carries an inference taint/);
+            // The seed path legitimately elevates boundary-gated metadata
+            // provenance whose observations were never linked as evidence.
+            insertSubject(db, graph, {
+                originObservationId: null,
+                originTaint: "USER_EXPLICIT",
+                classificationMethod: "taint-classifier-v1:seed",
+            });
+            expect(
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM claim_revision_policy_subjects WHERE revision_id = ?",
+                    )
+                    .get(graph.revisionId),
+            ).toEqual({ count: 1 });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("every policy ledger rejects UPDATE, DELETE, REPLACE, gaps, and reused predecessors", () => {
         const db = migratedDb();
         try {
@@ -384,7 +419,7 @@ describe("migration v86: claim trust policy authority", () => {
                         `INSERT OR REPLACE INTO claim_revision_policy_subjects
                             (revision_id, project_id, claim_kind, origin_observation_id, origin_taint,
                              classification_method, source_digest, policy_version, created_at)
-                         VALUES (?, ?, 'descriptive', NULL, 'USER_EXPLICIT', 'forged', ?, 1, 1)`,
+                         VALUES (?, ?, 'descriptive', NULL, 'ASSISTANT_INFERENCE', 'forged', ?, 1, 1)`,
                     )
                     .run(graph.revisionId, graph.projectId, "c".repeat(64)),
             ).toThrow(/append-only/);

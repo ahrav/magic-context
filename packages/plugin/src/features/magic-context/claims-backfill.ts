@@ -62,7 +62,11 @@ import {
     type MemoryProjectionRow,
     readMemoryProjectionRow,
 } from "./memory/storage-memory-projection";
-import { readSchemaMeta as readMeta, writeSchemaMeta as writeMeta } from "./schema-meta";
+import {
+    readIntMeta,
+    readSchemaMeta as readMeta,
+    writeSchemaMeta as writeMeta,
+} from "./schema-meta";
 import { CLAIMS_AND_EVIDENCE_TABLES } from "./storage-claims-schema";
 import {
     CLAIMS_BACKFILL_META_KEYS,
@@ -214,11 +218,6 @@ export function computeClaimsBackfillEvidenceDigest(measurements: unknown): stri
 // ---------------------------------------------------------------------------
 // Meta state
 // ---------------------------------------------------------------------------
-
-function readIntMeta(db: Database, key: string): number {
-    const parsed = Number.parseInt(readMeta(db, key) ?? "0", 10);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
-}
 
 // Meta keys owned by this module, beyond the U2-created contract in
 // CLAIMS_BACKFILL_META_KEYS. The `claims_backfill_` prefix keeps them inside
