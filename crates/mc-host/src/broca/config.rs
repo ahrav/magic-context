@@ -70,12 +70,12 @@ pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 = (MAX_BACKEND_PROCESSES as u64)
 /// Worst case for deletion tombstones installed UNCHARGED when the retained
 /// budget is exhausted at the delete/eviction race: every such tombstone
 /// still counts toward [`MAX_TERMINAL_SESSIONS`], so at most that many
-/// session keys (each retained twice plus overhead, the `meta_bytes`
-/// worst case) can sit outside the charged budget until they expire or the
-/// cap evicts them. Declared alongside the retained budget for the same
-/// reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+/// session keys (each charged at the `meta_bytes` worst case — three
+/// identity copies plus overhead) can sit outside the charged budget until
+/// they expire or the cap evicts them. Declared alongside the retained
+/// budget for the same reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
 pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
-    (MAX_TERMINAL_SESSIONS as u64) * ((4096 + 256) * 2 + 128);
+    (MAX_TERMINAL_SESSIONS as u64) * ((4096 + 256) * 3 + 128);
 
 /// The complete retained-byte reservation the component declares to the
 /// host: the supervisor's enforced budget plus the retention classes that

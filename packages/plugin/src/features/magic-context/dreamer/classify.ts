@@ -487,8 +487,18 @@ async function runClassifyThroughModule(
 ): Promise<{ classified: number; changed: number } | null> {
     const modelChain = args.modelChain ?? [];
     if (modelChain.length === 0) {
+        // Module-backed classify cannot inherit the session's model the way
+        // the non-module path does: `session.send` requires an explicit
+        // canonical `provider/model`, and no canonical string for the
+        // session default exists on this side of the boundary. So this
+        // configuration is a hard, permanent failure rather than a silent
+        // fallback — the message names every key that can supply one, and
+        // the wording stays outside the transient-retry vocabulary so the
+        // task advances to its next cron slot instead of hot-retrying.
         throw new Error(
-            "classify has no effective model chain (task model, dreamer model, and fallback_models are all unset or malformed)",
+            "classify has no effective model chain: set dreamer.model, " +
+                "dreamer.tasks.classify-memories.model, or dreamer.fallback_models " +
+                "(all are unset or malformed, and module-backed classify has no session default to fall back on)",
         );
     }
     const prompt = buildClassifyPrompt({

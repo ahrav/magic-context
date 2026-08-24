@@ -2549,7 +2549,7 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
         GroupRecord::record(i32::try_from(survivor.id()).expect("pid fits")).expect("record");
 
     assert!(
-        sweep_orphaned_groups() >= 1,
+        sweep_orphaned_groups().expect("sweep completes") >= 1,
         "sweep must kill at least the orphaned group"
     );
     wait_sigkilled(&mut orphan, "the orphan leader");
@@ -2590,7 +2590,7 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        sweep_orphaned_groups() >= 1,
+        sweep_orphaned_groups().expect("sweep completes") >= 1,
         "a zombie owner must count as dead"
     );
     wait_sigkilled(&mut zombie_orphan, "the zombie-owned leader");
@@ -2624,7 +2624,7 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
     assert!(leader_exit.success(), "shell leader must exit cleanly");
 
     assert!(
-        sweep_orphaned_groups() >= 1,
+        sweep_orphaned_groups().expect("sweep completes") >= 1,
         "sweep must kill the leaderless group"
     );
 

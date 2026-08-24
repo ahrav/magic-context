@@ -271,10 +271,18 @@ impl SecondaryComponent for BrocaComponent {
         // provably gone. Sweeping at construction would race — a
         // predecessor still alive then has its entries skipped (live
         // owner), and if it crashes while the successor is still retrying
-        // the lock, nothing would ever sweep them. Recovery treats an
-        // unknown run as `missing` and may refire it, which must never
-        // race a still-executing orphan.
-        let _ = subprocess::group_registry::sweep_orphaned_groups();
+        // the lock, nothing would ever sweep them.
+        //
+        // A sweep that cannot prove it finished fails startup rather than
+        // proceeding: recovery treats an unknown run as `missing` and may
+        // refire it, so an unverified registry could let a duplicate
+        // billable run race a surviving provider descendant. Refusing to
+        // start is recoverable; a double-billed refire is not.
+        subprocess::group_registry::sweep_orphaned_groups().map_err(|err| {
+            InitError(format!(
+                "broca could not sweep crash-orphaned process groups: {err}"
+            ))
+        })?;
         Ok(())
     }
 }

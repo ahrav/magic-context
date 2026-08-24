@@ -1039,53 +1039,88 @@ pub mod group_registry {
     use super::*;
 
     /// Reads a process's start time (clock ticks since boot, field 22 of
-    /// `/proc/<pid>/stat`). `None` means the pid does not exist — or the
-    /// stat format was unreadable, which the callers treat identically
-    /// because neither state can prove identity.
-    fn proc_start_time(pid: i32) -> Option<u64> {
-        proc_stat_field(pid, 19)
+    /// `/proc/<pid>/stat`). `Ok(None)` means the pid provably does not
+    /// exist; `Err` means the answer is UNKNOWN (a transient read failure or
+    /// an unreadable stat format) and callers must not guess, because both
+    /// "owner is dead" and "leader is gone" are kill/unlink decisions.
+    fn proc_start_time(pid: i32) -> io::Result<Option<u64>> {
+        proc_stat_fields(pid).map(|fields| fields.map(|(_, start)| start))
     }
 
     /// Like [`proc_start_time`], but treats a zombie as dead: a crashed
     /// host can linger unreaped (same pid, same start time) while its
     /// supervisor already runs the replacement, and a zombie cannot be
     /// holding runs.
-    fn proc_live_start_time(pid: i32) -> Option<u64> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let rest = stat.rsplit_once(')')?.1;
-        let mut fields = rest.split_ascii_whitespace();
-        if fields.next()? == "Z" {
-            return None;
-        }
-        fields.nth(18)?.parse().ok()
+    fn proc_live_start_time(pid: i32) -> io::Result<Option<u64>> {
+        Ok(proc_stat_fields(pid)?.and_then(|(state, start)| (state != 'Z').then_some(start)))
     }
 
-    /// Reads one whitespace-delimited `/proc/<pid>/stat` field by its
-    /// 0-based index AFTER the comm field (which may itself contain spaces
-    /// and parentheses; everything after the LAST ')' is unambiguous).
-    /// starttime is index 19, pgrp is index 2.
-    fn proc_stat_field(pid: i32, index: usize) -> Option<u64> {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let rest = stat.rsplit_once(')')?.1;
-        rest.split_ascii_whitespace().nth(index)?.parse().ok()
+    /// The process state character and start time from `/proc/<pid>/stat`.
+    /// The comm field may contain spaces and parentheses, so everything
+    /// after the LAST ')' is unambiguous: state is the first field there and
+    /// starttime the 20th.
+    fn proc_stat_fields(pid: i32) -> io::Result<Option<(char, u64)>> {
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            // The only proof that a pid is gone.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let unreadable = || io::Error::other("unreadable /proc stat format");
+        let rest = stat.rsplit_once(')').ok_or_else(unreadable)?.1;
+        let mut fields = rest.split_ascii_whitespace();
+        let state = fields
+            .next()
+            .and_then(|field| field.chars().next())
+            .ok_or_else(unreadable)?;
+        let start = fields
+            .nth(18)
+            .ok_or_else(unreadable)?
+            .parse()
+            .map_err(|_| unreadable())?;
+        Ok(Some((state, start)))
     }
 
     /// Whether any live process still belongs to process group `pgid`.
     /// Used only after the group's recorded leader is gone: the kernel
     /// keeps a pgid reserved while the group has members, so survivors
-    /// found here can only be members of the recorded group.
-    fn group_has_members(pgid: i32) -> bool {
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return false;
-        };
-        entries.flatten().any(|proc_entry| {
-            proc_entry
+    /// found here can only be members of the recorded group. A scan that
+    /// cannot be completed is an error, never "no members" — that answer
+    /// would both skip the kill and delete the record proving the orphan
+    /// exists.
+    fn group_has_members(pgid: i32) -> io::Result<bool> {
+        for proc_entry in fs::read_dir("/proc")? {
+            let Some(pid) = proc_entry?
                 .file_name()
                 .to_str()
                 .and_then(|name| name.parse::<i32>().ok())
-                .and_then(|pid| proc_stat_field(pid, 2))
-                .is_some_and(|pgrp| pgrp == pgid as u64)
-        })
+            else {
+                continue;
+            };
+            // A process that exits mid-scan is simply not a member.
+            match proc_stat_pgrp(pid) {
+                Ok(Some(pgrp)) if pgrp == pgid => return Ok(true),
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(false)
+    }
+
+    /// The process group of `pid` (field 5 of `/proc/<pid>/stat`, the third
+    /// field after comm).
+    fn proc_stat_pgrp(pid: i32) -> io::Result<Option<i32>> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let unreadable = || io::Error::other("unreadable /proc stat format");
+        let rest = stat.rsplit_once(')').ok_or_else(unreadable)?.1;
+        let pgrp = rest
+            .split_ascii_whitespace()
+            .nth(2)
+            .ok_or_else(unreadable)?
+            .parse()
+            .map_err(|_| unreadable())?;
+        Ok(Some(pgrp))
     }
 
     fn boot_id() -> String {
@@ -1160,13 +1195,15 @@ pub mod group_registry {
     }
 
     impl GroupRecord {
-        /// Records `leader_pid`'s group. Best-effort by contract: this is
-        /// the third backstop behind `pdeathsig` and the in-process kill
-        /// paths, so a registry failure must not fail the run.
+        /// Records `leader_pid`'s group, or `None` when the record cannot be
+        /// written or either process's identity cannot be established. The
+        /// spawner treats `None` as fatal for the run and kills the group
+        /// before delivering the prompt, so no billable work exists without
+        /// a durable record.
         pub fn record(leader_pid: i32) -> Option<Self> {
-            let leader_start = proc_start_time(leader_pid)?;
+            let leader_start = proc_start_time(leader_pid).ok().flatten()?;
             let owner_pid = std::process::id() as i32;
-            let owner_start = proc_start_time(owner_pid)?;
+            let owner_start = proc_start_time(owner_pid).ok().flatten()?;
             let dir = registry_dir().ok()?;
             let mut nonce = [0u8; 8];
             getrandom::getrandom(&mut nonce).ok()?;
@@ -1190,34 +1227,44 @@ pub mod group_registry {
     /// their entries; returns how many groups were signalled. Entries whose
     /// owning host is still alive are left untouched, so concurrent hosts
     /// (including test processes) never sweep each other's live runs.
-    pub fn sweep_orphaned_groups() -> usize {
-        let Ok(dir) = registry_dir() else {
-            return 0;
-        };
-        let Ok(entries) = fs::read_dir(&dir) else {
-            return 0;
-        };
+    ///
+    /// Fails closed on every ambiguity: an unreadable registry, an
+    /// unreadable record, or a `/proc` lookup that cannot answer whether a
+    /// process exists all propagate, and the record is left in place. The
+    /// caller must keep the component unavailable, because both
+    /// alternatives are worse than refusing to start — reading an unknown
+    /// as "no orphan" lets recovery refire a run whose descendant is still
+    /// executing, and unlinking a record after a failed scan destroys the
+    /// only evidence that the orphan exists.
+    pub fn sweep_orphaned_groups() -> io::Result<usize> {
+        let dir = registry_dir()?;
         let current_boot = boot_id();
         let mut killed = 0;
-        for file in entries.flatten() {
-            let path = file.path();
-            let entry = fs::read_to_string(&path)
-                .ok()
-                .and_then(|t| Entry::parse(&t));
-            let Some(entry) = entry else {
-                let _ = fs::remove_file(&path);
+        for file in fs::read_dir(&dir)? {
+            let path = file?.path();
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                // A record removed by its own owner between the listing and
+                // this read is not an error.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            // Content that was read successfully but does not parse names no
+            // group and can only be garbage; removing it is safe.
+            let Some(entry) = Entry::parse(&text) else {
+                remove_swept_record(&path)?;
                 continue;
             };
             // A different boot means every recorded process is gone and
             // both pids may have been reissued: never kill, just clean up.
             if entry.boot_id != current_boot {
-                let _ = fs::remove_file(&path);
+                remove_swept_record(&path)?;
                 continue;
             }
-            if proc_live_start_time(entry.owner_pid) == Some(entry.owner_start) {
+            if proc_live_start_time(entry.owner_pid)? == Some(entry.owner_start) {
                 continue;
             }
-            let group_live = match proc_start_time(entry.leader_pid) {
+            let group_live = match proc_start_time(entry.leader_pid)? {
                 // Same pid and start time: provably the recorded leader.
                 Some(start) if start == entry.leader_start => true,
                 // The leader's pid was reissued to another process. That is
@@ -1229,17 +1276,27 @@ pub mod group_registry {
                 // Members keep the pgid reserved, so any process still in
                 // that group can only be a surviving descendant of the
                 // recorded run.
-                None => group_has_members(entry.leader_pid),
+                None => group_has_members(entry.leader_pid)?,
             };
             if group_live {
                 if let Some(group) = rustix::process::Pid::from_raw(entry.leader_pid) {
-                    let _ =
-                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                    rustix::process::kill_process_group(group, rustix::process::Signal::KILL)?;
                     killed += 1;
                 }
             }
-            let _ = fs::remove_file(&path);
+            remove_swept_record(&path)?;
         }
-        killed
+        Ok(killed)
+    }
+
+    /// Removes a record whose group has been resolved. A record already gone
+    /// (a concurrent host's `Drop`) is success; anything else would leave
+    /// the sweep unable to prove it finished.
+    fn remove_swept_record(path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
