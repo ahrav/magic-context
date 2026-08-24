@@ -2,6 +2,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import { reconcileCompatibilityVerifications } from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
+    autoSearchHintFragmentsStillEligible,
     filterMemoriesByPolicy,
     filterMemoryIdsByPolicy,
 } from "../../features/magic-context/memory/storage-claim-visibility";
@@ -949,7 +950,15 @@ function buildAutoSearchHintSeeds(args: {
             );
             continue;
         }
-        const hintText = value.decision === "hint" ? value.text : "";
+        // The same replay gate as the TypeScript and Pi paths: a hint whose
+        // contributing memory was hidden or rewritten seeds the empty
+        // no-result shape, so the native overlay revokes the fragment
+        // instead of replaying it verbatim.
+        const hintText =
+            value.decision === "hint" &&
+            autoSearchHintFragmentsStillEligible(args.db, value.memoryFragments)
+                ? value.text
+                : "";
         byBlock.set(`${value.messageId}#${mapping.blockIndex}`, {
             block_id: `${value.messageId}#${mapping.blockIndex}`,
             hint_text: hintText,
@@ -1722,13 +1731,18 @@ export async function buildModuleStateSyncPayload(args: {
               text: anchor.text,
           }))
         : undefined;
-    const autoSearchHintSeedState = args.force
-        ? buildAutoSearchHintSeeds({
-              db: args.pass.db,
-              sessionId: args.pass.sessionId,
-              readRawById,
-          })
-        : null;
+    // Hint seeds ride force seeds AND epoch-driven syncs: the native store
+    // upserts them, so a policy transition that revokes a hint's fragments
+    // (seeded below as the empty no-result shape) reaches the module on the
+    // same epoch bump that hides the memory, not only on the next reseed.
+    const autoSearchHintSeedState =
+        args.force || epochChanged
+            ? buildAutoSearchHintSeeds({
+                  db: args.pass.db,
+                  sessionId: args.pass.sessionId,
+                  readRawById,
+              })
+            : null;
     const persistedTodoAnchor = args.force
         ? getPersistedTodoSyntheticAnchor(args.pass.db, args.pass.sessionId)
         : null;
@@ -1871,19 +1885,22 @@ export async function buildModuleStateSyncPayload(args: {
             ...(channel2NudgeState !== undefined
                 ? { channel2_nudge_state: channel2NudgeState }
                 : {}),
+            ...(autoSearchHintSeedState && autoSearchHintSeedState.seeds.length > 0
+                ? { auto_search_hint_decisions: autoSearchHintSeedState.seeds }
+                : {}),
         },
         watermarks: currentWatermarks,
     };
-    // An epoch-driven replacement snapshot loads the full eligible set into
-    // one live request; a large project can exceed the module's frame limit,
-    // and an oversized frame would permanently block the policy transition
-    // from reaching the native mirror. Escalate to the paged seed protocol
-    // instead — the caller retries the same sync with force, which routes
-    // through buildPagedModuleStateSyncPayloads above.
+    // Any live payload can outgrow one frame: an epoch-driven replacement
+    // snapshot loads the full eligible set, and an incremental sync can
+    // accumulate arbitrarily many rows, mutations, and deletion ids while the
+    // module is unavailable. An oversized frame would fail identically on
+    // every retry and permanently stall the mirror, so escalate to the paged
+    // seed protocol instead — the caller retries the same sync with force,
+    // which routes through buildPagedModuleStateSyncPayloads above.
     if (
-        epochChanged &&
         moduleWireBodyBytes({ method: "state_sync", params: livePayload.params }) >
-            MODULE_LIVE_SYNC_MAX_BYTES
+        MODULE_LIVE_SYNC_MAX_BYTES
     ) {
         return "frame_budget";
     }

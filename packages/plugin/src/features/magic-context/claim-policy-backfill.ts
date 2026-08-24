@@ -483,9 +483,19 @@ export function reconcileCompatibilityVerifications(db: Database): number {
             }
         }).immediate();
     }
-    db.transaction(() =>
-        writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark, String(maxEventId)),
-    ).immediate();
+    // Monotonic advance: two hosts can reconcile the shared database
+    // concurrently, and the slower one's lower maxEventId must not overwrite
+    // a higher stored watermark — re-consuming negative events would bump
+    // project epochs again on every pass and thrash the prompt and native
+    // caches. Re-read inside the write transaction.
+    db.transaction(() => {
+        const stored = Number(
+            readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
+        );
+        if (maxEventId > stored) {
+            writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark, String(maxEventId));
+        }
+    }).immediate();
     return refreshed;
 }
 

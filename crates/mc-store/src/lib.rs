@@ -9931,9 +9931,16 @@ impl McStore {
                     continue;
                 }
                 user_hint_seeds_seeded += tx.execute(
+                    // Upsert, not ignore: the host's decision list is the
+                    // policy authority for these overlays, and a reseed can
+                    // legitimately REVOKE a hint whose contributing memory
+                    // was hidden (the host sends the empty no-result shape).
+                    // Benign reseeds carry byte-identical text, so old turns
+                    // stay stable unless policy demanded the change.
                     "INSERT INTO mc_user_hints(session_id, block_id, hint_text, created_at)
                      VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(session_id, block_id) DO NOTHING",
+                     ON CONFLICT(session_id, block_id) DO UPDATE SET
+                         hint_text = excluded.hint_text",
                     params![request.session_id, seed.block_id, seed.hint_text, current_time_ms()],
                 )?;
             }
