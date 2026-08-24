@@ -119,9 +119,8 @@ fn run_child_host() {
             daemon_ver: "mc-host/ipc-budget".to_owned(),
             ..Default::default()
         };
-        let publication = data_dir
-            .join("cortexkit")
-            .join("run")
+        let publication = mc_host::runtime_dir_path(Some(&data_dir))
+            .expect("runtime dir")
             .join(mc_host::CONNECTION_FILE_NAME);
         let shutdown = mc_host::CancellationToken::new();
         let host = tokio::spawn(mc_host::run(

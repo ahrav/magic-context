@@ -101,9 +101,8 @@ async fn main() {
         config.timing.frame_deadline = deadline;
     }
 
-    let publication = data_dir
-        .join("cortexkit")
-        .join("run")
+    let publication = mc_host::runtime_dir_path(Some(&data_dir))
+        .expect("runtime dir")
         .join(mc_host::CONNECTION_FILE_NAME);
     let shutdown = CancellationToken::new();
     let host = tokio::spawn(mc_host::run(

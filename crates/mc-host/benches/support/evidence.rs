@@ -441,6 +441,11 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     type GapKey = (u32, Option<String>, (u32, u32));
     let mut atomic: BTreeMap<GapKey, f64> = BTreeMap::new();
     let mut tcp: BTreeMap<GapKey, f64> = BTreeMap::new();
+    // Each arm's collection configuration may differ from the other
+    // arm's, but must be uniform within the arm: rows produced under
+    // different batch sizes or operation counts are not one gap
+    // distribution.
+    let mut arm_collections: BTreeMap<String, Option<serde_json::Value>> = BTreeMap::new();
     for attempt in &complete {
         // Pairing spans arms, so it checks the shared environment only;
         // requiring collection equality here would reject every
@@ -454,6 +459,19 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
         }
         let m = &attempt.manifest;
         let Some(pair) = m.arm.pair else { continue };
+        if matches!(m.arm.name.as_str(), ARM_ATOMIC | ARM_TCP_SERIAL) {
+            let known = arm_collections
+                .entry(m.arm.name.clone())
+                .or_insert_with(|| m.collection.clone());
+            if *known != m.collection {
+                return Err(format!(
+                    "{}: collection configuration differs from other {} attempts; \
+                     rows from different configurations are not one gap distribution",
+                    attempt.dir.display(),
+                    m.arm.name
+                ));
+            }
+        }
         let key = (m.run_block, m.arm.class.clone(), pair);
         let results = m.results.as_ref();
         match m.arm.name.as_str() {

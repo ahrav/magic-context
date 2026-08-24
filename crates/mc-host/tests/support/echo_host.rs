@@ -76,9 +76,8 @@ pub struct InProcessHost {
 impl InProcessHost {
     /// Starts the host and blocks until its publication exists.
     pub fn start(data_dir: &Path) -> Self {
-        let publication = data_dir
-            .join("cortexkit")
-            .join("run")
+        let publication = mc_host::runtime_dir_path(Some(data_dir))
+            .expect("runtime dir")
             .join(mc_host::CONNECTION_FILE_NAME);
         let shutdown = mc_host::CancellationToken::new();
         let host_shutdown = shutdown.clone();

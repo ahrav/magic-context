@@ -704,15 +704,23 @@ async fn run_throughput_inner(
     let mut first_measured: Option<u64> = None;
     let measured_corr = |first: Option<u64>, c: u64| first.is_some_and(|f| c >= f);
     let start = Instant::now();
+    // Writes share the receive deadline (plus drain budget): a host that
+    // stops reading fills the TCP send buffer, and an unbounded
+    // write_all would park the arm past every deadline.
+    let write_deadline = start + cfg.warmup + cfg.measure + DRAIN_BUDGET;
 
     // Prime the pipeline to the fixed depth.
     for _ in 0..cfg.depth {
         corr += 1;
         outstanding.insert(corr);
-        stream
-            .write_all(&request_frame(channel, epoch, corr))
-            .await
-            .map_err(|err| format!("prime write: {err}"))?;
+        let remaining = write_deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(
+            remaining,
+            stream.write_all(&request_frame(channel, epoch, corr)),
+        )
+        .await
+        .map_err(|_| "prime write: deadline exceeded".to_owned())?
+        .map_err(|err| format!("prime write: {err}"))?;
     }
 
     // The window deadline bounds every receive: a host that delays one
@@ -790,13 +798,21 @@ async fn run_throughput_inner(
             }
         }
         outstanding.insert(corr);
-        if stream
-            .write_all(&request_frame(channel, epoch, corr))
+        let write_remaining = write_deadline.saturating_duration_since(Instant::now());
+        let wrote = if write_remaining.is_zero() {
+            None
+        } else {
+            tokio::time::timeout(
+                write_remaining,
+                stream.write_all(&request_frame(channel, epoch, corr)),
+            )
             .await
-            .is_err()
-        {
-            // The failed send and every other outstanding measured
-            // request resolve as failures; the window did not complete.
+            .ok()
+        };
+        if !matches!(wrote, Some(Ok(()))) {
+            // The failed or deadline-expired send and every other
+            // outstanding measured request resolve as failures; the
+            // window did not complete.
             for c in outstanding.drain() {
                 if measured_corr(first_measured, c) {
                     outcomes.record(if c == corr {
