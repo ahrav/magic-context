@@ -9869,14 +9869,19 @@ impl McHandler {
                     // child session and its live, billable run: purging
                     // would cancel the other caller's run, and advancing
                     // the chain would start a duplicate billable attempt
-                    // for a command already executing. Back off instead —
-                    // a retry replays the winner's ledgered response.
+                    // for a command already executing. Return without any
+                    // ledger write — the loser's failure must not win the
+                    // INSERT OR IGNORE race against the in-flight winner's
+                    // outcome; a retry replays the winner's ledgered
+                    // response.
                     if matches!(
                         &primary,
                         HistorianProducerError::Subc(body) if body.code == "idempotency_conflict"
                     ) {
-                        last_error = primary.to_string();
-                        break;
+                        return HandlerOutcome::Error {
+                            code: "dreamer_run_failed".to_string(),
+                            message: primary.to_string(),
+                        };
                     }
                     let purge_result = producer.purge_session(&child_session).await;
                     let purge_failed = purge_result.is_err();
@@ -26689,26 +26694,39 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dreamer_run_task_backs_off_on_idempotency_conflict_without_purging() {
         let producer = Arc::new(ProducerState::default());
-        producer
-            .await_results
-            .lock()
-            .unwrap()
-            .push_back(Err(HistorianProducerError::tagged_subc(
+        producer.await_results.lock().unwrap().extend([
+            Err(HistorianProducerError::tagged_subc(
                 "idempotency_conflict",
                 "a byte-different send holds this session",
                 ErrorClass::Permanent,
                 None,
-            )));
-        let (producer, outcome) = dreamer_classify_outcome(
-            &producer,
-            json!({
+            )),
+            classify_envelope_output(),
+        ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(route_root, "pi", "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let request = json!({
+            "v": 1,
+            "session_id": "ses",
+            "task": CLASSIFY_TASK,
+            "command_id": "conflict-command",
+            "authority_generation": generation,
+            "payload": {
                 "prompt_body": "classify",
                 "items": [],
                 "model_chain": ["test/model-a", "test/model-b"],
-            }),
-            "conflict-command",
-        )
-        .await;
+            },
+        });
+
+        let outcome = handler.handle_dreamer_run_task(7, &request).await;
         let HandlerOutcome::Error { code, .. } = outcome else {
             panic!("an idempotency conflict must fail the command");
         };
@@ -26725,6 +26743,17 @@ mod tests {
             1,
             "the chain must not advance past an idempotency conflict"
         );
+
+        // Crucially the loser recorded nothing: a failure row would win the
+        // ledger's INSERT OR IGNORE race and mask the in-flight winner's
+        // outcome. The command's slot stays open, so a later attempt can
+        // still commit success.
+        let outcome = handler.handle_dreamer_run_task(7, &request).await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the command slot must remain open after a conflict: {other:?}"),
+        };
+        assert_eq!(response["ok"], json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]
