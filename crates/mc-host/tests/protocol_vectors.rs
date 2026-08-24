@@ -933,3 +933,42 @@ async fn host_shutdown_response_bytes_are_pinned() {
     assert_eq!(frame.body, br#"{"op":"host.shutdown"}"#.to_vec());
     host.shutdown().await.expect("graceful shutdown");
 }
+
+/// The three-target profile's catalog is a deterministic wire shape: exactly
+/// `magic-context`, `synapse`, `broca` in order with the pinned `subc_ops`
+/// (protocol §7.3, V40).
+#[tokio::test]
+async fn three_component_catalog_order_is_pinned() {
+    let (mc, synapse, broca) = support::stub_trio();
+    let composite =
+        mc_host::StaticComposite::new(mc, synapse, broca).expect("distinct component ids");
+    let host = support::CompositeTestHost::start(composite, |_config| {}).await;
+    let mut client = host.client().await;
+
+    let corr = client
+        .control(&serde_json::json!({"op": "catalog.list"}))
+        .await
+        .expect("send catalog.list");
+    let frame = client.frame_within(BUDGET).await.expect("catalog");
+    assert_eq!(frame.corr, corr);
+    assert_eq!(frame.ty, TY_RESPONSE);
+    let body = frame.json();
+    let ids: Vec<&str> = body["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .map(|module| module["module_id"].as_str().expect("module_id"))
+        .collect();
+    assert_eq!(ids, ["magic-context", "synapse", "broca"]);
+    assert_eq!(
+        body["subc_ops"],
+        serde_json::json!([
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "transport.negotiate"
+        ])
+    );
+
+    host.shutdown().await.expect("graceful shutdown");
+}

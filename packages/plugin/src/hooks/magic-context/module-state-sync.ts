@@ -1,9 +1,21 @@
 import { createHmac, randomUUID } from "node:crypto";
-
+import {
+    reconcileCompatibilityVerifications,
+    seedLateCompatibilityRevisions,
+} from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
+import {
+    autoSearchHintFragmentsStillEligible,
+    bindMemoriesToCurrentRevision,
+    exactMemoryContentDigests,
+    filterMemoriesByPolicy,
+    filterMemoryIdsByPolicy,
+} from "../../features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
 import {
     buildWorkspaceMemorySqlFilter,
     getMaxMemoryIdForProjects,
+    getMemoriesByIds,
     getMemoriesByProject,
     getMemoriesByProjects,
     readNewMemoriesForM1Union,
@@ -28,6 +40,7 @@ import {
     getPendingCompactionMarkerState,
     getPersistedTodoSyntheticAnchor,
     peekDeferredExecutePending,
+    recordAutoSearchHintNativeBlockId,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getPendingOps } from "../../features/magic-context/storage-ops";
 import {
@@ -52,6 +65,13 @@ import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
+
+/** Ceiling for a single live (non-seed) state_sync body. Well under the
+ * transport frame limit; an epoch-driven replacement snapshot that exceeds
+ * it escalates to the paged seed protocol instead of risking an oversized
+ * frame that would permanently block the policy transition. */
+const MODULE_LIVE_SYNC_MAX_BYTES = 8 * 1024 * 1024;
+
 import {
     readRawSessionMessageOrdinalById,
     readRawSessionMessagePartsById,
@@ -155,6 +175,15 @@ export interface ModuleStateSyncPayload {
         seed_boundary_id?: string | null;
         compartments: unknown[];
         memories?: unknown[];
+        /** Projects whose `memories` entries form a FULL policy snapshot: the
+         * receiver prunes mirrored rows absent from the payload within this
+         * scope. Absent means incremental upsert-only semantics. */
+        memories_replace_projects?: string[];
+        /** Explicit prune: mirrored rows with these ids are deleted. Covers
+         * policy-hidden rows the replace scope cannot name — a foreign
+         * workspace member's rows — without granting a project-wide prune
+         * over that member's non-shared rows. */
+        memories_delete_ids?: number[];
         memory_mutations?: unknown[];
         user_profile?: string[];
         workspace?: ModuleWorkspacePayload | null;
@@ -169,6 +198,11 @@ export interface ModuleStateSyncPayload {
         note_nudge_anchors?: ModuleNoteNudgeAnchorSeed[];
         auto_search_hint_decisions?: ModuleAutoSearchHintSeed[];
         auto_search_hint_skipped?: number;
+        /** True when auto_search_hint_decisions is the COMPLETE decision
+         * list for the session: the native store deletes stored hint blocks
+         * absent from the list (no backing decision the host can still
+         * validate — e.g. a pre-policy hint whose raw message is gone). */
+        user_hints_replace_session?: boolean;
         todo_synthetic_anchor?: ModuleTodoSyntheticAnchorSeed | null;
         emergency_latches?: ModuleEmergencyLatchSeed;
         pending_compaction_marker?: ModulePendingCompactionMarkerSeed | null;
@@ -180,6 +214,14 @@ export interface ModuleStateSyncPayload {
     };
     watermarks: ModuleWatermarks;
     wireBatches?: ModuleStateSyncPayload[];
+    /** Exact digests of the content-carrying snapshot rows this payload
+     * installs, retained for the post-send recheck. Top-level (not in
+     * `params`), so it never crosses the wire. */
+    memorySnapshotDigests?: ReadonlyMap<number, string>;
+    /** Digest per content-carrying mutation row (by mutation id), retained
+     * for the same post-send recheck — mutations install content the
+     * snapshot digests do not cover. Top-level, never crosses the wire. */
+    memoryMutationDigests?: ReadonlyMap<number, { targetMemoryId: number; digest: string }>;
 }
 
 /** The subset of sender state needed to serialize a state-sync payload. */
@@ -921,17 +963,34 @@ function buildAutoSearchHintSeeds(args: {
         const mapping = moduleRawBlockMappings(args.readRawById(value.messageId)).find(
             (candidate) => candidate.kind === "text",
         );
-        if (!mapping) {
+        // Prefer the live raw mapping; fall back to the block id this
+        // decision was last seeded under. Without the fallback, a hint whose
+        // raw message can no longer be loaded would skip the eligibility
+        // gate below, and a quarantine/rejection/rewrite could never upsert
+        // the empty revocation over the module's stored hint row.
+        const blockId = mapping ? `${value.messageId}#${mapping.blockIndex}` : value.nativeBlockId;
+        if (!blockId) {
             skipped += 1;
             sessionLog(
                 args.sessionId,
-                `module auto-search decision seed skipped message ${value.messageId}: text block is missing`,
+                `module auto-search decision seed skipped message ${value.messageId}: text block is missing and no seeded block id is recorded`,
             );
             continue;
         }
-        const hintText = value.decision === "hint" ? value.text : "";
-        byBlock.set(`${value.messageId}#${mapping.blockIndex}`, {
-            block_id: `${value.messageId}#${mapping.blockIndex}`,
+        if (mapping && value.nativeBlockId !== blockId) {
+            recordAutoSearchHintNativeBlockId(args.db, args.sessionId, value.messageId, blockId);
+        }
+        // The same replay gate as the TypeScript and Pi paths: a hint whose
+        // contributing memory was hidden or rewritten seeds the empty
+        // no-result shape, so the native overlay revokes the fragment
+        // instead of replaying it verbatim.
+        const hintText =
+            value.decision === "hint" &&
+            autoSearchHintFragmentsStillEligible(args.db, value.memoryFragments)
+                ? value.text
+                : "";
+        byBlock.set(blockId, {
+            block_id: blockId,
             hint_text: hintText,
         });
     }
@@ -970,6 +1029,7 @@ type SeedItem =
     | { kind: "compartment"; value: unknown }
     | { kind: "memory"; value: unknown }
     | { kind: "memory_mutation"; value: unknown }
+    | { kind: "memory_delete_id"; value: number }
     | { kind: "drop_seed"; value: ModuleDropSeed }
     | { kind: "pending_agent_drop"; value: ModulePendingDropSeed }
     | { kind: "note_nudge_anchor"; value: ModuleNoteNudgeAnchorSeed }
@@ -1025,6 +1085,66 @@ function readCompartmentsAfterSequence(
             legacy: typeof row.legacy === "number" ? row.legacy : 0,
             createdAt: row.created_at as number,
         }));
+}
+
+/**
+ * Id-only coverage query for the explicit-delete lane: every foreign row the
+ * workspace snapshot's visibility scope can see, in ANY status and ignoring
+ * expiry — an archived or expired previously-mirrored row must still be
+ * named for deletion. Own-identity rows are excluded (the replace scope
+ * prunes those wholesale); own ALIASES not listed in `ownIdentities` count
+ * as foreign here, which is correct because the replace scope does not
+ * cover them either. Id-only so a large legacy history never hydrates
+ * content just to compute deletions.
+ */
+function readForeignCoverageMemoryIds(args: {
+    db: ContextDatabase;
+    workspace: ModuleWorkspaceContext;
+}): Array<{ id: number; shareVisible: boolean }> {
+    const identities = args.workspace.expandedIdentities;
+    if (identities.length === 0) return [];
+    const filter = buildWorkspaceMemorySqlFilter({
+        identities,
+        ownIdentities: args.workspace.ownIdentities,
+        shareCategories: args.workspace.shareCategories,
+        tableName: "m",
+        // Coverage must name FORMERLY visible rows, not only rows matching
+        // the current share filter: a foreign row reclassified shareable=0
+        // or private-scope leaves the kept snapshot, and without coverage
+        // its stale shareable copy would keep serving foreign readers. The
+        // classification predicate rides along as a SELECT flag instead of
+        // a WHERE clause: classification departures are CLASSIFICATION
+        // PROPAGATION (the owner keeps the row; the native reader's own
+        // share filter hides it), while only policy-hidden rows are
+        // DELETED. The category restriction stays, so this session still
+        // cannot touch a member's non-shared categories.
+        includeClassificationFields: false,
+    });
+    const ownIdentities = args.workspace.ownIdentities;
+    const ownClause =
+        ownIdentities.length > 0
+            ? ` AND m.project_path NOT IN (${ownIdentities.map(() => "?").join(", ")})`
+            : "";
+    const placeholders = identities.map(() => "?").join(", ");
+    const rows = args.db
+        .prepare(
+            // Interpolation is a compile-time placeholder list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT m.id,
+                    (m.shareable = 1 AND m.scope IN ('project','ecosystem','universe')) AS shareVisible
+               FROM memories AS m
+              WHERE m.project_path IN (${placeholders})
+                ${ownClause}
+                ${filter.clause}
+              ORDER BY m.id ASC`,
+        )
+        .all(...identities, ...ownIdentities, ...filter.params) as Array<{
+        id?: unknown;
+        shareVisible?: unknown;
+    }>;
+    return rows.flatMap((row) =>
+        typeof row.id === "number" ? [{ id: row.id, shareVisible: row.shareVisible === 1 }] : [],
+    );
 }
 
 function readRenderedMemoryIds(args: {
@@ -1092,6 +1212,14 @@ export function buildPagedModuleStateSyncPayloads(args: {
     lastTodoState: string;
     watermarks: ModuleWatermarks;
     omitAuthorityMemorySections?: boolean;
+    /** Full-snapshot replace scope; rides the completing batch so the module
+     * prunes after assembling every page's memories. */
+    memoriesReplaceProjects?: string[];
+    /** Explicit prune ids for rows the replace scope cannot name (foreign
+     * workspace members) or that left the base query (archived, expired).
+     * Paged with the seed items and concatenated by the reassembler, so a
+     * large legacy prune cannot overflow the completing page. */
+    memoriesDeleteIds?: number[];
 }): ModuleStateSyncPayload[] {
     const items: SeedItem[] = [
         ...args.compartments.map((value) => ({ kind: "compartment", value }) as const),
@@ -1101,6 +1229,13 @@ export function buildPagedModuleStateSyncPayloads(args: {
         ...(args.omitAuthorityMemorySections
             ? []
             : args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const)),
+        // Delete ids page with the other seed items: a large legacy project's
+        // hidden-row prune can exceed a single page's budget on its own.
+        ...(args.omitAuthorityMemorySections
+            ? []
+            : (args.memoriesDeleteIds ?? []).map(
+                  (value) => ({ kind: "memory_delete_id", value }) as const,
+              )),
         ...(args.dropSeeds ?? []).map((value) => ({ kind: "drop_seed", value }) as const),
         ...(args.pendingDropSeeds ?? []).map(
             (value) => ({ kind: "pending_agent_drop", value }) as const,
@@ -1119,6 +1254,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         compartments: unknown[];
         memories: unknown[];
         memoryMutations: unknown[];
+        memoriesDeleteIds: number[];
         dropSeeds: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
@@ -1131,6 +1267,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         compartments: [],
         memories: [],
         memoryMutations: [],
+        memoriesDeleteIds: [],
         dropSeeds: [],
         pendingAgentDrops: [],
         noteNudgeAnchors: [],
@@ -1143,6 +1280,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         if (item.kind === "compartment") batch.compartments.push(item.value);
         else if (item.kind === "memory") batch.memories.push(item.value);
         else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
+        else if (item.kind === "memory_delete_id") batch.memoriesDeleteIds.push(item.value);
         else if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
         else if (item.kind === "pending_agent_drop") batch.pendingAgentDrops.push(item.value);
         else if (item.kind === "note_nudge_anchor") batch.noteNudgeAnchors.push(item.value);
@@ -1158,6 +1296,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         compartments: unknown[];
         memories: unknown[];
         memoryMutations: unknown[];
+        memoriesDeleteIds: number[];
         dropSeeds?: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
@@ -1188,6 +1327,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       memories: input.memories,
                       memory_mutations: input.memoryMutations,
                   }),
+            ...(args.omitAuthorityMemorySections || input.memoriesDeleteIds.length === 0
+                ? {}
+                : { memories_delete_ids: input.memoriesDeleteIds }),
             user_profile: input.userProfile,
             ...(args.dropSeeds !== undefined ? { drop_seeds: input.dropSeeds } : {}),
             ...(args.pendingDropSeeds !== undefined
@@ -1208,6 +1350,10 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       project_memory_epoch: args.watermarks.project_memory_epoch,
                       user_profile_version: args.watermarks.project_user_profile_version,
                       acked_watermarks: args.watermarks,
+                      ...(args.memoriesReplaceProjects !== undefined &&
+                      !args.omitAuthorityMemorySections
+                          ? { memories_replace_projects: args.memoriesReplaceProjects }
+                          : {}),
                       ...(args.dropSeedSkipped !== undefined
                           ? { drop_seed_skipped: args.dropSeedSkipped }
                           : {}),
@@ -1216,6 +1362,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
                           : {}),
                       ...(args.autoSearchHintSkipped !== undefined
                           ? { auto_search_hint_skipped: args.autoSearchHintSkipped }
+                          : {}),
+                      ...(args.autoSearchHintSeeds !== undefined
+                          ? { user_hints_replace_session: true }
                           : {}),
                       ...(args.todoSyntheticAnchor !== undefined
                           ? { todo_synthetic_anchor: args.todoSyntheticAnchor }
@@ -1326,12 +1475,43 @@ export async function buildModuleStateSyncPayload(args: {
     options?: ModuleStateSyncOptions;
     seedId?: string;
 }): Promise<
-    ModuleStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" | "seed_budget"
+    | ModuleStateSyncPayload
+    | null
+    | "m0_mutation"
+    | "mismatch"
+    | "unresolved"
+    | "seed_budget"
+    | "frame_budget"
 > {
     const workspace = resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath);
     // One authority pool has one writer. While MODULE owns memories, this sender only mirrors
     // module changes back to TypeScript and must not send the TypeScript view in the other direction.
     const omitAuthorityMemorySections = args.options?.authorityState === "MODULE";
+    // A held-open v85 writer can append compatibility verification events at
+    // any time, not just before startup; reconcile them before reading
+    // watermarks so a resulting epoch bump is visible to THIS pass. The
+    // reconciler is watermark-guarded (one MAX probe when idle) and its
+    // failure must not fail the sync — an unmoved watermark retries next pass.
+    try {
+        reconcileCompatibilityVerifications(args.pass.db);
+    } catch (error) {
+        sessionLog(
+            args.pass.sessionId,
+            `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
+    // Sibling straggler probe: a held-open v85 writer can also append a NEW
+    // revision after the startup seeder completed; unseeded revisions read
+    // as automatic-hidden until seeded. One single-row anti-join when idle;
+    // the seed itself runs async and must not fail the sync.
+    try {
+        seedLateCompatibilityRevisions(args.pass.db);
+    } catch (error) {
+        sessionLog(
+            args.pass.sessionId,
+            `late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
     const currentWatermarks = loadModuleWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
@@ -1380,11 +1560,18 @@ export async function buildModuleStateSyncPayload(args: {
     };
     const compartmentsChanged =
         args.force || currentWatermarks.compartment_sequence > acked.compartment_sequence;
+    // In a workspace, a FOREIGN member's policy transition changes only the
+    // workspace fingerprint (which hashes every member's epoch), never the
+    // root project's epoch, so fingerprint drift must reach the memory lane.
+    const workspacePolicyDrift =
+        workspace.workspace != null &&
+        (currentWatermarks.workspace_fingerprint ?? null) !== (acked.workspace_fingerprint ?? null);
     const memoryChanged =
         !omitAuthorityMemorySections &&
         (args.force ||
             currentWatermarks.memory_id > acked.memory_id ||
-            currentWatermarks.project_memory_epoch !== acked.project_memory_epoch);
+            currentWatermarks.project_memory_epoch !== acked.project_memory_epoch ||
+            workspacePolicyDrift);
     const memoryMutationsChanged =
         !omitAuthorityMemorySections &&
         (args.force || currentWatermarks.memory_mutation_id > acked.memory_mutation_id);
@@ -1430,8 +1617,18 @@ export async function buildModuleStateSyncPayload(args: {
         }
     }
 
+    // A policy transition (approval, verification, revocation) changes rows
+    // the memory-id watermark cannot see: pre-existing memories flip in or
+    // out of automatic eligibility with no new row id. The root project's
+    // epoch carries that signal directly; workspace fingerprint drift covers
+    // foreign members' transitions.
+    const epochChanged =
+        memoryChanged &&
+        !args.force &&
+        (currentWatermarks.project_memory_epoch !== acked.project_memory_epoch ||
+            workspacePolicyDrift);
     const allMemories =
-        args.force && !omitAuthorityMemorySections && args.pass.projectPath
+        (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
             ? workspace.workspace
                 ? getMemoriesByProjects(
                       args.pass.db,
@@ -1449,7 +1646,7 @@ export async function buildModuleStateSyncPayload(args: {
                   )
             : [];
     const incrementalMemories =
-        memoryChanged && !args.force && args.pass.projectPath
+        memoryChanged && !args.force && !epochChanged && args.pass.projectPath
             ? readNewMemoriesForM1Union(
                   args.pass.db,
                   workspace.expandedIdentities,
@@ -1459,8 +1656,102 @@ export async function buildModuleStateSyncPayload(args: {
                   workspace.shareCategories,
               )
             : [];
-    const memoryRows = args.force ? allMemories : incrementalMemories;
-    const memories = memoryRows.map((memory) => ({
+    // Both full-snapshot shapes need replace semantics: the receiver only
+    // upserts, so without a prune scope a policy-hidden row already mirrored
+    // in the durable module store would survive a forced resync (which also
+    // acknowledges the current epoch, blocking any later epoch-driven
+    // replacement until the next policy change). The scope names ONLY the
+    // session's OWN identities: the workspace snapshot carries a foreign
+    // member's rows filtered by share category, so naming that member would
+    // let this session prune the member's non-shared rows from the global
+    // native store. Foreign members prune their own rows from their own
+    // sessions' syncs.
+    const memoriesReplaceProjects =
+        (args.force || epochChanged) && !omitAuthorityMemorySections && args.pass.projectPath
+            ? workspace.workspace
+                ? workspace.ownIdentities
+                : [args.pass.projectPath]
+            : undefined;
+    // The module mirror is a host-computed snapshot: only policy-eligible
+    // automatic rows cross the boundary, so the native memory lane can never
+    // serve content the policy hides. Rust stays free of policy derivation.
+    // Exact-bind each loaded row to the revision the policy evaluated: a
+    // rewrite committed between the snapshot load and the policy read
+    // resolves the id through the NEW revision, and the superseded bytes
+    // must not be persisted into the native store under its eligibility.
+    const policyFiltered = filterMemoriesByPolicy(
+        args.pass.db,
+        args.force || epochChanged ? allMemories : incrementalMemories,
+        "auto_inject",
+    ).memories;
+    const snapshotDigests = exactMemoryContentDigests(
+        args.pass.db,
+        policyFiltered.map((memory) => memory.id),
+    );
+    const memoryRows = policyFiltered.filter(
+        (memory) => snapshotDigests.get(memory.id) === sha256Utf8Hex(memory.content),
+    );
+    // The replace scope above cannot cover foreign workspace members, so a
+    // previously mirrored foreign row that the policy now hides — or that was
+    // archived or expired since it was mirrored — would survive in the native
+    // store until one of the member's own sessions syncs. Explicit id
+    // deletions close that gap for exactly those rows: an id-only foreign
+    // coverage query (all statuses, no expiry cutoff) minus the kept
+    // snapshot. Own-project rows are never named — the replace scope prunes
+    // them wholesale, and re-listing a large archived history here would
+    // bloat every force or epoch-driven sync for nothing. Non-shared foreign
+    // categories are outside the coverage scope entirely, so the session
+    // still cannot prune a member's non-shared rows.
+    const foreignCoverage = (() => {
+        if (!(args.force || epochChanged) || omitAuthorityMemorySections) return null;
+        if (!args.pass.projectPath) return null;
+        if (!workspace.workspace) return null;
+        const keptIds = new Set(memoryRows.map((memory) => memory.id));
+        const covered = readForeignCoverageMemoryIds({ db: args.pass.db, workspace });
+        const departed = covered.filter((row) => !keptIds.has(row.id));
+        // A CLASSIFICATION departure (shareable=0 / private scope) is the
+        // owner's row leaving the shared view, not leaving existence: the
+        // native store applies shareable/scope itself when selecting
+        // foreign rows, so upserting the current classification hides it
+        // from foreign readers while the owner's own native injection keeps
+        // it. Deleting it globally would erase the owner's private memory
+        // from native injection until an unrelated force sync. Only rows
+        // the POLICY hides (still share-classified but not kept) are
+        // deleted — uniform absence applies to everyone including the
+        // owner.
+        const reclassifyIds = departed.filter((row) => !row.shareVisible).map((row) => row.id);
+        const reclassifyEligible = new Set(
+            filterMemoryIdsByPolicy(args.pass.db, reclassifyIds, "auto_inject"),
+        );
+        const deleteIds = departed
+            .filter((row) => row.shareVisible || !reclassifyEligible.has(row.id))
+            .map((row) => row.id);
+        const reclassifyRows = bindMemoriesToCurrentRevision(
+            args.pass.db,
+            getMemoriesByIds(
+                args.pass.db,
+                reclassifyIds.filter((id) => reclassifyEligible.has(id)),
+            ),
+        );
+        return { deleteIds, reclassifyRows };
+    })();
+    const memoriesDeleteIds =
+        foreignCoverage !== null && foreignCoverage.deleteIds.length > 0
+            ? foreignCoverage.deleteIds
+            : undefined;
+    const snapshotRows =
+        foreignCoverage !== null && foreignCoverage.reclassifyRows.length > 0
+            ? [...memoryRows, ...foreignCoverage.reclassifyRows]
+            : memoryRows;
+    // Retained for the post-send recheck: a held-open pre-v86 writer can
+    // rewrite a member while the paged sends are in flight without bumping
+    // the epoch, and the completing-batch epoch/fingerprint comparison
+    // cannot see it. The digests describe exactly the bytes this payload
+    // installs (each row passed the oracle equality above).
+    const memorySnapshotDigests: ReadonlyMap<number, string> = new Map(
+        snapshotRows.map((memory) => [memory.id, sha256Utf8Hex(memory.content)]),
+    );
+    const memories = snapshotRows.map((memory) => ({
         id: memory.id,
         project_path: memory.projectPath,
         category: memory.category,
@@ -1486,7 +1777,13 @@ export async function buildModuleStateSyncPayload(args: {
         merged_from: memory.mergedFrom,
         metadata_json: memory.metadataJson,
     }));
-    const renderedMemoryIds = memoryMutationsChanged
+    // Mutation targets cross the boundary with `new_content`, so they get the
+    // same automatic policy as the snapshot rows: a hidden target's update
+    // must not ship its bytes through the mutation lane (a held-open compat
+    // writer can advance the mutation watermark without an epoch bump). The
+    // reader still force-includes visibility-mutation targets, so removal
+    // signals for previously mirrored rows are unaffected.
+    const unfilteredRenderedIds = memoryMutationsChanged
         ? args.force
             ? allMemories.map((memory) => memory.id)
             : readRenderedMemoryIds({
@@ -1496,27 +1793,84 @@ export async function buildModuleStateSyncPayload(args: {
                   nowMs: args.pass.nowMs,
               })
         : [];
+    const renderedMemoryIds = memoryMutationsChanged
+        ? args.force
+            ? memoryRows.map((memory) => memory.id)
+            : filterMemoryIdsByPolicy(args.pass.db, unfilteredRenderedIds, "auto_inject")
+        : [];
+    // A denied mutation target must not merely be dropped: the mutation
+    // watermark still advances, so with no full snapshot in this payload the
+    // module would keep serving the previously mirrored (old, eligible) row
+    // until an unrelated resync. Name denied targets as explicit deletions so
+    // the incremental sync removes the stale native row in the same
+    // acknowledgement. The full-snapshot shapes already cover them through
+    // the coverage subtraction above.
+    const incrementalDeniedIds = (() => {
+        if (memoriesDeleteIds !== undefined) return undefined;
+        if (!memoryMutationsChanged || args.force || epochChanged) return undefined;
+        const shipped = new Set(renderedMemoryIds);
+        const denied = unfilteredRenderedIds.filter((id) => !shipped.has(id));
+        return denied.length > 0 ? denied : undefined;
+    })();
+    const effectiveMemoriesDeleteIds = memoriesDeleteIds ?? incrementalDeniedIds;
     const userProfile = includeUserProfile
         ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
         : [];
-    const memoryMutations =
-        memoryMutationsChanged && args.pass.projectPath
-            ? getMemoryMutationsForRenderByProjects(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  acked.memory_mutation_id,
-                  renderedMemoryIds,
-              ).map((row) => ({
-                  id: row.id,
-                  project_path: row.projectPath,
-                  mutation_type: row.mutationType,
-                  target_memory_id: row.targetMemoryId,
-                  superseded_by_id: row.supersededById,
-                  category: row.category,
-                  new_content: row.newContent,
-                  queued_at: row.queuedAt,
-              }))
-            : [];
+    // Retained for the post-send recheck: a held-open compatibility writer
+    // can rewrite a mutation target while the sends are in flight without
+    // bumping the epoch, and the snapshot digests do not cover mutation
+    // content.
+    const boundMutationDigests = new Map<number, { targetMemoryId: number; digest: string }>();
+    const memoryMutations = (() => {
+        if (!memoryMutationsChanged || !args.pass.projectPath) return [];
+        const rows = getMemoryMutationsForRenderByProjects(
+            args.pass.db,
+            workspace.expandedIdentities,
+            acked.memory_mutation_id,
+            renderedMemoryIds,
+        );
+        // Bind each content-carrying mutation to the revision the policy
+        // check evaluated: a held-open pre-v86 writer can rewrite the target
+        // AFTER filterMemoryIdsByPolicy approved the id but BEFORE this read
+        // — without bumping the policy epoch, so the completion guard cannot
+        // catch it. A mutation whose bytes no longer match the claim's
+        // current revision is dropped; the unprojected successor reaches the
+        // native store only after the late-seed probe seeds it and the epoch
+        // bump triggers a policy-checked full sync.
+        const contentTargets = rows
+            .filter((row) => typeof row.newContent === "string")
+            .map((row) => row.targetMemoryId);
+        const oracleDigests = exactMemoryContentDigests(args.pass.db, contentTargets);
+        const bound = rows.filter(
+            (row) =>
+                typeof row.newContent !== "string" ||
+                oracleDigests.get(row.targetMemoryId) === sha256Utf8Hex(row.newContent),
+        );
+        if (bound.length < rows.length) {
+            sessionLog(
+                args.pass.sessionId,
+                `module sync dropped ${rows.length - bound.length} mutation(s) whose bytes no longer match the policy-evaluated revision`,
+            );
+        }
+        for (const row of bound) {
+            if (typeof row.newContent === "string") {
+                boundMutationDigests.set(row.id, {
+                    targetMemoryId: row.targetMemoryId,
+                    digest: sha256Utf8Hex(row.newContent),
+                });
+            }
+        }
+        return bound.map((row) => ({
+            id: row.id,
+            project_path: row.projectPath,
+            mutation_type: row.mutationType,
+            target_memory_id: row.targetMemoryId,
+            superseded_by_id: row.supersededById,
+            category: row.category,
+            new_content: row.newContent,
+            queued_at: row.queuedAt,
+        }));
+    })();
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
     const pendingDropSeedState = args.force
         ? buildPendingDropSeeds({ db: args.pass.db, sessionId: args.pass.sessionId, readRawById })
@@ -1527,13 +1881,18 @@ export async function buildModuleStateSyncPayload(args: {
               text: anchor.text,
           }))
         : undefined;
-    const autoSearchHintSeedState = args.force
-        ? buildAutoSearchHintSeeds({
-              db: args.pass.db,
-              sessionId: args.pass.sessionId,
-              readRawById,
-          })
-        : null;
+    // Hint seeds ride force seeds AND epoch-driven syncs: the native store
+    // upserts them, so a policy transition that revokes a hint's fragments
+    // (seeded below as the empty no-result shape) reaches the module on the
+    // same epoch bump that hides the memory, not only on the next reseed.
+    const autoSearchHintSeedState =
+        args.force || epochChanged
+            ? buildAutoSearchHintSeeds({
+                  db: args.pass.db,
+                  sessionId: args.pass.sessionId,
+                  readRawById,
+              })
+            : null;
     const persistedTodoAnchor = args.force
         ? getPersistedTodoSyntheticAnchor(args.pass.db, args.pass.sessionId)
         : null;
@@ -1641,18 +2000,33 @@ export async function buildModuleStateSyncPayload(args: {
         lastTodoState: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
         watermarks: currentWatermarks,
         omitAuthorityMemorySections,
+        memoriesReplaceProjects,
+        memoriesDeleteIds: effectiveMemoriesDeleteIds,
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
-        return { ...wireBatches[0], wireBatches };
+        return {
+            ...wireBatches[0],
+            wireBatches,
+            memorySnapshotDigests,
+            memoryMutationDigests: boundMutationDigests,
+        };
     }
-    return {
+    const livePayload: ModuleStateSyncPayload = {
+        memorySnapshotDigests,
+        memoryMutationDigests: boundMutationDigests,
         method: "state_sync",
         params: {
             shadow_generation: args.state.moduleGeneration,
             expected_shadow_seq: args.state.lastAckedSeq,
             compartments,
             ...(omitAuthorityMemorySections ? {} : { memories, memory_mutations: memoryMutations }),
+            ...(memoriesReplaceProjects !== undefined
+                ? { memories_replace_projects: memoriesReplaceProjects }
+                : {}),
+            ...(effectiveMemoriesDeleteIds !== undefined && !omitAuthorityMemorySections
+                ? { memories_delete_ids: effectiveMemoriesDeleteIds }
+                : {}),
             ...(includeUserProfile ? { user_profile: userProfile } : {}),
             ...(includeWorkspace ? { workspace: workspace.workspace } : {}),
             last_todo_state: effectiveLastTodoState(args.pass.sessionId, sessionMeta),
@@ -1668,9 +2042,36 @@ export async function buildModuleStateSyncPayload(args: {
             ...(channel2NudgeState !== undefined
                 ? { channel2_nudge_state: channel2NudgeState }
                 : {}),
+            ...(autoSearchHintSeedState !== null
+                ? {
+                      // The decision list is COMPLETE whenever it was built
+                      // (force or epoch-driven): send it — even empty — with
+                      // replace semantics, so a stored native hint whose
+                      // decision can no longer be resolved (a migrated
+                      // tombstone with no raw block and no recorded id) is
+                      // deleted on the same epoch bump that revoked it,
+                      // not only on the next paged force sync.
+                      auto_search_hint_decisions: autoSearchHintSeedState.seeds,
+                      user_hints_replace_session: true,
+                  }
+                : {}),
         },
         watermarks: currentWatermarks,
     };
+    // Any live payload can outgrow one frame: an epoch-driven replacement
+    // snapshot loads the full eligible set, and an incremental sync can
+    // accumulate arbitrarily many rows, mutations, and deletion ids while the
+    // module is unavailable. An oversized frame would fail identically on
+    // every retry and permanently stall the mirror, so escalate to the paged
+    // seed protocol instead — the caller retries the same sync with force,
+    // which routes through buildPagedModuleStateSyncPayloads above.
+    if (
+        moduleWireBodyBytes({ method: "state_sync", params: livePayload.params }) >
+        MODULE_LIVE_SYNC_MAX_BYTES
+    ) {
+        return "frame_budget";
+    }
+    return livePayload;
 }
 
 export interface ModuleStateSyncClient {
@@ -1775,6 +2176,10 @@ export async function syncModuleState(args: {
     options?: ModuleStateSyncOptions;
 }): Promise<ModuleStateSyncResult> {
     let force = args.force;
+    // Captured from the completing batch of the most recent send, for the
+    // post-send policy revalidation below (the batch list itself is scoped
+    // to the try block).
+    let completingBatchParams: unknown = null;
     const adoption = args.options?.authoritySeqAdoption ?? { used: false };
     const resolveStateSyncDeltas = async (afterGenerationChange = false): Promise<boolean> => {
         let capability = afterGenerationChange ? undefined : args.options?.stateSyncDeltas;
@@ -1805,6 +2210,15 @@ export async function syncModuleState(args: {
             options: { ...args.options, stateSyncDeltas },
         });
         if (payload === null) return { status: "no_change" };
+        if (payload === "frame_budget") {
+            // The live snapshot exceeded the single-frame budget; the paged
+            // seed protocol carries the same replacement content in bounded
+            // pages. The force path never returns this sentinel, so the
+            // escalation cannot loop.
+            if (force) throw new Error("module state sync frame_budget after escalation");
+            force = true;
+            continue;
+        }
         if (
             payload === "m0_mutation" ||
             payload === "mismatch" ||
@@ -1815,7 +2229,42 @@ export async function syncModuleState(args: {
         }
         try {
             const batches = payload.wireBatches ?? [payload];
-            for (const batch of batches) {
+            completingBatchParams = batches.length > 0 ? batches[batches.length - 1].params : null;
+            for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+                const batch = batches[batchIndex];
+                if (batchIndex === batches.length - 1 && args.pass.projectPath) {
+                    // The snapshot's policy check ran at payload construction,
+                    // and awaited work (delta probes, earlier page sends) runs
+                    // between then and this completing send. An epoch bump in
+                    // that window means a policy or content transition landed
+                    // after the check — abort and rebuild from current state
+                    // rather than apply the stale snapshot to the native
+                    // store. The workspace fingerprint hashes EVERY member's
+                    // epoch, so a foreign member's transition (which does not
+                    // move the root project epoch) also forces the rebuild.
+                    const params = batch.params as {
+                        project_memory_epoch?: number;
+                        acked_watermarks?: { workspace_fingerprint?: string | null };
+                    };
+                    const epochAtBuild = params.project_memory_epoch;
+                    const epochNow =
+                        getProjectState(args.pass.db, args.pass.projectPath)?.projectMemoryEpoch ??
+                        0;
+                    const epochMoved = epochAtBuild !== undefined && epochNow !== epochAtBuild;
+                    const fingerprintAtBuild = params.acked_watermarks?.workspace_fingerprint;
+                    const fingerprintMoved =
+                        fingerprintAtBuild !== undefined &&
+                        (resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath)
+                            .workspace?.fingerprint ?? null) !== (fingerprintAtBuild ?? null);
+                    if (epochMoved || fingerprintMoved) {
+                        sessionLog(
+                            args.pass.sessionId,
+                            `module state sync aborted before completing batch: ${epochMoved ? `project memory epoch moved ${epochAtBuild} -> ${epochNow}` : "workspace fingerprint moved"} during send; rebuilding`,
+                        );
+                        force = true;
+                        continue syncLoop;
+                    }
+                }
                 const response = await args.client.call({
                     sessionId: args.pass.sessionId,
                     projectRoot: args.projectRoot,
@@ -1860,6 +2309,109 @@ export async function syncModuleState(args: {
             args.state.lastAckedWatermarks = null;
             force = true;
             continue;
+        }
+        // Post-send revalidation: a held-open pre-v86 compatibility writer
+        // appends stale/flagged verification events WITHOUT bumping the
+        // project epoch — including while the awaited sends above were in
+        // flight, a window the pre-send completing-batch check cannot see.
+        // Reconcile first (it projects those events into policy state and
+        // bumps the epoch when any exist), then compare against the built
+        // snapshot; accepting the old watermarks here would leave the module
+        // serving a row the current policy already soft-hides.
+        if (args.pass.projectPath && completingBatchParams !== null) {
+            reconcileCompatibilityVerifications(args.pass.db);
+            const params = completingBatchParams as {
+                project_memory_epoch?: number;
+                acked_watermarks?: { workspace_fingerprint?: string | null };
+            };
+            const epochAtBuild = params.project_memory_epoch;
+            const epochNow =
+                getProjectState(args.pass.db, args.pass.projectPath)?.projectMemoryEpoch ?? 0;
+            const epochMoved = epochAtBuild !== undefined && epochNow !== epochAtBuild;
+            const fingerprintAtBuild = params.acked_watermarks?.workspace_fingerprint;
+            const fingerprintMoved =
+                fingerprintAtBuild !== undefined &&
+                (resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath).workspace
+                    ?.fingerprint ?? null) !== (fingerprintAtBuild ?? null);
+            if (epochMoved || fingerprintMoved) {
+                sessionLog(
+                    args.pass.sessionId,
+                    `module state sync rebuilding after send: ${epochMoved ? `project memory epoch moved ${epochAtBuild} -> ${epochNow}` : "workspace fingerprint moved"} while the sync was in flight`,
+                );
+                force = true;
+                continue;
+            }
+            // Exact snapshot recheck: the epoch/fingerprint comparison above
+            // cannot see a held-open pre-v86 writer's rewrite (it never
+            // bumps the epoch), so re-prove every content-carrying snapshot
+            // row this payload installed against the claim-revision oracle
+            // and rebuild before acking on any mismatch.
+            const sentDigests = payload.memorySnapshotDigests;
+            if (sentDigests !== undefined && sentDigests.size > 0) {
+                const sentIds = [...sentDigests.keys()];
+                const digestsNow = exactMemoryContentDigests(args.pass.db, sentIds);
+                const rewritten = sentIds.filter(
+                    (id) => digestsNow.get(id) !== sentDigests.get(id),
+                );
+                if (rewritten.length > 0) {
+                    sessionLog(
+                        args.pass.sessionId,
+                        `module state sync rebuilding after send: ${rewritten.length} snapshot row(s) rewritten while the sync was in flight`,
+                    );
+                    force = true;
+                    continue;
+                }
+            }
+            // Mutations carry content the snapshot digests do not cover:
+            // re-prove each sent mutation's bytes against the claim-revision
+            // oracle the same way, or the sender would ack the mutation
+            // watermark for content a compatibility writer superseded while
+            // the call was in flight.
+            const sentMutationDigests = payload.memoryMutationDigests;
+            if (sentMutationDigests !== undefined && sentMutationDigests.size > 0) {
+                const targets = [...sentMutationDigests.values()].map(
+                    (entry) => entry.targetMemoryId,
+                );
+                const digestsNow = exactMemoryContentDigests(args.pass.db, targets);
+                const rewrittenMutations = [...sentMutationDigests.values()].filter(
+                    (entry) => digestsNow.get(entry.targetMemoryId) !== entry.digest,
+                );
+                if (rewrittenMutations.length > 0) {
+                    sessionLog(
+                        args.pass.sessionId,
+                        `module state sync rebuilding after send: ${rewrittenMutations.length} mutation target(s) rewritten while the sync was in flight`,
+                    );
+                    force = true;
+                    continue;
+                }
+            }
+            // Reapply the automatic policy itself to every id this payload
+            // installed: a held-open v85 writer can record a claim_conflicts
+            // supersession (or another authoritative fact) mid-flight that
+            // bumps no epoch and changes no digest — the reconcile above
+            // only projects verification events. readMemoryPolicyRows reads
+            // the authoritative conflict/disposition subqueries, so a
+            // now-hidden id here forces the rebuild that removes it.
+            const installedIds = new Set<number>([
+                ...(payload.memorySnapshotDigests?.keys() ?? []),
+                ...[...(payload.memoryMutationDigests?.values() ?? [])].map(
+                    (entry) => entry.targetMemoryId,
+                ),
+            ]);
+            if (installedIds.size > 0) {
+                const eligibleNow = new Set(
+                    filterMemoryIdsByPolicy(args.pass.db, [...installedIds], "auto_inject"),
+                );
+                const hiddenNow = [...installedIds].filter((id) => !eligibleNow.has(id));
+                if (hiddenNow.length > 0) {
+                    sessionLog(
+                        args.pass.sessionId,
+                        `module state sync rebuilding after send: ${hiddenNow.length} installed row(s) no longer auto-eligible`,
+                    );
+                    force = true;
+                    continue;
+                }
+            }
         }
         args.state.lastAckedWatermarks = payload.watermarks;
         args.state.lastAckedSeq += 1;

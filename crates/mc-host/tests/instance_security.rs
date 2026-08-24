@@ -262,3 +262,64 @@ async fn a_planted_symlink_at_the_record_name_is_replaced_not_followed() {
 
     host.shutdown_gracefully().await;
 }
+
+/// The crate lint is `deny(unsafe_code)`, not `forbid`, because one
+/// `pre_exec` hook must arm `PR_SET_PDEATHSIG` so harness children cannot
+/// outlive a crashed host. `deny` is locally overridable, so this test
+/// restores the hard guarantee `forbid` gave: exactly one scoped
+/// `allow(unsafe_code)` exists, in the one file entitled to it, and it
+/// carries a safety justification.
+///
+/// (Keeping crate-root `forbid` was not an option: `forbid` cannot be
+/// overridden anywhere in the same crate, so the only alternative was
+/// moving the spawn helper into a separate crate for ~20 lines.)
+#[test]
+fn exactly_one_unsafe_escape_hatch_exists_in_the_crate() {
+    const BLESSED: &str = "broca/subprocess.rs";
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sites = Vec::new();
+
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read source dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            for (index, line) in text.lines().enumerate() {
+                if line.contains("allow(unsafe_code)") {
+                    let relative = path
+                        .strip_prefix(&src)
+                        .expect("source-relative path")
+                        .to_string_lossy()
+                        .into_owned();
+                    sites.push((relative, index + 1, text.clone()));
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        sites.len(),
+        1,
+        "exactly one allow(unsafe_code) may exist; found {:?}",
+        sites
+            .iter()
+            .map(|(file, line, _)| format!("{file}:{line}"))
+            .collect::<Vec<_>>()
+    );
+    let (file, _, text) = &sites[0];
+    assert_eq!(
+        file, BLESSED,
+        "the only allow(unsafe_code) must stay in {BLESSED}"
+    );
+    assert!(
+        text.contains("// SAFETY:"),
+        "the unsafe escape hatch must carry a SAFETY justification"
+    );
+}

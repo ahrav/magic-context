@@ -31,8 +31,11 @@ function formatResult(
 ): string {
     if (result.source === "memory") {
         const source = result.sourceName ? ` source=${boundDynamicField(result.sourceName)}` : "";
+        const policy = result.policyLabel
+            ? ` trust=[${boundDynamicField(result.policyLabel)}]`
+            : "";
         return [
-            `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${boundDynamicField(result.category)}${source} match=${result.matchType}`,
+            `[${index}] [memory] score=${result.score.toFixed(2)} id=${result.memoryId} category=${boundDynamicField(result.category)}${source} match=${result.matchType}${policy}`,
             boundDynamicField(result.content),
         ].join("\n");
     }

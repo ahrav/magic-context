@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::handler::{ManifestSnapshot, RouteIdentity, RouteTarget, TargetKind};
+use crate::handler::{ManifestSnapshot, RouteClass, RouteIdentity, RouteTarget, TargetKind};
 
 pub const CODE_INVALID_CONTROL_REQUEST: &str = "invalid_control_request";
 pub const CODE_UNSUPPORTED_OPERATION: &str = "unsupported_operation";
@@ -27,19 +27,26 @@ pub const OP_TRANSPORT_NEGOTIATE: &str = crate::transport_negotiation::OP_TRANSP
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
 /// pairs.
 pub struct TargetIndex {
-    entries: Vec<(Box<str>, Vec<TargetKind>)>,
+    entries: Vec<(Box<str>, Vec<TargetKind>, RouteClass)>,
 }
 
 impl TargetIndex {
-    pub(crate) fn new(entries: Vec<(Box<str>, Vec<TargetKind>)>) -> Self {
+    pub(crate) fn new(entries: Vec<(Box<str>, Vec<TargetKind>, RouteClass)>) -> Self {
         Self { entries }
     }
 
     fn kinds_of(&self, module_id: &str) -> Option<&[TargetKind]> {
         self.entries
             .iter()
-            .find(|(id, _)| id.as_ref() == module_id)
-            .map(|(_, kinds)| kinds.as_slice())
+            .find(|(id, _, _)| id.as_ref() == module_id)
+            .map(|(_, kinds, _)| kinds.as_slice())
+    }
+
+    pub(crate) fn class_of(&self, module_id: &str) -> Option<RouteClass> {
+        self.entries
+            .iter()
+            .find(|(id, _, _)| id.as_ref() == module_id)
+            .map(|(_, _, class)| *class)
     }
 }
 
@@ -697,11 +704,25 @@ mod tests {
 
     const LINKED: &str = "magic-context";
     const SYNAPSE: &str = "synapse";
+    const BROCA: &str = "broca";
 
     fn two_target_index() -> TargetIndex {
         TargetIndex::new(vec![
-            (LINKED.into(), vec![TargetKind::ToolProvider]),
-            (SYNAPSE.into(), vec![TargetKind::ManagementSurface]),
+            (
+                LINKED.into(),
+                vec![TargetKind::ToolProvider],
+                RouteClass::General,
+            ),
+            (
+                SYNAPSE.into(),
+                vec![TargetKind::ManagementSurface],
+                RouteClass::General,
+            ),
+            (
+                BROCA.into(),
+                vec![TargetKind::ManagementSurface],
+                RouteClass::Reserved,
+            ),
         ])
     }
 
@@ -948,7 +969,11 @@ mod tests {
 
     #[test]
     fn wrong_role_for_known_module_is_target_unavailable() {
-        for (module, kind) in [(LINKED, "management_surface"), (SYNAPSE, "tool_provider")] {
+        for (module, kind) in [
+            (LINKED, "management_surface"),
+            (SYNAPSE, "tool_provider"),
+            (BROCA, "tool_provider"),
+        ] {
             let mut request = minimal_route_open();
             request["target"]["module_id"] = serde_json::Value::String(module.to_owned());
             request["target"]["kind"] = serde_json::Value::String(kind.to_owned());
@@ -966,6 +991,26 @@ mod tests {
             }
             assert_eq!(reject_code(parse(&request)), CODE_TARGET_UNAVAILABLE);
         }
+    }
+
+    #[test]
+    fn broca_management_surface_parses_with_its_declared_class() {
+        let mut request = minimal_route_open();
+        request["target"]["kind"] = serde_json::Value::String("management_surface".to_owned());
+        request["target"]["module_id"] = serde_json::Value::String(BROCA.to_owned());
+        let ControlAction::RouteOpen { target, .. } = parse(&request) else {
+            panic!("expected route open");
+        };
+        assert_eq!(target.module_id, BROCA);
+        assert_eq!(target.kind, TargetKind::ManagementSurface);
+        assert_eq!(
+            two_target_index().class_of(BROCA),
+            Some(RouteClass::Reserved)
+        );
+        assert_eq!(
+            two_target_index().class_of(LINKED),
+            Some(RouteClass::General)
+        );
     }
 
     #[test]

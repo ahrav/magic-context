@@ -8,7 +8,11 @@ import {
     dropInheritedEmbeddingKeyOnRedirect,
     stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
-import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
+import {
+    DEFAULT_LOCAL_EMBEDDING_MODEL,
+    MagicContextConfigSchema,
+    RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL,
+} from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
@@ -748,6 +752,13 @@ async function runHealthChecks(options: {
         // Windows it sometimes fails to install and the plugin's static import
         // throws on every embedding (#128). Layout-agnostic resolution from the
         // installed plugin dir; stays silent if no plugin dir can be inspected.
+        if (loadedConfig.config.embedding.model === RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL) {
+            add(
+                results,
+                "warn",
+                `Config pins the retired default embedding model (${RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL}); remove the embedding.model line or rerun setup to adopt the current default (${DEFAULT_LOCAL_EMBEDDING_MODEL})`,
+            );
+        }
         let runtimeReported = false;
         let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
         for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {

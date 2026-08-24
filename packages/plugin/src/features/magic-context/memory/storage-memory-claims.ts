@@ -24,7 +24,12 @@ import {
     memoryLineagePresentSql,
     memoryRelationshipSourceMatchSql,
 } from "../storage-memory-claims-schema.ts";
-import { trustClassForLegacyMemorySource } from "./source-trust.ts";
+import {
+    automaticLadderSteps,
+    classifyFineTaint,
+    TAINT_CLASSIFIER_METHOD,
+} from "./claim-policy.ts";
+import { liveRewriteSourceType, trustClassForLegacyMemorySource } from "./source-trust.ts";
 import {
     type ApplicabilityPathsInput,
     hasClaimApplicabilitySchema,
@@ -34,8 +39,17 @@ import {
     syncMemoryApplicabilityPathsInCurrentTransaction,
 } from "./storage-claim-applicability.ts";
 import {
+    appendMaturityAssertionInCurrentTransaction,
+    createPolicySubjectInCurrentTransaction,
+    hasClaimPolicySchema,
+    readPolicySubject,
+    readPolicySupport,
+    readRevisionIdentity,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "./storage-claim-policy.ts";
+import {
     addClaimConflictInCurrentTransaction,
-    addVerificationEvent,
+    addVerificationEvent as addVerificationEventRaw,
     appendClaimRevisionInCurrentTransaction,
     ClaimGraphCorruptionError,
     type ClaimState,
@@ -806,6 +820,22 @@ function appendMemoryClaimRevision(
     },
 ): number {
     const expected = readClaimCurrentRevisionId(db, args.claimId);
+    // Rendered surfaces follow the claim's CURRENT revision. The per-revision
+    // refresh diffs a brand-new revision against its own (absent) projection
+    // — both sides read ineligible — so replacing an auto-eligible revision
+    // with an ineligible successor would never bump the epoch and cached
+    // m0/mirror content would keep serving the predecessor. Diff across the
+    // succession instead.
+    const policySchema = hasClaimPolicySchema(db);
+    const predecessorEligible = policySchema
+        ? ((
+              db
+                  .prepare(
+                      "SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+                  )
+                  .get(expected) as { auto: number } | null | undefined
+          )?.auto ?? 0)
+        : 0;
     const outcome = appendClaimRevisionInCurrentTransaction(db, {
         claimId: args.claimId,
         expectedCurrentRevisionId: expected,
@@ -820,6 +850,26 @@ function appendMemoryClaimRevision(
         );
     }
     insertRevisionMemoryMetadata(db, outcome.revisionId, args.metadata);
+    ensureRevisionPolicyInCurrentTransaction(db, outcome.revisionId, args.observationId);
+    if (policySchema) {
+        const successorEligible =
+            (
+                db
+                    .prepare(
+                        "SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+                    )
+                    .get(outcome.revisionId) as { auto: number } | null | undefined
+            )?.auto ?? 0;
+        // The 0->1 direction already bumped inside ensureRevisionPolicy: the
+        // successor's projection was created eligible, which the reducer's
+        // own before/after diff detects. Only the eligible-predecessor ->
+        // ineligible-successor handoff is invisible to it (the successor's
+        // projection never changes after creation), so only that direction
+        // bumps here.
+        if (predecessorEligible === 1 && successorEligible === 0) {
+            bumpEpochForClaimProjectInCurrentTransaction(db, args.claimId);
+        }
+    }
     return outcome.revisionId;
 }
 
@@ -936,6 +986,11 @@ export function ensureMemoryClaimLinkInCurrentTransaction(
             (memory_id, canonical_memory_id, claim_id, project_id, root_observation_id, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
     ).run(row.id, row.id, created.claimId, projectId, observationId, now);
+    // The crosswalk row must exist before the policy refresh: an immediately
+    // auto-eligible link (e.g. USER_EXPLICIT taint) bumps the owning
+    // project's memory epoch through `legacy_memory_claims`, and a missing
+    // row silently skips the bump, leaving cached snapshots stale.
+    ensureRevisionPolicyInCurrentTransaction(db, created.revisionId, observationId);
     resolveMemoryClaimLinkFailure(db, row.id);
     return {
         memoryId: row.id,
@@ -990,6 +1045,14 @@ export function recordMemoryClaimSupersessionOutcomeInCurrentTransaction(
             leftRevisionId: targetRevisionId,
             rightRevisionId: sourceRevisionId,
         });
+        if (hasClaimPolicySchema(db)) {
+            // The full maturity refresh (not the bare projection write) diffs
+            // auto-eligibility and bumps the project memory epoch: a
+            // supersession flips the source revision out of automatic
+            // visibility, and without the bump the native mirror keeps
+            // serving it until an unrelated epoch change.
+            refreshRevisionMaturityInCurrentTransaction(db, sourceRevisionId);
+        }
         return "recorded";
     }
     const existing = db
@@ -1354,6 +1417,180 @@ export function retireMemoryClaimInCurrentTransaction(
 }
 
 // ---------------------------------------------------------------------------
+// Claim policy companions (trust plan U2: KTD1-KTD4)
+// ---------------------------------------------------------------------------
+
+const MEMORY_POLICY_ACTOR = "reducer:mc-memory-v1";
+
+/**
+ * Recompute the automated maturity ladder and effective projection for one
+ * revision from current authoritative rows (R6-R8, R15). No-op until the
+ * revision has a frozen policy subject: a missing subject stays readable as
+ * conservative unknown (R26). Exported for the startup reconciler: a
+ * held-open v85 writer can append verification facts without running this
+ * reducer, and the read path only lets NEGATIVE authoritative facts override
+ * the projection.
+ */
+export function refreshRevisionMaturityInCurrentTransaction(
+    db: Database,
+    revisionId: number,
+): void {
+    if (!hasClaimPolicySchema(db)) return;
+    const subject = readPolicySubject(db, revisionId);
+    if (!subject) return;
+    const identity = readRevisionIdentity(db, revisionId);
+    if (!identity) return;
+    const support = readPolicySupport(db, revisionId);
+    const transition = {
+        kind: subject.claimKind,
+        originTaint: subject.originTaint,
+        independentGroups: support.independentGroups,
+        verified: support.verified,
+        explicitUserEvidence: support.explicitUserEvidence,
+    };
+    const steps = automaticLadderSteps(support.historicalMaturity, transition);
+    for (const step of steps) {
+        appendMaturityAssertionInCurrentTransaction(db, {
+            revisionId,
+            projectId: identity.projectId,
+            maturity: step,
+            actor: MEMORY_POLICY_ACTOR,
+        });
+    }
+    const before = db
+        .prepare("SELECT auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?")
+        .get(revisionId) as { auto: number } | null | undefined;
+    // Reuse the already-gathered support facts on the no-step common case;
+    // an appended ladder step advances the maturity head, making the
+    // pre-append snapshot stale, so the refresh re-reads it then.
+    const decision = refreshEffectivePolicyInCurrentTransaction(db, revisionId, {
+        support: steps.length === 0 ? support : undefined,
+    });
+    const autoAfter = decision.surfaces.auto_inject.eligible ? 1 : 0;
+    if ((before?.auto ?? 0) !== autoAfter) {
+        // Crossing the automatic boundary invalidates every derived
+        // project-memory cache, including the native module mirror, through
+        // the existing epoch rematerialization path.
+        bumpEpochForClaimProjectInCurrentTransaction(db, identity.claimId);
+    }
+}
+
+/** Bump the owning project's memory epoch for a claim so every derived
+ * project-memory cache (including the native module mirror) rematerializes.
+ * A claim with no memory link feeds no memory surface and no-ops.
+ *
+ * Sessions key `project_state` by the identity they resolve TODAY, which can
+ * differ from the path stored on a linked memory row: a canonical-identity
+ * change keeps the old identity only as a `project_aliases` row, and a
+ * never-rekeyed legacy path survives on the memory itself. Bumping only the
+ * stored path would leave the canonical reader's watermark intact and its
+ * caches serving the pre-change visibility set, so every identity attached
+ * to the claim's project — canonical, aliases, and linked memory paths — is
+ * bumped. */
+export function bumpEpochForClaimProjectInCurrentTransaction(db: Database, claimId: number): void {
+    if (!tableExists(db, "project_state")) return;
+    const identities = db
+        .prepare(
+            `SELECT memories.project_path AS projectPath
+               FROM legacy_memory_claims lmc
+               JOIN memories ON memories.id = lmc.canonical_memory_id
+              WHERE lmc.claim_id = ?
+             UNION
+             SELECT projects.canonical_identity
+               FROM claims
+               JOIN projects ON projects.id = claims.project_id
+              WHERE claims.id = ?
+                AND EXISTS (SELECT 1 FROM legacy_memory_claims WHERE claim_id = claims.id)
+             UNION
+             SELECT aliases.alias_identity
+               FROM claims
+               JOIN project_aliases aliases ON aliases.project_id = claims.project_id
+              WHERE claims.id = ?
+                AND EXISTS (SELECT 1 FROM legacy_memory_claims WHERE claim_id = claims.id)`,
+        )
+        .all(claimId, claimId, claimId) as Array<{ projectPath: string }>;
+    if (identities.length === 0) return;
+    const bump = db.prepare(
+        `INSERT INTO project_state
+            (project_path, project_memory_epoch, project_user_profile_version, updated_at)
+         VALUES (?, 1, 0, ?)
+         ON CONFLICT(project_path) DO UPDATE SET
+            project_memory_epoch = project_memory_epoch + 1,
+            updated_at = excluded.updated_at`,
+    );
+    const now = Date.now();
+    for (const identity of identities) {
+        bump.run(identity.projectPath, now);
+    }
+}
+
+function tableExists(db: Database, name: string): boolean {
+    return (
+        db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !=
+        null
+    );
+}
+
+/**
+ * Freeze the policy subject for a newly appended revision and run the first
+ * ladder pass (R1, R12): origin taint derives from the origin observation's
+ * host-written trust class and extractor lineage, never from extracted
+ * content or retained memory metadata (R4). Successor revisions never
+ * inherit approval or enforcement because the subject and stream are new.
+ */
+function ensureRevisionPolicyInCurrentTransaction(
+    db: Database,
+    revisionId: number,
+    originObservationId: number | null,
+): void {
+    if (!hasClaimPolicySchema(db)) return;
+    const identity = readRevisionIdentity(db, revisionId);
+    if (!identity) return;
+    let originTaint: ReturnType<typeof classifyFineTaint> = "ASSISTANT_INFERENCE";
+    if (originObservationId != null) {
+        const observation = db
+            .prepare("SELECT source_trust_class AS trust, extractor FROM observations WHERE id = ?")
+            .get(originObservationId) as
+            | { trust: string | null; extractor: string | null }
+            | null
+            | undefined;
+        originTaint = classifyFineTaint({
+            // SAFETY: source_trust_class carries a six-value CHECK constraint
+            // at the database boundary; NULL only for pre-v85 fixtures.
+            sourceTrustClass: (observation?.trust ??
+                "model_inference") as import("../storage-claim-applicability-schema.ts").SourceTrustClass,
+            extractor: observation?.extractor,
+        });
+    }
+    createPolicySubjectInCurrentTransaction(db, {
+        revisionId,
+        projectId: identity.projectId,
+        claimKind: "unknown",
+        originObservationId,
+        originTaint,
+        classificationMethod: TAINT_CLASSIFIER_METHOD,
+    });
+    refreshRevisionMaturityInCurrentTransaction(db, revisionId);
+}
+
+/** Verification writes feed the effective reducer, so every event refreshes
+ * the revision's ladder and projection in the same transaction (R27).
+ * Exported for the adoption paths (v84 backfill, relocation, identity merge)
+ * that carry legacy verification onto a freshly linked revision: writing the
+ * raw event alone would leave the revision's projection at CANDIDATE with no
+ * epoch bump, and the seeder never revisits a revision whose subject exists. */
+export function addVerificationEventInCurrentTransaction(
+    db: Database,
+    args: Parameters<typeof addVerificationEventRaw>[1],
+): ReturnType<typeof addVerificationEventRaw> {
+    const result = addVerificationEventRaw(db, args);
+    refreshRevisionMaturityInCurrentTransaction(db, args.revisionId);
+    return result;
+}
+
+const addVerificationEvent = addVerificationEventInCurrentTransaction;
+
+// ---------------------------------------------------------------------------
 // Kernel operations (Mutation Transition Matrix)
 // ---------------------------------------------------------------------------
 
@@ -1575,6 +1812,24 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             ).run(input.nowMs ?? Date.now(), row.id);
             row.verification_status = "unverified";
             row.verified_at = null;
+        } else if (memoryRowHasPositiveVerification(db, row)) {
+            // Exact-revision verification attests the OLD bytes; a rewrite
+            // must not let arbitrary replacement content inherit VERIFIED
+            // maturity. Withdraw rather than delete: 'unverified' with a
+            // positive verified_at is the documented withdrawn shape, which
+            // blocks the side-table carry in adoption paths while keeping
+            // history. The new revision earns visibility from a fresh
+            // verification event.
+            const withdrawnAt = input.nowMs ?? Date.now();
+            db.prepare(
+                `UPDATE memories
+                    SET verification_status = 'unverified',
+                        verified_at = COALESCE(verified_at, ?),
+                        updated_at = ?
+                  WHERE id = ?`,
+            ).run(withdrawnAt, withdrawnAt, row.id);
+            row.verification_status = "unverified";
+            row.verified_at = row.verified_at ?? withdrawnAt;
         }
         const projectId = resolveMemoryClaimProjectInCurrentTransaction(db, row.project_path);
         const failure = recordMemoryClaimAdoptionFailure(db, row, projectId);
@@ -1625,7 +1880,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                         projectId,
                         memoryId: row.id,
                         content: input.content,
-                        sourceType: post.source_type,
+                        sourceType: liveRewriteSourceType(),
                         provenance: repairProvenance,
                     });
                     appendMemoryClaimRevision(db, {
@@ -1656,22 +1911,6 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
                         envelope.producer,
                     ),
                 ];
-                // The projection keeps its verified columns across a content
-                // rewrite, so the adopted claim's current revision needs its
-                // own verified event.
-                if (!input.clearsVerification && memoryRowHasPositiveVerification(db, post)) {
-                    addVerificationEvent(db, {
-                        revisionId: readClaimCurrentRevisionId(db, link.claimId),
-                        outcome: "verified",
-                        verifier: envelope.producer,
-                    });
-                    effects.push({
-                        effectKey: `memory:${row.id}:evidence`,
-                        projectId,
-                        claimId: link.claimId,
-                        effectType: "evidence" as const,
-                    });
-                }
                 return {
                     result: {
                         memoryId: row.id,
@@ -1696,7 +1935,7 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             projectId,
             memoryId: row.id,
             content: input.content,
-            sourceType: row.source_type,
+            sourceType: liveRewriteSourceType(),
             provenance: contentProvenance,
         });
         if (
@@ -1736,23 +1975,6 @@ export function updateMemoryContentWithClaimsInCurrentTransaction(
             // any archive event lands on the new current revision.
             ...syncClaimLifecycleAfterAdoption(db, row, link, projectId, envelope.producer),
         ];
-        // The projection deliberately keeps its verified columns across a
-        // content rewrite, so the appended revision needs its own verified
-        // event — without one the claim's current revision reads unverified
-        // while the projection stays verified.
-        if (!input.clearsVerification && memoryRowHasPositiveVerification(db, row)) {
-            addVerificationEvent(db, {
-                revisionId,
-                outcome: "verified",
-                verifier: envelope.producer,
-            });
-            effects.push({
-                effectKey: `memory:${row.id}:evidence`,
-                projectId,
-                claimId: link.claimId,
-                effectType: "evidence" as const,
-            });
-        }
         hitMemoryClaimFailpoint("memory-claim.010.claim.after");
         updateMemoryProjectionContent(db, row.id, input.content, input.normalizedHash, input.nowMs);
         hitMemoryClaimFailpoint("memory-claim.020.projection.after");
@@ -2028,22 +2250,28 @@ export function setMemoryStatusWithClaimsInCurrentTransaction(
                     effectType: "upsert" as const,
                 });
             }
-            // A verified preimage carries its verified status onto the
-            // adopted claim as evidence — the fresh (or dedup-reused) claim
-            // has no verified event for this row yet.
-            if (memoryRowHasPositiveVerification(db, row)) {
-                addVerificationEvent(db, {
-                    revisionId: readClaimCurrentRevisionId(db, link.claimId),
-                    outcome: "verified",
-                    verifier: envelope.producer,
-                });
-                effects.push({
-                    effectKey: `memory:${row.id}:evidence`,
-                    projectId,
-                    claimId: link.claimId,
-                    effectType: "evidence" as const,
-                });
-            }
+        }
+        // A verified preimage carries its verified status onto the adopted
+        // claim as evidence — the fresh (or dedup-reused) claim has no
+        // verified event for this row yet. The same carry applies to a
+        // metadata-only successor (e.g. an archive reason): the appended
+        // revision holds the exact bytes the verification attested, so it
+        // owes its own verified event — the status-kernel twin of the
+        // classification kernel's same-content carry. Content rewrites are
+        // not reachable here (this kernel never changes bytes), so this
+        // never resurrects verification onto replaced content.
+        if ((revisionId !== null || !wasLinked) && memoryRowHasPositiveVerification(db, row)) {
+            addVerificationEvent(db, {
+                revisionId: readClaimCurrentRevisionId(db, link.claimId),
+                outcome: "verified",
+                verifier: envelope.producer,
+            });
+            effects.push({
+                effectKey: `memory:${row.id}:evidence`,
+                projectId,
+                claimId: link.claimId,
+                effectType: "evidence" as const,
+            });
         }
         // A shared canonical claim (several crosswalk rows, one claim, via
         // the dedup branch) holds the max-rank state across its surviving
@@ -3069,7 +3297,7 @@ export function applyModuleMemoryDeltaWithClaimsInCurrentTransaction(
                     projectId,
                     memoryId: post.id,
                     content: post.content,
-                    sourceType: post.source_type,
+                    sourceType: liveRewriteSourceType(),
                     provenance: deltaProvenance,
                 });
                 revisionId = appendMemoryClaimRevision(db, {

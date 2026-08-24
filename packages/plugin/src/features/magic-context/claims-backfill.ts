@@ -30,8 +30,9 @@
  */
 
 import type { Database } from "../../shared/sqlite";
-import { addVerificationEvent, sha256Utf8Hex } from "./memory/storage-claims";
+import { sha256Utf8Hex } from "./memory/storage-claims";
 import {
+    addVerificationEventInCurrentTransaction,
     canonicalMemoryProjectPathSql,
     computeClaimRequestDigest,
     ensureMemoryClaimLinkInCurrentTransaction,
@@ -61,6 +62,11 @@ import {
     type MemoryProjectionRow,
     readMemoryProjectionRow,
 } from "./memory/storage-memory-projection";
+import {
+    readIntMeta,
+    readSchemaMeta as readMeta,
+    writeSchemaMeta as writeMeta,
+} from "./schema-meta";
 import { CLAIMS_AND_EVIDENCE_TABLES } from "./storage-claims-schema";
 import {
     CLAIMS_BACKFILL_META_KEYS,
@@ -212,26 +218,6 @@ export function computeClaimsBackfillEvidenceDigest(measurements: unknown): stri
 // ---------------------------------------------------------------------------
 // Meta state
 // ---------------------------------------------------------------------------
-
-function readMeta(db: Database, key: string): string | null {
-    const row = db.prepare("SELECT value FROM schema_migrations_meta WHERE key = ?").get(key) as
-        | { value: string }
-        | undefined;
-    return row?.value ?? null;
-}
-
-function writeMeta(db: Database, key: string, value: string): void {
-    db.prepare(
-        `INSERT INTO schema_migrations_meta (key, value)
-         VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    ).run(key, value);
-}
-
-function readIntMeta(db: Database, key: string): number {
-    const parsed = Number.parseInt(readMeta(db, key) ?? "0", 10);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
-}
 
 // Meta keys owned by this module, beyond the U2-created contract in
 // CLAIMS_BACKFILL_META_KEYS. The `claims_backfill_` prefix keeps them inside
@@ -592,7 +578,11 @@ export function recordAdoptedMemoryVerifiedEventInCurrentTransaction(
     if (!memoryRowHasPositiveVerification(db, row)) {
         return false;
     }
-    addVerificationEvent(db, {
+    // The policy-aware writer refreshes the revision's maturity ladder and
+    // projection in the same transaction: the raw event alone would leave a
+    // freshly adopted, already-verified revision automatically hidden with
+    // no seeder pass left to repair it (its subject already exists).
+    addVerificationEventInCurrentTransaction(db, {
         revisionId: readClaimCurrentRevisionId(db, claimId),
         outcome: "verified",
         verifier,
@@ -1154,7 +1144,64 @@ export function isRetryableSqliteBusyError(error: unknown): boolean {
     return typeof candidate.errcode === "number" && (candidate.errcode & 0xff) === 5;
 }
 
-const DEFAULT_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
+export const DEFAULT_BUSY_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
+
+/**
+ * One whole-batch immediate transaction with bounded SQLITE_BUSY backoff —
+ * the retry scaffolding both backfills (v84 claims, v86 claim policy)
+ * share, extracted so a backoff-schedule tuning lands once. Returns "busy"
+ * after the delay schedule is exhausted; every other error rethrows.
+ */
+export async function runImmediateTransactionWithBusyRetry<T>(
+    db: Database,
+    work: () => T,
+    options: {
+        retryDelaysMs?: readonly number[];
+        sleep?: (delayMs: number) => Promise<void>;
+    } = {},
+): Promise<T | "busy"> {
+    const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_BUSY_RETRY_DELAYS_MS;
+    const sleep =
+        options.sleep ??
+        ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            return db.transaction(work).immediate() as T;
+        } catch (error) {
+            if (!isRetryableSqliteBusyError(error)) throw error;
+            const delayMs = retryDelaysMs[attempt];
+            if (delayMs === undefined) return "busy";
+            await sleep(delayMs);
+        }
+    }
+}
+
+/** Synchronous twin of `runImmediateTransactionWithBusyRetry` for callers on
+ * synchronous paths (the injection transform, module state sync) that cannot
+ * await: bounded BLOCKING backoff instead of event-loop sleeps, so the
+ * caller observes the commit before its next statement — a fire-and-forget
+ * promise would let publication-sensitive readers proceed on the old state.
+ * Returns "busy" after exhausting the delays, like the async variant. */
+export function runImmediateTransactionWithBusyRetrySync<T>(
+    db: Database,
+    work: () => T,
+    options: { retryDelaysMs?: readonly number[] } = {},
+): T | "busy" {
+    const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_BUSY_RETRY_DELAYS_MS;
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            return db.transaction(work).immediate() as T;
+        } catch (error) {
+            if (!isRetryableSqliteBusyError(error)) throw error;
+            const delayMs = retryDelaysMs[attempt];
+            if (delayMs === undefined) return "busy";
+            // Atomics.wait, not Bun.sleepSync: the Pi extension is built
+            // with --target node, where the Bun global does not exist — the
+            // blocking delay must work on both runtimes.
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+        }
+    }
+}
 
 export interface ClaimsBackfillRunOptions {
     batchSize?: number;
@@ -1247,22 +1294,13 @@ export async function runClaimsBackfill(
 
     /** Whole-batch immediate transaction with bounded busy backoff (R9). */
     const runBatch = async (work: () => BatchStep): Promise<BatchStep | "busy"> => {
-        for (let attempt = 0; ; attempt += 1) {
-            try {
-                const step = db
-                    .transaction(() =>
-                        withMemoryClaimGenerationContextInCurrentTransaction(db, work),
-                    )
-                    .immediate();
-                hitFailpoint("claims-backfill.020.batch-commit.after");
-                return step;
-            } catch (error) {
-                if (!isRetryableSqliteBusyError(error)) throw error;
-                const delayMs = retryDelaysMs[attempt];
-                if (delayMs === undefined) return "busy";
-                await sleep(delayMs);
-            }
-        }
+        const step = await runImmediateTransactionWithBusyRetry(
+            db,
+            () => withMemoryClaimGenerationContextInCurrentTransaction(db, work),
+            { retryDelaysMs, sleep },
+        );
+        if (step !== "busy") hitFailpoint("claims-backfill.020.batch-commit.after");
+        return step;
     };
 
     const rowsBatch = (): BatchStep => {

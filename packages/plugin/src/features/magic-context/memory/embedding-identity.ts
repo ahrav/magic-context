@@ -7,6 +7,43 @@ function normalizeEndpoint(endpoint?: string): string {
     return endpoint?.trim().replace(/\/+$/, "") ?? "";
 }
 
+export type LocalEmbeddingPooling = "mean" | "cls";
+
+/** How a model's card says its vectors must be produced. Wrong pooling or a
+ *  missing query instruction still yields plausible-looking vectors, just
+ *  quietly bad rankings, so the recipe is bound to the model id rather than
+ *  left to configuration. Defined here because the recipe participates in the
+ *  provider identity below, and the provider module already imports this one. */
+export interface LocalEmbeddingRecipe {
+    pooling: LocalEmbeddingPooling;
+    /** Prepended to `"query"`-purpose inputs only; passages embed unprefixed. */
+    queryPrefix: string;
+}
+
+/** Models without an entry embed symmetrically: mean pooling, no instruction. */
+const SYMMETRIC_RECIPE: LocalEmbeddingRecipe = { pooling: "mean", queryPrefix: "" };
+
+const MODEL_RECIPES: Record<string, LocalEmbeddingRecipe> = {
+    // BGE v1.5 CLS-pools and expects this exact retrieval instruction on short
+    // queries: https://huggingface.co/BAAI/bge-small-en-v1.5#model-usage
+    // Both the Xenova ONNX export and the upstream BAAI id name the same model
+    // card, so both bind the same recipe. Other spellings deliberately fall
+    // back to the symmetric recipe: guessing a recipe from a fuzzy name match
+    // risks applying the wrong transforms, which corrupts silently.
+    "Xenova/bge-small-en-v1.5": {
+        pooling: "cls",
+        queryPrefix: "Represent this sentence for searching relevant passages: ",
+    },
+    "BAAI/bge-small-en-v1.5": {
+        pooling: "cls",
+        queryPrefix: "Represent this sentence for searching relevant passages: ",
+    },
+};
+
+export function getLocalEmbeddingRecipe(model: string): LocalEmbeddingRecipe {
+    return MODEL_RECIPES[model] ?? SYMMETRIC_RECIPE;
+}
+
 /**
  * Stable embedding-provider identity used for provider/pipeline reuse.
  *
@@ -45,6 +82,10 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
         config.provider === "local" && config.local_dtype && config.local_dtype !== "fp32"
             ? config.local_dtype
             : undefined;
+    const localRecipe =
+        config.provider === "local"
+            ? getLocalEmbeddingRecipe(config.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL)
+            : undefined;
     const identityInput =
         config.provider === "openai-compatible"
             ? {
@@ -73,6 +114,24 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
                   endpoint: "",
                   apiKeyPresent: false,
                   ...(localDtype ? { localDtype } : {}),
+                  // The recipe (pooling + query instruction) changes the produced
+                  // vectors for the SAME model name: a bge-small vector embedded
+                  // under the symmetric mean recipe is not comparable to one
+                  // embedded under CLS with the query instruction. Folding the
+                  // recipe in re-embeds installations whose stored vectors
+                  // predate the model's bound recipe. Spread CONDITIONALLY and
+                  // EXCLUDE the symmetric recipe, so models without a bound
+                  // recipe keep a byte-identical identity — mirrors the
+                  // localDtype fold above.
+                  ...(localRecipe &&
+                  (localRecipe.pooling !== "mean" || localRecipe.queryPrefix !== "")
+                      ? {
+                            localRecipe: {
+                                pooling: localRecipe.pooling,
+                                queryPrefix: localRecipe.queryPrefix,
+                            },
+                        }
+                      : {}),
               };
 
     return `embedding-provider:${computeNormalizedHash(JSON.stringify(identityInput))}`;

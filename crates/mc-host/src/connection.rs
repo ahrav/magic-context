@@ -634,7 +634,22 @@ async fn handle_control<H: McHostHandler>(
     // consumer request against the global unsettled bound; at capacity the
     // no-dispatch `server_busy` terminal takes precedence over the semantic
     // error (protocol §8.3).
-    let Ok(pending_permit) = shared.pending_permits.clone().try_acquire_owned() else {
+    //
+    // A reserved-class target's `route.open` draws on ITS pool, matching
+    // routed dispatch: charging route establishment to the general pool
+    // would make the carve-out unreachable under exactly the general-load
+    // saturation it exists to survive — the reserved permits would sit idle
+    // while the module could not open the route needed to use them.
+    let pending_pool = match &action {
+        ControlAction::RouteOpen { target, .. }
+            if shared.targets.class_of(&target.module_id)
+                == Some(crate::handler::RouteClass::Reserved) =>
+        {
+            &shared.reserved_pending_permits
+        }
+        _ => &shared.pending_permits,
+    };
+    let Ok(pending_permit) = pending_pool.clone().try_acquire_owned() else {
         crate::dispatch::emit_rejection(
             shared,
             gen,

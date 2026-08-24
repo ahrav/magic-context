@@ -6,7 +6,12 @@ import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-cont
 import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { log } from "../../../shared/logger";
 import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-permissions";
-import { getEmbeddingProviderIdentity } from "./embedding-identity";
+import {
+    getEmbeddingProviderIdentity,
+    getLocalEmbeddingRecipe,
+    type LocalEmbeddingPooling,
+    type LocalEmbeddingRecipe,
+} from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 
 /** The dtype enum values accepted by @huggingface/transformers' feature-extraction
@@ -27,6 +32,15 @@ export type LocalEmbeddingDtype =
     | "q2f16"
     | "q1"
     | "q1f16";
+
+// The recipe definitions live in embedding-identity.ts because the recipe
+// participates in the provider identity; re-exported here so provider users
+// keep one import surface for local-embedding concerns.
+export {
+    getLocalEmbeddingRecipe,
+    type LocalEmbeddingPooling,
+    type LocalEmbeddingRecipe,
+} from "./embedding-identity";
 
 /**
  * Cross-process mutex for embedding-model load. When two OpenCode processes
@@ -244,7 +258,7 @@ type EmbeddingPipelineResult = {
 type EmbeddingPipeline = {
     (
         input: string | string[],
-        options: { pooling: "mean"; normalize: true },
+        options: { pooling: LocalEmbeddingPooling; normalize: true },
     ): Promise<EmbeddingPipelineResult>;
     dispose?: () => Promise<void> | void;
 };
@@ -413,6 +427,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
 
     private readonly model: string;
     private readonly dtype: LocalEmbeddingDtype;
+    private readonly recipe: LocalEmbeddingRecipe;
     private pipeline: EmbeddingPipeline | null = null;
     private initPromise: Promise<void> | null = null;
     private inFlight = 0;
@@ -425,12 +440,19 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         maxInputTokens = 512,
         dtype: LocalEmbeddingDtype = DEFAULT_LOCAL_DTYPE,
     ) {
-        this.model = model;
+        // Normalize ONCE and use the same string for the recipe, the identity,
+        // and the pipeline load. The identity function trims independently, so
+        // an untrimmed direct-construction model would otherwise resolve the
+        // symmetric recipe here while the identity hash folds the bound recipe:
+        // vectors and identity would disagree about the space.
+        const normalizedModel = model.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL;
+        this.model = normalizedModel;
         this.maxInputTokens = maxInputTokens;
         this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
+        this.recipe = getLocalEmbeddingRecipe(normalizedModel);
         this.modelId = getEmbeddingProviderIdentity({
             provider: "local",
-            model,
+            model: normalizedModel,
             // Only fold non-default dtype into identity so the default config
             // produces the byte-identical identity string as before this field
             // existed (no forced re-embed on upgrade). See issue #259.
@@ -644,7 +666,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     async embed(
         text: string,
         signal?: AbortSignal,
-        _purpose?: EmbeddingPurpose,
+        purpose?: EmbeddingPurpose,
     ): Promise<Float32Array | null> {
         // Local inference is fast (typically <100ms) and can't be cancelled
         // mid-compute with transformers.js, so we honor `signal` only as a
@@ -665,9 +687,13 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 return null;
             }
 
+            const input =
+                purpose === "query" && this.recipe.queryPrefix
+                    ? `${this.recipe.queryPrefix}${text}`
+                    : text;
             const result = await withQuietConsole(() =>
-                pipeline(text, {
-                    pooling: "mean",
+                pipeline(input, {
+                    pooling: this.recipe.pooling,
                     normalize: true,
                 }),
             );
@@ -684,7 +710,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     async embedBatch(
         texts: string[],
         signal?: AbortSignal,
-        _purpose?: EmbeddingPurpose,
+        purpose?: EmbeddingPurpose,
     ): Promise<(Float32Array | null)[]> {
         if (texts.length === 0) {
             return [];
@@ -710,9 +736,13 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 return Array.from({ length: texts.length }, () => null);
             }
 
+            const inputs =
+                purpose === "query" && this.recipe.queryPrefix
+                    ? texts.map((text) => `${this.recipe.queryPrefix}${text}`)
+                    : texts;
             const result = await withQuietConsole(() =>
-                pipeline(texts, {
-                    pooling: "mean",
+                pipeline(inputs, {
+                    pooling: this.recipe.pooling,
                     normalize: true,
                 }),
             );

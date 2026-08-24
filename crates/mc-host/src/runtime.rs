@@ -20,7 +20,7 @@ use crate::connection::{run_connection, GenerationCore};
 use crate::dispatch::{
     finish_route_close, force_close_all_routes, send_connection_goodbye, settle_route,
 };
-use crate::handler::{McHostHandler, TargetKind};
+use crate::handler::{McHostHandler, ResourceDeclaration, RouteClass, TargetKind};
 use crate::instance::{ConnectionKey, InstanceError, InstanceGuard};
 use crate::routing::RouteRegistry;
 use crate::wire::ByteBudget;
@@ -104,8 +104,15 @@ pub struct HostShared<H> {
     /// outlive the request that created them.
     pub scratch_budget: ByteBudget,
     pub egress_budget: ByteBudget,
+    /// General-class admission pools: the configured limits minus every
+    /// reserved-class declaration, so reserved work can never draw here.
     pub pending_permits: Arc<Semaphore>,
     pub task_permits: Arc<Semaphore>,
+    /// Reserved-class admission pools, sized by the checked declaration sums
+    /// (plan KTD2). Zero-permit when no module declared a reservation, and
+    /// then unreachable because every route is general-class.
+    pub reserved_pending_permits: Arc<Semaphore>,
+    pub reserved_task_permits: Arc<Semaphore>,
     pub handshake_permits: Arc<Semaphore>,
     pub connection_permits: Arc<Semaphore>,
     pub tracker: TaskTracker,
@@ -463,30 +470,95 @@ impl<H: McHostHandler> Drop for AbandonGuard<H> {
     }
 }
 
-/// Validates the startup manifest set and derives the routable
-/// `(module, kind)` pairs, so the published catalog and route admission can
-/// never contradict each other.
+/// Checked sums of every module's reserved admission capacity and retained
+/// resident bytes, validated before initialization so the host can never
+/// start with impossible accounting (plan KTD2).
+struct Reservations {
+    pending: usize,
+    tasks: usize,
+    retained_bytes: u64,
+}
+
+/// Validates the startup manifest set against its resource declarations and
+/// derives the routable `(module, kind, class)` entries plus the checked
+/// reservation sums, so the published catalog, route admission, and permit
+/// accounting can never contradict each other.
 fn build_target_index(
     manifests: &[crate::handler::ManifestSnapshot],
-) -> Result<crate::control::TargetIndex, HostError> {
-    if manifests.is_empty() || manifests.len() > 2 {
+    declarations: &[ResourceDeclaration],
+) -> Result<(crate::control::TargetIndex, Reservations), HostError> {
+    if manifests.is_empty() || manifests.len() > 3 {
         return Err(HostError::InitFailed(
-            "the static profile requires one or two module manifests".to_owned(),
+            "the static profile requires one to three module manifests".to_owned(),
         ));
     }
-    let mut target_entries: Vec<(Box<str>, Vec<TargetKind>)> = Vec::with_capacity(manifests.len());
-    for manifest in manifests {
+    if declarations.len() != manifests.len() {
+        return Err(HostError::InitFailed(
+            "resource declarations do not match the manifest set".to_owned(),
+        ));
+    }
+    let mut reservations = Reservations {
+        pending: 0,
+        tasks: 0,
+        retained_bytes: 0,
+    };
+    let mut target_entries: Vec<(Box<str>, Vec<TargetKind>, RouteClass)> =
+        Vec::with_capacity(manifests.len());
+    for (manifest, declaration) in manifests.iter().zip(declarations) {
         if let Err(err) = crate::control::validate_manifest_module_id(&manifest.module_id) {
             return Err(HostError::InitFailed(err));
         }
         if target_entries
             .iter()
-            .any(|(id, _)| id.as_ref() == manifest.module_id)
+            .any(|(id, _, _)| id.as_ref() == manifest.module_id)
         {
             return Err(HostError::InitFailed(
                 "duplicate module ID across startup manifests".to_owned(),
             ));
         }
+        // Class and reservation must agree: a general-class module holding
+        // reserved permits would shrink the general pools without anything
+        // ever drawing on the carve-out, and a reserved-class module with a
+        // zero reservation could dispatch only through another module's
+        // permits — both are impossible accounting, refused at startup.
+        match declaration.route_class {
+            RouteClass::General => {
+                if declaration.reserved_pending_requests != 0
+                    || declaration.reserved_handler_tasks != 0
+                {
+                    return Err(HostError::InitFailed(
+                        "a general-class module declares reserved permits".to_owned(),
+                    ));
+                }
+            }
+            RouteClass::Reserved => {
+                if declaration.reserved_pending_requests == 0
+                    || declaration.reserved_handler_tasks == 0
+                {
+                    return Err(HostError::InitFailed(
+                        "a reserved-class module declares no reserved permits".to_owned(),
+                    ));
+                }
+            }
+        }
+        reservations.pending = reservations
+            .pending
+            .checked_add(declaration.reserved_pending_requests)
+            .ok_or_else(|| {
+                HostError::InitFailed("reserved pending-request sum overflows".to_owned())
+            })?;
+        reservations.tasks = reservations
+            .tasks
+            .checked_add(declaration.reserved_handler_tasks)
+            .ok_or_else(|| {
+                HostError::InitFailed("reserved handler-task sum overflows".to_owned())
+            })?;
+        reservations.retained_bytes = reservations
+            .retained_bytes
+            .checked_add(declaration.retained_resident_bytes)
+            .ok_or_else(|| {
+                HostError::InitFailed("retained resident-byte sum overflows".to_owned())
+            })?;
         let mut kinds = Vec::new();
         for entry in &manifest.provides {
             // A published catalog entry whose role can never route would
@@ -512,17 +584,24 @@ fn build_target_index(
                 "manifest advertises no routable role".to_owned(),
             ));
         }
-        target_entries.push((manifest.module_id.clone().into_boxed_str(), kinds));
+        target_entries.push((
+            manifest.module_id.clone().into_boxed_str(),
+            kinds,
+            declaration.route_class,
+        ));
     }
     if !target_entries
         .iter()
-        .any(|(_, kinds)| kinds.contains(&TargetKind::ToolProvider))
+        .any(|(_, kinds, _)| kinds.contains(&TargetKind::ToolProvider))
     {
         return Err(HostError::InitFailed(
             "startup manifests do not advertise a tool_provider role".to_owned(),
         ));
     }
-    Ok(crate::control::TargetIndex::new(target_entries))
+    Ok((
+        crate::control::TargetIndex::new(target_entries),
+        reservations,
+    ))
 }
 
 /// Runs one host incarnation to completion.
@@ -572,7 +651,22 @@ pub async fn run<H: McHostHandler>(
 
     let handler = Arc::new(handler);
     let manifests = crate::panic_boundary::redact_sync(|| handler.manifests());
-    let targets = build_target_index(&manifests)?;
+    let declarations = crate::panic_boundary::redact_sync(|| handler.resource_declarations());
+    let (targets, reservations) = build_target_index(&manifests, &declarations)?;
+    // Reservations must leave a usable general class: after carving out
+    // every reserved permit, at least one general pending slot and one
+    // general task slot must remain, or unrelated Magic Context and Synapse
+    // requests could never dispatch (plan KTD2, R13).
+    if reservations.pending >= config.limits.max_pending_requests {
+        return Err(HostError::InitFailed(
+            "reserved pending requests leave no general pending slot".to_owned(),
+        ));
+    }
+    if reservations.tasks >= config.limits.max_handler_tasks {
+        return Err(HostError::InitFailed(
+            "reserved handler tasks leave no general handler-task slot".to_owned(),
+        ));
+    }
     // Bounded during serialization, not after: an over-limit manifest must be
     // refused without ever materializing a full copy of its catalog.
     let Ok(catalog) =
@@ -583,15 +677,19 @@ pub async fn run<H: McHostHandler>(
         ));
     };
     // The cached catalog stays resident for the whole incarnation outside
-    // the byte-budget semaphores; the ingress budget shrinks by it below so
-    // total resident bytes still honor max_resident_bytes. That subtraction
-    // must leave at least one maximum request body of ingress headroom.
+    // the byte-budget semaphores, and declared retained bytes are handler
+    // state with the same whole-incarnation lifetime; the ingress budget
+    // shrinks by both below so total resident bytes still honor
+    // max_resident_bytes. That subtraction must leave at least one maximum
+    // request body of ingress headroom — the handler-dependent resident
+    // floor: one byte below it fails startup, the exact floor is accepted.
     let catalog_resident = catalog.resident_len() as u64;
-    if config.limits.max_resident_bytes
-        < crate::config::MIN_RESIDENT_BYTES.saturating_add(catalog_resident)
-    {
+    let resident_floor = crate::config::MIN_RESIDENT_BYTES
+        .saturating_add(catalog_resident)
+        .saturating_add(reservations.retained_bytes);
+    if config.limits.max_resident_bytes < resident_floor {
         return Err(HostError::InitFailed(
-            "linked manifest catalog leaves no resident-byte headroom".to_owned(),
+            "catalog and declared retained bytes leave no resident-byte headroom".to_owned(),
         ));
     }
 
@@ -736,12 +834,19 @@ pub async fn run<H: McHostHandler>(
             config.limits.max_resident_bytes
                 - crate::config::EGRESS_RESERVED_BYTES
                 - crate::config::SCRATCH_RESERVED_BYTES
-                - catalog_resident,
+                - catalog_resident
+                - reservations.retained_bytes,
         ),
         scratch_budget: ByteBudget::new(crate::config::SCRATCH_RESERVED_BYTES),
         egress_budget: ByteBudget::new(crate::config::EGRESS_RESERVED_BYTES),
-        pending_permits: Arc::new(Semaphore::new(config.limits.max_pending_requests)),
-        task_permits: Arc::new(Semaphore::new(config.limits.max_handler_tasks)),
+        pending_permits: Arc::new(Semaphore::new(
+            config.limits.max_pending_requests - reservations.pending,
+        )),
+        task_permits: Arc::new(Semaphore::new(
+            config.limits.max_handler_tasks - reservations.tasks,
+        )),
+        reserved_pending_permits: Arc::new(Semaphore::new(reservations.pending)),
+        reserved_task_permits: Arc::new(Semaphore::new(reservations.tasks)),
         handshake_permits: Arc::new(Semaphore::new(config.limits.max_handshakes)),
         connection_permits: Arc::new(Semaphore::new(config.limits.max_connections)),
         tracker: TaskTracker::new(),

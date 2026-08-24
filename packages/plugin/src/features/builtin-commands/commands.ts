@@ -47,5 +47,15 @@ export function getMagicContextBuiltinCommands(compactionEnabled = true): Builti
             description:
                 "Embedding status, or start/pause history compartment embedding (start | pause)",
         },
+        "ctx-approve": {
+            template: "ctx-approve",
+            description:
+                "Approve (or --revoke) the exact current revision of a project memory claim",
+        },
+        "ctx-enforce": {
+            template: "ctx-enforce",
+            description:
+                "Bind a passing in-project artifact to an approved memory claim (ENFORCED)",
+        },
     };
 }

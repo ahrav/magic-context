@@ -24,6 +24,11 @@ import {
     getMemoryVerifications,
     type Memory,
 } from "../memory";
+import {
+    exactMemoryContentDigests,
+    filterMemoriesForMaintenance,
+} from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
 import { runCompressCues } from "../mural/compress-cues";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { reviewUserMemories } from "../user-memory/review-user-memories";
@@ -65,6 +70,7 @@ import {
     isRetrospectiveWindowProcessed,
     recordRetrospectiveWindowProcessed,
 } from "./storage-task-schedule";
+import { buildClassifyModelChain } from "./task-config";
 import { getDreamTaskBacklog } from "./task-gates";
 import {
     buildDreamTaskPrompt,
@@ -181,7 +187,32 @@ function loadActiveMemoryPromptMemories(
     db: Database,
     projectIdentity: string,
 ): CuratePromptMemory[] {
-    const memories = getMemoriesByProject(db, projectIdentity);
+    // Curation is hygiene maintenance with no healing authority over
+    // dispositions: candidates stay in the pool, while soft-hidden and
+    // uniform-absence rows never reach the child-model prompt — and the
+    // ctx_memory gate refuses hidden rows as mutation targets.
+    const loaded = filterMemoriesForMaintenance(
+        db,
+        getMemoriesByProject(db, projectIdentity),
+        "hygiene",
+    );
+    // Exact-byte binding: the maintenance filter evaluates CURRENT policy by
+    // id, but the loaded rows carry bytes read before that policy read —
+    // another process rewriting a row in that window would disclose the
+    // superseded bytes to the curate child. Keep only rows whose loaded
+    // bytes still match the claim's current revision digest.
+    const oracle = exactMemoryContentDigests(
+        db,
+        loaded.map((memory) => memory.id),
+    );
+    const memories = loaded.filter(
+        (memory) => oracle.get(memory.id) === sha256Utf8Hex(memory.content),
+    );
+    if (memories.length < loaded.length) {
+        log(
+            `[dreamer] curate pool dropped ${loaded.length - memories.length} member(s) rewritten since load`,
+        );
+    }
     const verificationById = getMemoryVerifications(
         db,
         memories.map((memory) => memory.id),
@@ -562,6 +593,11 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                     leaseAcquisition,
                     model: config.model,
                     fallbackModels: config.fallbackModels,
+                    modelChain: buildClassifyModelChain(
+                        config.model,
+                        deps.dreamerModel,
+                        config.fallbackModels,
+                    ),
                     ...moduleArgs,
                     onProgress: (processed) => reportProgress(processed),
                 });
@@ -1155,20 +1191,9 @@ async function runAgenticTask(
 
     // verify / verify-broad / classify-memories now run via their own non-agentic
     // manifest runners and never reach runAgenticTask. The agentic path handles
-    // curate / maintain-docs only.
-    let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
-    if (task === "curate") {
-        curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
-        log(`[dreamer] curate pool: in_scope=${curateMemories.length}`);
-    }
-
-    const taskPrompt = buildDreamTaskPrompt(task, {
-        projectPath: projectIdentity,
-        lastDreamAt: lastRunAt ? String(lastRunAt) : null,
-        existingDocs,
-        userMemories,
-        curate: curateMemories ? { memories: curateMemories } : undefined,
-    });
+    // curate / maintain-docs only. The curate pool is loaded AFTER the awaited
+    // child-session creation below — a pool frozen before that await could
+    // carry a memory hidden or rewritten in the gap into the child prompt.
 
     const abortController = new AbortController();
     let leaseLost = false;
@@ -1202,6 +1227,24 @@ async function runAgenticTask(
         childSessionId = typeof created?.id === "string" ? created.id : null;
         if (!childSessionId) throw new Error("Dreamer could not create its child session.");
         const sessionId = childSessionId;
+
+        // Load the curate pool and build the prompt only now, past the
+        // awaited child-session creation: the maintenance filter runs on
+        // current policy state and the rendered bytes are current when the
+        // prompt is submitted. The later ctx_memory target gates prevent
+        // mutation of hidden rows but cannot undo disclosure to the child.
+        let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
+        if (task === "curate") {
+            curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
+            log(`[dreamer] curate pool: in_scope=${curateMemories.length}`);
+        }
+        const taskPrompt = buildDreamTaskPrompt(task, {
+            projectPath: projectIdentity,
+            lastDreamAt: lastRunAt ? String(lastRunAt) : null,
+            existingDocs,
+            userMemories,
+            curate: curateMemories ? { memories: curateMemories } : undefined,
+        });
 
         const remainingMs = Math.max(0, deadline - Date.now());
         const run = await shared.promptSyncWithValidatedOutputRetry(

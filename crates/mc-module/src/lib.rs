@@ -94,9 +94,9 @@ use subc_client_rs::{
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use classify::{
-    child_session_id, has_manifest_envelope, CLASSIFY_AWAIT_TIMEOUT, CLASSIFY_MAX_OUTPUT_TOKENS,
-    CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK, CLASSIFY_TEMPERATURE,
-    MAX_CLASSIFY_PROMPT_BYTES,
+    attempt_child_session_id, validate_classify_manifest, CLASSIFY_AWAIT_TIMEOUT,
+    CLASSIFY_MAX_OUTPUT_TOKENS, CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK,
+    CLASSIFY_TEMPERATURE, MAX_CLASSIFY_MODEL_CHAIN, MAX_CLASSIFY_PROMPT_BYTES,
 };
 use config::{derive_historian_chunk_tokens, ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
@@ -678,6 +678,17 @@ struct ModuleStateSyncWire {
     compartments: Vec<ModuleCompartmentWire>,
     #[serde(default)]
     memories: Vec<ModuleMemoryWire>,
+    /// Present when `memories` is a FULL policy snapshot for these projects:
+    /// the store prunes mirrored rows absent from the payload within this
+    /// scope. Absent means incremental upsert-only semantics.
+    #[serde(default)]
+    memories_replace_projects: Option<Vec<String>>,
+    /// Explicit prune: mirrored rows with these ids are deleted before the
+    /// snapshot upsert. Covers policy-hidden rows the replace scope cannot
+    /// name — a foreign workspace member's rows — without granting a
+    /// project-wide prune over that member's non-shared rows.
+    #[serde(default)]
+    memories_delete_ids: Option<Vec<i64>>,
     #[serde(default)]
     memory_mutations: Vec<ModuleMemoryMutationWire>,
     #[serde(default)]
@@ -707,6 +718,11 @@ struct ModuleStateSyncWire {
     auto_search_hint_decisions: Vec<UserHintSeedWire>,
     #[serde(default)]
     auto_search_hint_skipped: usize,
+    /// When true, the host sent its COMPLETE hint-decision list for this
+    /// session: stored hint blocks absent from the list have no backing
+    /// decision the host can still validate and are deleted.
+    #[serde(default)]
+    user_hints_replace_session: bool,
     #[serde(default)]
     todo_synthetic_anchor: Option<Option<TodoSyntheticAnchorSeedWire>>,
     #[serde(default)]
@@ -3056,6 +3072,9 @@ pub struct McHandler {
     /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
     /// only registered ids may bypass transform after route validation.
     active_dreamer_runs: Arc<Mutex<HashSet<String>>>,
+    /// In-flight `(ledger_session, command_id)` dream-task commands; see
+    /// [`DreamCommandGuard`].
+    inflight_dream_commands: Arc<Mutex<HashSet<(String, String)>>>,
     /// Back-compat facade callers may omit the host tool-call id. Warn once per resolved session
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
@@ -3126,6 +3145,7 @@ pub trait HistorianProducerFactory: Send + Sync {
     async fn connect(
         &self,
         project_root: &Path,
+        harness: &str,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError>;
 }
 
@@ -3138,15 +3158,12 @@ impl HistorianProducerFactory for RealHistorianProducerFactory {
     async fn connect(
         &self,
         project_root: &Path,
+        harness: &str,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Ok(Box::new(
             HistorianProducer::connect(HistorianProducerConfig {
                 handshake_timeout: Duration::from_secs(2),
-                ..HistorianProducerConfig::new(
-                    self.connection_file.clone(),
-                    project_root,
-                    "opencode",
-                )
+                ..HistorianProducerConfig::new(self.connection_file.clone(), project_root, harness)
             })
             .await?,
         ))
@@ -3166,6 +3183,26 @@ impl Drop for DreamerRunGuard {
             .lock()
             .expect("dreamer registry mutex")
             .remove(&self.session_id);
+    }
+}
+
+/// In-flight `(ledger_session, command_id)` marker: exactly one
+/// `dreamer.run_task` executes per durable command identity. A concurrent
+/// duplicate — byte-identical or not, same first model or not — must not
+/// start its own billable chain or race the ledger's INSERT OR IGNORE
+/// with a different outcome, and serializing here also guarantees each
+/// derived child session has at most one live run registration.
+struct DreamCommandGuard {
+    registry: Arc<Mutex<HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for DreamCommandGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .expect("dream command registry mutex")
+            .remove(&self.key);
     }
 }
 
@@ -3443,6 +3480,7 @@ struct HistorianFiringTask {
     session_id: String,
     project_path: String,
     project_root: PathBuf,
+    harness: String,
     project_slug: String,
     firing: AssembledHistorianFiring,
     live_guard: SessionSetGuard,
@@ -3461,6 +3499,7 @@ impl HistorianProducerFactory for MissingProducerFactory {
     async fn connect(
         &self,
         _project_root: &Path,
+        _harness: &str,
     ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
         Err(HistorianProducerError::NoEndpoint {
             path: PathBuf::from("<missing --subc>"),
@@ -3539,6 +3578,7 @@ impl McHandler {
             transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
+            inflight_dream_commands: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
         }
     }
@@ -3795,6 +3835,7 @@ impl McHandler {
             transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
+            inflight_dream_commands: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
         }
     }
@@ -4697,6 +4738,21 @@ impl McHandler {
                 });
                 let factory = Arc::clone(&self.producer_factory);
                 let project_root = PathBuf::from(&project_path);
+                // The harness the run was STARTED under, not the resuming
+                // route's: Broca scopes run identity by (project_root,
+                // harness, session), so after a cross-harness handoff the
+                // current binding would resolve to `missing` and
+                // abandon-then-refire a run the original harness may still
+                // be executing. A state written before this field existed
+                // came from the producer factory that hardcoded
+                // `opencode`, so that — not the resuming binding — is the
+                // correct value for a legacy row.
+                let harness = loaded
+                    .meta
+                    .historian
+                    .producer_harness
+                    .clone()
+                    .unwrap_or_else(|| OPENCODE_HARNESS.to_string());
                 let live: Vec<_> = projection
                     .blocks
                     .iter()
@@ -4756,7 +4812,7 @@ impl McHandler {
                             }
                             historian::RestartAction::ReattachProducer { .. } => {}
                         }
-                        let mut producer = factory.connect(&project_root).await?;
+                        let mut producer = factory.connect(&project_root, &harness).await?;
                         reattach_historian_producer(
                             &mut *producer,
                             historian::HistorianReattachRequest {
@@ -5172,6 +5228,7 @@ impl McHandler {
                 session_id: parsed.session_id.clone(),
                 project_path: project_path.to_string(),
                 project_root: binding.project_root.clone(),
+                harness: binding.harness.clone(),
                 project_slug,
                 firing,
                 live_guard,
@@ -5288,6 +5345,7 @@ impl McHandler {
             session_id: parsed.session_id.clone(),
             project_path,
             project_root: binding.project_root.clone(),
+            harness: binding.harness.clone(),
             project_slug,
             firing,
             live_guard,
@@ -5338,6 +5396,7 @@ impl McHandler {
             session_id,
             project_path,
             project_root,
+            harness,
             project_slug,
             firing,
             live_guard,
@@ -5347,10 +5406,15 @@ impl McHandler {
         let _guard = live_guard;
         let failure_started_at_ms = firing.now_ms;
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
-        match factory.connect(&project_root).await {
+        match factory.connect(&project_root, &harness).await {
             Ok(mut producer) => {
-                let mut request =
-                    firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
+                let mut request = firing.as_fire_request(
+                    &store,
+                    &session_id,
+                    &project_path,
+                    &project_slug,
+                    &harness,
+                );
                 request.publication_fence = publication_fence.as_deref();
                 run_historian_firing(&mut *producer, request).await
             }
@@ -9214,6 +9278,30 @@ impl McHandler {
             Ok(mutations) => mutations,
             Err(error) => return invalid_params_error(error),
         };
+        // Replace-scope entries are project assertions exactly like memory
+        // rows: validate each against the bound owner / workspace membership
+        // so one sync cannot prune rows outside its authority.
+        let memories_replace_projects = match parsed
+            .memories_replace_projects
+            .take()
+            .map(|projects| {
+                projects
+                    .into_iter()
+                    .map(|project| {
+                        authority_source_path(
+                            Some(&project),
+                            store_project_path,
+                            &member_paths,
+                            has_workspace,
+                        )
+                    })
+                    .collect::<Result<Vec<String>, String>>()
+            })
+            .transpose()
+        {
+            Ok(scope) => scope,
+            Err(error) => return invalid_params_error(error),
+        };
         let acked_watermarks = parsed.acked_watermarks.unwrap_or_else(|| {
             json!({
                 "compartment_seq": compartments.iter().map(|c| c.sequence).max(),
@@ -9243,6 +9331,7 @@ impl McHandler {
             pending_agent_drops_skipped: parsed.pending_agent_drops_skipped,
             user_hint_seeds: &user_hint_seeds,
             auto_search_hint_skipped: parsed.auto_search_hint_skipped,
+            user_hints_replace_session: parsed.user_hints_replace_session,
             note_nudge_anchors: note_nudge_anchors.as_deref(),
             todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
             todo_synthetic_anchor_present,
@@ -9268,6 +9357,8 @@ impl McHandler {
             reasoning_cleared_through_tag: parsed.reasoning_cleared_through_tag,
             compartments: &compartments,
             memories: &memories,
+            memories_replace_projects: memories_replace_projects.as_deref(),
+            memories_delete_ids: parsed.memories_delete_ids.as_deref(),
             memory_mutations: &memory_mutations,
             user_profile: &user_profile,
             user_profile_present,
@@ -9701,69 +9792,256 @@ impl McHandler {
                 message: format!("classify prompt_body exceeds {MAX_CLASSIFY_PROMPT_BYTES} bytes"),
             };
         }
-        if payload.get("items").and_then(Value::as_array).is_none() {
+        let Some(items) = payload.get("items").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires items");
+        };
+        // The requested IDs are the accept predicate's oracle: an attempt is
+        // successful only if its manifest covers exactly these.
+        let mut expected_ids: BTreeSet<i64> = BTreeSet::new();
+        for item in items {
+            let Some(memory_id) = item.get("memory_id").and_then(Value::as_i64) else {
+                return invalid_params_error("classify items require an integer memory_id");
+            };
+            expected_ids.insert(memory_id);
+        }
+        let Some(models) = payload.get("model_chain").and_then(Value::as_array) else {
+            return invalid_params_error("classify payload requires model_chain");
+        };
+        if models.is_empty() {
+            return invalid_params_error("classify model_chain must not be empty");
+        }
+        if models.len() > MAX_CLASSIFY_MODEL_CHAIN {
+            return invalid_params_error(format!(
+                "classify model_chain exceeds {MAX_CLASSIFY_MODEL_CHAIN} entries"
+            ));
+        }
+        let mut model_chain = Vec::with_capacity(models.len());
+        for model in models {
+            let Some(model) = model.as_str() else {
+                return invalid_params_error("classify model_chain entries must be strings");
+            };
+            let canonical = model
+                .split_once('/')
+                .is_some_and(|(provider, name)| !provider.is_empty() && !name.is_empty());
+            if !canonical {
+                return invalid_params_error(format!(
+                    "classify model {model:?} is not in canonical provider/model form"
+                ));
+            }
+            model_chain.push(model.to_string());
+        }
+        // The deadline prevents new producer runs after the caller's supplied
+        // budget expires.
+        let deadline = match payload.get("timeout_ms") {
+            None => None,
+            Some(value) => {
+                let Some(ms) = value.as_u64().filter(|ms| *ms > 0) else {
+                    return invalid_params_error("classify timeout_ms must be a positive integer");
+                };
+                // `Instant + Duration` panics on overflow, so an absurd
+                // budget is a parameter error, not a crashed handler task.
+                let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
+                    return invalid_params_error("classify timeout_ms is out of range");
+                };
+                Some(deadline)
+            }
+        };
+
+        // Exactly one execution per (ledger_session, command_id): a
+        // concurrent duplicate with different prompt bytes or a different
+        // first model would derive its own child session, bypass Broca's
+        // byte-level idempotency, start a second billable chain, and race
+        // the ledger's INSERT OR IGNORE with a different outcome. The
+        // loser returns without any ledger write; its retry replays the
+        // winner's recorded response.
+        //
+        // Taken BEFORE the ledger read so it also closes the read-to-
+        // registration window: reading first would let a duplicate observe
+        // no row, lose the CPU while the winner ran to completion and
+        // released the guard, then acquire it and start a second billable
+        // chain against a command that already has a durable response.
+        let command_key = (ledger_session.clone(), command_id.to_string());
+        {
+            let mut inflight = self
+                .inflight_dream_commands
+                .lock()
+                .expect("dream command registry mutex");
+            if !inflight.insert(command_key.clone()) {
+                return HandlerOutcome::Error {
+                    code: "dreamer_run_failed".to_string(),
+                    message:
+                        "this command is already executing; retry replays its recorded outcome"
+                            .to_string(),
+                };
+            }
+        }
+        let _command_guard = DreamCommandGuard {
+            registry: Arc::clone(&self.inflight_dream_commands),
+            key: command_key,
+        };
+
+        // A ledger read failure must not look like "no record": replaying a
+        // command whose durable response exists would start a second
+        // billable run, so the read fails closed and the caller retries.
+        match store.load_dream_task_command(&ledger_session, command_id) {
+            Ok(Some(recorded)) => return replay_dream_task_response(&recorded.response_json),
+            Ok(None) => {}
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "dreamer_ledger_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
         }
 
-        if let Ok(Some(recorded)) = store.load_dream_task_command(&ledger_session, command_id) {
-            return replay_dream_task_response(&recorded.response_json);
-        }
-
-        let child_session = child_session_id(&authority_project, command_id);
-        let _dreamer_run_guard = self.register_dreamer_run(&child_session);
         let mut attempts = 0usize;
         let mut last_error = String::new();
         let mut output = None;
-        for model in &binding.config.model_chain {
+        for (attempt, model) in model_chain.iter().enumerate() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                last_error =
+                    "classify time budget exhausted before starting a producer run".to_string();
+                break;
+            }
             attempts += 1;
-            let mut producer = match self.producer_factory.connect(&binding.project_root).await {
+            let child_session = attempt_child_session_id(
+                &authority_project,
+                &ledger_session,
+                command_id,
+                attempt,
+                model,
+            );
+            let _dreamer_run_guard = self.register_dreamer_run(&child_session);
+            let mut producer = match self
+                .producer_factory
+                .connect(&binding.project_root, &binding.harness)
+                .await
+            {
                 Ok(producer) => producer,
                 Err(error) => {
                     last_error = error.to_string();
                     continue;
                 }
             };
-            let started = producer
-                .start_with_generation(
+            // Connection and route setup can consume the remaining budget;
+            // a send after the promised deadline would start a billable run
+            // only to time out its zero-length await immediately.
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                last_error = "classify time budget exhausted during producer startup".to_string();
+                break;
+            }
+            // Bounded by the caller's remaining budget like the await and
+            // redrain: `session.send` is a request with its own 30s timeout
+            // (and a reconnect resend), so an unbounded start could overrun
+            // the promised deadline and eat the transport margin reserved
+            // for `session.delete` — letting the caller's cancel land
+            // during cleanup and leave a billable run alive.
+            let started = match tokio::time::timeout(
+                classify_attempt_timeout(CLASSIFY_AWAIT_TIMEOUT, deadline),
+                producer.start_with_generation(
                     &child_session,
                     CLASSIFY_SYSTEM_PROMPT,
                     prompt_body,
                     model,
                     CLASSIFY_MAX_OUTPUT_TOKENS,
                     CLASSIFY_TEMPERATURE,
-                )
-                .await;
+                ),
+            )
+            .await
+            {
+                Ok(started) => started,
+                Err(_) => Err(HistorianProducerError::TimedOut),
+            };
             let attempt_output = match started {
                 Ok(handle) => match producer
-                    .await_output_with_timeout(&handle.run_id, CLASSIFY_AWAIT_TIMEOUT)
+                    .await_output_with_timeout(
+                        &handle.run_id,
+                        classify_attempt_timeout(CLASSIFY_AWAIT_TIMEOUT, deadline),
+                    )
                     .await
                 {
                     Ok(result) => Ok(result),
                     Err(HistorianProducerError::TimedOut) => {
                         producer
-                            .redrain_output_with_timeout(&handle.run_id, CLASSIFY_RECOVERY_TIMEOUT)
+                            .redrain_output_with_timeout(
+                                &handle.run_id,
+                                classify_attempt_timeout(CLASSIFY_RECOVERY_TIMEOUT, deadline),
+                            )
                             .await
                     }
                     Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
             };
+            // Each non-final attempt must purge its session before advancing
+            // or returning; dreamer sessions carry memory-pool snapshots. A
+            // failed purge is therefore terminal for the command on those
+            // outcome kinds — advancing the chain would let a later success
+            // mask the session (and its snapshot) left behind.
+            //
+            // The successful attempt is the exception: its session is the
+            // only recoverable copy of the result until the response is
+            // durably recorded, so it is purged after the ledger write —
+            // purging first would let a ledger failure tombstone the run and
+            // persist a failure for a command that actually succeeded.
             match attempt_output {
-                Ok(result) if has_manifest_envelope(&result.text) => {
-                    // The module checks only for the task-specific envelope. Even if the
-                    // output limit truncated a result, this layer accepts it when the
-                    // envelope remains; the host parser rejects malformed contents.
-                    output = Some((model.clone(), result));
-                    producer.purge_session(&child_session).await;
-                    break;
-                }
-                Ok(_) => {
+                // Validated against the requested IDs before the attempt is
+                // accepted: an enveloped-but-invalid manifest must advance
+                // the chain, not end it and be ledgered as this command's
+                // durable response. The caller stays the authority for
+                // interpreting the values it applies.
+                //
+                // A length-capped generation is an attempt failure even when
+                // its prefix happens to parse: the caller rejects
+                // `truncated`, so accepting one here would ledger a response
+                // no caller can use and burn the remaining chain.
+                Ok(result) => match length_capped_or_invalid(&result, &expected_ids) {
+                    Ok(()) => {
+                        output = Some((model.clone(), result, child_session, producer));
+                        break;
+                    }
+                    Err(detail) => match producer.purge_session(&child_session).await {
+                        Ok(()) => {
+                            last_error = format!("classify producer returned {detail}");
+                        }
+                        Err(cleanup) => {
+                            last_error = format!(
+                                "classify producer returned {detail} (session.delete cleanup also failed: {cleanup})"
+                            );
+                            break;
+                        }
+                    },
+                },
+                Err(primary) => {
+                    // An idempotency conflict means a concurrent command
+                    // with the same (ledger_session, command_id) owns this
+                    // child session and its live, billable run: purging
+                    // would cancel the other caller's run, and advancing
+                    // the chain would start a duplicate billable attempt
+                    // for a command already executing. Return without any
+                    // ledger write — the loser's failure must not win the
+                    // INSERT OR IGNORE race against the in-flight winner's
+                    // outcome; a retry replays the winner's ledgered
+                    // response.
+                    if matches!(
+                        &primary,
+                        HistorianProducerError::Subc(body) if body.code == "idempotency_conflict"
+                    ) {
+                        return HandlerOutcome::Error {
+                            code: "dreamer_run_failed".to_string(),
+                            message: primary.to_string(),
+                        };
+                    }
+                    let purge_result = producer.purge_session(&child_session).await;
+                    let purge_failed = purge_result.is_err();
                     last_error =
-                        "classify producer returned no classify manifest envelope".to_string();
+                        historian_producer::attach_cleanup(primary, purge_result, "session.delete")
+                            .to_string();
+                    if purge_failed {
+                        break;
+                    }
                 }
-                Err(error) => last_error = error.to_string(),
             }
-            producer.purge_session(&child_session).await;
         }
         if output.is_none() {
             let response = json!({
@@ -9782,7 +10060,7 @@ impl McHandler {
                 message: last_error,
             };
         }
-        let (model, result) = output.expect("classifier output set");
+        let (model, result, child_session, mut producer) = output.expect("classifier output set");
         let response = json!({
             "ok": true,
             "manifest_text": result.text,
@@ -9804,7 +10082,19 @@ impl McHandler {
             &response.to_string(),
             now_ms(),
         ) {
-            Ok(recorded) => replay_dream_task_response(&recorded.response_json),
+            Ok(recorded) => {
+                // Purge only after the response is durable. A purge failure
+                // here cannot fail the command — the recorded response is
+                // already the command's outcome (any retry replays it) —
+                // and the leftover session stays bounded by host terminal
+                // retention.
+                let _ = producer.purge_session(&child_session).await;
+                replay_dream_task_response(&recorded.response_json)
+            }
+            // The completed session is left alive deliberately: with no
+            // ledger row, a retry derives the same child session and can
+            // recover the completed run instead of hitting a deletion
+            // tombstone.
             Err(error) => HandlerOutcome::Error {
                 code: "dreamer_ledger_failed".to_string(),
                 message: error.to_string(),
@@ -9884,6 +10174,10 @@ impl McHandler {
             updates.push(mc_store::ClassificationUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 importance: row
                     .get("importance")
                     .and_then(Value::as_i64)
@@ -10107,6 +10401,10 @@ impl McHandler {
             updates.push(VerificationUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 verification_status: status.to_string(),
                 updated_content: row
                     .get("updated_content")
@@ -10216,6 +10514,10 @@ impl McHandler {
             updates.push(MappingUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 mapped_files,
             });
         }
@@ -12041,6 +12343,46 @@ impl McHandler {
             .await
     }
 
+    /// Cross-crate test seam: dispatch one parsed request, bypassing the transport. `RequestCtx` is transport-owned, so the authenticated round-trip test cannot call `handle()`. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub async fn dispatch_value_for_integration(
+        &self,
+        channel: u16,
+        request: Value,
+    ) -> HandlerOutcome {
+        self.dispatch_value_with_inbound_bytes(channel, request, None)
+            .await
+    }
+
+    /// Cross-crate test seam mirroring `on_bind`: `RouteBindRequest` needs a `RouteHandle`, whose constructor is private to the transport crate. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn bind_route_for_integration(
+        &self,
+        channel: u16,
+        project_root: &Path,
+        harness: &str,
+        session: &str,
+    ) {
+        let config = self.effective_config(project_root);
+        self.bind_route(
+            channel,
+            SessionBinding {
+                project_root: project_root.to_path_buf(),
+                harness: harness.to_owned(),
+                session: session.to_owned(),
+                model_key: None,
+                config,
+                history_budget_tokens: memory_render::DEFAULT_HISTORY_BUDGET_TOKENS,
+            },
+        );
+    }
+
+    /// Cross-crate test seam mirroring the `on_hello_ack` store open: sharing one already-open handle lets the test seed and verify rows without fighting the store's single-writer lease. commentlint: allow(JUDGE)
+    #[doc(hidden)]
+    pub fn install_store_for_integration(&self, store: Arc<McStore>) {
+        let _ = self.store.set(store);
+    }
+
     async fn dispatch_value_with_inbound_bytes(
         &self,
         channel: u16,
@@ -12962,6 +13304,29 @@ fn need_full_sync_response(request: &TransformRequest) -> HandlerOutcome {
     )
 }
 
+fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Duration {
+    match deadline {
+        None => ceiling,
+        Some(deadline) => ceiling.min(deadline.saturating_duration_since(Instant::now())),
+    }
+}
+
+/// The accept predicate for one classify attempt: usable output, then a
+/// manifest that covers exactly the requested memories. A length-capped
+/// generation is rejected even when its truncated prefix parses, because the
+/// caller refuses `truncated` output — accepting one would write a durable
+/// response no caller can use and leave the remaining chain unavailable to
+/// every retry.
+fn length_capped_or_invalid(
+    result: &historian_producer::ProducerOutput,
+    expected_ids: &BTreeSet<i64>,
+) -> Result<(), String> {
+    if result.length_capped {
+        return Err("a length-capped generation".to_owned());
+    }
+    validate_classify_manifest(&result.text, expected_ids)
+}
+
 fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
     let Ok(response) = serde_json::from_str::<Value>(response_json) else {
         return HandlerOutcome::Error {
@@ -13534,6 +13899,7 @@ fn assemble_state_sync_seed(
     let mut note_nudge_anchors_present = false;
     let mut strip_seeds = Vec::new();
     let mut user_profile = None;
+    let mut memories_delete_ids: Option<Vec<i64>> = None;
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
@@ -13550,6 +13916,11 @@ fn assemble_state_sync_seed(
             user_profile
                 .get_or_insert_with(Vec::new)
                 .append(&mut profile);
+        }
+        if let Some(mut ids) = batch.memories_delete_ids.take() {
+            memories_delete_ids
+                .get_or_insert_with(Vec::new)
+                .append(&mut ids);
         }
     }
     compartments.append(&mut final_batch.compartments);
@@ -13578,6 +13949,19 @@ fn assemble_state_sync_seed(
         seed_boundary_id: final_batch.seed_boundary_id,
         compartments,
         memories,
+        // Replace scope rides the completing batch and applies to the whole
+        // assembled snapshot; earlier batches never carry it.
+        memories_replace_projects: final_batch.memories_replace_projects,
+        // Delete ids page with the seed items; concatenate every page's list.
+        memories_delete_ids: match (memories_delete_ids, final_batch.memories_delete_ids) {
+            (None, None) => None,
+            (Some(ids), None) => Some(ids),
+            (None, Some(ids)) => Some(ids),
+            (Some(mut ids), Some(mut tail)) => {
+                ids.append(&mut tail);
+                Some(ids)
+            }
+        },
         memory_mutations,
         user_profile,
         workspace: final_batch.workspace,
@@ -13592,6 +13976,7 @@ fn assemble_state_sync_seed(
         note_nudge_anchors: note_nudge_anchors_present.then_some(note_nudge_anchors),
         auto_search_hint_decisions,
         auto_search_hint_skipped: final_batch.auto_search_hint_skipped,
+        user_hints_replace_session: final_batch.user_hints_replace_session,
         todo_synthetic_anchor: final_batch.todo_synthetic_anchor,
         emergency_latches: final_batch.emergency_latches,
         pending_compaction_marker: final_batch.pending_compaction_marker,
@@ -15921,7 +16306,7 @@ mod tests {
         CkIngressMessage, CkKind, CkOutputKind, CkToolOutput, CkWireBlock, CkWireMessage,
         HarnessMeta, ProviderExtras,
     };
-    use historian_producer::{ProducerOutput, RunHandle, RunState};
+    use historian_producer::{ErrorClass, ProducerOutput, RunHandle, RunState};
     use mc_core::CoreState;
     use mc_store::{
         HistorianChunkRange, HistorianDurableState, ModuleMeta, ModuleUsage, NoteEvaluationInput,
@@ -16559,7 +16944,8 @@ mod tests {
     }
 
     async fn wait_for_store_open_phase(handler: &McHandler, phase: u8) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        // The 10-second timeout is only a ceiling against an indefinite wait.
+        tokio::time::timeout(Duration::from_secs(10), async {
             while handler.store_open.phase.load(Ordering::Acquire) != phase {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -16569,7 +16955,7 @@ mod tests {
     }
 
     async fn wait_for_store_open(handler: &McHandler) {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             while handler.store.get().is_none() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -16586,7 +16972,9 @@ mod tests {
         let descriptor = dev_descriptor_at(data_home.to_str().unwrap());
         let predecessor = McStore::open(&descriptor).unwrap();
         let handler = McHandler::new();
-        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_millis(500)));
+        // The 30-second window keeps the pre-drop assertion inside the lease
+        // wait.
+        handler.set_store_open_policy_for_test(short_store_open_policy(Duration::from_secs(30)));
 
         handler.begin_store_open(descriptor);
         wait_for_store_open_phase(&handler, STORE_OPEN_WAITING).await;
@@ -17316,6 +17704,13 @@ mod tests {
         outputs: Mutex<VecDeque<String>>,
         next_fact: Mutex<Option<String>>,
         prompts: Mutex<Vec<String>>,
+        harnesses: Mutex<Vec<String>>,
+        sessions: Mutex<Vec<String>>,
+        purges: Mutex<Vec<String>>,
+        /// `session_events` preserves start/purge order that separate logs lose.
+        session_events: Mutex<Vec<String>>,
+        purge_errors: Mutex<VecDeque<HistorianProducerError>>,
+        await_timeouts: Mutex<Vec<Duration>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
@@ -17328,8 +17723,14 @@ mod tests {
         async fn connect(
             &self,
             _project_root: &Path,
+            harness: &str,
         ) -> Result<Box<dyn HistorianProducerDriver + Send>, HistorianProducerError> {
             self.state.connects.fetch_add(1, Ordering::SeqCst);
+            self.state
+                .harnesses
+                .lock()
+                .expect("harnesses mutex")
+                .push(harness.to_string());
             if let Some(err) = self
                 .state
                 .connect_errors
@@ -17358,12 +17759,22 @@ mod tests {
 
         async fn start(
             &mut self,
-            _session_id: &str,
+            session_id: &str,
             _system: &str,
             prompt: &str,
             _model: &str,
         ) -> Result<RunHandle, HistorianProducerError> {
             let n = self.state.starts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state
+                .sessions
+                .lock()
+                .expect("sessions mutex")
+                .push(session_id.to_string());
+            self.state
+                .session_events
+                .lock()
+                .expect("session events mutex")
+                .push(format!("start:{session_id}"));
             self.state
                 .prompts
                 .lock()
@@ -17434,6 +17845,19 @@ mod tests {
             })
         }
 
+        async fn await_output_with_timeout(
+            &mut self,
+            run_id: &str,
+            timeout: Duration,
+        ) -> Result<ProducerOutput, HistorianProducerError> {
+            self.state
+                .await_timeouts
+                .lock()
+                .expect("await timeouts mutex")
+                .push(timeout);
+            self.await_output(run_id).await
+        }
+
         async fn status(&mut self, _run_id: &str) -> Result<RunState, HistorianProducerError> {
             self.state.statuses.fetch_add(1, Ordering::SeqCst);
             Ok(RunState::Active)
@@ -17443,7 +17867,32 @@ mod tests {
             Ok(())
         }
 
-        async fn close(&mut self) {}
+        async fn close(&mut self) -> Result<(), HistorianProducerError> {
+            Ok(())
+        }
+
+        async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
+            self.state
+                .purges
+                .lock()
+                .expect("purges mutex")
+                .push(session_id.to_string());
+            self.state
+                .session_events
+                .lock()
+                .expect("session events mutex")
+                .push(format!("purge:{session_id}"));
+            match self
+                .state
+                .purge_errors
+                .lock()
+                .expect("purge errors mutex")
+                .pop_front()
+            {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
     }
 
     fn handler_with_store(
@@ -23762,6 +24211,7 @@ mod tests {
                 selected_range_identities: selected_range_identities.clone(),
                 producer_session_id: Some("producer".to_string()),
                 producer_run_id: Some("run".to_string()),
+                producer_harness: None,
                 fired_at_ms: Some(1),
                 expected_revert_epoch: 0,
                 compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
@@ -23868,19 +24318,20 @@ mod tests {
                 ),
             },
         ];
-        let mut snapshots = handler
-            .transform_snapshots
-            .lock()
-            .expect("transform snapshots mutex");
-        let generation = snapshots.begin("ses");
-        snapshots.finish_ready(
-            "ses",
-            generation,
-            Arc::new(transform_request(raw_messages, 45_000, 50_000)),
-            0,
-            0,
-        );
-        drop(snapshots);
+        {
+            let mut snapshots = handler
+                .transform_snapshots
+                .lock()
+                .expect("transform snapshots mutex");
+            let generation = snapshots.begin("ses");
+            snapshots.finish_ready(
+                "ses",
+                generation,
+                Arc::new(transform_request(raw_messages, 45_000, 50_000)),
+                0,
+                0,
+            );
+        }
 
         let verbose = tool_text(
             call_facade(
@@ -26067,10 +26518,7 @@ mod tests {
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
         let route_root = project.to_str().unwrap();
-        let mut route_binding = binding(route_root, "ses");
-        route_binding.config.model_chain =
-            vec!["test/bad-model".to_string(), "test/good-model".to_string()];
-        handler.bind_route(7, route_binding);
+        handler.bind_route(7, binding(route_root, "ses"));
         activate_module_authority(&store, "context", "git:identity", route_root, "memories");
         let generation = store
             .authority_status("context", "git:identity", "memories")
@@ -26087,7 +26535,11 @@ mod tests {
                     "task": CLASSIFY_TASK,
                     "command_id": "model-chain-command",
                     "authority_generation": generation,
-                    "payload": { "prompt_body": "classify", "items": [] },
+                    "payload": {
+                        "prompt_body": "classify",
+                        "items": [],
+                        "model_chain": ["test/bad-model", "test/good-model"],
+                    },
                 }),
             )
             .await;
@@ -26100,6 +26552,32 @@ mod tests {
         assert_eq!(response["manifest_text"], json!("<classify></classify>"));
         assert_eq!(response["diagnostics"]["model"], json!("test/good-model"));
         assert_eq!(response["diagnostics"]["attempts"], json!(2));
+        let sessions = producer.sessions.lock().unwrap().clone();
+        assert_eq!(
+            sessions,
+            vec![
+                attempt_child_session_id(
+                    "git:identity",
+                    "ses",
+                    "model-chain-command",
+                    0,
+                    "test/bad-model"
+                ),
+                attempt_child_session_id(
+                    "git:identity",
+                    "ses",
+                    "model-chain-command",
+                    1,
+                    "test/good-model"
+                ),
+            ],
+            "fallback attempts must run in distinct deterministic child sessions"
+        );
+        assert_eq!(
+            producer.purges.lock().unwrap().clone(),
+            sessions,
+            "every attempt must purge its own session before the next starts"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -26116,7 +26594,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .generation;
-        let child_session = child_session_id("git:identity", "cancel-command");
+        let child_session =
+            attempt_child_session_id("git:identity", "parent", "cancel-command", 0, "test/model");
         let handler = Arc::new(handler);
         let running_handler = Arc::clone(&handler);
         let task = tokio::spawn(async move {
@@ -26129,7 +26608,11 @@ mod tests {
                         "task": CLASSIFY_TASK,
                         "command_id": "cancel-command",
                         "authority_generation": generation,
-                        "payload": { "prompt_body": "classify", "items": [] },
+                        "payload": {
+                            "prompt_body": "classify",
+                            "items": [],
+                            "model_chain": ["test/model"],
+                        },
                     }),
                 )
                 .await
@@ -26140,6 +26623,527 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert!(!handler.dreamer_run_registered(&child_session));
+    }
+
+    async fn dreamer_classify_outcome(
+        producer: &Arc<ProducerState>,
+        payload: Value,
+        command_id: &str,
+    ) -> (Arc<ProducerState>, HandlerOutcome) {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        // A poisoned historian chain proves the classify loop no longer reads
+        // route config models.
+        let mut route_binding = binding_with_harness(route_root, "pi", "ses");
+        route_binding.config.model_chain = vec!["test/route-only-model".to_string()];
+        handler.bind_route(7, route_binding);
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let outcome = handler
+            .handle_dreamer_run_task(
+                7,
+                &json!({
+                    "v": 1,
+                    "session_id": "ses",
+                    "task": CLASSIFY_TASK,
+                    "command_id": command_id,
+                    "authority_generation": generation,
+                    "payload": payload,
+                }),
+            )
+            .await;
+        (Arc::clone(producer), outcome)
+    }
+
+    fn classify_envelope_output() -> Result<ProducerOutput, HistorianProducerError> {
+        Ok(ProducerOutput {
+            text: "<classify></classify>".to_string(),
+            length_capped: false,
+        })
+    }
+
+    /// A length-capped generation is an attempt failure even when its
+    /// truncated prefix parses: the caller refuses `truncated` output, so
+    /// accepting one would ledger a response no caller can use and leave no
+    /// fallback model for any retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_advances_past_a_length_capped_attempt() {
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            Ok(ProducerOutput {
+                text: "<classify></classify>".to_string(),
+                length_capped: true,
+            }),
+            classify_envelope_output(),
+        ]);
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/capped-model", "test/whole-model"],
+            }),
+            "length-capped",
+        )
+        .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the chain must recover from a capped attempt: {other:?}"),
+        };
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["truncated"], json!(false));
+        assert_eq!(
+            response["diagnostics"]["model"],
+            json!("test/whole-model"),
+            "the capped attempt must not be the accepted one"
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            producer.purges.lock().unwrap().len(),
+            2,
+            "the capped attempt's session must be purged before advancing"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_requires_explicit_canonical_model_chain() {
+        // One entry past the attempt cap: every entry is a potential
+        // billable provider run, so an oversized chain must die before
+        // any run starts.
+        let oversized_chain = json!({
+            "prompt_body": "classify",
+            "items": [],
+            "model_chain": (0..=MAX_CLASSIFY_MODEL_CHAIN)
+                .map(|i| format!("prov/m{i}"))
+                .collect::<Vec<_>>(),
+        });
+        for payload in [
+            json!({ "prompt_body": "classify", "items": [] }),
+            json!({ "prompt_body": "classify", "items": [], "model_chain": [] }),
+            json!({ "prompt_body": "classify", "items": [], "model_chain": ["flat-model"] }),
+            json!({ "prompt_body": "classify", "items": [], "model_chain": ["/model"] }),
+            json!({ "prompt_body": "classify", "items": [], "model_chain": ["prov/"] }),
+            json!({ "prompt_body": "classify", "items": [], "model_chain": [7] }),
+            oversized_chain,
+        ] {
+            let producer = Arc::new(ProducerState::default());
+            let (producer, outcome) =
+                dreamer_classify_outcome(&producer, payload.clone(), "chain-shape").await;
+            match outcome {
+                HandlerOutcome::Error { code, .. } => {
+                    assert_eq!(code, "invalid_params", "payload {payload}")
+                }
+                other => panic!("expected invalid_params for {payload}, got {other:?}"),
+            }
+            assert_eq!(
+                producer.starts.load(Ordering::SeqCst),
+                0,
+                "a rejected chain must never start a run: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_uses_request_chain_and_route_harness() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .unwrap()
+            .push_back(classify_envelope_output());
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/payload-model"],
+            }),
+            "request-chain",
+        )
+        .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("dreamer run failed: {other:?}"),
+        };
+        assert_eq!(
+            response["diagnostics"]["model"],
+            json!("test/payload-model")
+        );
+        assert_eq!(
+            producer.harnesses.lock().unwrap().clone(),
+            vec!["pi"],
+            "the classify producer must connect with the route-bound harness"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_purges_each_attempt_session_on_every_outcome_kind() {
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            // provider failure
+            Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "boom",
+                ErrorClass::Transient,
+                None,
+            )),
+            // invalid envelope
+            Ok(ProducerOutput {
+                text: "no envelope here".to_string(),
+                length_capped: false,
+            }),
+            // timeout, then the recovery re-drain also times out
+            Err(HistorianProducerError::TimedOut),
+            Err(HistorianProducerError::TimedOut),
+            // provider-reported cancellation
+            Err(HistorianProducerError::aborted("run cancelled")),
+            // valid output
+            classify_envelope_output(),
+        ]);
+        let models = [
+            "test/failing",
+            "test/enveloping",
+            "test/timing-out",
+            "test/cancelling",
+            "test/succeeding",
+        ];
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": models,
+            }),
+            "purge-outcomes",
+        )
+        .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("dreamer run failed: {other:?}"),
+        };
+        assert_eq!(response["diagnostics"]["attempts"], json!(5));
+        let expected: Vec<String> = models
+            .iter()
+            .enumerate()
+            .map(|(attempt, model)| {
+                attempt_child_session_id("git:identity", "ses", "purge-outcomes", attempt, model)
+            })
+            .collect();
+        assert_eq!(
+            producer.purges.lock().unwrap().clone(),
+            expected,
+            "every outcome kind must delete its attempt session before advancing"
+        );
+        let interleaved: Vec<String> = expected
+            .iter()
+            .flat_map(|session| [format!("start:{session}"), format!("purge:{session}")])
+            .collect();
+        assert_eq!(
+            producer.session_events.lock().unwrap().clone(),
+            interleaved,
+            "each attempt's purge must land before the next attempt's start"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_success_survives_cleanup_failure_after_ledger_record() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .unwrap()
+            .push_back(classify_envelope_output());
+        producer
+            .purge_errors
+            .lock()
+            .unwrap()
+            .push_back(HistorianProducerError::TimedOut);
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/model"],
+            }),
+            "cleanup-on-success",
+        )
+        .await;
+        // The response was durably recorded before the purge ran, so the
+        // purge failure cannot fail the command — a retry would replay the
+        // recorded success anyway; the leftover session is bounded by host
+        // terminal retention.
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("a recorded success must survive a cleanup failure: {other:?}"),
+        };
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(
+            producer.starts.load(Ordering::SeqCst),
+            1,
+            "a successful classification must not burn fallback attempts on cleanup failure"
+        );
+        assert_eq!(
+            producer.purges.lock().unwrap().len(),
+            1,
+            "the purge must still be attempted after the ledger write"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_retains_provider_error_and_cleanup_failure_together() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .unwrap()
+            .push_back(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "model gone",
+                ErrorClass::Permanent,
+                None,
+            )));
+        producer
+            .purge_errors
+            .lock()
+            .unwrap()
+            .push_back(HistorianProducerError::TimedOut);
+        let (_producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/model"],
+            }),
+            "cleanup-with-failure",
+        )
+        .await;
+        let HandlerOutcome::Error { code, message } = outcome else {
+            panic!("expected dreamer_run_failed");
+        };
+        assert_eq!(code, "dreamer_run_failed");
+        assert!(
+            message.contains("model gone") && message.contains("cleanup also failed"),
+            "both the provider failure and the cleanup failure must survive: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_backs_off_on_idempotency_conflict_without_purging() {
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            Err(HistorianProducerError::tagged_subc(
+                "idempotency_conflict",
+                "a byte-different send holds this session",
+                ErrorClass::Permanent,
+                None,
+            )),
+            classify_envelope_output(),
+        ]);
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        let route_root = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(route_root, "pi", "ses"));
+        activate_module_authority(&store, "context", "git:identity", route_root, "memories");
+        let generation = store
+            .authority_status("context", "git:identity", "memories")
+            .unwrap()
+            .unwrap()
+            .generation;
+        let request = json!({
+            "v": 1,
+            "session_id": "ses",
+            "task": CLASSIFY_TASK,
+            "command_id": "conflict-command",
+            "authority_generation": generation,
+            "payload": {
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/model-a", "test/model-b"],
+            },
+        });
+
+        let outcome = handler.handle_dreamer_run_task(7, &request).await;
+        let HandlerOutcome::Error { code, .. } = outcome else {
+            panic!("an idempotency conflict must fail the command");
+        };
+        assert_eq!(code, "dreamer_run_failed");
+        // The conflicting session belongs to a concurrent command's live
+        // run: purging would cancel it, and a chain advance would start a
+        // duplicate billable attempt for a command already executing.
+        assert!(
+            producer.purges.lock().unwrap().is_empty(),
+            "the losing caller must not purge the winner's session"
+        );
+        assert_eq!(
+            producer.starts.load(Ordering::SeqCst),
+            1,
+            "the chain must not advance past an idempotency conflict"
+        );
+
+        // Crucially the loser recorded nothing: a failure row would win the
+        // ledger's INSERT OR IGNORE race and mask the in-flight winner's
+        // outcome. The command's slot stays open, so a later attempt can
+        // still commit success.
+        let outcome = handler.handle_dreamer_run_task(7, &request).await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the command slot must remain open after a conflict: {other:?}"),
+        };
+        assert_eq!(response["ok"], json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_exhausted_budget_starts_no_new_run() {
+        let producer = Arc::new(ProducerState::default());
+        producer
+            .await_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(ProducerOutput {
+                text: "no envelope".to_string(),
+                length_capped: false,
+            }));
+        // The first attempt outlives the 10ms budget, so the second configured
+        // model must never start.
+        *producer.on_await_output.lock().unwrap() = Some(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(30));
+        }));
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/slow", "test/never-started"],
+                "timeout_ms": 10,
+            }),
+            "budget-exhausted",
+        )
+        .await;
+        let HandlerOutcome::Error { code, message } = outcome else {
+            panic!("expected dreamer_run_failed");
+        };
+        assert_eq!(code, "dreamer_run_failed");
+        assert!(
+            message.contains("budget exhausted"),
+            "the failure must name the exhausted budget: {message}"
+        );
+        assert_eq!(
+            producer.starts.load(Ordering::SeqCst),
+            1,
+            "an exhausted budget must start no new LLM run"
+        );
+        let await_timeouts = producer.await_timeouts.lock().unwrap().clone();
+        assert_eq!(await_timeouts.len(), 1);
+        assert!(
+            await_timeouts[0] <= Duration::from_millis(10),
+            "the await window must be bounded by the remaining budget, not the 600s ceiling: {await_timeouts:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn organic_fire_connects_producer_with_route_bound_harness() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
+        );
+
+        let first = call_transform(&handler, big_messages()).await;
+        assert_eq!(first["historian"]["fired"], true);
+        wait_for_count(&producer.starts, 1).await;
+        wait_for_idle(&store).await;
+
+        assert_eq!(producer.harnesses.lock().unwrap().clone(), vec!["pi"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wrapup_fire_connects_producer_with_route_bound_harness() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, _store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "opencode", "ses"),
+        );
+        cache_wrapup_messages(&handler, wrapup_messages(80, 800));
+
+        let body = tool_body(
+            handler
+                .dispatch_value(
+                    7,
+                    json!({ "method": "session.wrapup", "v": 1, "session_id": "ses" }),
+                )
+                .await,
+        );
+
+        assert_eq!(body["ok"], json!(true), "{body}");
+        let harnesses = producer.harnesses.lock().unwrap().clone();
+        assert!(
+            !harnesses.is_empty() && harnesses.iter().all(|harness| harness == "opencode"),
+            "every wrapup round must connect with the route harness: {harnesses:?}"
+        );
+    }
+
+    /// Reattach must target the run's OWN Broca identity, which is scoped by
+    /// `(project_root, harness, session)` — not the harness of whatever
+    /// route happens to resume the session. Using the resuming binding after
+    /// a cross-harness handoff queries a different key, observes `missing`,
+    /// and can abandon-then-refire a run the original harness is still
+    /// executing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reattach_connects_producer_with_the_runs_own_harness() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
+        );
+        let messages = big_messages();
+        // The run was started under opencode; the resuming route is pi.
+        seed_awaiting_with_harness(&store, &messages, Some("opencode"));
+
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["no_fire"], "reattaching");
+        wait_for_count(&producer.connects, 1).await;
+        wait_for_idle(&store).await;
+
+        assert_eq!(
+            producer.harnesses.lock().unwrap().clone(),
+            vec!["opencode"],
+            "reattach must use the harness the run was started under"
+        );
+    }
+
+    /// A state written before the harness was persisted came from the
+    /// producer factory that hardcoded `opencode`, so that — not the
+    /// resuming route's harness — is the correct recovery target for a
+    /// legacy row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reattach_treats_a_legacy_awaiting_row_as_opencode() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
+        );
+        let messages = big_messages();
+        seed_awaiting(&store, &messages);
+
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["no_fire"], "reattaching");
+        wait_for_count(&producer.connects, 1).await;
+        wait_for_idle(&store).await;
+
+        assert_eq!(producer.harnesses.lock().unwrap().clone(), vec!["opencode"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -27384,17 +28388,6 @@ mod tests {
         assert_eq!(second["action"], "HARD");
         assert!(m0_text(&second).contains("autonomous summary"));
     }
-
-    /// Imported compartments whose anchor mids never appear in the live array
-    /// must refuse at the bootstrap fold: the minted boundary has to name a real
-    /// live block. Pins the anchor-acceptance rule that seeded/imported sessions
-    /// depend on (a synthetic-anchor seed can never compose, regardless of ranges).
-
-    /// Desk rehearsal of the drive's final seed shape: 20 live messages with a
-    /// role=system message mid-span at ordinal 1, four imported compartments
-    /// partitioning 0..=16 on real live block ids, live tail 17..=19. Must
-    /// bootstrap-HARD-fold with the last covered block as the minted boundary —
-    /// and the mid-span system ordinal must be absorbed, not rejected.
 
     /// Desk rehearsal of the round-3 drive seed: 18 live messages (system at
     /// ordinal 1 mid-span), four imported compartments partitioning 0..=14 on
@@ -30409,7 +31402,19 @@ mod tests {
         }]
     }
 
+    /// Seeds a legacy `AwaitingProducer` row — one written before the
+    /// producer harness was persisted.
     fn seed_awaiting(store: &McStore, messages: &[CkIngressMessage]) {
+        seed_awaiting_with_harness(store, messages, None);
+    }
+
+    /// Seeds an `AwaitingProducer` row. `producer_harness: None` reproduces a
+    /// state written before that field existed.
+    fn seed_awaiting_with_harness(
+        store: &McStore,
+        messages: &[CkIngressMessage],
+        producer_harness: Option<&str>,
+    ) {
         let canonical_messages = transform_request(messages.to_vec(), 1, 200_000).messages;
         let projection = crate::ck_wire::project_messages(&canonical_messages).unwrap();
         let chunk = historian_chunk::build_historian_chunk(
@@ -30444,6 +31449,7 @@ mod tests {
             selected_range_identities,
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-reattach".to_string()),
+            producer_harness: producer_harness.map(str::to_owned),
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
@@ -30476,6 +31482,7 @@ mod tests {
             selected_range_identities,
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-stale".to_string()),
+            producer_harness: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
@@ -32827,6 +33834,7 @@ mod tests {
                 selected_range_identities: selected_range_identities.clone(),
                 producer_session_id: Some("ctx-expand-producer".to_string()),
                 producer_run_id: Some("ctx-expand-run".to_string()),
+                producer_harness: None,
                 fired_at_ms: Some(1),
                 expected_revert_epoch: 0,
                 compartment_set_generation: mc_store::CompartmentSetGeneration::default(),

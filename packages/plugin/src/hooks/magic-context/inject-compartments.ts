@@ -1,5 +1,9 @@
 import { Buffer } from "node:buffer";
 import {
+    reconcileCompatibilityVerifications,
+    seedLateCompatibilityRevisions,
+} from "../../features/magic-context/claim-policy-backfill";
+import {
     buildCompartmentBlock,
     type Compartment,
     type CompartmentDateRanges,
@@ -10,6 +14,15 @@ import {
     type SessionFact,
 } from "../../features/magic-context/compartment-storage";
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
+import {
+    bindMemoriesToCurrentRevision,
+    exactMemoryContentDigests,
+    filterMemoriesByPolicy,
+    hasClaimEffectivePolicy,
+    recordedMemoryBlockStillBacked,
+    sessionMemoryBlockStillEligible,
+} from "../../features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
@@ -94,8 +107,23 @@ export interface PreparedCompartmentInjection {
  */
 const INJECTION_CACHE_MAX = 100;
 type InjectionCacheEntry =
-    | { db: Database; kind: "empty"; compartmentEndMessageId: string; renderedBytes: number }
-    | { db: Database; kind: "populated"; injection: PreparedCompartmentInjection };
+    | {
+          db: Database;
+          kind: "empty";
+          compartmentEndMessageId: string;
+          renderedBytes: number;
+          /** Project memory epoch at build time; a later bump means a policy
+           * transition may have hidden or newly exposed a memory, so the
+           * entry (and the persisted block cache) must rebuild instead of
+           * replaying a stale snapshot. */
+          projectMemoryEpoch: number;
+      }
+    | {
+          db: Database;
+          kind: "populated";
+          injection: PreparedCompartmentInjection;
+          projectMemoryEpoch: number;
+      };
 
 const injectionCache = new BoundedSessionMap<InjectionCacheEntry>(INJECTION_CACHE_MAX);
 
@@ -319,6 +347,31 @@ export function prepareCompartmentInjection(
 ): PreparedCompartmentInjection | null {
     // On defer (cache-safe) passes, replay the cached injection result so that
     // historian publications between passes do not bust the prompt-cache prefix.
+    // Before any replay gate runs, reconcile compatibility verification events
+    // a held-open v85 writer may have appended since startup: a reconciled
+    // event bumps the project epoch, which the gates below then observe in
+    // this same pass. The reconciler is watermark-guarded (one MAX probe when
+    // idle); a failure retries next pass with the watermark unmoved.
+    try {
+        reconcileCompatibilityVerifications(db);
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
+    // Sibling straggler probe: a held-open v85 writer can also append a NEW
+    // revision (not just a verification event) after the startup seeder
+    // completed; unseeded revisions read as automatic-hidden until seeded.
+    // One single-row anti-join when idle; the seed itself runs async.
+    try {
+        seedLateCompatibilityRevisions(db);
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            `late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
     const cached = injectionCache.get(sessionId);
     if (cached && cached.db !== db) {
         // Session ids are unique in production, but tests and explicit database
@@ -333,11 +386,43 @@ export function prepareCompartmentInjection(
     }
     const usableCached = cached?.db === db ? cached : undefined;
 
-    if (!isCacheBusting && usableCached) {
-        if (usableCached.kind === "empty") {
+    // The fast path replays a prepared block without touching the database
+    // caches below, so it needs its own policy revalidation: an epoch bump
+    // does not clear this process-local map.
+    if (
+        !isCacheBusting &&
+        usableCached?.kind === "populated" &&
+        usableCached.injection.memoryCount > 0 &&
+        !sessionMemoryBlockStillEligible(db, sessionId)
+    ) {
+        clearInjectionCache(sessionId);
+    }
+    // The epoch twin: a policy transition can also make a memory NEWLY
+    // eligible, which the id-recheck above cannot see (every rendered id is
+    // still eligible, and a zero-memory entry has no ids at all). Entries
+    // record the project memory epoch at build time; a changed epoch
+    // rebuilds. The persisted memory_block cache replays by id-eligibility
+    // alone, so the rebuild below must skip it — carried as an in-call flag
+    // rather than a database reset, which could fail on SQLITE_BUSY while
+    // the rebuild stamps a fresh-epoch entry and never retries. This check
+    // runs on cache-busting passes too: their rebuild consults session_meta
+    // directly. An unchanged epoch replays byte-stable.
+    let forceMemoryBlockRecompute = false;
+    if (
+        usableCached !== undefined &&
+        usableCached.projectMemoryEpoch !== getProjectMemoryEpoch(db, projectPath)
+    ) {
+        clearInjectionCache(sessionId);
+        forceMemoryBlockRecompute = true;
+    }
+    const revalidatedCached = injectionCache.get(sessionId);
+    const replayableCached = revalidatedCached?.db === db ? revalidatedCached : undefined;
+
+    if (!isCacheBusting && replayableCached) {
+        if (replayableCached.kind === "empty") {
             return null;
         }
-        const prepared = usableCached.injection;
+        const prepared = replayableCached.injection;
         if (prepared.compartmentEndMessageId === null) {
             sessionLog(
                 sessionId,
@@ -377,6 +462,13 @@ export function prepareCompartmentInjection(
 
     let memoryBlock: string | undefined;
     let memoryCount = 0;
+    // Epoch stamp for the replay gates: captured BEFORE the memory set is
+    // read/rendered. Cache entries are stamped with this pre-snapshot value,
+    // so an epoch bump that lands mid-build (a memory becoming newly
+    // eligible after the read but before the stamp) leaves the stored entry
+    // stamped with the OLD epoch — the next pass sees the mismatch and
+    // rebuilds instead of serving the stale block indefinitely.
+    const buildProjectMemoryEpoch = getProjectMemoryEpoch(db, projectPath);
     if (projectPath) {
         // Use cached memory block to avoid cache busting on background changes (ctx_memory write, promotion).
         // Cache is cleared by replaceSessionFacts/replaceAllCompartmentState after historian/compressor/recomp.
@@ -385,15 +477,83 @@ export function prepareCompartmentInjection(
         // hot path (every transform) for a table we fully control.
         const cachedMemory = db
             .prepare(
-                "SELECT memory_block_cache, memory_block_count FROM session_meta WHERE session_id = ?",
+                "SELECT memory_block_cache, memory_block_count, memory_block_ids, memory_block_hashes, memory_block_epoch FROM session_meta WHERE session_id = ?",
             )
-            .get(sessionId) as { memory_block_cache: string; memory_block_count: number } | null;
+            .get(sessionId) as {
+            memory_block_cache: string;
+            memory_block_count: number;
+            memory_block_ids: string | null;
+            memory_block_hashes: string | null;
+            memory_block_epoch: number | null;
+        } | null;
 
-        if (cachedMemory?.memory_block_cache) {
+        // A cached block replays only while every rendered id is still
+        // automatic-eligible AND content-identical: a policy transition
+        // (quarantine, contradiction, rejection, supersession) or an
+        // in-place rewrite must not keep serving stale content through this
+        // legacy render path until a historian pass happens to clear the
+        // cache.
+        const cachedBlockStillEligible = (): boolean => {
+            if (!hasClaimEffectivePolicy(db)) return true;
+            // The rendered-ids/hashes checks below can only vouch for rows
+            // that WERE rendered; a row that became newly eligible after the
+            // render was never recorded, and after a host restart the
+            // process-local epoch cache cannot force the rebuild. The
+            // persisted build-epoch stamp closes that path: any epoch bump
+            // since the snapshot rebuilds the block.
+            if ((cachedMemory?.memory_block_epoch ?? -1) !== buildProjectMemoryEpoch) {
+                return false;
+            }
+            return recordedMemoryBlockStillBacked(
+                db,
+                cachedMemory?.memory_block_ids,
+                cachedMemory?.memory_block_hashes,
+            );
+        };
+
+        if (
+            cachedMemory?.memory_block_cache &&
+            !forceMemoryBlockRecompute &&
+            cachedBlockStillEligible()
+        ) {
             memoryBlock = cachedMemory.memory_block_cache;
             memoryCount = cachedMemory.memory_block_count;
         } else {
-            let memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+            // The legacy render is an automatic injection surface exactly like
+            // the m0/m1 lanes below; policy-hidden rows never reach it. The
+            // persisted epoch stamp only protects FUTURE passes — this loop
+            // protects the block being returned NOW: each attempt loads and
+            // policy-filters fresh rows, binds them to the current revision's
+            // exact bytes (a rewrite between load and policy read must not
+            // ride the successor's eligibility), and re-reads the epoch; a
+            // bump during the build retries once so a quarantine landing
+            // mid-build cannot reach the current prompt unchecked.
+            let memories: Memory[] = [];
+            let buildEpoch = buildProjectMemoryEpoch;
+            let buildStable = false;
+            for (let attempt = 0; attempt < 2 && !buildStable; attempt += 1) {
+                buildEpoch = getProjectMemoryEpoch(db, projectPath);
+                memories = bindMemoriesToCurrentRevision(
+                    db,
+                    filterMemoriesByPolicy(
+                        db,
+                        getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+                        "auto_inject",
+                    ).memories,
+                );
+                buildStable = getProjectMemoryEpoch(db, projectPath) === buildEpoch;
+            }
+            if (!buildStable) {
+                // Fail closed: the epoch moved during BOTH attempts, so a
+                // quarantine committed after the last policy read could sit
+                // in this snapshot. One prompt without the memory block is
+                // cheaper than leaking a hidden row; the next pass rebuilds.
+                sessionLog(
+                    sessionId,
+                    "memory block rebuild unstable after retries (epoch kept moving); omitting the block this pass",
+                );
+                memories = [];
+            }
             if (injectionBudgetTokens && memories.length > 0) {
                 memories = trimMemoriesToBudget(sessionId, memories, injectionBudgetTokens);
             }
@@ -402,8 +562,16 @@ export function prepareCompartmentInjection(
             // Capture ids of memories actually rendered in the block. Stored in
             // session_meta.memory_block_ids as JSON so ctx_search can hard-filter
             // them out of search results (the agent already sees them in <session-history>).
+            // The aligned hashes bind the cached bytes to the exact content
+            // rendered (SHA-256 of the exact bytes — the normalized hash
+            // cannot tell a rewritten revision from its predecessor), so the
+            // replay guards can reject a rewrite-in-place.
             const renderedIds = memories.map((m) => m.id);
+            const renderedHashes = memories.map((m) => sha256Utf8Hex(m.content));
 
+            // An unstable build is not cached: its empty block is a
+            // fail-closed placeholder, not a decision, and stamping it would
+            // replay emptiness until the next epoch bump.
             // Snapshot so subsequent turns reuse the same block without cache bust.
             // Swallow SQLITE_BUSY: the cache is a pure optimization (the block itself
             // is already computed and returned below). If another writer holds the DB
@@ -412,9 +580,17 @@ export function prepareCompartmentInjection(
             // proceed with a one-turn cache miss than crash the user's prompt.
             // Issue: https://github.com/cortexkit/magic-context/issues/23
             try {
-                db.prepare(
-                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
-                ).run(memoryBlock ?? "", memoryCount, JSON.stringify(renderedIds), sessionId);
+                if (buildStable)
+                    db.prepare(
+                        "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ?, memory_block_epoch = ? WHERE session_id = ?",
+                    ).run(
+                        memoryBlock ?? "",
+                        memoryCount,
+                        JSON.stringify(renderedIds),
+                        JSON.stringify(renderedHashes),
+                        buildEpoch,
+                        sessionId,
+                    );
             } catch (error) {
                 const code = (error as { code?: string } | null)?.code;
                 if (code === "SQLITE_BUSY") {
@@ -434,6 +610,7 @@ export function prepareCompartmentInjection(
         injectionCache.set(sessionId, {
             db,
             kind: "empty",
+            projectMemoryEpoch: buildProjectMemoryEpoch,
             compartmentEndMessageId: "",
             renderedBytes: 0,
         });
@@ -477,7 +654,12 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        injectionCache.set(sessionId, { db, kind: "populated", injection: result });
+        injectionCache.set(sessionId, {
+            db,
+            kind: "populated",
+            injection: result,
+            projectMemoryEpoch: buildProjectMemoryEpoch,
+        });
         return result;
     }
 
@@ -542,7 +724,12 @@ export function prepareCompartmentInjection(
             memoryCount,
             rebuiltFromDb: true,
         };
-        injectionCache.set(sessionId, { db, kind: "populated", injection: result });
+        injectionCache.set(sessionId, {
+            db,
+            kind: "populated",
+            injection: result,
+            projectMemoryEpoch: buildProjectMemoryEpoch,
+        });
         return result;
     }
 
@@ -629,7 +816,12 @@ export function prepareCompartmentInjection(
     if (needsFreshMaterialization) {
         result.needsFreshMaterialization = true;
     }
-    injectionCache.set(sessionId, { db, kind: "populated", injection: result });
+    injectionCache.set(sessionId, {
+        db,
+        kind: "populated",
+        injection: result,
+        projectMemoryEpoch: buildProjectMemoryEpoch,
+    });
     return result;
 }
 
@@ -2186,23 +2378,27 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // empty so renderSessionHistoryWithDecay never emits a <session_facts>
         // block and no stale pre-v2 rows leak into m[0].
         facts = [];
-        memories = projectPath
-            ? workspace.isWorkspaced
-                ? getMemoriesByProjects(
-                      options.db,
-                      workspace.expandedIdentities,
-                      ["active", "permanent"],
-                      foldMaterializedAt,
-                      workspace.ownIdentities,
-                      workspace.shareCategories,
-                  )
-                : getMemoriesByProject(
-                      options.db,
-                      projectPath,
-                      ["active", "permanent"],
-                      foldMaterializedAt,
-                  )
-            : [];
+        memories = filterMemoriesByPolicy(
+            options.db,
+            projectPath
+                ? workspace.isWorkspaced
+                    ? getMemoriesByProjects(
+                          options.db,
+                          workspace.expandedIdentities,
+                          ["active", "permanent"],
+                          foldMaterializedAt,
+                          workspace.ownIdentities,
+                          workspace.shareCategories,
+                      )
+                    : getMemoriesByProject(
+                          options.db,
+                          projectPath,
+                          ["active", "permanent"],
+                          foldMaterializedAt,
+                      )
+                : [],
+            "auto_inject",
+        ).memories;
         userMemories = safeGetActiveUserMemories(options.db);
         options.db.exec("COMMIT");
     } catch (error) {
@@ -2412,11 +2608,24 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // dogfood 2026-05-30: AFT showed "Injected 256" against 124 live memories,
         // all 256 ids deleted. Same transaction as the m[0] snapshot so the cached
         // bytes and their id manifest never diverge.
+        // Aligned exact hashes ride the same write: the replay gate proves a
+        // recorded block against current policy AND revision digests, and a
+        // missing or stale hash record reads as unbacked — which would clear
+        // the freshly prepared injection cache on the very next defer pass.
+        // Inside this transaction the rendered bytes ARE the current
+        // revisions (the phase-3 stale check just passed), so the oracle
+        // digests describe exactly what was rendered.
+        const visibleMemoryDigests = exactMemoryContentDigests(options.db, visibleMemoryIds);
         options.db
             .prepare(
-                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
+                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ? WHERE session_id = ?",
             )
-            .run(visibleMemoryIds.length, JSON.stringify(visibleMemoryIds), options.sessionId);
+            .run(
+                visibleMemoryIds.length,
+                JSON.stringify(visibleMemoryIds),
+                JSON.stringify(visibleMemoryIds.map((id) => visibleMemoryDigests.get(id) ?? "")),
+                options.sessionId,
+            );
 
         // Persist the boundary the freshly-rendered m[0]+m[1] cover (the latest
         // compartment's end message id). A cold post-restart pass reads this to
@@ -2493,9 +2702,29 @@ function renderMemoryUpdatesBlock(args: {
           );
     if (mutations.length === 0) return { block: "", count: 0, forcedMemoryIds: [] };
 
+    // Bind content-carrying mutations to the claim revision the policy
+    // read evaluated: a held-open pre-v86 compatibility writer can rewrite the
+    // target after the eligibility load without bumping the policy epoch, so
+    // the materialization stability check cannot reject the mixed snapshot. A
+    // mutation whose bytes no longer match the claim's current revision is
+    // dropped; the successor reaches the prompt only through a policy-checked
+    // snapshot rebuild.
+    const oracleDigests = exactMemoryContentDigests(
+        args.db,
+        mutations
+            .filter((mutation) => mutation.newContent !== null)
+            .map((mutation) => mutation.targetMemoryId),
+    );
+    const boundMutations = mutations.filter(
+        (mutation) =>
+            mutation.newContent === null ||
+            oracleDigests.get(mutation.targetMemoryId) === sha256Utf8Hex(mutation.newContent),
+    );
+    if (boundMutations.length === 0) return { block: "", count: 0, forcedMemoryIds: [] };
+
     const forcedIds = new Set<number>();
     const lines = ["These memories changed since the snapshot below — trust these:"];
-    for (const mutation of mutations) {
+    for (const mutation of boundMutations) {
         if (mutation.mutationType === "superseded") {
             const replacementId = mutation.supersededById;
             if (
@@ -2567,23 +2796,52 @@ function renderM1WithMetadata(
         workspaceIdentitySet: options.workspaceIdentitySet,
     });
 
-    const eligibleMemories = options.projectPath
-        ? workspace.isWorkspaced
-            ? getMemoriesByProjects(
-                  options.db,
-                  workspace.expandedIdentities,
-                  ["active", "permanent"],
-                  markers.materializedAt,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMemoriesByProject(
-                  options.db,
-                  options.projectPath,
-                  ["active", "permanent"],
-                  markers.materializedAt,
-              )
-        : [];
+    // Stabilized rebuild: this pool is loaded independently of the M0
+    // snapshot (the non-persisted fallback pair has no phase-3 marker check
+    // downstream), so bind the bytes to their current revisions and require
+    // the memory epoch/workspace fingerprint to hold across the load; fail
+    // closed with an empty pool on exhaustion.
+    const m1StabilityMarker = (): string =>
+        workspace.isWorkspaced
+            ? `ws:${computeWorkspaceEpochFingerprint(options.db, workspace.identities)}`
+            : `ep:${(options.projectPath ? getProjectState(options.db, options.projectPath) : undefined)?.projectMemoryEpoch ?? 0}`;
+    let eligibleMemories: Memory[] = [];
+    let m1PoolStable = !options.projectPath;
+    for (let attempt = 0; attempt < 2 && !m1PoolStable; attempt += 1) {
+        const markerAtLoad = m1StabilityMarker();
+        eligibleMemories = bindMemoriesToCurrentRevision(
+            options.db,
+            filterMemoriesByPolicy(
+                options.db,
+                options.projectPath
+                    ? workspace.isWorkspaced
+                        ? getMemoriesByProjects(
+                              options.db,
+                              workspace.expandedIdentities,
+                              ["active", "permanent"],
+                              markers.materializedAt,
+                              workspace.ownIdentities,
+                              workspace.shareCategories,
+                          )
+                        : getMemoriesByProject(
+                              options.db,
+                              options.projectPath,
+                              ["active", "permanent"],
+                              markers.materializedAt,
+                          )
+                    : [],
+                "auto_inject",
+            ).memories,
+        );
+        m1PoolStable = m1StabilityMarker() === markerAtLoad;
+    }
+    if (!m1PoolStable) {
+        sessionLog(
+            options.sessionId,
+            "m1 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+        );
+        eligibleMemories = [];
+    }
     const eligibleMemoryIds = new Set(eligibleMemories.map((memory) => memory.id));
     const memoryUpdates = renderMemoryUpdatesBlock({
         db: options.db,
@@ -2900,13 +3158,18 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
         // cached summary covers moves forward with it. Keeping it in sync here is
         // what lets a later cold post-restart defer pass trim correctly.
         const baselineEndMessageId = getLastCompartmentEndMessageId(options.db, options.sessionId);
+        // Same aligned-hash discipline as the materialize write above: the
+        // soft refresh replaces the id manifest, so the hash record must move
+        // with it or the replay gate reads the block as unbacked.
+        const visibleMemoryDigests = exactMemoryContentDigests(options.db, visibleMemoryIds);
         options.db
             .prepare(
                 `UPDATE session_meta
                     SET cached_m1_bytes = ?,
                         cached_m0_last_baseline_end_message_id = ?,
                         memory_block_count = ?,
-                        memory_block_ids = ?
+                        memory_block_ids = ?,
+                        memory_block_hashes = ?
                   WHERE session_id = ?`,
             )
             .run(
@@ -2914,6 +3177,7 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
                 baselineEndMessageId,
                 visibleMemoryIds.length,
                 JSON.stringify(visibleMemoryIds),
+                JSON.stringify(visibleMemoryIds.map((id) => visibleMemoryDigests.get(id) ?? "")),
                 options.sessionId,
             );
         options.db.exec("COMMIT");
@@ -3031,23 +3295,54 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     // Use the SAME frozen cutoff for the baseline memory read as m[1] does, so a
     // memory crossing expires_at between two fallback passes can't shift the m[0]
     // baseline bytes either (live Date.now() default would reintroduce drift).
-    const memories = projectPath
-        ? workspace.isWorkspaced
-            ? getMemoriesByProjects(
-                  options.db,
-                  workspace.expandedIdentities,
-                  ["active", "permanent"],
-                  snapshotMarkers.materializedAt,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMemoriesByProject(
-                  options.db,
-                  projectPath,
-                  ["active", "permanent"],
-                  snapshotMarkers.materializedAt,
-              )
-        : [];
+    // Same stabilized rebuild discipline as the legacy block path: load,
+    // policy-filter, exact-bind, and verify the epoch did not move — the
+    // fallback publishes without a persisted snapshot, so this loop is the
+    // only thing standing between a mid-build rewrite/quarantine and the
+    // current prompt. On exhaustion, fail closed with an empty pool.
+    // The marker must cover FOREIGN workspace members too: the load below is
+    // workspace-aware, and a quarantine on another member's row bumps THAT
+    // project's epoch, not this one's — the fingerprint aggregates every
+    // member's epoch (same rule as renderM1WithMetadata and the Pi twin).
+    const fallbackStabilityMarker = (): string =>
+        workspace.isWorkspaced
+            ? `ws:${computeWorkspaceEpochFingerprint(options.db, workspace.identities)}`
+            : `ep:${projectPath ? getProjectMemoryEpoch(options.db, projectPath) : 0}`;
+    let memories: Memory[] = [];
+    let fallbackPoolStable = !projectPath;
+    for (let attempt = 0; attempt < 2 && projectPath && !fallbackPoolStable; attempt += 1) {
+        const markerAtLoad = fallbackStabilityMarker();
+        memories = bindMemoriesToCurrentRevision(
+            options.db,
+            filterMemoriesByPolicy(
+                options.db,
+                workspace.isWorkspaced
+                    ? getMemoriesByProjects(
+                          options.db,
+                          workspace.expandedIdentities,
+                          ["active", "permanent"],
+                          snapshotMarkers.materializedAt,
+                          workspace.ownIdentities,
+                          workspace.shareCategories,
+                      )
+                    : getMemoriesByProject(
+                          options.db,
+                          projectPath,
+                          ["active", "permanent"],
+                          snapshotMarkers.materializedAt,
+                      ),
+                "auto_inject",
+            ).memories,
+        );
+        fallbackPoolStable = fallbackStabilityMarker() === markerAtLoad;
+    }
+    if (!fallbackPoolStable) {
+        sessionLog(
+            options.sessionId,
+            "fallback m0 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+        );
+        memories = [];
+    }
     const userMemories = safeGetActiveUserMemories(options.db);
     const memoryBudget = options.memoryInjectionBudgetTokens ?? DEFAULT_MEMORY_BUDGET_TOKENS;
     const memoryRenderOptions: MemoryRenderOptions = {

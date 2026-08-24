@@ -1,3 +1,4 @@
+import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
@@ -392,7 +393,15 @@ export function runRustModePostprocess(args: {
         appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
     }
     for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-        if (decision.decision === "hint") {
+        // Same replay gate as runAutoSearchHint: a persisted hint replays
+        // only while every contributing memory is still auto_search-eligible
+        // and byte-identical — a quarantine, contradiction, rejection, or
+        // rewrite after the hint was computed must not keep re-injecting the
+        // stored fragment through this sticky loop.
+        if (
+            decision.decision === "hint" &&
+            autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
+        ) {
             appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
         }
     }
@@ -1717,7 +1726,13 @@ export async function runPostTransformPhase(
             appendReminderToUserMessageById(args.messages, anchor.messageId, anchor.text);
         }
         for (const decision of getAutoSearchHintDecisions(args.db, args.sessionId)) {
-            if (decision.decision === "hint") {
+            // Same replay gate as runAutoSearchHint (see the Rust-mode loop
+            // above): the stored fragment must never outlive its
+            // contributing memories' eligibility.
+            if (
+                decision.decision === "hint" &&
+                autoSearchHintFragmentsStillEligible(args.db, decision.memoryFragments)
+            ) {
                 appendReminderToUserMessageById(args.messages, decision.messageId, decision.text);
             }
         }

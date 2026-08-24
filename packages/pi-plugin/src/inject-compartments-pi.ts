@@ -26,6 +26,17 @@
  */
 
 import {
+	reconcileCompatibilityVerifications,
+	seedLateCompatibilityRevisions,
+} from "@magic-context/core/features/magic-context/claim-policy-backfill";
+import {
+	bindMemoriesToCurrentRevision,
+	exactMemoryContentDigests,
+	filterMemoriesByPolicy,
+	sessionMemoryBlockStillEligible,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
+import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
 	getMemoriesByProjects,
@@ -1180,18 +1191,22 @@ export function renderM0Pi(
 		workspaceOverride ?? resolveWorkspaceRenderContextPi(state, db);
 	const allMemories =
 		memoriesOverride ??
-		(memPath
-			? workspace.isWorkspaced
-				? getMemoriesByProjects(
-						db,
-						workspace.expandedIdentities,
-						["active", "permanent"],
-						Date.now(),
-						workspace.ownIdentities,
-						workspace.shareCategories,
-					)
-				: getMemoriesByProject(db, memPath, ["active", "permanent"])
-			: []);
+		filterMemoriesByPolicy(
+			db,
+			memPath
+				? workspace.isWorkspaced
+					? getMemoriesByProjects(
+							db,
+							workspace.expandedIdentities,
+							["active", "permanent"],
+							Date.now(),
+							workspace.ownIdentities,
+							workspace.shareCategories,
+						)
+					: getMemoriesByProject(db, memPath, ["active", "permanent"])
+				: [],
+			"auto_inject",
+		).memories;
 	// Use the V2 trim + render helpers (shared with OpenCode) so both harnesses
 	// emit the same category-grouped `#id: fact` bytes and use the same
 	// permanent-first / importance-DESC selection. A divergent shape here would
@@ -1360,23 +1375,27 @@ function readFrozenM0InputsPi(
 	const read = db.transaction(() => {
 		const workspace = resolveWorkspaceRenderContextPi(state, db);
 		const compartments = getRenderableCompartmentsPi(db, state);
-		const memories = memPath
-			? workspace.isWorkspaced
-				? getMemoriesByProjects(
-						db,
-						workspace.expandedIdentities,
-						["active", "permanent"],
-						memoryCutoff,
-						workspace.ownIdentities,
-						workspace.shareCategories,
-					)
-				: getMemoriesByProject(
-						db,
-						memPath,
-						["active", "permanent"],
-						memoryCutoff,
-					)
-			: [];
+		const memories = filterMemoriesByPolicy(
+			db,
+			memPath
+				? workspace.isWorkspaced
+					? getMemoriesByProjects(
+							db,
+							workspace.expandedIdentities,
+							["active", "permanent"],
+							memoryCutoff,
+							workspace.ownIdentities,
+							workspace.shareCategories,
+						)
+					: getMemoriesByProject(
+							db,
+							memPath,
+							["active", "permanent"],
+							memoryCutoff,
+						)
+				: [],
+			"auto_inject",
+		).memories;
 		const userProfile = safeGetActiveUserMemoriesPi(db);
 		const projectState = memPath ? getProjectState(db, memPath) : undefined;
 		const globalState = getProjectState(db, GLOBAL_USER_PROFILE_PROJECT_PATH);
@@ -1442,7 +1461,38 @@ function renderFreshM0PiNonPersisted(
 	const docs = readProjectDocsForPiM0(state);
 	const cachedMaterializedAt =
 		getOrCreateSessionMeta(db, state.sessionId).cachedM0MaterializedAt ?? 0;
-	const frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
+	// Same stabilized rebuild discipline as the OpenCode fallback: this path
+	// publishes WITHOUT the phase-3 persist-time marker check that guards
+	// materializeM0Pi, so a quarantine, rejection, or rewrite landing after
+	// the frozen read transaction closes would still render the old bytes.
+	// Re-read until the memory epoch (workspace fingerprint when foreign rows
+	// are in scope) is unchanged across the read; fail closed with an empty
+	// pool on exhaustion.
+	const memPath = memoryProjectPath(state);
+	const fallbackStabilityMarker = (): string => {
+		const workspace = resolveWorkspaceRenderContextPi(state, db);
+		return workspace.isWorkspaced
+			? `ws:${computeWorkspaceEpochFingerprint(db, workspace.identities)}`
+			: `ep:${(memPath ? getProjectState(db, memPath) : undefined)?.projectMemoryEpoch ?? 0}`;
+	};
+	let frozen: FrozenM0Inputs | undefined;
+	let fallbackPoolStable = !memPath;
+	for (let attempt = 0; attempt < 2 && !fallbackPoolStable; attempt += 1) {
+		const markerAtLoad = fallbackStabilityMarker();
+		frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
+		frozen.memories = bindMemoriesToCurrentRevision(db, frozen.memories);
+		fallbackPoolStable = fallbackStabilityMarker() === markerAtLoad;
+	}
+	if (frozen === undefined) {
+		frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
+	}
+	if (!fallbackPoolStable) {
+		logSession(
+			state.sessionId,
+			"pi fallback m0 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+		);
+		frozen.memories = [];
+	}
 	// CACHE STABILITY: materializedAt feeds the m[1] expiry cutoff. It must be
 	// stable across consecutive fallback passes, so reuse the last persisted value
 	// (or 0 when no cached baseline exists) rather than live Date.now().
@@ -1668,11 +1718,24 @@ export function materializeM0Pi(
 		// path, so they'd stay frozen at the last legacy value — wrong sidebar
 		// "Injected" count AND a stale ctx_search hide-already-visible filter after
 		// any memory change (e.g. migration delete+reinserts with new ids).
+		// Hashes ride the same record (OpenCode parity): the replay gate in
+		// injectM0M1Pi proves the cached block against current policy AND the
+		// exact rendered bytes, so a rewrite-in-place that keeps the id
+		// eligible cannot replay superseded content.
+		const renderedHashById = new Map(
+			snapshotMemories.map((memory) => [
+				memory.id,
+				sha256Utf8Hex(memory.content),
+			]),
+		);
 		db.prepare(
-			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
+			"UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ? WHERE session_id = ?",
 		).run(
 			renderedMemoryIds.length,
 			JSON.stringify(renderedMemoryIds),
+			JSON.stringify(
+				renderedMemoryIds.map((id) => renderedHashById.get(id) ?? ""),
+			),
 			state.sessionId,
 		);
 
@@ -1761,11 +1824,34 @@ function renderMemoryUpdatesBlockPi(args: {
 		return { block: "", count: 0, forcedMemoryIds: [] };
 	}
 
+	// Bind content-carrying mutations to the claim revision the policy
+	// read evaluated: a held-open pre-v86 compatibility writer can rewrite the
+	// target after the eligibility load without bumping the policy epoch, so
+	// the materialization stability check cannot reject the mixed snapshot. A
+	// mutation whose bytes no longer match the claim's current revision is
+	// dropped; the successor reaches the prompt only through a policy-checked
+	// snapshot rebuild.
+	const oracleDigests = exactMemoryContentDigests(
+		args.db,
+		mutations
+			.filter((mutation) => mutation.newContent !== null)
+			.map((mutation) => mutation.targetMemoryId),
+	);
+	const boundMutations = mutations.filter(
+		(mutation) =>
+			mutation.newContent === null ||
+			oracleDigests.get(mutation.targetMemoryId) ===
+				sha256Utf8Hex(mutation.newContent),
+	);
+	if (boundMutations.length === 0) {
+		return { block: "", count: 0, forcedMemoryIds: [] };
+	}
+
 	const forcedIds = new Set<number>();
 	const lines = [
 		"These memories changed since the snapshot below — trust these:",
 	];
-	for (const mutation of mutations) {
+	for (const mutation of boundMutations) {
 		if (mutation.mutationType === "superseded") {
 			const replacementId = mutation.supersededById;
 			if (
@@ -1842,23 +1928,52 @@ function renderM1PiWithMetadata(
 	const workspace = resolveWorkspaceRenderContextPi(state, db);
 
 	const memPath = memoryProjectPath(state);
-	const eligibleMemories = memPath
-		? workspace.isWorkspaced
-			? getMemoriesByProjects(
-					db,
-					workspace.expandedIdentities,
-					["active", "permanent"],
-					markers.materializedAt,
-					workspace.ownIdentities,
-					workspace.shareCategories,
-				)
-			: getMemoriesByProject(
-					db,
-					memPath,
-					["active", "permanent"],
-					markers.materializedAt,
-				)
-		: [];
+	// Stabilized rebuild: this pool is loaded independently of the M0
+	// snapshot (the non-persisted fallback pair has no phase-3 marker check
+	// downstream), so bind the bytes to their current revisions and require
+	// the memory epoch/workspace fingerprint to hold across the load; fail
+	// closed with an empty pool on exhaustion.
+	const m1StabilityMarker = (): string =>
+		workspace.isWorkspaced
+			? `ws:${computeWorkspaceEpochFingerprint(db, workspace.identities)}`
+			: `ep:${(memPath ? getProjectState(db, memPath) : undefined)?.projectMemoryEpoch ?? 0}`;
+	let eligibleMemories: Memory[] = [];
+	let m1PoolStable = !memPath;
+	for (let attempt = 0; attempt < 2 && !m1PoolStable; attempt += 1) {
+		const markerAtLoad = m1StabilityMarker();
+		eligibleMemories = bindMemoriesToCurrentRevision(
+			db,
+			filterMemoriesByPolicy(
+				db,
+				memPath
+					? workspace.isWorkspaced
+						? getMemoriesByProjects(
+								db,
+								workspace.expandedIdentities,
+								["active", "permanent"],
+								markers.materializedAt,
+								workspace.ownIdentities,
+								workspace.shareCategories,
+							)
+						: getMemoriesByProject(
+								db,
+								memPath,
+								["active", "permanent"],
+								markers.materializedAt,
+							)
+					: [],
+				"auto_inject",
+			).memories,
+		);
+		m1PoolStable = m1StabilityMarker() === markerAtLoad;
+	}
+	if (!m1PoolStable) {
+		logSession(
+			state.sessionId,
+			"pi m1 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+		);
+		eligibleMemories = [];
+	}
 	const eligibleMemoryIds = new Set(
 		eligibleMemories.map((memory) => memory.id),
 	);
@@ -2366,12 +2481,50 @@ export function injectM0M1Pi(
 	entryIds?: readonly (string | undefined)[],
 	recomputeM1ThisPass = false,
 ): PiM0M1InjectionResult {
+	// A held-open v85 writer can append compatibility verification events or
+	// whole revisions at any time, not just before startup. Run the same
+	// guarded probes as the OpenCode injection lane before any cache replay:
+	// a reconciled event bumps the project epoch this pass observes, and an
+	// unseeded revision kicks the bounded async seeder. Both are watermark/
+	// anti-join guarded (one probe each when idle) and must not fail the
+	// injection.
+	try {
+		reconcileCompatibilityVerifications(db);
+	} catch (error) {
+		logSession(
+			state.sessionId,
+			`compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	try {
+		seedLateCompatibilityRevisions(db);
+	} catch (error) {
+		logSession(
+			state.sessionId,
+			`late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
 	// One compartment snapshot for the WHOLE decision: the materialize decision
 	// and every cached-marker reload below normalize against this same set, so a
 	// concurrent count change can't flip markers to null mid-decision and escape
 	// the guarded fallback (TOCTOU).
 	const currentCompartments = getRenderableCompartmentsPi(db, state);
 	let decision = mustMaterializePi(state, db, currentCompartments);
+	// Publication-time policy gate (OpenCode parity): the cache decision
+	// consumed the epoch it read, so a quarantine that never bumps it — or
+	// one landing after the marker read — would replay the recorded block.
+	// The ids and exact digests persisted at materialize time are re-proved
+	// against current policy and current revisions; any mismatch (including
+	// a missing hash record) fails closed into a fresh materialization.
+	if (
+		!decision.value &&
+		!sessionMemoryBlockStillEligible(db, state.sessionId)
+	) {
+		decision = {
+			value: true,
+			reason: "cached memory block no longer policy-backed",
+		};
+	}
 	if (decision.value) {
 		const mismatch = decision.mismatch
 			? ` mismatch=${JSON.stringify(decision.mismatch)}`

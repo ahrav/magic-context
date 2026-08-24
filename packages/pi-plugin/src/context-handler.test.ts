@@ -3,6 +3,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
+import { insertMemory } from "@magic-context/core/features/magic-context/memory";
+import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
+import {
+	runInMemoryClaimsWriteTransaction,
+	updateMemoryVerificationWithClaimsInCurrentTransaction,
+} from "@magic-context/core/features/magic-context/memory/storage-memory-claims";
 import {
 	__resetMessageIndexAsyncForTests,
 	isSessionReconciled,
@@ -1815,16 +1821,36 @@ describe("registerPiContextHandler", () => {
 
 	it("appends an auto-search hint to the latest user message when the threshold is met", async () => {
 		const db = createTestDb();
+		// Fresh hints pass the same eligibility gate as replays, so the mocked
+		// result needs a real verified memory id and the loaded-bytes digest.
+		const content = "Relevant Pi search wiring";
+		const seeded = insertMemory(db, {
+			projectPath: "git:test",
+			category: "WORKFLOW_RULES",
+			content,
+		});
+		runInMemoryClaimsWriteTransaction(db, () =>
+			updateMemoryVerificationWithClaimsInCurrentTransaction(
+				db,
+				{
+					producer: "context-handler-test",
+					operationKey: `verify:${seeded.id}`,
+					requestDigest: sha256Utf8Hex(`verify:${seeded.id}`),
+				},
+				{ memoryId: seeded.id, verificationStatus: "verified", nowMs: 2_000 },
+			),
+		);
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(
 			async () =>
 				[
 					{
 						source: "memory",
-						content: "Relevant Pi search wiring",
+						content,
 						score: 0.9,
-						memoryId: 1,
+						memoryId: seeded.id,
 						category: "WORKFLOW_RULES",
 						matchType: "fts",
+						contentDigest: sha256Utf8Hex(content),
 					},
 				] as never,
 		);

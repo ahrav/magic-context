@@ -1,9 +1,9 @@
 # `mc-host` Wire Protocol and Handshake
 
-Status: normative direct-linked static two-target profile
+Status: normative direct-linked static three-target profile
 Wire version: 2
 Connection-file schema: 1
-Task: `magic-context-c50.2`; two-target revision and Synapse application protocol: `magic-context-c50.6`
+Task: `magic-context-c50.2`; two-target revision and Synapse application protocol: `magic-context-c50.6`; three-target revision and reserved capacity classes: `magic-context-c50.11`
 
 ## 1. Conformance and authority
 
@@ -23,7 +23,7 @@ This document is sufficient to implement a compatible host and client without pr
 
 ## 2. Profile, actors, and trust boundary
 
-`mc-host` directly links one static composite handler and serves exactly two immutable modules: `magic-context` (role `tool_provider`) and `synapse` (role `management_surface`). The composition is fixed at startup: there is no dynamic registration, catalog mutation, plugin loading, or module supervision, and `mc-host` is not a remote transport.
+`mc-host` directly links one static composite handler and serves exactly three immutable modules: `magic-context` (role `tool_provider`), `synapse` (role `management_surface`), and `broca` (role `management_surface`). The composition is fixed at startup: there is no dynamic registration, catalog mutation, plugin loading, or module supervision, and `mc-host` is not a remote transport.
 
 Actors:
 
@@ -31,7 +31,7 @@ Actors:
 - **TypeScript clients:** `SubcModuleTransport`, the Synapse embedding provider, and the wake-plane catalog probe.
 - **Raw Rust client:** `HistorianProducer`; authenticates directly, opens command and subscription routes, sends unary and streaming requests, reads errors, and sends route `Goodbye`.
 - **Managed Rust client:** published `SubcConsumer`; owns bounded reconnect and route-open policy around fresh control RPCs.
-- **Handler:** the linked static composite; receives synthetic initialization, target-aware bind, request, route-gone, internal health, and shutdown callbacks, and dispatches each to the owning component (`magic-context` or `synapse`).
+- **Handler:** the linked static composite; receives synthetic initialization, target-aware bind, request, route-gone, internal health, and shutdown callbacks, and dispatches each to the owning component (`magic-context`, `synapse`, or `broca`).
 
 The 32-byte connection key is a bearer capability. Possession grants every direct-profile operation — including host-global `host.shutdown` (Section 7.6) — and permits any `BindIdentity`. Client `role`, `consumer_identity`, `project_root`, `harness`, and `session` are claims or scoping metadata; none grants authority. A key reader MUST therefore be trusted as the same local security principal as the host, and every key reader is stop-capable: a diagnostic or proxy principal that holds the bearer is not read-only, whatever its role label or mount permissions claim.
 
@@ -351,18 +351,19 @@ Successful response MUST retain the tag:
 {"op":"route.open","route_channel":7,"route_epoch":77}
 ```
 
-The direct profile routes exactly two static target pairs. Classification runs only after every structural bound in Section 7.1 held, and each rejection is one stable terminal code:
+The direct profile routes exactly three static target pairs. Classification runs only after every structural bound in Section 7.1 held, and each rejection is one stable terminal code:
 
 | `target.kind` | `target.module_id` | Result |
 | --- | --- | --- |
 | `tool_provider` | `magic-context` | handler bind for the Magic Context component |
 | `management_surface` | `synapse` | handler bind for the Synapse component |
-| `tool_provider` | `synapse` | terminal `target_unavailable` (known module, unsupported role); zero bind calls |
+| `management_surface` | `broca` | handler bind for the Broca component |
+| `tool_provider` | `synapse` or `broca` | terminal `target_unavailable` (known module, unsupported role); zero bind calls |
 | `management_surface` | `magic-context` | terminal `target_unavailable` (known module, unsupported role); zero bind calls |
 | any recognized kind above | any other module | terminal `unknown_module`; zero bind calls |
 | any other kind (`internal_service`, model-runner kinds, unknown strings) | any module | terminal `target_unavailable`; zero bind calls |
 
-A successful classification carries the validated typed target into the handler bind, so the composite dispatches on host-validated data and never re-parses the client body. The Synapse target stays in this matrix even when its model bundle is missing or invalid: classification still succeeds, the bind is invoked, and the component rejects it with terminal `artifact_invalid` (Section 7.5.1). Dynamic routing, provider discovery, `internal_service`, and model-runner routing remain outside this document; `magic-context-c50.11` owns model-runner route integration required by the Rust historian.
+A successful classification carries the validated typed target into the handler bind, so the composite dispatches on host-validated data and never re-parses the client body. The Synapse target stays in this matrix even when its model bundle is missing or invalid: classification still succeeds, the bind is invoked, and the component rejects it with terminal `artifact_invalid` (Section 7.5.1). The Broca component serves the five-operation LLM-run management protocol consumed by `HistorianProducer` (`session.send`, `session.subscribe`, `run.status`, `run.cancel`, `session.delete`); its application protocol is specified by the Broca revision that implements it, not this section. That protocol's load-bearing properties for this profile are: run lifetime is detached from transport lifetime (waiter loss never stops a run; only `run.cancel`, `session.delete`, or host shutdown does, and each terminates and reaps the complete harness subprocess group before settling), run state is process-local and bounded (a restarted host reports old run IDs as strict `missing`), and subprocess execution is confined to the hardened OpenCode/Pi adapter trust boundary (no shell, private prompt delivery, daemon-owned environment snapshot, bounded redacted output). A Broca bind additionally requires harness `opencode` or `pi`; any other harness is rejected at bind with `invalid_identity` and no run state. Dynamic routing, provider discovery, and `internal_service` routing remain outside this document.
 
 This exclusion has one known in-repo casualty: `RealSessionResolver` (`crates/mc-module/src/session_resolver.rs`), constructed whenever `McHandler` receives a connection file, unconditionally opens a `management_surface` route to module `thalamus`, and the linked manifest consumes that service. Against a conforming direct host that `route.open` receives terminal `unknown_module` (the kind is recognized but no static module named `thalamus` exists), so stateful facade calls that resolve sessions fail at route-open. This contract deliberately does not add a thalamus-compatible route; `magic-context-c50.4` owns replacing or disabling that resolver path (for example, a host-served session-resolve equivalent or the existing `MissingSessionResolver` fallback) before mc-module runs against this profile.
 
@@ -378,13 +379,13 @@ Requests MAY omit `module_id` to list all entries or supply a filter. Unknown fi
 {"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","transport.negotiate"]}
 ```
 
-An unfiltered request MUST return exactly two entries — `magic-context` then `synapse`, in that deterministic order — and an exact-module filter MUST return that one entry, each derived without lossy rewriting from its startup manifest:
+An unfiltered request MUST return exactly three entries — `magic-context`, then `synapse`, then `broca`, in that deterministic order — and an exact-module filter MUST return that one entry, each derived without lossy rewriting from its startup manifest:
 
 | Response field | Required value |
 | --- | --- |
 | `op` | `catalog.list` |
 | `generation` | current catalog-state generation |
-| `modules[i].module_id` | `magic-context` or `synapse` |
+| `modules[i].module_id` | `magic-context`, `synapse`, or `broca` |
 | `modules[i].module_version` | that manifest's exact build version |
 | `modules[i].roles` | that manifest's complete `provides` array, including tool schemas |
 | `modules[i].control_ops` | implemented module control operations only; the direct profile never includes `wake.create` |
@@ -392,7 +393,7 @@ An unfiltered request MUST return exactly two entries — `magic-context` then `
 
 `transport.activate` and `transport.commit` (Section 7.7) are candidate-channel-only operations and MUST NOT appear in `subc_ops`: the catalog advertises bootstrap channel-0 capabilities, and those two operations are never valid on a bootstrap connection.
 
-The Synapse entry is immutable identity, not readiness: it stays in the catalog even when the model bundle is missing or invalid (Section 7.5.1). The direct host is final-decision unsupported for `wake.create`: an advertised `wake.create` entry is an ownership certificate for the complete scheduled-wake lifecycle (durable scheduling, agent-callable lifecycle operations, backlog adoption, and readiness withdrawal), not a readiness hint, and the direct profile owns none of it. Wake-plane probing therefore remains fail-open against this profile; only a future host that owns the complete lifecycle may advertise the capability. `generation` changes only when catalog content changes and is unrelated to connection generation.
+The Synapse and Broca entries are immutable identity, not readiness: each stays in the catalog even when its component cannot currently serve a bind (Section 7.5.1). The direct host is final-decision unsupported for `wake.create`: an advertised `wake.create` entry is an ownership certificate for the complete scheduled-wake lifecycle (durable scheduling, agent-callable lifecycle operations, backlog adoption, and readiness withdrawal), not a readiness hint, and the direct profile owns none of it. Wake-plane probing therefore remains fail-open against this profile; only a future host that owns the complete lifecycle may advertise the capability. `generation` changes only when catalog content changes and is unrelated to connection generation.
 
 ### 7.4 Operation classification
 
@@ -511,6 +512,7 @@ Both languages MUST produce identical bytes: UTF-8 pass-through for non-ASCII, t
 | Rule | Verified by |
 | --- | --- |
 | target matrix and catalog (Section 7.2, 7.3) | `crates/mc-host/tests/composite_routing.rs` |
+| reserved pending/task classes, declaration floors, and retained-byte ingress subtraction (Section 8.3) | `crates/mc-host/tests/dispatch.rs`, `crates/mc-host/tests/handler_contract.rs` |
 | bundle identity, offline CPU inference, degraded isolation | `crates/mc-host/tests/synapse_bundle.rs` |
 | request validation, bounds, idempotency, cursors, restart fencing | `crates/mc-host/tests/synapse_protocol.rs`, `crates/mc-host/tests/synapse_jobs.rs` |
 | depth boundary (7 containers holding a value valid, 8 rejected, strings inert) | `crates/mc-host/src/synapse/protocol.rs` (unit tests), `crates/mc-host/tests/synapse_protocol.rs` |
@@ -736,6 +738,8 @@ Host pending state is keyed by full request identity. Sender-side no-reuse alone
 
 Implementations MUST use finite limits for live connections, routes, pending correlations, handler tasks, queued requests, and aggregate buffered bodies. Limit exhaustion before dispatch of a routed or control request returns terminal `server_busy` for that correlation; `target_unavailable` is reserved for route admission — `route.open` failures such as channel exhaustion (Section 8.2) — so each code keeps exactly one recovery rule in Section 10.2. Rejection MUST NOT silently queue without a deadline.
 
+Pending-request and handler-task capacity is split into two independent permit classes. Each component declares, immutably and before handler initialization, its reserved handler tasks, reserved unsettled (pending) requests, retained resident bytes, and route class; the direct profile's Broca component is the only reserved-class declarer, and `magic-context` and `synapse` keep zero reservations and the general class. Startup checked-sums every declaration and MUST refuse to initialize unless, after subtracting the reservations, at least one general pending slot, one general handler-task slot, and one maximum-size ingress body remain — declared retained bytes are subtracted from the frame-admission (ingress) pool alongside the resident catalog, never from the egress or scratch reserves. Every routed request draws both its pending and its task permit from the class stored on its installed route at bind time: the host never parses the application body to pick a class, saturating one class never consumes the other, and exhaustion of either class returns the same pre-dispatch `server_busy` terminal. A handler whose declarations are all zero observes the original single-pool behavior.
+
 ## 9. Requests, streams, cancellation, and close
 
 ### 9.1 Unary and streaming terminals
@@ -852,7 +856,7 @@ Graceful host shutdown order:
 3. drain or cancel work within finite shutdown deadline, emitting terminal `Response`, `StreamEnd`, or `Error{code:"cancelled"}` frames while generations are still live;
 4. send best-effort connection Goodbye; receiving it retires the generation client-side (Section 6.2), so it MUST follow the drain, or drain-phase terminals would arrive on a retired generation and be dropped;
 5. invoke route-gone exactly once for every handler-visible route;
-6. invoke the handler shutdown callback exactly once, after route cleanup and health-probe quiescence; the callback must not be aborted — a deadline overrun or panic marks the shutdown non-graceful, but the handler, host state, and instance lock remain owned until every native call and lifecycle callback has actually stopped. On the forced path (the drain deadline already expired) the callback still runs exactly once, but residual route-gone callbacks that themselves overran their deadline may still be in flight beside it; that incarnation is already fatal;
+6. invoke the handler shutdown callback exactly once, after route cleanup and health-probe quiescence; the callback must not be aborted — a deadline overrun or panic marks the shutdown non-graceful, but the handler, host state, and instance lock remain owned until every native call and lifecycle callback has actually stopped. Inside that single callback the static composite drains its children in fixed order — `broca`, then `synapse`, then `magic-context` — and a child's panic or returned shutdown error MUST NOT skip a later child's drain: failures are collected as typed, redacted diagnostics and surfaced as one deterministic non-graceful failure only after every child has drained, with the instance fence still held. On the forced path (the drain deadline already expired) the callback still runs exactly once, but residual route-gone callbacks that themselves overran their deadline may still be in flight beside it; that incarnation is already fatal;
 7. drop handler only after all route-gone callbacks and the shutdown callback complete;
 8. sockets and the listener close as their owning tasks exit (no later than this step);
 9. release instance lock.
@@ -952,7 +956,7 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | V37 | Proven zero-byte write | Result `not_sent`; policy may issue fresh RPC with new correlation |
 | V38 | Normal stream | Ordered zero-or-more StreamData then one StreamEnd/Error; duplicate terminal ignored |
 | V39 | Bad client proof | Host closes, releases handshake slot, and reads no envelope |
-| V40 | Catalog filters | Unfiltered/exact filter returns linked entry; unknown filter returns empty list |
+| V40 | Catalog filters | Unfiltered request returns `magic-context`, `synapse`, `broca` in order; an exact filter returns that entry; unknown filter returns empty list |
 | V41 | Unsupported control op | One `unsupported_operation` terminal; connection remains usable; no handler callback |
 | V42 | Host sends structurally valid `Request` | Client closes generation without dispatching or responding |
 | V43 | Host `Ping` correlation numerically equals a pending consumer correlation | `Pong` settles only the Ping; consumer terminals settle only the consumer request; no cross-settlement |
@@ -960,10 +964,13 @@ Every scenario has one required outcome. These are review vectors; executable fi
 | V45 | Authenticated `host.shutdown` | One correlated success response is fully written before Goodbye/EOF and before admission cancels; shutdown then follows Section 12 |
 | V46 | Shutdown attempt fails before acknowledgement | Latch reopens; a later authenticated requester commits; cancellation fires at most once |
 | V47 | `host.shutdown` under any role label, or without authentication | Every bearer-authenticated connection may stop the host; an unauthenticated socket can never reach the operation |
+| V48 | Reserved-class saturation | Every reserved pending/task permit held through blocked settlement rejects the next reserved-class request `server_busy` while a general request still dispatches and settles; saturating the general class never consumes a reserved permit |
+| V49 | Declarations exceed configured limits | A reservation that leaves zero general pending slots, zero general task slots, or less than one maximum ingress body fails startup before publication |
+| V50 | Child shutdown failure | A Broca shutdown panic or returned error still drains Synapse and Magic Context; the incarnation reports one deterministic redacted non-graceful failure |
 
 ### 14.1 Downstream fixture oracle
 
-Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V47 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
+Fixtures MUST use committed literal bytes and an independent decoder/oracle; importing production proof, header, or frame helpers to generate expected values proves only self-consistency. V1-V50 define the deterministic cases. A green suite establishes only that checked implementations, vectors, schedules, platforms, and bounds passed.
 
 ## 15. Consumer traceability
 
@@ -1001,7 +1008,9 @@ Fixtures MUST use committed literal bytes and an independent decoder/oracle; imp
 
 ## 17. Scope boundaries
 
-In scope: discovery and secure publication, pre-envelope authentication, v2 framing, `route.open`, `catalog.list`, `host.shutdown`, lifecycle evidence and native state probing (Section 4.3), the fixed two-module static composition, the Synapse application protocol (Section 7.5), routing/correlation/streaming/cancel/close, internal health, send outcomes, and generation recovery.
+In scope: discovery and secure publication, pre-envelope authentication, v2 framing, `route.open`, `catalog.list`, `host.shutdown`, lifecycle evidence and native state probing (Section 4.3), the fixed three-module static composition and its reserved pending/task/resident capacity classes, the Synapse application protocol (Section 7.5), routing/correlation/streaming/cancel/close, internal health, send outcomes, and generation recovery.
+
+The Broca application protocol (the five run-management operations, run lifecycle, replay, and subprocess trust boundary) is normative for the Broca revision that implements it; this section fixes only Broca's catalog identity, route classification, capacity class, and shutdown ordering.
 
 Deferred: executable cross-language golden fixtures; host, shim, and client code; private dependency compiler closure; model-runner routing; test-only TypeScript provider API; deployment-specific numeric quotas beyond required finite bounds.
 

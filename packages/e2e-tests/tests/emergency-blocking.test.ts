@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { buildMockHistorianPayload } from "../src/mock-historian";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
@@ -66,16 +67,23 @@ describe("emergency >=95%", () => {
 
             // Fast historian mock so the test doesn't need to wait on a long
             // delay. We only need historian to be INVOKED; what it does after
-            // that isn't part of this invariant.
+            // that isn't part of this invariant. The payload must still be a
+            // VALID v2 tiered compartment: strict tier validation rejects an
+            // empty or flat output, re-enters the retry chain, and never
+            // publishes — so an invalid mock would hang the compartment wait.
             h.mock.addMatcher((body) => {
                 if (!isHistorianRequest(body)) return null;
+                const flat = JSON.stringify(body.messages ?? []);
+                const rangeHdr = flat.match(/Messages (\d+)-(\d+):/);
+                const start = rangeHdr ? Number(rangeHdr[1]) : 1;
+                const end = rangeHdr ? Number(rangeHdr[2]) : 1;
                 return {
-                    text:
-                        "<output>" +
-                        "<compartments></compartments>" +
-                        "<facts></facts>" +
-                        "<unprocessed_from>1</unprocessed_from>" +
-                        "</output>",
+                    text: buildMockHistorianPayload({
+                        start,
+                        end,
+                        title: "Emergency build-up",
+                        body: "Summary of the fill turns.",
+                    }),
                     usage: {
                         input_tokens: 500,
                         output_tokens: 50,
@@ -158,10 +166,44 @@ describe("emergency >=95%", () => {
                 return;
             }
 
-            await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
-                timeoutMs: 30_000,
-                label: "emergency historian compartment",
-            });
+            // 90s, not 30s: the historian pass runs a subprocess against the
+            // mock provider, which on GitHub-hosted runners is 3-5x slower
+            // than local hardware; the test's own budget below stays the
+            // real bound.
+            try {
+                await h.waitFor(() => h.countCompartments(sessionId) >= 1, {
+                    timeoutMs: 90_000,
+                    label: "emergency historian compartment",
+                });
+            } catch (error) {
+                // Diagnostics before rethrow: pinpoint which stage of the
+                // emergency pipeline stalled (scheduling, the historian
+                // request, or compartment publish).
+                const historianRequests = h.mock
+                    .requests()
+                    .filter((r) => isHistorianRequest(r.body)).length;
+                console.log(
+                    `[TEST] emergency timeout: historianRequests=${historianRequests} totalRequests=${h.mock.requests().length} compartments=${h.countCompartments(sessionId)}`,
+                );
+                try {
+                    const state = h
+                        .contextDb()
+                        .prepare(
+                            "SELECT compartment_in_progress, last_context_percentage FROM session_meta WHERE session_id = ?",
+                        )
+                        .get(sessionId) as {
+                        compartment_in_progress: number;
+                        last_context_percentage: number;
+                    } | null;
+                    console.log(
+                        `[TEST] session_meta: inProgress=${state?.compartment_in_progress} lastPct=${state?.last_context_percentage}`,
+                    );
+                } catch (dbError) {
+                    console.log(`[TEST] session_meta probe failed: ${dbError}`);
+                }
+                console.log(`[TEST] opencode stderr tail:\n${h.opencode.stderr().slice(-3000)}`);
+                throw error;
+            }
             expect(h.countCompartments(sessionId)).toBeGreaterThanOrEqual(1);
 
             // The shared pressure observation above also proves the plugin saw

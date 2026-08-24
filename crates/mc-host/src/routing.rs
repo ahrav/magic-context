@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::connection::GenerationCore;
-use crate::handler::RouteHandle;
+use crate::handler::{RouteClass, RouteHandle};
 
 pub struct RouteRegistry {
     inner: Mutex<Inner>,
@@ -40,6 +40,7 @@ struct Occupant {
     epoch: u32,
     gen: Arc<GenerationCore>,
     state: OccState,
+    class: RouteClass,
     /// Abort handles for dispatch tasks on this route.
     aborts: Vec<tokio::task::AbortHandle>,
     /// Completion tracker for those same tasks. Registry-owned, so a close
@@ -109,7 +110,7 @@ impl RouteRegistry {
     /// higher epoch, owned by the registry in `Binding` state. `None` means
     /// admission is frozen, the generation is cancelled, or channel/route
     /// capacity is exhausted (`target_unavailable`, without any handler bind).
-    pub fn reserve(&self, gen: &Arc<GenerationCore>) -> Option<RouteHandle> {
+    pub fn reserve(&self, gen: &Arc<GenerationCore>, class: RouteClass) -> Option<RouteHandle> {
         let mut inner = self.inner.lock().expect("registry lock");
         if !inner.accepting || gen.token.is_cancelled() || inner.live >= self.max_routes {
             return None;
@@ -133,6 +134,7 @@ impl RouteRegistry {
                         state: OccState::Binding {
                             close_requested: false,
                         },
+                        class,
                         aborts: Vec::new(),
                         tracker: TaskTracker::new(),
                         cancel: CancellationToken::new(),
@@ -321,7 +323,11 @@ impl RouteRegistry {
     /// future before it is spawned. `None` proves the route is not live, so
     /// this doubles as the cheap `unknown_channel` precheck; the authoritative
     /// admission check remains [`RouteRegistry::register_dispatch`].
-    pub fn route_tracker(&self, handle: RouteHandle, gen_id: u64) -> Option<TaskTracker> {
+    pub fn route_tracker(
+        &self,
+        handle: RouteHandle,
+        gen_id: u64,
+    ) -> Option<(TaskTracker, RouteClass)> {
         let inner = self.inner.lock().expect("registry lock");
         let occupant = inner
             .slots
@@ -330,7 +336,7 @@ impl RouteRegistry {
         (occupant.epoch == handle.epoch
             && occupant.gen.id == gen_id
             && occupant.state == OccState::Live)
-            .then(|| occupant.tracker.clone())
+            .then(|| (occupant.tracker.clone(), occupant.class))
     }
 
     /// Routes currently owned by one generation (binding, live, or closing),
@@ -510,8 +516,12 @@ mod tests {
     async fn reserved_channels_are_nonzero_distinct_and_start_at_epoch_one() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
-        let first = registry.reserve(&gen).expect("first reserve");
-        let second = registry.reserve(&gen).expect("second reserve");
+        let first = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("first reserve");
+        let second = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("second reserve");
 
         assert_ne!(first.channel, 0);
         assert_ne!(second.channel, 0);
@@ -529,7 +539,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..8 {
             for gen in [&left, &right] {
-                let handle = registry.reserve(gen).expect("reserve");
+                let handle = registry.reserve(gen, RouteClass::General).expect("reserve");
                 registry.install_bound(handle);
                 assert!(seen.insert(handle.channel), "channel reused while live");
             }
@@ -541,7 +551,9 @@ mod tests {
     async fn membership_appears_at_publication_and_clears_at_close() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
-        let handle = registry.reserve(&gen).expect("reserve");
+        let handle = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve");
 
         // Reservation alone must not make the route dispatchable.
         assert!(gen.membership.lock().expect("lock").is_empty());
@@ -563,19 +575,23 @@ mod tests {
     async fn reuse_requires_cleanup_and_advances_the_epoch() {
         let registry = RouteRegistry::new(1);
         let gen = generation(1);
-        let first = registry.reserve(&gen).expect("reserve");
+        let first = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve");
         registry.install_bound(first);
 
         // A single-route budget cannot admit another route while this one lives.
-        assert!(registry.reserve(&gen).is_none());
+        assert!(registry.reserve(&gen, RouteClass::General).is_none());
 
         owner_aborts(registry.begin_close(first));
         // Still owned until cleanup finalizes.
-        assert!(registry.reserve(&gen).is_none());
+        assert!(registry.reserve(&gen, RouteClass::General).is_none());
 
         registry.finalize_close(first);
         registry.force_cursor(first.channel);
-        let reused = registry.reserve(&gen).expect("reuse after cleanup");
+        let reused = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reuse after cleanup");
         assert_eq!(reused.channel, first.channel);
         assert!(
             reused.epoch > first.epoch,
@@ -587,14 +603,16 @@ mod tests {
     async fn channel_is_retired_permanently_at_max_epoch() {
         let registry = RouteRegistry::new(4);
         let gen = generation(1);
-        let probe = registry.reserve(&gen).expect("probe reserve");
+        let probe = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("probe reserve");
         let channel = probe.channel;
         registry.finalize_close(probe);
         registry.force_last_epoch(channel, u32::MAX);
         registry.force_cursor(channel);
 
         let handle = registry
-            .reserve(&gen)
+            .reserve(&gen, RouteClass::General)
             .expect("another channel remains available");
         assert_ne!(
             handle.channel, channel,
@@ -606,7 +624,9 @@ mod tests {
     async fn close_racing_bind_defers_to_the_bind_task_and_wins() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
-        let handle = registry.reserve(&gen).expect("reserve");
+        let handle = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve");
 
         assert!(matches!(
             registry.begin_close(handle),
@@ -627,7 +647,9 @@ mod tests {
     async fn route_gone_is_claimed_exactly_once_across_racing_closers() {
         let registry = Arc::new(RouteRegistry::new(16));
         let gen = generation(1);
-        let handle = registry.reserve(&gen).expect("reserve");
+        let handle = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve");
         registry.install_bound(handle);
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
 
@@ -654,7 +676,9 @@ mod tests {
     async fn rejected_bind_keeps_cleanup_ownership_without_publishing() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
-        let handle = registry.reserve(&gen).expect("reserve");
+        let handle = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve");
 
         registry.take_rejected_bind(handle);
         assert!(gen.membership.lock().expect("lock").is_empty());
@@ -670,7 +694,9 @@ mod tests {
     async fn duplicate_and_stale_closes_are_idempotent_no_ops() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
-        let handle = registry.reserve(&gen).expect("reserve");
+        let handle = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve");
         registry.install_bound(handle);
 
         owner_aborts(registry.begin_close(handle));
@@ -685,7 +711,7 @@ mod tests {
         ));
         // A stale epoch against a live reuse must not close the new binding.
         registry.force_cursor(handle.channel);
-        let reused = registry.reserve(&gen).expect("reuse");
+        let reused = registry.reserve(&gen, RouteClass::General).expect("reuse");
         assert_eq!(reused.channel, handle.channel);
         assert!(reused.epoch > handle.epoch);
         registry.install_bound(reused);
@@ -707,7 +733,9 @@ mod tests {
     async fn dispatch_registration_is_atomic_with_route_close() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
-        let handle = registry.reserve(&gen).expect("reserve");
+        let handle = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve");
 
         // Mid-bind: not yet dispatchable, so no task may attach or receive
         // the route's cancellation root.
@@ -752,9 +780,15 @@ mod tests {
         let registry = RouteRegistry::new(16);
         let mine = generation(7);
         let theirs = generation(8);
-        let a = registry.reserve(&mine).expect("reserve a");
-        let b = registry.reserve(&mine).expect("reserve b");
-        let other = registry.reserve(&theirs).expect("reserve other");
+        let a = registry
+            .reserve(&mine, RouteClass::General)
+            .expect("reserve a");
+        let b = registry
+            .reserve(&mine, RouteClass::General)
+            .expect("reserve b");
+        let other = registry
+            .reserve(&theirs, RouteClass::General)
+            .expect("reserve other");
         for handle in [a, b, other] {
             registry.install_bound(handle);
         }
@@ -772,9 +806,13 @@ mod tests {
     async fn forced_drain_claims_settled_routes_and_defers_mid_bind_to_its_wrapper() {
         let registry = RouteRegistry::new(16);
         let gen = generation(1);
-        let live = registry.reserve(&gen).expect("reserve live");
+        let live = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve live");
         registry.install_bound(live);
-        let mid_bind = registry.reserve(&gen).expect("reserve mid-bind");
+        let mid_bind = registry
+            .reserve(&gen, RouteClass::General)
+            .expect("reserve mid-bind");
 
         let drained: Vec<RouteHandle> = registry
             .force_drain()

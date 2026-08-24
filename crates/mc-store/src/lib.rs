@@ -48,6 +48,33 @@ pub fn canonical_root(path: impl AsRef<Path>) -> PathBuf {
 
 /// Canonical foreign-memory visibility predicate used by module SQL consumers.
 /// The plugin mirrors this literal to keep cache visibility and workspace policy aligned.
+/// Content-rewrite projection update shared by the `Tx` and `McStore`
+/// twins. Exact-revision verification attests the OLD bytes, so a rewrite
+/// withdraws a verified projection ('unverified' with a retained
+/// verified_at is the documented withdrawn shape; the TypeScript harness
+/// twin writes the same). A user-sourced row demotes to 'agent': the stored
+/// bytes are no longer user-authored, and after mirror-back a same-content
+/// revision keyed on this column would otherwise carry explicit_user
+/// provenance and promote the replacement to VERIFIED.
+const UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL: &str = "UPDATE mc_memories
+    SET content = ?1,
+        normalized_hash = ?2,
+        updated_at = ?3,
+        shareable = 0,
+        classified_at = NULL,
+        verified_at = CASE
+            WHEN verification_status = 'verified'
+                THEN COALESCE(verified_at, ?3)
+            ELSE verified_at END,
+        verification_status = CASE
+            WHEN verification_status = 'verified'
+                THEN 'unverified'
+            ELSE verification_status END,
+        source_type = CASE
+            WHEN source_type = 'user' THEN 'agent'
+            ELSE source_type END
+  WHERE id = ?4";
+
 pub const FOREIGN_VISIBLE_SQL: &str = "status IN ('active','permanent') AND (expires_at IS NULL OR expires_at > :now_ms) AND shareable = 1 AND scope IN ('project','ecosystem','universe') AND category IN (SELECT value FROM json_each(:share_categories)) AND project_path IN (SELECT project_path FROM mc_workspace_members WHERE workspace_id = :workspace_id) AND project_path <> :reader_project";
 
 /// Internal mutation category used to carry foreign-visibility transitions across state sync.
@@ -2904,6 +2931,15 @@ pub struct HistorianDurableState {
     pub producer_session_id: Option<String>,
     #[serde(default)]
     pub producer_run_id: Option<String>,
+    /// The harness the producer run was started under. Broca scopes a run's
+    /// identity by `(project_root, harness, session)`, so recovery must
+    /// reattach with THIS harness rather than whatever the resuming route is
+    /// bound to: after a cross-harness handoff the current binding would
+    /// resolve to `missing` and abandon-then-refire a run the original
+    /// harness may still be executing. `None` is a state written before this
+    /// field existed; recovery falls back to the resuming binding there.
+    #[serde(default)]
+    pub producer_harness: Option<String>,
     #[serde(default)]
     pub fired_at_ms: Option<i64>,
     /// Session-level revert epoch observed when the chunk was assembled. It is copied
@@ -2946,6 +2982,7 @@ impl Default for HistorianDurableState {
             selected_range_identities: Vec::new(),
             producer_session_id: None,
             producer_run_id: None,
+            producer_harness: None,
             fired_at_ms: None,
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration::default(),
@@ -4718,6 +4755,11 @@ pub struct DreamTaskCommandRow {
 pub struct ClassificationUpdate {
     pub memory_id: i64,
     pub content_hash_at_prompt: String,
+    /// SHA-256 hex of the exact bytes the model was prompted with; the
+    /// normalized hash folds case and whitespace, so it alone cannot reject
+    /// a rewrite that changed only those bytes. Compared against the row's
+    /// exact content inside the apply transaction when present.
+    pub content_sha256_at_prompt: Option<String>,
     pub importance: Option<i32>,
     pub scope: Option<String>,
     pub shareable: Option<bool>,
@@ -4759,6 +4801,12 @@ pub struct ClassificationApplyResult {
 pub struct VerificationUpdate {
     pub memory_id: i64,
     pub content_hash_at_prompt: String,
+    /// SHA-256 hex of the exact bytes the model was prompted with.
+    /// Normalized hashing folds case and whitespace, so it alone cannot
+    /// reject a rewrite that changed only those bytes; when present this
+    /// digest is compared against the row's exact content inside the
+    /// verification transaction.
+    pub content_sha256_at_prompt: Option<String>,
     pub verification_status: String,
     pub updated_content: Option<String>,
     pub archive_reason: Option<String>,
@@ -4780,6 +4828,8 @@ pub struct VerificationApplyResult {
 pub struct MappingUpdate {
     pub memory_id: i64,
     pub content_hash_at_prompt: String,
+    /// SHA-256 hex of the exact prompted bytes (see `ClassificationUpdate`).
+    pub content_sha256_at_prompt: Option<String>,
     pub mapped_files: Option<Vec<String>>,
 }
 
@@ -4959,6 +5009,12 @@ pub struct ModuleStateSyncRequest<'a> {
     pub pending_agent_drops_skipped: usize,
     pub user_hint_seeds: &'a [UserHintSeedRow],
     pub auto_search_hint_skipped: usize,
+    /// When true, the seed batch is the host's COMPLETE hint-decision list
+    /// for this session: any stored hint block absent from the batch has no
+    /// backing decision the host can still validate (a pre-policy hint whose
+    /// raw message is gone), and keeping it would replay unvalidated overlay
+    /// bytes forever. Rows in the batch are upserted; absent rows deleted.
+    pub user_hints_replace_session: bool,
     pub note_nudge_anchors: Option<&'a [NoteNudgeAnchorSeed]>,
     pub todo_synthetic_anchor: Option<&'a FrozenSyntheticTodoPair>,
     pub todo_synthetic_anchor_present: bool,
@@ -4971,6 +5027,15 @@ pub struct ModuleStateSyncRequest<'a> {
     pub reasoning_cleared_through_tag: Option<u64>,
     pub compartments: &'a [StoredCompartment],
     pub memories: &'a [ModuleMemoryRow],
+    /// Present when `memories` is a FULL policy snapshot for these projects:
+    /// mirrored rows absent from the payload are pruned within this scope
+    /// before the upsert. Absent means incremental upsert-only semantics.
+    pub memories_replace_projects: Option<&'a [String]>,
+    /// Explicit prune ids applied before the snapshot upsert. Covers
+    /// policy-hidden rows the replace scope cannot name — a foreign
+    /// workspace member's rows — without granting a project-wide prune over
+    /// that member's non-shared rows.
+    pub memories_delete_ids: Option<&'a [i64]>,
     pub memory_mutations: &'a [ModuleMemoryMutationRow],
     pub user_profile: &'a [String],
     /// False means the sender omitted the profile section; true includes Some(empty) clears.
@@ -5573,8 +5638,9 @@ fn session_has_durable_state(
     conn: &rusqlite::Connection,
     session_id: &str,
 ) -> rusqlite::Result<bool> {
-    let exists: i64 = conn.prepare_cached(
-        "SELECT EXISTS(
+    let exists: i64 = conn
+        .prepare_cached(
+            "SELECT EXISTS(
              SELECT 1 FROM mc_cache_state WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_compartments WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_tags WHERE session_id = ?1
@@ -5593,8 +5659,8 @@ fn session_has_durable_state(
              UNION ALL SELECT 1 FROM mc_user_memory_candidates WHERE session_id = ?1
              UNION ALL SELECT 1 FROM mc_notes WHERE session_id = ?1
          )",
-    )?
-    .query_row(params![session_id], |row| row.get(0))?;
+        )?
+        .query_row(params![session_id], |row| row.get(0))?;
     Ok(exists != 0)
 }
 
@@ -5806,13 +5872,11 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
-                "UPDATE mc_memories
-                    SET content = ?1,
-                        normalized_hash = ?2,
-                        updated_at = ?3,
-                        shareable = 0,
-                        classified_at = NULL
-                  WHERE id = ?4",
+                // See UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL: withdrawal and
+                // provenance-demotion semantics live with the shared
+                // statement; verifier-authored rewrites go through the
+                // verification applier, which re-verifies explicitly.
+                UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL,
                 params![content, normalized_hash, now_ms, id],
             )
             .map_err(|error| error.to_string())?;
@@ -5998,6 +6062,10 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
+                // Merge rewrites the target's content, so the withdrawal
+                // and provenance-demotion clauses mirror
+                // UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL (extra merge columns
+                // keep this statement separate).
                 "UPDATE mc_memories
                     SET content = ?1,
                         normalized_hash = ?2,
@@ -6007,7 +6075,18 @@ impl<'a> FacadeMutationTxn<'a> {
                         status = ?6,
                         updated_at = ?7,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        verified_at = CASE
+                            WHEN verification_status = 'verified'
+                                THEN COALESCE(verified_at, ?7)
+                            ELSE verified_at END,
+                        verification_status = CASE
+                            WHEN verification_status = 'verified'
+                                THEN 'unverified'
+                            ELSE verification_status END,
+                        source_type = CASE
+                            WHEN source_type = 'user' THEN 'agent'
+                            ELSE source_type END
                   WHERE id = ?8",
                 params![
                     merged_content,
@@ -8234,16 +8313,13 @@ impl McStore {
                    FROM mc_tag_cache_generations
                   WHERE session_id = ?1",
             )?
-            .query_row(
-                params![session_id],
-                |row| {
-                    Ok(TagCacheSummary {
-                        generation: row.get::<_, i64>(0)?.max(0) as u64,
-                        count: row.get::<_, i64>(1)?.max(0) as usize,
-                        max_tag_number: row.get(2)?,
-                    })
-                },
-            )
+            .query_row(params![session_id], |row| {
+                Ok(TagCacheSummary {
+                    generation: row.get::<_, i64>(0)?.max(0) as u64,
+                    count: row.get::<_, i64>(1)?.max(0) as usize,
+                    max_tag_number: row.get(2)?,
+                })
+            })
             .optional()
             .map(|summary| summary.unwrap_or_default())
         })?)
@@ -8899,6 +8975,16 @@ impl McStore {
                         reason: "stale".to_string(),
                     });
                     continue;
+                }
+                if let Some(expected) = update.content_sha256_at_prompt.as_deref() {
+                    let actual = format!("{:x}", Sha256::digest(memory.content.as_bytes()));
+                    if actual != expected {
+                        rejected.push(ClassificationRejected {
+                            memory_id: update.memory_id,
+                            reason: "stale".to_string(),
+                        });
+                        continue;
+                    }
                 }
                 if let Some(scope) = update.scope.as_deref() {
                     if !matches!(scope, "project" | "ecosystem" | "universe") {
@@ -9902,15 +9988,47 @@ impl McStore {
             }
             let mut user_hint_seeds_seeded = 0usize;
             let mut auto_search_hint_skipped = request.auto_search_hint_skipped;
+            if request.user_hints_replace_session {
+                // The host's decision list is the complete policy authority
+                // for this session's overlays. One batched NOT IN delete (the
+                // same json_each shape the scope prune uses) keeps the kept
+                // rows' created_at stable and avoids a round-trip per stale
+                // row.
+                // Serializing a Vec<&str> cannot fail in practice; if it
+                // ever does, SKIP the replace-delete (fail closed toward
+                // retention) rather than deleting every hint with an empty
+                // kept set.
+                if let Ok(kept_json) = serde_json::to_string(
+                    &request
+                        .user_hint_seeds
+                        .iter()
+                        .map(|seed| seed.block_id.as_str())
+                        .collect::<Vec<_>>(),
+                ) {
+                    tx.execute(
+                        "DELETE FROM mc_user_hints
+                          WHERE session_id = ?1
+                            AND block_id NOT IN (SELECT value FROM json_each(?2))",
+                        params![request.session_id, kept_json],
+                    )?;
+                }
+            }
             for seed in request.user_hint_seeds {
                 if !valid_drop_seed_block_id(&seed.block_id) {
                     auto_search_hint_skipped = auto_search_hint_skipped.saturating_add(1);
                     continue;
                 }
                 user_hint_seeds_seeded += tx.execute(
+                    // Upsert, not ignore: the host's decision list is the
+                    // policy authority for these overlays, and a reseed can
+                    // legitimately REVOKE a hint whose contributing memory
+                    // was hidden (the host sends the empty no-result shape).
+                    // Benign reseeds carry byte-identical text, so old turns
+                    // stay stable unless policy demanded the change.
                     "INSERT INTO mc_user_hints(session_id, block_id, hint_text, created_at)
                      VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(session_id, block_id) DO NOTHING",
+                     ON CONFLICT(session_id, block_id) DO UPDATE SET
+                         hint_text = excluded.hint_text",
                     params![request.session_id, seed.block_id, seed.hint_text, current_time_ms()],
                 )?;
             }
@@ -10002,6 +10120,21 @@ impl McStore {
                 Some("PREPARING" | "MODULE" | "DRAINING")
             );
             if !memories_skipped {
+                if let Some(scope) = request.memories_replace_projects {
+                    prune_absent_authority_memories_tx(
+                        tx,
+                        request.project_path,
+                        scope,
+                        request.memories,
+                    )?;
+                }
+                // Explicit deletions run before the upsert so a translated id
+                // that unexpectedly collides with a snapshot row cannot
+                // remove content the payload carries: the upsert below
+                // re-creates any such row.
+                if let Some(delete_ids) = request.memories_delete_ids {
+                    delete_authority_memories_by_id_tx(tx, request.project_path, delete_ids)?;
+                }
                 replace_authority_memories_tx(tx, request.project_path, request.memories)?;
                 replace_authority_memory_mutations_tx(
                     tx,
@@ -11603,13 +11736,11 @@ impl McStore {
                 return Ok(MemoryMutationOutcome::Duplicate(duplicate_id));
             }
             tx.execute(
-                "UPDATE mc_memories
-                    SET content = ?1,
-                        normalized_hash = ?2,
-                        updated_at = ?3,
-                        shareable = 0,
-                        classified_at = NULL
-                  WHERE id = ?4",
+                // Withdrawal twin of `Tx::update_memory_content`: a content
+                // rewrite must not carry a verified projection onto bytes the
+                // verification never attested. 'unverified' with a positive
+                // verified_at is the documented withdrawn shape.
+                UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL,
                 params![content, normalized_hash, now_ms, id],
             )?;
             append_memory_mutation_tx(
@@ -11818,6 +11949,10 @@ impl McStore {
             }
 
             tx.execute(
+                // Merge rewrites the target's content, so the withdrawal
+                // and provenance-demotion clauses mirror
+                // UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL (extra merge columns
+                // keep this statement separate).
                 "UPDATE mc_memories
                     SET content = ?1,
                         normalized_hash = ?2,
@@ -11827,7 +11962,18 @@ impl McStore {
                         status = ?6,
                         updated_at = ?7,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        verified_at = CASE
+                            WHEN verification_status = 'verified'
+                                THEN COALESCE(verified_at, ?7)
+                            ELSE verified_at END,
+                        verification_status = CASE
+                            WHEN verification_status = 'verified'
+                                THEN 'unverified'
+                            ELSE verification_status END,
+                        source_type = CASE
+                            WHEN source_type = 'user' THEN 'agent'
+                            ELSE source_type END
                   WHERE id = ?8",
                 params![
                     merged_content,
@@ -15962,6 +16108,192 @@ fn authority_memory_id_for_source_tx(
     .optional()
 }
 
+/// Remove mirrored rows a full policy snapshot no longer contains. Scope is
+/// the exact project set the snapshot covered; rows from other projects and
+/// other context stores are untouched. Incoming ids are translated through
+/// the authority seed mapping first so an adopted row is recognized as
+/// present instead of being deleted and re-inserted under a new id.
+fn prune_absent_authority_memories_tx(
+    tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
+    scope_projects: &[String],
+    memories: &[ModuleMemoryRow],
+) -> rusqlite::Result<()> {
+    let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
+    // Batch the id translation: a full policy snapshot can carry many rows,
+    // and one query_row round-trip per row dwarfs the single json_each join
+    // the DELETEs below already use. Untranslated ids fall back to the
+    // source id, matching the per-row helper's unwrap_or.
+    let source_json = format!(
+        "[{}]",
+        memories
+            .iter()
+            .map(|memory| memory.id.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    // With a bound store, TypeScript and native row ids are independent
+    // namespaces (the same rule delete_authority_memories_by_id_tx applies):
+    // a mapped incoming id protects its translated NATIVE row, while an
+    // unmapped incoming id only protects the unadopted legacy mirror row
+    // that carries the TypeScript id — it must never shield a same-numbered
+    // module-created native row from the prune.
+    let mut native_keep_ids: Vec<i64> = Vec::new();
+    let mut host_keep_ids: Vec<i64> = Vec::with_capacity(memories.len());
+    if let Some(context_store_uuid) = context_store_uuid.as_deref() {
+        let mut translated: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut stmt = tx.prepare(
+            "SELECT context_row_id, id FROM mc_memories
+              WHERE context_store_uuid = ?1
+                AND context_row_id IN (SELECT value FROM json_each(?2))",
+        )?;
+        let rows = stmt.query_map(params![context_store_uuid, source_json], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (source, target) = row?;
+            translated.insert(source, target);
+        }
+        for memory in memories {
+            host_keep_ids.push(memory.id);
+            if let Some(target) = translated.get(&memory.id) {
+                native_keep_ids.push(*target);
+            }
+        }
+    } else {
+        host_keep_ids.extend(memories.iter().map(|memory| memory.id));
+    }
+    let to_json = |ids: &[i64]| {
+        format!(
+            "[{}]",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let host_keep_json = to_json(&host_keep_ids);
+    let native_keep_json = to_json(&native_keep_ids);
+    for project in scope_projects {
+        // Two arms with separate keep sets: unadopted mirror rows (NULL
+        // uuid) share the TypeScript id namespace and survive through the
+        // incoming host ids; this store's adopted rows (bound uuid) survive
+        // only through translated native ids. Rows from other context
+        // stores never match either arm.
+        tx.execute(
+            "DELETE FROM mc_memory_mappings
+              WHERE memory_id IN (
+                  SELECT id FROM mc_memories
+                   WHERE project_path = ?1
+                     AND context_store_uuid IS NULL
+                     AND id NOT IN (SELECT value FROM json_each(?2))
+              )",
+            params![project, host_keep_json],
+        )?;
+        tx.execute(
+            "DELETE FROM mc_memories
+              WHERE project_path = ?1
+                AND context_store_uuid IS NULL
+                AND id NOT IN (SELECT value FROM json_each(?2))",
+            params![project, host_keep_json],
+        )?;
+        if let Some(context_store_uuid) = context_store_uuid.as_deref() {
+            tx.execute(
+                "DELETE FROM mc_memory_mappings
+                  WHERE memory_id IN (
+                      SELECT id FROM mc_memories
+                       WHERE project_path = ?1
+                         AND context_store_uuid IS ?2
+                         AND id NOT IN (SELECT value FROM json_each(?3))
+                  )",
+                params![project, context_store_uuid, native_keep_json],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_memories
+                  WHERE project_path = ?1
+                    AND context_store_uuid IS ?2
+                    AND id NOT IN (SELECT value FROM json_each(?3))",
+                params![project, context_store_uuid, native_keep_json],
+            )?;
+        }
+    }
+    Ok(())
+}
+/// Delete explicitly named mirrored memory rows. The host names ids the
+/// policy hides from the native lane but that the replace scope cannot
+/// reach — a foreign workspace member's rows — so the guard is the same
+/// context-store ownership check the scope prune applies, not a project
+/// scope. Ids translate through the authority seed mapping first; with a
+/// bound store, TypeScript and native row ids are independent namespaces,
+/// so an unmapped id must never be treated as a native row id (it could
+/// name an unrelated module-created row). Unmapped ids still prune the
+/// unadopted legacy mirror arm, whose NULL-uuid rows share the TypeScript
+/// id namespace.
+fn delete_authority_memories_by_id_tx(
+    tx: &rusqlite::Transaction<'_>,
+    route_project_root: &str,
+    ids: &[i64],
+) -> rusqlite::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
+    let mut mapped_ids: Vec<i64> = Vec::new();
+    let mut unmapped_ids: Vec<i64> = Vec::new();
+    for id in ids {
+        match authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), *id)? {
+            Some(translated) => mapped_ids.push(translated),
+            None => unmapped_ids.push(*id),
+        }
+    }
+    let to_json = |ids: &[i64]| {
+        format!(
+            "[{}]",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    if !mapped_ids.is_empty() {
+        let ids_json = to_json(&mapped_ids);
+        tx.execute(
+            "DELETE FROM mc_memory_mappings
+              WHERE memory_id IN (
+                  SELECT id FROM mc_memories
+                   WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
+                     AND id IN (SELECT value FROM json_each(?2))
+              )",
+            params![context_store_uuid, ids_json],
+        )?;
+        tx.execute(
+            "DELETE FROM mc_memories
+              WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
+                AND id IN (SELECT value FROM json_each(?2))",
+            params![context_store_uuid, ids_json],
+        )?;
+    }
+    if !unmapped_ids.is_empty() {
+        let ids_json = to_json(&unmapped_ids);
+        tx.execute(
+            "DELETE FROM mc_memory_mappings
+              WHERE memory_id IN (
+                  SELECT id FROM mc_memories
+                   WHERE context_store_uuid IS NULL
+                     AND id IN (SELECT value FROM json_each(?1))
+              )",
+            params![ids_json],
+        )?;
+        tx.execute(
+            "DELETE FROM mc_memories
+              WHERE context_store_uuid IS NULL
+                AND id IN (SELECT value FROM json_each(?1))",
+            params![ids_json],
+        )?;
+    }
+    Ok(())
+}
+
 fn replace_authority_memories_tx(
     tx: &rusqlite::Transaction<'_>,
     route_project_root: &str,
@@ -18086,6 +18418,16 @@ fn set_memory_verification_tx(
             });
             continue;
         }
+        if let Some(expected) = update.content_sha256_at_prompt.as_deref() {
+            let actual = format!("{:x}", Sha256::digest(memory.content.as_bytes()));
+            if actual != expected {
+                rejected.push(VerificationRejected {
+                    memory_id: update.memory_id,
+                    reason: "stale".to_string(),
+                });
+                continue;
+            }
+        }
         let feed_seq_before = tx.query_row(
             "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed",
             [],
@@ -18240,6 +18582,16 @@ fn set_memory_mapping_tx(
                 reason: "stale".to_string(),
             });
             continue;
+        }
+        if let Some(expected) = update.content_sha256_at_prompt.as_deref() {
+            let actual = format!("{:x}", Sha256::digest(memory.content.as_bytes()));
+            if actual != expected {
+                rejected.push(MappingRejected {
+                    memory_id: update.memory_id,
+                    reason: "stale".to_string(),
+                });
+                continue;
+            }
         }
         let files = serde_json::to_string(&update.mapped_files)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
@@ -21737,7 +22089,8 @@ mod tests {
         let remaining_classes = migrated
             .inner
             .with_conn(|conn| {
-                let mut stmt = conn.prepare_cached("SELECT class FROM shadow_divergences ORDER BY id")?;
+                let mut stmt =
+                    conn.prepare_cached("SELECT class FROM shadow_divergences ORDER BY id")?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -22576,6 +22929,7 @@ mod tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: content_hash.clone(),
+                    content_sha256_at_prompt: None,
                     importance: Some(75),
                     scope: Some("ecosystem".to_string()),
                     shareable: None,
@@ -22610,6 +22964,7 @@ mod tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: content_hash.clone(),
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: None,
                     shareable: Some(false),
@@ -22635,6 +22990,7 @@ mod tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: content_hash,
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: None,
                     shareable: Some(true),
@@ -22866,6 +23222,49 @@ mod tests {
         assert_eq!(mutations[0].target_memory_id, id);
         assert_eq!(mutations[0].mutation_type, "update");
         assert_eq!(mutations[0].new_content.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn update_memory_content_withdraws_verified_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = McStore::open(&descriptor(dir.path())).unwrap();
+        let project = "git:proj";
+        let id = store
+            .insert_memory(insert_input(project, "ARCHITECTURE", "attested bytes", 1))
+            .unwrap();
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "UPDATE mc_memories
+                        SET verification_status = 'verified', verified_at = 5
+                      WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Verification attests the old bytes: a rewrite lands in the withdrawn
+        // shape ('unverified' with the positive verified_at preserved) instead
+        // of carrying VERIFIED onto content the verifier never saw.
+        let updated = store
+            .update_memory_content(project, id, "replacement bytes", 9)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.verification_status, "unverified");
+        assert_eq!(updated.verified_at, Some(5));
+
+        // A never-verified row is untouched by the withdrawal clause.
+        let plain = store
+            .insert_memory(insert_input(project, "CONSTRAINTS", "plain", 1))
+            .unwrap();
+        let plain_updated = store
+            .update_memory_content(project, plain, "plain v2", 9)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain_updated.verification_status, "unverified");
+        assert_eq!(plain_updated.verified_at, None);
     }
 
     #[test]
@@ -23254,6 +23653,7 @@ mod tests {
                 selected_range_identities,
                 producer_session_id: Some("producer-session".into()),
                 producer_run_id: Some("run-1".into()),
+                producer_harness: None,
                 fired_at_ms: Some(123),
                 expected_revert_epoch: 0,
                 compartment_set_generation: CompartmentSetGeneration::default(),
@@ -26611,6 +27011,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -26623,6 +27024,8 @@ mod shadow_tests {
                 reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
+                memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: user_profile.unwrap_or(&[]),
                 user_profile_present: user_profile.is_some(),
@@ -26737,7 +27140,7 @@ mod shadow_tests {
             .with_conn_fenced(|tx| {
                 tx.execute(
                     "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
-                     VALUES ('context', ?1, 'memories', 'MODULE')",
+                     VALUES ('context', ?1, 'memories', 'TS')",
                     params![identity],
                 )?;
                 tx.execute(
@@ -26776,6 +27179,8 @@ mod shadow_tests {
                 reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[incoming],
+                memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
@@ -26788,6 +27193,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -26828,6 +27234,241 @@ mod shadow_tests {
                 Some(9395)
             )]
         );
+    }
+
+    #[test]
+    fn state_sync_replace_scope_prunes_absent_rows_within_project_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request =
+            |seq: u64, memories: &'static [ModuleMemoryRow], scope: Option<&'static [String]>| {
+                ModuleStateSyncRequest {
+                    session_id: "mirror-session",
+                    project_path: "shadow:real",
+                    shadow_generation: 0,
+                    expected_shadow_seq: seq,
+                    seed_boundary_id: None,
+                    drop_seeds: &[],
+                    drop_seed_skipped: 0,
+                    strip_seeds: &[],
+                    strip_seed_skipped: 0,
+                    reasoning_cleared_through_tag: None,
+                    compartments: &[],
+                    memories,
+                    memories_replace_projects: scope,
+                    memories_delete_ids: None,
+                    memory_mutations: &[],
+                    user_profile: &[],
+                    user_profile_present: false,
+                    workspace: None,
+                    workspace_present: false,
+                    last_todo_state: None,
+                    project_memory_epoch: None,
+                    user_profile_version: None,
+                    pending_agent_drops: &[],
+                    pending_agent_drops_skipped: 0,
+                    user_hint_seeds: &[],
+                    auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
+                    note_nudge_anchors: None,
+                    todo_synthetic_anchor: None,
+                    todo_synthetic_anchor_present: false,
+                    emergency_latches: None,
+                    pending_compaction_marker: None,
+                    deferred_execute_state: None,
+                    channel2_nudge_state: None,
+                    acked_watermarks: serde_json::Value::Null,
+                }
+            };
+        let mut other_project = memory(103, "other project row");
+        other_project.project_path = "shadow:other".to_string();
+        let seeded: &'static [ModuleMemoryRow] = Box::leak(Box::new([
+            memory(101, "eligible row"),
+            memory(102, "revoked row"),
+            other_project,
+        ]));
+        store
+            .apply_authority_state_sync(request(0, seeded, None))
+            .unwrap();
+
+        // A full snapshot scoped to shadow:real prunes 102 (absent) but must
+        // not touch the other project's row.
+        let snapshot: &'static [ModuleMemoryRow] =
+            Box::leak(Box::new([memory(101, "eligible row")]));
+        let scope: &'static [String] = Box::leak(Box::new(["shadow:real".to_string()]));
+        store
+            .apply_authority_state_sync(request(1, snapshot, Some(scope)))
+            .unwrap();
+
+        let ids = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT id, project_path FROM mc_memories ORDER BY id")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                (101, "shadow:real".to_string()),
+                (103, "shadow:other".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn state_sync_delete_ids_prune_named_rows_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let request =
+            |seq: u64, memories: &'static [ModuleMemoryRow], delete_ids: Option<&'static [i64]>| {
+                ModuleStateSyncRequest {
+                    session_id: "mirror-session",
+                    project_path: "shadow:real",
+                    shadow_generation: 0,
+                    expected_shadow_seq: seq,
+                    seed_boundary_id: None,
+                    drop_seeds: &[],
+                    drop_seed_skipped: 0,
+                    strip_seeds: &[],
+                    strip_seed_skipped: 0,
+                    reasoning_cleared_through_tag: None,
+                    compartments: &[],
+                    memories,
+                    memories_replace_projects: None,
+                    memories_delete_ids: delete_ids,
+                    memory_mutations: &[],
+                    user_profile: &[],
+                    user_profile_present: false,
+                    workspace: None,
+                    workspace_present: false,
+                    last_todo_state: None,
+                    project_memory_epoch: None,
+                    user_profile_version: None,
+                    pending_agent_drops: &[],
+                    pending_agent_drops_skipped: 0,
+                    user_hint_seeds: &[],
+                    auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
+                    note_nudge_anchors: None,
+                    todo_synthetic_anchor: None,
+                    todo_synthetic_anchor_present: false,
+                    emergency_latches: None,
+                    pending_compaction_marker: None,
+                    deferred_execute_state: None,
+                    channel2_nudge_state: None,
+                    acked_watermarks: serde_json::Value::Null,
+                }
+            };
+        let mut foreign = memory(202, "foreign member row now policy-hidden");
+        foreign.project_path = "shadow:member".to_string();
+        let seeded: &'static [ModuleMemoryRow] =
+            Box::leak(Box::new([memory(201, "eligible row"), foreign]));
+        store
+            .apply_authority_state_sync(request(0, seeded, None))
+            .unwrap();
+
+        // Explicit delete ids prune exactly the named rows — here a foreign
+        // member's row the replace scope could not cover — and leave every
+        // other row untouched.
+        let delete_ids: &'static [i64] = Box::leak(Box::new([202i64]));
+        store
+            .apply_authority_state_sync(request(1, &[], Some(delete_ids)))
+            .unwrap();
+
+        let ids = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT id, project_path FROM mc_memories ORDER BY id")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        assert_eq!(ids, vec![(201, "shadow:real".to_string())]);
+        let mapping_count = store
+            .inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM mc_memory_mappings WHERE memory_id = 202",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(mapping_count, 0);
+    }
+
+    #[test]
+    fn state_sync_delete_ids_never_treat_unmapped_ids_as_native_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let route_project_root = "/worktrees/repo";
+        let identity = "git:identity";
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('context', ?1, 'memories', 'TS')",
+                    params![identity],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+                     VALUES (?1, 'context', ?2)",
+                    params![route_project_root, identity],
+                )?;
+                // A module-created native row whose id collides with an
+                // unmapped TypeScript id named for deletion. TS and native
+                // ids are independent namespaces under a binding, so this
+                // row must survive.
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, status,
+                          first_seen_at, created_at, updated_at, last_seen_at,
+                          context_store_uuid, context_row_id)
+                     VALUES (77, ?1, 'CONFIG_VALUES', 'module fact', 'module-hash', 'active',
+                             0, 0, 0, 0, 'context', 9001)",
+                    params![identity],
+                )?;
+                // An adopted row mapped from TypeScript id 55 to native id 88.
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, status,
+                          first_seen_at, created_at, updated_at, last_seen_at,
+                          context_store_uuid, context_row_id)
+                     VALUES (88, ?1, 'CONFIG_VALUES', 'adopted fact', 'adopted-hash', 'active',
+                             0, 0, 0, 0, 'context', 55)",
+                    params![identity],
+                )?;
+                // Delete ids: 55 (mapped -> native 88) and 77 (unmapped; its
+                // raw value may only touch the NULL-uuid legacy arm).
+                delete_authority_memories_by_id_tx(tx, route_project_root, &[55, 77])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let rows = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT id, COALESCE(context_store_uuid, 'null') FROM mc_memories ORDER BY id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        // The module-created row (id 77, uuid 'context') survives the raw 77
+        // delete; the adopted row (native 88) is gone via its mapping.
+        assert_eq!(rows, vec![(77, "context".to_string())]);
     }
 
     #[test]
@@ -26884,6 +27525,8 @@ mod shadow_tests {
                     reasoning_cleared_through_tag: None,
                     compartments: &[],
                     memories: &[incoming],
+                    memories_replace_projects: None,
+                    memories_delete_ids: None,
                     memory_mutations: &[],
                     user_profile: &[],
                     user_profile_present: true,
@@ -26896,6 +27539,7 @@ mod shadow_tests {
                     pending_agent_drops_skipped: 0,
                     user_hint_seeds: &[],
                     auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
                     note_nudge_anchors: None,
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
@@ -26988,6 +27632,8 @@ mod shadow_tests {
                     reasoning_cleared_through_tag: None,
                     compartments: &[],
                     memories: &[incoming],
+                    memories_replace_projects: None,
+                    memories_delete_ids: None,
                     memory_mutations: &[],
                     user_profile: &[],
                     user_profile_present: true,
@@ -27000,6 +27646,7 @@ mod shadow_tests {
                     pending_agent_drops_skipped: 0,
                     user_hint_seeds: &[],
                     auto_search_hint_skipped: 0,
+                    user_hints_replace_session: false,
                     note_nudge_anchors: None,
                     todo_synthetic_anchor: None,
                     todo_synthetic_anchor_present: false,
@@ -27192,6 +27839,7 @@ mod shadow_tests {
                 &[ClassificationUpdate {
                     memory_id: classified_id,
                     content_hash_at_prompt: classified_hash,
+                    content_sha256_at_prompt: None,
                     importance: Some(77),
                     scope: None,
                     shareable: None,
@@ -28302,6 +28950,8 @@ mod shadow_tests {
                 reasoning_cleared_through_tag: None,
                 compartments: &[comp(0, 0, "first#0")],
                 memories: &[],
+                memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
@@ -28314,6 +28964,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -28339,6 +28990,8 @@ mod shadow_tests {
                 reasoning_cleared_through_tag: None,
                 compartments: &[comp(1, 1, "second#0")],
                 memories: &[],
+                memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: &[],
                 user_profile_present: true,
@@ -28351,6 +29004,7 @@ mod shadow_tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -28504,6 +29158,7 @@ mod shadow_tests {
                 &[ClassificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash(1),
+                    content_sha256_at_prompt: None,
                     importance: Some(88),
                     scope: Some("project".into()),
                     shareable: Some(false),
@@ -28520,6 +29175,7 @@ mod shadow_tests {
                 &[MappingUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash(1),
+                    content_sha256_at_prompt: None,
                     mapped_files: Some(vec!["src/old.rs".to_string()]),
                 }],
                 5,
@@ -28534,6 +29190,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 1,
                         content_hash_at_prompt: hash(1),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -28541,6 +29198,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 2,
                         content_hash_at_prompt: "stale".into(),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -28548,6 +29206,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 99,
                         content_hash_at_prompt: "missing".into(),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -28555,6 +29214,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 3,
                         content_hash_at_prompt: hash(3),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -28593,6 +29253,7 @@ mod shadow_tests {
                 &[VerificationUpdate {
                     memory_id: 2,
                     content_hash_at_prompt: hash(2),
+                    content_sha256_at_prompt: None,
                     verification_status: "update".into(),
                     updated_content: Some("two changed".into()),
                     archive_reason: None,
@@ -28609,6 +29270,7 @@ mod shadow_tests {
                 &[VerificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash(1),
+                    content_sha256_at_prompt: None,
                     verification_status: "archive".into(),
                     updated_content: None,
                     archive_reason: Some("obsolete".into()),
@@ -28634,6 +29296,7 @@ mod shadow_tests {
                 &[MappingUpdate {
                     memory_id: 2,
                     content_hash_at_prompt: hash(2),
+                    content_sha256_at_prompt: None,
                     mapped_files: Some(vec!["src/lib.rs".into()]),
                 }],
                 4,
@@ -28698,6 +29361,7 @@ mod shadow_tests {
                 &[MappingUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash.clone(),
+                    content_sha256_at_prompt: None,
                     mapped_files: Some(vec!["src/lib.rs".to_string()]),
                 }],
                 2,
@@ -28717,6 +29381,7 @@ mod shadow_tests {
         let update = VerificationUpdate {
             memory_id: 1,
             content_hash_at_prompt: hash,
+            content_sha256_at_prompt: None,
             verification_status: "archive".to_string(),
             updated_content: None,
             archive_reason: Some("obsolete".to_string()),

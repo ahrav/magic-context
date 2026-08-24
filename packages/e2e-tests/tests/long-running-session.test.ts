@@ -3,7 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
-import { insertMemory } from "../../plugin/src/features/magic-context/memory";
+import { insertMemory, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
@@ -203,7 +203,7 @@ function contextDbPath(): string {
 }
 
 function writeDb(fn: (db: Database) => void): void {
-    const db = new Database(contextDbPath());
+    const db = openTestDb(contextDbPath(), { readwrite: true });
     try {
         fn(db);
     } finally {
@@ -214,12 +214,15 @@ function writeDb(fn: (db: Database) => void): void {
 function seedMemory(content: string): void {
     const projectIdentity = resolveProjectIdentity(realpathSync(pathResolve(h.opencode.env.workdir)));
     writeDb((db) => {
-        insertMemory(db, {
+        const seeded = insertMemory(db, {
             projectPath: projectIdentity,
             category: "PROJECT_RULES",
             content,
-            sourceType: "historian",
+            sourceType: "user",
         });
+        // Synchronous promotion: the async policy evaluator may not have
+        // marked the row eligible before the next turn renders memory.
+        updateMemoryVerification(db, seeded.id, "verified");
     });
 }
 

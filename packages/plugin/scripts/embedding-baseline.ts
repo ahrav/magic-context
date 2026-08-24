@@ -311,7 +311,7 @@ async function run() {
 
     for (const query of QUERIES) {
         const start = performance.now();
-        const vector = await embedText(query.text);
+        const vector = await embedText(query.text, undefined, "query");
         const latencyMs = performance.now() - start;
         queryLatencies.push(latencyMs);
 

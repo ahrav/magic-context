@@ -53,6 +53,51 @@ impl TargetKind {
     }
 }
 
+/// Which pending-request and handler-task permit class a module's routes
+/// draw on (plan KTD2).
+///
+/// The class is fixed per module by its [`ResourceDeclaration`], stored on
+/// each installed route at bind time, and read back by dispatch — the host
+/// never parses application bodies to pick a class, so long-settling
+/// reserved work (Broca subscriptions) and general Magic Context/Synapse
+/// traffic cannot consume each other's admission capacity (protocol §8.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteClass {
+    /// Draws on the shared pools left after every reservation. The default,
+    /// and the only class a zero-reservation handler ever uses.
+    #[default]
+    General,
+    /// Draws only on permits the module reserved at startup.
+    Reserved,
+}
+
+/// One immutable, host-neutral, pre-initialization declaration of the
+/// runtime resources a module reserves (plan KTD2).
+///
+/// The runtime checked-sums declarations across all modules before handler
+/// initialization: reserved pending/task slots are carved out of the
+/// configured limits into a separate permit class, and retained resident
+/// bytes are subtracted from the frame-admission (ingress) pool alongside
+/// the resident catalog. Startup refuses any configuration that leaves
+/// fewer than one general pending slot, one general task slot, or one
+/// maximum-size ingress body. The all-zero default preserves the original
+/// single-pool behavior exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceDeclaration {
+    /// Handler-task permits carved out of `max_handler_tasks` for this
+    /// module's reserved class.
+    pub reserved_handler_tasks: usize,
+    /// Pending-request permits carved out of `max_pending_requests` for
+    /// this module's reserved class.
+    pub reserved_pending_requests: usize,
+    /// Resident bytes this module retains for its own bounded state (for
+    /// example Broca's 64 MiB replay budget). An accounting reservation
+    /// subtracted from ingress; the module enforces its own internal budget.
+    pub retained_resident_bytes: u64,
+    /// The permit class every route bound to this module dispatches under.
+    pub route_class: RouteClass,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTarget {
     pub module_id: String,
@@ -427,6 +472,14 @@ impl std::error::Error for InitError {}
 /// runtime unwinds; under `panic=abort` any panic kills the process).
 pub trait McHostHandler: Send + Sync + 'static {
     fn manifests(&self) -> Vec<ManifestSnapshot>;
+
+    /// One immutable resource declaration per [`McHostHandler::manifests`]
+    /// entry, in the same order, read exactly once before initialization
+    /// (plan KTD2). The default declares zero reservations for every
+    /// module, which preserves single-pool admission unchanged.
+    fn resource_declarations(&self) -> Vec<ResourceDeclaration> {
+        vec![ResourceDeclaration::default(); self.manifests().len()]
+    }
 
     fn initialize(&self, init: HostInit) -> impl Future<Output = Result<(), InitError>> + Send;
 

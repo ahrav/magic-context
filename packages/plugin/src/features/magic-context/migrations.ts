@@ -17,6 +17,13 @@ import {
     seedApplicabilityBaselines,
 } from "./storage-claim-applicability-schema";
 import {
+    assertClaimPolicySchemaForeignKeys,
+    CLAIM_POLICY_SEED_META_KEYS,
+    CLAIM_POLICY_TABLES,
+    createClaimPolicySchema,
+    missingClaimPolicySchemaObjects,
+} from "./storage-claim-policy-schema";
+import {
     assertClaimsSchemaForeignKeys,
     CLAIMS_AND_EVIDENCE_TABLES,
     createClaimsAndEvidenceSchema,
@@ -2487,6 +2494,8 @@ export const MIGRATIONS: Migration[] = [
             // connection must not inherit permission to write module-owned rows.
             const memoriesPresent = tableExists(db, "memories");
             const notesPresent = tableExists(db, "notes");
+            // SAFETY: the cast only exposes optional driver methods; typeof
+            // checks determine availability before any use.
             const native = db as unknown as {
                 function?: unknown;
                 createFunction?: unknown;
@@ -3359,6 +3368,230 @@ export const MIGRATIONS: Migration[] = [
             createClaimApplicabilitySchema(db);
             seedApplicabilityBaselines(db, Date.now());
             assertClaimApplicabilitySchemaForeignKeys(db);
+        },
+    },
+    {
+        version: 86,
+        description:
+            "claim trust policy: revision policy subjects, maturity ledger, dispositions, approvals, enforcement artifacts, and the effective-policy projection",
+        up(db: Database): void {
+            // A replayed v86 must no-op over its own published schema, but a
+            // partial shape (tables without the view, indexes, or guard
+            // triggers) is refused instead of skipped or overwritten.
+            if (tableExists(db, "claim_revision_policy_subjects")) {
+                const missing = CLAIM_POLICY_TABLES.filter((table) => !tableExists(db, table));
+                if (missing.length > 0) {
+                    throw new Error(
+                        `v86 replay guard: claim_revision_policy_subjects exists but ${missing.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                const missingObjects = missingClaimPolicySchemaObjects(db);
+                if (missingObjects.length > 0) {
+                    throw new Error(
+                        `v86 replay guard: policy tables exist but ${missingObjects.join(", ")} missing; refusing to skip or overwrite`,
+                    );
+                }
+                return;
+            }
+            createClaimPolicySchema(db);
+
+            // Sparse legacy databases that never ran v22 lack the meta table.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS schema_migrations_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            `);
+            const writeMeta = db.prepare(
+                `INSERT INTO schema_migrations_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+            );
+            // Record the deterministic seed boundary and fail-closed pending
+            // phase (KTD11, R28) BEFORE any reconciliation: missing policy
+            // rows read as CANDIDATE / unknown / automatic-hidden by contract.
+            const corpus = db
+                .prepare(
+                    "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS boundary FROM claim_revisions",
+                )
+                .get() as { count: number; boundary: number };
+            writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.boundaryRevisionId, String(corpus.boundary));
+            writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.expectedCount, String(corpus.count));
+            writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.cursor, "0");
+            if (corpus.count === 0) {
+                // An empty corpus completes synchronously in the migration.
+                const watermark = tableExists(db, "claim_change_outbox")
+                    ? ((
+                          db
+                              .prepare("SELECT COALESCE(MAX(id), 0) AS id FROM claim_change_outbox")
+                              .get() as { id: number }
+                      ).id ?? 0)
+                    : 0;
+                writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.phase, "complete");
+                writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.completionWatermark, String(watermark));
+                writeMeta.run(
+                    CLAIM_POLICY_SEED_META_KEYS.seededCounts,
+                    JSON.stringify({ CANDIDATE: 0, CORROBORATED: 0, VERIFIED: 0 }),
+                );
+            } else {
+                writeMeta.run(CLAIM_POLICY_SEED_META_KEYS.phase, "pending");
+            }
+
+            // Pre-v86 automatic context was assembled without a policy gate:
+            // invalidate derived project-memory blocks and sticky auto-search
+            // decisions instead of grandfathering unverified content (R28).
+            if (tableExists(db, "project_state")) {
+                db.exec("UPDATE project_state SET project_memory_epoch = project_memory_epoch + 1");
+            }
+            if (tableExists(db, "session_meta")) {
+                const columns = new Set(
+                    (
+                        db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
+                            name: string;
+                        }>
+                    ).map((column) => column.name),
+                );
+                const resets: string[] = [];
+                if (columns.has("cached_m0_bytes")) resets.push("cached_m0_bytes = NULL");
+                if (columns.has("cached_m1_bytes")) resets.push("cached_m1_bytes = NULL");
+                if (columns.has("cached_m0_project_memory_epoch")) {
+                    resets.push("cached_m0_project_memory_epoch = NULL");
+                }
+                if (columns.has("auto_search_hint_decisions")) {
+                    // Convert instead of clear: each pre-policy hint decision
+                    // becomes a no-hint tombstone that PRESERVES its message
+                    // id. The native store may hold an already-seeded copy of
+                    // the hint text, its seed apply never deletes omitted
+                    // rows, and the seed lane derives block ids from these
+                    // decisions — an emptied list would leave pre-policy hint
+                    // text (potentially unverified fragments) overlaying
+                    // native transforms indefinitely, while a tombstone seeds
+                    // the empty no-result shape over it.
+                    const hintRows = db
+                        .prepare(
+                            `SELECT session_id AS sessionId,
+                                    auto_search_hint_decisions AS decisions
+                               FROM session_meta
+                              WHERE auto_search_hint_decisions IS NOT NULL
+                                AND auto_search_hint_decisions != ''
+                                AND auto_search_hint_decisions != '[]'`,
+                        )
+                        .all() as Array<{ sessionId: string; decisions: string }>;
+                    const updateHints = db.prepare(
+                        "UPDATE session_meta SET auto_search_hint_decisions = ? WHERE session_id = ?",
+                    );
+                    for (const row of hintRows) {
+                        let parsed: unknown = null;
+                        try {
+                            parsed = JSON.parse(row.decisions);
+                        } catch {
+                            parsed = null;
+                        }
+                        const tombstones = Array.isArray(parsed)
+                            ? parsed.flatMap((value) => {
+                                  const messageId =
+                                      value !== null && typeof value === "object"
+                                          ? (value as { messageId?: unknown }).messageId
+                                          : undefined;
+                                  return typeof messageId === "string" && messageId.length > 0
+                                      ? [
+                                            {
+                                                messageId,
+                                                decision: "no-hint",
+                                                reason: "policy-reset",
+                                            },
+                                        ]
+                                      : [];
+                              })
+                            : [];
+                        updateHints.run(JSON.stringify(tombstones), row.sessionId);
+                    }
+                }
+                if (resets.length > 0) {
+                    // Interpolation is a compile-time column allowlist, not caller input.
+                    // pi-lens-ignore: sql-injection
+                    db.exec(`UPDATE session_meta SET ${resets.join(", ")}`);
+                }
+            }
+            assertClaimPolicySchemaForeignKeys(db);
+        },
+    },
+    {
+        version: 87,
+        description:
+            "claim trust policy: the policy-subject origin guard requires SUPPORTING evidence (merged_from lineage no longer selects the origin)",
+        up(db: Database): void {
+            // The v86 guard accepted any claim_evidence row linking the
+            // observation to the revision, including relation='merged_from';
+            // merged lineage is provenance of a different observation, not
+            // evidence supporting this revision, so an importer or merge
+            // path could freeze the merged observation's taint as the
+            // revision origin. Recreate the trigger (same name, so the v86
+            // replay guard's object inventory is unchanged) with the
+            // relation constrained. Databases created after the fix carry
+            // the corrected body from createClaimPolicySchema; the
+            // drop-and-create replays to identical results there.
+            if (!tableExists(db, "claim_revision_policy_subjects")) return;
+            db.exec(`
+    DROP TRIGGER IF EXISTS claim_policy_subjects_origin_guard;
+    CREATE TRIGGER claim_policy_subjects_origin_guard
+    BEFORE INSERT ON claim_revision_policy_subjects
+    WHEN NEW.origin_observation_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM claim_evidence
+        WHERE revision_id = NEW.revision_id
+          AND observation_id = NEW.origin_observation_id
+          AND relation = 'supports'
+    )
+    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be supporting evidence for the same revision'); END;
+            `);
+        },
+    },
+    {
+        version: 88,
+        description:
+            "claim trust policy: enforcement artifacts record the checkout root that enforced them (revalidation scopes to it)",
+        up(db: Database): void {
+            // Clones and worktrees of one repository share a project
+            // identity, so artifact revalidation must only rehash from the
+            // checkout that ran the enforcement — checkout B legitimately
+            // lacks or differs at the same relative path. NULL (legacy rows)
+            // reads as "owning checkout unknown" and revalidation skips it.
+            if (!tableExists(db, "claim_enforcement_artifacts")) return;
+            ensureColumn(db, "claim_enforcement_artifacts", "enforced_from_root", "TEXT");
+        },
+    },
+    {
+        version: 89,
+        description:
+            "claim trust policy: a live policy subject without a named origin only carries an inference taint (seed writes exempt)",
+        up(db: Database): void {
+            // The v87 guard validated only NAMED origins; with
+            // origin_observation_id NULL any taint — including USER_EXPLICIT
+            // — could be frozen with nothing backing it. Recreate the
+            // trigger (same name, so the v86 replay guard's object inventory
+            // is unchanged) with a second branch coupling a NULL origin to
+            // inference taints for live writes. Legacy-seed subjects
+            // (classification method ':seed') are exempt: the pre-v86 corpus
+            // legitimately elevates boundary-gated metadata provenance whose
+            // observations were never linked as evidence.
+            if (!tableExists(db, "claim_revision_policy_subjects")) return;
+            db.exec(`
+    DROP TRIGGER IF EXISTS claim_policy_subjects_origin_guard;
+    CREATE TRIGGER claim_policy_subjects_origin_guard
+    BEFORE INSERT ON claim_revision_policy_subjects
+    WHEN (
+        NEW.origin_observation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM claim_evidence
+            WHERE revision_id = NEW.revision_id
+              AND observation_id = NEW.origin_observation_id
+              AND relation = 'supports'
+        )
+    ) OR (
+        NEW.origin_observation_id IS NULL
+        AND NEW.classification_method NOT LIKE '%:seed'
+        AND NEW.origin_taint NOT IN ('ASSISTANT_INFERENCE', 'DREAMER_INFERENCE')
+    )
+    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be supporting evidence for the same revision, and a live write without a named origin only carries an inference taint'); END;
+            `);
         },
     },
 ];

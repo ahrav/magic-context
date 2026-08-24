@@ -51,7 +51,12 @@ import {
 	promoteSessionFactsDurable,
 } from "@magic-context/core/features/magic-context/memory";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	bindMemoriesToCurrentRevision,
+	filterMemoriesByPolicy,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import type { Memory } from "@magic-context/core/features/magic-context/memory/types";
 import {
 	clearEmergencyDrainLatch,
 	clearEmergencyRecovery,
@@ -74,6 +79,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage-historian-runs";
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import { insertPrimerCandidates } from "@magic-context/core/features/magic-context/storage-primers";
+import { getProjectState } from "@magic-context/core/features/magic-context/storage-project-state";
 import { getLatestHistorianInvocationId } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import {
@@ -682,10 +688,42 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				rollbackDrainReservation();
 				return;
 			}
-			const memories = getMemoriesByProject(db, projectPath, [
-				"active",
-				"permanent",
-			]);
+			// The historian's reference block is an automatic model prompt:
+			// policy-hidden content must not reach it, or a hidden fact can
+			// steer newly generated summaries. The binder drops rows
+			// rewritten between load and policy read, so a superseded (or
+			// previously hidden) revision's bytes cannot ride the successor's
+			// eligibility into durable summaries.
+			// Stabilized rebuild (same discipline as the m0 fallback): the
+			// load and the provider send are separated by prompt assembly,
+			// and a cross-process transition in that window has no epoch
+			// check to catch it downstream. Re-read until the project memory
+			// epoch is unchanged across the load; fail closed with no memory
+			// block on exhaustion.
+			let memories: Memory[] = [];
+			let memoriesStable = false;
+			for (let attempt = 0; attempt < 2 && !memoriesStable; attempt += 1) {
+				const epochAtLoad =
+					getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0;
+				memories = bindMemoriesToCurrentRevision(
+					db,
+					filterMemoriesByPolicy(
+						db,
+						getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+						"auto_inject",
+					).memories,
+				);
+				memoriesStable =
+					(getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0) ===
+					epochAtLoad;
+			}
+			if (!memoriesStable) {
+				sessionLog(
+					sessionId,
+					"pi historian memory block unstable after retries (epoch kept moving); omitting memories this pass",
+				);
+				memories = [];
+			}
 			const memoryBlock = renderMemoryBlock(memories) ?? undefined;
 
 			// v2 (E6 parity): bounded reference blocks replace the unbounded

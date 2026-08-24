@@ -5,6 +5,7 @@ import { realpathSync } from "node:fs";
 import { resolve as pathResolve } from "node:path";
 import { TestHarness } from "../src/harness";
 import { PiTestHarness } from "../src/pi-harness";
+import { promoteMemoryToVerified } from "../src/test-db";
 
 let oc: TestHarness | null = null;
 let pi: PiTestHarness | null = null;
@@ -70,6 +71,9 @@ describe("pi cross harness", () => {
         const fromOpenCode = "OpenCode wrote this memory for Pi flagship search";
         emitMemoryWriteOnce(oc.mock, fromOpenCode);
         await oc.sendPrompt(ocSession, "remember this workflow rule for Pi");
+        // v86 trust policy: agent writes start CANDIDATE and are hidden from
+        // automatic injection; promote through the real verification API.
+        promoteMemoryToVerified(pi.contextDbPath(), fromOpenCode);
         await pi.newSession();
 
         pi.mock.reset();
@@ -89,6 +93,7 @@ describe("pi cross harness", () => {
         const fromPi = "Pi wrote this memory for OpenCode injection";
         emitMemoryWriteOnce(pi.mock, fromPi);
         await pi.sendPrompt("remember this workflow rule for OpenCode", { timeoutMs: 60_000 });
+        promoteMemoryToVerified(pi.contextDbPath(), fromPi);
 
         oc.mock.reset();
         oc.mock.setDefault({

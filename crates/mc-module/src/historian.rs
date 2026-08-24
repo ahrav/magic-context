@@ -18,8 +18,8 @@ use mc_store::{
 };
 
 use crate::historian_producer::{
-    ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError, ProducerOutput,
-    RunHandle, RunState,
+    attach_cleanup, ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError,
+    ProducerOutput, RunHandle, RunState,
 };
 use crate::historian_validate::{
     validate_historian_output, HistorianChunk, HistorianValidationError, StoredCompartmentRange,
@@ -277,6 +277,7 @@ pub fn fire(
         selected_range_identities,
         producer_session_id: None,
         producer_run_id: None,
+        producer_harness: None,
         fired_at_ms: Some(fired_at_ms),
         expected_revert_epoch,
         compartment_set_generation,
@@ -292,12 +293,16 @@ pub fn producer_started(
     current: &HistorianDurableState,
     producer_session_id: String,
     producer_run_id: String,
+    producer_harness: String,
 ) -> Result<HistorianDurableState, HistorianStateError> {
     require_phase(current, HistorianPhase::Firing, "producer_started")?;
     let mut next = current.clone();
     next.state = HistorianPhase::AwaitingProducer;
     next.producer_session_id = Some(producer_session_id);
     next.producer_run_id = Some(producer_run_id);
+    // Recovery must reattach under the harness that started the run: Broca
+    // scopes run identity by (project_root, harness, session).
+    next.producer_harness = Some(producer_harness);
     // A producer run is established: any failure detail or retry cooldown from a
     // prior firing is resolved.
     next.failure_backoff_at_ms = None;
@@ -618,6 +623,11 @@ pub enum RestartAction {
     ReattachProducer {
         producer_session_id: String,
         producer_run_id: String,
+        /// The harness the run was started under, when the durable state
+        /// recorded it. Reattach must use this rather than the resuming
+        /// route's binding: Broca scopes run identity by (project_root,
+        /// harness, session).
+        producer_harness: Option<String>,
         firing_seq: u64,
         chunk_fingerprint: String,
     },
@@ -653,6 +663,7 @@ pub fn handle_restart_load(
             Ok(RestartAction::ReattachProducer {
                 producer_session_id,
                 producer_run_id,
+                producer_harness: state.producer_harness.clone(),
                 firing_seq: state.firing_seq,
                 chunk_fingerprint: state.chunk_fingerprint,
             })
@@ -794,12 +805,12 @@ pub trait HistorianProducerDriver: Send {
     }
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
-    async fn close(&mut self);
+    async fn close(&mut self) -> Result<(), HistorianProducerError>;
     /// Delete the provider session on every terminal path. The default calls close()
     /// for compatibility with older test producers, while production producers override
     /// this method to explicitly delete session data before closing.
-    async fn purge_session(&mut self, _session_id: &str) {
-        self.close().await;
+    async fn purge_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
+        self.close().await
     }
 }
 
@@ -879,17 +890,12 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::cancel(self, run_id).await
     }
 
-    async fn close(&mut self) {
-        HistorianProducer::close(self).await;
+    async fn close(&mut self) -> Result<(), HistorianProducerError> {
+        HistorianProducer::close(self).await
     }
 
-    async fn purge_session(&mut self, session_id: &str) {
-        if HistorianProducer::purge_session(self, session_id)
-            .await
-            .is_err()
-        {
-            HistorianProducer::close(self).await;
-        }
+    async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
+        HistorianProducer::purge_session(self, session_id).await
     }
 }
 
@@ -898,6 +904,9 @@ pub struct HistorianFireRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
     pub project_slug: &'a str,
+    /// The harness this firing connects under, recorded with the awaiting
+    /// state so recovery reattaches to the run's own Broca identity.
+    pub harness: &'a str,
     /// The role-scoped historian SYSTEM prompt (HISTORIAN_SYSTEM_PROMPT). Sent via the
     /// producer's `system` field, never concatenated into `prompt`. Empty means absent.
     pub system: &'a str,
@@ -1199,6 +1208,29 @@ fn prefixed_detail(prefix: Option<&str>, detail: String) -> String {
     }
 }
 
+/// The caller persists the durable transition before invoking
+/// `log_cleanup_failure`, so logging a cleanup failure cannot corrupt the
+/// transition.
+fn log_cleanup_failure(
+    session_id: &str,
+    operation: &str,
+    result: &Result<(), HistorianProducerError>,
+) {
+    if let Err(err) = result {
+        eprintln!("mc-module: historian {operation} cleanup failed for {session_id}: {err}");
+    }
+}
+
+/// True when a cancel could not prove the run's harness process group
+/// stopped. The host reports this as the `teardown_unconfirmed` request
+/// error, which the wire producer surfaces verbatim as a `Subc` body code.
+fn cancel_left_work_unconfirmed(result: &Result<(), HistorianProducerError>) -> bool {
+    matches!(
+        result,
+        Err(HistorianProducerError::Subc(body)) if body.code == "teardown_unconfirmed"
+    )
+}
+
 pub async fn run_historian_firing<P>(
     producer: &mut P,
     request: HistorianFireRequest<'_>,
@@ -1275,16 +1307,25 @@ where
                         )),
                     ),
                 )?;
-                producer.close().await;
+                let close_result = producer.close().await;
                 if decision.try_next_model {
+                    log_cleanup_failure(request.session_id, "close", &close_result);
                     continue;
                 }
-                return Err(HistorianDriveError::Producer(err));
+                return Err(HistorianDriveError::Producer(attach_cleanup(
+                    err,
+                    close_result,
+                    "close",
+                )));
             }
         };
 
-        let awaiting =
-            producer_started(&fired, producer_session_id.clone(), handle.run_id.clone())?;
+        let awaiting = producer_started(
+            &fired,
+            producer_session_id.clone(),
+            handle.run_id.clone(),
+            request.harness.to_owned(),
+        )?;
         persist_historian_state(request.store, request.session_id, awaiting.clone())?;
 
         let output = match producer.await_output(&handle.run_id).await {
@@ -1293,7 +1334,7 @@ where
                 match producer.redrain_output(&handle.run_id).await {
                     Ok(output) => output,
                     Err(recovery_err) => {
-                        let _ = producer.cancel(&handle.run_id).await;
+                        let cancel_result = producer.cancel(&handle.run_id).await;
                         let detail = format!(
                             "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
                         );
@@ -1307,13 +1348,17 @@ where
                             request.session_id,
                             abandon_with_detail(&awaiting, failure_backoff_at_ms, Some(detail)),
                         )?;
-                        producer.close().await;
-                        return Err(HistorianDriveError::Producer(recovery_err));
+                        let close_result = producer.close().await;
+                        return Err(HistorianDriveError::Producer(attach_cleanup(
+                            attach_cleanup(recovery_err, cancel_result, "cancel"),
+                            close_result,
+                            "close",
+                        )));
                     }
                 }
             }
             Err(err) => {
-                let _ = producer.cancel(&handle.run_id).await;
+                let cancel_result = producer.cancel(&handle.run_id).await;
                 let completed_at_ms = (request.completion_now_ms)();
                 let failure_backoff_at_ms = completion_failure_backoff_at_ms(
                     request.now_ms,
@@ -1341,11 +1386,24 @@ where
                         )),
                     ),
                 )?;
-                producer.close().await;
-                if decision.try_next_model {
+                let close_result = producer.close().await;
+                // Fallback requires the failed attempt to actually be over:
+                // a cancel that reports `teardown_unconfirmed` means the
+                // host could not prove the provider descendant stopped, and
+                // starting the next model would run a second billable
+                // producer beside it under a fresh firing sequence. The
+                // firing ends here instead; the durable abandon above keeps
+                // the state recoverable and backoff-gated.
+                if decision.try_next_model && !cancel_left_work_unconfirmed(&cancel_result) {
+                    log_cleanup_failure(request.session_id, "cancel", &cancel_result);
+                    log_cleanup_failure(request.session_id, "close", &close_result);
                     continue;
                 }
-                return Err(HistorianDriveError::Producer(err));
+                return Err(HistorianDriveError::Producer(attach_cleanup(
+                    attach_cleanup(err, cancel_result, "cancel"),
+                    close_result,
+                    "close",
+                )));
             }
         };
 
@@ -1371,7 +1429,7 @@ where
             completion_now_ms: request.completion_now_ms,
             publication_fence: request.publication_fence,
         });
-        producer.close().await;
+        log_cleanup_failure(request.session_id, "close", &producer.close().await);
         let row_version = match publish_result {
             Ok(row_version) => row_version,
             Err(HistorianDriveError::Validation(err)) => {
@@ -1426,15 +1484,19 @@ where
     producer.bind_session(&producer_session_id).await?;
     let state = match producer.status(&producer_run_id).await {
         Ok(state) => state,
-        Err(_) => {
-            let failure_backoff_at_ms = completion_failure_backoff_at_ms(
-                request.now_ms,
-                request.failure_backoff_at_ms,
-                (request.completion_now_ms)(),
-            );
-            abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
-            producer.close().await;
-            return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
+        // Every status failure is inconclusive about the run — transport
+        // timeouts, EOF, and protocol violations alike — and the original
+        // run may still be active. Abandoning here would authorize a second
+        // billable firing; propagate instead and keep the durable awaiting
+        // state so a later reattach can ask again. Only an explicit
+        // `missing` answer below authorizes a refire.
+        Err(err) => {
+            let close_result = producer.close().await;
+            return Err(HistorianDriveError::Producer(attach_cleanup(
+                err,
+                close_result,
+                "close",
+            )));
         }
     };
 
@@ -1447,17 +1509,25 @@ where
                 (request.completion_now_ms)(),
             );
             abandon_current_state(request.store, request.session_id, failure_backoff_at_ms)?;
-            producer.close().await;
+            log_cleanup_failure(request.session_id, "close", &producer.close().await);
             return Ok(HistorianReattachOutcome::RefireEligible { firing_seq });
         }
     }
 
     let loaded = request.store.load(request.session_id)?;
     let awaiting = loaded.meta.historian.clone();
-    let output = match producer.await_output(&producer_run_id).await {
+    // The initial firing path covers the gap between the producer's await
+    // window and Broca's longer run allowance with a recovery re-drain;
+    // reattachment gets the same grace so a run completing inside that gap
+    // is not cancelled and discarded.
+    let awaited = match producer.await_output(&producer_run_id).await {
+        Err(HistorianProducerError::TimedOut) => producer.redrain_output(&producer_run_id).await,
+        other => other,
+    };
+    let output = match awaited {
         Ok(output) => output,
         Err(err) => {
-            let _ = producer.cancel(&producer_run_id).await;
+            let cancel_result = producer.cancel(&producer_run_id).await;
             let detail_prefix = match err
                 .classification()
                 .map(|classification| classification.class)
@@ -1496,8 +1566,12 @@ where
                     format!("producer reattach output ({producer_run_id}): {err:?}"),
                 )),
             )?;
-            producer.close().await;
-            return Err(HistorianDriveError::Producer(err));
+            let close_result = producer.close().await;
+            return Err(HistorianDriveError::Producer(attach_cleanup(
+                attach_cleanup(err, cancel_result, "cancel"),
+                close_result,
+                "close",
+            )));
         }
     };
 
@@ -1522,7 +1596,7 @@ where
         completion_now_ms: request.completion_now_ms,
         publication_fence: request.publication_fence,
     });
-    producer.close().await;
+    log_cleanup_failure(request.session_id, "close", &producer.close().await);
     let row_version = publish_result?;
     Ok(HistorianReattachOutcome::Published(HistorianRunSuccess {
         row_version,
@@ -2051,6 +2125,8 @@ mod tests {
         starts: VecDeque<Result<RunHandle, HistorianProducerError>>,
         outputs: VecDeque<Result<ProducerOutput, HistorianProducerError>>,
         statuses: VecDeque<Result<RunState, HistorianProducerError>>,
+        cancel_results: VecDeque<Result<(), HistorianProducerError>>,
+        close_results: VecDeque<Result<(), HistorianProducerError>>,
         observed_starts: Vec<(String, String)>,
         observed_sessions: Vec<String>,
         observed_systems: Vec<String>,
@@ -2073,6 +2149,16 @@ mod tests {
 
         fn with_status(mut self, result: Result<RunState, HistorianProducerError>) -> Self {
             self.statuses.push_back(result);
+            self
+        }
+
+        fn with_cancel_result(mut self, result: Result<(), HistorianProducerError>) -> Self {
+            self.cancel_results.push_back(result);
+            self
+        }
+
+        fn with_close_result(mut self, result: Result<(), HistorianProducerError>) -> Self {
+            self.close_results.push_back(result);
             self
         }
 
@@ -2126,11 +2212,12 @@ mod tests {
 
         async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError> {
             self.cancels.push(run_id.to_string());
-            Ok(())
+            self.cancel_results.pop_front().unwrap_or(Ok(()))
         }
 
-        async fn close(&mut self) {
+        async fn close(&mut self) -> Result<(), HistorianProducerError> {
             self.closes += 1;
+            self.close_results.pop_front().unwrap_or(Ok(()))
         }
     }
 
@@ -2199,6 +2286,7 @@ mod tests {
             .compartment_set_generation;
         HistorianFireRequest {
             store,
+            harness: "pi",
             session_id: "ses",
             project_path: "git:proj",
             project_slug: "proj",
@@ -2261,6 +2349,7 @@ mod tests {
             selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("producer-session".into()),
             producer_run_id: Some("run-3".into()),
+            producer_harness: None,
             fired_at_ms: Some(10),
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration::default(),
@@ -2830,7 +2919,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -2885,7 +2980,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -2960,8 +3061,13 @@ mod tests {
                 FireOutcome::Fired(state) => state,
                 FireOutcome::Busy(_) => unreachable!(),
             };
-            let awaiting =
-                producer_started(&fired, producer_session.to_string(), run_id.to_string()).unwrap();
+            let awaiting = producer_started(
+                &fired,
+                producer_session.to_string(),
+                run_id.to_string(),
+                "pi".into(),
+            )
+            .unwrap();
             store
                 .commit(
                     lineage,
@@ -3070,7 +3176,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -3117,7 +3229,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -3222,6 +3340,153 @@ mod tests {
                 && detail.contains("prov/model-a"),
             "durable failure detail keeps the timeout + recovery cause: {detail}"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_and_close_failures_surface_without_corrupting_abandon() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "model gone",
+                ErrorClass::Permanent,
+                None,
+            )))
+            .with_cancel_result(Err(HistorianProducerError::TimedOut))
+            .with_close_result(Err(HistorianProducerError::TimedOut));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        let HistorianDriveError::Producer(producer_err) = err else {
+            panic!("expected producer error, got {err:?}");
+        };
+        assert_eq!(
+            producer_err.classification().map(|c| c.class),
+            Some(ErrorClass::Permanent),
+            "cleanup failures must not change the primary retry policy"
+        );
+        let rendered = producer_err.to_string();
+        assert!(
+            rendered.contains("model gone") && rendered.contains("cleanup also failed"),
+            "both diagnostics must survive: {rendered}"
+        );
+        assert_eq!(producer.cancels, vec!["run-1"]);
+        assert_eq!(producer.closes, 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.state,
+            HistorianPhase::Idle,
+            "the durable abandon transition survives cleanup failures"
+        );
+        assert!(state.failure_backoff_at_ms.is_some());
+        assert!(state
+            .last_failure
+            .expect("failure detail recorded")
+            .contains("producer output"));
+    }
+
+    /// A retryable failure normally advances the model chain, but a cancel
+    /// that reports `teardown_unconfirmed` means the failed attempt's
+    /// provider descendant may still be executing — falling back would start
+    /// a second billable run beside it. The firing must end with the
+    /// unconfirmed cancellation surfaced, and the next model must never
+    /// start.
+    #[tokio::test]
+    async fn unconfirmed_cancellation_stops_the_fallback_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        // Only ONE start is scripted: reaching for model-b would panic the
+        // scripted queue, so completion alone proves the chain stopped.
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "provider overloaded",
+                ErrorClass::Transient,
+                None,
+            )))
+            .with_cancel_result(Err(HistorianProducerError::tagged_subc(
+                "teardown_unconfirmed",
+                "the harness process group could not be confirmed stopped",
+                ErrorClass::Transient,
+                None,
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        let HistorianDriveError::Producer(producer_err) = err else {
+            panic!("expected producer error, got {err:?}");
+        };
+        let rendered = producer_err.to_string();
+        assert!(
+            rendered.contains("teardown_unconfirmed"),
+            "the unconfirmed cancellation must surface: {rendered}"
+        );
+        assert_eq!(producer.cancels, vec!["run-1"]);
+        assert_eq!(
+            producer.observed_starts.len(),
+            1,
+            "the fallback chain must not start another run"
+        );
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.state,
+            HistorianPhase::Idle,
+            "the durable abandon transition still lands"
+        );
+        assert!(state.failure_backoff_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn close_failure_after_publish_keeps_the_completed_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("published summary"))))
+            .with_close_result(Err(HistorianProducerError::TimedOut));
+
+        let outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(outcome, HistorianDriveOutcome::Completed(_)),
+            "a route-release failure after publish must not refire published work"
+        );
+        assert_eq!(producer.closes, 1);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.last_failure, None);
+        let published = store.load_compartments("ses").unwrap().pop().unwrap();
+        assert_eq!(published.p1.as_deref(), Some("published summary"));
     }
 
     #[tokio::test]
@@ -3451,7 +3716,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -3789,6 +4060,7 @@ mod tests {
             selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("ps".into()),
             producer_run_id: Some("run-1".into()),
+            producer_harness: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration {
@@ -3992,7 +4264,7 @@ mod tests {
             FireOutcome::Busy(_)
         ));
 
-        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        let awaiting = producer_started(&fired, "ps".into(), "run".into(), "pi".into()).unwrap();
         let validating = output_received(&awaiting, "text").unwrap();
         let publishing = validation_ok(&validating).unwrap();
         let idle_again = tx_committed(&publishing).unwrap();
@@ -4023,7 +4295,7 @@ mod tests {
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.failure_backoff_at_ms, Some(999));
-        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        let awaiting = producer_started(&fired, "ps".into(), "run".into(), "pi".into()).unwrap();
         assert_eq!(awaiting.failure_backoff_at_ms, None);
         assert_eq!(awaiting.last_failure, None);
     }
@@ -4112,7 +4384,7 @@ mod tests {
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.expected_revert_epoch, 42);
-        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        let awaiting = producer_started(&fired, "ps".into(), "run".into(), "pi".into()).unwrap();
         assert_eq!(awaiting.expected_revert_epoch, 42);
     }
 
@@ -4272,7 +4544,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -4329,6 +4607,7 @@ mod tests {
             },
             "producer-session".into(),
             "run-1".into(),
+            "pi".into(),
         )
         .unwrap();
         let meta = test_meta_with_historian(awaiting);
@@ -4342,6 +4621,10 @@ mod tests {
             RestartAction::ReattachProducer {
                 producer_session_id: "producer-session".into(),
                 producer_run_id: "run-1".into(),
+                // Recovery reattaches under the harness the run STARTED on,
+                // not whatever route resumes the session: Broca scopes run
+                // identity by (project_root, harness, session).
+                producer_harness: Some("pi".into()),
                 firing_seq: 1,
                 chunk_fingerprint: "fp".into(),
             }

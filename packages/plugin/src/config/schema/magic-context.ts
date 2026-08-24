@@ -19,7 +19,18 @@ export const EXECUTE_THRESHOLD_CAP_MESSAGE =
 export const DEFAULT_HISTORIAN_TIMEOUT_MS = 300_000;
 export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
 
-export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+// bge-small beat MiniLM and four other candidates on the judged in-domain
+// retrieval benchmark (development and sealed holdout both), at the same
+// 384-dim vector size. Its CLS pooling and query-side instruction are bound to
+// the model id in embedding-local.ts, so the default stays correct end to end.
+export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
+
+/** The previous local default. Setup wizards used to write it as an explicit
+ *  pin, so configs carrying this exact value are almost always echoing the
+ *  then-default rather than expressing a preference. Doctor surfaces those pins
+ *  with the remedy; nothing rewrites a user's config automatically, because the
+ *  file carries no provenance and a deliberate pin must keep working. */
+export const RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 
 // Re-exported from the (DB-free) task registry so the schema and the runtime
 // scheduler share ONE source of truth for task names. DreamingTask remains the
@@ -301,7 +312,7 @@ const BaseEmbeddingConfigSchema = z
             .enum(["local", "openai-compatible", "off", "synapse"])
             .default("local")
             .describe(
-                "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
+                "Embedding provider. 'local' uses Xenova/bge-small-en-v1.5, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
             ),
         fallback_provider: EmbeddingFallbackProviderSchema.optional().describe(
             "Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid.",
@@ -309,7 +320,9 @@ const BaseEmbeddingConfigSchema = z
         model: z
             .string()
             .optional()
-            .describe("Embedding model name. Required for openai-compatible, ignored for local."),
+            .describe(
+                "Embedding model name. Required for openai-compatible. For local it selects the ONNX model AND its embedding recipe: recognized models (Xenova/bge-small-en-v1.5, BAAI/bge-small-en-v1.5) get their card's pooling and query instruction; any other model embeds symmetrically (mean pooling, no instruction).",
+            ),
         endpoint: z
             .string()
             .optional()

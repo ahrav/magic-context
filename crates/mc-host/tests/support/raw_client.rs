@@ -124,13 +124,11 @@ pub fn connection_frame_violation(frame: &RawFrame) -> Option<String> {
                 ));
             }
         }
-        TY_PUSH => {
-            if frame.channel == 0 || frame.epoch == 0 || frame.corr != 0 {
-                return Some(format!(
-                    "push with illegal identity {}/{}/{}",
-                    frame.channel, frame.epoch, frame.corr
-                ));
-            }
+        TY_PUSH if frame.channel == 0 || frame.epoch == 0 || frame.corr != 0 => {
+            return Some(format!(
+                "push with illegal identity {}/{}/{}",
+                frame.channel, frame.epoch, frame.corr
+            ));
         }
         _ => {}
     }

@@ -13,6 +13,7 @@ import {
     applyClassifications,
     type ClassifyArgs,
     type ClassifyModuleCallArgs,
+    ClassifyModuleFailureError,
     runClassify,
 } from "./classify";
 import { acquireLease } from "./lease";
@@ -105,6 +106,33 @@ describe("runClassify disposition", () => {
         }
     });
 
+    test("the TypeScript path classifies memories the module prompt cap would exclude", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-large-content";
+            addMemoriesForDisposition(db, projectIdentity, 9);
+            // Larger than the module route's per-chunk prompt byte budget:
+            // that cap mirrors a Rust-side rejection that does not exist on
+            // the TypeScript provider path, so this memory must still be
+            // chunked and classified here.
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `huge ${"x".repeat(250 * 1024)}`,
+                sourceSessionId: "ses",
+            });
+            const args = classifyArgs(db, projectIdentity);
+            args.client = successfulClassifyClient() as never;
+
+            const result = await runClassify(args);
+            expect(result.classified).toBe(10);
+            expect(result.remaining).toBe(0);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("reports a swallowed chunk failure as incomplete", async () => {
         const db = freshDb();
         try {
@@ -131,6 +159,7 @@ describe("runClassify disposition", () => {
 function addMemoriesForDisposition(db: Database, projectIdentity: string, count: number): void {
     for (let index = 0; index < count; index += 1) {
         insertMemory(db, {
+            sourceType: "user",
             projectPath: projectIdentity,
             category: "ARCHITECTURE",
             content: `Classification fact ${index}.`,
@@ -145,6 +174,7 @@ describe("applyClassifications", () => {
         try {
             const projectIdentity = "git:test";
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Important project fact.",
@@ -180,6 +210,7 @@ describe("applyClassifications", () => {
         try {
             const projectIdentity = "git:test";
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Important project fact.",
@@ -240,8 +271,34 @@ describe("module-backed classification", () => {
         args.moduleProjectRoot = "/repo";
         args.moduleContextStoreUuid = "store";
         args.moduleAuthorityGeneration = 3;
+        args.modelChain = ["test/classify-model"];
         args.moduleClient = { call: async (call) => onCall(call) };
         return args;
+    }
+
+    function manifestForItems(call: ClassifyModuleCallArgs): { result: object } {
+        const items = (call.body as { payload: { items: Array<{ memory_id: number }> } }).payload
+            .items;
+        const manifest = items
+            .map(
+                (item) =>
+                    `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
+            )
+            .join("\n");
+        return { result: { manifest_text: `<classify>${manifest}</classify>` } };
+    }
+
+    function acceptAllRows(call: ClassifyModuleCallArgs): { result: object } {
+        const rows = (call.body as { arguments: { rows: Array<{ memory_id: number }> } }).arguments
+            .rows;
+        return { result: { accepted: rows.map((row) => row.memory_id), rejected: [] } };
+    }
+
+    function mirrorAll(db: Database, projectIdentity: string, contextIds: number[]): void {
+        for (const [index, contextId] of contextIds.entries()) {
+            addMirrorMapping(db, projectIdentity, contextId, 9500 + index, `hash-${index}`);
+        }
+        installAuthorityManagedMarker(db, projectIdentity, "store");
     }
 
     function addMemories(db: Database, projectIdentity: string, count: number): number[] {
@@ -249,6 +306,7 @@ describe("module-backed classification", () => {
             { length: count },
             (_, index) =>
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Module-backed memory ${index}`,
@@ -366,6 +424,296 @@ describe("module-backed classification", () => {
 
             expect(itemIds).toHaveLength(10);
             expect(itemIds).not.toContain(contextIds[10]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("sends the classify-owned model chain to dreamer.run_task only", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-chain";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.modelChain = ["prov/override", "prov/default", "prov/fb"];
+
+            await runClassify(args);
+
+            const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            const applyCall = calls.find((call) => call.method === "memory.set_classification");
+            const payload = (
+                taskCall?.body as { payload: { model_chain: string[]; timeout_ms: number } }
+            ).payload;
+            expect(payload.model_chain).toEqual(["prov/override", "prov/default", "prov/fb"]);
+            expect(Number.isInteger(payload.timeout_ms)).toBe(true);
+            expect(payload.timeout_ms).toBeGreaterThan(0);
+            expect(JSON.stringify(applyCall?.body)).not.toContain("model_chain");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rejects an empty effective model chain before any module call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-empty-chain";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.modelChain = [];
+
+            await expect(runClassify(args)).rejects.toThrow(/model chain/);
+            expect(calls).toHaveLength(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("caps a short slice to the live remainder instead of the fixed ceiling", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-short-slice";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 60_000;
+
+            await runClassify(args);
+
+            const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            expect(taskCall?.timeoutMs).toBeGreaterThan(0);
+            expect(taskCall?.timeoutMs).toBeLessThanOrEqual(60_000);
+            const payload = (taskCall?.body as { payload: { timeout_ms: number } }).payload;
+            expect(payload.timeout_ms).toBeGreaterThan(0);
+            expect(payload.timeout_ms).toBeLessThanOrEqual(60_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("caps a long slice at the module ceiling", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-long-slice";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 10 * 660_000;
+
+            await runClassify(args);
+
+            const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            expect(taskCall?.timeoutMs).toBe(660_000);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a slice that expires during prompt construction starts no module call and leaves the chunk unbanked", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-expired-slice";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                return call.method === "dreamer.run_task"
+                    ? manifestForItems(call)
+                    : acceptAllRows(call);
+            });
+            // The loop admission check sees time remaining, but by the recompute
+            // just before the module call (after prompt construction) the budget
+            // has expired — the getter models the wall clock passing in between.
+            let deadlineReads = 0;
+            Object.defineProperty(args, "deadline", {
+                get: () => {
+                    deadlineReads += 1;
+                    return deadlineReads === 1 ? Date.now() + 60_000 : Date.now() - 1;
+                },
+            });
+
+            const result = await runClassify(args);
+
+            expect(calls).toHaveLength(0);
+            expect(result.classified).toBe(0);
+            expect(result.remaining).toBe(10);
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("chunk slices are floored to a workable budget and capped by the live remainder", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-multi-chunk";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 120));
+
+            const taskCalls: Array<{ timeoutMs: number | undefined }> = [];
+            const args = moduleArgs(db, projectIdentity, async (call) => {
+                if (call.method === "dreamer.run_task") {
+                    taskCalls.push({ timeoutMs: call.timeoutMs });
+                    if (taskCalls.length === 1) {
+                        await new Promise((resolve) => setTimeout(resolve, 200));
+                    }
+                    return manifestForItems(call);
+                }
+                return acceptAllRows(call);
+            });
+            // 100s across 2 chunks: the equal 50s share sits under the
+            // 160s slice floor, so both chunks are floored up to the live
+            // remainder instead of splitting the deadline into shares that
+            // barely clear the 40s purge margin.
+            args.deadline = Date.now() + 100_000;
+
+            await runClassify(args);
+
+            expect(taskCalls).toHaveLength(2);
+            // Both transport budgets are the live remainder (floored, capped
+            // by the deadline): chunk 1 sees ~100s; chunk 2 sees strictly
+            // less — the 200ms chunk 1 consumed — instead of the old equal
+            // 50s share.
+            expect(taskCalls[0].timeoutMs).toBeGreaterThan(60_000);
+            expect(taskCalls[0].timeoutMs).toBeLessThanOrEqual(100_000);
+            expect(taskCalls[1].timeoutMs).toBeGreaterThan(60_000);
+            expect(taskCalls[1].timeoutMs).toBeLessThan(taskCalls[0].timeoutMs as number);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("chunks are split by rendered prompt bytes and every module call stays under the cap", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-byte-chunks";
+            // 12 memories of ~30 KiB each: one 100-entry count chunk, but
+            // ~360 KiB of content — over the module's 256 KiB prompt cap.
+            const contextIds = Array.from(
+                { length: 12 },
+                (_, index) =>
+                    insertMemory(db, {
+                        projectPath: projectIdentity,
+                        category: "ARCHITECTURE",
+                        content: `bulk-${index} ${"x".repeat(30 * 1024)}`,
+                        sourceSessionId: "ses",
+                    }).id,
+            );
+            mirrorAll(db, projectIdentity, contextIds);
+
+            const promptBytes: number[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                if (call.method === "dreamer.run_task") {
+                    const prompt = (call.body as { payload: { prompt_body: string } }).payload
+                        .prompt_body;
+                    promptBytes.push(Buffer.byteLength(prompt, "utf8"));
+                    return manifestForItems(call);
+                }
+                return acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 600_000;
+
+            const result = await runClassify(args);
+
+            expect(promptBytes.length).toBeGreaterThan(1);
+            for (const bytes of promptBytes) {
+                expect(bytes).toBeLessThanOrEqual(256 * 1024);
+            }
+            expect(result.classified).toBe(12);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a memory too large for any chunk is excluded instead of failing the pass forever", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-oversized";
+            const contextIds = addMemories(db, projectIdentity, 9);
+            const oversized = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `oversized ${"x".repeat(250 * 1024)}`,
+                sourceSessionId: "ses",
+            }).id;
+            mirrorAll(db, projectIdentity, [...contextIds, oversized]);
+
+            const classifiedIds: number[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                if (call.method === "dreamer.run_task") {
+                    const items = (
+                        call.body as { payload: { items: Array<{ memory_id: number }> } }
+                    ).payload.items;
+                    classifiedIds.push(...items.map((item) => item.memory_id));
+                    return manifestForItems(call);
+                }
+                return acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 600_000;
+
+            const result = await runClassify(args);
+
+            expect(classifiedIds).toHaveLength(9);
+            expect(result.classified).toBe(9);
+            // The oversized memory is excluded from `remaining` — counting a
+            // memory that can never fit a chunk would keep the pass
+            // permanently incomplete and hot-retry forever.
+            expect(result.remaining).toBe(0);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a module failure stays transient and never falls back to the TypeScript child", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-no-fallback";
+            mirrorAll(db, projectIdentity, addMemories(db, projectIdentity, 10));
+
+            let childSessionsCreated = 0;
+            const args = moduleArgs(db, projectIdentity, () => {
+                throw new Error("producer run aborted: lease lost");
+            });
+            args.client = {
+                session: {
+                    create: async () => {
+                        childSessionsCreated += 1;
+                        return { data: { id: "unexpected-child" } };
+                    },
+                },
+            } as never;
+
+            const rejection = await runClassify(args).catch((error: unknown) => error);
+            expect(rejection).toBeInstanceOf(ClassifyModuleFailureError);
+            expect((rejection as ClassifyModuleFailureError).transient).toBe(true);
+            expect(childSessionsCreated).toBe(0);
         } finally {
             closeQuietly(db);
         }

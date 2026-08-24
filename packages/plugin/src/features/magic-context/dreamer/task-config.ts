@@ -45,6 +45,27 @@ export function buildDreamTaskRuntimeConfigs(
 }
 
 /**
+ * Mirrors `MAX_CLASSIFY_MODEL_CHAIN` in `crates/mc-module/src/classify.rs`:
+ * `dreamer.run_task` rejects longer chains before starting any run, so the
+ * resolved chain is capped here rather than failing module-side on a valid
+ * (if enthusiastic) fallback configuration.
+ */
+export const MAX_CLASSIFY_MODEL_CHAIN = 8;
+
+/** Built from dreamer-level inputs only so historian model settings cannot select a classify model. commentlint: allow(JUDGE) */
+export function buildClassifyModelChain(
+    taskModel: string | undefined,
+    dreamerModel: string | undefined,
+    fallbackModels: readonly string[] | undefined,
+): string[] {
+    return resolveFallbackChain([
+        taskModel ?? "",
+        dreamerModel ?? "",
+        ...(fallbackModels ?? []),
+    ]).slice(0, MAX_CLASSIFY_MODEL_CHAIN);
+}
+
+/**
  * The collection privacy gate (Option C): user-behavior observation candidates
  * are stored during historian runs ONLY when the user has scheduled the
  * review-user-memories task (schedule != ""). Replaces the v1

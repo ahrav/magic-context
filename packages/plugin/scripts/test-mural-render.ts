@@ -13,6 +13,8 @@ import { join } from "node:path";
 import { openDatabase } from "../src/features/magic-context/storage";
 import { getMuralCoverage, resolveMural } from "../src/features/magic-context/mural/resolve-mural";
 import { muralCoverageGate } from "../src/features/magic-context/mural/render-trigger";
+import { getMemoriesByProject } from "../src/features/magic-context/memory";
+import { filterMemoriesByPolicy } from "../src/features/magic-context/memory/storage-claim-visibility";
 import {
     muralImageTokenEstimateForDimensions,
     renderMural,
@@ -41,14 +43,22 @@ const identities =
           ).map((row) => row.project_path);
 
 for (const identity of identities) {
-    const coverage = getMuralCoverage(db, identity);
+    // Same policy gate production uses: the mural is an automatic injection
+    // channel, so even this offline render tool must not draw policy-hidden
+    // content into a PNG.
+    const pool = filterMemoriesByPolicy(
+        db,
+        getMemoriesByProject(db, identity, ["active", "permanent"]),
+        "auto_inject",
+    ).memories;
+    const coverage = getMuralCoverage(db, identity, pool);
     const gatePassed = muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount);
     const header = `${identity} · active=${coverage.activeMemoryCount} cued=${coverage.cuedMemoryCount}`;
     if (!gatePassed) {
         console.log(`${header} → GATE SKIP (needs >=15 cued or >=50% coverage)`);
         continue;
     }
-    const entries = resolveMural(db, identity);
+    const entries = resolveMural(db, identity, undefined, pool);
     if (entries.length === 0) {
         // Mirrors ensureMuralRendered: every memory fits the m0 budget, so there
         // is no overflow to visualize and production emits no mural block.

@@ -822,7 +822,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
         ).toEqual([memory.id]);
     });
 
-    it("duplicate: idempotent re-insert bumps stats seen_count only; direct insert throws UNIQUE", () => {
+    it("duplicate: idempotent re-insert is non-mutating; direct insert throws UNIQUE", () => {
         migrated = migratedDb();
         const first = insertMemory(migrated, {
             projectPath: "git:v82-charter",
@@ -831,6 +831,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
             nowMs: 1_000,
         });
         const baseBefore = JSON.stringify(baseRow(migrated, first.id));
+        const statsBefore = JSON.stringify(statsRow(migrated, first.id));
 
         const dup = insertMemoryIdempotent(migrated, {
             projectPath: "git:v82-charter",
@@ -842,11 +843,10 @@ describe("migrated-v82 mutation inventory characterization", () => {
 
         expect(dup.inserted).toBeFalse();
         expect(dup.memory.id).toBe(first.id);
-        expect(dup.memory.seenCount).toBe(2);
-        // The base row is byte-identical: telemetry lives in memory_stats.
+        // The recovery mutates nothing: a raced row can be policy-hidden, so
+        // the caller owns the seen-count bump after its visibility decision.
         expect(JSON.stringify(baseRow(migrated, first.id))).toBe(baseBefore);
-        expect(statsRow(migrated, first.id)?.seen_count).toBe(2);
-        expect((statsRow(migrated, first.id)?.last_seen_at as number) > 1_000).toBeTrue();
+        expect(JSON.stringify(statsRow(migrated, first.id))).toBe(statsBefore);
 
         expect(() =>
             insertMemory(migrated, {
@@ -858,7 +858,7 @@ describe("migrated-v82 mutation inventory characterization", () => {
         expect(getMemoryCount(migrated, "git:v82-charter")).toBe(1);
     });
 
-    it("update: content rewrite resets shareable/classified_at/mural cue and embedding, keeps verification", () => {
+    it("update: content rewrite resets shareable/classified_at/mural cue and embedding, withdraws verification", () => {
         migrated = migratedDb();
         const memory = insertMemory(migrated, {
             projectPath: "git:v82-charter",
@@ -898,8 +898,9 @@ describe("migrated-v82 mutation inventory characterization", () => {
         expect(row?.mural_cue_hash).toBeNull();
         expect(row?.mural_cue_at).toBeNull();
         expect(row?.mural_cue_rejection_count).toBe(0);
-        // Verification state is NOT reset by a content update in v82.
-        expect(row?.verification_status).toBe("verified");
+        // Verification attested the OLD bytes: the rewrite withdraws it
+        // ('unverified' with the original verified_at kept as history).
+        expect(row?.verification_status).toBe("unverified");
         expect(row?.verified_at).toBe(222);
         // The stale vector is dropped; stats stay untouched.
         expect(loadAllEmbeddings(migrated, "git:v82-charter", "local:model-a")).toEqual(new Map());

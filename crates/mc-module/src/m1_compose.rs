@@ -591,6 +591,7 @@ mod tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -603,6 +604,8 @@ mod tests {
                 reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
+                memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: profile,
                 user_profile_present: true,
@@ -630,8 +633,8 @@ mod tests {
         let fixture = FixtureBuilder::store();
         let store = &fixture.store;
         let p = "git:proj";
-        let s0 = m1_revision_signal(&store, p, "ses").unwrap();
-        let s1 = m1_revision_signal(&store, p, "ses").unwrap();
+        let s0 = m1_revision_signal(store, p, "ses").unwrap();
+        let s1 = m1_revision_signal(store, p, "ses").unwrap();
         assert_eq!(s0, s1, "stable store → stable signal");
         assert_ne!(s0, 0, "a computed signal is never the empty marker 0");
 
@@ -639,7 +642,7 @@ mod tests {
         store
             .replace_compartments("ses", &[comp(1, 1, 9, "m9")])
             .unwrap();
-        let s2 = m1_revision_signal(&store, p, "ses").unwrap();
+        let s2 = m1_revision_signal(store, p, "ses").unwrap();
         assert_ne!(s1, s2, "new compartment → signal moves");
     }
 
@@ -648,10 +651,10 @@ mod tests {
         let fixture = FixtureBuilder::store();
         let store = &fixture.store;
         let before =
-            m1_revision_signal_parts_for_pass(&store, "git:proj", "git:proj", "ses", 1, true, 0)
+            m1_revision_signal_parts_for_pass(store, "git:proj", "git:proj", "ses", 1, true, 0)
                 .unwrap();
         let after =
-            m1_revision_signal_parts_for_pass(&store, "git:proj", "git:proj", "ses", 2, true, 0)
+            m1_revision_signal_parts_for_pass(store, "git:proj", "git:proj", "ses", 2, true, 0)
                 .unwrap();
 
         assert_ne!(before.revision, after.revision);
@@ -734,8 +737,7 @@ mod tests {
             .seed_workspace_member("ws", foreign, "[\"CONSTRAINTS\"]")
             .unwrap();
         let before =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
-                .unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
 
         let memory = store
             .insert_memory(insert_input(project, "CONSTRAINTS", "private rule", 1))
@@ -755,21 +757,19 @@ mod tests {
             .update_memory_content(foreign, foreign_memory, "changed shared rule", 4)
             .unwrap();
         let after_memory =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
-                .unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
         assert_eq!(after_memory.revision, before.revision);
         assert_eq!(after_memory.max_memory_id, 0);
         assert_eq!(after_memory.max_memory_mutation_id, 0);
         let enabled_after_memory =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, true, 0).unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, true, 0).unwrap();
         assert_ne!(enabled_after_memory.revision, before.revision);
 
         store
             .replace_compartments("ses", &[comp(1, 1, 9, "m9")])
             .unwrap();
         let after_compartment =
-            m1_revision_signal_parts_for_pass(&store, project, project, "ses", 0, false, 0)
-                .unwrap();
+            m1_revision_signal_parts_for_pass(store, project, project, "ses", 0, false, 0).unwrap();
         assert_ne!(after_compartment.revision, after_memory.revision);
     }
 
@@ -809,7 +809,7 @@ mod tests {
 
         let meta = meta_after_hard(0, None, folded_max, folded_cursor, vec![baseline]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -836,7 +836,7 @@ mod tests {
         // a HARD folded everything (folded_seq covers all, no new memories/mutations)
         let meta = meta_after_hard(5, Some(50), 100, 9, vec![1, 2]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             "git:proj",
             "git:proj",
             "ses",
@@ -863,7 +863,7 @@ mod tests {
             .unwrap();
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             "git:proj",
             "git:proj",
             "ses",
@@ -898,7 +898,7 @@ mod tests {
         // meta: folded_seq=1, coverage=10 (matches the only compartment), folded max_mem=0
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             "git:proj",
             "git:proj",
             "ses",
@@ -1014,22 +1014,22 @@ mod tests {
         let folded_cursor = store
             .max_memory_mutation_id(&[project.to_string()])
             .unwrap();
-        let before = m1_revision_signal(&store, project, "ses").unwrap();
+        let before = m1_revision_signal(store, project, "ses").unwrap();
 
         store
             .merge_memories(project, target, &[source], "merged correction", 2)
             .unwrap();
 
-        let after = m1_revision_signal(&store, project, "ses").unwrap();
+        let after = m1_revision_signal(store, project, "ses").unwrap();
         assert_ne!(before, after, "the atomic merge must move the m1 revision");
         assert_eq!(
             after,
-            m1_revision_signal(&store, project, "ses").unwrap(),
+            m1_revision_signal(store, project, "ses").unwrap(),
             "the merge moves the revision once rather than creating a live render input"
         );
         let meta = meta_after_hard(1, Some(10), folded_max, folded_cursor, vec![source]);
         let first = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1043,7 +1043,7 @@ mod tests {
         )
         .unwrap();
         let replay = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1096,7 +1096,7 @@ mod tests {
 
         let meta = meta_after_hard(0, None, source, folded_cursor, vec![source]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1154,7 +1154,7 @@ mod tests {
 
         let meta = meta_after_hard(1, Some(10), folded_max, folded_cursor, vec![source]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1229,7 +1229,7 @@ mod tests {
             .unwrap();
 
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1276,7 +1276,7 @@ mod tests {
             .merge_memories(project, terminal, &[middle], "terminal merged", 3)
             .unwrap();
         let chain = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1356,7 +1356,7 @@ mod tests {
             .unwrap();
         store.archive_memory(project, target, None, 3).unwrap();
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1424,6 +1424,7 @@ mod tests {
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash.clone(),
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: Some("project".to_string()),
                     shareable: Some(true),
@@ -1435,7 +1436,7 @@ mod tests {
             .max_memory_mutation_id(&membership.union_identities)
             .unwrap();
         let grant = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1459,6 +1460,7 @@ mod tests {
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash,
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: None,
                     shareable: Some(false),
@@ -1467,7 +1469,7 @@ mod tests {
             )
             .unwrap();
         let revoke = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1502,7 +1504,7 @@ mod tests {
         store
             .replace_compartments("ses", &[comp(1, 1, 10, "m10")])
             .unwrap();
-        let before_signal = m1_revision_signal(&store, project, "ses").unwrap();
+        let before_signal = m1_revision_signal(store, project, "ses").unwrap();
         let cursor = store
             .max_memory_mutation_id(&[project.to_string()])
             .unwrap();
@@ -1510,7 +1512,7 @@ mod tests {
         store
             .insert_memory(insert_input(project, "CONSTRAINTS", "brand new", 1))
             .unwrap();
-        let after_signal = m1_revision_signal(&store, project, "ses").unwrap();
+        let after_signal = m1_revision_signal(store, project, "ses").unwrap();
         assert_ne!(before_signal, after_signal, "insert moves max_memory_id");
         assert_eq!(
             store
@@ -1521,7 +1523,7 @@ mod tests {
         );
         let meta = meta_after_hard(1, Some(10), 0, cursor, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             project,
             project,
             "ses",
@@ -1566,7 +1568,7 @@ mod tests {
 
         let meta = meta_after_hard(1, Some(10), 0, 0, vec![]);
         let m1 = compose_m1_from_store(
-            &store,
+            store,
             own,
             own,
             "ses",
@@ -1597,7 +1599,7 @@ mod tests {
         };
         assert_ne!(
             before,
-            m1_revision_signal(&store, own, "ses").unwrap(),
+            m1_revision_signal(store, own, "ses").unwrap(),
             "the new memory advances the digest"
         );
     }

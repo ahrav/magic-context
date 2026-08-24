@@ -19,8 +19,10 @@ fn competing_module_passes_keep_one_increment_and_reopen_keeps_it() {
     let store = McStore::open(&descriptor(directory.path())).unwrap();
     let session = "module-counter";
     let core = CoreState::default();
-    let mut initial = ModuleMeta::default();
-    initial.boundary_divergence_pending_count = 0;
+    let initial = ModuleMeta {
+        boundary_divergence_pending_count: 0,
+        ..Default::default()
+    };
     store.commit(session, None, &core, &initial).unwrap();
 
     let winner = store.load(session).unwrap();
