@@ -308,7 +308,13 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 return finish_serial(hist, outcomes, measured_scheduled, window_start);
             }
             if !is_request_terminal(decoded.ty) {
-                continue;
+                if is_connection_frame(decoded.ty) {
+                    continue;
+                }
+                return Err(format!(
+                    "wire-protocol violation: server-illegal frame type {}",
+                    decoded.ty
+                ));
             }
             if decoded.corr != corr {
                 // One request is in flight on this route, so the only
@@ -589,13 +595,23 @@ struct OpenLoopState {
 }
 
 /// True for frame types that answer a request and must therefore name an
-/// outstanding correlation. Connection-level frames (ping/pong, hello,
-/// goodbye, push, cancel) are legal without one — a shutting-down host
-/// legitimately emits a goodbye — and are simply skipped.
+/// outstanding correlation.
 fn is_request_terminal(ty: u8) -> bool {
     matches!(
         ty,
         TY_RESPONSE | TY_ERROR | raw_client::TY_STREAM_DATA | raw_client::TY_STREAM_END
+    )
+}
+
+/// True for the frame types a host may legally emit outside a request
+/// exchange (keepalives, pushes, and the shutdown goodbye). Everything
+/// that is neither a request terminal nor one of these — an unknown type
+/// or a server-illegal one such as a request — is a wire-protocol
+/// violation, never a skippable frame.
+fn is_connection_frame(ty: u8) -> bool {
+    matches!(
+        ty,
+        raw_client::TY_PING | raw_client::TY_PONG | raw_client::TY_PUSH | raw_client::TY_GOODBYE
     )
 }
 
@@ -627,7 +643,13 @@ impl OpenLoopState {
             return Err(ConsumeFailure::Transport);
         }
         if !is_request_terminal(frame.ty) {
-            return Ok(());
+            if is_connection_frame(frame.ty) {
+                return Ok(());
+            }
+            return Err(ConsumeFailure::Protocol(format!(
+                "server-illegal frame type {}",
+                frame.ty
+            )));
         }
         let now_ns = self.start.elapsed().as_nanos() as u64;
         let Some((scheduled_ns, issue_ns)) = self.pending.remove(&frame.corr) else {
@@ -811,7 +833,13 @@ async fn run_throughput_inner(
             Some(Ok(Some(decoded))) => decoded,
         };
         if !is_request_terminal(decoded.ty) {
-            continue;
+            if is_connection_frame(decoded.ty) {
+                continue;
+            }
+            return Err(format!(
+                "wire-protocol violation: server-illegal frame type {}",
+                decoded.ty
+            ));
         }
         // A frame naming no outstanding request (a duplicate terminal or
         // a never-issued correlation) is a wire-protocol regression: it
@@ -912,6 +940,12 @@ async fn run_throughput_inner(
             match read {
                 Ok(Ok(None)) => {}
                 Ok(Ok(Some(decoded))) => {
+                    if !is_request_terminal(decoded.ty) && !is_connection_frame(decoded.ty) {
+                        return Err(format!(
+                            "wire-protocol violation: server-illegal frame type {}",
+                            decoded.ty
+                        ));
+                    }
                     if is_request_terminal(decoded.ty) {
                         if !outstanding.remove(&decoded.corr) {
                             return Err(format!(

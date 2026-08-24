@@ -1116,6 +1116,46 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                 }
             }
         }
+        if arm.name == ARM_ATOMIC {
+            // Every atomic result field is recomputable from the
+            // checksummed batches.json record; the manifest's copy is
+            // otherwise unprotected beyond the median the gap pairing
+            // recomputes.
+            for a in &complete {
+                evidence::require_declared(a, "batches.json")?;
+                let raw = std::fs::read(a.dir.join("batches.json"))
+                    .map_err(|err| format!("{}: batches.json: {err}", a.dir.display()))?;
+                let output: atomic::PingPongOutput = serde_json::from_slice(&raw)
+                    .map_err(|err| format!("{}: batches.json: {err}", a.dir.display()))?;
+                let mut means = output.batch_mean_rtt_ns.clone();
+                let median = evidence::median(&mut means).unwrap_or(0.0);
+                let batches = output.batch_mean_rtt_ns.len() as u64;
+                let expected = serde_json::json!({
+                    "median_batch_rtt_ns": median,
+                    "min_batch_rtt_ns": means.first().copied().unwrap_or(0.0),
+                    "max_batch_rtt_ns": means.last().copied().unwrap_or(0.0),
+                    "exchanges_per_sec": output.exchanges_per_sec(),
+                    "clock_bracket_ns": output.clock_bracket_ns,
+                    "batches": batches,
+                    "exchanges_per_batch": if batches == 0 {
+                        0
+                    } else {
+                        output.total_exchanges / batches
+                    },
+                });
+                let manifest_results = a
+                    .manifest
+                    .results
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null);
+                if expected != manifest_results {
+                    return Err(format!(
+                        "{}: manifest results disagree with the verified batches.json",
+                        a.dir.display()
+                    ));
+                }
+            }
+        }
         let per_block: Vec<serde_json::Value> = complete
             .iter()
             .map(|a| {

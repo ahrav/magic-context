@@ -176,6 +176,10 @@ async fn run_conn(
     let (read_half, mut write_half) = stream.into_split();
     let body = body_bytes(&opts);
     let expect_fixture = opts.workload == Workload::Json;
+    // The raw workload echoes the request byte-for-byte, so length
+    // equality is the response contract the reader can check without
+    // retaining a copy of the request.
+    let request_body_len = body.len();
     // The response-length cap tracks the echoed request: the raw
     // workload legitimately echoes multi-megabyte bodies, while
     // MAX_BODY_LEN alone is sized for the fixture and error terminals.
@@ -260,7 +264,18 @@ async fn run_conn(
                             continue;
                         }
                         match inflight.clone().acquire_owned().await {
-                            Ok(permit) => permit,
+                            Ok(permit) => {
+                                // The permit wait can outlive the send
+                                // window; a request issued past the
+                                // deadline would count toward a
+                                // throughput that still divides by the
+                                // fixed window. Dropping the permit
+                                // returns it unused.
+                                if Instant::now() >= send_deadline {
+                                    break;
+                                }
+                                permit
+                            }
                             Err(_) => break,
                         }
                     }
@@ -471,16 +486,27 @@ async fn run_conn(
         let frame = pending_frame.take().expect("frame body completed");
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
         drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
-        // Connection-level frames (ping/pong, goodbye, hello, push,
-        // cancel) are legal without a correlation and are skipped;
-        // request terminals (response, error, stream) must resolve an
-        // outstanding request, and an unsolicited one is a wire-protocol
-        // regression that must fail the run rather than quietly vanish.
+        // Frame-type tri-state, matching the bench receivers: request
+        // terminals (response, error, stream) must resolve an
+        // outstanding request; keepalives, pushes, and the shutdown
+        // goodbye are legal without one; anything else — an unknown type
+        // or a server-illegal request — is a wire-protocol regression.
         if !matches!(
             frame.ty,
             TY_RESPONSE | TY_ERROR | raw_client::TY_STREAM_DATA | raw_client::TY_STREAM_END
         ) {
-            continue;
+            if matches!(
+                frame.ty,
+                raw_client::TY_PING
+                    | raw_client::TY_PONG
+                    | raw_client::TY_PUSH
+                    | raw_client::TY_GOODBYE
+            ) {
+                continue;
+            }
+            result.protocol_violation = Some(format!("server-illegal frame type {}", frame.ty));
+            result.closed_early = true;
+            break;
         }
         let Some((sched, issue)) = pending.remove(&frame.corr) else {
             result.protocol_violation = Some(format!(
@@ -517,6 +543,13 @@ async fn run_conn(
                         result.outcomes.record(Outcome::UnexpectedFrame);
                     }
                 } else if expect_fixture && body_buf.as_slice() != FIXTURE_BODY {
+                    if measured {
+                        result.outcomes.record(Outcome::BodyMismatch);
+                    }
+                } else if !expect_fixture && body_buf.len() != request_body_len {
+                    // The raw echo must return the request's exact
+                    // length; a truncated or empty body with valid flags
+                    // is not a successful echo.
                     if measured {
                         result.outcomes.record(Outcome::BodyMismatch);
                     }
