@@ -538,7 +538,7 @@ describe("module-backed classification", () => {
         }
     });
 
-    test("later chunks recompute their own remaining shares after earlier work consumes time", async () => {
+    test("chunk slices are floored to a workable budget and capped by the live remainder", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:module-multi-chunk";
@@ -555,19 +555,106 @@ describe("module-backed classification", () => {
                 }
                 return acceptAllRows(call);
             });
-            // Each chunk's slice must clear the module purge margin, or the
-            // chunk is left unbanked instead of calling the module.
+            // 100s across 2 chunks: the equal 50s share sits under the
+            // 160s slice floor, so both chunks are floored up to the live
+            // remainder instead of splitting the deadline into shares that
+            // barely clear the 40s purge margin.
             args.deadline = Date.now() + 100_000;
 
             await runClassify(args);
 
             expect(taskCalls).toHaveLength(2);
-            // Chunk 1 gets half the budget; chunk 2, as the last chunk, gets the
-            // live remainder — larger than its original half share but reduced by
-            // the 200ms chunk 1 consumed.
-            expect(taskCalls[0].timeoutMs).toBeLessThanOrEqual(50_000);
-            expect(taskCalls[1].timeoutMs).toBeGreaterThan(50_000);
-            expect(taskCalls[1].timeoutMs).toBeLessThanOrEqual(99_900);
+            // Both transport budgets are the live remainder (floored, capped
+            // by the deadline): chunk 1 sees ~100s; chunk 2 sees strictly
+            // less — the 200ms chunk 1 consumed — instead of the old equal
+            // 50s share.
+            expect(taskCalls[0].timeoutMs).toBeGreaterThan(60_000);
+            expect(taskCalls[0].timeoutMs).toBeLessThanOrEqual(100_000);
+            expect(taskCalls[1].timeoutMs).toBeGreaterThan(60_000);
+            expect(taskCalls[1].timeoutMs).toBeLessThan(taskCalls[0].timeoutMs as number);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("chunks are split by rendered prompt bytes and every module call stays under the cap", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-byte-chunks";
+            // 12 memories of ~30 KiB each: one 100-entry count chunk, but
+            // ~360 KiB of content — over the module's 256 KiB prompt cap.
+            const contextIds = Array.from(
+                { length: 12 },
+                (_, index) =>
+                    insertMemory(db, {
+                        projectPath: projectIdentity,
+                        category: "ARCHITECTURE",
+                        content: `bulk-${index} ${"x".repeat(30 * 1024)}`,
+                        sourceSessionId: "ses",
+                    }).id,
+            );
+            mirrorAll(db, projectIdentity, contextIds);
+
+            const promptBytes: number[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                if (call.method === "dreamer.run_task") {
+                    const prompt = (call.body as { payload: { prompt_body: string } }).payload
+                        .prompt_body;
+                    promptBytes.push(Buffer.byteLength(prompt, "utf8"));
+                    return manifestForItems(call);
+                }
+                return acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 600_000;
+
+            const result = await runClassify(args);
+
+            expect(promptBytes.length).toBeGreaterThan(1);
+            for (const bytes of promptBytes) {
+                expect(bytes).toBeLessThanOrEqual(256 * 1024);
+            }
+            expect(result.classified).toBe(12);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a memory too large for any chunk is excluded instead of failing the pass forever", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-oversized";
+            const contextIds = addMemories(db, projectIdentity, 9);
+            const oversized = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `oversized ${"x".repeat(250 * 1024)}`,
+                sourceSessionId: "ses",
+            }).id;
+            mirrorAll(db, projectIdentity, [...contextIds, oversized]);
+
+            const classifiedIds: number[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                if (call.method === "dreamer.run_task") {
+                    const items = (
+                        call.body as { payload: { items: Array<{ memory_id: number }> } }
+                    ).payload.items;
+                    classifiedIds.push(...items.map((item) => item.memory_id));
+                    return manifestForItems(call);
+                }
+                return acceptAllRows(call);
+            });
+            args.deadline = Date.now() + 600_000;
+
+            const result = await runClassify(args);
+
+            expect(classifiedIds).toHaveLength(9);
+            expect(result.classified).toBe(9);
+            // The oversized memory is excluded from `remaining` — counting a
+            // memory that can never fit a chunk would keep the pass
+            // permanently incomplete and hot-retry forever.
+            expect(result.remaining).toBe(0);
+            expect(result.complete).toBe(true);
         } finally {
             closeQuietly(db);
         }

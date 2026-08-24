@@ -82,6 +82,34 @@ const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
 // delete response must not let the transport cancel mid-purge.
 const CLASSIFY_MODULE_PURGE_MARGIN_MS = 40_000;
 
+// A chunk slice below this floor cannot host a real module call: the purge
+// margin alone consumes 40s, and the model needs minutes-scale time on top.
+// Equal division of the remaining deadline across many chunks can drop every
+// slice under the margin; flooring the slice processes chunks head-first
+// with workable budgets and defers the tail to the next pass, instead of
+// letting later chunks inherit progressively larger slices while the head of
+// the stable pool ordering is skipped on every pass.
+const CLASSIFY_MIN_CHUNK_SLICE_MS = CLASSIFY_MODULE_PURGE_MARGIN_MS + 120_000;
+
+// Mirrors MAX_CLASSIFY_PROMPT_BYTES (crates/mc-module/src/classify.rs): the
+// module rejects any prompt_body over 256 KiB, and a rejected prompt is
+// rebuilt identically on every retry, so chunks must be sized by rendered
+// bytes as well as entry count. The pool and anchor budgets plus the
+// template and per-entry prefixes stay under the cap by construction.
+const MODULE_PROMPT_BYTE_CAP = 256 * 1024;
+// Per-entry prompt prefix (`[id] category (current: ...)`) plus separators;
+// 128 bytes dominates the rendered form for both pool and anchor entries.
+const PROMPT_ENTRY_OVERHEAD_BYTES = 128;
+// Anchors are calibration aids, not work: they get the smaller share.
+const ANCHOR_PROMPT_BYTE_BUDGET = 48 * 1024;
+// Memory pool share: cap minus the anchor budget, with headroom for the
+// task template and guidance.
+const CHUNK_PROMPT_BYTE_BUDGET = MODULE_PROMPT_BYTE_CAP - ANCHOR_PROMPT_BYTE_BUDGET - 16 * 1024;
+
+function promptEntryBytes(content: string): number {
+    return Buffer.byteLength(content, "utf8") + PROMPT_ENTRY_OVERHEAD_BYTES;
+}
+
 export interface ClassifyModuleCallArgs {
     sessionId: string;
     projectRoot: string;
@@ -295,9 +323,20 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         return result;
     }
 
-    const chunks: ClassifyCandidate[][] = [];
-    for (let i = 0; i < toClassify.length; i += CLASSIFY_CHUNK_SIZE) {
-        chunks.push(toClassify.slice(i, i + CLASSIFY_CHUNK_SIZE));
+    // Anchors ride every chunk's prompt, so they are bounded once by bytes.
+    anchors = boundAnchorsByBytes(anchors);
+    // Chunk by entry count AND rendered prompt bytes: the module rejects a
+    // prompt_body over its byte cap, and content-heavy memories can exceed
+    // it well under the 100-entry count bound.
+    const { chunks, oversized } = chunkByCountAndBytes(toClassify);
+    if (oversized > 0) {
+        // A memory whose content alone exceeds the pool budget can never
+        // classify at this cap; counting it as remaining would keep the
+        // pass permanently incomplete and hot-retry forever.
+        result.remaining -= oversized;
+        log(
+            `[dreamer] classify: ${oversized} memory(ies) exceed the prompt byte budget and cannot be classified`,
+        );
     }
 
     const abortController = new AbortController();
@@ -314,7 +353,13 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
             const remainingMs = Math.max(0, args.deadline - Date.now());
             if (remainingMs <= 0) break;
             const chunksRemaining = chunks.length - i;
-            const sliceMs = Math.max(1, Math.floor(remainingMs / chunksRemaining));
+            // Floored so equal division across a long backlog cannot hand
+            // every chunk an unworkable slice; the tail defers to the next
+            // pass instead of the head starving on every pass.
+            const sliceMs = Math.min(
+                remainingMs,
+                Math.max(Math.floor(remainingMs / chunksRemaining), CLASSIFY_MIN_CHUNK_SLICE_MS),
+            );
 
             const counts = await classifyOneChunk(
                 args,
@@ -323,6 +368,16 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
                 sliceMs,
                 abortController.signal,
             );
+            if (counts === null) {
+                // The slice could not reserve the purge margin: the overall
+                // deadline is effectively exhausted, and every later chunk
+                // would fare no better. Ending the pass keeps the stable
+                // pool ordering fair — the same chunks lead the next pass.
+                log(
+                    `[dreamer] classify: pass ended before chunk ${i + 1}/${chunks.length}; deadline cannot host another module call`,
+                );
+                break;
+            }
             result.classified += counts.classified;
             result.changed += counts.changed;
             result.remaining -= counts.classified;
@@ -339,13 +394,67 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     }
 }
 
+/** Splits the pool into chunks bounded by both entry count and rendered
+ *  prompt bytes. A memory whose content alone exceeds the pool byte budget
+ *  is excluded (`oversized`) — it cannot fit any chunk. */
+function chunkByCountAndBytes(toClassify: ClassifyCandidate[]): {
+    chunks: ClassifyCandidate[][];
+    oversized: number;
+} {
+    const chunks: ClassifyCandidate[][] = [];
+    let current: ClassifyCandidate[] = [];
+    let currentBytes = 0;
+    let oversized = 0;
+    for (const candidate of toClassify) {
+        const cost = promptEntryBytes(candidate.contextMemory.content);
+        if (cost > CHUNK_PROMPT_BYTE_BUDGET) {
+            oversized += 1;
+            continue;
+        }
+        if (
+            current.length >= CLASSIFY_CHUNK_SIZE ||
+            currentBytes + cost > CHUNK_PROMPT_BYTE_BUDGET
+        ) {
+            chunks.push(current);
+            current = [];
+            currentBytes = 0;
+        }
+        current.push(candidate);
+        currentBytes += cost;
+    }
+    if (current.length > 0) chunks.push(current);
+    return { chunks, oversized };
+}
+
+/** Keeps stratified anchors while they fit the anchor byte budget, skipping
+ *  individual anchors too large to fit so the remaining stratification is
+ *  preserved. Anchors are calibration aids: dropping some degrades
+ *  calibration, while keeping them all can push every chunk's prompt past
+ *  the module's byte cap. */
+function boundAnchorsByBytes(anchors: ClassifyAnchorMemory[]): ClassifyAnchorMemory[] {
+    const out: ClassifyAnchorMemory[] = [];
+    let bytes = 0;
+    for (const anchor of anchors) {
+        const cost = promptEntryBytes(anchor.content);
+        if (bytes + cost > ANCHOR_PROMPT_BYTE_BUDGET) continue;
+        out.push(anchor);
+        bytes += cost;
+    }
+    if (out.length < anchors.length) {
+        log(
+            `[dreamer] classify: ${anchors.length - out.length} anchor(s) dropped to fit the prompt byte budget`,
+        );
+    }
+    return out;
+}
+
 async function classifyOneChunk(
     args: ClassifyArgs,
     chunk: ClassifyCandidate[],
     anchors: ClassifyAnchorMemory[],
     sliceMs: number,
     signal: AbortSignal,
-): Promise<{ classified: number; changed: number }> {
+): Promise<{ classified: number; changed: number } | null> {
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);
@@ -359,8 +468,10 @@ async function classifyOneChunk(
                 signal,
             );
             // A null run means the slice expired before the module call could
-            // start: the chunk stays unbanked and is not a completed invocation.
-            if (run === null) return { classified: 0, changed: 0 };
+            // start: the chunk stays unbanked and is not a completed
+            // invocation. Propagated so the pass ends instead of skipping
+            // this chunk and classifying later ones out of order.
+            if (run === null) return null;
             recordInvocation(args, startedAt, { status: "completed" });
             return run;
         }

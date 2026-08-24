@@ -335,7 +335,13 @@ pub async fn run(
         let _ = kill_group(group, rustix::process::Signal::KILL);
         // Covers the (theoretical) missing-group-id case kill_group skips.
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        // Bounded like `terminate_group`'s final reap: an unbounded wait on
+        // a leader wedged in uninterruptible kernel state would hold this
+        // task — and every waiter parked on its `work_done` — indefinitely.
+        // No prompt bytes have flowed (registration is a barrier before
+        // delivery), so no billable work can exist behind the SIGKILLed
+        // group; the run ends as this spawn failure either way.
+        let _ = tokio::time::timeout(limits.termination_grace, child.wait()).await;
         return Err(io::Error::other(
             "crash-ownership registration failed before prompt delivery",
         ));
