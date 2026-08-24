@@ -159,10 +159,11 @@ pub struct SubprocessResult {
 /// is reaped on every path, including timeout, cancellation, and overflow,
 /// so lifecycle completion upstream can never observe a live child (R10).
 ///
-/// `terminal_probe`, when supplied, inspects the captured stdout after each
-/// read and reports whether a decisive transcript has already arrived. The
-/// first hit rearms the run deadline to the drain grace, so a harness that
-/// finishes its output without closing its pipes (the Pi print-mode
+/// `terminal_probe`, when supplied, inspects each region of newly completed
+/// stdout lines exactly once and reports whether it contains a decisive
+/// terminal event — the total probing cost stays linear in the transcript.
+/// The first hit rearms the run deadline to the drain grace, so a harness
+/// that finishes its output without closing its pipes (the Pi print-mode
 /// shutdown gap) ends as a drain kill with the completed transcript instead
 /// of burning the whole run timeout and failing.
 pub async fn run(
@@ -222,6 +223,9 @@ pub async fn run(
     let deadline = tokio::time::sleep(limits.run_timeout);
     tokio::pin!(deadline);
     let mut terminal_seen = false;
+    // Everything before this offset has already been probed; each complete
+    // line is inspected exactly once no matter how the reads chunk it.
+    let mut probed_to = 0usize;
 
     // One loop drains both streams concurrently under their byte caps while
     // watching the timeout and the cancellation token (R17).
@@ -247,11 +251,22 @@ pub async fn run(
                         break Some(SubprocessEnd::StdoutOverflow);
                     }
                     stdout.extend_from_slice(&stdout_chunk[..n]);
-                    if !terminal_seen && terminal_probe.is_some_and(|probe| probe(&stdout)) {
-                        terminal_seen = true;
-                        let drain_deadline = tokio::time::Instant::now() + limits.drain_grace;
-                        if drain_deadline < deadline.deadline() {
-                            deadline.as_mut().reset(drain_deadline);
+                    if !terminal_seen {
+                        if let Some(probe) = terminal_probe {
+                            if let Some(last_newline) =
+                                stdout[probed_to..].iter().rposition(|byte| *byte == b'\n')
+                            {
+                                let end = probed_to + last_newline + 1;
+                                if probe(&stdout[probed_to..end]) {
+                                    terminal_seen = true;
+                                    let drain_deadline =
+                                        tokio::time::Instant::now() + limits.drain_grace;
+                                    if drain_deadline < deadline.deadline() {
+                                        deadline.as_mut().reset(drain_deadline);
+                                    }
+                                }
+                                probed_to = end;
+                            }
                         }
                     }
                 }

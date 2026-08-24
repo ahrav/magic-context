@@ -9816,8 +9816,12 @@ impl McHandler {
                 Err(error) => Err(error),
             };
             // Each attempt must purge its session before advancing or
-            // returning; dreamer sessions carry memory-pool snapshots.
+            // returning; dreamer sessions carry memory-pool snapshots. A
+            // failed purge is therefore terminal for the command on every
+            // outcome kind — advancing the chain would let a later success
+            // mask the session (and its snapshot) left behind.
             let purge_result = producer.purge_session(&child_session).await;
+            let purge_failed = purge_result.is_err();
             match attempt_output {
                 Ok(result) if has_manifest_envelope(&result.text) => match purge_result {
                     // The module checks only for the task-specific envelope. Even if the
@@ -9845,11 +9849,17 @@ impl McHandler {
                             "classify producer returned no classify manifest envelope (session.delete cleanup also failed: {cleanup})"
                         ),
                     };
+                    if purge_failed {
+                        break;
+                    }
                 }
                 Err(primary) => {
                     last_error =
                         historian_producer::attach_cleanup(primary, purge_result, "session.delete")
                             .to_string();
+                    if purge_failed {
+                        break;
+                    }
                 }
             }
         }

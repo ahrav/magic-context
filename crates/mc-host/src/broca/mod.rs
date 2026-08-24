@@ -109,12 +109,14 @@ impl CompositeComponent for BrocaComponent {
     fn resources(&self) -> ResourceDeclaration {
         // The fixed reserved-class declaration (R13, KTD2): 96 pending, 96
         // tasks, and the 64 MiB retained budget the supervisor enforces
-        // internally. Constants rather than limits so a test-shrunken
-        // supervisor still declares the product contract.
+        // internally plus the route-identity map's worst case, which is
+        // retained outside that budget. Constants rather than limits so a
+        // test-shrunken supervisor still declares the product contract.
         ResourceDeclaration {
             reserved_handler_tasks: config::RESERVED_HANDLER_TASKS,
             reserved_pending_requests: config::RESERVED_PENDING_REQUESTS,
-            retained_resident_bytes: config::MAX_RETAINED_BYTES,
+            retained_resident_bytes: config::MAX_RETAINED_BYTES
+                + config::ROUTE_IDENTITY_HEADROOM_BYTES,
             route_class: RouteClass::Reserved,
         }
     }

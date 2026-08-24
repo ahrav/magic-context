@@ -114,7 +114,13 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     let resources = component.resources();
     assert_eq!(resources.reserved_pending_requests, 96);
     assert_eq!(resources.reserved_handler_tasks, 96);
-    assert_eq!(resources.retained_resident_bytes, 64 * 1024 * 1024);
+    // The supervisor's 64 MiB budget plus the route-identity map's worst
+    // case (1024 routes x (4096-byte root + 256-byte session + 128-byte
+    // key overhead)), which is retained outside that budget.
+    assert_eq!(
+        resources.retained_resident_bytes,
+        64 * 1024 * 1024 + 1024 * (4096 + 256 + 128)
+    );
     assert_eq!(resources.route_class, mc_host::RouteClass::Reserved);
 }
 

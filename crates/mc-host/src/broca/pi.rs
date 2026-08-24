@@ -236,19 +236,46 @@ async fn run_pi(
     subprocess::finalize(HarnessName::Pi, &result, parsed, &limits, dir.cleanup())
 }
 
-/// Reports whether the captured stdout already holds a decisive transcript,
-/// so the drain loop can arm its grace instead of waiting for pipe EOF: Pi's
-/// print mode often finishes the agent loop without exiting (the shutdown
-/// gap `subagent-runner.ts` documents), and its open stdout would otherwise
-/// hold the run until the full timeout and discard the completed answer.
-/// Only complete lines participate; a line split across reads is re-checked
-/// once its newline arrives.
-fn pi_terminal_probe(stdout: &[u8]) -> bool {
-    let end = stdout
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position + 1);
-    parse_pi_transcript(&stdout[..end]).is_ok()
+/// Reports whether a region of newly completed stdout lines contains the
+/// decisive terminal event, so the drain loop can arm its grace instead of
+/// waiting for pipe EOF: Pi's print mode often finishes the agent loop
+/// without exiting (the shutdown gap `subagent-runner.ts` documents), and
+/// its open stdout would otherwise hold the run until the full timeout and
+/// discard the completed answer. The caller feeds each complete line
+/// exactly once, so probing stays linear; arming early on a transcript the
+/// full parse later rejects only shortens the wait for the same failure.
+fn pi_terminal_probe(lines: &[u8]) -> bool {
+    lines
+        .split(|byte| *byte == b'\n')
+        .any(pi_line_is_terminal_message_end)
+}
+
+/// One-line check for a terminal assistant `message_end` (stopReason
+/// `stop`, `length`, `error`, or `aborted`) — the probe-side mirror of the
+/// terminal decision in [`parse_pi_transcript`]. Noise and malformed lines
+/// are simply not terminals here; the full parse renders that verdict.
+fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(line) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("message_end") {
+        return false;
+    }
+    let Some(message) = value.get("message") else {
+        return false;
+    };
+    if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return false;
+    }
+    matches!(
+        message
+            .get("stopReason")
+            .and_then(serde_json::Value::as_str),
+        Some("stop" | "length" | "error" | "aborted")
+    )
 }
 
 /// Parses the closed Pi print-mode JSON vocabulary (R18). The terminal

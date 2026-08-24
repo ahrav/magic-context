@@ -35,9 +35,16 @@ pub const TERMINAL_HEADROOM_BYTES: usize = 4096;
 
 /// Aggregate retained-data budget (R12): immutable request bytes, replay
 /// allocation, session and run keys, and tombstone metadata all draw on this
-/// one accounting bound. Matches the module's `retained_resident_bytes`
-/// declaration, which the host subtracts from ingress.
+/// one accounting bound. The supervisor enforces exactly this amount.
 pub const MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Worst case for the component's route-identity map, which lives outside
+/// the supervisor's budget: the host permits 1024 routes, each binding a
+/// project root of up to 4096 bytes plus a session of up to 256 bytes, with
+/// 128 bytes of key overhead. Declared to the host on top of
+/// [`MAX_RETAINED_BYTES`] so the published reservation remains an actual
+/// ceiling on resident bytes.
+pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = 1024 * (4096 + 256 + 128);
 
 /// Most sessions retained in a terminal or deletion-tombstone state (R12);
 /// beyond it the oldest eligible entry is evicted.
