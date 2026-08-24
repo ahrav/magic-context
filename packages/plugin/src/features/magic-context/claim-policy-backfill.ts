@@ -13,8 +13,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join, normalize, sep } from "node:path";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite.ts";
@@ -488,6 +487,17 @@ export function revalidateEnforcementArtifacts(
     );
 }
 
+/** Streamed SHA-256: read and hash yield per chunk, so hashing a large
+ *  artifact never pins the event loop the way a whole-buffer
+ *  createHash().update() would. */
+async function sha256FileStreaming(absolutePath: string): Promise<string> {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(absolutePath)) {
+        hash.update(chunk as Buffer);
+    }
+    return hash.digest("hex");
+}
+
 async function revalidateEnforcementArtifactsNow(
     db: Database,
     projectIdentity: string,
@@ -537,12 +547,11 @@ async function revalidateEnforcementArtifactsNow(
         const absolute = join(projectRoot, relative);
         let drifted: string | null = null;
         try {
-            // Asynchronous read: hashing a large artifact must not pin the
-            // event loop; ENOENT means the file is gone (a drift), any other
-            // read error is indistinguishable from transient I/O.
-            const digest = createHash("sha256")
-                .update(await readFile(absolute))
-                .digest("hex");
+            // Streamed hash: reading AND hashing yield per chunk, so a large
+            // artifact never pins the event loop. ENOENT means the file is
+            // gone (a drift); any other read error is indistinguishable from
+            // transient I/O.
+            const digest = await sha256FileStreaming(absolute);
             if (digest !== artifact.bytesDigest) drifted = "artifact bytes drifted";
         } catch (error) {
             if ((error as { code?: string } | null)?.code === "ENOENT") {
