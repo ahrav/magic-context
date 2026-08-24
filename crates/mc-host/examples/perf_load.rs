@@ -486,21 +486,19 @@ async fn run_conn(
         let frame = pending_frame.take().expect("frame body completed");
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
         drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
-        // Frame-type tri-state, matching the bench receivers: request
-        // terminals (response, error, stream) must resolve an
-        // outstanding request; keepalives, pushes, and the shutdown
-        // goodbye are legal without one; anything else — an unknown type
-        // or a server-illegal request — is a wire-protocol regression.
+        // Frame-type tri-state, matching the bench receivers and the
+        // wire contract's host-to-consumer set: request terminals
+        // (response, error, stream) must resolve an outstanding request;
+        // pings, pushes, and the shutdown goodbye are legal without one
+        // (pong is consumer-to-host only); anything else is a
+        // wire-protocol regression.
         if !matches!(
             frame.ty,
             TY_RESPONSE | TY_ERROR | raw_client::TY_STREAM_DATA | raw_client::TY_STREAM_END
         ) {
             if matches!(
                 frame.ty,
-                raw_client::TY_PING
-                    | raw_client::TY_PONG
-                    | raw_client::TY_PUSH
-                    | raw_client::TY_GOODBYE
+                raw_client::TY_PING | raw_client::TY_PUSH | raw_client::TY_GOODBYE
             ) {
                 continue;
             }

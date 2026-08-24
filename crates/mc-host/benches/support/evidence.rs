@@ -396,11 +396,11 @@ pub fn merge_arm_histograms(
         return Err(format!("no complete attempts for arm {}", arm.name));
     }
     let reference = &complete[0].manifest;
-    let mut merged = reference
+    let declared = reference
         .histogram
         .clone()
-        .ok_or_else(|| format!("arm {} records no histogram", arm.name))?
-        .build()?;
+        .ok_or_else(|| format!("arm {} records no histogram", arm.name))?;
+    let mut merged = declared.build()?;
     for attempt in &complete {
         if !compatible(reference, &attempt.manifest) {
             return Err(format!(
@@ -410,6 +410,27 @@ pub fn merge_arm_histograms(
         }
         verify_sidecars(attempt)?;
         let hist = read_histogram(attempt, file)?;
+        // The merged histogram is constructed from the manifest's
+        // declared configuration, which no checksum protects; an edited
+        // declaration would silently quantize the merged percentiles at
+        // a different precision than the retained evidence. Every
+        // verified sidecar must agree with the declaration.
+        if hist.low() != declared.low_ns
+            || hist.high() != declared.high_ns
+            || hist.sigfig() != declared.sigfigs
+        {
+            return Err(format!(
+                "{}: {file} bounds ({}, {}, {} sigfigs) disagree with the declared \
+                 histogram configuration ({}, {}, {} sigfigs)",
+                attempt.dir.display(),
+                hist.low(),
+                hist.high(),
+                hist.sigfig(),
+                declared.low_ns,
+                declared.high_ns,
+                declared.sigfigs
+            ));
+        }
         merged
             .add(&hist)
             .map_err(|err| format!("{}: merge: {err}", attempt.dir.display()))?;

@@ -604,14 +604,15 @@ fn is_request_terminal(ty: u8) -> bool {
 }
 
 /// True for the frame types a host may legally emit outside a request
-/// exchange (keepalives, pushes, and the shutdown goodbye). Everything
-/// that is neither a request terminal nor one of these — an unknown type
-/// or a server-illegal one such as a request — is a wire-protocol
-/// violation, never a skippable frame.
+/// exchange, matching the wire contract's host-to-consumer set
+/// (keepalive pings, pushes, and the shutdown goodbye). Pong is
+/// consumer-to-host only. Everything that is neither a request terminal
+/// nor one of these is a wire-protocol violation, never a skippable
+/// frame.
 fn is_connection_frame(ty: u8) -> bool {
     matches!(
         ty,
-        raw_client::TY_PING | raw_client::TY_PONG | raw_client::TY_PUSH | raw_client::TY_GOODBYE
+        raw_client::TY_PING | raw_client::TY_PUSH | raw_client::TY_GOODBYE
     )
 }
 

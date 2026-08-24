@@ -352,13 +352,27 @@ fn host_id() -> HostId {
         // shared default would merge histograms across physically
         // different hosts that happen to share kernel and CPU strings.
         hostname: env_var("MC_IPC_BUDGET_HOST_LABEL").unwrap_or_else(|| {
+            // An empty machine-id (minimal or not-yet-initialized
+            // images) must not hash to one shared identity; fall through
+            // to the hostname, and to "unknown" only when both sources
+            // are empty.
             let id = std::fs::read_to_string("/etc/machine-id")
-                .or_else(|_| std::fs::read_to_string("/proc/sys/kernel/hostname"))
-                .unwrap_or_default();
-            format!(
-                "host-{}",
-                &perf_measurement::sha256_hex(id.trim().as_bytes())[..12]
-            )
+                .ok()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    std::fs::read_to_string("/proc/sys/kernel/hostname")
+                        .ok()
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                });
+            match id {
+                Some(id) => format!(
+                    "host-{}",
+                    &perf_measurement::sha256_hex(id.as_bytes())[..12]
+                ),
+                None => "unknown".to_owned(),
+            }
         }),
         kernel: read("/proc/sys/kernel/osrelease"),
         cpu_model,
@@ -773,6 +787,28 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
     ] {
         attempt.add_histogram(file, hist)?;
     }
+    let results = serde_json::json!({
+        "offered_rate_per_sec": rate,
+        "sched_p50_ns": result.sched_to_completion.value_at_quantile(0.50),
+        "sched_p99_ns": result.sched_to_completion.value_at_quantile(0.99),
+        "issue_p50_ns": result.issue_to_completion.value_at_quantile(0.50),
+        "issue_p99_ns": result.issue_to_completion.value_at_quantile(0.99),
+        "lag_p99_ns": result.scheduler_lag.value_at_quantile(0.99),
+        "scheduled_slots": result.scheduled_slots,
+        "elapsed_secs": result.elapsed.as_secs_f64(),
+    });
+    // The results and outcomes get a checksummed record like the serial
+    // and throughput arms; the histograms cover only the percentiles,
+    // leaving scheduled_slots and the outcome counters unprotected
+    // otherwise.
+    let record = serde_json::json!({
+        "results": results,
+        "outcomes": result.outcomes,
+    });
+    attempt.add_sidecar(
+        "open.json",
+        &serde_json::to_vec_pretty(&record).map_err(|err| err.to_string())?,
+    )?;
     let manifest = attempt.manifest_mut();
     manifest.histogram = Some(cfg.histogram.clone());
     manifest.collection = Some(serde_json::json!({
@@ -784,16 +820,7 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
     manifest.outcomes = Some(result.outcomes.clone());
     manifest.recorded_samples = Some(result.sched_to_completion.len());
     manifest.histogram_rejected = Some(result.outcomes.histogram_overflow);
-    manifest.results = Some(serde_json::json!({
-        "offered_rate_per_sec": rate,
-        "sched_p50_ns": result.sched_to_completion.value_at_quantile(0.50),
-        "sched_p99_ns": result.sched_to_completion.value_at_quantile(0.99),
-        "issue_p50_ns": result.issue_to_completion.value_at_quantile(0.50),
-        "issue_p99_ns": result.issue_to_completion.value_at_quantile(0.99),
-        "lag_p99_ns": result.scheduler_lag.value_at_quantile(0.99),
-        "scheduled_slots": result.scheduled_slots,
-        "elapsed_secs": result.elapsed.as_secs_f64(),
-    }));
+    manifest.results = Some(results);
     Ok(())
 }
 
@@ -822,6 +849,16 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
     // an error. Host liveness and correctness stay as gates.
     check_host_alive(&mut host)?;
     check_correctness(&result.outcomes)?;
+    if result.successful == 0 {
+        // Every measured completion can land in the post-window drain
+        // (depth 1 with latency longer than the remaining window), which
+        // is a valid drain but not a measured operating point.
+        return Err(format!(
+            "throughput window produced no measured successful completion \
+             (outcomes: {:?}); the point is invalid for this host",
+            result.outcomes
+        ));
+    }
     let results = serde_json::json!({
         "depth": cfg.depth,
         "offered": result.offered,
@@ -945,19 +982,31 @@ fn run_aggregate() -> i32 {
 /// Builds the byte-stable run summary from complete attempts only.
 fn aggregate(run_dir: &Path) -> Result<String, String> {
     // Attempts holding only a running manifest are crash residue that
-    // finalize-interrupted has not converted; aggregating past them
-    // would publish a complete-looking summary that silently omits
-    // repetitions.
+    // finalize-interrupted has not converted, and a directory with no
+    // manifest at all is a failed Attempt::begin; aggregating past
+    // either would publish a complete-looking summary that silently
+    // omits repetitions.
     let mut unfinalized = 0usize;
     let entries =
         std::fs::read_dir(run_dir).map_err(|err| format!("{}: {err}", run_dir.display()))?;
     for entry in entries {
         let path = entry.map_err(|err| err.to_string())?.path();
-        if path.is_dir()
-            && path.join(evidence::RUNNING_MANIFEST).is_file()
-            && !path.join(evidence::FINAL_MANIFEST).is_file()
-        {
+        if !path.is_dir() {
+            continue;
+        }
+        let has_final = path.join(evidence::FINAL_MANIFEST).is_file();
+        let has_running = path.join(evidence::RUNNING_MANIFEST).is_file();
+        if has_final {
+            continue;
+        }
+        if has_running {
             unfinalized += 1;
+        } else {
+            return Err(format!(
+                "{}: attempt directory holds no manifest at all; remove it or restore \
+                 its manifest before aggregating",
+                path.display()
+            ));
         }
     }
     if unfinalized > 0 {
@@ -1091,6 +1140,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         // no histogram at all.
         let record_file = match arm.name.as_str() {
             ARM_TCP_SERIAL => Some("serial.json"),
+            ARM_TCP_OPEN => Some("open.json"),
             ARM_TCP_THROUGHPUT => Some("throughput.json"),
             _ => None,
         };
