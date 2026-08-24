@@ -4722,7 +4722,19 @@ impl McHandler {
                 });
                 let factory = Arc::clone(&self.producer_factory);
                 let project_root = PathBuf::from(&project_path);
-                let harness = binding.harness.clone();
+                // The harness the run was STARTED under, not the resuming
+                // route's: Broca scopes run identity by (project_root,
+                // harness, session), so after a cross-harness handoff the
+                // current binding would resolve to `missing` and
+                // abandon-then-refire a run the original harness may still
+                // be executing. States written before this was persisted
+                // fall back to the resuming binding.
+                let harness = loaded
+                    .meta
+                    .historian
+                    .producer_harness
+                    .clone()
+                    .unwrap_or_else(|| binding.harness.clone());
                 let live: Vec<_> = projection
                     .blocks
                     .iter()
@@ -5378,8 +5390,13 @@ impl McHandler {
         let configured_failure_backoff_at_ms = firing.failure_backoff_at_ms;
         match factory.connect(&project_root, &harness).await {
             Ok(mut producer) => {
-                let mut request =
-                    firing.as_fire_request(&store, &session_id, &project_path, &project_slug);
+                let mut request = firing.as_fire_request(
+                    &store,
+                    &session_id,
+                    &project_path,
+                    &project_slug,
+                    &harness,
+                );
                 request.publication_fence = publication_fence.as_deref();
                 run_historian_firing(&mut *producer, request).await
             }
@@ -9785,20 +9802,6 @@ impl McHandler {
             }
         };
 
-        // A ledger read failure must not look like "no record": replaying a
-        // command whose durable response exists would start a second
-        // billable run, so the read fails closed and the caller retries.
-        match store.load_dream_task_command(&ledger_session, command_id) {
-            Ok(Some(recorded)) => return replay_dream_task_response(&recorded.response_json),
-            Ok(None) => {}
-            Err(error) => {
-                return HandlerOutcome::Error {
-                    code: "dreamer_ledger_failed".to_string(),
-                    message: error.to_string(),
-                }
-            }
-        }
-
         // Exactly one execution per (ledger_session, command_id): a
         // concurrent duplicate with different prompt bytes or a different
         // first model would derive its own child session, bypass Broca's
@@ -9806,6 +9809,12 @@ impl McHandler {
         // the ledger's INSERT OR IGNORE with a different outcome. The
         // loser returns without any ledger write; its retry replays the
         // winner's recorded response.
+        //
+        // Taken BEFORE the ledger read so it also closes the read-to-
+        // registration window: reading first would let a duplicate observe
+        // no row, lose the CPU while the winner ran to completion and
+        // released the guard, then acquire it and start a second billable
+        // chain against a command that already has a durable response.
         let command_key = (ledger_session.clone(), command_id.to_string());
         {
             let mut inflight = self
@@ -9825,6 +9834,20 @@ impl McHandler {
             registry: Arc::clone(&self.inflight_dream_commands),
             key: command_key,
         };
+
+        // A ledger read failure must not look like "no record": replaying a
+        // command whose durable response exists would start a second
+        // billable run, so the read fails closed and the caller retries.
+        match store.load_dream_task_command(&ledger_session, command_id) {
+            Ok(Some(recorded)) => return replay_dream_task_response(&recorded.response_json),
+            Ok(None) => {}
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "dreamer_ledger_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        }
 
         let mut attempts = 0usize;
         let mut last_error = String::new();
@@ -24099,6 +24122,7 @@ mod tests {
                 selected_range_identities: selected_range_identities.clone(),
                 producer_session_id: Some("producer".to_string()),
                 producer_run_id: Some("run".to_string()),
+                producer_harness: None,
                 fired_at_ms: Some(1),
                 expected_revert_epoch: 0,
                 compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
@@ -31289,6 +31313,7 @@ mod tests {
             selected_range_identities,
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-reattach".to_string()),
+            producer_harness: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
@@ -31321,6 +31346,7 @@ mod tests {
             selected_range_identities,
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-stale".to_string()),
+            producer_harness: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: mc_store::CompartmentSetGeneration::default(),
@@ -33672,6 +33698,7 @@ mod tests {
                 selected_range_identities: selected_range_identities.clone(),
                 producer_session_id: Some("ctx-expand-producer".to_string()),
                 producer_run_id: Some("ctx-expand-run".to_string()),
+                producer_harness: None,
                 fired_at_ms: Some(1),
                 expected_revert_epoch: 0,
                 compartment_set_generation: mc_store::CompartmentSetGeneration::default(),

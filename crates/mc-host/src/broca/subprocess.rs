@@ -805,17 +805,20 @@ pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
     ErrorClass::Permanent
 }
 
-/// Whether `haystack` contains `code` as a standalone number rather than as
-/// digits inside a longer one. A plain substring match reads `401` out of an
-/// unrelated request id like `req-40123`, and misreading a provider failure
-/// as `AuthRequired` is expensive: the historian path treats it as fatal for
-/// every remaining model from that provider, and the Pi adapter spends a
-/// canonical-provider retry on it.
+/// Whether `haystack` contains `code` as a standalone token rather than as
+/// digits inside a longer identifier. A plain substring match reads `401`
+/// out of an unrelated request id like `req-40123` or `req-x401abc`, and
+/// misreading a provider failure as `AuthRequired` is expensive: the
+/// historian path treats it as fatal for every remaining model from that
+/// provider, and the Pi adapter spends a canonical-provider retry on it.
+/// Boundaries are non-alphanumeric on both sides, so `status 401`, `(401)`,
+/// and `401:` match while `x401abc` does not.
 fn contains_status_code(haystack: &str, code: &str) -> bool {
     haystack.match_indices(code).any(|(index, _)| {
         let before = haystack[..index].chars().next_back();
         let after = haystack[index + code.len()..].chars().next();
-        before.is_none_or(|c| !c.is_ascii_digit()) && after.is_none_or(|c| !c.is_ascii_digit())
+        before.is_none_or(|c| !c.is_ascii_alphanumeric())
+            && after.is_none_or(|c| !c.is_ascii_alphanumeric())
     })
 }
 
@@ -1160,10 +1163,19 @@ pub mod group_registry {
     /// real directory we own with no group/world access — the sweep kills
     /// processes named by these files, so a directory another uid can
     /// write into would be a kill-by-proxy primitive.
+    ///
+    /// Rooted at a literal `/tmp`, NOT `std::env::temp_dir()`: crash
+    /// ownership is only transferable if every incarnation derives the same
+    /// path, and `temp_dir()` follows `TMPDIR`, so a replacement launched
+    /// with a different environment would sweep an empty registry and let
+    /// recovery refire while the predecessor's descendants still run. A
+    /// per-service private `/tmp` namespace (systemd `PrivateTmp`) is
+    /// still shared by predecessor and successor of that same service,
+    /// which is exactly the scope this needs.
     fn registry_dir() -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
         let uid = rustix::process::getuid().as_raw();
-        let dir = std::env::temp_dir().join(format!("mc-broca-groups-{uid}"));
+        let dir = PathBuf::from(format!("/tmp/mc-broca-groups-{uid}"));
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
         match builder.create(&dir) {

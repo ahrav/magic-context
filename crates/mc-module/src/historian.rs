@@ -277,6 +277,7 @@ pub fn fire(
         selected_range_identities,
         producer_session_id: None,
         producer_run_id: None,
+        producer_harness: None,
         fired_at_ms: Some(fired_at_ms),
         expected_revert_epoch,
         compartment_set_generation,
@@ -292,12 +293,16 @@ pub fn producer_started(
     current: &HistorianDurableState,
     producer_session_id: String,
     producer_run_id: String,
+    producer_harness: String,
 ) -> Result<HistorianDurableState, HistorianStateError> {
     require_phase(current, HistorianPhase::Firing, "producer_started")?;
     let mut next = current.clone();
     next.state = HistorianPhase::AwaitingProducer;
     next.producer_session_id = Some(producer_session_id);
     next.producer_run_id = Some(producer_run_id);
+    // Recovery must reattach under the harness that started the run: Broca
+    // scopes run identity by (project_root, harness, session).
+    next.producer_harness = Some(producer_harness);
     // A producer run is established: any failure detail or retry cooldown from a
     // prior firing is resolved.
     next.failure_backoff_at_ms = None;
@@ -618,6 +623,11 @@ pub enum RestartAction {
     ReattachProducer {
         producer_session_id: String,
         producer_run_id: String,
+        /// The harness the run was started under, when the durable state
+        /// recorded it. Reattach must use this rather than the resuming
+        /// route's binding: Broca scopes run identity by (project_root,
+        /// harness, session).
+        producer_harness: Option<String>,
         firing_seq: u64,
         chunk_fingerprint: String,
     },
@@ -653,6 +663,7 @@ pub fn handle_restart_load(
             Ok(RestartAction::ReattachProducer {
                 producer_session_id,
                 producer_run_id,
+                producer_harness: state.producer_harness.clone(),
                 firing_seq: state.firing_seq,
                 chunk_fingerprint: state.chunk_fingerprint,
             })
@@ -893,6 +904,9 @@ pub struct HistorianFireRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
     pub project_slug: &'a str,
+    /// The harness this firing connects under, recorded with the awaiting
+    /// state so recovery reattaches to the run's own Broca identity.
+    pub harness: &'a str,
     /// The role-scoped historian SYSTEM prompt (HISTORIAN_SYSTEM_PROMPT). Sent via the
     /// producer's `system` field, never concatenated into `prompt`. Empty means absent.
     pub system: &'a str,
@@ -1296,8 +1310,12 @@ where
             }
         };
 
-        let awaiting =
-            producer_started(&fired, producer_session_id.clone(), handle.run_id.clone())?;
+        let awaiting = producer_started(
+            &fired,
+            producer_session_id.clone(),
+            handle.run_id.clone(),
+            request.harness.to_owned(),
+        )?;
         persist_historian_state(request.store, request.session_id, awaiting.clone())?;
 
         let output = match producer.await_output(&handle.run_id).await {
@@ -2251,6 +2269,7 @@ mod tests {
             .compartment_set_generation;
         HistorianFireRequest {
             store,
+            harness: "pi",
             session_id: "ses",
             project_path: "git:proj",
             project_slug: "proj",
@@ -2313,6 +2332,7 @@ mod tests {
             selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("producer-session".into()),
             producer_run_id: Some("run-3".into()),
+            producer_harness: None,
             fired_at_ms: Some(10),
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration::default(),
@@ -2882,7 +2902,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -2937,7 +2963,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -3012,8 +3044,13 @@ mod tests {
                 FireOutcome::Fired(state) => state,
                 FireOutcome::Busy(_) => unreachable!(),
             };
-            let awaiting =
-                producer_started(&fired, producer_session.to_string(), run_id.to_string()).unwrap();
+            let awaiting = producer_started(
+                &fired,
+                producer_session.to_string(),
+                run_id.to_string(),
+                "pi".into(),
+            )
+            .unwrap();
             store
                 .commit(
                     lineage,
@@ -3122,7 +3159,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -3169,7 +3212,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -3589,7 +3638,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -3927,6 +3982,7 @@ mod tests {
             selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("ps".into()),
             producer_run_id: Some("run-1".into()),
+            producer_harness: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration {
@@ -4130,7 +4186,7 @@ mod tests {
             FireOutcome::Busy(_)
         ));
 
-        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        let awaiting = producer_started(&fired, "ps".into(), "run".into(), "pi".into()).unwrap();
         let validating = output_received(&awaiting, "text").unwrap();
         let publishing = validation_ok(&validating).unwrap();
         let idle_again = tx_committed(&publishing).unwrap();
@@ -4161,7 +4217,7 @@ mod tests {
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.failure_backoff_at_ms, Some(999));
-        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        let awaiting = producer_started(&fired, "ps".into(), "run".into(), "pi".into()).unwrap();
         assert_eq!(awaiting.failure_backoff_at_ms, None);
         assert_eq!(awaiting.last_failure, None);
     }
@@ -4250,7 +4306,7 @@ mod tests {
             FireOutcome::Busy(_) => panic!("idle state must fire"),
         };
         assert_eq!(fired.expected_revert_epoch, 42);
-        let awaiting = producer_started(&fired, "ps".into(), "run".into()).unwrap();
+        let awaiting = producer_started(&fired, "ps".into(), "run".into(), "pi".into()).unwrap();
         assert_eq!(awaiting.expected_revert_epoch, 42);
     }
 
@@ -4410,7 +4466,13 @@ mod tests {
             FireOutcome::Fired(state) => state,
             FireOutcome::Busy(_) => unreachable!(),
         };
-        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        let awaiting = producer_started(
+            &fired,
+            "producer-session".into(),
+            "run-1".into(),
+            "pi".into(),
+        )
+        .unwrap();
         store
             .commit(
                 "ses",
@@ -4467,6 +4529,7 @@ mod tests {
             },
             "producer-session".into(),
             "run-1".into(),
+            "pi".into(),
         )
         .unwrap();
         let meta = test_meta_with_historian(awaiting);
@@ -4480,6 +4543,10 @@ mod tests {
             RestartAction::ReattachProducer {
                 producer_session_id: "producer-session".into(),
                 producer_run_id: "run-1".into(),
+                // Recovery reattaches under the harness the run STARTED on,
+                // not whatever route resumes the session: Broca scopes run
+                // identity by (project_root, harness, session).
+                producer_harness: Some("pi".into()),
                 firing_seq: 1,
                 chunk_fingerprint: "fp".into(),
             }

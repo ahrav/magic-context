@@ -844,6 +844,22 @@ impl HistorianProducer {
         run_id: &str,
         timeout: Duration,
     ) -> Result<ProducerOutput, HistorianProducerError> {
+        // The whole operation is bounded, not just the drain: opening the
+        // subscription route and writing the request are themselves
+        // requests that can stall for their own request timeout, and the
+        // caller's budget is a deadline for the attempt — overshooting it
+        // here would eat the transport margin reserved for cleanup and let
+        // an outer cancel land during `session.delete`.
+        match tokio::time::timeout(timeout, self.subscribe_and_drain(run_id)).await {
+            Ok(result) => result,
+            Err(_) => Err(HistorianProducerError::TimedOut),
+        }
+    }
+
+    async fn subscribe_and_drain(
+        &mut self,
+        run_id: &str,
+    ) -> Result<ProducerOutput, HistorianProducerError> {
         let route = self.ensure_subscribe_route().await?;
         // Subscribe from "start" instead of a cursor. Replay after a cursor is
         // exclusive, so persisting an advancing cursor can drop units at or before
@@ -851,10 +867,7 @@ impl HistorianProducer {
         // and compare-and-swap checks during publish are idempotent.
         let body = json!({ "method": "session.subscribe", "params": { "from": "start" } });
         let corr = self.send_request(route, body).await?;
-        match tokio::time::timeout(timeout, self.drain_subscribe(route, corr, run_id)).await {
-            Ok(result) => result,
-            Err(_) => Err(HistorianProducerError::TimedOut),
-        }
+        self.drain_subscribe(route, corr, run_id).await
     }
 
     /// One transmission of the frozen `session.send` bytes, split from
