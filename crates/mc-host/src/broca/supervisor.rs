@@ -761,7 +761,26 @@ struct DoneGuard {
 
 impl Drop for DoneGuard {
     fn drop(&mut self) {
-        lock_run(&self.run).work_done = true;
+        // The second half of the request-byte release rule in `finish`: if
+        // the terminal is already committed, the task exiting is what stops
+        // the request bytes from being owned, so the excess releases here.
+        // For a started run the excess already rode the backend task and
+        // this split is empty. The charge drops outside the run lock.
+        let excess = {
+            let mut state = lock_run(&self.run);
+            state.work_done = true;
+            if state.terminal_appended {
+                let retained = self
+                    .run
+                    .key
+                    .meta_bytes()
+                    .saturating_add(TERMINAL_HEADROOM_BYTES);
+                Some(state.base_charge.split_excess(retained))
+            } else {
+                None
+            }
+        };
+        drop(excess);
         self.run.notify.notify_waiters();
     }
 }
@@ -923,13 +942,20 @@ fn finish(inner: &Arc<Inner>, run: &Arc<Run>, outcome: TerminalOutcome) {
             released.permits.push(permit);
         }
         // A started run's immutable request bytes ride the backend task and
-        // drop with it; for a run whose backend never started they are
-        // still in the base charge and release here. Either way only key
+        // drop with it. For a run whose backend never started they release
+        // only once BOTH the terminal is committed and the run task has
+        // stopped (`work_done`): a run cancelled while queued commits its
+        // terminal while the parked task still owns `backend_request`, and
+        // releasing then would admit replacement sends beside the old
+        // prompt. Whichever of terminal commit and task exit happens second
+        // performs the split — see `DoneGuard`. Either way only key
         // metadata and the (now spent) terminal headroom stay charged.
         let retained = run.key.meta_bytes().saturating_add(TERMINAL_HEADROOM_BYTES);
-        released
-            .charges
-            .push(state.base_charge.split_excess(retained));
+        if state.work_done {
+            released
+                .charges
+                .push(state.base_charge.split_excess(retained));
+        }
     }
     enforce_terminal_cap(inner, &mut index, &run.run_id, &mut released);
     drop(index);

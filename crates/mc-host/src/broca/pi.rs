@@ -123,7 +123,10 @@ pub fn pi_model_ref(provider: &str, model: &str) -> String {
 /// once on a credential failure: a user authenticated through the direct
 /// `openai`/`google` API-key providers has no credentials under the
 /// subscription-extension aliases, and `subagent-runner.ts` resolves the
-/// same ambiguity with the same alias-then-canonical order.
+/// same ambiguity with the same alias-then-canonical order. Both attempts
+/// share one wall-clock budget — the retry gets only the remainder — and a
+/// first attempt whose private-directory cleanup failed forfeits the retry,
+/// so a masking success can never hide material left on disk.
 async fn run_pi_with_provider_fallback(
     descriptor: PiRuntimeDescriptor,
     thinking_level: Option<String>,
@@ -135,6 +138,7 @@ async fn run_pi_with_provider_fallback(
 ) -> BackendTerminal {
     let aliased = pi_model_ref(&request.provider, &request.model);
     let canonical = format!("{}/{}", request.provider, request.model);
+    let started = tokio::time::Instant::now();
     let first = run_pi(
         descriptor.clone(),
         thinking_level.clone(),
@@ -146,17 +150,30 @@ async fn run_pi_with_provider_fallback(
         aliased.clone(),
     )
     .await;
+    // "cleanup failed" is the spelling `merge_cleanup` pins (and its
+    // contract test asserts): an attempt that left private prompt material
+    // on disk must surface that failure, not be replaced by a retry's
+    // unqualified success.
     let credential_failure = matches!(
         &first,
         BackendTerminal::Failed(error) if error.class == ErrorClass::AuthRequired
+            && !error.message.contains("cleanup failed")
     );
     if aliased == canonical || !credential_failure || cancel.is_cancelled() {
         return first;
     }
+    let Some(remaining) = limits.run_timeout.checked_sub(started.elapsed()) else {
+        return first;
+    };
+    if remaining.is_zero() {
+        return first;
+    }
+    let mut retry_limits = limits;
+    retry_limits.run_timeout = remaining;
     run_pi(
         descriptor,
         thinking_level,
-        limits,
+        retry_limits,
         env,
         request,
         events,
