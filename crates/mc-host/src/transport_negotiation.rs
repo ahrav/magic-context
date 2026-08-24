@@ -348,7 +348,7 @@ fn require_version(
     }
 }
 
-fn valid_transport_name(name: &str) -> bool {
+pub(crate) fn valid_transport_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_TRANSPORT_NAME_BYTES {
         return false;
@@ -388,6 +388,31 @@ fn require_transport_name<'a>(
 /// Opaque `parameters`/`descriptor` bounds: a JSON object at most
 /// [`MAX_OPAQUE_BYTES`] compact bytes and [`MAX_OPAQUE_DEPTH`] levels deep.
 /// Duplicate keys inside the value were already rejected by the strict parse.
+/// Counts serialized bytes and fails past `limit` without retaining them,
+/// so an oversized provider value is rejected during traversal instead of
+/// materializing a full compact document on the connection read loop.
+struct CappedCounter {
+    written: usize,
+    limit: usize,
+}
+
+impl std::io::Write for CappedCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written = self.written.saturating_add(buf.len());
+        if self.written > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "opaque value exceeds its byte bound",
+            ));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn check_opaque(value: &serde_json::Value, path: &str) -> Result<(), NegotiationError> {
     if !value.is_object() {
         return Err(NegotiationError::new(
@@ -395,8 +420,11 @@ fn check_opaque(value: &serde_json::Value, path: &str) -> Result<(), Negotiation
             path,
         ));
     }
-    let compact = serde_json::to_vec(value).expect("Value serialization cannot fail");
-    if compact.len() > MAX_OPAQUE_BYTES {
+    let mut counter = CappedCounter {
+        written: 0,
+        limit: MAX_OPAQUE_BYTES,
+    };
+    if serde_json::to_writer(&mut counter, value).is_err() {
         return Err(NegotiationError::new(
             NegotiationErrorCode::OpaqueTooLarge,
             path,

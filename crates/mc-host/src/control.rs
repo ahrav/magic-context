@@ -100,11 +100,13 @@ fn invalid(message: &str) -> ControlAction {
 /// and-close path (§7.7.1), so classification cannot depend on the body
 /// parsing under ANY reader — truncated JSON still names its operation.
 /// JSON permits escaped spellings of any string, so a raw miss is retried
-/// against a structure-blind unescape of the bytes. The scan over-matches
-/// (the tag may appear as a value rather than as `op`), which only retires
-/// a connection that already sent an invalid control body: fail closed.
+/// against a structure-blind unescape of the bytes. The needle omits the
+/// closing quote so a body truncated mid-token still classifies. The scan
+/// over-matches (the tag may appear as a value, or as the prefix of a
+/// longer operation name), which only retires a connection that already
+/// sent an invalid control body: fail closed.
 fn is_negotiation_family(body: &[u8]) -> bool {
-    const NEEDLE: &[u8] = b"\"transport.negotiate\"";
+    const NEEDLE: &[u8] = b"\"transport.negotiate";
     if body.windows(NEEDLE.len()).any(|window| window == NEEDLE) {
         return true;
     }
@@ -790,7 +792,9 @@ mod tests {
         let truncated = br#"{"op":"transport.negotiate","offers":"#;
         // Escaped spelling of the tag: legal JSON, still negotiation-family.
         let escaped = br#"{"op":"transport.\u006eegotiate","offers":"#;
-        for body in [&dup_nested[..], dup_root, truncated, escaped] {
+        // Truncated mid-tag, before the closing quote.
+        let mid_tag = br#"{"op":"transport.negotiate"#;
+        for body in [&dup_nested[..], dup_root, truncated, escaped, mid_tag] {
             let action = parse_control(body, false, &two_target_index());
             assert!(
                 matches!(action, ControlAction::TransportNegotiate(Err(_))),

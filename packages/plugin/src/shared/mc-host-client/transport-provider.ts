@@ -9,18 +9,19 @@
  */
 
 import { SubcCallError } from "./errors";
-import type {
-    ByteBudget,
-    FrameChannelCloseReason,
-    FrameChannelDiagnosticType,
-    FrameChannelHandlers,
-    FrameMeta,
-    FrameSendHooks,
-    FrameSendTicket,
-    InboundFrame,
-    SetupFrameChannel,
+import {
+    type ByteBudget,
+    type FrameChannelCloseReason,
+    type FrameChannelDiagnosticType,
+    type FrameChannelHandlers,
+    type FrameMeta,
+    type FrameSendHooks,
+    type FrameSendTicket,
+    headerViolation,
+    type InboundFrame,
+    type SetupFrameChannel,
 } from "./frame-channel";
-import type { FrameType } from "./protocol";
+import { type FrameType, validateHeader } from "./protocol";
 import {
     checkOpaqueSerialized,
     encodeNegotiateRequest,
@@ -257,8 +258,8 @@ export function sanitizedCandidateFactory(
                         throw new Error("malformed provider frame");
                     }
                     snapshot = {
-                        // The safe-integer check bounds `ty`; dispatch owns
-                        // semantic validation of unknown frame types.
+                        // The safe-integer check bounds `ty`; the shared
+                        // wire validation below rejects illegal values.
                         header: {
                             len,
                             ver,
@@ -270,6 +271,22 @@ export function sanitizedCandidateFactory(
                         },
                         body,
                     };
+                    // A provider channel owes the generation the same
+                    // structural guarantees TcpFrameChannel provides:
+                    // dispatch assumes header legality, the declared length
+                    // matching the body, and the body cap. Without these a
+                    // wire-invalid frame (a channel-0 Goodbye with a
+                    // nonzero correlation, say) would reach dispatch as a
+                    // legitimate connection close.
+                    validateHeader(snapshot.header);
+                    const violation = headerViolation(snapshot.header);
+                    if (
+                        violation !== null ||
+                        snapshot.header.len !== body.length ||
+                        body.length > args.maxBodyLen
+                    ) {
+                        throw new Error("wire-invalid provider frame");
+                    }
                 } catch {
                     args.handlers.onClosed(
                         "protocol_violation",

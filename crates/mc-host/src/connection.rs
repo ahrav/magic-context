@@ -989,6 +989,20 @@ async fn grant_candidate<H: McHostHandler>(
     // or occupy a fresh blocking-pool worker per reconnect. On timeout the
     // job's eventual result is dropped, releasing the candidate.
     let deadline = Instant::now() + shared.timing.transport_setup_deadline;
+    // KTD4 order: bootstrap liveness is stopped AND joined before the
+    // selection is published — no bootstrap Ping can race the client onto
+    // two live channels. It stops HERE, before the preparation wait,
+    // because that wait blocks this generation's sole read loop: a
+    // `prepare` slower than `ping_interval + pong_deadline` would
+    // otherwise leave a timely Pong unread and let liveness invalidate a
+    // healthy generation. Every path past this point either publishes the
+    // selection or closes the generation, so no bootstrap needs probing
+    // again.
+    let liveness = gen.liveness.lock().expect("liveness lock").take();
+    if let Some(handle) = liveness {
+        handle.stop.cancel();
+        let _ = handle.task.await;
+    }
     let reply = shared.providers.prepare_on_worker(provider, ctx);
     // A provider failure — including a stalled gate — is not fallback
     // evidence (§7.7.3): the setup fails closed with no same-generation
@@ -1026,14 +1040,6 @@ async fn grant_candidate<H: McHostHandler>(
         // resources.
         Err(_) => return ControlFlow::Close(ReadExit::Peer),
     };
-    // KTD4 order: candidate and grant exist, so bootstrap liveness is
-    // stopped AND joined before the selection is published — no bootstrap
-    // Ping can race the client onto two live channels.
-    let liveness = gen.liveness.lock().expect("liveness lock").take();
-    if let Some(handle) = liveness {
-        handle.stop.cancel();
-        let _ = handle.task.await;
-    }
     let Candidate {
         sender,
         receiver,

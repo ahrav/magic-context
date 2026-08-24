@@ -293,6 +293,14 @@ interface RequestParams {
     body: Uint8Array;
     deadline: Deadline;
     options: RequestOptions;
+    /**
+     * Retain the raw wire Error terminal on the thrown failure. Only the
+     * negotiation family needs it (legacy-fallback classification reads the
+     * exact bytes); every other request leaves it off so a peer-controlled
+     * body — up to the frame limit — is not held alive by a caller's error
+     * outside the channel's released reader charge.
+     */
+    captureErrorTerminal?: boolean;
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -764,6 +772,7 @@ export class SubcClient {
                 body,
                 deadline: stage,
                 options: {},
+                captureErrorTerminal: true,
             });
         } catch (error) {
             if (
@@ -888,6 +897,7 @@ export class SubcClient {
                 body: encodeActivateRequest(grant.activationToken),
                 deadline: stage,
                 options: {},
+                captureErrorTerminal: true,
             });
             // Negotiation-family responses must be UTF-8 JSON with
             // `binary = 0`; a mismatched flag is malformed, never
@@ -902,6 +912,7 @@ export class SubcClient {
                 body: commitRequestJson(),
                 deadline: stage,
                 options: {},
+                captureErrorTerminal: true,
             });
             if (flagsBinary(commit.flags)) {
                 throw new NegotiationError("malformed_json", "flags");
@@ -1029,7 +1040,9 @@ export class SubcClient {
             const terminal = await pending.result;
             if (terminal.kind === "error") {
                 const failure = terminalFromErrorBody(terminal.body);
-                failure.errorTerminal = { body: terminal.body, flags: terminal.flags };
+                if (params.captureErrorTerminal === true) {
+                    failure.errorTerminal = { body: terminal.body, flags: terminal.flags };
+                }
                 throw failure;
             }
             return terminal;

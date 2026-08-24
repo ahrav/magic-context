@@ -151,6 +151,15 @@ impl TransportProviders {
     /// here: negotiation lookups on a connection's read loop touch only the
     /// snapshot, so a slow or blocking metadata method cannot stall reads
     /// before the setup deadline exists.
+    ///
+    /// # Panics
+    ///
+    /// A static configuration error — a transport name outside the wire
+    /// grammar, the reserved `tcp` name, or a duplicate
+    /// `(transport, capability_version)` identity — panics with a bounded
+    /// message. Nothing provider-authored is echoed, so an invalid name
+    /// never reaches the registry (and therefore never its `Debug`, which
+    /// `HostConfig` derives through).
     pub fn with_injected(injected: Vec<Arc<dyn InjectedProvider>>) -> Self {
         // Metadata getters are provider code: the redaction hook must exist
         // before they run (registration happens before `run` installs it),
@@ -158,17 +167,35 @@ impl TransportProviders {
         // cannot print provider data through the hook. The panic still
         // fails registration loudly.
         crate::panic_boundary::install();
+        let entries: Vec<ProviderEntry> = injected
+            .into_iter()
+            .map(|provider| ProviderEntry {
+                transport: crate::panic_boundary::redact_sync(|| provider.transport().into()),
+                capability_version: crate::panic_boundary::redact_sync(|| {
+                    provider.capability_version()
+                }),
+                provider,
+            })
+            .collect();
+        for (index, entry) in entries.iter().enumerate() {
+            assert!(
+                crate::transport_negotiation::valid_transport_name(&entry.transport),
+                "injected provider {index} has a transport name outside the wire grammar"
+            );
+            assert!(
+                &*entry.transport != crate::transport_negotiation::TRANSPORT_TCP,
+                "injected provider {index} uses the reserved tcp transport name"
+            );
+            assert!(
+                !entries[..index].iter().any(|prior| {
+                    prior.transport == entry.transport
+                        && prior.capability_version == entry.capability_version
+                }),
+                "injected provider {index} duplicates an earlier (transport, capability_version)"
+            );
+        }
         Self {
-            injected: injected
-                .into_iter()
-                .map(|provider| ProviderEntry {
-                    transport: crate::panic_boundary::redact_sync(|| provider.transport().into()),
-                    capability_version: crate::panic_boundary::redact_sync(|| {
-                        provider.capability_version()
-                    }),
-                    provider,
-                })
-                .collect(),
+            injected: entries,
             worker: Arc::new(PrepareWorker::default()),
         }
     }
