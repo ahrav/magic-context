@@ -615,9 +615,16 @@ export class ConnectionGeneration {
                 );
             });
             if (this.retiredInfo) {
-                throw new SocketClosedError(
-                    `connection retired during setup: ${this.retiredInfo.reason}`,
-                );
+                // A channel that ignored close() can still resolve start()
+                // inside the grace window; a success after retirement must
+                // surface the stored retirement cause, not a fresh generic
+                // close error.
+                const cause = this.retiredInfo.error;
+                throw cause instanceof Error
+                    ? cause
+                    : new SocketClosedError(
+                          `connection retired during setup: ${this.retiredInfo.reason}`,
+                      );
             }
             this.daemonVer = result.daemonVer;
             this.phase = "frames";

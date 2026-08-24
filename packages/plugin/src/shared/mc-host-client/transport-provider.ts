@@ -9,9 +9,15 @@
  */
 
 import { SubcCallError } from "./errors";
-import type { ByteBudget, FrameChannelHandlers, SetupFrameChannel } from "./frame-channel";
+import type {
+    ByteBudget,
+    FrameChannelHandlers,
+    FrameSendTicket,
+    SetupFrameChannel,
+} from "./frame-channel";
 import {
     checkOpaquePlain,
+    NegotiationError,
     type OpaqueObject,
     TRANSPORT_TCP,
     type TransportOffer,
@@ -58,27 +64,34 @@ export class ClientTransportRegistry {
         // an authenticated connection's setup path, where synchronous
         // provider code could hold the socket and shared flight
         // indefinitely and a throwing getter would escape unsanitized. Both
-        // the offer list and grant resolution read only this snapshot.
-        this.entries = providers.map((provider) => ({
-            transport: provider.transport,
-            capabilityVersion: provider.capabilityVersion,
-            provider,
-        }));
-        const offers: TransportOffer[] = this.entries.map((entry) => {
-            const parameters = entry.provider.parameters;
-            return parameters === undefined
-                ? {
-                      transport: entry.transport,
-                      capabilityVersion: entry.capabilityVersion,
-                  }
-                : {
-                      transport: entry.transport,
-                      capabilityVersion: entry.capabilityVersion,
-                      parameters: checkOpaquePlain(parameters, "parameters"),
-                  };
-        });
-        offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
-        this.offerSnapshot = offers;
+        // the offer list and grant resolution read only this snapshot, and
+        // a getter that throws during registration is replaced with a
+        // bounded error so provider-owned text never leaves `connect()`.
+        try {
+            this.entries = providers.map((provider) => ({
+                transport: provider.transport,
+                capabilityVersion: provider.capabilityVersion,
+                provider,
+            }));
+            const offers: TransportOffer[] = this.entries.map((entry) => {
+                const parameters = entry.provider.parameters;
+                return parameters === undefined
+                    ? {
+                          transport: entry.transport,
+                          capabilityVersion: entry.capabilityVersion,
+                      }
+                    : {
+                          transport: entry.transport,
+                          capabilityVersion: entry.capabilityVersion,
+                          parameters: checkOpaquePlain(parameters, "parameters"),
+                      };
+            });
+            offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
+            this.offerSnapshot = offers;
+        } catch (error) {
+            if (error instanceof NegotiationError) throw error;
+            throw new Error("transport provider registration failed");
+        }
     }
 
     /** Ordered offers: installed non-TCP providers first, then the required TCP entry. */
@@ -188,11 +201,26 @@ export function sanitizedCandidateFactory(
                 }
             },
             send: (frame, hooks) => {
+                let ticket: FrameSendTicket;
                 try {
-                    return channel.send(frame, hooks);
+                    ticket = channel.send(frame, hooks);
                 } catch (error) {
                     throw sanitizedChannelFailure(transport, "send", error);
                 }
+                return {
+                    ...ticket,
+                    cancel: () => {
+                        try {
+                            return ticket.cancel();
+                        } catch {
+                            // A throwing provider ticket must not disrupt
+                            // pending-entry settlement; `false` is the
+                            // conservative "possibly sent" answer the
+                            // caller already handles.
+                            return false;
+                        }
+                    },
+                };
             },
             sendControl: (header) => {
                 try {

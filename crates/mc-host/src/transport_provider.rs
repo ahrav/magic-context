@@ -16,7 +16,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -101,11 +101,30 @@ struct ProviderEntry {
     provider: Arc<dyn InjectedProvider>,
 }
 
+/// One queued preparation for the registry's dedicated worker thread.
+type PrepareJob = (
+    Arc<dyn InjectedProvider>,
+    ProviderContext,
+    tokio::sync::oneshot::Sender<Result<PreparedCandidate, ProviderFailure>>,
+);
+
+/// The registry's single, lazily started preparation thread. `prepare` runs
+/// here — never on a Tokio worker or the blocking pool — so a provider gate
+/// that blocks forever occupies exactly this one OS thread: later attempts
+/// queue behind it and fail at their own setup deadlines instead of
+/// consuming another pool worker per reconnect, and runtime shutdown never
+/// waits on it.
+#[derive(Default)]
+struct PrepareWorker {
+    sender: Mutex<Option<std::sync::mpsc::Sender<PrepareJob>>>,
+}
+
 /// The host's provider registry. `Default` (production) is empty: TCP is the
 /// implicit bootstrap transport and the only production channel.
 #[derive(Clone, Default)]
 pub struct TransportProviders {
     injected: Vec<ProviderEntry>,
+    worker: Arc<PrepareWorker>,
 }
 
 impl TransportProviders {
@@ -124,7 +143,40 @@ impl TransportProviders {
                     provider,
                 })
                 .collect(),
+            worker: Arc::new(PrepareWorker::default()),
         }
+    }
+
+    /// Queues `provider.prepare(ctx)` on the registry's dedicated worker
+    /// thread and returns the reply channel. A dropped or timed-out receiver
+    /// leaves the job to complete (or hang) on that one thread; the caller's
+    /// own deadline governs how long it waits.
+    pub(crate) fn prepare_on_worker(
+        &self,
+        provider: Arc<dyn InjectedProvider>,
+        ctx: ProviderContext,
+    ) -> tokio::sync::oneshot::Receiver<Result<PreparedCandidate, ProviderFailure>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let mut sender = self.worker.sender.lock().expect("prepare worker lock");
+        if sender.is_none() {
+            let (job_tx, job_rx) = std::sync::mpsc::channel::<PrepareJob>();
+            let spawned = std::thread::Builder::new()
+                .name("mc-host-provider-prepare".to_owned())
+                .spawn(move || {
+                    while let Ok((provider, ctx, reply)) = job_rx.recv() {
+                        let _ = reply.send(provider.prepare(&ctx));
+                    }
+                });
+            if spawned.is_ok() {
+                *sender = Some(job_tx);
+            }
+            // On spawn failure the reply sender drops below and the caller
+            // observes a closed channel: the setup fails closed.
+        }
+        if let Some(job_tx) = sender.as_ref() {
+            let _ = job_tx.send((provider, ctx, reply_tx));
+        }
+        reply_rx
     }
 
     /// Provider identity is `(transport, capability_version)`: the same

@@ -980,20 +980,21 @@ async fn grant_candidate<H: McHostHandler>(
         shared.timing.frame_deadline,
     );
     // The setup deadline exists before any provider code runs, and the
-    // KTD9 attachment gate inside `prepare` executes on the blocking pool:
-    // a provider that stalls cannot pin the read loop or hold the
-    // connection permit past the configured setup budget. On timeout the
-    // detached task's eventual result is dropped, releasing the candidate.
+    // KTD9 attachment gate inside `prepare` executes on the registry's one
+    // dedicated worker thread: a provider that stalls cannot pin the read
+    // loop, hold the connection permit past the configured setup budget,
+    // or occupy a fresh blocking-pool worker per reconnect. On timeout the
+    // job's eventual result is dropped, releasing the candidate.
     let deadline = Instant::now() + shared.timing.transport_setup_deadline;
-    let prepare_task = tokio::task::spawn_blocking(move || provider.prepare(&ctx));
-    // A provider failure — including a stalled or panicked gate — is not
-    // fallback evidence (§7.7.3): the setup fails closed with no
-    // same-generation TCP continuation.
+    let reply = shared.providers.prepare_on_worker(provider, ctx);
+    // A provider failure — including a stalled gate — is not fallback
+    // evidence (§7.7.3): the setup fails closed with no same-generation
+    // TCP continuation.
     let PreparedCandidate {
         descriptor,
         candidate_id,
         candidate,
-    } = match timeout_at(deadline, prepare_task).await {
+    } = match timeout_at(deadline, reply).await {
         Ok(Ok(Ok(prepared))) => prepared,
         _ => return ControlFlow::Close(ReadExit::Peer),
     };
