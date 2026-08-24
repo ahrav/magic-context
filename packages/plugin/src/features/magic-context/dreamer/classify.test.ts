@@ -106,6 +106,33 @@ describe("runClassify disposition", () => {
         }
     });
 
+    test("the TypeScript path classifies memories the module prompt cap would exclude", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:classify-large-content";
+            addMemoriesForDisposition(db, projectIdentity, 9);
+            // Larger than the module route's per-chunk prompt byte budget:
+            // that cap mirrors a Rust-side rejection that does not exist on
+            // the TypeScript provider path, so this memory must still be
+            // chunked and classified here.
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `huge ${"x".repeat(250 * 1024)}`,
+                sourceSessionId: "ses",
+            });
+            const args = classifyArgs(db, projectIdentity);
+            args.client = successfulClassifyClient() as never;
+
+            const result = await runClassify(args);
+            expect(result.classified).toBe(10);
+            expect(result.remaining).toBe(0);
+            expect(result.complete).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("reports a swallowed chunk failure as incomplete", async () => {
         const db = freshDb();
         try {

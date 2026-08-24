@@ -324,11 +324,22 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     }
 
     // Anchors ride every chunk's prompt, so they are bounded once by bytes.
-    anchors = boundAnchorsByBytes(anchors);
+    // Both byte budgets exist only for the module route: the 256 KiB
+    // prompt_body cap they mirror is enforced by the Rust module, while the
+    // TypeScript child path accepts arbitrary content — capping it here
+    // would silently exclude memories a provider can classify.
+    const moduleRoute = isModuleRoute(args);
+    anchors = boundAnchorsByBytes(
+        anchors,
+        moduleRoute ? ANCHOR_PROMPT_BYTE_BUDGET : Number.POSITIVE_INFINITY,
+    );
     // Chunk by entry count AND rendered prompt bytes: the module rejects a
     // prompt_body over its byte cap, and content-heavy memories can exceed
     // it well under the 100-entry count bound.
-    const { chunks, oversized } = chunkByCountAndBytes(toClassify);
+    const { chunks, oversized } = chunkByCountAndBytes(
+        toClassify,
+        moduleRoute ? CHUNK_PROMPT_BYTE_BUDGET : Number.POSITIVE_INFINITY,
+    );
     if (oversized > 0) {
         // A memory whose content alone exceeds the pool budget can never
         // classify at this cap; counting it as remaining would keep the
@@ -396,8 +407,12 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
 
 /** Splits the pool into chunks bounded by both entry count and rendered
  *  prompt bytes. A memory whose content alone exceeds the pool byte budget
- *  is excluded (`oversized`) — it cannot fit any chunk. */
-function chunkByCountAndBytes(toClassify: ClassifyCandidate[]): {
+ *  is excluded (`oversized`) — it cannot fit any chunk. An infinite budget
+ *  degrades to count-only chunking (the TypeScript child path). */
+function chunkByCountAndBytes(
+    toClassify: ClassifyCandidate[],
+    byteBudget: number,
+): {
     chunks: ClassifyCandidate[][];
     oversized: number;
 } {
@@ -407,14 +422,11 @@ function chunkByCountAndBytes(toClassify: ClassifyCandidate[]): {
     let oversized = 0;
     for (const candidate of toClassify) {
         const cost = promptEntryBytes(candidate.contextMemory.content);
-        if (cost > CHUNK_PROMPT_BYTE_BUDGET) {
+        if (cost > byteBudget) {
             oversized += 1;
             continue;
         }
-        if (
-            current.length >= CLASSIFY_CHUNK_SIZE ||
-            currentBytes + cost > CHUNK_PROMPT_BYTE_BUDGET
-        ) {
+        if (current.length >= CLASSIFY_CHUNK_SIZE || currentBytes + cost > byteBudget) {
             chunks.push(current);
             current = [];
             currentBytes = 0;
@@ -430,13 +442,17 @@ function chunkByCountAndBytes(toClassify: ClassifyCandidate[]): {
  *  individual anchors too large to fit so the remaining stratification is
  *  preserved. Anchors are calibration aids: dropping some degrades
  *  calibration, while keeping them all can push every chunk's prompt past
- *  the module's byte cap. */
-function boundAnchorsByBytes(anchors: ClassifyAnchorMemory[]): ClassifyAnchorMemory[] {
+ *  the module's byte cap. An infinite budget keeps them all (the
+ *  TypeScript child path). */
+function boundAnchorsByBytes(
+    anchors: ClassifyAnchorMemory[],
+    byteBudget: number,
+): ClassifyAnchorMemory[] {
     const out: ClassifyAnchorMemory[] = [];
     let bytes = 0;
     for (const anchor of anchors) {
         const cost = promptEntryBytes(anchor.content);
-        if (bytes + cost > ANCHOR_PROMPT_BYTE_BUDGET) continue;
+        if (bytes + cost > byteBudget) continue;
         out.push(anchor);
         bytes += cost;
     }

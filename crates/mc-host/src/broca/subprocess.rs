@@ -332,16 +332,30 @@ pub async fn run(
     let group_record =
         group.and_then(|g| group_registry::GroupRecord::record(g.as_raw_nonzero().get()));
     if group_record.is_none() {
-        let _ = kill_group(group, rustix::process::Signal::KILL);
+        let signalled = kill_group(group, rustix::process::Signal::KILL).is_ok();
         // Covers the (theoretical) missing-group-id case kill_group skips.
         let _ = child.start_kill();
-        // Bounded like `terminate_group`'s final reap: an unbounded wait on
-        // a leader wedged in uninterruptible kernel state would hold this
-        // task — and every waiter parked on its `work_done` — indefinitely.
-        // No prompt bytes have flowed (registration is a barrier before
-        // delivery), so no billable work can exist behind the SIGKILLed
-        // group; the run ends as this spawn failure either way.
-        let _ = tokio::time::timeout(limits.termination_grace, child.wait()).await;
+        // Same proof obligations as `terminate_group`, bounded the same
+        // way: an unbounded wait on a leader wedged in uninterruptible
+        // kernel state would hold this task — and every waiter parked on
+        // its `work_done` — indefinitely, and a member merely signalled is
+        // not a member proven gone. The member scan runs before the reap,
+        // while the unreaped leader still pins the pgid.
+        let members_gone = wait_other_members_gone(group, limits.termination_grace).await;
+        let reaped = tokio::time::timeout(limits.termination_grace, child.wait())
+            .await
+            .is_ok();
+        if !(signalled && members_gone && reaped) {
+            // No registry record exists to retain — its absence is why this
+            // branch runs — so the unproven teardown can only ride the
+            // terminal: `spawn_failure` maps this marker to
+            // `BackendTerminal::FailedUnresolved`, and cancel, delete, and
+            // shutdown latch `work_unresolved` from it. No prompt bytes
+            // have flowed (registration is a barrier before delivery), so
+            // the surviving processes hold no billable request, but they
+            // are unrecorded and the host must not vouch for their death.
+            return Err(io::Error::other(RegistrationTeardownUnproven));
+        }
         return Err(io::Error::other(
             "crash-ownership registration failed before prompt delivery",
         ));
@@ -490,7 +504,15 @@ pub async fn run(
             // an unrelated recycled process group.
             let exit = wait_exited_unreaped(group, limits.drain_grace).await;
             if exit != LeaderExit::Running {
-                group_gone = kill_group_fenced(group, exit, rustix::process::Signal::KILL).is_ok();
+                let signalled =
+                    kill_group_fenced(group, exit, rustix::process::Signal::KILL).is_ok();
+                // Same proof obligation as `terminate_group`: the fenced
+                // KILL only signals; a member in uninterruptible kernel
+                // state must be observed gone before this teardown counts
+                // as proven. Checked while the unreaped leader still pins
+                // the pgid.
+                group_gone =
+                    signalled && wait_other_members_gone(group, limits.termination_grace).await;
                 child
                     .wait()
                     .await
@@ -645,13 +667,37 @@ fn kill_group_fenced(
     kill_group(group, signal)
 }
 
+/// Polls until no process other than the group leader remains in the
+/// group, bounded by `budget`. Run while the leader is still an unreaped
+/// zombie: the zombie pins the pgid, so the scan can never read a recycled
+/// group. `true` only when the group provably emptied — scan failures and
+/// the deadline both answer `false`, because an unproven teardown must
+/// never count as a proven one.
+async fn wait_other_members_gone(group: Option<rustix::process::Pid>, budget: Duration) -> bool {
+    let Some(pid) = group else { return true };
+    let pgid = pid.as_raw_nonzero().get();
+    const POLL: Duration = Duration::from_millis(10);
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if matches!(group_registry::group_has_other_members(pgid), Ok(false)) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Graceful group termination: SIGTERM the whole group, escalate to SIGKILL
-/// after the bounded grace, sweep the group, and reap the leader within one
-/// more grace before returning (R10). The final group SIGKILL is sent while
-/// the leader is still an unreaped zombie — the zombie pins the pgid, so the
-/// sweep can never target a recycled process group. A leader that stays
-/// unreapable past the final grace is reported as an error so the run ends
-/// as an unconfirmed teardown instead of wedging its task.
+/// after the bounded grace, sweep the group, verify the group emptied, and
+/// reap the leader within one more grace before returning (R10). The final
+/// group SIGKILL is sent while the leader is still an unreaped zombie — the
+/// zombie pins the pgid, so the sweep can never target a recycled process
+/// group. A leader that stays unreapable past the final grace, or a group
+/// member that cannot be shown gone, is reported as an error so the run
+/// ends as an unconfirmed teardown instead of wedging its task or claiming
+/// a teardown the host never proved.
 async fn terminate_group(
     group: Option<rustix::process::Pid>,
     child: &mut tokio::process::Child,
@@ -670,6 +716,12 @@ async fn terminate_group(
         exit = wait_exited_unreaped(group, grace).await;
     }
     let signalled = kill_group_fenced(group, exit, rustix::process::Signal::KILL);
+    // Verified BEFORE the reap, while the unreaped zombie still pins the
+    // pgid: a SIGKILLed member survives only in uninterruptible kernel
+    // state, and it must be observed GONE — not merely signalled — before
+    // this teardown counts as proven, or the caller drops the crash record
+    // while an unrecorded descendant still runs.
+    let members_gone = wait_other_members_gone(group, grace).await;
     // Bounded reap: SIGKILL makes the leader waitable promptly unless it is
     // wedged in uninterruptible kernel state, and an unbounded wait there
     // would hold `work_done` hostage — cancel, delete, and shutdown all
@@ -679,12 +731,17 @@ async fn terminate_group(
     // caller retain the crash record so a successor sweeps the group, and
     // the abandoned zombie keeps the pgid pinned against reuse until the
     // runtime's orphan reaper collects it.
-    match tokio::time::timeout(grace, child.wait()).await {
-        Ok(_) => signalled,
-        Err(_) => Err(io::Error::other(
+    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        return Err(io::Error::other(
             "harness leader was not reapable within the termination grace",
-        )),
+        ));
     }
+    if !members_gone {
+        return Err(io::Error::other(
+            "harness group members could not be confirmed stopped within the termination grace",
+        ));
+    }
+    signalled
 }
 
 /// A sensitive-file cleanup failure, reduced to a bounded structural fact
@@ -845,12 +902,49 @@ pub fn merge_cleanup(
     }
 }
 
+/// Marker payload for a spawn error whose pre-prompt process group could
+/// not be proven torn down: crash-ownership registration failed (so no
+/// registry record exists for a successor to sweep) AND the SIGKILLed
+/// group could not be shown gone within the grace. [`spawn_failure`] maps
+/// it to [`BackendTerminal::FailedUnresolved`] so cancel, delete, and
+/// shutdown latch `work_unresolved` instead of vouching for a teardown the
+/// host never proved.
+#[derive(Debug)]
+struct RegistrationTeardownUnproven;
+
+impl std::fmt::Display for RegistrationTeardownUnproven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "crash-ownership registration failed and the process group \
+             could not be confirmed stopped"
+        )
+    }
+}
+
+impl std::error::Error for RegistrationTeardownUnproven {}
+
 /// Maps a spawn failure to the run terminal (missing executables are run
 /// failures, not host failures — plan assumption). The message is
 /// structural only. Process-table and memory pressure clear on their own,
 /// so those kinds stay retryable; configuration failures (missing
 /// executable, permissions) are permanent.
 pub(crate) fn spawn_failure(harness: HarnessName, err: &io::Error) -> BackendTerminal {
+    if err
+        .get_ref()
+        .is_some_and(|inner| inner.is::<RegistrationTeardownUnproven>())
+    {
+        return BackendTerminal::FailedUnresolved(BackendError {
+            class: ErrorClass::Transient,
+            message: format!(
+                "{} backend crash-ownership registration failed; the \
+                 process group could not be confirmed stopped",
+                harness.name()
+            ),
+            retry_after_secs: None,
+            provider_code: None,
+        });
+    }
     let class = match err.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory => ErrorClass::Transient,
         _ => ErrorClass::Permanent,
@@ -1351,6 +1445,19 @@ pub mod group_registry {
     /// would both skip the kill and delete the record proving the orphan
     /// exists.
     pub(crate) fn group_has_members(pgid: i32) -> io::Result<bool> {
+        scan_group_members(pgid, None)
+    }
+
+    /// Like [`group_has_members`], excluding the group leader itself
+    /// (whose pid equals the pgid): used while the leader is a
+    /// deliberately unreaped zombie, whose `/proc` entry still names the
+    /// pgid. The zombie pins the pgid against reuse but is not a
+    /// surviving member.
+    pub(crate) fn group_has_other_members(pgid: i32) -> io::Result<bool> {
+        scan_group_members(pgid, Some(pgid))
+    }
+
+    fn scan_group_members(pgid: i32, exclude_pid: Option<i32>) -> io::Result<bool> {
         for proc_entry in fs::read_dir("/proc")? {
             let Some(pid) = proc_entry?
                 .file_name()
@@ -1359,6 +1466,9 @@ pub mod group_registry {
             else {
                 continue;
             };
+            if Some(pid) == exclude_pid {
+                continue;
+            }
             // A process that exits mid-scan is simply not a member.
             match proc_stat_pgrp(pid) {
                 Ok(Some(pgrp)) if pgrp == pgid => return Ok(true),
