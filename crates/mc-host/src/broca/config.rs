@@ -77,19 +77,30 @@ pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 = (MAX_BACKEND_PROCESSES as u64)
 pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
     (MAX_TERMINAL_SESSIONS as u64) * ((4096 + 256) * 3 + 128);
 
-/// Worst case for the daemon-startup environment snapshot and the copies a
-/// spawn briefly needs.
+/// Ceiling on the daemon-startup environment this component will capture.
 ///
-/// The snapshot is captured once and shared behind an `Arc`, so exactly one
-/// copy is retained for the component's lifetime — but it holds whatever
-/// environment the daemon inherited, which on Linux is bounded only by the
-/// total exec argument limit (commonly 2 MiB). Each concurrent spawn adds
-/// two transient copies of that size, the adapter's assembled child
-/// environment and the `Command`'s own map, both freed as soon as the child
-/// exists. Declared alongside the retained budget for the same reason as
-/// [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+/// An inherited environment has no platform-fixed size: Linux bounds one exec
+/// payload at a quarter of `RLIMIT_STACK`, which a raised stack limit pushes
+/// well past the conventional 2 MiB. A declaration can therefore only be a
+/// true ceiling if the capture itself is bounded, so a larger environment
+/// fails startup with a named limit rather than silently pushing the
+/// component past what the host subtracted from ingress. Rejecting beats
+/// truncating: dropping variables would silently remove provider
+/// credentials.
+pub const MAX_ENV_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Worst case for the environment snapshot and every simultaneous
+/// representation of it during a spawn.
+///
+/// One copy is retained for the component's lifetime (captured once, shared
+/// behind an `Arc`). Each concurrent spawn holds three more at its peak: the
+/// adapter's assembled child environment, the `Command`'s own map, and the
+/// exec-ready C-string array `spawn` materializes in the parent — the
+/// `pre_exec` hook forces the fork path, so that last one is real. All three
+/// are freed as soon as the child exists. Declared alongside the retained
+/// budget for the same reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
 pub const ENV_SNAPSHOT_HEADROOM_BYTES: u64 =
-    (1 + 2 * MAX_BACKEND_PROCESSES as u64) * 2 * 1024 * 1024;
+    (1 + 3 * MAX_BACKEND_PROCESSES as u64) * MAX_ENV_SNAPSHOT_BYTES as u64;
 
 /// The complete retained-byte reservation the component declares to the
 /// host: the supervisor's enforced budget plus the retention classes that

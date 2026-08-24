@@ -2524,7 +2524,9 @@ fn crash_orphaned_run_dirs_swept_only_for_dead_owners() {
     // A dead owner's directory: pid 1's start time can never match a
     // process this test could own, so it stands in for a crashed host.
     let root = private_run_root().expect("run root");
-    let orphan = root.join("mc-broca-test-orphan-2-1-000000000000dead");
+    // A foreign boot tag: unconditionally stale, and it also proves the
+    // cross-boot pid/start-reuse case cannot preserve the directory.
+    let orphan = root.join("mc-broca-test-orphan-ffffffffffffffff-2-1-000000000000dead");
     fs::create_dir(&orphan).expect("create orphan dir");
     fs::write(orphan.join("prompt.txt"), b"SENSITIVE-PROMPT").expect("seed orphan");
 

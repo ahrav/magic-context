@@ -52,8 +52,24 @@ impl EnvSnapshot {
     /// Captures the current process environment once — call at daemon
     /// startup, not per run, so request handling can never observe
     /// request-derived environment mutations.
-    pub fn capture() -> Self {
-        Self::from_vars(std::env::vars_os())
+    ///
+    /// Fails when the environment exceeds [`MAX_ENV_SNAPSHOT_BYTES`], which
+    /// is what makes the component's declared retained reservation a real
+    /// ceiling; see that constant for why this rejects rather than truncates.
+    pub fn capture() -> io::Result<Self> {
+        let snapshot = Self::from_vars(std::env::vars_os());
+        let bytes: usize = snapshot
+            .vars
+            .iter()
+            .map(|(name, value)| name.as_os_str().len() + value.as_os_str().len() + 2)
+            .sum();
+        if bytes > super::config::MAX_ENV_SNAPSHOT_BYTES {
+            return Err(io::Error::other(format!(
+                "startup environment is {bytes} bytes, over the {} byte snapshot ceiling",
+                super::config::MAX_ENV_SNAPSHOT_BYTES
+            )));
+        }
+        Ok(snapshot)
     }
 
     /// Builds a snapshot from explicit variables (test seam). The identity
@@ -571,6 +587,7 @@ impl PrivateDir {
         // transcript can be proven stale and removed after a crash instead
         // of persisting until someone clears /tmp (R17/R19).
         let base = group_registry::private_run_root()?;
+        let owner_boot = group_registry::owner_boot_tag()?;
         let owner_pid = std::process::id();
         let owner_start = group_registry::owner_start_time()?;
         // Requesting 0700 at mkdir(2) closes the window where a permissive
@@ -583,7 +600,7 @@ impl PrivateDir {
             getrandom::getrandom(&mut nonce)
                 .map_err(|_| io::Error::other("temp-dir nonce generation failed"))?;
             let candidate = base.join(format!(
-                "{prefix}-{owner_pid}-{owner_start}-{:016x}",
+                "{prefix}-{owner_boot}-{owner_pid}-{owner_start}-{:016x}",
                 u64::from_le_bytes(nonce)
             ));
             // `create` fails on any existing entry, including a planted
@@ -1381,8 +1398,16 @@ pub mod group_registry {
             };
             if group_live {
                 if let Some(group) = rustix::process::Pid::from_raw(entry.leader_pid) {
-                    rustix::process::kill_process_group(group, rustix::process::Signal::KILL)?;
-                    killed += 1;
+                    match rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+                    {
+                        Ok(()) => killed += 1,
+                        // The group exited between the membership proof and
+                        // the signal: the expected race, and the outcome the
+                        // sweep wanted. Failing startup over it would strand
+                        // the replacement host on an already-resolved record.
+                        Err(rustix::io::Errno::SRCH) => {}
+                        Err(err) => return Err(err.into()),
+                    }
                 }
             }
             remove_swept_record(&path)?;
@@ -1399,6 +1424,16 @@ pub mod group_registry {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    /// A filename-safe short form of the current boot id, for tagging the
+    /// run directories this host owns.
+    pub(crate) fn owner_boot_tag() -> io::Result<String> {
+        Ok(boot_id()?
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(16)
+            .collect())
     }
 
     /// This host's start time, for tagging the run directories it owns.
@@ -1441,35 +1476,54 @@ pub mod group_registry {
     /// disk cost.
     pub fn sweep_orphaned_run_dirs() -> io::Result<usize> {
         let root = private_run_root()?;
+        let current_boot = owner_boot_tag()?;
         let mut removed = 0;
         for entry in fs::read_dir(&root)? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            // `<prefix>-<owner pid>-<owner start>-<nonce>`: the owner
-            // identity is the last two fields before the nonce.
-            let mut fields = name.rsplitn(4, '-');
-            let (Some(_nonce), Some(start), Some(pid)) =
-                (fields.next(), fields.next(), fields.next())
+            // `<prefix>-<owner boot>-<owner pid>-<owner start>-<nonce>`: the
+            // owner identity is the last four fields.
+            let mut fields = name.rsplitn(5, '-');
+            let (Some(_nonce), Some(start), Some(pid), Some(boot)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
             else {
                 continue;
             };
             let (Ok(pid), Ok(start)) = (pid.parse::<i32>(), start.parse::<u64>()) else {
                 continue;
             };
+            // A different boot is unconditionally stale: pid and start ticks
+            // are both measured per boot, so on a `/tmp` that survives a
+            // reboot the successor can land on the same pair and mistake the
+            // previous incarnation for itself — keeping a directory holding
+            // the old run's prompt and OpenCode database.
+            if boot != current_boot {
+                remove_run_dir(&path, &mut removed)?;
+                continue;
+            }
             // Zombie owners count as dead, exactly as in the group sweep: a
             // crashed host can linger unreaped with its pid and start time
             // intact, and it cannot be using these files.
             if proc_live_start_time(pid)? == Some(start) {
                 continue;
             }
-            match fs::remove_dir_all(&path) {
-                Ok(()) => removed += 1,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
+            remove_run_dir(&path, &mut removed)?;
         }
         Ok(removed)
+    }
+
+    /// Removes one stale run directory. A directory already gone (a
+    /// concurrent sweep, or its owner's own cleanup) is success.
+    fn remove_run_dir(path: &Path, removed: &mut usize) -> io::Result<()> {
+        match fs::remove_dir_all(path) {
+            Ok(()) => {
+                *removed += 1;
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
