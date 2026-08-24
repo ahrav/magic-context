@@ -66,7 +66,7 @@ import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { buildAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import { packAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -402,20 +402,20 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
-	const hintText = buildAutoSearchHint(results);
-	if (!hintText) {
+	const packed = packAutoSearchHint(results);
+	if (!packed.text) {
 		writeNoHintAndReconcile("empty");
 		return messages;
 	}
 
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode lines 268-270.
-	const payload = `\n\n${hintText}`;
-	// Record contributing memory ids (a superset of the packed fragments) so
-	// replay passes can re-check them against the live policy.
+	const payload = `\n\n${packed.text}`;
+	// Record exactly the memories whose fragments the packed hint carries so
+	// replay gating never suppresses on a candidate the token budget dropped.
 	const deliveredMemoryIds = [
 		...new Set(
-			results
+			packed.delivered
 				.filter((result) => result.source === "memory")
 				.map((result) => result.memoryId),
 		),
