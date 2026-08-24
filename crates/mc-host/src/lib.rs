@@ -1,6 +1,11 @@
 //! Host runtime for the wire contract in `docs/mc-host-wire-protocol.md`.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`: the Broca subprocess spawner carries the one
+// permitted `unsafe` block in this crate — a `pre_exec` hook that arms
+// `PR_SET_PDEATHSIG` so harness children cannot outlive a crashed host.
+// Every other module remains unsafe-free; new `unsafe` requires its own
+// scoped `allow` and a safety justification.
+#![deny(unsafe_code)]
 
 pub mod broca;
 pub mod composite;

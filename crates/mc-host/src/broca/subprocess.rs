@@ -16,6 +16,7 @@ use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,9 +38,14 @@ pub const HOST_LAUNCH_IDENTITY_VARS: [&str; 2] = [
 /// credentials and user configuration are trusted inputs, while the host's
 /// launch-identity variables are removed at capture so no later composition
 /// step can forget to strip them.
+///
+/// The variable list is behind an `Arc`, so the per-run clones taken by
+/// backend `execute` paths and the Pi provider fallback share one
+/// allocation: concurrent runs retain one environment-sized buffer total,
+/// not one per handle.
 #[derive(Clone)]
 pub struct EnvSnapshot {
-    vars: Vec<(OsString, OsString)>,
+    vars: Arc<[(OsString, OsString)]>,
 }
 
 impl EnvSnapshot {
@@ -61,7 +67,8 @@ impl EnvSnapshot {
                     .iter()
                     .any(|identity| OsStr::new(identity) == name.as_os_str())
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         Self { vars }
     }
 
@@ -188,6 +195,28 @@ pub async fn run(
         .process_group(0)
         // Backstop only: every ordinary path below reaps explicitly.
         .kill_on_drop(true);
+    // Crash-safe fate binding: the leader asks the kernel to SIGKILL it if
+    // the spawning host thread dies, covering host crashes and SIGKILLs
+    // that never run the drop backstop — otherwise an orphaned harness
+    // keeps executing a billable run that the replacement host reports as
+    // `missing`, and recovery could refire it. `pdeathsig` covers only the
+    // leader; descendants lose their pipes with it, and the group sweep
+    // covers every ordinary path. The re-parent check closes the window
+    // where the host dies between fork and prctl.
+    //
+    // SAFETY: the hook runs post-fork/pre-exec, where only async-signal-safe
+    // operations are permitted. Both calls are raw syscalls (prctl,
+    // getppid) with no allocation, locking, or libc state access.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
+            match rustix::process::getppid() {
+                Some(parent) if parent.as_raw_nonzero().get() != 1 => Ok(()),
+                _ => Err(io::Error::other("host exited before spawn completed")),
+            }
+        });
+    }
     for (name, value) in &spec.env {
         command.env(name, value);
     }
