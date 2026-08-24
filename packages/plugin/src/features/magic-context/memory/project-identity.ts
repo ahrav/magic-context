@@ -545,6 +545,20 @@ function gitRootDirectory(canonical: string): string | null {
     }
 }
 
+/**
+ * The directory that owns a session's project identity: the git repository
+ * root when the directory sits inside one, otherwise the canonical directory
+ * itself. Command surfaces that canonicalize project-relative artifact paths
+ * must resolve against THIS root, not the invoking cwd — a `/cd` into a
+ * subdirectory keeps the same identity (resolved through the ancestor
+ * repository), so a path elsewhere in the same repository is in-project, not
+ * an escape.
+ */
+export function resolveProjectRootDirectory(directory: string): string {
+    const canonical = path.resolve(directory);
+    return gitRootDirectory(canonical) ?? canonical;
+}
+
 export function resolveProjectIdentityForSession(
     directory: string,
     allowHomeProject = false,

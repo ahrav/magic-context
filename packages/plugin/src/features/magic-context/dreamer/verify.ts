@@ -26,6 +26,8 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
+import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
+import { getMemoriesByIds } from "../memory/storage-memory";
 import {
     computeClaimRequestDigest,
     hasMemoryClaimsCompatSchema,
@@ -243,6 +245,31 @@ async function verifyOneBatch(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<VerifyBatchResult> {
+    // The scope was partitioned once at run start; later batches can wait
+    // behind several provider calls, and a memory quarantined, rejected, or
+    // superseded in the meantime must not reach the child-model prompt.
+    // Re-apply the maintenance policy to this batch's rows immediately
+    // before prompting.
+    const stillInScope = new Set(
+        filterMemoriesForMaintenance(
+            args.db,
+            getMemoriesByIds(
+                args.db,
+                batch.map((memory) => memory.id),
+            ),
+            "verification",
+        ).map((memory) => memory.id),
+    );
+    const eligibleBatch = batch.filter((memory) => stillInScope.has(memory.id));
+    if (eligibleBatch.length < batch.length) {
+        log(
+            `[dreamer] verify batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since scope partition`,
+        );
+    }
+    if (eligibleBatch.length === 0) {
+        return { verified: 0, updated: 0, archived: 0 };
+    }
+    batch = eligibleBatch;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {
@@ -369,6 +396,26 @@ export async function applyVerifyManifest(
         "verify",
     );
     const now = Date.now();
+    // The model ran for a while; a memory can enter the uniform-absence class
+    // (or leave the maintenance pool) between the prompt and this apply. An
+    // in-flight verification must not verify, rewrite, or archive a row the
+    // policy has since hidden — drop its manifest entries instead.
+    const applicableIds = new Set(
+        filterMemoriesForMaintenance(
+            args.db,
+            getMemoriesByIds(args.db, [...batchIds]),
+            "verification",
+        ).map((memory) => memory.id),
+    );
+    const droppedIds = [...batchIds].filter((id) => !applicableIds.has(id));
+    if (droppedIds.length > 0) {
+        log(
+            `[dreamer] verify manifest dropped ${droppedIds.length} target(s) hidden during evaluation: ${droppedIds.join(", ")}`,
+        );
+    }
+    parsed.verified = parsed.verified.filter((entry) => applicableIds.has(entry.id));
+    parsed.updated = parsed.updated.filter((entry) => applicableIds.has(entry.id));
+    parsed.archived = parsed.archived.filter((entry) => applicableIds.has(entry.id));
 
     // Pre-normalize files OUTSIDE the transaction (git/realpath I/O). For each
     // affected id, the COMPLETE backing set the agent reports.

@@ -55,8 +55,6 @@ import {
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
-import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
-import { getMemoriesByIds } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type {
 	UnifiedSearchOptions,
 	UnifiedSearchResult,
@@ -414,27 +412,23 @@ export async function runAutoSearchHintForPi(args: {
 	// OpenCode lines 268-270.
 	const payload = `\n\n${packed.text}`;
 	// Record exactly the memories whose fragments the packed hint carries —
-	// each bound to its normalized content hash — so replay gating never
-	// suppresses on a candidate the token budget dropped and never replays a
-	// fragment whose memory was rewritten in place. An unloadable row records
-	// an empty hash and fails closed rather than going silently untracked.
-	const deliveredMemoryIds = [
-		...new Set(
-			packed.delivered
-				.filter((result) => result.source === "memory")
-				.map((result) => result.memoryId),
-		),
-	];
-	const hashById = new Map(
-		getMemoriesByIds(db, deliveredMemoryIds).map((memory) => [
-			memory.id,
-			sha256Utf8Hex(memory.content),
-		]),
-	);
-	const memoryFragments = deliveredMemoryIds.map((id) => ({
-		id,
-		hash: hashById.get(id) ?? "",
-	}));
+	// each bound to the exact SHA-256 digest of the LOADED bytes the search
+	// lane ranked (carried on the result itself, so a rewrite between the
+	// lane's recheck and this persist cannot pair the packed text with the
+	// new revision's identity). A result without a digest records an empty
+	// hash and fails closed rather than going silently untracked.
+	const seenFragmentIds = new Set<number>();
+	const memoryFragments: Array<{ id: number; hash: string }> = [];
+	for (const result of packed.delivered) {
+		if (result.source !== "memory" || seenFragmentIds.has(result.memoryId)) {
+			continue;
+		}
+		seenFragmentIds.add(result.memoryId);
+		memoryFragments.push({
+			id: result.memoryId,
+			hash: result.contentDigest ?? "",
+		});
+	}
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",

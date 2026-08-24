@@ -44,7 +44,10 @@ import {
 	type FailClosedReason,
 	formatFailClosedBlockingMessage,
 } from "@magic-context/core/features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	resolveProjectIdentityForSession,
+	resolveProjectRootDirectory,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -1310,8 +1313,12 @@ async function startPiMagicContextRuntime(
 	registerCtxFlushCommand(pi, { db, compactionOff });
 	info("registered /ctx-flush");
 
+	// Approval/enforcement resolve against the identity-owning ROOT, not the
+	// invoking cwd: a /cd into a subdirectory of the same repository keeps
+	// the ancestor-resolved identity, and artifact paths must canonicalize
+	// against that same root or in-repo paths read as escapes.
 	const resolveCommandProject = (ctx: { cwd: string }) => ({
-		projectDir: ctx.cwd,
+		projectDir: resolveProjectRootDirectory(ctx.cwd),
 		projectIdentity: resolveCurrentProjectDeps(ctx).projectIdentity,
 	});
 	registerCtxApproveCommand(pi, {

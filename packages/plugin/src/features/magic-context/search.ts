@@ -214,6 +214,11 @@ export interface MemorySearchResult {
     matchType: "semantic" | "fts" | "hybrid";
     sourceName?: string;
     policyLabel?: string;
+    /** Exact SHA-256 digest of the LOADED memory bytes this result was ranked
+     * from. Consumers that persist replay state (auto-search hints) bind to
+     * this digest so a rewrite committed after the lane's recheck cannot pair
+     * the old packed text with the new revision's identity. */
+    contentDigest?: string;
 }
 
 export interface MessageSearchResult {
@@ -948,15 +953,20 @@ async function searchMemories(args: {
             continue;
         }
         const loaded = loadedMemoriesById.get(result.memoryId);
-        if (
-            loaded === undefined ||
-            currentHashById.get(result.memoryId) !== sha256Utf8Hex(loaded.content)
-        ) {
+        if (loaded === undefined) continue;
+        const loadedDigest = sha256Utf8Hex(loaded.content);
+        if (currentHashById.get(result.memoryId) !== loadedDigest) {
             continue;
         }
         const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);
         if (!decision.eligible) continue;
-        rechecked.push(decision.label ? { ...result, policyLabel: decision.label } : result);
+        // The digest of the LOADED bytes rides the result so hint persistence
+        // binds to exactly what was ranked and packed, not a later reload.
+        rechecked.push({
+            ...result,
+            contentDigest: loadedDigest,
+            ...(decision.label ? { policyLabel: decision.label } : {}),
+        });
     }
     // The lane's terminal span: the unified fusion span depends on it so
     // critical-path analysis can follow the memory lane.

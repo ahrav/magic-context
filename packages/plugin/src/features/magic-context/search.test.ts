@@ -215,6 +215,7 @@ describe("unifiedSearch", () => {
         expect(Object.keys(memories[0]).sort()).toEqual([
             "category",
             "content",
+            "contentDigest",
             "matchType",
             "memoryId",
             "policyLabel",
