@@ -676,6 +676,63 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 }),
                                 args,
                             );
+                            // Post-call revalidation: the native request is
+                            // an await window and the native store carries no
+                            // policy fields — a quarantine or rejection
+                            // committed while it ran must not be published
+                            // (get) or confirmed (mutations). Re-run the same
+                            // decision the pre-call gate used; a target
+                            // hidden mid-flight gets the uniform not-found
+                            // refusal, and a native mutation that already
+                            // applied is reconciled by the deletion lane on
+                            // the epoch bump that hid the row. Get trust
+                            // labels are rebuilt from this fresh read so a
+                            // label change during the call is also honored.
+                            if (
+                                text !== null &&
+                                !text.startsWith("Error:") &&
+                                args.ids &&
+                                args.ids.length > 0 &&
+                                hasClaimEffectivePolicy(deps.db)
+                            ) {
+                                const contextIdByModuleId = translateModuleMemoryIds(
+                                    deps.db,
+                                    projectPath,
+                                    args.ids,
+                                );
+                                const policyRows = readMemoryPolicyRows(deps.db, [
+                                    ...contextIdByModuleId.values(),
+                                ]);
+                                const deniedNow = args.ids.find((id) => {
+                                    const contextId = contextIdByModuleId.get(id);
+                                    return (
+                                        contextId !== undefined &&
+                                        !decideMemoryPolicy(
+                                            policyRows.get(contextId),
+                                            "explicit_search",
+                                        ).eligible
+                                    );
+                                });
+                                if (deniedNow !== undefined) {
+                                    return args.action === "merge"
+                                        ? "Error: One or more source memories were not found."
+                                        : `Error: Memory with ID ${deniedNow} was not found.`;
+                                }
+                                if (args.action === "get") {
+                                    moduleGetTrustLabels.clear();
+                                    for (const id of args.ids) {
+                                        const contextId = contextIdByModuleId.get(id);
+                                        if (contextId === undefined) continue;
+                                        const decision = decideMemoryPolicy(
+                                            policyRows.get(contextId),
+                                            "explicit_search",
+                                        );
+                                        if (decision.label) {
+                                            moduleGetTrustLabels.set(id, decision.label);
+                                        }
+                                    }
+                                }
+                            }
                             if (
                                 text !== null &&
                                 !text.startsWith("Error:") &&

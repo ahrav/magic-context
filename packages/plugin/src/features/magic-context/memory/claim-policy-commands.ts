@@ -35,7 +35,7 @@ import {
     runMemoryClaimOperationInCurrentTransaction,
     withMemoryClaimGenerationContextInCurrentTransaction,
 } from "./storage-memory-claims";
-import { isWithin, safeRealpath } from "./verification-paths";
+import { isWithin, safeRealpath, sha256FileSync } from "./verification-paths";
 
 export interface ClaimCommandResult {
     text: string;
@@ -521,8 +521,26 @@ function canonicalizeArtifactPath(
     return { canonicalPath: relative(rootReal, real).split(sep).join("/"), absolutePath: real };
 }
 
-function sha256Bytes(path: string): string {
-    return createHash("sha256").update(readFileSync(path)).digest("hex");
+/** Re-resolve the artifact's LIVE path and require it to still identify an
+ * in-project regular file. `canonicalizeArtifactPath` resolved symlinks at
+ * parse time, but the artifact or a parent directory replaced by a symlink
+ * AFTER that resolution would make every later read follow the replacement
+ * — recording ENFORCED authority for bytes outside the owning root. */
+function requireArtifactStillBound(projectRoot: string, absolutePath: string): string {
+    const rootReal = safeRealpath(resolve(projectRoot)) ?? resolve(projectRoot);
+    const live = safeRealpath(absolutePath);
+    let regularFile = false;
+    try {
+        regularFile = live !== null && statSync(live).isFile();
+    } catch {
+        regularFile = false;
+    }
+    if (live === null || !isWithin(rootReal, live) || !regularFile) {
+        throw new Error(
+            "the artifact path no longer identifies an in-project regular file; rerun the command",
+        );
+    }
+    return live;
 }
 
 export async function executeClaimEnforceCommand(
@@ -736,7 +754,11 @@ export async function executeClaimEnforceCommand(
                 // test-runner naming rules resolve identically, and its
                 // digest — the bytes that provably ran — is the digest
                 // recorded.
-                const bytes = readFileSync(canonical.absolutePath);
+                const liveBeforeRun = requireArtifactStillBound(
+                    deps.projectRoot,
+                    canonical.absolutePath,
+                );
+                const bytes = readFileSync(liveBeforeRun);
                 bytesDigest = createHash("sha256").update(bytes).digest("hex");
                 const snapshotName = `mc-enforce-${randomUUID().slice(0, 8)}.${basename(canonical.absolutePath)}`;
                 const snapshotPath = join(dirname(canonical.absolutePath), snapshotName);
@@ -770,7 +792,7 @@ export async function executeClaimEnforceCommand(
                     // The recorded digest must describe the bytes the
                     // evaluator ran: a snapshot replaced during the run
                     // cannot be recorded.
-                    if (sha256Bytes(snapshotPath) !== bytesDigest) {
+                    if (sha256FileSync(snapshotPath) !== bytesDigest) {
                         throw new Error(
                             "the evaluation snapshot changed during the run; rerun the command",
                         );
@@ -788,7 +810,11 @@ export async function executeClaimEnforceCommand(
                 // A live artifact that drifted during the run cannot be
                 // recorded: the digest would describe bytes no longer on
                 // disk.
-                if (sha256Bytes(canonical.absolutePath) !== bytesDigest) {
+                if (
+                    sha256FileSync(
+                        requireArtifactStillBound(deps.projectRoot, canonical.absolutePath),
+                    ) !== bytesDigest
+                ) {
                     throw new Error("the artifact changed during evaluation; rerun the command");
                 }
             },
@@ -805,7 +831,11 @@ export async function executeClaimEnforceCommand(
                 if (!evaluated) throw new Error("artifact evaluation did not run");
                 // Transactional recheck: the artifact bytes recorded must
                 // still be the bytes the pre-transaction evaluation ran on.
-                if (sha256Bytes(canonical.absolutePath) !== bytesDigest) {
+                if (
+                    sha256FileSync(
+                        requireArtifactStillBound(deps.projectRoot, canonical.absolutePath),
+                    ) !== bytesDigest
+                ) {
                     throw new Error("the artifact changed since evaluation; rerun the command");
                 }
                 const artifactId = recordEnforcementArtifactInCurrentTransaction(deps.db, {
