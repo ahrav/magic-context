@@ -17,6 +17,7 @@ import type {
     FrameMeta,
     FrameSendHooks,
     FrameSendTicket,
+    InboundFrame,
     SetupFrameChannel,
 } from "./frame-channel";
 import {
@@ -229,7 +230,44 @@ export function sanitizedCandidateFactory(
         const flushWaiters = new Set<() => void>();
         const upstreamDiagnostic = args.handlers.onDiagnostic;
         const handlers: FrameChannelHandlers = {
-            onFrame: args.handlers.onFrame,
+            onFrame: (frame) => {
+                // Snapshot and structurally validate the provider frame: a
+                // throwing getter or malformed shape becomes one bounded
+                // channel close, never an exception unwinding through the
+                // provider's reader callback with provider-owned text —
+                // and never a stalled published generation.
+                let snapshot: InboundFrame;
+                try {
+                    const header = frame.header;
+                    const len = Number(header.len);
+                    const ver = Number(header.ver);
+                    const ty = Number(header.ty);
+                    const flags = Number(header.flags);
+                    const channelId = Number(header.channel);
+                    const epoch = Number(header.epoch);
+                    const corr = BigInt(header.corr);
+                    const body = frame.body;
+                    if (
+                        ![len, ver, ty, flags, channelId, epoch].every((field) =>
+                            Number.isSafeInteger(field),
+                        ) ||
+                        !(body instanceof Uint8Array)
+                    ) {
+                        throw new Error("malformed provider frame");
+                    }
+                    snapshot = {
+                        header: { len, ver, ty, flags, channel: channelId, epoch, corr },
+                        body,
+                    };
+                } catch {
+                    args.handlers.onClosed(
+                        "protocol_violation",
+                        sanitizedProviderError(transport, "channel"),
+                    );
+                    return;
+                }
+                args.handlers.onFrame(snapshot);
+            },
             onClosed: (reason, _error) => {
                 for (const settle of [...flushWaiters]) settle();
                 args.handlers.onClosed(
@@ -392,6 +430,11 @@ export function sanitizedCandidateFactory(
                     }
                 }),
             close: (error) => {
+                // Owner close never fires onClosed (FrameChannel contract),
+                // so wrapper-owned flush waiters settle here too: a
+                // retiring generation must not leave them pending until
+                // the shutdown deadline.
+                for (const settle of [...flushWaiters]) settle();
                 try {
                     channel.close(error);
                 } catch {
