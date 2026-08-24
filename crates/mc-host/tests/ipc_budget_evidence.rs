@@ -43,6 +43,7 @@ fn manifest(arm: &str, block: u32, pair: Option<(u32, u32)>) -> Manifest {
             commit: "test-commit".to_owned(),
             rustc: "test-rustc".to_owned(),
             profile: "debug".to_owned(),
+            binary: "test-binary".to_owned(),
         },
         host: HostId {
             hostname: "test-host".to_owned(),

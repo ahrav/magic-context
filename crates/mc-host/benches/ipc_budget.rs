@@ -378,6 +378,11 @@ fn build_id() -> BuildId {
             "release"
         }
         .to_owned(),
+        binary: std::env::current_exe()
+            .ok()
+            .and_then(|exe| std::fs::read(exe).ok())
+            .map(|bytes| perf_measurement::sha256_hex(&bytes)[..16].to_owned())
+            .unwrap_or_else(|| "unknown".to_owned()),
     }
 }
 
@@ -681,16 +686,7 @@ fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Str
     check_host_and_conservation(&mut host, &result.outcomes, result.scheduled)?;
     attempt.add_histogram("issue_to_terminal.hist", &result.histogram)?;
     let hist = &result.histogram;
-    let manifest = attempt.manifest_mut();
-    manifest.histogram = Some(cfg.histogram.clone());
-    manifest.collection = Some(serde_json::json!({
-        "warmup_ops": cfg.warmup_ops,
-        "measured_ops": cfg.measured_ops,
-    }));
-    manifest.outcomes = Some(result.outcomes.clone());
-    manifest.recorded_samples = Some(hist.len());
-    manifest.histogram_rejected = Some(result.outcomes.histogram_overflow);
-    manifest.results = Some(serde_json::json!({
+    let results = serde_json::json!({
         "p50_ns": hist.value_at_quantile(0.50),
         "p99_ns": hist.value_at_quantile(0.99),
         "p999_ns": if perf_measurement::tail_publishable(hist.len()) {
@@ -701,7 +697,28 @@ fn collect_tcp_serial(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Str
         "max_ns": hist.max(),
         "scheduled": result.scheduled,
         "elapsed_secs": result.elapsed.as_secs_f64(),
+    });
+    // The results and outcomes get a checksummed record; aggregation
+    // compares the manifest copies against it, so a manifest edit to any
+    // scalar (not just the p50 the gap pairing recomputes) fails loudly.
+    let record = serde_json::json!({
+        "results": results,
+        "outcomes": result.outcomes,
+    });
+    attempt.add_sidecar(
+        "serial.json",
+        &serde_json::to_vec_pretty(&record).map_err(|err| err.to_string())?,
+    )?;
+    let manifest = attempt.manifest_mut();
+    manifest.histogram = Some(cfg.histogram.clone());
+    manifest.collection = Some(serde_json::json!({
+        "warmup_ops": cfg.warmup_ops,
+        "measured_ops": cfg.measured_ops,
     }));
+    manifest.outcomes = Some(result.outcomes.clone());
+    manifest.recorded_samples = Some(hist.len());
+    manifest.histogram_rejected = Some(result.outcomes.histogram_overflow);
+    manifest.results = Some(results);
     Ok(())
 }
 
@@ -1067,17 +1084,23 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                 }
             }
         }
-        if arm.name == ARM_TCP_THROUGHPUT {
-            // The throughput counters live in their checksummed sidecar;
-            // the manifest's copies are otherwise unprotected on their
-            // way into summary.json, and this arm has no histogram to
-            // recompute them from.
+        // Record-backed arms: the manifest's results and outcomes are
+        // compared against their checksummed record sidecar, so a
+        // manifest edit to any scalar fails loudly. The serial arm's
+        // histogram covers only its percentiles; the throughput arm has
+        // no histogram at all.
+        let record_file = match arm.name.as_str() {
+            ARM_TCP_SERIAL => Some("serial.json"),
+            ARM_TCP_THROUGHPUT => Some("throughput.json"),
+            _ => None,
+        };
+        if let Some(file) = record_file {
             for a in &complete {
-                evidence::require_declared(a, "throughput.json")?;
-                let raw = std::fs::read(a.dir.join("throughput.json"))
-                    .map_err(|err| format!("{}: throughput.json: {err}", a.dir.display()))?;
+                evidence::require_declared(a, file)?;
+                let raw = std::fs::read(a.dir.join(file))
+                    .map_err(|err| format!("{}: {file}: {err}", a.dir.display()))?;
                 let record: serde_json::Value = serde_json::from_slice(&raw)
-                    .map_err(|err| format!("{}: throughput.json: {err}", a.dir.display()))?;
+                    .map_err(|err| format!("{}: {file}: {err}", a.dir.display()))?;
                 let manifest_results = a
                     .manifest
                     .results
@@ -1087,8 +1110,7 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                     || record["outcomes"] != serde_json::json!(a.manifest.outcomes)
                 {
                     return Err(format!(
-                        "{}: manifest results or outcomes disagree with the verified \
-                         throughput.json",
+                        "{}: manifest results or outcomes disagree with the verified {file}",
                         a.dir.display()
                     ));
                 }

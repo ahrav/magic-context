@@ -58,6 +58,13 @@ pub struct BuildId {
     pub commit: String,
     pub rustc: String,
     pub profile: String,
+    /// Hash prefix of the measured executable. Commit, rustc, and
+    /// profile alone cannot distinguish two builds of one commit under
+    /// different inherited codegen settings (RUSTFLAGS, target-cpu);
+    /// the binary bytes can. Absent in manifests written before the
+    /// field existed.
+    #[serde(default)]
+    pub binary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

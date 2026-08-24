@@ -322,7 +322,9 @@ starvation)
   sleep 2
   load_tolerant --label A5-victims --conns 2 --payload 256 --rate 400 --secs 20
   wait "$HOG_PID" || true
-  load_tolerant --label A5-recovery --conns 2 --payload 256 --rate 400 --secs 10
+  # The recovery probe exists to verify post-load recovery: a failure
+  # here fails the arm through the strict wrapper.
+  load --label A5-recovery --conns 2 --payload 256 --rate 400 --secs 10
   stop_host
   ;;
 strace)

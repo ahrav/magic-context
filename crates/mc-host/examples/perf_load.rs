@@ -145,6 +145,9 @@ struct ConnResult {
     outcomes: OutcomeCounts,
     error_codes: HashMap<String, u64>,
     closed_early: bool,
+    /// A wire-protocol regression observed by the reader (unsolicited
+    /// request terminal); the run fails with this reason.
+    protocol_violation: Option<String>,
     inflight_full: u64,
 }
 
@@ -321,6 +324,7 @@ async fn run_conn(
         outcomes: OutcomeCounts::default(),
         error_codes: HashMap::new(),
         closed_early: false,
+        protocol_violation: None,
         inflight_full: 0,
     };
     let mut read_half = read_half;
@@ -467,8 +471,24 @@ async fn run_conn(
         let frame = pending_frame.take().expect("frame body completed");
         let now_ns = Instant::now().duration_since(start).as_nanos() as u64;
         drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
-        let Some((sched, issue)) = pending.remove(&frame.corr) else {
+        // Connection-level frames (ping/pong, goodbye, hello, push,
+        // cancel) are legal without a correlation and are skipped;
+        // request terminals (response, error, stream) must resolve an
+        // outstanding request, and an unsolicited one is a wire-protocol
+        // regression that must fail the run rather than quietly vanish.
+        if !matches!(
+            frame.ty,
+            TY_RESPONSE | TY_ERROR | raw_client::TY_STREAM_DATA | raw_client::TY_STREAM_END
+        ) {
             continue;
+        }
+        let Some((sched, issue)) = pending.remove(&frame.corr) else {
+            result.protocol_violation = Some(format!(
+                "unsolicited terminal for correlation {}",
+                frame.corr
+            ));
+            result.closed_early = true;
+            break;
         };
         inflight.add_permits(1);
         resolved += 1;
@@ -661,6 +681,7 @@ async fn main() {
     let mut closed = 0usize;
     let mut inflight_full = 0u64;
     let mut completed = 0u64;
+    let mut protocol_violation: Option<String> = None;
     for task in tasks {
         let conn = task.await.expect("conn task");
         issue_latencies.extend(conn.issue_latencies_ns);
@@ -671,6 +692,9 @@ async fn main() {
         closed += usize::from(conn.closed_early);
         inflight_full += conn.inflight_full;
         completed += conn.resolved;
+        if protocol_violation.is_none() {
+            protocol_violation = conn.protocol_violation;
+        }
         for (code, count) in conn.error_codes {
             *error_codes.entry(code).or_default() += count;
         }
@@ -741,6 +765,10 @@ async fn main() {
 
     if !conserved {
         eprintln!("outcome-accounting loss: aborting with failure status");
+        std::process::exit(1);
+    }
+    if let Some(reason) = protocol_violation {
+        eprintln!("wire-protocol violation: {reason}: aborting with failure status");
         std::process::exit(1);
     }
     // Correctness is a gate for the retained results, exactly as in the
