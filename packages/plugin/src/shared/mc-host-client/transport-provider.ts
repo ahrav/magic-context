@@ -249,6 +249,10 @@ export function sanitizedCandidateFactory(
                 // provider's reader callback with provider-owned text —
                 // and never a stalled published generation.
                 let snapshot: InboundFrame;
+                // Bytes charged for the owned copy, released after delivery
+                // like every channel's transient buffering (a receiver that
+                // retains a body re-charges it itself).
+                let charged = 0;
                 try {
                     const header = frame.header;
                     const len = Number(header.len);
@@ -281,6 +285,14 @@ export function sanitizedCandidateFactory(
                     if (providerBody.length > args.maxBodyLen) {
                         throw new Error("oversize provider frame");
                     }
+                    // The copy draws on the ONE shared aggregate cap the
+                    // channel seam promises, so a provider delivery cannot
+                    // create unaccounted allocation above it.
+                    if (args.budget.wouldExceed(providerBody.length)) {
+                        throw new Error("provider frame exceeds the aggregate cap");
+                    }
+                    args.budget.charge(providerBody.length);
+                    charged = providerBody.length;
                     // Owned copy: a provider that reuses or mutates its read
                     // buffer after onFrame returns must not change bytes a
                     // later promise continuation or retained stream item
@@ -315,10 +327,15 @@ export function sanitizedCandidateFactory(
                         throw new Error("wire-invalid provider frame");
                     }
                 } catch {
+                    if (charged > 0) args.budget.release(charged);
                     closeUpstream("protocol_violation", "channel");
                     return;
                 }
-                args.handlers.onFrame(snapshot);
+                try {
+                    args.handlers.onFrame(snapshot);
+                } finally {
+                    args.budget.release(charged);
+                }
             },
             onClosed: (reason, _error) =>
                 closeUpstream(
