@@ -808,15 +808,29 @@ impl HistorianProducer {
     /// sessions contain memory-pool snapshots, so retention settings never apply.
     pub async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
         self.bind_session(session_id.to_string());
-        let delete = async {
-            let route = self.ensure_command_route().await?;
-            self.unary_json(route, json!({ "method": "session.delete", "params": {} }))
-                .await
-                .map(|_| ())
+        // The WHOLE operation is bounded, not just the response wait:
+        // `unary_json` starts its timer only after the request write
+        // returns, and the goodbye writes have no timer at all, so a
+        // backpressured connection could wedge cleanup indefinitely. The
+        // caller reserves a fixed margin for this after its payload
+        // deadline; overrunning it lets the caller's cancel land mid-purge
+        // and leave the already-started run executing to its own timeout.
+        let budget = self.config.request_timeout;
+        let purge = async {
+            let delete = async {
+                let route = self.ensure_command_route().await?;
+                self.unary_json(route, json!({ "method": "session.delete", "params": {} }))
+                    .await
+                    .map(|_| ())
+            }
+            .await;
+            let close = self.close().await;
+            with_cleanup(delete, close, "close")
+        };
+        match tokio::time::timeout(budget, purge).await {
+            Ok(result) => result,
+            Err(_) => Err(HistorianProducerError::TimedOut),
         }
-        .await;
-        let close = self.close().await;
-        with_cleanup(delete, close, "close")
     }
 
     pub async fn close(&mut self) -> Result<(), HistorianProducerError> {

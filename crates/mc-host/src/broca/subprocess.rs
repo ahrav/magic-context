@@ -169,6 +169,10 @@ pub enum SubprocessEnd {
     /// is of unknown completeness, so no prefix of it may be trusted even
     /// when the child then exits cleanly.
     CaptureFailed,
+    /// A group signal failed for a reason other than "already gone", so the
+    /// run cannot be reported as settled: descendants may still be
+    /// executing a billable request.
+    TeardownUnconfirmed,
 }
 
 /// Bounded captured output plus the structural end state.
@@ -428,15 +432,21 @@ pub async fn run(
             }
         }
     };
-    if !group_gone {
-        // A signal that failed for anything but "already gone" leaves
-        // descendants possibly running. Dropping the record here would
-        // delete the only evidence of them while cancel or delete reports
-        // success; retaining it keeps this run sweepable by the next host.
+    // A signal that failed for anything but "already gone" leaves
+    // descendants possibly running, so the run is NOT settled: the end state
+    // says so (no transcript is trusted past an abnormal end) and the record
+    // is retained rather than dropped, since dropping it would delete the
+    // only evidence of that work while cancel or delete reported success.
+    // The record outlives this host deliberately — we could not signal those
+    // descendants, so only a successor should.
+    let end = if group_gone {
+        end
+    } else {
         if let Some(record) = group_record.take() {
             record.retain();
         }
-    }
+        SubprocessEnd::TeardownUnconfirmed
+    };
     drop(group_record);
 
     // The whole process group is dead on every path above, so the writer
@@ -833,6 +843,15 @@ pub(crate) fn abnormal_end_terminal(
         SubprocessEnd::CaptureFailed => BackendError {
             class: ErrorClass::Transient,
             message: format!("{name} backend output capture failed"),
+            retry_after_secs: None,
+            provider_code: None,
+        },
+        // Transient: whatever denied the signal (a policy, a credential
+        // change) may not deny the next run, and the caller must see that
+        // this one did not settle.
+        SubprocessEnd::TeardownUnconfirmed => BackendError {
+            class: ErrorClass::Transient,
+            message: format!("{name} backend process group teardown was not confirmed"),
             retry_after_secs: None,
             provider_code: None,
         },

@@ -654,9 +654,9 @@ fn pi_success_lines(text: &str, stop_reason: &str) -> Vec<serde_json::Value> {
         serde_json::json!({"type": "message_start", "message": {"role": "assistant", "content": []}}),
         serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": stop_reason, "content": [{"type": "text", "text": text}]}}),
         serde_json::json!({"type": "turn_end"}),
-        // Modern Pi closes with the authoritative agent_end array; the
-        // subprocess terminal probe arms the drain kill only on this shape.
-        serde_json::json!({"type": "agent_end", "messages": [{"role": "assistant", "stopReason": stop_reason, "content": [{"type": "text", "text": text}]}]}),
+        // No agent_end: Pi print mode does not emit it on stdout (that event
+        // is internal-channel only), so the fixture ends where a real
+        // transcript ends — at the terminal assistant message_end.
     ]
 }
 

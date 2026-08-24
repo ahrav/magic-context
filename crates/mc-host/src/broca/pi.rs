@@ -344,18 +344,26 @@ fn pi_terminal_probe(lines: &[u8]) -> bool {
         .any(pi_line_is_terminal_message_end)
 }
 
-/// One-line check for a decisive terminal: only the `agent_end` shape
-/// carrying a final assistant message (stopReason `stop`, `length`,
-/// `error`, or `aborted`) counts — the probe-side mirror of the
-/// authoritative decision in [`parse_pi_transcript`], including the rule
-/// that a completion still requesting tools is not this run's terminal. A
-/// provisional `message_end` is deliberately NOT decisive here: Pi can
-/// supersede it with an automatic retry or finalization
-/// (`subagent-runner.ts` waits for `agent_end`), and arming the short
-/// drain kill on it could destroy the authoritative outcome mid-retry. A
-/// runtime that never emits `agent_end` simply runs to its timeout —
-/// bounded, never wrong. Noise and malformed lines are simply not
-/// terminals here; the full parse renders that verdict.
+/// One-line check for the event that ENDS a Pi print-mode run, used only to
+/// rearm the run deadline to the short drain grace.
+///
+/// Print mode does not emit `agent_end` on stdout at all: that event lives
+/// on Pi's internal extension channel, while the stdout stream comes from
+/// `session.subscribe` and carries `message_*`, `tool_execution_*`,
+/// `compaction_*`, `session_info_changed`, `thinking_level_changed`,
+/// `queue_update`, and `auto_retry_end` (`subagent-runner.ts`). Completion
+/// is therefore detected the way the runner itself detects it — a terminal
+/// assistant `message_end` — because Pi routinely finishes its agent loop
+/// and then sits idle until killed, which is exactly what the drain grace
+/// exists for.
+///
+/// Only `stop` and `length` arm it. An `error`/`aborted` stop can be
+/// superseded by an automatic retry (`auto_retry_*`), and arming the
+/// two-second drain kill on one could destroy the retry's result; those runs
+/// fall back to the run timeout. `agent_end` still counts for a runtime that
+/// does emit it. A completion still requesting tools is an intermediate turn,
+/// never this tool-less run's terminal. Noise and malformed lines are simply
+/// not terminals here; the full parse renders that verdict.
 fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(line) else {
         return false;
@@ -370,17 +378,18 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
     };
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("agent_end") {
-        return false;
-    }
-    let message = value
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|messages| {
-            messages.iter().rev().find(|message| {
-                message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-            })
-        });
+    let message = match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("message_end") => value.get("message"),
+        Some("agent_end") => value
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|messages| {
+                messages.iter().rev().find(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                })
+            }),
+        _ => None,
+    };
     let Some(message) = message else {
         return false;
     };
@@ -392,7 +401,8 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
         .and_then(serde_json::Value::as_str)
     {
         Some("stop" | "length") => !message_requests_tools(message),
-        Some("error" | "aborted") => true,
+        // Retryable stops do not arm the drain: an automatic retry can
+        // follow, and killing two seconds later would discard its result.
         _ => false,
     }
 }
