@@ -180,6 +180,10 @@ fn main() {
             pi_auto_retry_supersedes_the_failed_attempts_terminal,
         ),
         (
+            "pi_retry_announcement_without_a_new_terminal_fails_as_missing",
+            pi_retry_announcement_without_a_new_terminal_fails_as_missing,
+        ),
+        (
             "oversized_json_structure_rejected_without_capping_prose",
             oversized_json_structure_rejected_without_capping_prose,
         ),
@@ -2685,6 +2689,33 @@ fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
         matches!(terminal, BackendTerminal::Failed(_)),
         "agent_end stays authoritative over provisional message_end: {terminal:?}"
     );
+}
+
+/// A retry announcement supersedes the failed attempt's provisional
+/// terminal even when the retry's own terminal never arrives: the
+/// transcript must fail as one missing its terminal, never resurrect the
+/// superseded failure — an obsolete authentication failure would drive the
+/// canonical-provider fallback, and other stale classes would advance the
+/// model chain for a run whose real outcome was never observed.
+fn pi_retry_announcement_without_a_new_terminal_fails_as_missing() {
+    for continuation in ["auto_retry_start", "message_start"] {
+        let (terminal, events) = run_pi_transcript(&[
+            serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+            serde_json::json!({"type": "agent_start"}),
+            serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "authentication failed", "content": [{"type": "text", "text": "STALE"}]}}),
+            serde_json::json!({"type": continuation}),
+        ]);
+        let error = failed(&terminal);
+        assert!(
+            error.message.contains("without a terminal event"),
+            "{continuation}: the superseded failure must not decide the run: {:?}",
+            error.message
+        );
+        assert!(
+            events.is_empty(),
+            "{continuation}: a superseded attempt publishes no text"
+        );
+    }
 }
 
 /// A run's private directory holds its hidden prompt and transcript, and a

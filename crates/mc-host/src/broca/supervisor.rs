@@ -692,7 +692,13 @@ impl Supervisor {
     /// queued and running backend, waits for all run tasks, wakes every
     /// subscriber, and releases all retained state. The metrics snapshot
     /// afterwards is exactly the construction baseline.
-    pub async fn shutdown(&self) {
+    ///
+    /// Returns how many runs ended with an unproven process-group teardown
+    /// (`work_unresolved`): local state is released either way, but a
+    /// drained supervisor is not proof the harness trees stopped, and the
+    /// component must not report a clean shutdown over provider work that
+    /// may still be running.
+    pub async fn shutdown(&self) -> usize {
         let inner = &self.inner;
         inner.closing.cancel();
         let runs: Vec<Arc<Run>> = {
@@ -705,6 +711,12 @@ impl Supervisor {
         }
         inner.tracker.close();
         inner.tracker.wait().await;
+        // Read after the tracker drain: every backend task has returned, so
+        // each run's teardown verdict is final.
+        let unresolved = runs
+            .iter()
+            .filter(|run| lock_run(run).work_unresolved)
+            .count();
         let mut released = Released::default();
         let mut index = lock_index(inner);
         let sessions: Vec<SessionKey> = index.sessions.keys().cloned().collect();
@@ -713,6 +725,7 @@ impl Supervisor {
         }
         debug_assert!(index.runs.is_empty(), "every run is session-owned");
         index.runs.clear();
+        unresolved
     }
 
     /// Releases expired retained entries so their charges cannot wedge the
@@ -847,6 +860,16 @@ impl Supervisor {
                     })
                 }
             };
+            // An unproven teardown is a property of the backend's exit, not
+            // of terminal arbitration: it is recorded here, before `finish`,
+            // because a cancel or delete that already committed its own
+            // terminal makes `finish` a first-append-wins no-op — the
+            // `FailedUnresolved` arm inside it never runs — and the waiter
+            // parked in `wait_work_done` would then read a clean
+            // `work_unresolved` and report a teardown the host never proved.
+            if matches!(terminal, BackendTerminal::FailedUnresolved(_)) {
+                lock_run(&run).work_unresolved = true;
+            }
             // A fired cancel token wins over whatever the backend returned:
             // the control operation already promised a cancellation
             // terminal, and `finish` is first-append-wins anyway.

@@ -758,6 +758,85 @@ async fn unproven_teardown_fails_cancel_and_delete() {
     );
 }
 
+/// The mirror of the case above: here the CONTROL operation commits its
+/// cancellation terminal first, and the backend reports the unproven
+/// teardown only afterwards. The committed cancellation wins the replay
+/// terminal (`finish` is first-append-wins), but the unresolved teardown
+/// must still reach the parked waiter — a cancel that returned `Ok` here
+/// would tell the module a billable provider descendant had stopped when
+/// the host never proved it.
+#[tokio::test]
+async fn cancellation_winning_the_terminal_still_reports_unproven_teardown() {
+    let backend = ScriptedBackend::with_behavior(|_request, _events, cancel| {
+        Box::pin(async move {
+            cancel.cancelled().await;
+            BackendTerminal::FailedUnresolved(BackendError {
+                class: ErrorClass::Transient,
+                message: "process group teardown was not confirmed".to_owned(),
+                retry_after_secs: None,
+                provider_code: None,
+            })
+        })
+    });
+    let supervisor = Supervisor::new(backend as Arc<_>);
+
+    let run_id = send(&supervisor, "s-cancel-unproven", "p1");
+    until(
+        || supervisor.status(&key("s-cancel-unproven"), &run_id) == Ok("running"),
+        "the backend starts before the cancel races it",
+    )
+    .await;
+
+    let cancelled = supervisor
+        .cancel(&key("s-cancel-unproven"), &run_id)
+        .await
+        .expect_err("cancel cannot claim a teardown the backend disproved");
+    assert_eq!(cancelled.code, "teardown_unconfirmed");
+    // The replay terminal stays the committed cancellation.
+    assert_eq!(
+        supervisor.status(&key("s-cancel-unproven"), &run_id),
+        Ok("cancelled")
+    );
+
+    let deleted = supervisor
+        .delete(&key("s-cancel-unproven"))
+        .await
+        .expect_err("delete reports the same unproven teardown");
+    assert_eq!(deleted.code, "teardown_unconfirmed");
+}
+
+/// Shutdown drains all local state either way, but must not report a clean
+/// drain over an unproven teardown: the run's crash record names this
+/// still-live owner, so a successor sweep skips it and the orphaned
+/// provider descendant is never reaped.
+#[tokio::test]
+async fn shutdown_counts_runs_with_unproven_teardown() {
+    let backend = ScriptedBackend::with_behavior(|_request, _events, cancel| {
+        Box::pin(async move {
+            cancel.cancelled().await;
+            BackendTerminal::FailedUnresolved(BackendError {
+                class: ErrorClass::Transient,
+                message: "process group teardown was not confirmed".to_owned(),
+                retry_after_secs: None,
+                provider_code: None,
+            })
+        })
+    });
+    let supervisor = Supervisor::new(backend as Arc<_>);
+    let run_id = send(&supervisor, "s-shutdown-unproven", "p1");
+    until(
+        || supervisor.status(&key("s-shutdown-unproven"), &run_id) == Ok("running"),
+        "the backend starts before shutdown cancels it",
+    )
+    .await;
+
+    assert_eq!(
+        supervisor.shutdown().await,
+        1,
+        "shutdown must surface the run whose teardown was never proven"
+    );
+}
+
 /// The eviction/delete race (AE7): a terminal-cap eviction removes the
 /// session while `delete` is parked in its work-done wait, so the re-lock
 /// no longer finds the run — the delete must still leave a tombstone

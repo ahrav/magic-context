@@ -251,11 +251,24 @@ impl CompositeComponent for BrocaComponent {
     }
 
     async fn shutdown(&self) -> Result<(), ShutdownError> {
-        self.supervisor.shutdown().await;
+        let unresolved = self.supervisor.shutdown().await;
         self.routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        // Local state is drained either way, but a run whose process-group
+        // teardown was never proven may leave a provider descendant alive —
+        // and its crash record names this still-live process as owner, so a
+        // successor host skips it as live and never sweeps the orphan. The
+        // shutdown must fail so the runtime reports the host as not
+        // gracefully drained instead of vouching for work it cannot prove
+        // stopped.
+        if unresolved > 0 {
+            return Err(ShutdownError(format!(
+                "{unresolved} run(s) ended without confirming harness \
+                 process-group teardown; provider work may still be running"
+            )));
+        }
         Ok(())
     }
 }

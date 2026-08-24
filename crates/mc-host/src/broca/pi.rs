@@ -437,7 +437,9 @@ fn pi_line_probe_signal(line: &[u8]) -> ProbeSignal {
 /// `message_end` one.
 /// Documented nonterminal events that occur on ordinary tool-less runs
 /// (lifecycle, compaction, retry, queue, and session-state notifications;
-/// `--thinking` emits `thinking_level_changed`) are ignored, but
+/// `--thinking` emits `thinking_level_changed`) are ignored — except the
+/// continuation events (`message_start`, `auto_retry_*`), which clear the
+/// provisional decision they supersede — but
 /// `tool_execution_*` events are rejected: this path is a zero-tool
 /// transform, so observed tool activity is a transcript-contract failure —
 /// the same rule the OpenCode parser applies to `tool_use`. Lines that do
@@ -481,15 +483,24 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
             | "agent_start"
             | "turn_start"
             | "turn_end"
-            | "message_start"
             | "message_update"
             | "compaction_start"
             | "compaction_end"
-            | "auto_retry_start"
-            | "auto_retry_end"
             | "queue_update"
             | "session_info_changed"
             | "thinking_level_changed" => {}
+            // A turn opening or a retry announcing itself means the run is
+            // still working — the same events `pi_line_probe_signal` treats
+            // as `Continues` — so whatever provisional terminal preceded it
+            // is superseded. A transcript that ends after this continuation
+            // without the successor's terminal must fail as a missing
+            // terminal, never resurrect the superseded attempt: an obsolete
+            // auth failure would otherwise drive the canonical-provider
+            // fallback, and other stale classes would advance the model
+            // chain for a run whose real outcome was never observed.
+            "message_start" | "auto_retry_start" | "auto_retry_end" => {
+                provisional = None;
+            }
             "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
                 return Err(format!(
                     "tool execution event in a tool-less run at line {line_no}"

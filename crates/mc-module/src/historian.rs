@@ -1221,6 +1221,16 @@ fn log_cleanup_failure(
     }
 }
 
+/// True when a cancel could not prove the run's harness process group
+/// stopped. The host reports this as the `teardown_unconfirmed` request
+/// error, which the wire producer surfaces verbatim as a `Subc` body code.
+fn cancel_left_work_unconfirmed(result: &Result<(), HistorianProducerError>) -> bool {
+    matches!(
+        result,
+        Err(HistorianProducerError::Subc(body)) if body.code == "teardown_unconfirmed"
+    )
+}
+
 pub async fn run_historian_firing<P>(
     producer: &mut P,
     request: HistorianFireRequest<'_>,
@@ -1377,7 +1387,14 @@ where
                     ),
                 )?;
                 let close_result = producer.close().await;
-                if decision.try_next_model {
+                // Fallback requires the failed attempt to actually be over:
+                // a cancel that reports `teardown_unconfirmed` means the
+                // host could not prove the provider descendant stopped, and
+                // starting the next model would run a second billable
+                // producer beside it under a fresh firing sequence. The
+                // firing ends here instead; the durable abandon above keeps
+                // the state recoverable and backoff-gated.
+                if decision.try_next_model && !cancel_left_work_unconfirmed(&cancel_result) {
                     log_cleanup_failure(request.session_id, "cancel", &cancel_result);
                     log_cleanup_failure(request.session_id, "close", &close_result);
                     continue;
@@ -3377,6 +3394,67 @@ mod tests {
             .last_failure
             .expect("failure detail recorded")
             .contains("producer output"));
+    }
+
+    /// A retryable failure normally advances the model chain, but a cancel
+    /// that reports `teardown_unconfirmed` means the failed attempt's
+    /// provider descendant may still be executing — falling back would start
+    /// a second billable run beside it. The firing must end with the
+    /// unconfirmed cancellation surfaced, and the next model must never
+    /// start.
+    #[tokio::test]
+    async fn unconfirmed_cancellation_stops_the_fallback_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        // Only ONE start is scripted: reaching for model-b would panic the
+        // scripted queue, so completion alone proves the chain stopped.
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::tagged_subc(
+                "provider_error",
+                "provider overloaded",
+                ErrorClass::Transient,
+                None,
+            )))
+            .with_cancel_result(Err(HistorianProducerError::tagged_subc(
+                "teardown_unconfirmed",
+                "the harness process group could not be confirmed stopped",
+                ErrorClass::Transient,
+                None,
+            )));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+
+        let HistorianDriveError::Producer(producer_err) = err else {
+            panic!("expected producer error, got {err:?}");
+        };
+        let rendered = producer_err.to_string();
+        assert!(
+            rendered.contains("teardown_unconfirmed"),
+            "the unconfirmed cancellation must surface: {rendered}"
+        );
+        assert_eq!(producer.cancels, vec!["run-1"]);
+        assert_eq!(
+            producer.observed_starts.len(),
+            1,
+            "the fallback chain must not start another run"
+        );
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            state.state,
+            HistorianPhase::Idle,
+            "the durable abandon transition still lands"
+        );
+        assert!(state.failure_backoff_at_ms.is_some());
     }
 
     #[tokio::test]
