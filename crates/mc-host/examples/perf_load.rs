@@ -490,10 +490,13 @@ async fn run_conn(
         match frame.ty {
             TY_RESPONSE => {
                 // A success requires the terminal-response flag shape
-                // (non-binary, last) alongside the body contract.
-                let valid = frame.flags == raw_client::FLAGS_RESPONSE_TEXT_LAST
-                    && (!expect_fixture || body_buf.as_slice() == FIXTURE_BODY);
-                if !valid {
+                // (non-binary, last) alongside the body contract; a flag
+                // regression is a wire failure, not a body mismatch.
+                if frame.flags != raw_client::FLAGS_RESPONSE_TEXT_LAST {
+                    if measured {
+                        result.outcomes.record(Outcome::UnexpectedFrame);
+                    }
+                } else if expect_fixture && body_buf.as_slice() != FIXTURE_BODY {
                     if measured {
                         result.outcomes.record(Outcome::BodyMismatch);
                     }
@@ -531,7 +534,20 @@ async fn run_conn(
     // would otherwise wait forever on a saturated window.
     inflight.close();
 
-    result.inflight_full = sender.await.map(|(count, _write_half)| count).unwrap_or(0);
+    // The join is bounded: closing the semaphore cannot interrupt a
+    // sender parked in write_all against a peer that stopped reading,
+    // and an unbounded await here would wedge the whole run — the exact
+    // failure the reader's backstop deadline exists to prevent.
+    let mut sender = sender;
+    result.inflight_full = match tokio::time::timeout(DRAIN_BUDGET, &mut sender).await {
+        Ok(Ok((count, _write_half))) => count,
+        Ok(Err(_)) => 0,
+        Err(_) => {
+            sender.abort();
+            result.closed_early = true;
+            0
+        }
+    };
     // The sender has exited, so the meta channel is complete. This drain
     // runs unconditionally and after the sender: a write-failure or
     // missed-slot marker can be enqueued without forcing the reader

@@ -41,7 +41,7 @@ every table below from the sidecars without rerunning the benchmark.
 
 | | |
 | --- | --- |
-| Host | shared dev host (hostname withheld; manifests record the operator-set `MC_IPC_BUDGET_HOST_LABEL`, default `redacted`) |
+| Host | shared dev host (hostname withheld; manifests record the operator-set `MC_IPC_BUDGET_HOST_LABEL`, which defaults to a hashed machine fingerprint of the form `host-<12 hex>`) |
 | CPU | aarch64, 32 cores, 1 socket, no SMT, one 32 MiB L3, 1 NUMA node |
 | Kernel | 6.12.100-125.179.amzn2023.aarch64 |
 | rustc | 1.94.1, release profile |

@@ -943,14 +943,24 @@ impl SerialProbe {
             for _ in 0..n {
                 *corr += 1;
                 let frame = request_frame(channel, epoch, *corr);
-                stream
-                    .write_all(&frame)
+                // Each exchange is bounded like every other arm's I/O: a
+                // live-but-stuck host would otherwise park the Criterion
+                // sample forever. Expiry abandons the connection, so the
+                // cancelled read cannot desync later traffic.
+                let deadline = Instant::now() + DRAIN_BUDGET;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::timeout(remaining, stream.write_all(&frame))
                     .await
+                    .map_err(|_| "write: deadline exceeded".to_owned())?
                     .map_err(|err| format!("write: {err}"))?;
                 loop {
-                    stream
-                        .read_exact(&mut header)
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err("response: deadline exceeded".to_owned());
+                    }
+                    tokio::time::timeout(remaining, stream.read_exact(&mut header))
                         .await
+                        .map_err(|_| "read: deadline exceeded".to_owned())?
                         .map_err(|err| format!("read: {err}"))?;
                     let decoded = raw_client::decode_header(&header);
                     if decoded.len > MAX_BODY_LEN {
@@ -960,9 +970,10 @@ impl SerialProbe {
                     }
                     body.resize(decoded.len as usize, 0);
                     if decoded.len > 0 {
-                        stream
-                            .read_exact(&mut body)
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        tokio::time::timeout(remaining, stream.read_exact(&mut body))
                             .await
+                            .map_err(|_| "read body: deadline exceeded".to_owned())?
                             .map_err(|err| format!("read body: {err}"))?;
                     }
                     if decoded.corr == *corr && decoded.ty != raw_client::TY_PING {

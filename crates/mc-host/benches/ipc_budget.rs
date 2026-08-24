@@ -731,7 +731,8 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
     check_host_and_conservation(&mut host, &result.outcomes, result.scheduled_slots)?;
     if result.outcomes.success == 0 {
         return Err(format!(
-            "offered-rate point {rate}/s produced no successful measured observation              (outcomes: {:?}); the point is invalid for this host",
+            "offered-rate point {rate}/s produced no successful measured observation \
+             (outcomes: {:?}); the point is invalid for this host",
             result.outcomes
         ));
     }

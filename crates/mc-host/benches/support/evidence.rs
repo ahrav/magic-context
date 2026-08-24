@@ -538,6 +538,16 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     let mut rows = Vec::new();
     for (key, atomic_rtt) in &atomic {
         if let Some(tcp_p50) = tcp.get(key) {
+            // A zero or negative atomic median cannot come from a real
+            // measurement; the ratio would be non-finite and serde_json
+            // would encode it as a silent null.
+            if *atomic_rtt <= 0.0 {
+                return Err(format!(
+                    "run block {} pair {:?}: atomic median {atomic_rtt} is not a positive \
+                     duration; the gap ratio would not be finite",
+                    key.0, key.2
+                ));
+            }
             rows.push(GapRow {
                 run_block: key.0,
                 class: key.1.clone(),
