@@ -3,7 +3,12 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { HARNESSES, LANES, type Harness, type Lane } from "../src/incident-pool/contract";
+import {
+    HARNESSES,
+    LANES,
+    type Harness,
+    type Lane,
+} from "../src/incident-pool/contract";
 import { validateIncidentHistory } from "../src/incident-pool/history";
 import {
     builtinIncidentCaseRegistry,
@@ -22,7 +27,11 @@ import {
     runIncidentPool,
     unavailableCaseResult,
 } from "../src/incident-pool/runner";
-import { E2E_ROOT, INCIDENTS_DIR, loadHistorySnapshot } from "./validate-incident-history";
+import {
+    E2E_ROOT,
+    INCIDENTS_DIR,
+    loadHistorySnapshot,
+} from "./validate-incident-history";
 
 const REPO_ROOT = resolve(E2E_ROOT, "../..");
 
@@ -43,14 +52,20 @@ function parseArgs(args: string[]): CliArgs {
         if (arg === "--harness") {
             const value = args[++index];
             if (!value || !HARNESSES.includes(value as Harness)) {
-                throw new Error(`--harness requires one of ${HARNESSES.join(", ")}`);
+                throw new Error(
+                    `--harness requires one of ${HARNESSES.join(", ")}`,
+                );
             }
             harness = value as Harness;
         } else if (arg === "--lane") {
             const value = args[++index];
             if (value === "all") {
                 lanes = ["green", "known-red"];
-            } else if (value && LANES.includes(value as Lane) && value !== "adjudication-only") {
+            } else if (
+                value &&
+                LANES.includes(value as Lane) &&
+                value !== "adjudication-only"
+            ) {
                 lanes = [value as Lane];
             } else {
                 throw new Error("--lane requires green, known-red, or all");
@@ -61,7 +76,8 @@ function parseArgs(args: string[]): CliArgs {
             reportPath = resolve(value);
         } else if (arg === "--timeout") {
             const value = Number(args[++index]);
-            if (!Number.isInteger(value) || value <= 0) throw new Error("--timeout requires positive milliseconds");
+            if (!Number.isInteger(value) || value <= 0)
+                throw new Error("--timeout requires positive milliseconds");
             timeoutMs = value;
         } else if (arg === "--help" || arg === "-h") {
             console.log(
@@ -76,7 +92,9 @@ function parseArgs(args: string[]): CliArgs {
 }
 
 async function main(): Promise<number> {
-    const { harness, lanes, reportPath, timeoutMs } = parseArgs(Bun.argv.slice(2));
+    const { harness, lanes, reportPath, timeoutMs } = parseArgs(
+        Bun.argv.slice(2),
+    );
     const files = loadHistorySnapshot(INCIDENTS_DIR, "working");
     const state = validateIncidentHistory(files);
     const registry = builtinIncidentCaseRegistry();
@@ -84,7 +102,13 @@ async function main(): Promise<number> {
 
     const implementationDigests = new Map<string, string>();
     for (const [variantId, registered] of registry) {
-        implementationDigests.set(variantId, implementationBundleDigest(REPO_ROOT, registered.implementationFiles));
+        implementationDigests.set(
+            variantId,
+            implementationBundleDigest(
+                REPO_ROOT,
+                registered.implementationFiles,
+            ),
+        );
     }
 
     const snapshot = buildRunSnapshot({
@@ -96,7 +120,9 @@ async function main(): Promise<number> {
         implementationDigests,
     });
     for (const excluded of snapshot.excluded) {
-        console.error(`[incident-pool] not scheduled ${excluded.variantId}: ${excluded.reason}`);
+        console.error(
+            `[incident-pool] not scheduled ${excluded.variantId}: ${excluded.reason}`,
+        );
     }
 
     const workspaceParentDir = mkdtempSync(join(tmpdir(), "incident-pool-"));
@@ -104,9 +130,13 @@ async function main(): Promise<number> {
     try {
         const report = await runIncidentPool(snapshot, async (selected) => {
             const registered = registry.get(selected.variantId);
-            const prerequisite = registered?.prerequisite?.() ?? { ok: true as const };
+            const prerequisite = registered?.prerequisite?.() ?? {
+                ok: true as const,
+            };
             if (!prerequisite.ok) {
-                console.error(`[incident-pool] ${selected.variantId} unavailable: ${prerequisite.reason}`);
+                console.error(
+                    `[incident-pool] ${selected.variantId} unavailable: ${prerequisite.reason}`,
+                );
                 return unavailableCaseResult(selected);
             }
             const execution = await runCaseInIsolation(snapshot, selected, {
@@ -140,6 +170,8 @@ async function main(): Promise<number> {
 main()
     .then((code) => process.exit(code))
     .catch((error: unknown) => {
-        console.error(`incident pool run failed: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(
+            `incident pool run failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
         process.exit(1);
     });

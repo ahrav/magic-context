@@ -25,11 +25,15 @@ import {
 
 const MODULE_PATH = "src/incident-pool/scenarios/source-linked-regressions.ts";
 
-function a1Observation(overrides: Partial<FirstRenderDeferObservation> = {}): FirstRenderDeferObservation {
+function a1Observation(
+    overrides: Partial<FirstRenderDeferObservation> = {},
+): FirstRenderDeferObservation {
     return { mainRequestCount: 6, bustCount: 0, bustReport: "", ...overrides };
 }
 
-function a3Observation(overrides: Partial<AgedCtxReduceObservation> = {}): AgedCtxReduceObservation {
+function a3Observation(
+    overrides: Partial<AgedCtxReduceObservation> = {},
+): AgedCtxReduceObservation {
     return {
         sawReduceOnWire: true,
         bustCount: 0,
@@ -86,34 +90,52 @@ describe("first-render tag stability verifiers (parity A1/A3)", () => {
     it("passes a clean pure-defer observation and emits the catalog check ids", () => {
         const result = verifyFirstRenderPureDeferStability(a1Observation());
         expect(result.verdict).toBe("pass");
-        expect(result.checks.map((check) => check.id)).toEqual([...FIRST_RENDER_A1_CHECKS]);
+        expect(result.checks.map((check) => check.id)).toEqual([
+            ...FIRST_RENDER_A1_CHECKS,
+        ]);
     });
 
     it("rejects a crafted bust observation and a below-floor request count", () => {
-        const busted = verifyFirstRenderPureDeferStability(a1Observation({ bustCount: 1 }));
+        const busted = verifyFirstRenderPureDeferStability(
+            a1Observation({ bustCount: 1 }),
+        );
         expect(busted.verdict).toBe("assertion_fail");
         expect(failedCheckIds(busted)).toEqual(["check-a1-zero-prefix-busts"]);
 
-        const thin = verifyFirstRenderPureDeferStability(a1Observation({ mainRequestCount: 5 }));
+        const thin = verifyFirstRenderPureDeferStability(
+            a1Observation({ mainRequestCount: 5 }),
+        );
         expect(failedCheckIds(thin)).toEqual(["check-a1-defer-request-floor"]);
     });
 
     it("passes a surviving aged ctx_reduce arc and emits the catalog check ids", () => {
         const result = verifyAgedCtxReduceSurvival(a3Observation());
         expect(result.verdict).toBe("pass");
-        expect(result.checks.map((check) => check.id)).toEqual([...FIRST_RENDER_A3_CHECKS]);
+        expect(result.checks.map((check) => check.id)).toEqual([
+            ...FIRST_RENDER_A3_CHECKS,
+        ]);
     });
 
     it("rejects a vanished ctx_reduce call, a bust, and a never-on-wire call", () => {
-        expect(failedCheckIds(verifyAgedCtxReduceSurvival(a3Observation({ finalWireHasCtxReduce: false })))).toEqual([
-            "check-a3-reduce-retained-final-wire",
-        ]);
-        expect(failedCheckIds(verifyAgedCtxReduceSurvival(a3Observation({ bustCount: 2 })))).toEqual([
-            "check-a3-zero-prefix-busts",
-        ]);
-        expect(failedCheckIds(verifyAgedCtxReduceSurvival(a3Observation({ sawReduceOnWire: false })))).toEqual([
-            "check-a3-reduce-on-wire",
-        ]);
+        expect(
+            failedCheckIds(
+                verifyAgedCtxReduceSurvival(
+                    a3Observation({ finalWireHasCtxReduce: false }),
+                ),
+            ),
+        ).toEqual(["check-a3-reduce-retained-final-wire"]);
+        expect(
+            failedCheckIds(
+                verifyAgedCtxReduceSurvival(a3Observation({ bustCount: 2 })),
+            ),
+        ).toEqual(["check-a3-zero-prefix-busts"]);
+        expect(
+            failedCheckIds(
+                verifyAgedCtxReduceSurvival(
+                    a3Observation({ sawReduceOnWire: false }),
+                ),
+            ),
+        ).toEqual(["check-a3-reduce-on-wire"]);
     });
 });
 
@@ -121,30 +143,52 @@ describe("thinking-block successor verifiers", () => {
     it("passes clean nudge-anchor observations in both modes", () => {
         const ts = verifyThinkingNudgeAnchor(nudgeObservation());
         expect(ts.verdict).toBe("pass");
-        expect(ts.checks.map((check) => check.id)).toEqual([...THINKING_NUDGE_ANCHOR_CHECKS]);
+        expect(ts.checks.map((check) => check.id)).toEqual([
+            ...THINKING_NUDGE_ANCHOR_CHECKS,
+        ]);
 
         const rust = verifyThinkingNudgeAnchor(
-            nudgeObservation({ rustMode: true, inspectedSignedAssistants: 0, rustThinkingBlockCount: 0 }),
+            nudgeObservation({
+                rustMode: true,
+                inspectedSignedAssistants: 0,
+                rustThinkingBlockCount: 0,
+            }),
         );
         expect(rust.verdict).toBe("pass");
     });
 
     it("rejects nudge text in a signed assistant even when every other field reads healthy", () => {
-        const result = verifyThinkingNudgeAnchor(nudgeObservation({ nudgeMarkerFound: true }));
-        expect(failedCheckIds(result)).toEqual(["check-thinking-a-no-nudge-in-signed-assistant"]);
+        const result = verifyThinkingNudgeAnchor(
+            nudgeObservation({ nudgeMarkerFound: true }),
+        );
+        expect(failedCheckIds(result)).toEqual([
+            "check-thinking-a-no-nudge-in-signed-assistant",
+        ]);
     });
 
     it("rejects vacuous inspection and mutated thinking bytes", () => {
         expect(
-            failedCheckIds(verifyThinkingNudgeAnchor(nudgeObservation({ inspectedSignedAssistants: 0 }))),
+            failedCheckIds(
+                verifyThinkingNudgeAnchor(
+                    nudgeObservation({ inspectedSignedAssistants: 0 }),
+                ),
+            ),
         ).toEqual(["check-thinking-a-nonvacuous-inspection"]);
         expect(
-            failedCheckIds(verifyThinkingNudgeAnchor(nudgeObservation({ thinkingByteStable: false }))),
+            failedCheckIds(
+                verifyThinkingNudgeAnchor(
+                    nudgeObservation({ thinkingByteStable: false }),
+                ),
+            ),
         ).toEqual(["check-thinking-a-signature-byte-stable"]);
         expect(
             failedCheckIds(
                 verifyThinkingNudgeAnchor(
-                    nudgeObservation({ rustMode: true, inspectedSignedAssistants: 0, rustThinkingBlockCount: 1 }),
+                    nudgeObservation({
+                        rustMode: true,
+                        inspectedSignedAssistants: 0,
+                        rustThinkingBlockCount: 1,
+                    }),
                 ),
             ),
         ).toEqual(["check-thinking-a-signature-byte-stable"]);
@@ -153,27 +197,47 @@ describe("thinking-block successor verifiers", () => {
     it("passes a clean dropped-shell observation and rejects crafted invalid states", () => {
         const clean = verifyThinkingDroppedShell(shellObservation());
         expect(clean.verdict).toBe("pass");
-        expect(clean.checks.map((check) => check.id)).toEqual([...THINKING_DROPPED_SHELL_CHECKS]);
+        expect(clean.checks.map((check) => check.id)).toEqual([
+            ...THINKING_DROPPED_SHELL_CHECKS,
+        ]);
 
-        expect(failedCheckIds(verifyThinkingDroppedShell(shellObservation({ pasteBodyAbsent: false })))).toEqual([
-            "check-thinking-b-paste-body-absent",
-        ]);
         expect(
-            failedCheckIds(verifyThinkingDroppedShell(shellObservation({ turnBoundaryPreserved: false }))),
+            failedCheckIds(
+                verifyThinkingDroppedShell(
+                    shellObservation({ pasteBodyAbsent: false }),
+                ),
+            ),
+        ).toEqual(["check-thinking-b-paste-body-absent"]);
+        expect(
+            failedCheckIds(
+                verifyThinkingDroppedShell(
+                    shellObservation({ turnBoundaryPreserved: false }),
+                ),
+            ),
         ).toEqual(["check-thinking-b-turn-boundary-preserved"]);
-        expect(failedCheckIds(verifyThinkingDroppedShell(shellObservation({ dropEmitted: false })))).toEqual([
-            "check-thinking-b-drop-emitted",
-        ]);
+        expect(
+            failedCheckIds(
+                verifyThinkingDroppedShell(
+                    shellObservation({ dropEmitted: false }),
+                ),
+            ),
+        ).toEqual(["check-thinking-b-drop-emitted"]);
     });
 
     it("passes clean image-survival observations and rejects a stripped image", () => {
         const ts = verifyThinkingImageSurvival(imageObservation());
         expect(ts.verdict).toBe("pass");
-        expect(ts.checks.map((check) => check.id)).toEqual([...THINKING_IMAGE_SURVIVAL_CHECKS]);
-
-        expect(failedCheckIds(verifyThinkingImageSurvival(imageObservation({ imageBlockCount: 0 })))).toEqual([
-            "check-thinking-c-image-part-survives",
+        expect(ts.checks.map((check) => check.id)).toEqual([
+            ...THINKING_IMAGE_SURVIVAL_CHECKS,
         ]);
+
+        expect(
+            failedCheckIds(
+                verifyThinkingImageSurvival(
+                    imageObservation({ imageBlockCount: 0 }),
+                ),
+            ),
+        ).toEqual(["check-thinking-c-image-part-survives"]);
         const rustCovered = verifyThinkingImageSurvival(
             imageObservation({
                 rustMode: true,
@@ -187,31 +251,53 @@ describe("thinking-block successor verifiers", () => {
         expect(
             failedCheckIds(
                 verifyThinkingImageSurvival(
-                    imageObservation({ rustMode: true, coveredByRustHistory: true, imageBlockCount: 1 }),
+                    imageObservation({
+                        rustMode: true,
+                        coveredByRustHistory: true,
+                        imageBlockCount: 1,
+                    }),
                 ),
             ),
         ).toEqual(["check-thinking-c-image-part-survives"]);
-        expect(failedCheckIds(verifyThinkingImageSurvival(imageObservation({ droppedTextAbsent: false })))).toEqual([
-            "check-thinking-c-dropped-text-absent",
-        ]);
+        expect(
+            failedCheckIds(
+                verifyThinkingImageSurvival(
+                    imageObservation({ droppedTextAbsent: false }),
+                ),
+            ),
+        ).toEqual(["check-thinking-c-dropped-text-absent"]);
     });
 });
 
 describe("registry binding surface", () => {
     it("resolves every committed live binding to a real exported function of this module", () => {
         const catalog = parseIncidentCatalog(
-            JSON.parse(readFileSync(join(E2E_ROOT, "incidents", "catalog.json"), "utf8")),
+            JSON.parse(
+                readFileSync(
+                    join(E2E_ROOT, "incidents", "catalog.json"),
+                    "utf8",
+                ),
+            ),
         );
         const moduleExports = regressions as Record<string, unknown>;
         let liveBindings = 0;
         for (const family of catalog.families) {
             for (const variant of family.variants) {
                 const binding = variant.verifier_binding;
-                if (binding === null || binding.binding_status !== "live") continue;
+                if (binding === null || binding.binding_status !== "live")
+                    continue;
                 for (const reference of [binding.driver, binding.verifier]) {
-                    const [path, symbol] = reference.split("#") as [string, string];
+                    const [path, symbol] = reference.split("#") as [
+                        string,
+                        string,
+                    ];
                     expect(path).toBe(MODULE_PATH);
-                    expect(resolve(E2E_ROOT, path)).toBe(resolve(import.meta.dir, "source-linked-regressions.ts"));
+                    expect(resolve(E2E_ROOT, path)).toBe(
+                        resolve(
+                            import.meta.dir,
+                            "source-linked-regressions.ts",
+                        ),
+                    );
                     expect(typeof moduleExports[symbol]).toBe("function");
                 }
                 liveBindings++;
@@ -222,7 +308,12 @@ describe("registry binding surface", () => {
 
     it("keeps the committed normative checks equal to the verifier-emitted check ids", () => {
         const catalog = parseIncidentCatalog(
-            JSON.parse(readFileSync(join(E2E_ROOT, "incidents", "catalog.json"), "utf8")),
+            JSON.parse(
+                readFileSync(
+                    join(E2E_ROOT, "incidents", "catalog.json"),
+                    "utf8",
+                ),
+            ),
         );
         const expectedChecks: Record<string, readonly string[]> = {
             "var-parity-a1-pure-defer-stability": FIRST_RENDER_A1_CHECKS,
@@ -241,7 +332,9 @@ describe("registry binding surface", () => {
     });
 
     it("returns a structured registry result, not a bare test outcome", () => {
-        const result = verifyFirstRenderPureDeferStability(a1Observation({ bustCount: 3 }));
+        const result = verifyFirstRenderPureDeferStability(
+            a1Observation({ bustCount: 3 }),
+        );
         expect(result).toEqual({
             verdict: "assertion_fail",
             checks: [

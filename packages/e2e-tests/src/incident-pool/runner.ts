@@ -98,14 +98,31 @@ export function parseCaseEnvelope(raw: unknown): CaseEnvelope {
         ],
         label,
     );
-    if (record.schema !== CASE_ENVELOPE_SCHEMA) fail(`${label}.schema`, `must be ${CASE_ENVELOPE_SCHEMA}`);
-    const preconditions = asEnum(record.preconditions, ["satisfied", "failed"] as const, `${label}.preconditions`);
-    const blockedBy = asIdArray(record.blocked_by, VARIANT_ID_RE, `${label}.blocked_by`);
-    const failedChecks = asIdArray(record.failed_checks, CHECK_ID_RE, `${label}.failed_checks`);
+    if (record.schema !== CASE_ENVELOPE_SCHEMA)
+        fail(`${label}.schema`, `must be ${CASE_ENVELOPE_SCHEMA}`);
+    const preconditions = asEnum(
+        record.preconditions,
+        ["satisfied", "failed"] as const,
+        `${label}.preconditions`,
+    );
+    const blockedBy = asIdArray(
+        record.blocked_by,
+        VARIANT_ID_RE,
+        `${label}.blocked_by`,
+    );
+    const failedChecks = asIdArray(
+        record.failed_checks,
+        CHECK_ID_RE,
+        `${label}.failed_checks`,
+    );
     const verdict =
         record.verdict === null
             ? null
-            : asEnum(record.verdict, ["pass", "assertion_fail"] as const, `${label}.verdict`);
+            : asEnum(
+                  record.verdict,
+                  ["pass", "assertion_fail"] as const,
+                  `${label}.verdict`,
+              );
     const preconditionReason =
         record.precondition_reason === null
             ? null
@@ -117,42 +134,94 @@ export function parseCaseEnvelope(raw: unknown): CaseEnvelope {
     const observationSignature =
         record.observation_signature === null
             ? null
-            : asHex64(record.observation_signature, `${label}.observation_signature`);
+            : asHex64(
+                  record.observation_signature,
+                  `${label}.observation_signature`,
+              );
 
     if (preconditions === "failed") {
-        if (verdict !== null) fail(label, "failed preconditions must not carry a behavioral verdict");
-        if (preconditionReason === null) fail(label, "failed preconditions require a static reason code");
+        if (verdict !== null)
+            fail(
+                label,
+                "failed preconditions must not carry a behavioral verdict",
+            );
+        if (preconditionReason === null)
+            fail(label, "failed preconditions require a static reason code");
         if (failedChecks.length !== 0 || observationSignature !== null) {
-            fail(label, "failed preconditions must not carry checks or signatures");
+            fail(
+                label,
+                "failed preconditions must not carry checks or signatures",
+            );
         }
-        if (preconditionReason === "blocked_by_dependency" && blockedBy.length === 0) {
-            fail(label, "blocked_by_dependency requires at least one dependency");
+        if (
+            preconditionReason === "blocked_by_dependency" &&
+            blockedBy.length === 0
+        ) {
+            fail(
+                label,
+                "blocked_by_dependency requires at least one dependency",
+            );
         }
-        if (preconditionReason === "precondition_unmet" && blockedBy.length !== 0) {
+        if (
+            preconditionReason === "precondition_unmet" &&
+            blockedBy.length !== 0
+        ) {
             fail(label, "precondition_unmet must not carry dependencies");
         }
     } else {
-        if (verdict === null) fail(label, "satisfied preconditions require a behavioral verdict");
+        if (verdict === null)
+            fail(label, "satisfied preconditions require a behavioral verdict");
         if (preconditionReason !== null || blockedBy.length !== 0) {
-            fail(label, "satisfied preconditions must not carry a precondition reason or dependencies");
+            fail(
+                label,
+                "satisfied preconditions must not carry a precondition reason or dependencies",
+            );
         }
-        if (verdict === "pass" && (failedChecks.length !== 0 || observationSignature !== null)) {
-            fail(label, "pass must not carry failed checks or an observation signature");
+        if (
+            verdict === "pass" &&
+            (failedChecks.length !== 0 || observationSignature !== null)
+        ) {
+            fail(
+                label,
+                "pass must not carry failed checks or an observation signature",
+            );
         }
         if (verdict === "assertion_fail") {
-            if (failedChecks.length === 0) fail(label, "assertion_fail requires at least one failed check");
-            if (observationSignature === null) fail(label, "assertion_fail requires an observation signature");
+            if (failedChecks.length === 0)
+                fail(
+                    label,
+                    "assertion_fail requires at least one failed check",
+                );
+            if (observationSignature === null)
+                fail(label, "assertion_fail requires an observation signature");
         }
     }
 
     return {
         schema: CASE_ENVELOPE_SCHEMA,
         run_nonce: asRunNonce(record.run_nonce, `${label}.run_nonce`),
-        variant_id: asId(record.variant_id, VARIANT_ID_RE, `${label}.variant_id`),
-        semantic_fingerprint: asHex64(record.semantic_fingerprint, `${label}.semantic_fingerprint`),
-        implementation_digest: asHex64(record.implementation_digest, `${label}.implementation_digest`),
-        ledger_fingerprint: asHex64(record.ledger_fingerprint, `${label}.ledger_fingerprint`),
-        baseline_event_id: asId(record.baseline_event_id, /^adj-[a-z0-9]+(?:-[a-z0-9]+)*$/, `${label}.baseline_event_id`),
+        variant_id: asId(
+            record.variant_id,
+            VARIANT_ID_RE,
+            `${label}.variant_id`,
+        ),
+        semantic_fingerprint: asHex64(
+            record.semantic_fingerprint,
+            `${label}.semantic_fingerprint`,
+        ),
+        implementation_digest: asHex64(
+            record.implementation_digest,
+            `${label}.implementation_digest`,
+        ),
+        ledger_fingerprint: asHex64(
+            record.ledger_fingerprint,
+            `${label}.ledger_fingerprint`,
+        ),
+        baseline_event_id: asId(
+            record.baseline_event_id,
+            /^adj-[a-z0-9]+(?:-[a-z0-9]+)*$/,
+            `${label}.baseline_event_id`,
+        ),
         preconditions,
         precondition_reason: preconditionReason,
         blocked_by: blockedBy,
@@ -219,37 +288,63 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
     for (const family of input.catalog.families) {
         for (const variant of family.variants) {
             if (!EXECUTABLE_LANES.includes(variant.lane)) {
-                excluded.push({ variantId: variant.id, reason: "adjudication-only variants are never scheduled" });
-                continue;
-            }
-            if (!input.lanes.includes(variant.lane)) {
-                excluded.push({ variantId: variant.id, reason: `lane ${variant.lane} was not requested` });
-                continue;
-            }
-            const applicability = variant.applicability;
-            if (applicability === null) throw new Error(`executable variant ${variant.id} lacks applicability`);
-            if (applicability.harness !== input.harness) {
-                const documented = applicability.omitted.find((omit) => omit.harness === input.harness);
                 excluded.push({
                     variantId: variant.id,
-                    reason: documented?.reason ?? `canonical harness is ${applicability.harness}`,
+                    reason: "adjudication-only variants are never scheduled",
                 });
                 continue;
             }
-            const baseline = input.ledger.byIdentity.get(variant.id)?.latestBaseline ?? null;
+            if (!input.lanes.includes(variant.lane)) {
+                excluded.push({
+                    variantId: variant.id,
+                    reason: `lane ${variant.lane} was not requested`,
+                });
+                continue;
+            }
+            const applicability = variant.applicability;
+            if (applicability === null)
+                throw new Error(
+                    `executable variant ${variant.id} lacks applicability`,
+                );
+            if (applicability.harness !== input.harness) {
+                const documented = applicability.omitted.find(
+                    (omit) => omit.harness === input.harness,
+                );
+                excluded.push({
+                    variantId: variant.id,
+                    reason:
+                        documented?.reason ??
+                        `canonical harness is ${applicability.harness}`,
+                });
+                continue;
+            }
+            const baseline =
+                input.ledger.byIdentity.get(variant.id)?.latestBaseline ?? null;
             if (baseline === null) {
-                throw new Error(`selected variant ${variant.id} has no reviewed baseline adjudication`);
+                throw new Error(
+                    `selected variant ${variant.id} has no reviewed baseline adjudication`,
+                );
             }
-            if (baseline.semantic_fingerprint !== variant.semantic_revision.fingerprint) {
-                throw new Error(`selected variant ${variant.id} baseline is stale against its semantic revision`);
+            if (
+                baseline.semantic_fingerprint !==
+                variant.semantic_revision.fingerprint
+            ) {
+                throw new Error(
+                    `selected variant ${variant.id} baseline is stale against its semantic revision`,
+                );
             }
-            const expectedVerdict: BaselineVerdict = variant.lane === "green" ? "green" : "red";
+            const expectedVerdict: BaselineVerdict =
+                variant.lane === "green" ? "green" : "red";
             if (baseline.baseline_verdict !== expectedVerdict) {
-                throw new Error(`selected variant ${variant.id} lane disagrees with its baseline verdict`);
+                throw new Error(
+                    `selected variant ${variant.id} lane disagrees with its baseline verdict`,
+                );
             }
             const digest = input.implementationDigests.get(variant.id);
             if (digest === undefined) {
-                throw new Error(`selected variant ${variant.id} has no implementation-bundle digest`);
+                throw new Error(
+                    `selected variant ${variant.id} has no implementation-bundle digest`,
+                );
             }
             selected.push({
                 familyId: family.id,
@@ -262,14 +357,21 @@ export function buildRunSnapshot(input: BuildSnapshotInput): RunSnapshot {
                 blockedBy: [...variant.blocked_by],
                 baselineEventId: baseline.event_id,
                 baselineVerdict: baseline.baseline_verdict as BaselineVerdict,
-                expectedFailedChecks: [...(baseline.expected_failed_checks ?? [])],
+                expectedFailedChecks: [
+                    ...(baseline.expected_failed_checks ?? []),
+                ],
                 expectedObservationSignature: baseline.observation_signature,
             });
         }
     }
     const digestRows = [...selected]
         .sort((a, b) => (a.variantId < b.variantId ? -1 : 1))
-        .map((entry) => [entry.variantId, entry.semanticFingerprint, entry.implementationDigest, entry.baselineEventId]);
+        .map((entry) => [
+            entry.variantId,
+            entry.semanticFingerprint,
+            entry.implementationDigest,
+            entry.baselineEventId,
+        ]);
     return {
         runNonce: newRunNonce(),
         harness: input.harness,
@@ -340,14 +442,17 @@ async function killAndJoinProcessGroup(pid: number): Promise<void> {
             return; // ESRCH: every group member has terminated.
         }
         if (Date.now() > deadline) {
-            throw new Error(`process group ${pid} did not terminate after SIGKILL`);
+            throw new Error(
+                `process group ${pid} did not terminate after SIGKILL`,
+            );
         }
         await sleep(25);
     }
 }
 
 function streamDone(stream: Readable | null | undefined): Promise<void> {
-    if (!stream || stream.readableEnded || stream.destroyed) return Promise.resolve();
+    if (!stream || stream.readableEnded || stream.destroyed)
+        return Promise.resolve();
     return new Promise((resolveDone) => {
         stream.once("end", resolveDone);
         stream.once("close", resolveDone);
@@ -398,7 +503,8 @@ function spawnCaseProcess(
         const timer = setTimeout(() => {
             timedOut = true;
             try {
-                if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+                if (child.pid !== undefined)
+                    process.kill(-child.pid, "SIGKILL");
             } catch {
                 // Child exited between the deadline and the kill.
             }
@@ -408,13 +514,22 @@ function spawnCaseProcess(
             if (settled) return;
             settled = true;
             clearTimeout(timer);
-            if (child.pid !== undefined) await killAndJoinProcessGroup(child.pid);
+            if (child.pid !== undefined)
+                await killAndJoinProcessGroup(child.pid);
             // Drain buffered pipe data; the group is dead, so this is bounded.
             await Promise.race([
-                Promise.all([streamDone(channel), streamDone(child.stdout), streamDone(child.stderr)]),
+                Promise.all([
+                    streamDone(channel),
+                    streamDone(child.stdout),
+                    streamDone(child.stderr),
+                ]),
                 sleep(2_000),
             ]);
-            resolveOutcome({ timedOut, envelopeBytes: Buffer.concat(chunks), envelopeOversized: oversized });
+            resolveOutcome({
+                timedOut,
+                envelopeBytes: Buffer.concat(chunks),
+                envelopeOversized: oversized,
+            });
         };
 
         child.once("exit", () => void settle().catch(rejectOutcome));
@@ -448,7 +563,9 @@ function unhealthyResult(
 
 /** Structurally complete `unavailable` fact for an applicable selected case
  *  whose prerequisite is missing — published, never scored (R6). */
-export function unavailableCaseResult(selected: SelectedCase): IncidentCaseResult {
+export function unavailableCaseResult(
+    selected: SelectedCase,
+): IncidentCaseResult {
     return unhealthyResult(selected, "unavailable", "prerequisite_missing");
 }
 
@@ -491,7 +608,9 @@ function classifyEnvelope(
             behavioral_verdict: "not_evaluated",
             baseline_comparison: "unscored",
             blocked_by: reviewed ? envelope.blocked_by : [],
-            reason_code: reviewed ? "blocked_by_dependency" : "precondition_unmet",
+            reason_code: reviewed
+                ? "blocked_by_dependency"
+                : "precondition_unmet",
         };
     }
 
@@ -503,8 +622,12 @@ function classifyEnvelope(
         comparison = "resolution_candidate";
     } else {
         const matches =
-            sameCheckSet(envelope.failed_checks, selected.expectedFailedChecks) &&
-            envelope.observation_signature === selected.expectedObservationSignature;
+            sameCheckSet(
+                envelope.failed_checks,
+                selected.expectedFailedChecks,
+            ) &&
+            envelope.observation_signature ===
+                selected.expectedObservationSignature;
         comparison = matches ? "expected_red" : "unexpected_failure";
     }
     return {
@@ -523,14 +646,18 @@ function classifyOutcome(
     selected: SelectedCase,
     outcome: ProcessOutcome,
 ): IncidentCaseResult {
-    if (outcome.timedOut) return unhealthyResult(selected, "timeout", "deadline_exceeded");
-    if (outcome.envelopeOversized) return unhealthyResult(selected, "malformed", "envelope_oversized");
+    if (outcome.timedOut)
+        return unhealthyResult(selected, "timeout", "deadline_exceeded");
+    if (outcome.envelopeOversized)
+        return unhealthyResult(selected, "malformed", "envelope_oversized");
     const text = outcome.envelopeBytes.toString("utf8");
     const lines = text.split("\n").filter((line) => line.trim().length > 0);
     // A child that exits without an envelope crashed, whatever it printed to
     // stdout — forged stdout success is never parsed as a verdict.
-    if (lines.length === 0) return unhealthyResult(selected, "crash", "exited_without_envelope");
-    if (lines.length > 1) return unhealthyResult(selected, "malformed", "duplicate_envelope");
+    if (lines.length === 0)
+        return unhealthyResult(selected, "crash", "exited_without_envelope");
+    if (lines.length > 1)
+        return unhealthyResult(selected, "malformed", "duplicate_envelope");
     let envelope: CaseEnvelope;
     try {
         envelope = parseCaseEnvelope(JSON.parse(lines[0]!) as unknown);
@@ -568,11 +695,22 @@ export async function runCaseInIsolation(
     selected: SelectedCase,
     options: RunCaseOptions,
 ): Promise<CaseExecution> {
-    if (options.providerEndpoints) assertLoopbackProviderEndpoints(options.providerEndpoints);
-    const workspace = createCaseWorkspace(options.workspaceParentDir, selected.variantId, snapshot.runNonce);
+    if (options.providerEndpoints)
+        assertLoopbackProviderEndpoints(options.providerEndpoints);
+    const workspace = createCaseWorkspace(
+        options.workspaceParentDir,
+        selected.variantId,
+        snapshot.runNonce,
+    );
     const cap = options.diagnosticCapBytes ?? DEFAULT_DIAGNOSTIC_CAP_BYTES;
-    const stdoutSink = new DiagnosticSink(join(workspace.diagnosticsDir, "stdout.log"), cap);
-    const stderrSink = new DiagnosticSink(join(workspace.diagnosticsDir, "stderr.log"), cap);
+    const stdoutSink = new DiagnosticSink(
+        join(workspace.diagnosticsDir, "stdout.log"),
+        cap,
+    );
+    const stderrSink = new DiagnosticSink(
+        join(workspace.diagnosticsDir, "stderr.log"),
+        cap,
+    );
     let outcome: ProcessOutcome;
     try {
         const env = {
@@ -581,7 +719,14 @@ export async function runCaseInIsolation(
             ...(options.providerEndpoints ?? {}),
             ...(options.extraEnv ?? {}),
         };
-        outcome = await spawnCaseProcess(options.argv, workspace.root, env, options.timeoutMs, stdoutSink, stderrSink);
+        outcome = await spawnCaseProcess(
+            options.argv,
+            workspace.root,
+            env,
+            options.timeoutMs,
+            stdoutSink,
+            stderrSink,
+        );
     } finally {
         stdoutSink.close();
         stderrSink.close();
@@ -614,7 +759,9 @@ export async function runIncidentPool(
         harness: snapshot.harness,
         ledgerFingerprint: snapshot.ledgerFingerprint,
         selectedSetDigest: snapshot.selectedSetDigest,
-        selectedVariantIds: snapshot.selected.map((selected) => selected.variantId),
+        selectedVariantIds: snapshot.selected.map(
+            (selected) => selected.variantId,
+        ),
         familyCount: snapshot.familyCount,
         results,
     });

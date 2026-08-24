@@ -1,5 +1,11 @@
 import { afterAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdtempSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -71,10 +77,20 @@ function rawVariant(spec: VariantSpec): Record<string, unknown> {
             harness: spec.harness ?? "opencode",
             omitted:
                 spec.harness === "rust"
-                    ? [{ harness: "opencode" as const, reason: spec.omittedReason ?? "module authority lives in rust" }]
+                    ? [
+                          {
+                              harness: "opencode" as const,
+                              reason:
+                                  spec.omittedReason ??
+                                  "module authority lives in rust",
+                          },
+                      ]
                     : [],
         },
-        normative_checks: spec.normativeChecks ?? ["check-red-holds", "check-red-durable"],
+        normative_checks: spec.normativeChecks ?? [
+            "check-red-holds",
+            "check-red-durable",
+        ],
         blocked_by: spec.blockedBy ?? [],
     };
     return {
@@ -82,7 +98,10 @@ function rawVariant(spec: VariantSpec): Record<string, unknown> {
         lane: contract.lane,
         source_claims: ["claim-demo-one"],
         applicability: contract.applicability,
-        semantic_revision: { id: `rev-${spec.id.slice(4)}`, fingerprint: semanticFingerprint(contract, {}) },
+        semantic_revision: {
+            id: `rev-${spec.id.slice(4)}`,
+            fingerprint: semanticFingerprint(contract, {}),
+        },
         normative_checks: contract.normative_checks,
         verifier_binding: {
             driver: "demo/driver",
@@ -106,12 +125,17 @@ function fixtureCatalog(): IncidentCatalog {
                 variants: [
                     rawVariant({ id: "var-green-one", lane: "green" }),
                     rawVariant({ id: "var-red-one", lane: "known-red" }),
-                    rawVariant({ id: "var-blocked-one", lane: "known-red", blockedBy: ["var-red-one"] }),
+                    rawVariant({
+                        id: "var-blocked-one",
+                        lane: "known-red",
+                        blockedBy: ["var-red-one"],
+                    }),
                     rawVariant({
                         id: "var-rust-only",
                         lane: "green",
                         harness: "rust",
-                        omittedReason: "storage authority is module-owned on rust",
+                        omittedReason:
+                            "storage authority is module-owned on rust",
                     }),
                 ],
             },
@@ -149,11 +173,17 @@ interface Fixture {
 
 function fixture(): Fixture {
     const catalog = fixtureCatalog();
-    const variants = new Map(catalog.families[0]!.variants.map((variant) => [variant.id, variant]));
+    const variants = new Map(
+        catalog.families[0]!.variants.map((variant) => [variant.id, variant]),
+    );
     const events = [
         baselineEvent("adj-green-one", variants.get("var-green-one")!, "green"),
         baselineEvent("adj-red-one", variants.get("var-red-one")!, "red"),
-        baselineEvent("adj-blocked-one", variants.get("var-blocked-one")!, "red"),
+        baselineEvent(
+            "adj-blocked-one",
+            variants.get("var-blocked-one")!,
+            "red",
+        ),
         baselineEvent("adj-rust-only", variants.get("var-rust-only")!, "green"),
     ];
     return {
@@ -180,8 +210,11 @@ function snapshotFor(data: Fixture = fixture()): RunSnapshot {
 }
 
 function selectedCase(snapshot: RunSnapshot, variantId: string): SelectedCase {
-    const found = snapshot.selected.find((entry) => entry.variantId === variantId);
-    if (!found) throw new Error(`fixture variant ${variantId} was not selected`);
+    const found = snapshot.selected.find(
+        (entry) => entry.variantId === variantId,
+    );
+    if (!found)
+        throw new Error(`fixture variant ${variantId} was not selected`);
     return found;
 }
 
@@ -243,18 +276,42 @@ describe("semantic and implementation fingerprints", () => {
     };
 
     it("is insensitive to formatting and key order of structured data", () => {
-        const fixturesA = JSON.parse('{"seed": 7, "topic": "recall"}') as Record<string, unknown>;
-        const fixturesB = JSON.parse('{\n    "topic": "recall",\n    "seed": 7\n}') as Record<string, unknown>;
-        expect(semanticFingerprint(contract, fixturesA)).toBe(semanticFingerprint(contract, fixturesB));
+        const fixturesA = JSON.parse(
+            '{"seed": 7, "topic": "recall"}',
+        ) as Record<string, unknown>;
+        const fixturesB = JSON.parse(
+            '{\n    "topic": "recall",\n    "seed": 7\n}',
+        ) as Record<string, unknown>;
+        expect(semanticFingerprint(contract, fixturesA)).toBe(
+            semanticFingerprint(contract, fixturesB),
+        );
     });
 
     it("changes when any owning semantic input changes", () => {
         const base = semanticFingerprint(contract, { seed: 7 });
-        expect(semanticFingerprint({ ...contract, lane: "green" }, { seed: 7 })).not.toBe(base);
-        expect(semanticFingerprint({ ...contract, normative_checks: ["check-a"] }, { seed: 7 })).not.toBe(base);
-        expect(semanticFingerprint({ ...contract, blocked_by: ["var-dep"] }, { seed: 7 })).not.toBe(base);
         expect(
-            semanticFingerprint({ ...contract, applicability: { harness: "rust", omitted: [] } }, { seed: 7 }),
+            semanticFingerprint({ ...contract, lane: "green" }, { seed: 7 }),
+        ).not.toBe(base);
+        expect(
+            semanticFingerprint(
+                { ...contract, normative_checks: ["check-a"] },
+                { seed: 7 },
+            ),
+        ).not.toBe(base);
+        expect(
+            semanticFingerprint(
+                { ...contract, blocked_by: ["var-dep"] },
+                { seed: 7 },
+            ),
+        ).not.toBe(base);
+        expect(
+            semanticFingerprint(
+                {
+                    ...contract,
+                    applicability: { harness: "rust", omitted: [] },
+                },
+                { seed: 7 },
+            ),
         ).not.toBe(base);
         expect(semanticFingerprint(contract, { seed: 8 })).not.toBe(base);
     });
@@ -263,28 +320,46 @@ describe("semantic and implementation fingerprints", () => {
         const root = mkdtempSync(join(testRoot, "impl-"));
         writeFileSync(join(root, "driver.ts"), "export const a = 1;\n");
         writeFileSync(join(root, "verifier.ts"), "export const b = 2;\n");
-        const digest = implementationBundleDigest(root, ["driver.ts", "verifier.ts"]);
-        expect(implementationBundleDigest(root, ["verifier.ts", "driver.ts"])).toBe(digest);
+        const digest = implementationBundleDigest(root, [
+            "driver.ts",
+            "verifier.ts",
+        ]);
+        expect(
+            implementationBundleDigest(root, ["verifier.ts", "driver.ts"]),
+        ).toBe(digest);
         writeFileSync(join(root, "driver.ts"), "export const a = 2;\n");
-        expect(implementationBundleDigest(root, ["driver.ts", "verifier.ts"])).not.toBe(digest);
+        expect(
+            implementationBundleDigest(root, ["driver.ts", "verifier.ts"]),
+        ).not.toBe(digest);
     });
 
     it("rejects non-root-confined implementation files", () => {
         const root = mkdtempSync(join(testRoot, "impl-confine-"));
-        expect(() => implementationBundleDigest(root, ["../escape.ts"])).toThrow(/root-confined/);
-        expect(() => implementationBundleDigest(root, ["/abs/path.ts"])).toThrow(/root-confined/);
-        expect(() => implementationBundleDigest(root, [])).toThrow(/must not be empty/);
+        expect(() =>
+            implementationBundleDigest(root, ["../escape.ts"]),
+        ).toThrow(/root-confined/);
+        expect(() =>
+            implementationBundleDigest(root, ["/abs/path.ts"]),
+        ).toThrow(/root-confined/);
+        expect(() => implementationBundleDigest(root, [])).toThrow(
+            /must not be empty/,
+        );
     });
 
     it("changes the ledger fingerprint when a baseline event is appended", () => {
         const data = fixture();
         const base = ledgerFingerprint(data.adjudicationLines);
-        expect(ledgerFingerprint([...data.adjudicationLines, '{"appended":true}'])).not.toBe(base);
+        expect(
+            ledgerFingerprint([...data.adjudicationLines, '{"appended":true}']),
+        ).not.toBe(base);
         expect(ledgerFingerprint(data.adjudicationLines)).toBe(base);
     });
 });
 
-function registeredCase(variantId: string, files: string[] = ["packages/e2e-tests/package.json"]): RegisteredIncidentCase {
+function registeredCase(
+    variantId: string,
+    files: string[] = ["packages/e2e-tests/package.json"],
+): RegisteredIncidentCase {
     return {
         variantId,
         implementationFiles: files,
@@ -300,11 +375,16 @@ describe("case registry", () => {
     it("requires a registered case for every executable variant and no extras", () => {
         const catalog = fixtureCatalog();
         const registry = builtinIncidentCaseRegistry();
-        expect(() => validateRegistryCatalogCorrespondence(registry, catalog)).toThrow(/no registered case/);
-        for (const variant of catalog.families[0]!.variants) registerIncidentCase(registry, registeredCase(variant.id));
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(/no registered case/);
+        for (const variant of catalog.families[0]!.variants)
+            registerIncidentCase(registry, registeredCase(variant.id));
         validateRegistryCatalogCorrespondence(registry, catalog);
         registerIncidentCase(registry, registeredCase("var-orphan"));
-        expect(() => validateRegistryCatalogCorrespondence(registry, catalog)).toThrow(/no executable catalog variant/);
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(/no executable catalog variant/);
     });
 
     it("rejects a registration whose fixtures drift from the catalog fingerprint", () => {
@@ -316,29 +396,38 @@ describe("case registry", () => {
                 fixtures: variant.id === "var-red-one" ? { drifted: true } : {},
             });
         }
-        expect(() => validateRegistryCatalogCorrespondence(registry, catalog)).toThrow(/new semantic revision/);
+        expect(() =>
+            validateRegistryCatalogCorrespondence(registry, catalog),
+        ).toThrow(/new semantic revision/);
     });
 
     it("rejects duplicate registrations and unconfined file lists", () => {
         const registry = builtinIncidentCaseRegistry();
         registerIncidentCase(registry, registeredCase("var-red-one"));
-        expect(() => registerIncidentCase(registry, registeredCase("var-red-one"))).toThrow(/duplicate/);
-        expect(() => registerIncidentCase(registry, registeredCase("var-x", ["../outside.ts"]))).toThrow(
-            /root-confined/,
-        );
+        expect(() =>
+            registerIncidentCase(registry, registeredCase("var-red-one")),
+        ).toThrow(/duplicate/);
+        expect(() =>
+            registerIncidentCase(
+                registry,
+                registeredCase("var-x", ["../outside.ts"]),
+            ),
+        ).toThrow(/root-confined/);
     });
 });
 
 describe("run snapshot selection", () => {
     it("selects applicable executable variants and documents exclusions", () => {
         const snapshot = snapshotFor();
-        expect(snapshot.selected.map((entry) => entry.variantId).sort()).toEqual([
-            "var-blocked-one",
-            "var-green-one",
-            "var-red-one",
-        ]);
-        const excluded = snapshot.excluded.find((entry) => entry.variantId === "var-rust-only");
-        expect(excluded?.reason).toBe("storage authority is module-owned on rust");
+        expect(
+            snapshot.selected.map((entry) => entry.variantId).sort(),
+        ).toEqual(["var-blocked-one", "var-green-one", "var-red-one"]);
+        const excluded = snapshot.excluded.find(
+            (entry) => entry.variantId === "var-rust-only",
+        );
+        expect(excluded?.reason).toBe(
+            "storage authority is module-owned on rust",
+        );
         expect(snapshot.familyCount).toBe(1);
         expect(snapshot.variantCount).toBe(3);
     });
@@ -362,27 +451,32 @@ describe("run snapshot selection", () => {
             lanes: ["known-red"],
             implementationDigests: data.implementationDigests,
         });
-        expect(snapshot.selected.map((entry) => entry.variantId).sort()).toEqual([
-            "var-blocked-one",
-            "var-red-one",
-        ]);
+        expect(
+            snapshot.selected.map((entry) => entry.variantId).sort(),
+        ).toEqual(["var-blocked-one", "var-red-one"]);
     });
 
     it("fails hard on a missing baseline or implementation digest", () => {
         const data = fixture();
-        const noBaseline = data.events.filter((event) => event.identity !== "var-red-one");
+        const noBaseline = data.events.filter(
+            (event) => event.identity !== "var-red-one",
+        );
         expect(() =>
             buildRunSnapshot({
                 catalog: data.catalog,
                 ledger: replayAdjudicationLedger(noBaseline),
-                adjudicationLines: noBaseline.map((event) => JSON.stringify(event)),
+                adjudicationLines: noBaseline.map((event) =>
+                    JSON.stringify(event),
+                ),
                 harness: "opencode",
                 lanes: ["green", "known-red"],
                 implementationDigests: data.implementationDigests,
             }),
         ).toThrow(/no reviewed baseline/);
         data.implementationDigests.delete("var-green-one");
-        expect(() => snapshotFor(data)).toThrow(/no implementation-bundle digest/);
+        expect(() => snapshotFor(data)).toThrow(
+            /no implementation-bundle digest/,
+        );
     });
 });
 
@@ -409,13 +503,17 @@ describe("isolated case execution", () => {
             red,
             `sendEnvelope({ verdict: "assertion_fail", failed_checks: ["check-red-holds", "check-red-durable"], observation_signature: ${JSON.stringify(RED_SIGNATURE)} });`,
         );
-        expect(additional.result.baseline_comparison).toBe("unexpected_failure");
+        expect(additional.result.baseline_comparison).toBe(
+            "unexpected_failure",
+        );
         const differentSignature = await runFakeChild(
             snapshot,
             red,
             `sendEnvelope({ verdict: "assertion_fail", failed_checks: ["check-red-holds"], observation_signature: ${JSON.stringify(HEX("9"))} });`,
         );
-        expect(differentSignature.result.baseline_comparison).toBe("unexpected_failure");
+        expect(differentSignature.result.baseline_comparison).toBe(
+            "unexpected_failure",
+        );
     }, 20_000);
 
     it("marks a passing red baseline as resolution_candidate (AE4)", async () => {
@@ -438,7 +536,11 @@ describe("isolated case execution", () => {
     }, 20_000);
 
     it("classifies unhealthy children as not_evaluated and unscored (AE2)", async () => {
-        const crashThrow = await runFakeChild(snapshot, red, 'throw new Error("driver blew up before observations");');
+        const crashThrow = await runFakeChild(
+            snapshot,
+            red,
+            'throw new Error("driver blew up before observations");',
+        );
         expect(crashThrow.result.run_health).toBe("crash");
         const forgedStdout = await runFakeChild(
             snapshot,
@@ -447,7 +549,11 @@ describe("isolated case execution", () => {
         );
         expect(forgedStdout.result.run_health).toBe("crash");
         expect(forgedStdout.result.reason_code).toBe("exited_without_envelope");
-        const malformedJson = await runFakeChild(snapshot, red, 'writeSync(3, "not json at all\\n");');
+        const malformedJson = await runFakeChild(
+            snapshot,
+            red,
+            'writeSync(3, "not json at all\\n");',
+        );
         expect(malformedJson.result.run_health).toBe("malformed");
         expect(malformedJson.result.reason_code).toBe("invalid_envelope");
         const stale = await runFakeChild(
@@ -457,7 +563,12 @@ describe("isolated case execution", () => {
         );
         expect(stale.result.run_health).toBe("malformed");
         expect(stale.result.reason_code).toBe("snapshot_mismatch");
-        for (const result of [crashThrow.result, forgedStdout.result, malformedJson.result, stale.result]) {
+        for (const result of [
+            crashThrow.result,
+            forgedStdout.result,
+            malformedJson.result,
+            stale.result,
+        ]) {
             expect(result.behavioral_verdict).toBe("not_evaluated");
             expect(result.baseline_comparison).toBe("unscored");
         }
@@ -470,7 +581,11 @@ describe("isolated case execution", () => {
             'sendEnvelope({ run_nonce: "ffffffffffffffffffffffffffffffff" });',
         );
         expect(wrongNonce.result.reason_code).toBe("snapshot_mismatch");
-        const wrongBaseline = await runFakeChild(snapshot, red, 'sendEnvelope({ baseline_event_id: "adj-green-one" });');
+        const wrongBaseline = await runFakeChild(
+            snapshot,
+            red,
+            'sendEnvelope({ baseline_event_id: "adj-green-one" });',
+        );
         expect(wrongBaseline.result.reason_code).toBe("snapshot_mismatch");
     }, 20_000);
 
@@ -485,13 +600,21 @@ describe("isolated case execution", () => {
     }, 20_000);
 
     it("rejects duplicate envelopes on the result channel", async () => {
-        const { result } = await runFakeChild(snapshot, red, "sendEnvelope(); sendEnvelope();");
+        const { result } = await runFakeChild(
+            snapshot,
+            red,
+            "sendEnvelope(); sendEnvelope();",
+        );
         expect(result.run_health).toBe("malformed");
         expect(result.reason_code).toBe("duplicate_envelope");
     }, 20_000);
 
     it("caps the envelope channel and classifies oversized output as malformed", async () => {
-        const { result } = await runFakeChild(snapshot, red, 'writeSync(3, "x".repeat(80 * 1024));');
+        const { result } = await runFakeChild(
+            snapshot,
+            red,
+            'writeSync(3, "x".repeat(80 * 1024));',
+        );
         expect(result.run_health).toBe("malformed");
         expect(result.reason_code).toBe("envelope_oversized");
     }, 20_000);
@@ -523,7 +646,11 @@ describe("case isolation", () => {
     const red = selectedCase(snapshot, "var-red-one");
 
     it("creates an owner-only workspace and deletes it at teardown", () => {
-        const workspace = createCaseWorkspace(testRoot, "var-perm-check", snapshot.runNonce);
+        const workspace = createCaseWorkspace(
+            testRoot,
+            "var-perm-check",
+            snapshot.runNonce,
+        );
         expect(statSync(workspace.root).mode & 0o777).toBe(0o700);
         expect(statSync(workspace.store).mode & 0o777).toBe(0o700);
         expect(workspace.storeNamespace).toContain("var-perm-check");
@@ -532,7 +659,11 @@ describe("case isolation", () => {
     });
 
     it("builds an allowlisted env with relocated home and temp roots", () => {
-        const workspace = createCaseWorkspace(testRoot, "var-env-check", snapshot.runNonce);
+        const workspace = createCaseWorkspace(
+            testRoot,
+            "var-env-check",
+            snapshot.runNonce,
+        );
         const env = buildCaseEnv(workspace, {
             PATH: "/usr/bin",
             HOME: "/real/home",
@@ -586,17 +717,28 @@ sendEnvelope();`;
         expect(isLoopbackUrl("http://[::1]:8080")).toBe(true);
         expect(isLoopbackUrl("http://127.evil.com/")).toBe(false);
         expect(isLoopbackUrl("http://10.0.0.5:8080")).toBe(false);
-        expect(() => assertLoopbackProviderEndpoints({ MC_E2E_PROVIDER_URL: "http://10.0.0.5:8080" })).toThrow(
-            /not a loopback/,
-        );
+        expect(() =>
+            assertLoopbackProviderEndpoints({
+                MC_E2E_PROVIDER_URL: "http://10.0.0.5:8080",
+            }),
+        ).toThrow(/not a loopback/);
         await expect(
             runFakeChild(snapshot, green, "sendEnvelope();", {
-                providerEndpoints: { MC_E2E_PROVIDER_URL: "https://api.provider.example" },
+                providerEndpoints: {
+                    MC_E2E_PROVIDER_URL: "https://api.provider.example",
+                },
             }),
         ).rejects.toThrow(/not a loopback/);
-        const loopback = await runFakeChild(snapshot, green, "sendEnvelope();", {
-            providerEndpoints: { MC_E2E_PROVIDER_URL: "http://127.0.0.1:19999" },
-        });
+        const loopback = await runFakeChild(
+            snapshot,
+            green,
+            "sendEnvelope();",
+            {
+                providerEndpoints: {
+                    MC_E2E_PROVIDER_URL: "http://127.0.0.1:19999",
+                },
+            },
+        );
         expect(loopback.result.behavioral_verdict).toBe("pass");
     }, 20_000);
 
@@ -622,17 +764,27 @@ import { spawn } from "node:child_process";
 spawn(process.execPath, ["-e", "setTimeout(()=>{require('node:fs').writeFileSync(process.env.LATE_MARKER,'late')},2500)"], { stdio: "ignore", env });
 setInterval(() => {}, 1000);`;
         const started = Date.now();
-        const { result, diagnostics } = await runFakeChild(snapshot, red, body, {
-            timeoutMs: 900,
-            extraEnv: { LATE_MARKER: marker },
-        });
+        const { result, diagnostics } = await runFakeChild(
+            snapshot,
+            red,
+            body,
+            {
+                timeoutMs: 900,
+                extraEnv: { LATE_MARKER: marker },
+            },
+        );
         expect(result.run_health).toBe("timeout");
         expect(result.behavioral_verdict).toBe("not_evaluated");
         expect(result.baseline_comparison).toBe("unscored");
         expect(result.reason_code).toBe("deadline_exceeded");
         expect(diagnostics.workspaceDeleted).toBe(true);
         // The descendant writes after 2500 ms; the marker must remain absent after that delay. commentlint: allow(JUDGE)
-        await new Promise((resolveWait) => setTimeout(resolveWait, Math.max(0, 3_000 - (Date.now() - started))));
+        await new Promise((resolveWait) =>
+            setTimeout(
+                resolveWait,
+                Math.max(0, 3_000 - (Date.now() - started)),
+            ),
+        );
         expect(existsSync(marker)).toBe(false);
     }, 20_000);
 
@@ -640,9 +792,14 @@ setInterval(() => {}, 1000);`;
         const body = `
 for (let i = 0; i < 200; i += 1) console.log("DIAGNOSTIC-NOISE-" + "y".repeat(1024));
 sendEnvelope();`;
-        const { result, diagnostics } = await runFakeChild(snapshot, green, body, {
-            diagnosticCapBytes: 4_096,
-        });
+        const { result, diagnostics } = await runFakeChild(
+            snapshot,
+            green,
+            body,
+            {
+                diagnosticCapBytes: 4_096,
+            },
+        );
         expect(result.behavioral_verdict).toBe("pass");
         expect(diagnostics.stdoutTruncated).toBe(true);
         expect(diagnostics.stdoutBytes).toBeLessThanOrEqual(4_096);
@@ -672,8 +829,15 @@ function reportInput(snapshot: RunSnapshot, results: IncidentCaseResult[]) {
     };
 }
 
-async function completedPass(snapshot: RunSnapshot, selected: SelectedCase): Promise<IncidentCaseResult> {
-    const { result } = await runFakeChild(snapshot, selected, "sendEnvelope();");
+async function completedPass(
+    snapshot: RunSnapshot,
+    selected: SelectedCase,
+): Promise<IncidentCaseResult> {
+    const { result } = await runFakeChild(
+        snapshot,
+        selected,
+        "sendEnvelope();",
+    );
     return result;
 }
 
@@ -684,19 +848,29 @@ describe("catalog-bound report", () => {
     const blocked = selectedCase(snapshot, "var-blocked-one");
 
     it("rejects an empty selection", () => {
-        expect(() => buildIncidentReport(reportInput(snapshot, []))).toThrow(/selection is empty/);
+        expect(() => buildIncidentReport(reportInput(snapshot, []))).toThrow(
+            /selection is empty/,
+        );
     });
 
     it("requires exactly one terminal result per selected variant", async () => {
         const result = await completedPass(snapshot, green);
         const base = reportInput(snapshot, [result]);
-        expect(() => buildIncidentReport({ ...base, results: [result, result] })).toThrow(/duplicate terminal result/);
         expect(() =>
-            buildIncidentReport({ ...base, selectedVariantIds: ["var-green-one", "var-red-one"] }),
+            buildIncidentReport({ ...base, results: [result, result] }),
+        ).toThrow(/duplicate terminal result/);
+        expect(() =>
+            buildIncidentReport({
+                ...base,
+                selectedVariantIds: ["var-green-one", "var-red-one"],
+            }),
         ).toThrow(/missing terminal result/);
-        expect(() => buildIncidentReport({ ...base, selectedVariantIds: ["var-red-one"] })).toThrow(
-            /unexpected result/,
-        );
+        expect(() =>
+            buildIncidentReport({
+                ...base,
+                selectedVariantIds: ["var-red-one"],
+            }),
+        ).toThrow(/unexpected result/);
     }, 20_000);
 
     it("publishes atomically: an interrupted publication is not structurally complete", async () => {
@@ -705,7 +879,9 @@ describe("catalog-bound report", () => {
         const target = join(testRoot, "reports", "incident-report.json");
         publishIncidentReport(report, join(testRoot, "reports", "warmup.json"));
         // The test simulates interruption after writing the temporary file and before renaming it. commentlint: allow(JUDGE)
-        writeFileSync(`${target}.tmp-dead`, JSON.stringify(report), { flag: "w" });
+        writeFileSync(`${target}.tmp-dead`, JSON.stringify(report), {
+            flag: "w",
+        });
         expect(existsSync(target)).toBe(false);
         expect(() => readIncidentReport(target)).toThrow();
         publishIncidentReport(report, target);
@@ -718,20 +894,42 @@ describe("catalog-bound report", () => {
     it("rejects tampered completion markers and completeness flags", async () => {
         const result = await completedPass(snapshot, green);
         const report = buildIncidentReport(reportInput(snapshot, [result]));
-        const raw = JSON.parse(JSON.stringify(report)) as Record<string, unknown>;
-        expect(() => parseIncidentReport({ ...raw, completion_marker: false })).toThrow(/completion_marker/);
-        expect(() => parseIncidentReport({ ...raw, evaluation_complete: false })).toThrow(/evaluation_complete/);
-        expect(() => parseIncidentReport({ ...raw, expected_count: 5 })).toThrow(/expected_count/);
-        expect(() => parseIncidentReport({ ...raw, extra_field: 1 })).toThrow(/exactly/);
+        const raw = JSON.parse(JSON.stringify(report)) as Record<
+            string,
+            unknown
+        >;
+        expect(() =>
+            parseIncidentReport({ ...raw, completion_marker: false }),
+        ).toThrow(/completion_marker/);
+        expect(() =>
+            parseIncidentReport({ ...raw, evaluation_complete: false }),
+        ).toThrow(/evaluation_complete/);
+        expect(() =>
+            parseIncidentReport({ ...raw, expected_count: 5 }),
+        ).toThrow(/expected_count/);
+        expect(() => parseIncidentReport({ ...raw, extra_field: 1 })).toThrow(
+            /exactly/,
+        );
     }, 20_000);
 
     it("publishes structurally complete facts for unhealthy runs with evaluation completeness false", async () => {
         const unavailable = unavailableCaseResult(red);
-        const timeout = await runFakeChild(snapshot, green, "setInterval(() => {}, 1000);", { timeoutMs: 700 });
-        const report = buildIncidentReport(reportInput(snapshot, [unavailable, timeout.result]));
+        const timeout = await runFakeChild(
+            snapshot,
+            green,
+            "setInterval(() => {}, 1000);",
+            { timeoutMs: 700 },
+        );
+        const report = buildIncidentReport(
+            reportInput(snapshot, [unavailable, timeout.result]),
+        );
         expect(report.completion_marker).toBe(true);
         expect(report.evaluation_complete).toBe(false);
-        expect(report.results.every((entry) => entry.behavioral_verdict === "not_evaluated")).toBe(true);
+        expect(
+            report.results.every(
+                (entry) => entry.behavioral_verdict === "not_evaluated",
+            ),
+        ).toBe(true);
         expect(incidentPoolExitCode(report)).toBe(1);
     }, 20_000);
 
@@ -746,14 +944,22 @@ describe("catalog-bound report", () => {
             blocked,
             'sendEnvelope({ preconditions: "failed", precondition_reason: "blocked_by_dependency", blocked_by: ["var-red-one"], verdict: null });',
         );
-        const blockedReport = buildIncidentReport(reportInput(snapshot, [redResult.result, blockedResult.result]));
+        const blockedReport = buildIncidentReport(
+            reportInput(snapshot, [redResult.result, blockedResult.result]),
+        );
         expect(blockedReport.evaluation_complete).toBe(false);
         expect(unexpectedIncompleteResults(blockedReport)).toEqual([]);
         expect(incidentPoolExitCode(blockedReport)).toBe(0);
 
         const crashed = await runFakeChild(snapshot, green, "process.exit(3);");
-        const crashReport = buildIncidentReport(reportInput(snapshot, [redResult.result, crashed.result]));
-        expect(unexpectedIncompleteResults(crashReport).map((entry) => entry.variant_id)).toEqual(["var-green-one"]);
+        const crashReport = buildIncidentReport(
+            reportInput(snapshot, [redResult.result, crashed.result]),
+        );
+        expect(
+            unexpectedIncompleteResults(crashReport).map(
+                (entry) => entry.variant_id,
+            ),
+        ).toEqual(["var-green-one"]);
         expect(incidentPoolExitCode(crashReport)).toBe(1);
     }, 20_000);
 
@@ -765,18 +971,34 @@ describe("catalog-bound report", () => {
                 'sendEnvelope({ preconditions: "failed", precondition_reason: "blocked_by_dependency", blocked_by: ["var-red-one"], verdict: null });',
         };
         const report = await runIncidentPool(snapshot, async (selected) => {
-            const { result } = await runFakeChild(snapshot, selected, scriptByVariant[selected.variantId]!);
+            const { result } = await runFakeChild(
+                snapshot,
+                selected,
+                scriptByVariant[selected.variantId]!,
+            );
             return result;
         });
         expect(report.expected_count).toBe(3);
         expect(report.family_count).toBe(1);
-        const byVariant = new Map(report.results.map((entry) => [entry.variant_id, entry]));
-        expect(byVariant.get("var-red-one")?.baseline_comparison).toBe("expected_red");
-        expect(byVariant.get("var-green-one")?.baseline_comparison).toBe("expected_green");
-        expect(byVariant.get("var-blocked-one")?.reason_code).toBe("blocked_by_dependency");
+        const byVariant = new Map(
+            report.results.map((entry) => [entry.variant_id, entry]),
+        );
+        expect(byVariant.get("var-red-one")?.baseline_comparison).toBe(
+            "expected_red",
+        );
+        expect(byVariant.get("var-green-one")?.baseline_comparison).toBe(
+            "expected_green",
+        );
+        expect(byVariant.get("var-blocked-one")?.reason_code).toBe(
+            "blocked_by_dependency",
+        );
         expect(report.evaluation_complete).toBe(false);
         expect(incidentPoolExitCode(report)).toBe(0);
-        expect(byVariant.get("var-red-one")?.semantic_fingerprint).toBe(red.semanticFingerprint);
-        expect(byVariant.get("var-red-one")?.implementation_digest).toBe(IMPL_DIGEST_RED);
+        expect(byVariant.get("var-red-one")?.semantic_fingerprint).toBe(
+            red.semanticFingerprint,
+        );
+        expect(byVariant.get("var-red-one")?.implementation_digest).toBe(
+            IMPL_DIGEST_RED,
+        );
     }, 30_000);
 });

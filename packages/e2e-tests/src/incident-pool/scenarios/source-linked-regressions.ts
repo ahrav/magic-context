@@ -15,7 +15,11 @@
  * the incident registry.
  */
 
-import { findBusts, formatBustReport, mainAgentRequests } from "../../cache-analysis";
+import {
+    findBusts,
+    formatBustReport,
+    mainAgentRequests,
+} from "../../cache-analysis";
 import type { TestHarness } from "../../harness";
 import type { MockUsage } from "../../mock-provider/server";
 
@@ -30,12 +34,19 @@ export interface RegressionResult {
 }
 
 function resultFromChecks(checks: RegressionCheck[]): RegressionResult {
-    return { verdict: checks.every((check) => check.passed) ? "pass" : "assertion_fail", checks };
+    return {
+        verdict: checks.every((check) => check.passed)
+            ? "pass"
+            : "assertion_fail",
+        checks,
+    };
 }
 
 /** Failed-check IDs, for wrapper assertions and error messages. */
 export function failedCheckIds(result: RegressionResult): string[] {
-    return result.checks.filter((check) => !check.passed).map((check) => check.id);
+    return result.checks
+        .filter((check) => !check.passed)
+        .map((check) => check.id);
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +92,10 @@ export async function driveFirstRenderPureDeferStability(
     const sessionId = await h.createSession();
     for (let i = 1; i <= 6; i++) {
         h.mock.setDefault({ text: `A1 reply ${i}`, usage: DEFER_USAGE });
-        await h.sendPrompt(sessionId, `A1 turn ${i}: low-pressure cache-stability probe.`);
+        await h.sendPrompt(
+            sessionId,
+            `A1 turn ${i}: low-pressure cache-stability probe.`,
+        );
     }
     const requests = mainAgentRequests(h.mock.requests());
     const busts = findBusts(requests);
@@ -96,8 +110,14 @@ export function verifyFirstRenderPureDeferStability(
     observation: FirstRenderDeferObservation,
 ): RegressionResult {
     return resultFromChecks([
-        { id: "check-a1-defer-request-floor", passed: observation.mainRequestCount >= 6 },
-        { id: "check-a1-zero-prefix-busts", passed: observation.bustCount === 0 },
+        {
+            id: "check-a1-defer-request-floor",
+            passed: observation.mainRequestCount >= 6,
+        },
+        {
+            id: "check-a1-zero-prefix-busts",
+            passed: observation.bustCount === 0,
+        },
     ]);
 }
 
@@ -110,8 +130,14 @@ function emitCtxReduceOnce(h: TestHarness, drop: string): void {
         if (!sys.includes("## Magic Context")) return null;
         const tools = Array.isArray(body.tools) ? body.tools : [];
         const name = tools
-            .map((t) => (t && typeof t === "object" ? (t as { name?: unknown }).name : null))
-            .find((n) => typeof n === "string" && /ctx_reduce/.test(n)) as string | undefined;
+            .map((t) =>
+                t && typeof t === "object"
+                    ? (t as { name?: unknown }).name
+                    : null,
+            )
+            .find((n) => typeof n === "string" && /ctx_reduce/.test(n)) as
+            | string
+            | undefined;
         if (!name) return null;
         emitted = true;
         return {
@@ -129,20 +155,31 @@ function emitCtxReduceOnce(h: TestHarness, drop: string): void {
     });
 }
 
-export async function driveAgedCtxReduceSurvival(h: TestHarness): Promise<AgedCtxReduceObservation> {
+export async function driveAgedCtxReduceSurvival(
+    h: TestHarness,
+): Promise<AgedCtxReduceObservation> {
     const sessionId = await h.createSession();
     h.mock.setDefault({ text: "A3 reply 1", usage: DEFER_USAGE });
     await h.sendPrompt(sessionId, "A3 turn 1: establish baseline content.");
 
     emitCtxReduceOnce(h, "99999");
-    h.mock.setDefault({ text: "A3 reply 2 (after ctx_reduce tool call)", usage: DEFER_USAGE });
-    await h.sendPrompt(sessionId, "A3 turn 2: this turn issues a ctx_reduce call.");
+    h.mock.setDefault({
+        text: "A3 reply 2 (after ctx_reduce tool call)",
+        usage: DEFER_USAGE,
+    });
+    await h.sendPrompt(
+        sessionId,
+        "A3 turn 2: this turn issues a ctx_reduce call.",
+    );
 
     // Age the ctx_reduce call past the protected window with pure-defer growth.
     let sawReduceOnWire = false;
     for (let i = 3; i <= 8; i++) {
         h.mock.setDefault({ text: `A3 defer reply ${i}`, usage: DEFER_USAGE });
-        await h.sendPrompt(sessionId, `A3 turn ${i}: defer growth ages the ctx_reduce call.`);
+        await h.sendPrompt(
+            sessionId,
+            `A3 turn ${i}: defer growth ages the ctx_reduce call.`,
+        );
         const body = JSON.stringify(h.mock.lastRequest()?.body ?? {});
         if (body.includes("ctx_reduce")) sawReduceOnWire = true;
     }
@@ -158,11 +195,19 @@ export async function driveAgedCtxReduceSurvival(h: TestHarness): Promise<AgedCt
     };
 }
 
-export function verifyAgedCtxReduceSurvival(observation: AgedCtxReduceObservation): RegressionResult {
+export function verifyAgedCtxReduceSurvival(
+    observation: AgedCtxReduceObservation,
+): RegressionResult {
     return resultFromChecks([
         { id: "check-a3-reduce-on-wire", passed: observation.sawReduceOnWire },
-        { id: "check-a3-zero-prefix-busts", passed: observation.bustCount === 0 },
-        { id: "check-a3-reduce-retained-final-wire", passed: observation.finalWireHasCtxReduce },
+        {
+            id: "check-a3-zero-prefix-busts",
+            passed: observation.bustCount === 0,
+        },
+        {
+            id: "check-a3-reduce-retained-final-wire",
+            passed: observation.finalWireHasCtxReduce,
+        },
     ]);
 }
 
@@ -221,16 +266,27 @@ interface AnthropicMessage {
 }
 
 function messagesOf(body: Record<string, unknown>): AnthropicMessage[] {
-    return Array.isArray(body.messages) ? (body.messages as AnthropicMessage[]) : [];
+    return Array.isArray(body.messages)
+        ? (body.messages as AnthropicMessage[])
+        : [];
 }
 
-function mainRequests(h: TestHarness): Array<{ body: Record<string, unknown> }> {
+function mainRequests(
+    h: TestHarness,
+): Array<{ body: Record<string, unknown> }> {
     return h.mock
         .requests()
-        .filter((request) => JSON.stringify(request.body.system ?? "").includes("## Magic Context"));
+        .filter((request) =>
+            JSON.stringify(request.body.system ?? "").includes(
+                "## Magic Context",
+            ),
+        );
 }
 
-function blocksOfRole(body: Record<string, unknown>, role: string): AnthropicContentBlock[] {
+function blocksOfRole(
+    body: Record<string, unknown>,
+    role: string,
+): AnthropicContentBlock[] {
     return messagesOf(body)
         .filter((m) => m.role === role)
         .flatMap((m) => (Array.isArray(m.content) ? m.content : []));
@@ -243,18 +299,24 @@ function userText(body: Record<string, unknown>): string {
         .join("\n");
 }
 
-function findThinkingBlocks(body: Record<string, unknown>): AnthropicContentBlock[] {
+function findThinkingBlocks(
+    body: Record<string, unknown>,
+): AnthropicContentBlock[] {
     const out: AnthropicContentBlock[] = [];
     for (const msg of messagesOf(body)) {
         if (!Array.isArray(msg.content)) continue;
         for (const block of msg.content) {
-            if (block.type === "thinking" || block.type === "redacted_thinking") out.push(block);
+            if (block.type === "thinking" || block.type === "redacted_thinking")
+                out.push(block);
         }
     }
     return out;
 }
 
-function toolName(body: Record<string, unknown>, pattern: RegExp): string | null {
+function toolName(
+    body: Record<string, unknown>,
+    pattern: RegExp,
+): string | null {
     const tools = body.tools;
     if (!Array.isArray(tools)) return null;
     for (const tool of tools) {
@@ -268,7 +330,11 @@ function toolName(body: Record<string, unknown>, pattern: RegExp): string | null
 function emitThinkingCtxReduceOnce(h: TestHarness, tag: number): () => boolean {
     let emitted = false;
     h.mock.addMatcher((body) => {
-        if (emitted || !JSON.stringify(body.system ?? "").includes("## Magic Context")) return null;
+        if (
+            emitted ||
+            !JSON.stringify(body.system ?? "").includes("## Magic Context")
+        )
+            return null;
         const name = toolName(body, /^ctx_reduce$/);
         if (!name) return null;
         emitted = true;
@@ -307,7 +373,10 @@ function tagForText(body: Record<string, unknown>, needle: string): number {
     throw new Error(`no §N§ tag found for ${JSON.stringify(needle)}`);
 }
 
-async function ageTagBeyondProtectedWindow(h: TestHarness, sessionId: string): Promise<void> {
+async function ageTagBeyondProtectedWindow(
+    h: TestHarness,
+    sessionId: string,
+): Promise<void> {
     h.mock.reset();
     h.mock.setDefault({
         text: "aging response",
@@ -352,7 +421,10 @@ async function dropAndMaterialize(
         },
     });
     await h.sendPrompt(sessionId, "inspect the reduced history");
-    return { body: mainRequests(h).at(-1)!.body, dropEmitted: wasDropEmitted() };
+    return {
+        body: mainRequests(h).at(-1)!.body,
+        dropEmitted: wasDropEmitted(),
+    };
 }
 
 const NUDGE_MARKERS = [
@@ -397,12 +469,20 @@ export async function driveThinkingNudgeAnchor(
 
     const sessionId = await h.createSession();
     await h.sendPrompt(sessionId, "turn 1 — establish the thinking block");
-    await h.sendPrompt(sessionId, "turn 2 — give nudge logic a chance to anchor");
-    await h.sendPrompt(sessionId, "turn 3 — defer pass must not mutate signed msg");
+    await h.sendPrompt(
+        sessionId,
+        "turn 2 — give nudge logic a chance to anchor",
+    );
+    await h.sendPrompt(
+        sessionId,
+        "turn 3 — defer pass must not mutate signed msg",
+    );
 
     const reqs = mainRequests(h);
     const lastBody = reqs.at(-1)?.body ?? {};
-    const assistants = messagesOf(lastBody).filter((m) => m.role === "assistant");
+    const assistants = messagesOf(lastBody).filter(
+        (m) => m.role === "assistant",
+    );
 
     let inspected = 0;
     let nudgeMarkerFound = false;
@@ -415,19 +495,27 @@ export async function driveThinkingNudgeAnchor(
         if (!hasMatchingSig) {
             if (options.rustMode) {
                 const serialized = JSON.stringify(asst.content);
-                if (NUDGE_MARKERS.some((marker) => serialized.includes(marker))) nudgeMarkerFound = true;
+                if (NUDGE_MARKERS.some((marker) => serialized.includes(marker)))
+                    nudgeMarkerFound = true;
             }
             continue;
         }
         inspected++;
         for (const block of asst.content) {
             if (block.type !== "text") continue;
-            if (NUDGE_MARKERS.some((marker) => (block.text ?? "").includes(marker))) {
+            if (
+                NUDGE_MARKERS.some((marker) =>
+                    (block.text ?? "").includes(marker),
+                )
+            ) {
                 nudgeMarkerFound = true;
             }
         }
         const thinking = asst.content.find((b) => b.type === "thinking");
-        if (thinking?.thinking !== signedThinking || thinking?.signature !== signature) {
+        if (
+            thinking?.thinking !== signedThinking ||
+            thinking?.signature !== signature
+        ) {
             thinkingByteStable = false;
         }
     }
@@ -442,7 +530,9 @@ export async function driveThinkingNudgeAnchor(
     };
 }
 
-export function verifyThinkingNudgeAnchor(observation: ThinkingNudgeAnchorObservation): RegressionResult {
+export function verifyThinkingNudgeAnchor(
+    observation: ThinkingNudgeAnchorObservation,
+): RegressionResult {
     return resultFromChecks([
         {
             id: "check-thinking-a-no-nudge-in-signed-assistant",
@@ -460,7 +550,8 @@ export function verifyThinkingNudgeAnchor(observation: ThinkingNudgeAnchorObserv
             id: "check-thinking-a-nonvacuous-inspection",
             passed:
                 observation.mainRequestCount >= 3 &&
-                (observation.rustMode || observation.inspectedSignedAssistants > 0),
+                (observation.rustMode ||
+                    observation.inspectedSignedAssistants > 0),
         },
     ]);
 }
@@ -488,7 +579,11 @@ export async function driveThinkingDroppedShell(
     h.mock.script([
         {
             content: [
-                { type: "thinking", thinking: signedThinkingA, signature: sigA },
+                {
+                    type: "thinking",
+                    thinking: signedThinkingA,
+                    signature: sigA,
+                },
                 { type: "text", text: "Response to turn 1." },
             ],
             usage: {
@@ -500,7 +595,11 @@ export async function driveThinkingDroppedShell(
         },
         {
             content: [
-                { type: "thinking", thinking: signedThinkingB, signature: sigB },
+                {
+                    type: "thinking",
+                    thinking: signedThinkingB,
+                    signature: sigB,
+                },
                 { type: "text", text: "Response to turn 2." },
             ],
             usage: {
@@ -529,13 +628,18 @@ export async function driveThinkingDroppedShell(
     const paste = `Here is a log of the failing session:\n${"ERROR: call_failed at line 42.\n".repeat(60)}`;
     await h.sendPrompt(sessionId, paste);
 
-    const pasteTag = tagForText(mainRequests(h).at(-1)!.body, "Here is a log of the failing session:");
+    const pasteTag = tagForText(
+        mainRequests(h).at(-1)!.body,
+        "Here is a log of the failing session:",
+    );
     await ageTagBeyondProtectedWindow(h, sessionId);
     const reduced = await dropAndMaterialize(h, sessionId, pasteTag);
     const body = reduced.body;
 
     const allUserText = userText(body);
-    const pasteBodyAbsent = !allUserText.includes("ERROR: call_failed at line 42.");
+    const pasteBodyAbsent = !allUserText.includes(
+        "ERROR: call_failed at line 42.",
+    );
     // TS keeps the `[dropped §N§]` shell; Rust supersedes covered turns with
     // one safe published history summary.
     const shellPreserved = options.rustMode
@@ -550,8 +654,10 @@ export async function driveThinkingDroppedShell(
     } else {
         signedReplayIntact = signatures.has(sigA) || signatures.has(sigB);
         for (const t of thinkings) {
-            if (t.signature === sigA && t.thinking !== signedThinkingA) signedReplayIntact = false;
-            if (t.signature === sigB && t.thinking !== signedThinkingB) signedReplayIntact = false;
+            if (t.signature === sigA && t.thinking !== signedThinkingA)
+                signedReplayIntact = false;
+            if (t.signature === sigB && t.thinking !== signedThinkingB)
+                signedReplayIntact = false;
         }
     }
 
@@ -560,14 +666,20 @@ export async function driveThinkingDroppedShell(
     if (options.rustMode) {
         turnBoundaryPreserved = true;
         for (let i = 1; i < messages.length; i++) {
-            if (messages[i - 1]!.role === "assistant" && messages[i]!.role === "assistant") {
+            if (
+                messages[i - 1]!.role === "assistant" &&
+                messages[i]!.role === "assistant"
+            ) {
                 turnBoundaryPreserved = false;
             }
         }
     } else {
         let userToAssistantTransitions = 0;
         for (let i = 1; i < messages.length; i++) {
-            if (messages[i - 1]!.role === "user" && messages[i]!.role === "assistant") {
+            if (
+                messages[i - 1]!.role === "user" &&
+                messages[i]!.role === "assistant"
+            ) {
                 userToAssistantTransitions++;
             }
         }
@@ -584,13 +696,30 @@ export async function driveThinkingDroppedShell(
     };
 }
 
-export function verifyThinkingDroppedShell(observation: ThinkingDroppedShellObservation): RegressionResult {
+export function verifyThinkingDroppedShell(
+    observation: ThinkingDroppedShellObservation,
+): RegressionResult {
     return resultFromChecks([
-        { id: "check-thinking-b-drop-emitted", passed: observation.dropEmitted },
-        { id: "check-thinking-b-paste-body-absent", passed: observation.pasteBodyAbsent },
-        { id: "check-thinking-b-shell-preserved", passed: observation.shellPreserved },
-        { id: "check-thinking-b-signed-replay-intact", passed: observation.signedReplayIntact },
-        { id: "check-thinking-b-turn-boundary-preserved", passed: observation.turnBoundaryPreserved },
+        {
+            id: "check-thinking-b-drop-emitted",
+            passed: observation.dropEmitted,
+        },
+        {
+            id: "check-thinking-b-paste-body-absent",
+            passed: observation.pasteBodyAbsent,
+        },
+        {
+            id: "check-thinking-b-shell-preserved",
+            passed: observation.shellPreserved,
+        },
+        {
+            id: "check-thinking-b-signed-replay-intact",
+            passed: observation.signedReplayIntact,
+        },
+        {
+            id: "check-thinking-b-turn-boundary-preserved",
+            passed: observation.turnBoundaryPreserved,
+        },
     ]);
 }
 
@@ -656,14 +785,22 @@ export async function driveThinkingImageSurvival(
             model: { providerID: "mock-anthropic", modelID: "mock-sonnet" },
             parts: [
                 { type: "text", text: "see this screenshot for the bug" },
-                { type: "file", mime: "image/png", url: imageDataUrl, filename: "bug.png" },
+                {
+                    type: "file",
+                    mime: "image/png",
+                    url: imageDataUrl,
+                    filename: "bug.png",
+                },
             ],
         },
     });
 
     // Drop only the text block via its public §N§ handle; the image is a
     // sibling content block.
-    const userTextTag = tagForText(mainRequests(h).at(-1)!.body, "see this screenshot for the bug");
+    const userTextTag = tagForText(
+        mainRequests(h).at(-1)!.body,
+        "see this screenshot for the bug",
+    );
     await ageTagBeyondProtectedWindow(h, sessionId);
     const reduced = await dropAndMaterialize(h, sessionId, userTextTag);
     const body = reduced.body;
@@ -678,8 +815,11 @@ export async function driveThinkingImageSurvival(
     return {
         rustMode: options.rustMode,
         dropEmitted: reduced.dropEmitted,
-        droppedTextAbsent: !allUserText.includes("see this screenshot for the bug"),
-        coveredByRustHistory: options.rustMode && allUserText.includes("<session-history>"),
+        droppedTextAbsent: !allUserText.includes(
+            "see this screenshot for the bug",
+        ),
+        coveredByRustHistory:
+            options.rustMode && allUserText.includes("<session-history>"),
         imageBlockCount: imageBlocks.length,
         placeholderPresent: /\[dropped \u00a7\d+\u00a7\]/.test(allUserText),
         userWithImagePresent: messagesOf(body).some(
@@ -698,14 +838,24 @@ export function verifyThinkingImageSurvival(
     // summary legitimately supersedes both the text shell and the image.
     const covered = observation.coveredByRustHistory;
     return resultFromChecks([
-        { id: "check-thinking-c-drop-emitted", passed: observation.dropEmitted },
-        { id: "check-thinking-c-dropped-text-absent", passed: observation.droppedTextAbsent },
-        { id: "check-thinking-c-shell-preserved", passed: covered || observation.placeholderPresent },
+        {
+            id: "check-thinking-c-drop-emitted",
+            passed: observation.dropEmitted,
+        },
+        {
+            id: "check-thinking-c-dropped-text-absent",
+            passed: observation.droppedTextAbsent,
+        },
+        {
+            id: "check-thinking-c-shell-preserved",
+            passed: covered || observation.placeholderPresent,
+        },
         {
             id: "check-thinking-c-image-part-survives",
             passed: covered
                 ? observation.imageBlockCount === 0
-                : observation.imageBlockCount > 0 && observation.userWithImagePresent,
+                : observation.imageBlockCount > 0 &&
+                  observation.userWithImagePresent,
         },
     ]);
 }

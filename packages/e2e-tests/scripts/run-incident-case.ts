@@ -8,7 +8,10 @@
 
 import { readFileSync, writeSync } from "node:fs";
 import { resolve } from "node:path";
-import { parseIncidentCatalog, type IncidentVariant } from "../src/incident-pool/contract";
+import {
+    parseIncidentCatalog,
+    type IncidentVariant,
+} from "../src/incident-pool/contract";
 import { rowDigest, splitLedgerLines } from "../src/incident-pool/history";
 import {
     builtinIncidentCaseRegistry,
@@ -16,7 +19,10 @@ import {
     ledgerFingerprint,
     semanticFingerprint,
 } from "../src/incident-pool/registry";
-import { CASE_ENVELOPE_SCHEMA, type CaseEnvelope } from "../src/incident-pool/runner";
+import {
+    CASE_ENVELOPE_SCHEMA,
+    type CaseEnvelope,
+} from "../src/incident-pool/runner";
 
 const E2E_ROOT = resolve(import.meta.dir, "..");
 const REPO_ROOT = resolve(E2E_ROOT, "../..");
@@ -31,12 +37,17 @@ function requireEnv(name: string): string {
 }
 
 function findVariant(variantId: string): IncidentVariant {
-    const catalogText = readFileSync(resolve(INCIDENTS_DIR, "catalog.json"), "utf8");
+    const catalogText = readFileSync(
+        resolve(INCIDENTS_DIR, "catalog.json"),
+        "utf8",
+    );
     let rawCatalog: unknown;
     try {
         rawCatalog = JSON.parse(catalogText) as unknown;
     } catch (error) {
-        throw new Error(`committed catalog.json is not valid JSON: ${String(error)}`);
+        throw new Error(
+            `committed catalog.json is not valid JSON: ${String(error)}`,
+        );
     }
     const catalog = parseIncidentCatalog(rawCatalog);
     for (const family of catalog.families) {
@@ -74,7 +85,10 @@ async function main(): Promise<void> {
         run_nonce: requireEnv("MC_INCIDENT_RUN_NONCE"),
         variant_id: variantId,
         semantic_fingerprint: semanticFingerprint(variant, registered.fixtures),
-        implementation_digest: implementationBundleDigest(REPO_ROOT, registered.implementationFiles),
+        implementation_digest: implementationBundleDigest(
+            REPO_ROOT,
+            registered.implementationFiles,
+        ),
         ledger_fingerprint: ledgerFingerprint(adjudicationLines),
         baseline_event_id: requireEnv("MC_INCIDENT_BASELINE_EVENT_ID"),
         preconditions: "satisfied",
@@ -87,15 +101,21 @@ async function main(): Promise<void> {
 
     if (precondition.satisfied) {
         const checks = registered.verifier(observation);
-        const failed = checks.filter((check) => !check.passed).map((check) => check.id);
+        const failed = checks
+            .filter((check) => !check.passed)
+            .map((check) => check.id);
         envelope.verdict = failed.length === 0 ? "pass" : "assertion_fail";
         envelope.failed_checks = failed;
-        envelope.observation_signature = failed.length === 0 ? null : rowDigest(observation);
+        envelope.observation_signature =
+            failed.length === 0 ? null : rowDigest(observation);
     } else {
         // A failed reproduction precondition must never reach the verifier.
         envelope.precondition_reason = precondition.reason;
         envelope.preconditions = "failed";
-        envelope.blocked_by = precondition.reason === "blocked_by_dependency" ? precondition.blockedBy : [];
+        envelope.blocked_by =
+            precondition.reason === "blocked_by_dependency"
+                ? precondition.blockedBy
+                : [];
     }
 
     writeSync(3, `${JSON.stringify(envelope)}\n`);
@@ -103,6 +123,8 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
     // Diagnostics only — the parent classifies a missing envelope as crash.
-    console.error(`incident case failed: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(
+        `incident case failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
     process.exit(1);
 });

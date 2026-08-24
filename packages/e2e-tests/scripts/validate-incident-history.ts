@@ -22,17 +22,26 @@ function readIncidentFile(dir: string, name: string): string {
     }
 }
 
-export function loadHistorySnapshot(dir: string, baseLabel: string): HistorySnapshot {
+export function loadHistorySnapshot(
+    dir: string,
+    baseLabel: string,
+): HistorySnapshot {
     return {
         baseLabel,
         inventoryText: readIncidentFile(dir, "source-inventory.json"),
         catalogText: readIncidentFile(dir, "catalog.json"),
-        adjudicationLines: splitLedgerLines(readIncidentFile(dir, "adjudications.jsonl")),
-        redactionLines: splitLedgerLines(readIncidentFile(dir, "emergency-redactions.jsonl")),
+        adjudicationLines: splitLedgerLines(
+            readIncidentFile(dir, "adjudications.jsonl"),
+        ),
+        redactionLines: splitLedgerLines(
+            readIncidentFile(dir, "emergency-redactions.jsonl"),
+        ),
     };
 }
 
-export function validateIncidentDirectory(dir: string = INCIDENTS_DIR): IncidentHistoryState {
+export function validateIncidentDirectory(
+    dir: string = INCIDENTS_DIR,
+): IncidentHistoryState {
     return validateIncidentHistory(loadHistorySnapshot(dir, "working"));
 }
 
@@ -88,8 +97,14 @@ if (import.meta.main) {
         const state = accepted
             ? validateAgainstAcceptedDirectory(accepted, base, dir)
             : validateIncidentDirectory(dir);
-        const claims = state.inventory.items.reduce((total, item) => total + item.claims.length, 0);
-        const variants = state.catalog.families.reduce((total, family) => total + family.variants.length, 0);
+        const claims = state.inventory.items.reduce(
+            (total, item) => total + item.claims.length,
+            0,
+        );
+        const variants = state.catalog.families.reduce(
+            (total, family) => total + family.variants.length,
+            0,
+        );
         console.log(
             `validated incident history: ${state.inventory.items.length} source items, ${claims} claims, ` +
                 `${state.catalog.families.length} families, ${variants} variants, ` +
@@ -97,7 +112,9 @@ if (import.meta.main) {
                 (accepted ? " (accepted-snapshot comparison passed)" : ""),
         );
     } catch (error) {
-        console.error(`incident history validation failed: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(
+            `incident history validation failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
         process.exit(1);
     }
 }

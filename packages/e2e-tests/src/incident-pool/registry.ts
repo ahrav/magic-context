@@ -26,7 +26,8 @@ import {
 import { rowDigest } from "./history";
 
 export const SEMANTIC_FINGERPRINT_CONTRACT = "incident-semantic-fingerprint/v1";
-export const IMPLEMENTATION_BUNDLE_CONTRACT = "incident-implementation-bundle/v1";
+export const IMPLEMENTATION_BUNDLE_CONTRACT =
+    "incident-implementation-bundle/v1";
 export const LEDGER_FINGERPRINT_CONTRACT = "incident-ledger-fingerprint/v1";
 
 export interface CaseDriverContext {
@@ -37,7 +38,13 @@ export interface CaseDriverContext {
 
 /** Serializable observation data — the only shape a driver may return and
  *  the only shape a normalizer/verifier may consume. */
-export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+export type JsonValue =
+    | string
+    | number
+    | boolean
+    | null
+    | JsonValue[]
+    | { [key: string]: JsonValue };
 export type NormalizedObservation = JsonValue;
 
 export interface VerifierCheck {
@@ -81,14 +88,25 @@ export type IncidentCaseRegistry = Map<string, RegisteredIncidentCase>;
 /** Reject absolute paths, parent escapes, and duplicates up front. */
 function validateImplementationFiles(files: string[], variantId: string): void {
     if (files.length === 0) {
-        throw new Error(`case ${variantId}: implementation file list must not be empty`);
+        throw new Error(
+            `case ${variantId}: implementation file list must not be empty`,
+        );
     }
     const seen = new Set<string>();
     for (const file of files) {
-        if (file.trim().length === 0 || isAbsolute(file) || file.split(/[\\/]/).includes("..")) {
-            throw new Error(`case ${variantId}: implementation file ${file} must be a root-confined relative path`);
+        if (
+            file.trim().length === 0 ||
+            isAbsolute(file) ||
+            file.split(/[\\/]/).includes("..")
+        ) {
+            throw new Error(
+                `case ${variantId}: implementation file ${file} must be a root-confined relative path`,
+            );
         }
-        if (seen.has(file)) throw new Error(`case ${variantId}: duplicate implementation file ${file}`);
+        if (seen.has(file))
+            throw new Error(
+                `case ${variantId}: duplicate implementation file ${file}`,
+            );
         seen.add(file);
     }
 }
@@ -98,10 +116,14 @@ export function registerIncidentCase(
     entry: RegisteredIncidentCase,
 ): void {
     if (!VARIANT_ID_RE.test(entry.variantId)) {
-        throw new Error(`registered case has invalid variant id ${entry.variantId}`);
+        throw new Error(
+            `registered case has invalid variant id ${entry.variantId}`,
+        );
     }
     if (registry.has(entry.variantId)) {
-        throw new Error(`duplicate case registration for variant ${entry.variantId}`);
+        throw new Error(
+            `duplicate case registration for variant ${entry.variantId}`,
+        );
     }
     validateImplementationFiles(entry.implementationFiles, entry.variantId);
     registry.set(entry.variantId, entry);
@@ -143,7 +165,10 @@ export function semanticFingerprint(
 
 /** Byte-hash of the explicit root-confined implementation file list. The
  *  listed order is irrelevant (paths are sorted); the bytes are not. */
-export function implementationBundleDigest(rootDir: string, files: string[]): string {
+export function implementationBundleDigest(
+    rootDir: string,
+    files: string[],
+): string {
     validateImplementationFiles(files, "bundle");
     const root = resolve(rootDir);
     const hash = createHash("sha256");
@@ -151,7 +176,9 @@ export function implementationBundleDigest(rootDir: string, files: string[]): st
     for (const file of [...files].sort()) {
         const absolute = resolve(root, file);
         if (absolute !== root && !absolute.startsWith(root + sep)) {
-            throw new Error(`implementation file ${file} escapes the declared root`);
+            throw new Error(
+                `implementation file ${file} escapes the declared root`,
+            );
         }
         const bytes = readFileSync(absolute);
         hash.update(file);
@@ -164,7 +191,9 @@ export function implementationBundleDigest(rootDir: string, files: string[]): st
 }
 
 /** Fingerprint of the full adjudication ledger (line-exact). */
-export function ledgerFingerprint(adjudicationLines: readonly string[]): string {
+export function ledgerFingerprint(
+    adjudicationLines: readonly string[],
+): string {
     return rowDigest([LEDGER_FINGERPRINT_CONTRACT, ...adjudicationLines]);
 }
 
@@ -185,7 +214,9 @@ export function validateRegistryCatalogCorrespondence(
             executableIds.add(variant.id);
             const registered = registry.get(variant.id);
             if (!registered) {
-                throw new Error(`executable variant ${variant.id} has no registered case`);
+                throw new Error(
+                    `executable variant ${variant.id} has no registered case`,
+                );
             }
             const computed = semanticFingerprint(variant, registered.fixtures);
             if (computed !== variant.semantic_revision.fingerprint) {
@@ -197,7 +228,9 @@ export function validateRegistryCatalogCorrespondence(
     }
     for (const variantId of registry.keys()) {
         if (!executableIds.has(variantId)) {
-            throw new Error(`registered case ${variantId} has no executable catalog variant`);
+            throw new Error(
+                `registered case ${variantId} has no executable catalog variant`,
+            );
         }
     }
 }

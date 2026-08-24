@@ -52,13 +52,18 @@ function fixtureFiles(): FixtureFiles {
                         lane: "known-red",
                         source_claims: ["claim-red-one"],
                         applicability: { harness: "opencode", omitted: [] },
-                        semantic_revision: { id: "rev-red-one", fingerprint: HEX("c") },
+                        semantic_revision: {
+                            id: "rev-red-one",
+                            fingerprint: HEX("c"),
+                        },
                         normative_checks: ["check-red-holds"],
                         verifier_binding: {
                             driver: "demo/driver",
                             verifier: "demo/verifier",
                             binding_status: "declared",
-                            invalid_state_evidence: ["false success narration fixture"],
+                            invalid_state_evidence: [
+                                "false success narration fixture",
+                            ],
                         },
                         blocked_by: [],
                         evidence_refs: [],
@@ -124,25 +129,38 @@ describe("validate-incident-history script", () => {
         withFixtureDir(fixtureFiles(), (dir) => {
             const state = validateIncidentDirectory(dir);
             expect(state.events).toHaveLength(1);
-            expect(state.ledger.byIdentity.get("var-red-one")!.latestBaseline!.event_id).toBe("adj-red-one");
+            expect(
+                state.ledger.byIdentity.get("var-red-one")!.latestBaseline!
+                    .event_id,
+            ).toBe("adj-red-one");
         });
     });
 
     it("fails a directory with an unknown contract field", () => {
         const files = fixtureFiles();
-        const catalog = JSON.parse(files["catalog.json"]) as { families: Record<string, unknown>[] };
+        const catalog = JSON.parse(files["catalog.json"]) as {
+            families: Record<string, unknown>[];
+        };
         catalog.families[0]!.owner = "someone";
-        files["catalog.json"] = JSON.stringify({ schema: "incident-catalog/v1", ...catalog });
+        files["catalog.json"] = JSON.stringify({
+            schema: "incident-catalog/v1",
+            ...catalog,
+        });
         withFixtureDir(files, (dir) => {
-            expect(() => validateIncidentDirectory(dir)).toThrow(/must contain exactly/);
+            expect(() => validateIncidentDirectory(dir)).toThrow(
+                /must contain exactly/,
+            );
         });
     });
 
     it("fails closed on a malformed ledger line without folding later events", () => {
         const files = fixtureFiles();
-        files["adjudications.jsonl"] = `not json\n${files["adjudications.jsonl"]}`;
+        files["adjudications.jsonl"] =
+            `not json\n${files["adjudications.jsonl"]}`;
         withFixtureDir(files, (dir) => {
-            expect(() => validateIncidentDirectory(dir)).toThrow(/adjudications\[0\] is not valid JSON/);
+            expect(() => validateIncidentDirectory(dir)).toThrow(
+                /adjudications\[0\] is not valid JSON/,
+            );
         });
     });
 
@@ -150,7 +168,9 @@ describe("validate-incident-history script", () => {
         const files = fixtureFiles();
         withFixtureDir(files, (dir) => {
             rmSync(join(dir, "catalog.json"), { force: true });
-            expect(() => validateIncidentDirectory(dir)).toThrow(/could not read/);
+            expect(() => validateIncidentDirectory(dir)).toThrow(
+                /could not read/,
+            );
         });
     });
 
@@ -172,9 +192,14 @@ describe("validate-incident-history script", () => {
                 source_revision: "audit-2026-08-24",
                 supersedes: null,
             };
-            appended["adjudications.jsonl"] += `${JSON.stringify(resolution)}\n`;
+            appended["adjudications.jsonl"] +=
+                `${JSON.stringify(resolution)}\n`;
             withFixtureDir(appended, (candidateDir) => {
-                const state = validateAgainstAcceptedDirectory(acceptedDir, "base-1", candidateDir);
+                const state = validateAgainstAcceptedDirectory(
+                    acceptedDir,
+                    "base-1",
+                    candidateDir,
+                );
                 expect(state.events).toHaveLength(2);
             });
 
@@ -188,9 +213,13 @@ describe("validate-incident-history script", () => {
                 items: inventory.items,
             });
             withFixtureDir(edited, (candidateDir) => {
-                expect(() => validateAgainstAcceptedDirectory(acceptedDir, "base-1", candidateDir)).toThrow(
-                    /accepted source claim edited/,
-                );
+                expect(() =>
+                    validateAgainstAcceptedDirectory(
+                        acceptedDir,
+                        "base-1",
+                        candidateDir,
+                    ),
+                ).toThrow(/accepted source claim edited/);
             });
         });
     });
@@ -198,7 +227,9 @@ describe("validate-incident-history script", () => {
     it("exposes the same comparison used by compareWithAcceptedSnapshot", () => {
         withFixtureDir(fixtureFiles(), (dir) => {
             const accepted = loadHistorySnapshot(dir, "base-1");
-            expect(() => compareWithAcceptedSnapshot(accepted, accepted)).not.toThrow();
+            expect(() =>
+                compareWithAcceptedSnapshot(accepted, accepted),
+            ).not.toThrow();
         });
     });
 });
