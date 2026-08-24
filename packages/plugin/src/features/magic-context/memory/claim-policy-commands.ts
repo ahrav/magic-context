@@ -12,6 +12,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Database } from "../../../shared/sqlite";
+import { getAuthorityManagedMarker } from "../context-authority";
 import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
 import {
     appendMaturityAssertionInCurrentTransaction,
@@ -99,6 +100,23 @@ function resolveTarget(
     deps: ClaimCommandDeps,
     memoryId: number,
 ): ResolvedTarget | { error: string } {
+    // Under MODULE memory authority the agent-visible ids are the native
+    // store's row ids, and mirror-back may map a module id to a DIFFERENT
+    // context row (collision renumbering, module-created rows). Translate
+    // through the mirror identity before the claim lookup, or the command
+    // would report no claim — or start confirmation for whatever context
+    // row happens to carry that number.
+    if (getAuthorityManagedMarker(deps.db, deps.projectPath)) {
+        const mapped = deps.db
+            .prepare(
+                `SELECT context_row_id AS contextRowId FROM mirror_identity
+                  WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?`,
+            )
+            .get(deps.projectPath, memoryId) as { contextRowId?: number } | null | undefined;
+        if (mapped != null && Number.isInteger(mapped.contextRowId)) {
+            memoryId = mapped.contextRowId as number;
+        }
+    }
     const link = readMemoryClaimLink(deps.db, memoryId);
     if (!link) return { error: `Memory ${memoryId} has no claim link in this project.` };
     // Membership is decided by resolved project id, not stored-path bytes: a

@@ -1800,24 +1800,48 @@ export async function buildModuleStateSyncPayload(args: {
     const userProfile = includeUserProfile
         ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
         : [];
-    const memoryMutations =
-        memoryMutationsChanged && args.pass.projectPath
-            ? getMemoryMutationsForRenderByProjects(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  acked.memory_mutation_id,
-                  renderedMemoryIds,
-              ).map((row) => ({
-                  id: row.id,
-                  project_path: row.projectPath,
-                  mutation_type: row.mutationType,
-                  target_memory_id: row.targetMemoryId,
-                  superseded_by_id: row.supersededById,
-                  category: row.category,
-                  new_content: row.newContent,
-                  queued_at: row.queuedAt,
-              }))
-            : [];
+    const memoryMutations = (() => {
+        if (!memoryMutationsChanged || !args.pass.projectPath) return [];
+        const rows = getMemoryMutationsForRenderByProjects(
+            args.pass.db,
+            workspace.expandedIdentities,
+            acked.memory_mutation_id,
+            renderedMemoryIds,
+        );
+        // Bind each content-carrying mutation to the revision the policy
+        // check evaluated: a held-open pre-v86 writer can rewrite the target
+        // AFTER filterMemoryIdsByPolicy approved the id but BEFORE this read
+        // — without bumping the policy epoch, so the completion guard cannot
+        // catch it. A mutation whose bytes no longer match the claim's
+        // current revision is dropped; the unprojected successor reaches the
+        // native store only after the late-seed probe seeds it and the epoch
+        // bump triggers a policy-checked full sync.
+        const contentTargets = rows
+            .filter((row) => typeof row.newContent === "string")
+            .map((row) => row.targetMemoryId);
+        const oracleDigests = exactMemoryContentDigests(args.pass.db, contentTargets);
+        const bound = rows.filter(
+            (row) =>
+                typeof row.newContent !== "string" ||
+                oracleDigests.get(row.targetMemoryId) === sha256Utf8Hex(row.newContent),
+        );
+        if (bound.length < rows.length) {
+            sessionLog(
+                args.pass.sessionId,
+                `module sync dropped ${rows.length - bound.length} mutation(s) whose bytes no longer match the policy-evaluated revision`,
+            );
+        }
+        return bound.map((row) => ({
+            id: row.id,
+            project_path: row.projectPath,
+            mutation_type: row.mutationType,
+            target_memory_id: row.targetMemoryId,
+            superseded_by_id: row.supersededById,
+            category: row.category,
+            new_content: row.newContent,
+            queued_at: row.queuedAt,
+        }));
+    })();
     const sessionMeta = getOrCreateSessionMeta(args.pass.db, args.pass.sessionId);
     const pendingDropSeedState = args.force
         ? buildPendingDropSeeds({ db: args.pass.db, sessionId: args.pass.sessionId, readRawById })
