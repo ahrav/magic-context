@@ -194,7 +194,16 @@ describe("local embedding recipes", () => {
     });
 
     test("the default model has a bound recipe rather than the symmetric fallback", () => {
-        expect(getLocalEmbeddingRecipe(DEFAULT_LOCAL_EMBEDDING_MODEL).pooling).toBe("cls");
+        expect(getLocalEmbeddingRecipe(DEFAULT_LOCAL_EMBEDDING_MODEL)).toEqual({
+            pooling: "cls",
+            queryPrefix: BGE_QUERY_PREFIX,
+        });
+    });
+
+    test("the upstream BAAI id binds the same recipe as the Xenova export", () => {
+        expect(getLocalEmbeddingRecipe("BAAI/bge-small-en-v1.5")).toEqual(
+            getLocalEmbeddingRecipe(BGE_MODEL),
+        );
     });
 
     test("unlisted models keep the symmetric mean recipe", () => {
@@ -243,6 +252,9 @@ describe("local embedding recipes", () => {
         await provider.embedBatch(["c", "d"], undefined, "passage");
         expect(calls[0]!.input).toEqual([`${BGE_QUERY_PREFIX}a`, `${BGE_QUERY_PREFIX}b`]);
         expect(calls[1]!.input).toEqual(["c", "d"]);
+        expect(
+            calls.every((c) => c.options.pooling === "cls" && c.options.normalize === true),
+        ).toBe(true);
     });
 
     test("an unlisted model embeds queries unprefixed with mean pooling", async () => {

@@ -26,7 +26,15 @@ const SYMMETRIC_RECIPE: LocalEmbeddingRecipe = { pooling: "mean", queryPrefix: "
 const MODEL_RECIPES: Record<string, LocalEmbeddingRecipe> = {
     // BGE v1.5 CLS-pools and expects this exact retrieval instruction on short
     // queries: https://huggingface.co/BAAI/bge-small-en-v1.5#model-usage
+    // Both the Xenova ONNX export and the upstream BAAI id name the same model
+    // card, so both bind the same recipe. Other spellings deliberately fall
+    // back to the symmetric recipe: guessing a recipe from a fuzzy name match
+    // risks applying the wrong transforms, which corrupts silently.
     "Xenova/bge-small-en-v1.5": {
+        pooling: "cls",
+        queryPrefix: "Represent this sentence for searching relevant passages: ",
+    },
+    "BAAI/bge-small-en-v1.5": {
         pooling: "cls",
         queryPrefix: "Represent this sentence for searching relevant passages: ",
     },
