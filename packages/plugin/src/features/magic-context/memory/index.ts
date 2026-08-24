@@ -1,3 +1,4 @@
+export * from "./claim-operation-contract";
 export * from "./constants";
 export * from "./embedding";
 export * from "./embedding-backfill";
@@ -6,6 +7,8 @@ export * from "./normalize-hash";
 export * from "./project-identity";
 export type { PromotedMemoryRef } from "./promotion";
 export { embedPromotedFacts, promoteSessionFactsDurable } from "./promotion";
+export * from "./storage-claim-current-state";
+export * from "./storage-claim-operations";
 export * from "./storage-claims";
 export * from "./storage-memory";
 export * from "./storage-memory-embeddings";

@@ -1,0 +1,89 @@
+{
+    "protocol": "mc-direct-format-v1",
+    "applicationId": 1296258136,
+    "formatEpoch": 1,
+    "markerTable": "mc_format_marker",
+    "markerDigestProtocol": "mc-direct-format-marker-v1",
+    "manifestProtocol": "mc-schema-manifest-v1",
+    "minSqliteVersion": "3.47.1",
+    "minNodeVersion": "24.15.0",
+    "minBunVersion": "1.3.14",
+    "componentManifest": {
+        "protocol": "mc-schema-manifest-v1",
+        "components": [
+            {
+                "name": "claims-evidence",
+                "dependsOn": [],
+                "provides": [
+                    "projects",
+                    "project_aliases",
+                    "episodes",
+                    "source_spans",
+                    "observations",
+                    "claims",
+                    "claim_revisions",
+                    "claim_evidence",
+                    "claim_conflicts",
+                    "verification_events"
+                ]
+            },
+            {
+                "name": "claim-applicability",
+                "dependsOn": ["claims-evidence"],
+                "provides": [
+                    "git_anchors",
+                    "git_anchor_representations",
+                    "claim_revision_applicability_streams",
+                    "claim_revision_applicability_assertions",
+                    "claim_revision_applicability_paths",
+                    "claim_revision_applicability_symbols",
+                    "claim_revision_applicability_intervals"
+                ]
+            },
+            {
+                "name": "claim-policy",
+                "dependsOn": ["claims-evidence", "claim-applicability"],
+                "provides": [
+                    "claim_revision_policy_subjects",
+                    "claim_maturity_streams",
+                    "claim_maturity_assertions",
+                    "claim_disposition_events",
+                    "claim_approval_actions",
+                    "claim_enforcement_artifacts",
+                    "claim_enforcement_artifact_events",
+                    "claim_effective_policy",
+                    "claim_policy_projector_watermarks",
+                    "claim_maturity_heads"
+                ]
+            },
+            {
+                "name": "claim-memory",
+                "dependsOn": ["claims-evidence", "claim-applicability", "claim-policy"],
+                "provides": [
+                    "claim_public_ids",
+                    "claim_memory_revision_attributes",
+                    "claim_memory_lifecycle_events",
+                    "claim_memory_current_heads",
+                    "claim_usage_stats",
+                    "claim_derivations",
+                    "claim_operation_receipts",
+                    "claim_operation_effects",
+                    "claim_outbox_consumer_checkpoints",
+                    "claim_outbox_prune_state",
+                    "claim_memory_lifecycle_heads",
+                    "claim_project_generations"
+                ]
+            }
+        ]
+    },
+    "goldens": {
+        "manifestDigest": "d04f2447c2d2d690b3b5bbc014f55fcb8346944f2359554651869267f6716700",
+        "marker": {
+            "formatEpoch": 1,
+            "databaseIncarnationId": "00112233445566778899aabbccddeeff",
+            "componentManifestDigest": "d04f2447c2d2d690b3b5bbc014f55fcb8346944f2359554651869267f6716700",
+            "createdAtMs": 1755900000000,
+            "markerDigest": "4c16f12dfe0bed85e2f401cad2b1a75509013f691a47a6a433b1117772981f3f"
+        }
+    }
+}

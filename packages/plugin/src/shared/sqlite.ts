@@ -372,3 +372,166 @@ export function withPrivilegedWriter<T>(db: Database, operation: () => T): T {
         throw error;
     }
 }
+
+// ---------------------------------------------------------------------------
+// U1 direct-cutover groundwork (KTD2, R17): off-path SQLite source probe and
+// connection-contract verification. Pure helpers plus one off-path opener —
+// nothing here is wired into the production open path yet (U8 activates it).
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimum SQLite release whose WAL machinery carries the wal-reset fix
+ * (https://www.sqlite.org/wal.html#walresetbug, fixed in 3.47.1). Writers on
+ * an older source may corrupt a shared WAL family and must not open it.
+ */
+export const SQLITE_WAL_RESET_SAFE_MIN_VERSION = "3.47.1";
+
+/** Node floor whose node:sqlite ships a WAL-reset-safe SQLite (KTD2). */
+export const MIN_SUPPORTED_NODE_VERSION = "24.15.0";
+
+/** Bun floor whose bun:sqlite ships a WAL-reset-safe SQLite (KTD2). */
+export const MIN_SUPPORTED_BUN_VERSION = "1.3.14";
+
+/** `sqlite_source_id()` shape: `YYYY-MM-DD HH:MM:SS <commit hash>`. */
+const SQLITE_SOURCE_ID_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [0-9a-f]{40,64}$/;
+
+export interface SqliteEngineIdentity {
+    readonly sqliteVersion: string;
+    readonly sqliteSourceId: string;
+}
+
+/** Read `sqlite_version()` / `sqlite_source_id()` from an open connection. */
+export function readSqliteEngineIdentity(db: Database): SqliteEngineIdentity {
+    const row = db
+        .prepare("SELECT sqlite_version() AS version, sqlite_source_id() AS source_id")
+        .get() as { version: string; source_id: string };
+    return { sqliteVersion: String(row.version), sqliteSourceId: String(row.source_id) };
+}
+
+/**
+ * Probe the runtime's SQLite engine off-path: a throwaway in-memory
+ * connection, never the real database file, so an unsafe engine is detected
+ * before it can touch a shared WAL family.
+ */
+export function probeSqliteEngineIdentityOffPath(): SqliteEngineIdentity {
+    const probe = new Database(":memory:");
+    try {
+        return readSqliteEngineIdentity(probe);
+    } finally {
+        probe.close();
+    }
+}
+
+/** Parse a dotted version into numeric parts; null when not parseable. */
+function parseDottedVersion(version: string): number[] | null {
+    const match = version.trim().match(/^(\d+)\.(\d+)(?:\.(\d+))?/);
+    if (!match) return null;
+    return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
+}
+
+export function isVersionAtLeast(candidate: string, floor: string): boolean {
+    const left = parseDottedVersion(candidate);
+    const right = parseDottedVersion(floor);
+    if (!left || !right) return false;
+    for (let index = 0; index < 3; index += 1) {
+        if (left[index] !== right[index]) return left[index] > right[index];
+    }
+    return true;
+}
+
+export interface SqliteRuntimeGateInput extends SqliteEngineIdentity {
+    readonly runtime: SqliteRuntime;
+    /** `process.versions.bun` or `process.versions.node`. */
+    readonly runtimeVersion: string;
+}
+
+export interface SqliteRuntimeGateResult {
+    readonly ok: boolean;
+    readonly reasons: readonly string[];
+}
+
+/**
+ * Pure WAL-reset-safety gate (KTD2). The engine identity is authoritative:
+ * a wrapper or runtime version alone never passes, and an unknown
+ * `sqlite_source_id()` fails closed because the source cannot be proven safe.
+ */
+export function evaluateSqliteRuntimeGate(input: SqliteRuntimeGateInput): SqliteRuntimeGateResult {
+    const reasons: string[] = [];
+    const runtimeFloor =
+        input.runtime === "Bun" ? MIN_SUPPORTED_BUN_VERSION : MIN_SUPPORTED_NODE_VERSION;
+    if (!isVersionAtLeast(input.runtimeVersion, runtimeFloor)) {
+        reasons.push(
+            `${input.runtime} ${input.runtimeVersion} is below the supported floor ${runtimeFloor}`,
+        );
+    }
+    if (!isVersionAtLeast(input.sqliteVersion, SQLITE_WAL_RESET_SAFE_MIN_VERSION)) {
+        reasons.push(
+            `SQLite ${input.sqliteVersion} predates the WAL-reset fix in ${SQLITE_WAL_RESET_SAFE_MIN_VERSION}`,
+        );
+    }
+    if (!SQLITE_SOURCE_ID_PATTERN.test(input.sqliteSourceId)) {
+        reasons.push(
+            `sqlite_source_id() '${input.sqliteSourceId}' is not a recognized SQLite source identity`,
+        );
+    }
+    return { ok: reasons.length === 0, reasons };
+}
+
+/** Gather the live gate input for the current runtime (off-path probe). */
+export function collectSqliteRuntimeGateInput(): SqliteRuntimeGateInput {
+    const runtime = detectSqliteRuntime();
+    const runtimeVersion =
+        runtime === "Bun" ? (process.versions.bun ?? "0.0.0") : (process.versions.node ?? "0.0.0");
+    return { runtime, runtimeVersion, ...probeSqliteEngineIdentityOffPath() };
+}
+
+export interface SqliteConnectionContractExpectations {
+    /** Require `journal_mode=wal`; false for in-memory or non-WAL scratch databases. */
+    readonly expectWal: boolean;
+    readonly minBusyTimeoutMs?: number;
+    /** Allowed `PRAGMA synchronous` levels; OFF (0) is never acceptable for writers. */
+    readonly allowedSynchronous?: readonly number[];
+}
+
+/**
+ * Verify the per-connection contract (R17) after PRAGMAs are applied and
+ * before application writes: foreign keys enforced, WAL actually activated,
+ * a busy timeout installed, and a declared synchronous mode. Returns every
+ * violation; callers fail closed on a nonempty list.
+ */
+export function verifySqliteConnectionContract(
+    db: Database,
+    expectations: SqliteConnectionContractExpectations,
+): string[] {
+    const violations: string[] = [];
+    const foreignKeys = Number(
+        (db.prepare("PRAGMA foreign_keys").get() as { foreign_keys: number }).foreign_keys,
+    );
+    if (foreignKeys !== 1) violations.push("foreign_keys is disabled");
+    const journalMode = String(
+        (db.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode,
+    ).toLowerCase();
+    if (expectations.expectWal && journalMode !== "wal") {
+        violations.push(`journal_mode is '${journalMode}', expected 'wal'`);
+    }
+    const busyTimeoutMs = Number(
+        (db.prepare("PRAGMA busy_timeout").get() as { timeout: number }).timeout,
+    );
+    const minBusyTimeoutMs = expectations.minBusyTimeoutMs ?? 1;
+    if (!Number.isFinite(busyTimeoutMs) || busyTimeoutMs < minBusyTimeoutMs) {
+        violations.push(
+            `busy_timeout ${busyTimeoutMs}ms is below the required ${minBusyTimeoutMs}ms`,
+        );
+    }
+    const synchronous = Number(
+        (db.prepare("PRAGMA synchronous").get() as { synchronous: number }).synchronous,
+    );
+    // 1=NORMAL, 2=FULL, 3=EXTRA; 0=OFF forfeits WAL durability guarantees.
+    const allowedSynchronous = expectations.allowedSynchronous ?? [1, 2, 3];
+    if (!allowedSynchronous.includes(synchronous)) {
+        violations.push(
+            `synchronous mode ${synchronous} is not in the declared set [${allowedSynchronous.join(", ")}]`,
+        );
+    }
+    return violations;
+}

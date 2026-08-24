@@ -970,3 +970,119 @@ describe("storage-claims: transaction-local primitives", () => {
         }
     });
 });
+
+describe("storage-claims: session cleanup and the claim-memory kernel (U2 scenario 15, R19)", () => {
+    test("clearSession preserves every claim-owned row and operation receipt", async () => {
+        const db = migratedDb();
+        try {
+            // The claim-memory fragment overlays a migrated database:
+            // claim_project_generations already exists from the v84 chain.
+            const { createClaimMemorySchema } = await import("../storage-claim-memory-schema");
+            const {
+                createProjectMemoryClaim,
+                recordProjectMemoryVerification,
+                computeProjectMemoryMutationToken,
+                getProjectMemoryClaimByPublicId,
+            } = await import("./storage-claim-operations");
+            const { formatRevisionLocator } = await import("./claim-operation-contract");
+            createClaimMemorySchema(db);
+
+            const sessionId = "ses_kernel_durable";
+            db.prepare(
+                "INSERT INTO session_meta (session_id, last_response_time) VALUES (?, 1)",
+            ).run(sessionId);
+            const projectId = ensureProject(db, "git:kernel-durable");
+            const created = createProjectMemoryClaim(
+                db,
+                { producer: "test", operationKey: "op-durable" },
+                {
+                    projectId,
+                    content: "Durable kernel claim.",
+                    category: "ARCHITECTURE",
+                    provenance: {
+                        sourceLocator: "transcript://durable",
+                        sourceContent: "raw durable source",
+                        sourceSessionId: sessionId,
+                        extractor: "historian",
+                        extractorVersion: "2",
+                        extractorRunId: "run-1",
+                        independenceKey: "ik-durable",
+                        sourceTrustClass: "explicit_user",
+                    },
+                    actor: "user:test",
+                },
+            );
+            expect(created.outcome).toBe("applied");
+            const publicId = (created.result.payload as { claim: { publicClaimId: string } }).claim
+                .publicClaimId;
+            const ref = getProjectMemoryClaimByPublicId(db, publicId);
+            if (!ref) throw new Error("unreachable");
+            const verified = recordProjectMemoryVerification(
+                db,
+                { producer: "test", operationKey: "op-verify" },
+                {
+                    token: computeProjectMemoryMutationToken(db, publicId),
+                    revisionLocator: formatRevisionLocator(ref),
+                    outcome: "verified",
+                    verifier: "test-verifier",
+                },
+            );
+            expect(verified.outcome).toBe("applied");
+
+            const claimOwnedTables = [
+                "claims",
+                "claim_revisions",
+                "claim_evidence",
+                "observations",
+                "claim_public_ids",
+                "claim_memory_revision_attributes",
+                "claim_memory_lifecycle_events",
+                "claim_memory_current_heads",
+                "claim_usage_stats",
+                "claim_revision_applicability_assertions",
+                "claim_revision_policy_subjects",
+                "claim_maturity_assertions",
+                "claim_effective_policy",
+                "claim_operation_receipts",
+                "claim_operation_effects",
+                "verification_events",
+            ];
+            const before = Object.fromEntries(
+                claimOwnedTables.map((table) => [table, rowCount(db, table)]),
+            );
+
+            clearSession(db, sessionId);
+
+            expect(rowCount(db, "session_meta")).toBe(0);
+            expect(
+                Object.fromEntries(claimOwnedTables.map((table) => [table, rowCount(db, table)])),
+            ).toEqual(before);
+
+            // The lifetime receipt still replays byte-identically.
+            const replay = createProjectMemoryClaim(
+                db,
+                { producer: "test", operationKey: "op-durable" },
+                {
+                    projectId,
+                    content: "Durable kernel claim.",
+                    category: "ARCHITECTURE",
+                    provenance: {
+                        sourceLocator: "transcript://durable",
+                        sourceContent: "raw durable source",
+                        sourceSessionId: sessionId,
+                        extractor: "historian",
+                        extractorVersion: "2",
+                        extractorRunId: "run-1",
+                        independenceKey: "ik-durable",
+                        sourceTrustClass: "explicit_user",
+                    },
+                    actor: "user:test",
+                },
+            );
+            expect(replay.replayed).toBe(true);
+            expect(replay.resultJson).toBe(created.resultJson);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});

@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod claim_operation;
 pub mod decay;
 
 pub use cortexkit_cache_core::{

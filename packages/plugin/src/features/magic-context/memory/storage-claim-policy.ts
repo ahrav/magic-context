@@ -512,6 +512,21 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
  * boundary key reads as 0 (never seeded): every revision on such a database
  * was written by a build that classifies rewrites as model inference. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
+    // Direct-format databases carry neither schema_migrations_meta nor the
+    // v84 memory-metadata table; there the boundary reads as 0 (never
+    // seeded) and the metadata branch cannot apply.
+    const hasLegacyMeta =
+        db
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations_meta'",
+            )
+            .get() != null;
+    const boundarySql = hasLegacyMeta
+        ? `COALESCE((
+                           SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
+                           WHERE key = 'claim_policy_seed_boundary_revision_id'
+                       ), 0)`
+        : "0";
     const byObservation = db
         .prepare(
             // Post-boundary observations are NOT unconditionally trusted:
@@ -523,6 +538,9 @@ export function hasExplicitUserEvidence(db: Database, revisionId: number): boole
             // no v86 path authors NEW user-content revisions), so a
             // content-changing compatibility rewrite can never ride the
             // copied stamp to VERIFIED.
+            // Interpolation is a compile-time boundary expression, not
+            // caller input.
+            // pi-lens-ignore: sql-injection
             `SELECT 1 FROM claim_evidence e
              JOIN observations o ON o.id = e.observation_id
              JOIN claim_revisions cr ON cr.id = e.revision_id
@@ -531,10 +549,7 @@ export function hasExplicitUserEvidence(db: Database, revisionId: number): boole
                AND (
                    cr.revision = 1
                    OR (
-                       e.revision_id > COALESCE((
-                           SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
-                           WHERE key = 'claim_policy_seed_boundary_revision_id'
-                       ), 0)
+                       e.revision_id > ${boundarySql}
                        AND cr.content_sha256 = (
                            SELECT first.content_sha256 FROM claim_revisions first
                            WHERE first.claim_id = cr.claim_id AND first.revision = 1
@@ -545,6 +560,16 @@ export function hasExplicitUserEvidence(db: Database, revisionId: number): boole
         )
         .get(revisionId);
     if (byObservation) return true;
+    if (
+        !hasLegacyMeta ||
+        db
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_revision_memory_metadata'",
+            )
+            .get() == null
+    ) {
+        return false;
+    }
     const byMetadata = db
         .prepare(
             `SELECT 1 FROM claim_revision_memory_metadata m

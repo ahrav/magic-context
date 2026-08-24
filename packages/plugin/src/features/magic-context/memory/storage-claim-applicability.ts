@@ -636,22 +636,23 @@ function pathsStateEquals(
 }
 
 /**
- * Append a successor assertion carrying the memory's current side-table path
- * knowledge onto the revision's legacy-memory source stream — only when that
- * knowledge differs from the stream head, so a replayed or no-op mapping
- * write appends nothing. Every non-path head field carries into the
- * successor unchanged: readers treat the head as the whole current snapshot,
- * so a path-only update must not erase anchors, dependency or verifier
- * metadata, or symbol selectors. Callers supply the desired path state and
- * knowledge time explicitly; a regressing knowledge time is clamped forward
- * to the stream maximum.
+ * Append a successor assertion carrying new path knowledge onto one of a
+ * revision's source streams — only when that knowledge differs from the
+ * stream head, so a replayed or no-op mapping write appends nothing. Every
+ * non-path head field carries into the successor unchanged: readers treat
+ * the head as the whole current snapshot, so a path-only update must not
+ * erase anchors, dependency or verifier metadata, or symbol selectors.
+ * Callers supply the desired path state and knowledge time explicitly; a
+ * regressing knowledge time is clamped forward to the stream maximum.
  */
-export function syncMemoryApplicabilityPathsInCurrentTransaction(
+export function syncRevisionApplicabilityPathsInCurrentTransaction(
     db: Database,
     args: {
         revisionId: number;
         projectId: number;
-        memoryId: number;
+        streamKey: string;
+        keyProtocol: string;
+        sourceDigest: string;
         paths: ApplicabilityPathsInput;
         knownFrom: number;
     },
@@ -660,12 +661,9 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
         revisionId: args.revisionId,
         projectId: args.projectId,
         ownerKind: "source",
-        streamKey: legacyMemoryApplicabilityStreamKey(args.memoryId),
-        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
-        sourceDigest: computeApplicabilitySourceDigest({
-            kind: "legacy-memory",
-            memoryId: args.memoryId,
-        }),
+        streamKey: args.streamKey,
+        keyProtocol: args.keyProtocol,
+        sourceDigest: args.sourceDigest,
     });
     const heads = readCurrentApplicabilityAssertions(db, args.revisionId);
     const head = heads.find((candidate) => candidate.streamId === stream.streamId);
@@ -687,4 +685,33 @@ export function syncMemoryApplicabilityPathsInCurrentTransaction(
         verifierSpec: head?.verifierSpec ?? null,
     });
     return { appended: true };
+}
+
+/**
+ * Append a successor assertion carrying the memory's current side-table path
+ * knowledge onto the revision's legacy-memory source stream. Legacy-keyed
+ * wrapper over syncRevisionApplicabilityPathsInCurrentTransaction.
+ */
+export function syncMemoryApplicabilityPathsInCurrentTransaction(
+    db: Database,
+    args: {
+        revisionId: number;
+        projectId: number;
+        memoryId: number;
+        paths: ApplicabilityPathsInput;
+        knownFrom: number;
+    },
+): { appended: boolean } {
+    return syncRevisionApplicabilityPathsInCurrentTransaction(db, {
+        revisionId: args.revisionId,
+        projectId: args.projectId,
+        streamKey: legacyMemoryApplicabilityStreamKey(args.memoryId),
+        keyProtocol: APPLICABILITY_STREAM_KEY_PROTOCOL,
+        sourceDigest: computeApplicabilitySourceDigest({
+            kind: "legacy-memory",
+            memoryId: args.memoryId,
+        }),
+        paths: args.paths,
+        knownFrom: args.knownFrom,
+    });
 }

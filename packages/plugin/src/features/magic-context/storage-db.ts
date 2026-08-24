@@ -27,7 +27,14 @@ import {
     parseRpcPortFile,
     readProcessCommand,
 } from "../../shared/rpc-utils";
-import { Database } from "../../shared/sqlite";
+import {
+    collectSqliteRuntimeGateInput,
+    Database,
+    evaluateSqliteRuntimeGate,
+    type SqliteConnectionContractExpectations,
+    type SqliteRuntimeGateInput,
+    verifySqliteConnectionContract,
+} from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
 import { ensureContextStoreUuid } from "./context-authority";
@@ -722,6 +729,34 @@ export function runSqliteOptimize(db: Database): void {
     } catch {
         // Best-effort maintenance; never fail a caller over stats refresh.
     }
+}
+
+export interface SqliteRuntimeGateReport {
+    readonly input: SqliteRuntimeGateInput;
+    readonly ok: boolean;
+    readonly reasons: readonly string[];
+}
+
+export function probeSqliteRuntimeGate(): SqliteRuntimeGateReport {
+    const input = collectSqliteRuntimeGateInput();
+    const { ok, reasons } = evaluateSqliteRuntimeGate(input);
+    if (!ok) {
+        log(
+            `[magic-context] storage fatal: this ${input.runtime} ${input.runtimeVersion} runtime's SQLite source (version ${input.sqliteVersion}, source ${input.sqliteSourceId}) failed the WAL-reset-safety gate: ${reasons.join("; ")}. Upgrade the runtime before this process may write context.db.`,
+        );
+    }
+    return { input, ok, reasons };
+}
+
+export function assertSqliteConnectionContract(
+    db: Database,
+    expectations: SqliteConnectionContractExpectations,
+): void {
+    const violations = verifySqliteConnectionContract(db, expectations);
+    if (violations.length === 0) return;
+    const message = `[magic-context] storage fatal: connection contract violated before application writes: ${violations.join("; ")}`;
+    log(message);
+    throw new Error(message);
 }
 
 function finishDatabaseOpen(

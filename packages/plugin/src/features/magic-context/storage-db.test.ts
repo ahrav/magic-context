@@ -16,7 +16,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
-import { Database } from "../../shared/sqlite";
+import { Database, evaluateSqliteRuntimeGate } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     __resetStoragePrivatePermissionEnforcementForTests,
@@ -28,6 +28,7 @@ import {
     __resetStoragePermissionFsForTests,
     __setRpcDiscoveryFsForTests,
     __setStoragePermissionFsForTests,
+    assertSqliteConnectionContract,
     closeDatabase,
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
@@ -40,6 +41,7 @@ import {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
+    probeSqliteRuntimeGate,
     resolveDatabasePath,
 } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
@@ -1068,5 +1070,130 @@ describe("storage-db", () => {
                 expect(body.includes("test-preload.ts")).toBe(true);
             }
         });
+    });
+});
+
+describe("sqlite runtime gate", () => {
+    const safeInput = {
+        runtime: "Node.js" as const,
+        runtimeVersion: "24.18.0",
+        sqliteVersion: "3.53.1",
+        sqliteSourceId:
+            "2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9",
+    };
+
+    it("passes an approved WAL-reset-safe source", () => {
+        expect(evaluateSqliteRuntimeGate(safeInput)).toEqual({ ok: true, reasons: [] });
+    });
+
+    it("fails Node 24.14.1 even with a safe SQLite source", () => {
+        const result = evaluateSqliteRuntimeGate({ ...safeInput, runtimeVersion: "24.14.1" });
+        expect(result.ok).toBe(false);
+        expect(result.reasons).toEqual(["Node.js 24.14.1 is below the supported floor 24.15.0"]);
+    });
+
+    it("fails an unsafe bundled SQLite source that predates the WAL-reset fix", () => {
+        const result = evaluateSqliteRuntimeGate({
+            ...safeInput,
+            sqliteVersion: "3.46.0",
+            sqliteSourceId:
+                "2024-05-23 13:25:27 96c92aba00c8375bc32fafcdf12429c58bd8aabfcadab6683e35bbb9cdebf19e",
+        });
+        expect(result.ok).toBe(false);
+        expect(result.reasons).toEqual(["SQLite 3.46.0 predates the WAL-reset fix in 3.47.1"]);
+    });
+
+    it("fails an unknown SQLite source identity", () => {
+        const result = evaluateSqliteRuntimeGate({
+            ...safeInput,
+            sqliteSourceId: "vendor-custom-build",
+        });
+        expect(result.ok).toBe(false);
+        expect(result.reasons[0]).toContain("not a recognized SQLite source identity");
+    });
+
+    it("fails a Bun runtime below the supported floor", () => {
+        const result = evaluateSqliteRuntimeGate({
+            ...safeInput,
+            runtime: "Bun",
+            runtimeVersion: "1.3.13",
+        });
+        expect(result.ok).toBe(false);
+        expect(result.reasons).toEqual(["Bun 1.3.13 is below the supported floor 1.3.14"]);
+    });
+
+    it("passes the live off-path probe on this supported runtime", () => {
+        const report = probeSqliteRuntimeGate();
+        expect(report.ok).toBe(true);
+        expect(report.input.sqliteVersion.length).toBeGreaterThan(0);
+    });
+});
+
+describe("sqlite connection contract", () => {
+    it("accepts a file-backed connection with the production PRAGMAs", () => {
+        const dir = makeTempDir("storage-db-contract-");
+        const db = new Database(join(dir, "contract.db"));
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            db.exec("PRAGMA foreign_keys=ON");
+            db.exec("PRAGMA journal_mode=WAL");
+            expect(() =>
+                assertSqliteConnectionContract(db, { expectWal: true, minBusyTimeoutMs: 5000 }),
+            ).not.toThrow();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks when foreign keys are disabled", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: false })).toThrow(
+                /foreign_keys is disabled/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks when WAL activation did not stick", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            db.exec("PRAGMA foreign_keys=ON");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: true })).toThrow(
+                /journal_mode is 'memory', expected 'wal'/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks when the busy timeout is missing", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA foreign_keys=ON");
+            db.exec("PRAGMA busy_timeout=0");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: false })).toThrow(
+                /busy_timeout 0ms is below the required 1ms/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("blocks a synchronous mode outside the declared set", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec("PRAGMA busy_timeout=5000");
+            db.exec("PRAGMA foreign_keys=ON");
+            db.exec("PRAGMA synchronous=OFF");
+            expect(() => assertSqliteConnectionContract(db, { expectWal: false })).toThrow(
+                /synchronous mode 0 is not in the declared set/,
+            );
+        } finally {
+            closeQuietly(db);
+        }
     });
 });
