@@ -508,8 +508,13 @@ export function parseRecordedMemoryBlockIds(raw: string | null | undefined): num
     if (raw == null) return null;
     try {
         const parsed = JSON.parse(raw) as unknown;
-        return Array.isArray(parsed)
-            ? parsed.filter((id): id is number => typeof id === "number")
+        // EVERY element must be a number — filtering invalid entries would
+        // turn a malformed manifest (e.g. `[null]` or `["12"]`) into `[]`,
+        // whose zero-ids fast path authorizes replay without proving the
+        // cached block holds no policy-hidden content. Malformed durable
+        // state fails closed instead.
+        return Array.isArray(parsed) && parsed.every((id) => typeof id === "number")
+            ? (parsed as number[])
             : null;
     } catch {
         return null;

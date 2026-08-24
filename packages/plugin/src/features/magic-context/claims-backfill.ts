@@ -1195,7 +1195,10 @@ export function runImmediateTransactionWithBusyRetrySync<T>(
             if (!isRetryableSqliteBusyError(error)) throw error;
             const delayMs = retryDelaysMs[attempt];
             if (delayMs === undefined) return "busy";
-            Bun.sleepSync(delayMs);
+            // Atomics.wait, not Bun.sleepSync: the Pi extension is built
+            // with --target node, where the Bun global does not exist — the
+            // blocking delay must work on both runtimes.
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
         }
     }
 }
