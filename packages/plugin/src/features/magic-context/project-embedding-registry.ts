@@ -2754,12 +2754,24 @@ export async function embedUnembeddedMemoriesForProject(
             return written.size;
         }
         // Same drain-boundary recheck as the detailed lane: the page-walk
-        // precheck above is stale once any await has run.
+        // precheck above is stale once any await has run. Bind each row to
+        // the exact captured bytes too — a rewrite to an eligible revision
+        // differing only in case/whitespace keeps the normalized hash equal,
+        // so saveEmbeddingIfHashMatches alone would persist the superseded
+        // revision's vector for the new bytes.
         const eligibleAtDrain = memoriesEligibleForEmbedding(
             db,
             memories.map((memory) => memory.id),
         );
-        const stillEligible = memories.filter((memory) => eligibleAtDrain.has(memory.id));
+        const digestsAtDrain = exactMemoryContentDigests(
+            db,
+            memories.map((memory) => memory.id),
+        );
+        const stillEligible = memories.filter(
+            (memory) =>
+                eligibleAtDrain.has(memory.id) &&
+                digestsAtDrain.get(memory.id) === sha256Utf8Hex(memory.content),
+        );
         if (stillEligible.length === 0) return 0;
         const result = await embedItemsForProject(
             projectIdentity,
