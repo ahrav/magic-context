@@ -111,6 +111,10 @@ fn main() {
         ),
         ("pi_auxiliary_events_ignored", pi_auxiliary_events_ignored),
         (
+            "undelivered_prompt_rejects_clean_transcript",
+            undelivered_prompt_rejects_clean_transcript,
+        ),
+        (
             "cancel_reaps_group_with_sigterm_first",
             cancel_reaps_group_with_sigterm_first,
         ),
@@ -322,6 +326,15 @@ mod fixture {
         hang();
     }
 
+    /// A child that answers without the question: stdin is replaced with
+    /// /dev/null (closing the prompt pipe's read end) before a complete,
+    /// valid transcript is printed and the process exits cleanly.
+    fn ignore_stdin_print_transcript() -> ! {
+        let devnull = fs::File::open("/dev/null").expect("open /dev/null");
+        rustix::stdio::dup2_stdin(&devnull).expect("replace stdin");
+        print_transcript_and_exit();
+    }
+
     fn flood(secret: &str, to_stderr: bool) -> ! {
         let line = format!("{{\"type\":\"noise\",\"secret\":\"{secret}\"}}\n");
         let stdout = std::io::stdout();
@@ -407,6 +420,11 @@ mod fixture {
     }
 
     fn harness() {
+        // Checked before the stdin drain below: this behavior models a child
+        // that produces its transcript without ever consuming the prompt.
+        if std::env::var(BEHAVIOR_ENV).as_deref() == Ok("ignore_stdin_print_transcript") {
+            ignore_stdin_print_transcript();
+        }
         let mut stdin = Vec::new();
         std::io::stdin()
             .read_to_end(&mut stdin)
@@ -427,6 +445,8 @@ mod fixture {
             }
             Ok("hang") => hang(),
             Ok("transcript_then_hang") => print_transcript_then_hang(),
+            // "ignore_stdin_print_transcript" is dispatched before the stdin
+            // drain at the top of this function.
             Ok("hang_ignore_term") => hang_ignore_term(out),
             Ok("grandchild_hang") => {
                 spawn_grandchild_then_hang(out.expect("grandchild fixtures need an out dir"));
@@ -1573,6 +1593,17 @@ fn malformed_outputs_one_bounded_failure() {
     let (terminal, _) = run_opencode_transcript(&lines);
     assert_bounded(&terminal, "contradictory terminal");
 
+    // Content after the terminal: a settled run cannot grow its answer.
+    let mut lines = opencode_success_lines("ok");
+    lines.push(serde_json::json!({
+        "type": "text",
+        "timestamp": 4,
+        "sessionID": "ses_x",
+        "part": {"type": "text", "text": "post-terminal smuggle"},
+    }));
+    let (terminal, _) = run_opencode_transcript(&lines);
+    assert_bounded(&terminal, "text event after the terminal at line 4");
+
     // Unknown event types fail closed (risk table: JSON vocabulary drift).
     let (terminal, _) = run_pi_transcript(&[serde_json::json!({"type": "wire_novelty"})]);
     assert_bounded(&terminal, "unknown event type at line 1");
@@ -1737,6 +1768,38 @@ fn pi_auxiliary_events_ignored() {
     assert!(events.iter().any(
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "aux answer")
     ));
+}
+
+/// A child that emits a valid transcript without consuming the prompt (its
+/// stdin closes before delivery completes) answered a question it never
+/// received; the run must fail rather than accept the transcript.
+fn undelivered_prompt_rejects_clean_transcript() {
+    let setup = RunSetup::new();
+    let transcript = write_transcript(
+        setup.scratch.path(),
+        "unread.ndjson",
+        &pi_success_lines("answer without a question", "stop"),
+    );
+    let backend = pi_backend(
+        &setup,
+        &[
+            (TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy()),
+            (BEHAVIOR_ENV, "ignore_stdin_print_transcript"),
+        ],
+        Vec::new(),
+        None,
+    );
+    // The prompt must exceed the pipe buffer so an unread prompt cannot be
+    // absorbed by the kernel and counted as delivered.
+    let mut request = request(setup.project.path(), Harness::Pi, "anthropic/m", None);
+    request.prompt = "p".repeat(1024 * 1024);
+    let (terminal, _) = execute(&backend, request);
+    let error = failed(&terminal);
+    assert!(
+        error.message.contains("prompt delivery failed"),
+        "{:?}",
+        error.message
+    );
 }
 
 fn cancel_reaps_group_with_sigterm_first() {

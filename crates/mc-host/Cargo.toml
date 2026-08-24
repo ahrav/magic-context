@@ -26,6 +26,9 @@ getrandom = "0.2"
 hmac = "0.12"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "signal"] }
+# `stdio` only serves the broca_subprocess fixture that replaces its own
+# stdin; feature unification keeps production builds on fs+process alone.
+rustix = { version = "1.1.4", features = ["stdio"] }
 
 [[test]]
 name = "broca_subprocess"
