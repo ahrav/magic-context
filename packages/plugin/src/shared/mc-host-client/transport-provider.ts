@@ -10,7 +10,12 @@
 
 import { SubcCallError } from "./errors";
 import type { ByteBudget, FrameChannelHandlers, SetupFrameChannel } from "./frame-channel";
-import { type OpaqueObject, TRANSPORT_TCP, type TransportOffer } from "./transport-negotiation";
+import {
+    checkOpaquePlain,
+    type OpaqueObject,
+    TRANSPORT_TCP,
+    type TransportOffer,
+} from "./transport-negotiation";
 
 /** The TCP capability version this client offers and accepts. */
 export const TCP_CAPABILITY_VERSION = 1;
@@ -41,12 +46,18 @@ export interface ClientTransportProvider {
 
 /** Ordered provider set consulted once per connection setup (KTD5: selection is sticky). */
 export class ClientTransportRegistry {
-    constructor(private readonly providers: readonly ClientTransportProvider[]) {}
+    private readonly offerSnapshot: readonly TransportOffer[];
 
-    /** Ordered offers: installed non-TCP providers first, then the required TCP entry. */
-    offers(): TransportOffer[] {
-        const offers: TransportOffer[] = this.providers.map((provider) =>
-            provider.parameters === undefined
+    constructor(private readonly providers: readonly ClientTransportProvider[]) {
+        // Provider-authored getters and `toJSON` run once, here — never on
+        // an authenticated connection's setup path, where synchronous
+        // provider code could hold the socket and shared flight
+        // indefinitely and a throwing getter would escape unsanitized. The
+        // validated parsed snapshot is pure data with no live provider
+        // references.
+        const offers: TransportOffer[] = providers.map((provider) => {
+            const parameters = provider.parameters;
+            return parameters === undefined
                 ? {
                       transport: provider.transport,
                       capabilityVersion: provider.capabilityVersion,
@@ -54,11 +65,16 @@ export class ClientTransportRegistry {
                 : {
                       transport: provider.transport,
                       capabilityVersion: provider.capabilityVersion,
-                      parameters: provider.parameters,
-                  },
-        );
+                      parameters: checkOpaquePlain(parameters, "parameters"),
+                  };
+        });
         offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
-        return offers;
+        this.offerSnapshot = offers;
+    }
+
+    /** Ordered offers: installed non-TCP providers first, then the required TCP entry. */
+    offers(): TransportOffer[] {
+        return [...this.offerSnapshot];
     }
 
     find(transport: string, capabilityVersion: number): ClientTransportProvider | undefined {

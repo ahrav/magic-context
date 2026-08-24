@@ -898,7 +898,7 @@ export class SubcClient {
             }
             decodeCommitResponse(commit.body);
         } catch (error) {
-            const failure = wrapNegotiationError(error);
+            const failure = boundedNegotiationFailure(error);
             candidate.retire("negotiation_failed", failure);
             bootstrap.generation.retire("negotiation_failed", failure);
             throw failure;
@@ -1496,6 +1496,27 @@ function wrapNegotiationError(error: unknown): Error {
         );
     }
     return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * Negotiation-path failure sanitizer: a wire Error terminal carries
+ * peer-controlled text, so it is replaced with a bounded failure before it
+ * can enter retirement info or caller-visible error graphs (R14). Every
+ * other failure keeps `wrapNegotiationError` semantics.
+ */
+function boundedNegotiationFailure(error: unknown): Error {
+    if (
+        error instanceof SubcCallError &&
+        error.kind === "terminal" &&
+        error.errorTerminal !== undefined
+    ) {
+        return new SubcCallError(
+            "terminal",
+            "transport negotiation failed: host error terminal",
+            "negotiation_failed",
+        );
+    }
+    return wrapNegotiationError(error);
 }
 
 function toManagedCallError(error: unknown): SubcCallError {

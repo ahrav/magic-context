@@ -776,7 +776,7 @@ function plainDepth(value: unknown): number {
  * callers MUST encode: a stateful `toJSON` could otherwise pass validation
  * and emit a different shape on the second serialization.
  */
-function checkOpaquePlain(value: unknown, path: string): OpaqueObject {
+export function checkOpaquePlain(value: unknown, path: string): OpaqueObject {
     const serialized = JSON.stringify(value);
     if (serialized === undefined) {
         throw new NegotiationError("invalid_type", path);

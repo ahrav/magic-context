@@ -982,7 +982,10 @@ async fn stalled_provider_prepare_fails_setup_within_the_deadline() {
         .await
         .expect("send negotiation");
     assert!(
-        client.closed_within(HOST_BUDGET).await,
+        // Shorter than the provider's 800 ms stall: only the 100 ms setup
+        // deadline can close the connection this early, so the assertion
+        // discriminates the deadline from the provider's own late error.
+        client.closed_within(Duration::from_millis(400)).await,
         "a stalled provider gate fails the setup closed within the deadline"
     );
     host.shutdown_gracefully().await;
