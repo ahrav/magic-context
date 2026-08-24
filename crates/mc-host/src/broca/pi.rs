@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{
-    BackendError, BackendEvent, BackendFuture, BackendRequest, BackendTerminal, EventSink,
-    FinishReason, LlmExecutionBackend,
+    BackendError, BackendEvent, BackendFuture, BackendRequest, BackendTerminal, ErrorClass,
+    EventSink, FinishReason, LlmExecutionBackend,
 };
 use super::subprocess::{
     self, commit_terminal, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
@@ -95,7 +95,7 @@ impl LlmExecutionBackend for PiBackend {
         let thinking_level = self.thinking_level.clone();
         let limits = self.limits.clone();
         let env = self.env.clone();
-        Box::pin(run_pi(
+        Box::pin(run_pi_with_provider_fallback(
             descriptor,
             thinking_level,
             limits,
@@ -119,6 +119,54 @@ pub fn pi_model_ref(provider: &str, model: &str) -> String {
     format!("{pi_provider}/{model}")
 }
 
+/// Runs the aliased Pi provider first, then retries the canonical provider
+/// once on a credential failure: a user authenticated through the direct
+/// `openai`/`google` API-key providers has no credentials under the
+/// subscription-extension aliases, and `subagent-runner.ts` resolves the
+/// same ambiguity with the same alias-then-canonical order.
+async fn run_pi_with_provider_fallback(
+    descriptor: PiRuntimeDescriptor,
+    thinking_level: Option<String>,
+    limits: SubprocessLimits,
+    env: EnvSnapshot,
+    request: BackendRequest,
+    events: EventSink,
+    cancel: CancellationToken,
+) -> BackendTerminal {
+    let aliased = pi_model_ref(&request.provider, &request.model);
+    let canonical = format!("{}/{}", request.provider, request.model);
+    let first = run_pi(
+        descriptor.clone(),
+        thinking_level.clone(),
+        limits.clone(),
+        env.clone(),
+        request.clone(),
+        events.clone(),
+        cancel.clone(),
+        aliased.clone(),
+    )
+    .await;
+    let credential_failure = matches!(
+        &first,
+        BackendTerminal::Failed(error) if error.class == ErrorClass::AuthRequired
+    );
+    if aliased == canonical || !credential_failure || cancel.is_cancelled() {
+        return first;
+    }
+    run_pi(
+        descriptor,
+        thinking_level,
+        limits,
+        env,
+        request,
+        events,
+        cancel,
+        canonical,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // One fully-specified child invocation; grouping would only rename the same set.
 async fn run_pi(
     descriptor: PiRuntimeDescriptor,
     thinking_level: Option<String>,
@@ -127,6 +175,7 @@ async fn run_pi(
     request: BackendRequest,
     events: EventSink,
     cancel: CancellationToken,
+    model_ref: String,
 ) -> BackendTerminal {
     let dir = match PrivateDir::create("mc-broca-pi") {
         Ok(dir) => dir,
@@ -194,7 +243,7 @@ async fn run_pi(
         args.push(path.to_string_lossy().into_owned());
     }
     args.push("--model".to_owned());
-    args.push(pi_model_ref(&request.provider, &request.model));
+    args.push(model_ref);
     if let Some(level) = &thinking_level {
         args.push("--thinking".to_owned());
         args.push(level.clone());

@@ -9784,6 +9784,13 @@ impl McHandler {
                     continue;
                 }
             };
+            // Connection and route setup can consume the remaining budget;
+            // a send after the promised deadline would start a billable run
+            // only to time out its zero-length await immediately.
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                last_error = "classify time budget exhausted during producer startup".to_string();
+                break;
+            }
             let started = producer
                 .start_with_generation(
                     &child_session,

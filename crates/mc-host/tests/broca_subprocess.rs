@@ -70,6 +70,10 @@ fn main() {
         ("pi_argv_privacy_contract", pi_argv_privacy_contract),
         ("pi_provider_alias_mapping", pi_provider_alias_mapping),
         (
+            "pi_alias_credential_failure_retries_canonical_provider",
+            pi_alias_credential_failure_retries_canonical_provider,
+        ),
+        (
             "pi_project_pi_resources_ignored",
             pi_project_pi_resources_ignored,
         ),
@@ -343,6 +347,34 @@ mod fixture {
         print_transcript_and_exit();
     }
 
+    /// Models credentials that live under the canonical provider rather
+    /// than the subscription alias: the first invocation fails with a
+    /// credential error and the retry (marker present) succeeds.
+    fn alias_auth_retry(out: PathBuf) -> ! {
+        let marker = out.join("alias-attempted");
+        let lines: Vec<serde_json::Value> = if marker.exists() {
+            vec![
+                serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+                serde_json::json!({"type": "agent_start"}),
+                serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "canonical answer"}]}}),
+            ]
+        } else {
+            fs::write(&marker, b"1").expect("write alias marker");
+            vec![
+                serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+                serde_json::json!({"type": "agent_start"}),
+                serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "No API key found for provider", "content": []}}),
+            ]
+        };
+        let mut stdout = std::io::stdout();
+        for line in lines {
+            let bytes = serde_json::to_string(&line).expect("line");
+            stdout.write_all(bytes.as_bytes()).expect("write line");
+            stdout.write_all(b"\n").expect("write newline");
+        }
+        std::process::exit(0);
+    }
+
     fn flood(secret: &str, to_stderr: bool) -> ! {
         let line = format!("{{\"type\":\"noise\",\"secret\":\"{secret}\"}}\n");
         let stdout = std::io::stdout();
@@ -453,6 +485,9 @@ mod fixture {
             }
             Ok("hang") => hang(),
             Ok("transcript_then_hang") => print_transcript_then_hang(),
+            Ok("alias_auth_retry") => {
+                alias_auth_retry(out.expect("alias fixture needs an out dir"));
+            }
             // "ignore_stdin_print_transcript" is dispatched before the stdin
             // drain at the top of this function.
             Ok("hang_ignore_term") => hang_ignore_term(out),
@@ -1865,6 +1900,37 @@ fn pi_extension_stdout_noise_skipped() {
         "{:?}",
         error.message
     );
+}
+
+/// A credential failure under the subscription alias retries the canonical
+/// provider once (`subagent-runner.ts`'s alias-then-canonical order), so a
+/// user authenticated through the direct API-key provider still completes
+/// Rust-mode historian and classify runs.
+fn pi_alias_credential_failure_retries_canonical_provider() {
+    let setup = RunSetup::new();
+    let backend = pi_backend(
+        &setup,
+        &[(BEHAVIOR_ENV, "alias_auth_retry")],
+        Vec::new(),
+        None,
+    );
+    let (terminal, events) = execute(
+        &backend,
+        request(setup.project.path(), Harness::Pi, "openai/m", None),
+    );
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "canonical answer")
+    ));
+    // The retry's argv capture carries the canonical reference, not the
+    // alias the first attempt used.
+    let args = setup.argv();
+    assert!(args.iter().any(|arg| arg == "openai/m"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg == "openai-codex/m"), "{args:?}");
+    assert!(setup.out.path().join("alias-attempted").exists());
 }
 
 /// A completion that still carries a `toolCall` block is an intermediate
