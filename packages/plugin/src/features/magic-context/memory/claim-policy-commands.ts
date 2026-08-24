@@ -505,6 +505,16 @@ export async function executeClaimEnforceCommand(
     if (unknownFlags.length > 0) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
+    // At most one occurrence of each flag, and --revoke and --kind never
+    // combine: duplicates would silently use the FIRST --kind pair and
+    // ignore the rest, committing arguments the user did not confirm.
+    if (
+        parts.filter((part) => part === "--kind").length > 1 ||
+        parts.filter((part) => part === "--revoke").length > 1 ||
+        (parts.includes("--revoke") && parts.includes("--kind"))
+    ) {
+        return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
+    }
     // Artifact revocation is the compromise-response path (KTD6): a revoked
     // approval alone only lowers maturity until the next approval, because
     // supportedMaturity would reuse the still-valid artifact and restore
@@ -624,7 +634,9 @@ export async function executeClaimEnforceCommand(
     }
     const [idText, artifactInput] = parts;
     const memoryId = Number(idText);
-    if (!Number.isSafeInteger(memoryId) || memoryId <= 0 || !artifactInput) {
+    // Exactly two positional arguments (id and path): extra tokens would be
+    // silently ignored, committing arguments the user did not confirm.
+    if (parts.length !== 2 || !Number.isSafeInteger(memoryId) || memoryId <= 0 || !artifactInput) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
     const target = resolveTarget(deps, memoryId);

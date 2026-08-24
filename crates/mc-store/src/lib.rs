@@ -6039,6 +6039,10 @@ impl<'a> FacadeMutationTxn<'a> {
         }
         self.tx
             .execute(
+                // Merge rewrites the target's content, so the withdrawal
+                // and provenance-demotion clauses mirror
+                // UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL (extra merge columns
+                // keep this statement separate).
                 "UPDATE mc_memories
                     SET content = ?1,
                         normalized_hash = ?2,
@@ -6048,7 +6052,18 @@ impl<'a> FacadeMutationTxn<'a> {
                         status = ?6,
                         updated_at = ?7,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        verified_at = CASE
+                            WHEN verification_status = 'verified'
+                                THEN COALESCE(verified_at, ?7)
+                            ELSE verified_at END,
+                        verification_status = CASE
+                            WHEN verification_status = 'verified'
+                                THEN 'unverified'
+                            ELSE verification_status END,
+                        source_type = CASE
+                            WHEN source_type = 'user' THEN 'agent'
+                            ELSE source_type END
                   WHERE id = ?8",
                 params![
                     merged_content,
@@ -11901,6 +11916,10 @@ impl McStore {
             }
 
             tx.execute(
+                // Merge rewrites the target's content, so the withdrawal
+                // and provenance-demotion clauses mirror
+                // UPDATE_MEMORY_CONTENT_WITHDRAWAL_SQL (extra merge columns
+                // keep this statement separate).
                 "UPDATE mc_memories
                     SET content = ?1,
                         normalized_hash = ?2,
@@ -11910,7 +11929,18 @@ impl McStore {
                         status = ?6,
                         updated_at = ?7,
                         shareable = 0,
-                        classified_at = NULL
+                        classified_at = NULL,
+                        verified_at = CASE
+                            WHEN verification_status = 'verified'
+                                THEN COALESCE(verified_at, ?7)
+                            ELSE verified_at END,
+                        verification_status = CASE
+                            WHEN verification_status = 'verified'
+                                THEN 'unverified'
+                            ELSE verification_status END,
+                        source_type = CASE
+                            WHEN source_type = 'user' THEN 'agent'
+                            ELSE source_type END
                   WHERE id = ?8",
                 params![
                     merged_content,

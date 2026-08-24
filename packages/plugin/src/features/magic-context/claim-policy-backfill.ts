@@ -473,6 +473,27 @@ export function revalidateEnforcementArtifacts(
     const last = artifactRevalidationLastRunMs.get(throttleKey) ?? 0;
     if (nowMs - last < ARTIFACT_REVALIDATION_INTERVAL_MS) return;
     artifactRevalidationLastRunMs.set(throttleKey, nowMs);
+    // The filesystem walk (existsSync + readFileSync + hashing per enforced
+    // artifact) runs OFF the caller's synchronous path: the probe is invoked
+    // from the transform hot path, and a large artifact must not delay a
+    // live prompt. The throttle above already coalesces concurrent passes.
+    setImmediate(() => {
+        try {
+            revalidateEnforcementArtifactsNow(db, projectIdentity, projectRoot, nowMs);
+        } catch (error) {
+            log(
+                `[claim-policy] artifact revalidation failed (retrying on a later probe): ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+    });
+}
+
+function revalidateEnforcementArtifactsNow(
+    db: Database,
+    projectIdentity: string,
+    projectRoot: string,
+    nowMs: number,
+): void {
     if (!existsSync(projectRoot)) return;
     const projectRow = db
         .prepare("SELECT id FROM projects WHERE canonical_identity = ?")
