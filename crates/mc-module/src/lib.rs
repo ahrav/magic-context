@@ -10150,6 +10150,10 @@ impl McHandler {
             updates.push(VerificationUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 verification_status: status.to_string(),
                 updated_content: row
                     .get("updated_content")

@@ -511,6 +511,16 @@ export async function applyVerifyManifest(
             return {
                 memory_id: identity.moduleId,
                 content_hash_at_prompt: identity.normalizedHash,
+                // Exact prompted bytes: `stillApplicable` above proved the
+                // claim-revision digest equals the sha256 of the bytes the
+                // model saw, and the native handler compares it against the
+                // row's exact content inside its transaction — the
+                // normalized hash alone cannot reject a case/whitespace-only
+                // rewrite landing between this preflight and that
+                // transaction.
+                ...(digestsForModule.get(write.id) !== undefined
+                    ? { content_sha256_at_prompt: digestsForModule.get(write.id) }
+                    : {}),
                 verification_status: write.kind === "verify" ? "verified" : write.kind,
                 ...(write.kind === "update" ? { updated_content: write.content } : {}),
                 ...(write.kind === "archive" ? { archive_reason: write.reason } : {}),

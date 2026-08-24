@@ -4786,6 +4786,12 @@ pub struct ClassificationApplyResult {
 pub struct VerificationUpdate {
     pub memory_id: i64,
     pub content_hash_at_prompt: String,
+    /// SHA-256 hex of the exact bytes the model was prompted with.
+    /// Normalized hashing folds case and whitespace, so it alone cannot
+    /// reject a rewrite that changed only those bytes; when present this
+    /// digest is compared against the row's exact content inside the
+    /// verification transaction.
+    pub content_sha256_at_prompt: Option<String>,
     pub verification_status: String,
     pub updated_content: Option<String>,
     pub archive_reason: Option<String>,
@@ -18352,6 +18358,16 @@ fn set_memory_verification_tx(
             });
             continue;
         }
+        if let Some(expected) = update.content_sha256_at_prompt.as_deref() {
+            let actual = format!("{:x}", Sha256::digest(memory.content.as_bytes()));
+            if actual != expected {
+                rejected.push(VerificationRejected {
+                    memory_id: update.memory_id,
+                    reason: "stale".to_string(),
+                });
+                continue;
+            }
+        }
         let feed_seq_before = tx.query_row(
             "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed",
             [],
@@ -29097,6 +29113,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 1,
                         content_hash_at_prompt: hash(1),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -29104,6 +29121,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 2,
                         content_hash_at_prompt: "stale".into(),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -29111,6 +29129,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 99,
                         content_hash_at_prompt: "missing".into(),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -29118,6 +29137,7 @@ mod shadow_tests {
                     VerificationUpdate {
                         memory_id: 3,
                         content_hash_at_prompt: hash(3),
+                        content_sha256_at_prompt: None,
                         verification_status: "verified".into(),
                         updated_content: None,
                         archive_reason: None,
@@ -29156,6 +29176,7 @@ mod shadow_tests {
                 &[VerificationUpdate {
                     memory_id: 2,
                     content_hash_at_prompt: hash(2),
+                    content_sha256_at_prompt: None,
                     verification_status: "update".into(),
                     updated_content: Some("two changed".into()),
                     archive_reason: None,
@@ -29172,6 +29193,7 @@ mod shadow_tests {
                 &[VerificationUpdate {
                     memory_id: 1,
                     content_hash_at_prompt: hash(1),
+                    content_sha256_at_prompt: None,
                     verification_status: "archive".into(),
                     updated_content: None,
                     archive_reason: Some("obsolete".into()),
@@ -29280,6 +29302,7 @@ mod shadow_tests {
         let update = VerificationUpdate {
             memory_id: 1,
             content_hash_at_prompt: hash,
+            content_sha256_at_prompt: None,
             verification_status: "archive".to_string(),
             updated_content: None,
             archive_reason: Some("obsolete".to_string()),

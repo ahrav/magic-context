@@ -2806,7 +2806,17 @@ export async function embedUnembeddedMemoriesForProject(
 
         let embeddedCount = 0;
         db.transaction(() => {
+            // Re-bind inside the write transaction: the provider call above
+            // yielded, and the normalized-hash guard alone cannot reject a
+            // case/whitespace-only rewrite that landed meanwhile — the save
+            // would reinstate the predecessor's vector under the successor
+            // bytes. Same discipline as the shadow drain.
+            const digestsAtSave = exactMemoryContentDigests(
+                db,
+                stillEligible.map((memory) => memory.id),
+            );
             for (const memory of stillEligible) {
+                if (digestsAtSave.get(memory.id) !== sha256Utf8Hex(memory.content)) continue;
                 const embedding = result.vectors.get(`memory:${memory.id}`);
                 if (!embedding) continue;
                 if (
