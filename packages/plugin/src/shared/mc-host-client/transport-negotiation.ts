@@ -778,10 +778,21 @@ function plainDepth(value: unknown): number {
  * `undefined` members, and other JavaScript-only shapes all differ from
  * their pre-serialization value — and the returned parsed snapshot is what
  * callers MUST encode: a stateful `toJSON` could otherwise pass validation
- * and emit a different shape on the second serialization.
+ * and emit a different shape on the second serialization. Note that
+ * `JSON.stringify` may run provider-authored `toJSON`; callers holding a
+ * provider-owned value contain that call and pass the string to
+ * {@link checkOpaqueSerialized} instead.
  */
 export function checkOpaquePlain(value: unknown, path: string): OpaqueObject {
-    const serialized = JSON.stringify(value);
+    return checkOpaqueSerialized(JSON.stringify(value), path);
+}
+
+/**
+ * Validates one already-serialized opaque value — pure data, no provider
+ * code — against the object, depth, and compact-size bounds, returning the
+ * parsed snapshot to encode.
+ */
+export function checkOpaqueSerialized(serialized: string | undefined, path: string): OpaqueObject {
     if (serialized === undefined) {
         throw new NegotiationError("invalid_type", path);
     }

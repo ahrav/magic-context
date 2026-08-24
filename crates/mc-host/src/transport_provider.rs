@@ -108,15 +108,21 @@ type PrepareJob = (
     tokio::sync::oneshot::Sender<Result<PreparedCandidate, ProviderFailure>>,
 );
 
+/// Bounds preparations queued behind a wedged gate: a hung `prepare` can
+/// strand at most this many unreachable provider/context tuples before
+/// later negotiations fail closed immediately instead of growing host
+/// memory per reconnect.
+const PREPARE_QUEUE_BOUND: usize = 8;
+
 /// The registry's single, lazily started preparation thread. `prepare` runs
 /// here — never on a Tokio worker or the blocking pool — so a provider gate
 /// that blocks forever occupies exactly this one OS thread: later attempts
-/// queue behind it and fail at their own setup deadlines instead of
-/// consuming another pool worker per reconnect, and runtime shutdown never
-/// waits on it.
+/// queue behind it (up to [`PREPARE_QUEUE_BOUND`]) and fail at their own
+/// setup deadlines instead of consuming another pool worker per reconnect,
+/// and runtime shutdown never waits on it.
 #[derive(Default)]
 struct PrepareWorker {
-    sender: Mutex<Option<std::sync::mpsc::Sender<PrepareJob>>>,
+    sender: Mutex<Option<std::sync::mpsc::SyncSender<PrepareJob>>>,
 }
 
 /// The host's provider registry. `Default` (production) is empty: TCP is the
@@ -159,12 +165,21 @@ impl TransportProviders {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let mut sender = self.worker.sender.lock().expect("prepare worker lock");
         if sender.is_none() {
-            let (job_tx, job_rx) = std::sync::mpsc::channel::<PrepareJob>();
+            let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<PrepareJob>(PREPARE_QUEUE_BOUND);
             let spawned = std::thread::Builder::new()
                 .name("mc-host-provider-prepare".to_owned())
                 .spawn(move || {
                     while let Ok((provider, ctx, reply)) = job_rx.recv() {
-                        let _ = reply.send(provider.prepare(&ctx));
+                        // A panicking gate is one failed preparation, not a
+                        // dead worker: the payload is discarded (the same
+                        // containment the composite handler boundary uses)
+                        // and that setup fails closed.
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                provider.prepare(&ctx)
+                            }))
+                            .unwrap_or(Err(ProviderFailure::Unavailable));
+                        let _ = reply.send(outcome);
                     }
                 });
             if spawned.is_ok() {
@@ -174,7 +189,10 @@ impl TransportProviders {
             // observes a closed channel: the setup fails closed.
         }
         if let Some(job_tx) = sender.as_ref() {
-            let _ = job_tx.send((provider, ctx, reply_tx));
+            // try_send: a wedged worker rejects new jobs instead of queueing
+            // unreachable provider/context tuples without bound; the dropped
+            // reply sender fails that caller's setup closed immediately.
+            let _ = job_tx.try_send((provider, ctx, reply_tx));
         }
         reply_rx
     }

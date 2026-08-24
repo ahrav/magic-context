@@ -16,8 +16,7 @@ import type {
     SetupFrameChannel,
 } from "./frame-channel";
 import {
-    checkOpaquePlain,
-    NegotiationError,
+    checkOpaqueSerialized,
     type OpaqueObject,
     TRANSPORT_TCP,
     type TransportOffer,
@@ -63,35 +62,51 @@ export class ClientTransportRegistry {
         // Provider-authored getters and `toJSON` run once, here — never on
         // an authenticated connection's setup path, where synchronous
         // provider code could hold the socket and shared flight
-        // indefinitely and a throwing getter would escape unsanitized. Both
-        // the offer list and grant resolution read only this snapshot, and
-        // a getter that throws during registration is replaced with a
-        // bounded error so provider-owned text never leaves `connect()`.
+        // indefinitely and a throwing getter would escape unsanitized.
+        // Phase 1 runs every provider call (getters plus serialization)
+        // inside one containment: any throw — including a provider-forged
+        // `NegotiationError` — becomes the bounded registration error.
+        let raw: {
+            transport: string;
+            capabilityVersion: number;
+            serializedParameters: string | undefined;
+            provider: ClientTransportProvider;
+        }[];
         try {
-            this.entries = providers.map((provider) => ({
-                transport: provider.transport,
-                capabilityVersion: provider.capabilityVersion,
-                provider,
-            }));
-            const offers: TransportOffer[] = this.entries.map((entry) => {
-                const parameters = entry.provider.parameters;
-                return parameters === undefined
-                    ? {
-                          transport: entry.transport,
-                          capabilityVersion: entry.capabilityVersion,
-                      }
-                    : {
-                          transport: entry.transport,
-                          capabilityVersion: entry.capabilityVersion,
-                          parameters: checkOpaquePlain(parameters, "parameters"),
-                      };
+            raw = providers.map((provider) => {
+                const parameters = provider.parameters;
+                return {
+                    transport: provider.transport,
+                    capabilityVersion: provider.capabilityVersion,
+                    serializedParameters:
+                        parameters === undefined ? undefined : JSON.stringify(parameters),
+                    provider,
+                };
             });
-            offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
-            this.offerSnapshot = offers;
-        } catch (error) {
-            if (error instanceof NegotiationError) throw error;
+        } catch {
             throw new Error("transport provider registration failed");
         }
+        // Phase 2 validates pure data: a NegotiationError raised here is
+        // ours and carries only bounded codes and structural paths.
+        this.entries = raw.map((entry) => ({
+            transport: entry.transport,
+            capabilityVersion: entry.capabilityVersion,
+            provider: entry.provider,
+        }));
+        const offers: TransportOffer[] = raw.map((entry) =>
+            entry.serializedParameters === undefined
+                ? {
+                      transport: entry.transport,
+                      capabilityVersion: entry.capabilityVersion,
+                  }
+                : {
+                      transport: entry.transport,
+                      capabilityVersion: entry.capabilityVersion,
+                      parameters: checkOpaqueSerialized(entry.serializedParameters, "parameters"),
+                  },
+        );
+        offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
+        this.offerSnapshot = offers;
     }
 
     /** Ordered offers: installed non-TCP providers first, then the required TCP entry. */
@@ -207,8 +222,10 @@ export function sanitizedCandidateFactory(
                 } catch (error) {
                     throw sanitizedChannelFailure(transport, "send", error);
                 }
+                // Built explicitly — never spread from the provider object,
+                // whose enumerable getters could throw mid-construction
+                // after the frame was already admitted.
                 return {
-                    ...ticket,
                     cancel: () => {
                         try {
                             return ticket.cancel();
