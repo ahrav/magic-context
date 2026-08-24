@@ -327,6 +327,35 @@ fn the_512kib_boundary_admits_exactly_and_rejects_one_byte_over() {
     assert!(error.message.contains("512 KiB"), "{}", error.message);
 }
 
+#[test]
+fn error_unit_stays_within_terminal_headroom_after_json_escaping() {
+    use mc_host::broca::backend::{BackendError, ErrorClass};
+
+    // Control characters JSON-escape to six bytes each (`\u00XX`): a raw-byte
+    // diagnostic bound alone would let two such fields encode past the
+    // headroom charged at admission. The worst case must still fit alongside
+    // the `run_started` unit, which shares the same reserved slice.
+    let hostile = "\u{1}".repeat(4096);
+    let run_id = "r".repeat(protocol::MAX_RUN_ID_BYTES);
+    let unit = protocol::error_unit(
+        &run_id,
+        &BackendError {
+            class: ErrorClass::Transient,
+            message: hostile.clone(),
+            retry_after_secs: Some(u64::MAX),
+            provider_code: Some(hostile),
+        },
+    );
+    let started = protocol::run_started_unit(&run_id);
+    assert!(
+        unit.len() + started.len() <= config::TERMINAL_HEADROOM_BYTES,
+        "terminal ({}) plus run_started ({}) must fit the {}-byte headroom",
+        unit.len(),
+        started.len(),
+        config::TERMINAL_HEADROOM_BYTES
+    );
+}
+
 /// Exercises the component's bind checks directly: the host's control layer
 /// refuses relative roots and empty identity fields before a bind, so these
 /// component-level rejections are unreachable over the wire.

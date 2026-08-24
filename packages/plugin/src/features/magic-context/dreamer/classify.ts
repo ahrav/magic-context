@@ -69,6 +69,17 @@ const CLASSIFY_CHUNK_SIZE = 100;
 // chunk's live slice remainder.
 const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
 
+// The module's payload budget is shortened by this margin relative to the
+// transport request budget: the transport's absolute deadline starts before
+// connection and lane admission, while the module starts its own clock only
+// after parsing the request — with equal budgets the transport times out
+// first and its cancel aborts the handler between the producer run and
+// `purge_session`, leaving the attempt's Broca subprocess (and its
+// memory-pool prompt) alive until the run timeout. The margin covers the
+// module's timeout path: await cutoff, redrain, and session purge
+// (subprocess SIGTERM plus its 5s termination grace).
+const CLASSIFY_MODULE_PURGE_MARGIN_MS = 15_000;
+
 export interface ClassifyModuleCallArgs {
     sessionId: string;
     projectRoot: string;
@@ -509,7 +520,11 @@ async function runClassifyThroughModule(
             payload: {
                 prompt_body: prompt,
                 model_chain: [...modelChain],
-                timeout_ms: remainingMs,
+                // Shorter than the transport budget below so the module's own
+                // deadline machinery — not a transport cancel that aborts the
+                // handler mid-cleanup — ends an over-budget run and purges its
+                // attempt session.
+                timeout_ms: Math.max(1, remainingMs - CLASSIFY_MODULE_PURGE_MARGIN_MS),
                 items: chunk.map((candidate) => ({
                     memory_id: candidate.id,
                     content_hash: candidate.normalizedHash,

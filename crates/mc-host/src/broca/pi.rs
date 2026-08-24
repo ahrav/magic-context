@@ -222,7 +222,7 @@ async fn run_pi(
         stdin: request.prompt.clone().into_bytes(),
     };
 
-    let result = match subprocess::run(spec, &limits, &cancel).await {
+    let result = match subprocess::run(spec, &limits, &cancel, Some(pi_terminal_probe)).await {
         Ok(result) => result,
         Err(err) => {
             return subprocess::merge_cleanup(
@@ -236,12 +236,31 @@ async fn run_pi(
     subprocess::finalize(HarnessName::Pi, &result, parsed, &limits, dir.cleanup())
 }
 
-/// Parses the closed Pi print-mode JSON vocabulary (R18): `session`,
-/// `agent_start`, `turn_start`, `turn_end`, `message_start`, and
-/// `message_end`. The terminal assistant `message_end` (stopReason `stop`,
-/// `length`, `error`, or `aborted` with no tool calls — the run is
-/// tool-less) decides the run. Anything else fails to one bounded terminal
-/// whose detail never quotes the line (R19).
+/// Reports whether the captured stdout already holds a decisive transcript,
+/// so the drain loop can arm its grace instead of waiting for pipe EOF: Pi's
+/// print mode often finishes the agent loop without exiting (the shutdown
+/// gap `subagent-runner.ts` documents), and its open stdout would otherwise
+/// hold the run until the full timeout and discard the completed answer.
+/// Only complete lines participate; a line split across reads is re-checked
+/// once its newline arrives.
+fn pi_terminal_probe(stdout: &[u8]) -> bool {
+    let end = stdout
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    parse_pi_transcript(&stdout[..end]).is_ok()
+}
+
+/// Parses the closed Pi print-mode JSON vocabulary (R18). The terminal
+/// assistant `message_end` (stopReason `stop`, `length`, `error`, or
+/// `aborted` with no tool calls — the run is tool-less) decides the run.
+/// Every other documented `--mode json` event (lifecycle, tool execution,
+/// compaction, retry, queue, and session-state notifications) is ignored:
+/// Pi emits them on ordinary runs (`--thinking` emits
+/// `thinking_level_changed`, provider retries emit `auto_retry_*`), so
+/// rejecting them would fail otherwise valid transcripts. Anything outside
+/// the documented vocabulary still fails to one bounded terminal whose
+/// detail never quotes the line (R19).
 fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTerminal), String> {
     let mut events = Vec::new();
     let mut terminal: Option<BackendTerminal> = None;
@@ -260,7 +279,23 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
             return Err(format!("missing event type at line {line_no}"));
         };
         match event_type {
-            "session" | "agent_start" | "turn_start" | "turn_end" | "message_start" => {}
+            "session"
+            | "agent_start"
+            | "agent_end"
+            | "turn_start"
+            | "turn_end"
+            | "message_start"
+            | "message_update"
+            | "tool_execution_start"
+            | "tool_execution_update"
+            | "tool_execution_end"
+            | "compaction_start"
+            | "compaction_end"
+            | "auto_retry_start"
+            | "auto_retry_end"
+            | "queue_update"
+            | "session_info_changed"
+            | "thinking_level_changed" => {}
             "message_end" => {
                 let Some(message) = value.get("message") else {
                     return Err(format!("message_end without message at line {line_no}"));

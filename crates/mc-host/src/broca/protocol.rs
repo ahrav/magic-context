@@ -362,13 +362,22 @@ pub fn error_unit(run_id: &str, error: &BackendError) -> Vec<u8> {
     }))
 }
 
+/// Truncates a diagnostic so its JSON-ENCODED form stays within
+/// [`MAX_UNIT_DIAGNOSTIC_BYTES`]: escaping expands `"`/`\\` and short-escape
+/// controls to two bytes and other control characters to six (`\u00XX`), so
+/// a raw-byte bound alone would let two 512-byte fields encode to ~6 KiB and
+/// overrun the terminal headroom charged at admission.
 fn bounded(value: &str) -> &str {
-    if value.len() <= MAX_UNIT_DIAGNOSTIC_BYTES {
-        return value;
+    let mut encoded = 0usize;
+    for (index, c) in value.char_indices() {
+        encoded += match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\x08' | '\x0c' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+        if encoded > MAX_UNIT_DIAGNOSTIC_BYTES {
+            return &value[..index];
+        }
     }
-    let mut end = MAX_UNIT_DIAGNOSTIC_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
+    value
 }

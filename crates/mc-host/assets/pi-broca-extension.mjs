@@ -39,34 +39,42 @@ export default function (pi) {
 		if (!isPlainObject(payload)) {
 			throw new Error("broca payload hook: unsupported provider payload shape");
 		}
-		// Closed shape set: exactly one known provider-native output-token
+		// Closed shape set: at least one known provider-native output-token
 		// spelling must already exist on the payload (or a Gemini-style
 		// generationConfig object). Anything else is an unknown wire family
-		// and the request fails closed rather than running uncapped.
-		if ("max_output_tokens" in payload) {
-			return { ...payload, max_output_tokens: maxOutputTokens, temperature };
+		// and the request fails closed rather than running uncapped. Every
+		// recognized spelling that is present gets rewritten — an earlier
+		// extension can leave more than one (say `max_completion_tokens`
+		// plus `max_tokens`), and rewriting only the first would preserve a
+		// larger limit in the field the provider actually honors.
+		const spellings = [
+			"max_output_tokens",
+			"max_completion_tokens",
+			"max_tokens",
+			"maxOutputTokens",
+		].filter((name) => name in payload);
+		const generationConfig = isPlainObject(payload.generationConfig)
+			? payload.generationConfig
+			: null;
+		if (spellings.length === 0 && generationConfig === null) {
+			throw new Error(
+				"broca payload hook: no recognized output-token field; refusing to send without generation controls",
+			);
 		}
-		if ("max_completion_tokens" in payload) {
-			return { ...payload, max_completion_tokens: maxOutputTokens, temperature };
+		const next = { ...payload };
+		for (const name of spellings) {
+			next[name] = maxOutputTokens;
 		}
-		if ("max_tokens" in payload) {
-			return { ...payload, max_tokens: maxOutputTokens, temperature };
+		if (spellings.length > 0) {
+			next.temperature = temperature;
 		}
-		if ("maxOutputTokens" in payload) {
-			return { ...payload, maxOutputTokens, temperature };
-		}
-		if (isPlainObject(payload.generationConfig)) {
-			return {
-				...payload,
-				generationConfig: {
-					...payload.generationConfig,
-					maxOutputTokens,
-					temperature,
-				},
+		if (generationConfig !== null) {
+			next.generationConfig = {
+				...generationConfig,
+				maxOutputTokens,
+				temperature,
 			};
 		}
-		throw new Error(
-			"broca payload hook: no recognized output-token field; refusing to send without generation controls",
-		);
+		return next;
 	});
 }

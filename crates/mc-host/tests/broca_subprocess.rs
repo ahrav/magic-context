@@ -106,6 +106,11 @@ fn main() {
             timeout_reaps_leader_and_grandchild,
         ),
         (
+            "pi_lingering_child_drained_after_terminal",
+            pi_lingering_child_drained_after_terminal,
+        ),
+        ("pi_auxiliary_events_ignored", pi_auxiliary_events_ignored),
+        (
             "cancel_reaps_group_with_sigterm_first",
             cancel_reaps_group_with_sigterm_first,
         ),
@@ -305,6 +310,18 @@ mod fixture {
         std::process::exit(code);
     }
 
+    /// The Pi print-mode shutdown gap: the complete transcript is written
+    /// and flushed, but the leader neither closes its pipes nor exits.
+    fn print_transcript_then_hang() -> ! {
+        if let Some(path) = std::env::var_os(TRANSCRIPT_FILE_ENV) {
+            let bytes = fs::read(path).expect("read transcript");
+            let mut stdout = std::io::stdout();
+            stdout.write_all(&bytes).expect("write transcript");
+            stdout.flush().expect("flush transcript");
+        }
+        hang();
+    }
+
     fn flood(secret: &str, to_stderr: bool) -> ! {
         let line = format!("{{\"type\":\"noise\",\"secret\":\"{secret}\"}}\n");
         let stdout = std::io::stdout();
@@ -409,6 +426,7 @@ mod fixture {
                 flood(&std::env::var(SECRET_ENV).unwrap_or_default(), true);
             }
             Ok("hang") => hang(),
+            Ok("transcript_then_hang") => print_transcript_then_hang(),
             Ok("hang_ignore_term") => hang_ignore_term(out),
             Ok("grandchild_hang") => {
                 spawn_grandchild_then_hang(out.expect("grandchild fixtures need an out dir"));
@@ -1159,6 +1177,7 @@ function apply(payload) {{
 }}
 console.log(JSON.stringify(apply({{ model: "m", max_tokens: 4096, temperature: 0.7, messages: [], keep: "yes" }})));
 console.log(JSON.stringify(apply({{ contents: [], generationConfig: {{ maxOutputTokens: 999, temperature: 1.9, topK: 3 }}, keep: "g" }})));
+console.log(JSON.stringify(apply({{ model: "m", max_completion_tokens: 8192, max_tokens: 4096, messages: [] }})));
 try {{ apply({{ foo: "bar" }}); console.log("ACCEPTED"); }} catch {{ console.log("REJECTED"); }}
 "#,
         hook = hook_path.to_string_lossy()
@@ -1202,6 +1221,14 @@ try {{ apply({{ foo: "bar" }}); console.log("ACCEPTED"); }} catch {{ console.log
     assert_eq!(gemini["generationConfig"]["temperature"], 0.25);
     assert_eq!(gemini["generationConfig"]["topK"], 3);
     assert_eq!(gemini["keep"], "g");
+
+    // Ambiguous shape: every recognized spelling is capped, so no earlier
+    // extension's larger limit survives in the field the provider honors.
+    let mixed: serde_json::Value =
+        serde_json::from_str(lines.next().expect("mixed line")).expect("mixed json");
+    assert_eq!(mixed["max_completion_tokens"], 32_000);
+    assert_eq!(mixed["max_tokens"], 32_000);
+    assert_eq!(mixed["temperature"], 0.25);
 
     // Unknown shape: rejected, never silently uncapped.
     assert_eq!(lines.next(), Some("REJECTED"));
@@ -1621,6 +1648,95 @@ fn timeout_reaps_leader_and_grandchild() {
     assert_eq!(error.class, ErrorClass::Transient);
     assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     assert_process_gone(read_pid(&setup.out.path().join("grandchild.pid")));
+}
+
+/// A Pi child that finishes its transcript but never closes its pipes (the
+/// print-mode shutdown gap) ends as a drain kill carrying the completed
+/// answer, not a run-timeout failure that discards it.
+fn pi_lingering_child_drained_after_terminal() {
+    let setup = RunSetup::new();
+    let transcript = write_transcript(
+        setup.scratch.path(),
+        "linger.ndjson",
+        &pi_success_lines("late exit", "stop"),
+    );
+    let limits = SubprocessLimits {
+        run_timeout: Duration::from_secs(30),
+        termination_grace: Duration::from_secs(2),
+        drain_grace: Duration::from_millis(200),
+        max_stdout_bytes: 1024 * 1024,
+        max_stderr_bytes: 64 * 1024,
+    };
+    let backend = pi_backend_with_limits(
+        &setup,
+        &[
+            (TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy()),
+            (BEHAVIOR_ENV, "transcript_then_hang"),
+        ],
+        Vec::new(),
+        None,
+        limits,
+    );
+    let started = Instant::now();
+    let (terminal, events) = execute(
+        &backend,
+        request(setup.project.path(), Harness::Pi, "anthropic/m", None),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the drain grace, not the run timeout, must end the lingering child ({:?})",
+        started.elapsed()
+    );
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "late exit")
+    ));
+    assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
+}
+
+/// Pi's documented auxiliary print-mode events (thinking, retry, queue,
+/// tool, compaction, and session-state notifications) ride alongside the
+/// decisive transcript on ordinary runs and must not fail it.
+fn pi_auxiliary_events_ignored() {
+    let mut lines = pi_success_lines("aux answer", "stop");
+    lines.insert(
+        2,
+        serde_json::json!({"type": "thinking_level_changed", "thinkingLevel": "high"}),
+    );
+    lines.insert(
+        3,
+        serde_json::json!({"type": "queue_update", "steering": [], "followUp": []}),
+    );
+    lines.insert(
+        4,
+        serde_json::json!({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 10, "errorMessage": "overloaded"}),
+    );
+    lines.insert(
+        5,
+        serde_json::json!({"type": "auto_retry_end", "success": true, "attempt": 1}),
+    );
+    lines.insert(6, serde_json::json!({"type": "session_info_changed"}));
+    lines.insert(
+        7,
+        serde_json::json!({"type": "message_update", "message": {"role": "assistant", "content": []}}),
+    );
+    lines.push(serde_json::json!({"type": "agent_end", "messages": []}));
+    let (terminal, events) = run_pi_transcript(&lines);
+    assert!(
+        matches!(
+            terminal,
+            BackendTerminal::Completed {
+                finish_reason: FinishReason::Completed
+            }
+        ),
+        "{terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "aux answer")
+    ));
 }
 
 fn cancel_reaps_group_with_sigterm_first() {

@@ -130,9 +130,11 @@ pub struct SubprocessSpec {
 pub enum SubprocessEnd {
     /// Natural exit with a code.
     Exited(i32),
-    /// Streams closed cleanly but the leader lingered past the drain grace
-    /// and was terminated; parsers treat this like a clean exit because the
-    /// transcript is complete.
+    /// The transcript is complete but the leader lingered — either its
+    /// streams closed cleanly and it outlived the drain grace, or the
+    /// terminal probe recognized a decisive transcript while the child kept
+    /// its pipes open — and it was terminated; parsers treat this like a
+    /// clean exit because the transcript is complete.
     DrainKilled,
     /// Killed by a signal we did not send.
     Signaled,
@@ -152,10 +154,18 @@ pub struct SubprocessResult {
 /// Spawns and supervises one harness child (KTD6). Returns after the leader
 /// is reaped on every path, including timeout, cancellation, and overflow,
 /// so lifecycle completion upstream can never observe a live child (R10).
+///
+/// `terminal_probe`, when supplied, inspects the captured stdout after each
+/// read and reports whether a decisive transcript has already arrived. The
+/// first hit rearms the run deadline to the drain grace, so a harness that
+/// finishes its output without closing its pipes (the Pi print-mode
+/// shutdown gap) ends as a drain kill with the completed transcript instead
+/// of burning the whole run timeout and failing.
 pub async fn run(
     spec: SubprocessSpec,
     limits: &SubprocessLimits,
     cancel: &CancellationToken,
+    terminal_probe: Option<fn(&[u8]) -> bool>,
 ) -> io::Result<SubprocessResult> {
     let mut command = tokio::process::Command::new(&spec.executable);
     command
@@ -206,6 +216,7 @@ pub async fn run(
     let mut stderr_chunk = [0u8; 8192];
     let deadline = tokio::time::sleep(limits.run_timeout);
     tokio::pin!(deadline);
+    let mut terminal_seen = false;
 
     // One loop drains both streams concurrently under their byte caps while
     // watching the timeout and the cancellation token (R17).
@@ -216,7 +227,14 @@ pub async fn run(
         tokio::select! {
             biased;
             () = cancel.cancelled() => break Some(SubprocessEnd::Cancelled),
-            () = &mut deadline => break Some(SubprocessEnd::TimedOut),
+            // After the probe fires the (rearmed) deadline is the drain
+            // grace: the transcript is complete, so a still-open pipe is the
+            // shutdown gap, not a timeout.
+            () = &mut deadline => break Some(if terminal_seen {
+                SubprocessEnd::DrainKilled
+            } else {
+                SubprocessEnd::TimedOut
+            }),
             read = stdout_pipe.read(&mut stdout_chunk), if stdout_open => match read {
                 Ok(0) | Err(_) => stdout_open = false,
                 Ok(n) => {
@@ -224,6 +242,13 @@ pub async fn run(
                         break Some(SubprocessEnd::StdoutOverflow);
                     }
                     stdout.extend_from_slice(&stdout_chunk[..n]);
+                    if !terminal_seen && terminal_probe.is_some_and(|probe| probe(&stdout)) {
+                        terminal_seen = true;
+                        let drain_deadline = tokio::time::Instant::now() + limits.drain_grace;
+                        if drain_deadline < deadline.deadline() {
+                            deadline.as_mut().reset(drain_deadline);
+                        }
+                    }
                 }
             },
             read = stderr_pipe.read(&mut stderr_chunk), if stderr_open => match read {

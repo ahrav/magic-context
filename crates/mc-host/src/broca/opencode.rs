@@ -185,7 +185,9 @@ async fn run_opencode(
         stdin: request.prompt.clone().into_bytes(),
     };
 
-    let result = match subprocess::run(spec, &limits, &cancel).await {
+    // No terminal probe: the OpenCode CLI closes its streams and exits when
+    // the run finishes, so EOF plus the drain grace already bound the tail.
+    let result = match subprocess::run(spec, &limits, &cancel, None).await {
         Ok(result) => result,
         Err(err) => {
             return subprocess::merge_cleanup(
