@@ -611,7 +611,8 @@ export function prepareCompartmentInjection(
             // mid-build cannot reach the current prompt unchecked.
             let memories: Memory[] = [];
             let buildEpoch = buildProjectMemoryEpoch;
-            for (let attempt = 0; attempt < 2; attempt += 1) {
+            let buildStable = false;
+            for (let attempt = 0; attempt < 2 && !buildStable; attempt += 1) {
                 buildEpoch = getProjectMemoryEpoch(db, projectPath);
                 memories = bindMemoriesToCurrentRevision(
                     db,
@@ -621,7 +622,18 @@ export function prepareCompartmentInjection(
                         "auto_inject",
                     ).memories,
                 );
-                if (getProjectMemoryEpoch(db, projectPath) === buildEpoch) break;
+                buildStable = getProjectMemoryEpoch(db, projectPath) === buildEpoch;
+            }
+            if (!buildStable) {
+                // Fail closed: the epoch moved during BOTH attempts, so a
+                // quarantine committed after the last policy read could sit
+                // in this snapshot. One prompt without the memory block is
+                // cheaper than leaking a hidden row; the next pass rebuilds.
+                sessionLog(
+                    sessionId,
+                    "memory block rebuild unstable after retries (epoch kept moving); omitting the block this pass",
+                );
+                memories = [];
             }
             if (injectionBudgetTokens && memories.length > 0) {
                 memories = trimMemoriesToBudget(sessionId, memories, injectionBudgetTokens);
@@ -638,6 +650,9 @@ export function prepareCompartmentInjection(
             const renderedIds = memories.map((m) => m.id);
             const renderedHashes = memories.map((m) => sha256Utf8Hex(m.content));
 
+            // An unstable build is not cached: its empty block is a
+            // fail-closed placeholder, not a decision, and stamping it would
+            // replay emptiness until the next epoch bump.
             // Snapshot so subsequent turns reuse the same block without cache bust.
             // Swallow SQLITE_BUSY: the cache is a pure optimization (the block itself
             // is already computed and returned below). If another writer holds the DB
@@ -646,16 +661,17 @@ export function prepareCompartmentInjection(
             // proceed with a one-turn cache miss than crash the user's prompt.
             // Issue: https://github.com/cortexkit/magic-context/issues/23
             try {
-                db.prepare(
-                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ?, memory_block_epoch = ? WHERE session_id = ?",
-                ).run(
-                    memoryBlock ?? "",
-                    memoryCount,
-                    JSON.stringify(renderedIds),
-                    JSON.stringify(renderedHashes),
-                    buildEpoch,
-                    sessionId,
-                );
+                if (buildStable)
+                    db.prepare(
+                        "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ?, memory_block_epoch = ? WHERE session_id = ?",
+                    ).run(
+                        memoryBlock ?? "",
+                        memoryCount,
+                        JSON.stringify(renderedIds),
+                        JSON.stringify(renderedHashes),
+                        buildEpoch,
+                        sessionId,
+                    );
             } catch (error) {
                 const code = (error as { code?: string } | null)?.code;
                 if (code === "SQLITE_BUSY") {

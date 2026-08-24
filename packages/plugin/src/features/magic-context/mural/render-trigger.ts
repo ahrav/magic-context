@@ -83,7 +83,8 @@ export function ensureMuralRendered(
     // outside the m0 snapshot transaction, so its own epoch marker only
     // protects LATER rebuilds — this loop protects the render happening now.
     let pool: Memory[] = [];
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    let poolStable = false;
+    for (let attempt = 0; attempt < 2 && !poolStable; attempt += 1) {
         const epochAtLoad = getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0;
         pool = bindMemoriesToCurrentRevision(
             db,
@@ -93,9 +94,15 @@ export function ensureMuralRendered(
                 "auto_inject",
             ).memories,
         );
-        if ((getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0) === epochAtLoad) {
-            break;
-        }
+        poolStable =
+            (getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0) === epochAtLoad;
+    }
+    if (!poolStable) {
+        // Fail closed: the epoch moved during both attempts, so a quarantine
+        // committed after the last policy read could sit in this pool. Skip
+        // the render this pass; the next epoch-driven pass rebuilds.
+        log(`[mural] skipped for ${projectIdentity}: memory pool unstable (epoch kept moving)`);
+        return { hasMural: false, rerendered: false, skipReason: "memory pool unstable" };
     }
     const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (

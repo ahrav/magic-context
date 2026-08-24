@@ -3,7 +3,11 @@ import type { Database } from "../../../shared/sqlite";
 import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { computeNormalizedHash } from "./normalize-hash";
-import { memoriesEligibleForEmbedding } from "./storage-claim-visibility";
+import {
+    exactMemoryContentDigests,
+    memoriesEligibleForEmbedding,
+} from "./storage-claim-visibility";
+import { sha256Utf8Hex } from "./storage-claims";
 import {
     getMemoryByHash,
     getMemoryById,
@@ -122,6 +126,15 @@ async function embedAndStoreMemory(
         // embedding providers included. Re-checked here (cheap single-id
         // read) because earlier refs' provider calls yield arbitrarily long.
         if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
+            return;
+        }
+        // Bind the captured bytes to the current revision: a rewrite after
+        // publication makes eligibility (and the hash captured below)
+        // describe the NEW revision while `content` still holds the old
+        // promoted bytes — embedding them would disclose a superseded
+        // revision to the provider and store its vector as if it described
+        // the replacement.
+        if (exactMemoryContentDigests(db, [memoryId]).get(memoryId) !== sha256Utf8Hex(content)) {
             return;
         }
         // Capture the row's content hash BEFORE the async provider call: the

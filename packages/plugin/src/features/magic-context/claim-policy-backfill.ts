@@ -465,9 +465,14 @@ export function revalidateEnforcementArtifacts(
     nowMs = Date.now(),
 ): void {
     if (!hasClaimPolicySchema(db)) return;
-    const last = artifactRevalidationLastRunMs.get(projectIdentity) ?? 0;
+    // The throttle key carries the CHECKOUT root, not just the identity:
+    // worktrees and clones share one identity, artifacts are scoped by
+    // enforced_from_root, and an identity-only key would let whichever
+    // checkout runs first after each interval starve the others' probes.
+    const throttleKey = `${projectIdentity}\u0000${projectRoot}`;
+    const last = artifactRevalidationLastRunMs.get(throttleKey) ?? 0;
     if (nowMs - last < ARTIFACT_REVALIDATION_INTERVAL_MS) return;
-    artifactRevalidationLastRunMs.set(projectIdentity, nowMs);
+    artifactRevalidationLastRunMs.set(throttleKey, nowMs);
     if (!existsSync(projectRoot)) return;
     const projectRow = db
         .prepare("SELECT id FROM projects WHERE canonical_identity = ?")
