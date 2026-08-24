@@ -20,6 +20,7 @@ import type { Database } from "../../shared/sqlite.ts";
 import {
     DEFAULT_BUSY_RETRY_DELAYS_MS,
     runImmediateTransactionWithBusyRetry,
+    runImmediateTransactionWithBusyRetrySync,
 } from "./claims-backfill.ts";
 import {
     automaticMaturityTarget,
@@ -761,7 +762,11 @@ export function reconcileCompatibilityVerifications(db: Database): number {
         if (events.length === 0) break;
         cursor = events[events.length - 1].id;
         const pageCursor = cursor;
-        runImmediateTransactionWithBusyRetry(db, () => {
+        // SYNC variant: this reconciler runs on synchronous publication
+        // paths (module state sync, injection), and the caller must observe
+        // the epoch bump before its next read — an un-awaited async retry
+        // would return before the page committed.
+        const pageOutcome = runImmediateTransactionWithBusyRetrySync(db, () => {
             for (const event of events) {
                 if (event.outcome === "verified") {
                     const divergent = db
@@ -813,11 +818,19 @@ export function reconcileCompatibilityVerifications(db: Database): number {
                 );
             }
         });
+        if (pageOutcome === "busy") {
+            // Committed pages already advanced the watermark inside their
+            // own transactions; the remaining range retries on a later
+            // pass. The final maxEventId advance below must be skipped —
+            // it would skip past the unconsumed events.
+            return refreshed;
+        }
     }
     // Final monotonic advance to maxEventId: the page loop only reaches the
     // last CONSUMED event id, and an event range with no qualifying outcomes
-    // would otherwise be re-scanned on every pass.
-    runImmediateTransactionWithBusyRetry(db, () => {
+    // would otherwise be re-scanned on every pass. A busy outcome is safe to
+    // drop — the next pass re-derives the same advance.
+    runImmediateTransactionWithBusyRetrySync(db, () => {
         const stored = Number(
             readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
         );

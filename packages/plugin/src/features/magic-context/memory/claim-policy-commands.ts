@@ -344,15 +344,30 @@ export async function executeClaimApprovalCommand(
                 nonce,
             }),
             mutate: (nonce) => {
+                // Effective-state recheck INSIDE the serialized transaction:
+                // the ordinal identity alone cannot catch two hosts racing
+                // the same transition — the second transaction observes the
+                // first action and derives the NEXT ordinal, so only the
+                // state check refuses the duplicate. A revoke of an
+                // already-revoked approval is refused symmetrically.
+                const effectiveApprovalId = currentApprovalActionId(deps.db, target.revisionId);
+                if (action === "approve" && effectiveApprovalId != null) {
+                    throw new Error(
+                        "the revision is already approved; another session may have recorded it first",
+                    );
+                }
+                if (action === "revoke" && effectiveApprovalId == null) {
+                    throw new Error(
+                        "the revision has no active approval to revoke; another session may have revoked it first",
+                    );
+                }
                 // Cross-process idempotency: the confirmation nonce is
                 // process-local, so two hosts racing the same
                 // propose+confirm flow would mint two identities and record
                 // the action twice. Derive the identity from the target and
-                // the revision's action ordinal instead — racing writers
-                // read the same ordinal inside their immediate transactions
-                // and the command_identity UNIQUE constraint refuses the
-                // loser, while a legitimate re-approval after a revocation
-                // sees a higher ordinal.
+                // the revision's action ordinal — with the state recheck
+                // above refusing same-transition duplicates, the UNIQUE
+                // constraint is the belt-and-suspenders second gate.
                 const actionOrdinal = Number(
                     (
                         deps.db

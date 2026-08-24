@@ -1176,6 +1176,30 @@ export async function runImmediateTransactionWithBusyRetry<T>(
     }
 }
 
+/** Synchronous twin of `runImmediateTransactionWithBusyRetry` for callers on
+ * synchronous paths (the injection transform, module state sync) that cannot
+ * await: bounded BLOCKING backoff instead of event-loop sleeps, so the
+ * caller observes the commit before its next statement — a fire-and-forget
+ * promise would let publication-sensitive readers proceed on the old state.
+ * Returns "busy" after exhausting the delays, like the async variant. */
+export function runImmediateTransactionWithBusyRetrySync<T>(
+    db: Database,
+    work: () => T,
+    options: { retryDelaysMs?: readonly number[] } = {},
+): T | "busy" {
+    const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_BUSY_RETRY_DELAYS_MS;
+    for (let attempt = 0; ; attempt += 1) {
+        try {
+            return db.transaction(work).immediate() as T;
+        } catch (error) {
+            if (!isRetryableSqliteBusyError(error)) throw error;
+            const delayMs = retryDelaysMs[attempt];
+            if (delayMs === undefined) return "busy";
+            Bun.sleepSync(delayMs);
+        }
+    }
+}
+
 export interface ClaimsBackfillRunOptions {
     batchSize?: number;
     retryDelaysMs?: readonly number[];
