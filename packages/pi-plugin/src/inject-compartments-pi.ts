@@ -29,7 +29,10 @@ import {
 	reconcileCompatibilityVerifications,
 	seedLateCompatibilityRevisions,
 } from "@magic-context/core/features/magic-context/claim-policy-backfill";
-import { filterMemoriesByPolicy } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
+import {
+	bindMemoriesToCurrentRevision,
+	filterMemoriesByPolicy,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import {
 	getMaxMemoryIdForProjects,
 	getMemoriesByProject,
@@ -1455,7 +1458,38 @@ function renderFreshM0PiNonPersisted(
 	const docs = readProjectDocsForPiM0(state);
 	const cachedMaterializedAt =
 		getOrCreateSessionMeta(db, state.sessionId).cachedM0MaterializedAt ?? 0;
-	const frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
+	// Same stabilized rebuild discipline as the OpenCode fallback: this path
+	// publishes WITHOUT the phase-3 persist-time marker check that guards
+	// materializeM0Pi, so a quarantine, rejection, or rewrite landing after
+	// the frozen read transaction closes would still render the old bytes.
+	// Re-read until the memory epoch (workspace fingerprint when foreign rows
+	// are in scope) is unchanged across the read; fail closed with an empty
+	// pool on exhaustion.
+	const memPath = memoryProjectPath(state);
+	const fallbackStabilityMarker = (): string => {
+		const workspace = resolveWorkspaceRenderContextPi(state, db);
+		return workspace.isWorkspaced
+			? `ws:${computeWorkspaceEpochFingerprint(db, workspace.identities)}`
+			: `ep:${(memPath ? getProjectState(db, memPath) : undefined)?.projectMemoryEpoch ?? 0}`;
+	};
+	let frozen: FrozenM0Inputs | undefined;
+	let fallbackPoolStable = !memPath;
+	for (let attempt = 0; attempt < 2 && !fallbackPoolStable; attempt += 1) {
+		const markerAtLoad = fallbackStabilityMarker();
+		frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
+		frozen.memories = bindMemoriesToCurrentRevision(db, frozen.memories);
+		fallbackPoolStable = fallbackStabilityMarker() === markerAtLoad;
+	}
+	if (frozen === undefined) {
+		frozen = readFrozenM0InputsPi(state, db, docs, cachedMaterializedAt);
+	}
+	if (!fallbackPoolStable) {
+		logSession(
+			state.sessionId,
+			"pi fallback m0 memory pool unstable after retries (epoch kept moving); omitting memories this pass",
+		);
+		frozen.memories = [];
+	}
 	// CACHE STABILITY: materializedAt feeds the m[1] expiry cutoff. It must be
 	// stable across consecutive fallback passes, so reuse the last persisted value
 	// (or 0 when no cached baseline exists) rather than live Date.now().
