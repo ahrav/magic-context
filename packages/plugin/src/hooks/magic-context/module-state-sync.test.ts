@@ -1217,7 +1217,7 @@ describe("module incremental and paged assembly", () => {
 
     it("pages explicit delete ids with the seed items instead of the completing batch", () => {
         const watermarks = {
-            compartment_seq: 0,
+            compartment_sequence: 0,
             memory_id: 0,
             memory_mutation_id: 0,
             m0_mutation_id: 0,
