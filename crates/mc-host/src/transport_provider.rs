@@ -47,12 +47,24 @@ pub enum ProviderFailure {
 }
 
 /// Host resources a provider may draw on while constructing a candidate
-/// channel. Fields are crate-internal; injected providers pass the context
-/// through to [`memory_candidate`] unchanged.
+/// channel, plus the selected offer's advertised parameters. Resource
+/// fields are crate-internal; injected providers pass the context through
+/// to [`memory_candidate`] unchanged.
 pub struct ProviderContext {
     pub(crate) ingress: ByteBudget,
     pub(crate) queue_frames: usize,
     pub(crate) frame_deadline: Duration,
+    pub(crate) offer_parameters: Option<serde_json::Value>,
+}
+
+impl ProviderContext {
+    /// The selected offer's opaque `parameters` exactly as decoded from the
+    /// negotiation request, or `None` when the offer carried none. A
+    /// provider whose service naming, capacity, or compatibility handshake
+    /// depends on its advertised parameters reads them here.
+    pub fn offer_parameters(&self) -> Option<&serde_json::Value> {
+        self.offer_parameters.as_ref()
+    }
 }
 
 /// One prepared, setup-only, non-routable candidate channel (host side).
@@ -268,11 +280,17 @@ pub fn memory_candidate(
 }
 
 impl ProviderContext {
-    pub(crate) fn new(ingress: ByteBudget, queue_frames: usize, frame_deadline: Duration) -> Self {
+    pub(crate) fn new(
+        ingress: ByteBudget,
+        queue_frames: usize,
+        frame_deadline: Duration,
+        offer_parameters: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             ingress,
             queue_frames,
             frame_deadline,
+            offer_parameters,
         }
     }
 }

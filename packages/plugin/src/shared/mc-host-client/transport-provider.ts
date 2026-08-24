@@ -20,6 +20,7 @@ import {
     checkOpaqueSerialized,
     encodeNegotiateRequest,
     NEGOTIATION_VERSION,
+    NegotiationError,
     type OpaqueObject,
     TRANSPORT_TCP,
     type TransportOffer,
@@ -97,6 +98,16 @@ export class ClientTransportRegistry {
         }
         // Phase 2 validates pure data: a NegotiationError raised here is
         // ours and carries only bounded codes and structural paths.
+        for (const entry of raw) {
+            // "tcp" is reserved for the implicit bootstrap entry: a
+            // provider advertising tcp at another capability version could
+            // be validly selected by a host, and the client would then
+            // continue on the v1 bootstrap channel under a version lie
+            // while the provider is never activated.
+            if (entry.transport === TRANSPORT_TCP) {
+                throw new NegotiationError("invalid_transport_name", "transport");
+            }
+        }
         this.entries = raw.map((entry) => ({
             transport: entry.transport,
             capabilityVersion: entry.capabilityVersion,
@@ -287,17 +298,36 @@ export function sanitizedCandidateFactory(
             sendControl: (header) => {
                 try {
                     channel.sendControl(header);
-                } catch (error) {
-                    throw sanitizedChannelFailure(transport, "send", error);
+                } catch {
+                    // Generation control paths (a Pong answered inside frame
+                    // dispatch) do not catch here, so a throw would unwind
+                    // through the provider's own onFrame callback. Control
+                    // emission failure IS channel failure: surface it as one
+                    // close — retirement is idempotent — never an exception
+                    // across the frame-delivery callback.
+                    args.handlers.onClosed(
+                        "write_failed",
+                        sanitizedProviderError(transport, "send"),
+                    );
                 }
             },
-            flush: async (deadline) => {
-                try {
-                    return await channel.flush(deadline);
-                } catch (error) {
-                    throw sanitizedChannelFailure(transport, "flush", error);
-                }
-            },
+            flush: (deadline) =>
+                // Best-effort by contract and bounded locally: a provider
+                // that ignores its deadline must not stall teardown, and a
+                // synchronous throw or rejection must not abort the close
+                // path that still has to retire the generation.
+                new Promise<void>((resolve) => {
+                    const timer = setTimeout(resolve, deadline.remainingMs());
+                    const settle = (): void => {
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    try {
+                        void Promise.resolve(channel.flush(deadline)).then(settle, settle);
+                    } catch {
+                        settle();
+                    }
+                }),
             close: (error) => {
                 try {
                     channel.close(error);

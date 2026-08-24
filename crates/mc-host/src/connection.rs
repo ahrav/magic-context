@@ -903,6 +903,7 @@ async fn handle_negotiate<H: McHostHandler>(
                     request.negotiation_version,
                     selected,
                     provider,
+                    offer.parameters.clone(),
                     setup,
                 )
                 .await;
@@ -972,12 +973,14 @@ async fn grant_candidate<H: McHostHandler>(
     negotiation_version: u32,
     selected: SelectedTransport,
     provider: Arc<dyn InjectedProvider>,
+    offer_parameters: Option<serde_json::Value>,
     setup: &mut ConnectionSetup,
 ) -> ControlFlow {
     let ctx = ProviderContext::new(
         shared.ingress_budget.clone(),
         shared.limits.writer_queue_frames,
         shared.timing.frame_deadline,
+        offer_parameters,
     );
     // The setup deadline exists before any provider code runs, and the
     // KTD9 attachment gate inside `prepare` executes on the registry's one

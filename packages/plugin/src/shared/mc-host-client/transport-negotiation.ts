@@ -430,8 +430,6 @@ function requireTransportName(fields: Map<string, StrictValue>, pathPrefix: stri
 
 type PlainJson = null | boolean | string | number | PlainJson[] | { [key: string]: PlainJson };
 
-const INTEGER_LITERAL_RE = /^-?(?:0|[1-9]\d*)$/;
-
 function strictToPlain(value: StrictValue, path: string): PlainJson {
     switch (value.kind) {
         case "null":
@@ -440,11 +438,13 @@ function strictToPlain(value: StrictValue, path: string): PlainJson {
         case "string":
             return value.value;
         case "number":
-            // A JSON integer beyond the double-safe range would silently
-            // round (9007199254740993 becomes ...992), handing the provider
-            // altered identifiers. This client cannot represent it
-            // faithfully, so it is rejected rather than corrupted.
-            if (INTEGER_LITERAL_RE.test(value.raw) && !Number.isSafeInteger(value.value)) {
+            // A JSON number that is mathematically an integer but beyond
+            // the double-safe range silently rounds (9007199254740993
+            // becomes ...992) in ANY notation, plain or exponent form,
+            // handing the provider altered identifiers. This client cannot
+            // represent it faithfully, so it is rejected rather than
+            // corrupted.
+            if (Number.isInteger(value.value) && !Number.isSafeInteger(value.value)) {
                 throw new NegotiationError("invalid_type", path);
             }
             return value.value;
