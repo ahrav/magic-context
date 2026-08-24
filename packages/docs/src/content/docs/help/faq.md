@@ -49,7 +49,7 @@ The local embedding model cache (if using `embedding.provider: "local"`) is stor
 ~/.local/share/cortexkit/magic-context/models/
 ```
 
-This is about 90 MB and is downloaded on first use. It can be safely deleted — it will be re-downloaded the next time an embedding is needed.
+This is about 130 MB and is downloaded on first use. It can be safely deleted — it will be re-downloaded the next time an embedding is needed.
 
 ## Can I edit or delete memories?
 

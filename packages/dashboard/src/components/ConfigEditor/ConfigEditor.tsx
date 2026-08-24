@@ -773,7 +773,7 @@ function ConfigForm(props: {
                                         "font-style": "italic",
                                       }}
                                     >
-                                      Uses Xenova/all-MiniLM-L6-v2 locally — no configuration needed
+                                      Uses Xenova/bge-small-en-v1.5 locally — no configuration needed
                                     </span>
                                   </Show>
                                   <Show when={embeddingProvider() === "local"}>
