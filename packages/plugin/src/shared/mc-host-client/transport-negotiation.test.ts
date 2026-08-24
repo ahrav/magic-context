@@ -574,4 +574,39 @@ describe("encode-side validation", () => {
         );
         expectCode(() => encodeActivateRequest("not-a-token"), "invalid_activation_token");
     });
+
+    test("provider-supplied opaque values are bounded before they reach the wire", () => {
+        function offersWith(parameters: unknown): TransportOffer[] {
+            return [
+                { transport: "shm", capabilityVersion: 1, parameters } as TransportOffer,
+                tcpOffer(1),
+            ];
+        }
+        const encode = (parameters: unknown) =>
+            encodeNegotiateRequest({
+                negotiationVersion: NEGOTIATION_VERSION,
+                offers: offersWith(parameters),
+            });
+        // The decoder's exact bounds apply on the way out too.
+        expectCode(() => encode({ x: "x".repeat(9000) }), "opaque_too_large");
+        let deep: Record<string, unknown> = {};
+        for (let level = 0; level < MAX_OPAQUE_DEPTH; level++) {
+            deep = { n: deep };
+        }
+        expectCode(() => encode(deep), "opaque_too_deep");
+        for (const parameters of [[], 1, "x", null, true]) {
+            expectCode(() => encode(parameters), "invalid_type");
+        }
+        const error = expectCode(
+            () =>
+                encodeNegotiateResponse({
+                    kind: "grant",
+                    selected: { transport: "shm", capabilityVersion: 1 },
+                    activationToken: VECTOR_TOKEN,
+                    descriptor: { x: "x".repeat(9000) },
+                }),
+            "opaque_too_large",
+        );
+        expect(error.path).toBe("descriptor");
+    });
 });

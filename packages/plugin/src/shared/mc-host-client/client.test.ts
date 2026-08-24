@@ -1971,6 +1971,32 @@ describe("transport negotiation", () => {
         expect(serialized).not.toContain(GRANT_TOKEN);
     });
 
+    test("AE5/R14: a provider whose connect() throws still retires the bootstrap", async () => {
+        // The generation constructor invokes the provider synchronously, so
+        // this failure surfaces before candidate activation begins; the
+        // authenticated bootstrap must not be left alive.
+        const provider = createFakePairedProvider({
+            connectError: new Error("provider-sentinel-3d1e"),
+        });
+        const events: SubcDiagnosticsEvent[] = [];
+        const peer = await startPeer({
+            negotiate: negotiateResponder(() => grantBody({})),
+        });
+        const { error } = await connectRejected({
+            peer,
+            transportProviders: [provider],
+            diagnostics: (event) => events.push(event),
+        });
+        expect(provider.connectCount).toBe(1);
+        expect(errorGraphText(error)).not.toContain("sentinel");
+        await waitUntil(() =>
+            events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
+        );
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
     test("AE7: a base wire mismatch fails before dial and never invokes the provider registry", async () => {
         const provider = createFakePairedProvider();
         const peer = await startPeer();

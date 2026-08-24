@@ -97,15 +97,15 @@ fn invalid(message: &str) -> ControlAction {
 /// Tolerantly classifies a body that failed strict validation. A generic
 /// rejection commits the generation to TCP and leaves it usable, but a
 /// malformed negotiation-family body must reach the authoritative-terminal-
-/// and-close path (§7.7.1), so classification cannot be lost to the strict
-/// parse. Duplicate keys resolve last-wins, matching lenient JSON readers.
+/// and-close path (§7.7.1), so classification cannot depend on the body
+/// parsing under ANY reader — truncated JSON still names its operation.
+/// The raw scan over-matches (the tag may appear as a value rather than as
+/// `op`), which only retires a connection that already sent an invalid
+/// control body: fail closed. JSON string escapes are not decoded; a
+/// conforming client never escapes this tag.
 fn is_negotiation_family(body: &[u8]) -> bool {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(serde_json::Value::Object(fields)) => {
-            fields.get("op").and_then(serde_json::Value::as_str) == Some(OP_TRANSPORT_NEGOTIATE)
-        }
-        _ => false,
-    }
+    const NEEDLE: &[u8] = b"\"transport.negotiate\"";
+    body.windows(NEEDLE.len()).any(|window| window == NEEDLE)
 }
 
 /// The strict negotiation decode for a body already known to be invalid:
@@ -373,8 +373,9 @@ pub(crate) fn check_string(
 }
 
 /// Depth of a JSON value: 1 at the subtree root, +1 per nested object/array
-/// level (protocol §7.1).
-fn value_depth(value: &serde_json::Value) -> usize {
+/// level (protocol §7.1). Shared with the negotiation decoder so both read
+/// the same §7.1 counting rule.
+pub(crate) fn value_depth(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Array(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
         serde_json::Value::Object(map) => 1 + map.values().map(value_depth).max().unwrap_or(0),
@@ -731,7 +732,9 @@ mod tests {
         let dup_nested = br#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":1,"a":2}}]}"#;
         // Duplicate key at the root.
         let dup_root = br#"{"op":"transport.negotiate","negotiation_version":1,"negotiation_version":1,"offers":[]}"#;
-        for body in [&dup_nested[..], dup_root] {
+        // Syntactically truncated body whose negotiation tag is complete.
+        let truncated = br#"{"op":"transport.negotiate","offers":"#;
+        for body in [&dup_nested[..], dup_root, truncated] {
             let action = parse_control(body, false, &two_target_index());
             assert!(
                 matches!(action, ControlAction::TransportNegotiate(Err(_))),

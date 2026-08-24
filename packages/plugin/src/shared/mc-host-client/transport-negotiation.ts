@@ -674,28 +674,61 @@ function decodeTaggedOnly(bytes: Uint8Array, op: string): void {
 }
 
 /**
- * True only for the exact legacy `unsupported_operation` Error terminal:
- * strict UTF-8 JSON `{code, message}` with both fields strings, no extras,
- * and no duplicate keys. Only this terminal proves a legacy host, so only
- * it may select TCP fallback (KTD6); every other Error body fails closed.
+ * The closed set of legacy Error terminal codes that prove
+ * `transport.negotiate` was never dispatched, so selecting TCP on this
+ * connection is safe (KTD6):
+ *
+ * - `unsupported_operation` — a pre-negotiation daemon does not know the op.
+ * - `server_busy` — a pre-negotiation daemon takes its global pending-request
+ *   permit *before* dispatching on `op`, so a saturated one answers
+ *   negotiation with this rather than `unsupported_operation`. A
+ *   negotiation-aware daemon exempts negotiation from that admission and so
+ *   never emits it on the negotiation correlation, which keeps the code
+ *   unambiguous evidence of a no-dispatch rejection on a connection that is
+ *   still serviceable.
+ *
+ * Every other Error body is malformed negotiation content and fails closed.
  */
-export function isLegacyUnsupportedOperationBody(bytes: Uint8Array): boolean {
+const LEGACY_FALLBACK_CODES: readonly string[] = ["unsupported_operation", "server_busy"];
+
+/**
+ * The `code` of a strict legacy Error terminal: UTF-8 JSON `{code, message}`
+ * with both fields strings, no extra fields, and no duplicate keys.
+ * `undefined` for anything else, so a malformed body can never be read as
+ * fallback evidence.
+ */
+function legacyErrorCode(bytes: Uint8Array): string | undefined {
     let fields: Map<string, StrictValue>;
     try {
         fields = requireRootObject(bytes);
         checkClosedFields(fields, ["code", "message"], "body");
     } catch {
-        return false;
+        return undefined;
     }
     const code = fields.get("code");
     const message = fields.get("message");
-    return (
-        code !== undefined &&
-        code.kind === "string" &&
-        code.value === "unsupported_operation" &&
-        message !== undefined &&
-        message.kind === "string"
-    );
+    if (code === undefined || code.kind !== "string") return undefined;
+    if (message === undefined || message.kind !== "string") return undefined;
+    return code.value;
+}
+
+/**
+ * True only for the exact legacy `unsupported_operation` Error terminal:
+ * strict UTF-8 JSON `{code, message}` with both fields strings, no extras,
+ * and no duplicate keys.
+ */
+export function isLegacyUnsupportedOperationBody(bytes: Uint8Array): boolean {
+    return legacyErrorCode(bytes) === "unsupported_operation";
+}
+
+/**
+ * True for the closed set of legacy Error terminals that may select TCP
+ * fallback (KTD6); see {@link LEGACY_FALLBACK_CODES}. A body with extra
+ * fields, a non-string message, or any other code fails closed.
+ */
+export function isLegacyFallbackTerminalBody(bytes: Uint8Array): boolean {
+    const code = legacyErrorCode(bytes);
+    return code !== undefined && LEGACY_FALLBACK_CODES.includes(code);
 }
 
 function requireExactVersion(fields: Map<string, StrictValue>): void {
@@ -708,6 +741,38 @@ function requireExactVersion(fields: Map<string, StrictValue>): void {
 function checkVersionRange(version: number, path: string): void {
     if (!Number.isInteger(version) || version < 1 || version > MAX_VERSION) {
         throw new NegotiationError("invalid_version", path);
+    }
+}
+
+function plainDepth(value: unknown): number {
+    if (Array.isArray(value)) {
+        return 1 + value.reduce((max: number, item) => Math.max(max, plainDepth(item)), 0);
+    }
+    if (typeof value === "object" && value !== null) {
+        let max = 0;
+        for (const entry of Object.values(value)) {
+            max = Math.max(max, plainDepth(entry));
+        }
+        return 1 + max;
+    }
+    return 1;
+}
+
+/**
+ * Encode-side counterpart of `checkOpaque`: the same object, depth, and
+ * compact-size bounds, applied to a provider-supplied value about to be
+ * serialized, so a provider cannot push an out-of-contract offer or
+ * descriptor onto the wire and burn the generation on the host's reject.
+ */
+function checkOpaquePlain(value: unknown, path: string): void {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new NegotiationError("invalid_type", path);
+    }
+    if (plainDepth(value) > MAX_OPAQUE_DEPTH) {
+        throw new NegotiationError("opaque_too_deep", path);
+    }
+    if (new TextEncoder().encode(JSON.stringify(value)).length > MAX_OPAQUE_BYTES) {
+        throw new NegotiationError("opaque_too_large", path);
     }
 }
 
@@ -737,6 +802,9 @@ export function encodeNegotiateRequest(request: NegotiateRequest): Uint8Array {
                 )
         ) {
             throw new NegotiationError("duplicate_offer", path);
+        }
+        if (offer.parameters !== undefined) {
+            checkOpaquePlain(offer.parameters, `${path}.parameters`);
         }
         return offer.parameters === undefined
             ? { transport: offer.transport, capability_version: offer.capabilityVersion }
@@ -783,6 +851,7 @@ export function encodeNegotiateResponse(response: NegotiateResponse): Uint8Array
     if (!isValidActivationToken(response.activationToken)) {
         throw new NegotiationError("invalid_activation_token", "activation_token");
     }
+    checkOpaquePlain(response.descriptor, "descriptor");
     return new TextEncoder().encode(
         JSON.stringify({
             op: OP_TRANSPORT_NEGOTIATE,
@@ -811,17 +880,28 @@ export function encodeActivateRequest(activationToken: string): Uint8Array {
     );
 }
 
+/**
+ * One `{op, negotiation_version}` candidate body. Built from the module
+ * constants rather than a frozen literal so a {@link NEGOTIATION_VERSION}
+ * bump cannot leave these emitting a version their own decoders reject.
+ */
+function taggedBody(op: string): Uint8Array {
+    return new TextEncoder().encode(
+        JSON.stringify({ op, negotiation_version: NEGOTIATION_VERSION }),
+    );
+}
+
 /** The tagged candidate `transport.activate` response (correlation 1). */
 export function activateResponseJson(): Uint8Array {
-    return new TextEncoder().encode('{"op":"transport.activate","negotiation_version":1}');
+    return taggedBody(OP_TRANSPORT_ACTIVATE);
 }
 
 /** The candidate `transport.commit` request (correlation 2). */
 export function commitRequestJson(): Uint8Array {
-    return new TextEncoder().encode('{"op":"transport.commit","negotiation_version":1}');
+    return taggedBody(OP_TRANSPORT_COMMIT);
 }
 
 /** The tagged candidate `transport.commit` response (correlation 2). */
 export function commitResponseJson(): Uint8Array {
-    return new TextEncoder().encode('{"op":"transport.commit","negotiation_version":1}');
+    return taggedBody(OP_TRANSPORT_COMMIT);
 }

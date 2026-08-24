@@ -48,7 +48,7 @@ import {
     encodeActivateRequest,
     encodeNegotiateRequest,
     type FallbackReason,
-    isLegacyUnsupportedOperationBody,
+    isLegacyFallbackTerminalBody,
     NEGOTIATION_VERSION,
     type NegotiateResponse,
     NegotiationError,
@@ -765,12 +765,12 @@ export class SubcClient {
                 error.kind === "terminal" &&
                 error.errorTerminal !== undefined &&
                 !flagsBinary(error.errorTerminal.flags) &&
-                isLegacyUnsupportedOperationBody(error.errorTerminal.body)
+                isLegacyFallbackTerminalBody(error.errorTerminal.body)
             ) {
-                // Only the byte-exact legacy `unsupported_operation` Error
-                // terminal proves a legacy host (KTD6). A body with extra
-                // fields, a non-string message, or a binary flag is
-                // malformed negotiation content and fails closed.
+                // Only the closed set of legacy Error terminals proves the
+                // negotiation was never dispatched (KTD6). A body with extra
+                // fields, a non-string message, a binary flag, or any other
+                // code is malformed negotiation content and fails closed.
                 return {
                     kind: "tcp",
                     selected: {
@@ -825,21 +825,32 @@ export class SubcClient {
         }
         const snapshot = bootstrap.snapshot;
         let conn: ActiveConnection | null = null;
-        const candidate = new ConnectionGeneration({
-            host: snapshot.endpoint.host,
-            port: snapshot.endpoint.port,
-            credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
-            channelFactory: sanitizedCandidateFactory(provider, grant.descriptor),
-            firstCorrelation: ACTIVATION_CORRELATION,
-            onRetired: (info) => {
-                if (conn) this.onGenerationRetired(conn, info);
-            },
-            onRouteGoodbye: (channel, epoch) => {
-                if (conn) this.onRouteGoodbye(conn, channel, epoch);
-            },
-            onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
-            ...this.generationOptions,
-        });
+        let candidate: ConnectionGeneration;
+        try {
+            // The generation constructor invokes the channel factory — and
+            // therefore the provider's `connect()` — synchronously, so a
+            // throwing provider surfaces here, before the activation `try`
+            // below exists to retire the channels.
+            candidate = new ConnectionGeneration({
+                host: snapshot.endpoint.host,
+                port: snapshot.endpoint.port,
+                credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
+                channelFactory: sanitizedCandidateFactory(provider, grant.descriptor),
+                firstCorrelation: ACTIVATION_CORRELATION,
+                onRetired: (info) => {
+                    if (conn) this.onGenerationRetired(conn, info);
+                },
+                onRouteGoodbye: (channel, epoch) => {
+                    if (conn) this.onRouteGoodbye(conn, channel, epoch);
+                },
+                onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
+                ...this.generationOptions,
+            });
+        } catch (error) {
+            const failure = wrapNegotiationError(error);
+            bootstrap.generation.retire("negotiation_failed", failure);
+            throw failure;
+        }
         conn = {
             generation: candidate,
             token: newConnectionToken(),
