@@ -87,7 +87,14 @@ pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
 /// component past what the host subtracted from ingress. Rejecting beats
 /// truncating: dropping variables would silently remove provider
 /// credentials.
-pub const MAX_ENV_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+///
+/// Sized to leave exec headroom UNDER the conventional 2 MiB limit rather
+/// than to consume it: a child's payload is this snapshot plus the adapter's
+/// own variables — up to [`MAX_OPENCODE_CONFIG_BYTES`] of inline config, the
+/// generation and identity controls — plus argv. Accepting a snapshot that
+/// only the daemon itself could exec would start a host on which every run
+/// fails `E2BIG`.
+pub const MAX_ENV_SNAPSHOT_BYTES: usize = 1536 * 1024;
 
 /// Worst case for the environment snapshot and every simultaneous
 /// representation of it during a spawn.

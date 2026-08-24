@@ -165,6 +165,10 @@ pub enum SubprocessEnd {
     Cancelled,
     StdoutOverflow,
     StderrOverflow,
+    /// Reading the child's stdout failed. Distinct from EOF: the transcript
+    /// is of unknown completeness, so no prefix of it may be trusted even
+    /// when the child then exits cleanly.
+    CaptureFailed,
 }
 
 /// Bounded captured output plus the structural end state.
@@ -281,7 +285,7 @@ pub async fn run(
     let group_record =
         group.and_then(|g| group_registry::GroupRecord::record(g.as_raw_nonzero().get()));
     if group_record.is_none() {
-        kill_group(group, rustix::process::Signal::KILL);
+        let _ = kill_group(group, rustix::process::Signal::KILL);
         // Covers the (theoretical) missing-group-id case kill_group skips.
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -289,7 +293,10 @@ pub async fn run(
             "crash-ownership registration failed before prompt delivery",
         ));
     }
-    let _group_record = group_record;
+    // Held in a slot rather than a plain binding: a teardown that cannot
+    // PROVE the group is gone retains the record instead of dropping it, so
+    // this host's successor sweeps those descendants once this host exits.
+    let mut group_record = group_record;
 
     // Prompt delivery is concurrent with output draining: a child that
     // fills its stdout pipe before reading stdin must not deadlock us.
@@ -336,7 +343,12 @@ pub async fn run(
                 SubprocessEnd::TimedOut
             }),
             read = stdout_pipe.read(&mut stdout_chunk), if stdout_open => match read {
-                Ok(0) | Err(_) => stdout_open = false,
+                Ok(0) => stdout_open = false,
+                // NOT EOF: the rest of the transcript is unknown, and a
+                // parseable prefix plus a clean child exit would otherwise
+                // publish a truncated answer — or miss a contradictory
+                // terminal — as success.
+                Err(_) => break Some(SubprocessEnd::CaptureFailed),
                 Ok(n) => {
                     if stdout.len() + n > limits.max_stdout_bytes {
                         break Some(SubprocessEnd::StdoutOverflow);
@@ -381,9 +393,12 @@ pub async fn run(
         }
     };
 
+    let group_gone;
     let end = match abnormal {
         Some(end) => {
-            terminate_group(group, &mut child, limits.termination_grace).await;
+            group_gone = terminate_group(group, &mut child, limits.termination_grace)
+                .await
+                .is_ok();
             end
         }
         None => {
@@ -396,7 +411,7 @@ pub async fn run(
             // an unrelated recycled process group.
             let exit = wait_exited_unreaped(group, limits.drain_grace).await;
             if exit != LeaderExit::Running {
-                kill_group_fenced(group, exit, rustix::process::Signal::KILL);
+                group_gone = kill_group_fenced(group, exit, rustix::process::Signal::KILL).is_ok();
                 child
                     .wait()
                     .await
@@ -406,11 +421,24 @@ pub async fn run(
                             .map_or(SubprocessEnd::Signaled, SubprocessEnd::Exited)
                     })
             } else {
-                terminate_group(group, &mut child, limits.termination_grace).await;
+                group_gone = terminate_group(group, &mut child, limits.termination_grace)
+                    .await
+                    .is_ok();
                 SubprocessEnd::DrainKilled
             }
         }
     };
+    if !group_gone {
+        // A signal that failed for anything but "already gone" leaves
+        // descendants possibly running. Dropping the record here would
+        // delete the only evidence of them while cancel or delete reports
+        // success; retaining it keeps this run sweepable by the next host.
+        if let Some(record) = group_record.take() {
+            record.retain();
+        }
+    }
+    drop(group_record);
+
     // The whole process group is dead on every path above, so the writer
     // settles promptly: it either finished long ago or its pipe just broke.
     // An incomplete write means the child produced its output without the
@@ -433,10 +461,17 @@ pub async fn run(
     })
 }
 
-fn kill_group(group: Option<rustix::process::Pid>, signal: rustix::process::Signal) {
-    if let Some(group) = group {
-        // ESRCH (already gone) is the success case here.
-        let _ = rustix::process::kill_process_group(group, signal);
+/// Signals a whole process group. `ESRCH` — the group is already gone — is
+/// the success case; any other failure means descendants may still be
+/// running, which the caller must not mistake for a completed teardown.
+fn kill_group(
+    group: Option<rustix::process::Pid>,
+    signal: rustix::process::Signal,
+) -> io::Result<()> {
+    let Some(group) = group else { return Ok(()) };
+    match rustix::process::kill_process_group(group, signal) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -505,9 +540,9 @@ fn kill_group_fenced(
     group: Option<rustix::process::Pid>,
     exit: LeaderExit,
     signal: rustix::process::Signal,
-) {
+) -> io::Result<()> {
     if exit == LeaderExit::ExitedUnfenced {
-        let Some(pid) = group else { return };
+        let Some(pid) = group else { return Ok(()) };
         let pgid = pid.as_raw_nonzero().get();
         // An unverifiable scan must not read as "no members": skipping the
         // signal there leaks this run's descendants AND the crash record is
@@ -519,10 +554,10 @@ fn kill_group_fenced(
             .or_else(|_| group_registry::group_has_members(pgid))
             .unwrap_or(true);
         if !live {
-            return;
+            return Ok(());
         }
     }
-    kill_group(group, signal);
+    kill_group(group, signal)
 }
 
 /// Graceful group termination: SIGTERM the whole group, escalate to SIGKILL
@@ -534,21 +569,22 @@ async fn terminate_group(
     group: Option<rustix::process::Pid>,
     child: &mut tokio::process::Child,
     grace: Duration,
-) {
-    kill_group(group, rustix::process::Signal::TERM);
+) -> io::Result<()> {
+    kill_group(group, rustix::process::Signal::TERM)?;
     if group.is_none() {
         let _ = child.start_kill();
     }
     let mut exit = wait_exited_unreaped(group, grace).await;
     if exit == LeaderExit::Running {
-        kill_group(group, rustix::process::Signal::KILL);
+        kill_group(group, rustix::process::Signal::KILL)?;
         let _ = child.start_kill();
         // SIGKILL cannot be caught, so the leader dies promptly; the bound
         // only guards against pathological kernel states wedging the run.
         exit = wait_exited_unreaped(group, grace).await;
     }
-    kill_group_fenced(group, exit, rustix::process::Signal::KILL);
+    let signalled = kill_group_fenced(group, exit, rustix::process::Signal::KILL);
     let _ = child.wait().await;
+    signalled
 }
 
 /// A sensitive-file cleanup failure, reduced to a bounded structural fact
@@ -789,6 +825,14 @@ pub(crate) fn abnormal_end_terminal(
         SubprocessEnd::StdoutOverflow | SubprocessEnd::StderrOverflow => BackendError {
             class: ErrorClass::Permanent,
             message: format!("{name} backend exceeded its bounded output limit"),
+            retry_after_secs: None,
+            provider_code: None,
+        },
+        // An I/O failure on the pipe says nothing about the request, so a
+        // retry may well succeed.
+        SubprocessEnd::CaptureFailed => BackendError {
+            class: ErrorClass::Transient,
+            message: format!("{name} backend output capture failed"),
             retry_after_secs: None,
             provider_code: None,
         },
@@ -1327,6 +1371,15 @@ pub mod group_registry {
             );
             fs::write(&path, body).ok()?;
             Some(Self { path })
+        }
+    }
+
+    impl GroupRecord {
+        /// Keeps the record on disk instead of removing it: the caller could
+        /// not prove this run's group is gone, so ownership must outlive the
+        /// run and be swept once this host exits.
+        pub fn retain(self) {
+            std::mem::forget(self);
         }
     }
 

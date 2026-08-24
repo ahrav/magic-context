@@ -122,14 +122,14 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     // fallback's aliased attempt)), and the uncharged deletion-tombstone
     // worst case (256 sessions x the tripled key-meta bound), and the
     // environment snapshot plus every simultaneous per-spawn copy of it
-    // (25 x the 2 MiB capture ceiling).
+    // (25 x the 1.5 MiB capture ceiling).
     assert_eq!(
         resources.retained_resident_bytes,
         64 * 1024 * 1024
             + 1024 * (4096 + 256 + 128)
             + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024)
             + 256 * ((4096 + 256) * 3 + 128)
-            + (1 + 3 * 8) * 2 * 1024 * 1024
+            + (1 + 3 * 8) * 1536 * 1024
     );
     assert_eq!(resources.route_class, mc_host::RouteClass::Reserved);
 }

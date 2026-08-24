@@ -61,14 +61,6 @@ Rules:
 - Every memory in the pool below MUST appear exactly once.
 - importance is an integer 1-100; scope is one of project|ecosystem|universe; shareable is true|false."#;
 
-/// Cheap producer-chain guard for completions that succeeded at the transport
-/// layer but did not return even a classify manifest envelope. The TypeScript
-/// host remains responsible for XML parsing, membership checks, and field validation.
-pub fn has_manifest_envelope(text: &str) -> bool {
-    let text = text.trim();
-    text.contains("<classify>") && text.contains("</classify>")
-}
-
 /// The scope vocabulary a classify entry may carry, mirroring `SCOPES` in
 /// `classify-prompt.ts`.
 const CLASSIFY_SCOPES: [&str; 3] = ["project", "ecosystem", "universe"];
@@ -105,15 +97,27 @@ fn shareable_attr_pattern() -> &'static Regex {
     })
 }
 
-/// The body between the outermost `<classify>` tags, or `None` when the
-/// envelope is absent or unterminated.
+fn classify_root_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)<classify\b[^>]*>(.*?)</classify>").expect("classify root pattern")
+    })
+}
+
+/// The body of the classify root element, or `None` when the envelope is
+/// absent or unterminated.
+///
+/// Deliberately the same syntax the caller accepts
+/// (`extractCompleteManifestBody` in `manifest-parser.ts`): case-insensitive
+/// and attribute-tolerant, so `<Classify>` or `<classify version="1">` is a
+/// valid envelope here too. A stricter reader would advance the fallback
+/// chain — and eventually fail the command — over output the authority
+/// parses fine.
 fn classify_body(text: &str) -> Option<&str> {
-    const OPEN: &str = "<classify>";
-    const CLOSE: &str = "</classify>";
-    let start = text.find(OPEN)? + OPEN.len();
-    let rest = &text[start..];
-    let end = rest.find(CLOSE)?;
-    Some(&rest[..end])
+    classify_root_pattern()
+        .captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|body| body.as_str())
 }
 
 /// Whether one attempt's output is an acceptable classify manifest for
@@ -221,12 +225,28 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The envelope syntax must match what the caller's parser accepts, or
+    /// this gate would advance the chain over output the authority parses.
     #[test]
-    fn manifest_envelope_rejects_provider_outage_text() {
-        assert!(!has_manifest_envelope("All Antigravity endpoints failed"));
-        assert!(has_manifest_envelope(
-            "<classify><memory id=\"1\"/></classify>"
-        ));
+    fn manifest_root_matching_mirrors_the_caller_parser() {
+        let expected: BTreeSet<i64> = [1].into_iter().collect();
+        for text in [
+            "<classify><memory id=\"1\" scope=\"project\"/></classify>",
+            // Case-insensitive root, as `extractCompleteManifestBody` is.
+            "<Classify><memory id=\"1\" scope=\"project\"/></Classify>",
+            // Attributes on the root are tolerated there too.
+            "<classify version=\"1\"><memory id=\"1\" scope=\"project\"/></classify>",
+            // Surrounding prose is ignored: the root is located, not anchored.
+            "here you go:\n<classify><memory id=\"1\" scope=\"project\"/></classify>\ndone",
+        ] {
+            assert_eq!(
+                validate_classify_manifest(text, &expected),
+                Ok(()),
+                "must accept {text:?}"
+            );
+        }
+        // Provider outage text carries no envelope at all.
+        assert!(validate_classify_manifest("All Antigravity endpoints failed", &expected).is_err());
     }
 
     #[test]
