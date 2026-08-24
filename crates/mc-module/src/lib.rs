@@ -9832,45 +9832,40 @@ impl McHandler {
                 },
                 Err(error) => Err(error),
             };
-            // Each attempt must purge its session before advancing or
-            // returning; dreamer sessions carry memory-pool snapshots. A
-            // failed purge is therefore terminal for the command on every
-            // outcome kind — advancing the chain would let a later success
+            // Each non-final attempt must purge its session before advancing
+            // or returning; dreamer sessions carry memory-pool snapshots. A
+            // failed purge is therefore terminal for the command on those
+            // outcome kinds — advancing the chain would let a later success
             // mask the session (and its snapshot) left behind.
-            let purge_result = producer.purge_session(&child_session).await;
-            let purge_failed = purge_result.is_err();
+            //
+            // The successful attempt is the exception: its session is the
+            // only recoverable copy of the result until the response is
+            // durably recorded, so it is purged after the ledger write —
+            // purging first would let a ledger failure tombstone the run and
+            // persist a failure for a command that actually succeeded.
             match attempt_output {
-                Ok(result) if has_manifest_envelope(&result.text) => match purge_result {
-                    // The module checks only for the task-specific envelope. Even if the
-                    // output limit truncated a result, this layer accepts it when the
-                    // envelope remains; the host parser rejects malformed contents.
+                // The module checks only for the task-specific envelope. Even if the
+                // output limit truncated a result, this layer accepts it when the
+                // envelope remains; the host parser rejects malformed contents.
+                Ok(result) if has_manifest_envelope(&result.text) => {
+                    output = Some((model.clone(), result, child_session, producer));
+                    break;
+                }
+                Ok(_) => match producer.purge_session(&child_session).await {
                     Ok(()) => {
-                        output = Some((model.clone(), result, child_session));
-                        break;
+                        last_error =
+                            "classify producer returned no classify manifest envelope".to_string();
                     }
                     Err(cleanup) => {
-                        // A session-purge failure after successful
-                        // classification fails the command.
                         last_error = format!(
-                            "classify succeeded on {model} but attempt session cleanup failed: {cleanup}"
+                            "classify producer returned no classify manifest envelope (session.delete cleanup also failed: {cleanup})"
                         );
                         break;
                     }
                 },
-                Ok(_) => {
-                    last_error = match purge_result {
-                        Ok(()) => {
-                            "classify producer returned no classify manifest envelope".to_string()
-                        }
-                        Err(cleanup) => format!(
-                            "classify producer returned no classify manifest envelope (session.delete cleanup also failed: {cleanup})"
-                        ),
-                    };
-                    if purge_failed {
-                        break;
-                    }
-                }
                 Err(primary) => {
+                    let purge_result = producer.purge_session(&child_session).await;
+                    let purge_failed = purge_result.is_err();
                     last_error =
                         historian_producer::attach_cleanup(primary, purge_result, "session.delete")
                             .to_string();
@@ -9897,7 +9892,7 @@ impl McHandler {
                 message: last_error,
             };
         }
-        let (model, result, child_session) = output.expect("classifier output set");
+        let (model, result, child_session, mut producer) = output.expect("classifier output set");
         let response = json!({
             "ok": true,
             "manifest_text": result.text,
@@ -9919,7 +9914,19 @@ impl McHandler {
             &response.to_string(),
             now_ms(),
         ) {
-            Ok(recorded) => replay_dream_task_response(&recorded.response_json),
+            Ok(recorded) => {
+                // Purge only after the response is durable. A purge failure
+                // here cannot fail the command — the recorded response is
+                // already the command's outcome (any retry replays it) —
+                // and the leftover session stays bounded by host terminal
+                // retention.
+                let _ = producer.purge_session(&child_session).await;
+                replay_dream_task_response(&recorded.response_json)
+            }
+            // The completed session is left alive deliberately: with no
+            // ledger row, a retry derives the same child session and can
+            // recover the completed run instead of hitting a deletion
+            // tombstone.
             Err(error) => HandlerOutcome::Error {
                 code: "dreamer_ledger_failed".to_string(),
                 message: error.to_string(),
@@ -26584,7 +26591,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn dreamer_run_task_returns_cleanup_failure_on_otherwise_successful_classify() {
+    async fn dreamer_run_task_success_survives_cleanup_failure_after_ledger_record() {
         let producer = Arc::new(ProducerState::default());
         producer
             .await_results
@@ -26606,18 +26613,24 @@ mod tests {
             "cleanup-on-success",
         )
         .await;
-        let HandlerOutcome::Error { code, message } = outcome else {
-            panic!("a leaked attempt session must not report an unqualified success");
+        // The response was durably recorded before the purge ran, so the
+        // purge failure cannot fail the command — a retry would replay the
+        // recorded success anyway; the leftover session is bounded by host
+        // terminal retention.
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("a recorded success must survive a cleanup failure: {other:?}"),
         };
-        assert_eq!(code, "dreamer_run_failed");
-        assert!(
-            message.contains("session cleanup failed"),
-            "the returned error must carry the cleanup failure: {message}"
-        );
+        assert_eq!(response["ok"], json!(true));
         assert_eq!(
             producer.starts.load(Ordering::SeqCst),
             1,
             "a successful classification must not burn fallback attempts on cleanup failure"
+        );
+        assert_eq!(
+            producer.purges.lock().unwrap().len(),
+            1,
+            "the purge must still be attempted after the ledger write"
         );
     }
 
