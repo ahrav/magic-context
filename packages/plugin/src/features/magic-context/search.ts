@@ -2552,6 +2552,35 @@ async function executeUnifiedSearch(args: {
                     }
                 }
             })();
+            // The telemetry write above is the LAST database boundary before
+            // publication, and its transaction can WAIT behind a concurrent
+            // writer whose commit quarantines, rejects, or rewrites one of
+            // these rows — a transition the lane-level recheck read the old
+            // policy for. Reapply the policy and exact-digest gate here so
+            // the returned set reflects every transition that committed
+            // before publication.
+            if (hasClaimEffectivePolicy(db)) {
+                const surface = options.memoryPolicySurface ?? "explicit_search";
+                const policyRows = readMemoryPolicyRows(db, memoryIds);
+                const digestsNow = exactMemoryContentDigests(db, memoryIds);
+                const droppedIds = new Set<number>();
+                for (const result of results) {
+                    if (result.source !== "memory") continue;
+                    const decision = decideMemoryPolicy(policyRows.get(result.memoryId), surface);
+                    if (
+                        !decision.eligible ||
+                        (result.contentDigest !== undefined &&
+                            digestsNow.get(result.memoryId) !== result.contentDigest)
+                    ) {
+                        droppedIds.add(result.memoryId);
+                    }
+                }
+                if (droppedIds.size > 0) {
+                    return results.filter(
+                        (result) => result.source !== "memory" || !droppedIds.has(result.memoryId),
+                    );
+                }
+            }
         }
     }
 

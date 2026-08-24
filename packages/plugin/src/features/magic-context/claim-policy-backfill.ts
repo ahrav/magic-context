@@ -577,11 +577,12 @@ async function revalidateEnforcementArtifactsNow(
             const code = (error as { code?: string } | null)?.code;
             if (code === "ENOENT") {
                 drifted = "artifact file missing";
-            } else if (code === "EISDIR" || code === "ENOTDIR") {
-                // A path replaced by a directory (or a parent replaced by a
-                // file) is a PERMANENT type change, not transient I/O: the
-                // recorded regular file no longer exists, and skipping would
-                // keep the claim ENFORCED forever on a recurring error.
+            } else if (code === "EISDIR" || code === "ENOTDIR" || code === "ELOOP") {
+                // A path replaced by a directory, a parent replaced by a
+                // file, or a symlink loop is a PERMANENT type change, not
+                // transient I/O: the recorded regular file no longer exists,
+                // and skipping would keep the claim ENFORCED forever on a
+                // recurring error.
                 drifted = "artifact replaced by a non-file";
             } else {
                 continue;
@@ -614,7 +615,12 @@ async function revalidateEnforcementArtifactsNow(
                     // recurring probe. Anything else is indistinguishable
                     // from transient I/O; keep the artifact and retry later.
                     const code = (error as { code?: string } | null)?.code;
-                    if (code !== "ENOENT" && code !== "EISDIR" && code !== "ENOTDIR") {
+                    if (
+                        code !== "ENOENT" &&
+                        code !== "EISDIR" &&
+                        code !== "ENOTDIR" &&
+                        code !== "ELOOP"
+                    ) {
                         return;
                     }
                 }

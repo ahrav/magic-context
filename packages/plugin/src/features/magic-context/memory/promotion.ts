@@ -150,6 +150,17 @@ async function embedAndStoreMemory(
         const result = await embedTextForProject(projectPath, content);
         if (result) {
             db.transaction(() => {
+                // Re-bind inside the write transaction: the provider call
+                // above yielded, and the normalized-hash guard alone cannot
+                // reject a case/whitespace-only rewrite that landed
+                // meanwhile — the save would reinstate the predecessor's
+                // vector under the successor bytes.
+                if (
+                    exactMemoryContentDigests(db, [memoryId]).get(memoryId) !==
+                    sha256Utf8Hex(content)
+                ) {
+                    return;
+                }
                 saveEmbeddingIfHashMatches(
                     db,
                     memoryId,
