@@ -20,6 +20,7 @@ import type {
     InboundFrame,
     SetupFrameChannel,
 } from "./frame-channel";
+import type { FrameType } from "./protocol";
 import {
     checkOpaqueSerialized,
     encodeNegotiateRequest,
@@ -256,7 +257,17 @@ export function sanitizedCandidateFactory(
                         throw new Error("malformed provider frame");
                     }
                     snapshot = {
-                        header: { len, ver, ty, flags, channel: channelId, epoch, corr },
+                        // The safe-integer check bounds `ty`; dispatch owns
+                        // semantic validation of unknown frame types.
+                        header: {
+                            len,
+                            ver,
+                            ty: ty as FrameType,
+                            flags,
+                            channel: channelId,
+                            epoch,
+                            corr,
+                        },
                         body,
                     };
                 } catch {
