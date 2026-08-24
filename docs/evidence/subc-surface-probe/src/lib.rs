@@ -6,7 +6,7 @@ use std::{path::Path, path::PathBuf, time::Duration};
 
 use serde_json::{json, Value};
 use subc_client_rs::{
-    async_trait, BindDecision, CallError, CallOptions, CloseRouteOptions, ConsumerOptions,
+    async_trait, CallError, CallOptions, CloseRouteOptions, ConsumerOptions,
     HandlerOutcome, HealthReport, HealthStatus, ModuleHandler, RequestCtx, RetryBackoff,
     RouteBindRequest, RouteHandle, SubcConsumer,
 };

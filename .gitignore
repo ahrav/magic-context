@@ -71,6 +71,12 @@ docs/specs/
 # Rust workspace build output
 /target
 
+# Standalone evidence crates under docs/evidence/ (workspace-excluded; compiled
+# ad hoc for verification) — their build output and lockfiles are throwaway.
+# The workspace-root and src-tauri Cargo.locks stay tracked.
+docs/evidence/**/target/
+docs/evidence/**/Cargo.lock
+
 # Local experiment scratch under scripts/experiments/ — dev-only harnesses and
 # their outputs, several run against real session/memory data and must never be
 # tracked.
