@@ -5843,7 +5843,17 @@ impl<'a> FacadeMutationTxn<'a> {
                         verification_status = CASE
                             WHEN verification_status = 'verified'
                                 THEN 'unverified'
-                            ELSE verification_status END
+                            ELSE verification_status END,
+                        -- A user-sourced row demotes to 'agent' on rewrite:
+                        -- the stored bytes are no longer user-authored, and
+                        -- after mirror-back a same-content revision keyed on
+                        -- this column would otherwise carry explicit_user
+                        -- provenance and promote the replacement to VERIFIED
+                        -- (the TypeScript projection writer demotes the same
+                        -- way).
+                        source_type = CASE
+                            WHEN source_type = 'user' THEN 'agent'
+                            ELSE source_type END
                   WHERE id = ?4",
                 params![content, normalized_hash, now_ms, id],
             )
@@ -11698,7 +11708,17 @@ impl McStore {
                         verification_status = CASE
                             WHEN verification_status = 'verified'
                                 THEN 'unverified'
-                            ELSE verification_status END
+                            ELSE verification_status END,
+                        -- A user-sourced row demotes to 'agent' on rewrite:
+                        -- the stored bytes are no longer user-authored, and
+                        -- after mirror-back a same-content revision keyed on
+                        -- this column would otherwise carry explicit_user
+                        -- provenance and promote the replacement to VERIFIED
+                        -- (the TypeScript projection writer demotes the same
+                        -- way).
+                        source_type = CASE
+                            WHEN source_type = 'user' THEN 'agent'
+                            ELSE source_type END
                   WHERE id = ?4",
                 params![content, normalized_hash, now_ms, id],
             )?;

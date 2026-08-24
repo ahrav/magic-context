@@ -51,7 +51,10 @@ import {
 	promoteSessionFactsDurable,
 } from "@magic-context/core/features/magic-context/memory";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { filterMemoriesByPolicy } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
+import {
+	bindMemoriesToCurrentRevision,
+	filterMemoriesByPolicy,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	clearEmergencyDrainLatch,
@@ -685,12 +688,18 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			}
 			// The historian's reference block is an automatic model prompt:
 			// policy-hidden content must not reach it, or a hidden fact can
-			// steer newly generated summaries.
-			const memories = filterMemoriesByPolicy(
+			// steer newly generated summaries. The binder drops rows
+			// rewritten between load and policy read, so a superseded (or
+			// previously hidden) revision's bytes cannot ride the successor's
+			// eligibility into durable summaries.
+			const memories = bindMemoriesToCurrentRevision(
 				db,
-				getMemoriesByProject(db, projectPath, ["active", "permanent"]),
-				"auto_inject",
-			).memories;
+				filterMemoriesByPolicy(
+					db,
+					getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+					"auto_inject",
+				).memories,
+			);
 			const memoryBlock = renderMemoryBlock(memories) ?? undefined;
 
 			// v2 (E6 parity): bounded reference blocks replace the unbounded

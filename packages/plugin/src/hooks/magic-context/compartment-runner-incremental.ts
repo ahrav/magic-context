@@ -22,7 +22,10 @@ import {
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
-import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
+import {
+    bindMemoriesToCurrentRevision,
+    filterMemoriesByPolicy,
+} from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     getMemoriesByProject,
     ModuleMemoryAuthorityError,
@@ -442,11 +445,14 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // lookup above so the policy filter and the rendered bytes are
         // current when the prompt is handed to the provider — a load before
         // that await could carry a memory hidden or rewritten in the gap.
-        const memories = filterMemoriesByPolicy(
+        const memories = bindMemoriesToCurrentRevision(
             db,
-            getMemoriesByProject(db, projectPath, ["active", "permanent"]),
-            "auto_inject",
-        ).memories;
+            filterMemoriesByPolicy(
+                db,
+                getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+                "auto_inject",
+            ).memories,
+        );
         const projectMemory = renderMemoryBlock(memories) ?? "";
 
         const prompt = buildCompartmentAgentPrompt({
