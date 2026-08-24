@@ -310,22 +310,35 @@ export function sanitizedCandidateFactory(
                     ) {
                         throw new Error("out-of-range provider header field");
                     }
-                    if (providerBody.length > args.maxBodyLen) {
+                    // `length` on a subclass is an overridable accessor, so
+                    // the reported size only sizes the budget reservation;
+                    // the copy's own length below is authoritative.
+                    const reported = Number(providerBody.length);
+                    if (!Number.isSafeInteger(reported) || reported > args.maxBodyLen) {
                         throw new Error("oversize provider frame");
                     }
                     // The copy draws on the ONE shared aggregate cap the
                     // channel seam promises, so a provider delivery cannot
                     // create unaccounted allocation above it.
-                    if (args.budget.wouldExceed(providerBody.length)) {
+                    if (args.budget.wouldExceed(reported)) {
                         throw new Error("provider frame exceeds the aggregate cap");
                     }
-                    args.budget.charge(providerBody.length);
-                    charged = providerBody.length;
-                    // Owned copy: a provider that reuses or mutates its read
-                    // buffer after onFrame returns must not change bytes a
-                    // later promise continuation or retained stream item
-                    // decodes.
-                    const body = providerBody.slice();
+                    args.budget.charge(reported);
+                    charged = reported;
+                    // Owned copy through the intrinsic constructor, which
+                    // reads the source's internal slots: a `Uint8Array`
+                    // subclass cannot override it to alias its own storage,
+                    // the way an overridden `slice()` could. Independent
+                    // storage is what keeps a provider's later buffer reuse
+                    // from mutating bytes a promise continuation or retained
+                    // stream item decodes.
+                    const body = new Uint8Array(providerBody);
+                    // Reconcile against the copy's true length: a spoofed
+                    // `length` accessor must not leave the budget carrying a
+                    // charge that does not match the bytes now held.
+                    if (body.length !== reported) {
+                        throw new Error("provider frame length disagrees with its bytes");
+                    }
                     snapshot = {
                         // The safe-integer check bounds `ty`; the shared
                         // wire validation below rejects illegal values.

@@ -782,6 +782,7 @@ export class SubcClient {
             ) {
                 if (
                     !flagsBinary(error.errorTerminal.flags) &&
+                    !error.errorTerminal.streamed &&
                     isLegacyFallbackTerminalBody(error.errorTerminal.body)
                 ) {
                     // Only the closed set of legacy Error terminals proves
@@ -1041,7 +1042,14 @@ export class SubcClient {
             if (terminal.kind === "error") {
                 const failure = terminalFromErrorBody(terminal.body);
                 if (params.captureErrorTerminal === true) {
-                    failure.errorTerminal = { body: terminal.body, flags: terminal.flags };
+                    failure.errorTerminal = {
+                        body: terminal.body,
+                        flags: terminal.flags,
+                        // A stream frame ahead of the terminal means the
+                        // host produced response data, which cannot prove a
+                        // no-dispatch rejection.
+                        streamed: terminal.stream.length > 0,
+                    };
                 }
                 throw failure;
             }
