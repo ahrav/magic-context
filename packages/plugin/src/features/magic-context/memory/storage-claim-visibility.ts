@@ -276,21 +276,38 @@ export function decideMemoryPolicy(
  * Replay gate for a persisted auto-search hint: the hint text was computed
  * from these memories' fragments under the policy of an earlier pass, and a
  * later policy transition (quarantine, contradiction, rejection) must not
- * keep serving those fragments through the persisted decision. `undefined`
- * means the contributing set is unknown (a pre-field decision or a reseed
- * that dropped it) and fails closed — an unknown set cannot prove the text
- * holds no hidden fragment, the same discipline as an unknown rendered-id
- * record on the injection path.
+ * keep serving those fragments through the persisted decision. Each fragment
+ * is bound to the normalized content hash that produced it, so a memory
+ * rewritten in place cannot lend the OLD fragment its NEW revision's
+ * eligibility — the ids resolve through the claim's current revision, and
+ * only the exact content the hint carries may replay. `undefined` means the
+ * contributing set is unknown (a pre-field decision or a reseed that dropped
+ * it) and fails closed — an unknown set cannot prove the text holds no
+ * hidden fragment, the same discipline as an unknown rendered-id record on
+ * the injection path.
  */
 export function autoSearchHintFragmentsStillEligible(
     db: Database,
-    memoryIds: readonly number[] | undefined,
+    fragments: readonly { id: number; hash: string }[] | undefined,
 ): boolean {
     if (!hasClaimEffectivePolicy(db)) return true;
-    if (memoryIds === undefined) return false;
-    if (memoryIds.length === 0) return true;
-    const rows = readMemoryPolicyRows(db, memoryIds);
-    return memoryIds.every((id) => decideMemoryPolicy(rows.get(id), "auto_search").eligible);
+    if (fragments === undefined) return false;
+    if (fragments.length === 0) return true;
+    const ids = fragments.map((fragment) => fragment.id);
+    const rows = readMemoryPolicyRows(db, ids);
+    if (!ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_search").eligible)) {
+        return false;
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    const hashRows = db
+        .prepare(
+            // Interpolation is a compile-time placeholder list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT id, normalized_hash AS hash FROM memories WHERE id IN (${placeholders})`,
+        )
+        .all(...ids) as Array<{ id: number; hash: string }>;
+    const currentHashById = new Map(hashRows.map((row) => [row.id, row.hash]));
+    return fragments.every((fragment) => currentHashById.get(fragment.id) === fragment.hash);
 }
 
 /**

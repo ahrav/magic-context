@@ -1588,22 +1588,37 @@ export async function buildModuleStateSyncPayload(args: {
     // must not ship its bytes through the mutation lane (a held-open compat
     // writer can advance the mutation watermark without an epoch bump). The
     // reader still force-includes visibility-mutation targets, so removal
-    // signals for previously mirrored rows are unaffected; the row itself is
-    // repaired by the next full snapshot's replace scope and delete ids.
+    // signals for previously mirrored rows are unaffected.
+    const unfilteredRenderedIds = memoryMutationsChanged
+        ? args.force
+            ? allMemories.map((memory) => memory.id)
+            : readRenderedMemoryIds({
+                  db: args.pass.db,
+                  projectPath: args.pass.projectPath,
+                  workspace,
+                  nowMs: args.pass.nowMs,
+              })
+        : [];
     const renderedMemoryIds = memoryMutationsChanged
         ? args.force
             ? memoryRows.map((memory) => memory.id)
-            : filterMemoryIdsByPolicy(
-                  args.pass.db,
-                  readRenderedMemoryIds({
-                      db: args.pass.db,
-                      projectPath: args.pass.projectPath,
-                      workspace,
-                      nowMs: args.pass.nowMs,
-                  }),
-                  "auto_inject",
-              )
+            : filterMemoryIdsByPolicy(args.pass.db, unfilteredRenderedIds, "auto_inject")
         : [];
+    // A denied mutation target must not merely be dropped: the mutation
+    // watermark still advances, so with no full snapshot in this payload the
+    // module would keep serving the previously mirrored (old, eligible) row
+    // until an unrelated resync. Name denied targets as explicit deletions so
+    // the incremental sync removes the stale native row in the same
+    // acknowledgement. The full-snapshot shapes already cover them through
+    // the coverage subtraction above.
+    const incrementalDeniedIds = (() => {
+        if (memoriesDeleteIds !== undefined) return undefined;
+        if (!memoryMutationsChanged || args.force || epochChanged) return undefined;
+        const shipped = new Set(renderedMemoryIds);
+        const denied = unfilteredRenderedIds.filter((id) => !shipped.has(id));
+        return denied.length > 0 ? denied : undefined;
+    })();
+    const effectiveMemoriesDeleteIds = memoriesDeleteIds ?? incrementalDeniedIds;
     const userProfile = includeUserProfile
         ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
         : [];
@@ -1750,7 +1765,7 @@ export async function buildModuleStateSyncPayload(args: {
         watermarks: currentWatermarks,
         omitAuthorityMemorySections,
         memoriesReplaceProjects,
-        memoriesDeleteIds,
+        memoriesDeleteIds: effectiveMemoriesDeleteIds,
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
@@ -1766,8 +1781,8 @@ export async function buildModuleStateSyncPayload(args: {
             ...(memoriesReplaceProjects !== undefined
                 ? { memories_replace_projects: memoriesReplaceProjects }
                 : {}),
-            ...(memoriesDeleteIds !== undefined && !omitAuthorityMemorySections
-                ? { memories_delete_ids: memoriesDeleteIds }
+            ...(effectiveMemoriesDeleteIds !== undefined && !omitAuthorityMemorySections
+                ? { memories_delete_ids: effectiveMemoriesDeleteIds }
                 : {}),
             ...(includeUserProfile ? { user_profile: userProfile } : {}),
             ...(includeWorkspace ? { workspace: workspace.workspace } : {}),

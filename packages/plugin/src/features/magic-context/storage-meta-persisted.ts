@@ -93,14 +93,16 @@ export type AutoSearchHintDecision =
           decision: "hint";
           text: string;
           /**
-           * Memory ids whose fragments the hint text carries. Replay gates
-           * re-check these against the live policy so a memory hidden after
-           * the hint was computed stops being served; a decision without the
+           * Memories whose fragments the hint text carries, each bound to the
+           * normalized content hash that produced it. Replay gates re-check
+           * both against live state so a memory hidden after the hint was
+           * computed — or rewritten in place, even if the replacement later
+           * becomes eligible — stops being served; a decision without the
            * field (written before the field existed, or reseeded through a
            * lane that drops it) cannot prove its fragments are clean and
            * fails closed under an effective claim policy.
            */
-          memoryIds?: number[];
+          memoryFragments?: Array<{ id: number; hash: string }>;
       }
     | { messageId: string; decision: "no-hint"; reason: AutoSearchHintNoHintReason };
 
@@ -250,8 +252,15 @@ function isValidAutoSearchHintDecision(value: unknown): value is AutoSearchHintD
     if (row.decision === "hint") {
         if (typeof row.text !== "string" || row.text.length === 0) return false;
         return (
-            row.memoryIds === undefined ||
-            (Array.isArray(row.memoryIds) && row.memoryIds.every((id) => Number.isInteger(id)))
+            row.memoryFragments === undefined ||
+            (Array.isArray(row.memoryFragments) &&
+                row.memoryFragments.every(
+                    (fragment) =>
+                        fragment !== null &&
+                        typeof fragment === "object" &&
+                        Number.isInteger((fragment as { id?: unknown }).id) &&
+                        typeof (fragment as { hash?: unknown }).hash === "string",
+                ))
         );
     }
     if (row.decision === "no-hint") {

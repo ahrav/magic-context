@@ -24,6 +24,7 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
 import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
+import { getMemoriesByIds } from "../../features/magic-context/memory/storage-memory";
 import type {
     UnifiedSearchOptions,
     UnifiedSearchResult,
@@ -307,7 +308,7 @@ export async function runAutoSearchHint(args: {
     // sending the fragment on defer/retry passes through the stored text.
     const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
         if (decision.decision !== "hint") return;
-        if (!autoSearchHintFragmentsStillEligible(db, decision.memoryIds)) {
+        if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
             sessionLog(
                 sessionId,
                 `auto-search: suppressing persisted hint for ${decision.messageId} — a contributing memory is no longer eligible`,
@@ -451,8 +452,11 @@ export async function runAutoSearchHint(args: {
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.
     const payload = `\n\n${hintText}`;
-    // Record which memories contributed fragments so replay passes can
-    // re-check them against the live policy.
+    // Record which memories contributed fragments — each bound to its
+    // normalized content hash — so replay passes can re-check both policy
+    // and content identity against live state. A delivered id whose row
+    // cannot be loaded records an empty hash, which can never match a live
+    // row: the fragment fails closed rather than silently untracked.
     const deliveredMemoryIds = [
         ...new Set(
             delivery.delivered
@@ -460,11 +464,21 @@ export async function runAutoSearchHint(args: {
                 .map((result) => result.memoryId),
         ),
     ];
+    const hashById = new Map(
+        getMemoriesByIds(db, deliveredMemoryIds).map((memory) => [
+            memory.id,
+            memory.normalizedHash,
+        ]),
+    );
+    const memoryFragments = deliveredMemoryIds.map((id) => ({
+        id,
+        hash: hashById.get(id) ?? "",
+    }));
     const outcome = appendAutoSearchHintDecision(db, sessionId, {
         messageId: userMsgId,
         decision: "hint",
         text: payload,
-        memoryIds: deliveredMemoryIds,
+        memoryFragments,
     });
     if (!outcome.ok) {
         sessionLog(sessionId, `auto-search: CAS exhausted for ${userMsgId}; skipping wire append`);

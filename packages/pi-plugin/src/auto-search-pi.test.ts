@@ -159,7 +159,7 @@ describe("runAutoSearchHintForPi", () => {
 				decision: "hint",
 				text: "\n\n<ctx-search-hint>stored hint</ctx-search-hint>",
 				// No memory fragments contributed, so replay needs no policy check.
-				memoryIds: [],
+				memoryFragments: [],
 			});
 			const replay = [
 				{ ...userMessage("explain cached hint", 1), id: "entry-replay" },

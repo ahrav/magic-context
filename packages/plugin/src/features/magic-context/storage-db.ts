@@ -1393,6 +1393,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       memory_block_cache TEXT DEFAULT '',
       memory_block_count INTEGER DEFAULT 0,
       memory_block_ids TEXT DEFAULT '',
+      memory_block_hashes TEXT DEFAULT '',
       -- pending_compaction_marker_state: intentionally NULLABLE without a
       -- default. Absence of a deferred marker is SQL NULL; presence is a
       -- valid JSON blob written via setPendingCompactionMarkerState.
@@ -1696,6 +1697,11 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // already see in context — they're wasted tokens and crowd out high-signal
     // raw-history hits.
     ensureColumn(db, "session_meta", "memory_block_ids", "TEXT DEFAULT ''");
+    // JSON array of normalized content hashes aligned index-wise with
+    // memory_block_ids: the cached block replays only while each id still
+    // carries the exact content that was rendered, so a rewrite-in-place
+    // cannot lend the old cached bytes its successor's eligibility.
+    ensureColumn(db, "session_meta", "memory_block_hashes", "TEXT DEFAULT ''");
     ensureColumn(db, "dream_queue", "retry_count", "INTEGER DEFAULT 0");
     ensureColumn(db, "tags", "reasoning_byte_size", "INTEGER DEFAULT 0");
     ensureColumn(db, "tags", "drop_mode", "TEXT DEFAULT 'full'");

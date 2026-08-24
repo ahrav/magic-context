@@ -637,11 +637,26 @@ export async function executeClaimEnforceCommand(
                 const committedSnap = join(snapDir, `${basename(canonical.absolutePath)}.snap`);
                 const copiedSnap = join(snapDir, `${snapshotName}.snap`);
                 const carrySnapshots = existsSync(committedSnap);
-                writeFileSync(snapshotPath, bytes);
+                // `wx` refuses a pre-existing path (a planted file or symlink
+                // under the nonce name), and read-only mode plus the
+                // post-run digest re-check below raise the bar against a
+                // watcher process replacing the snapshot around the run.
+                // This is hardening, not proof: a local adversary with
+                // project-directory write access sits in the same trust
+                // domain as the artifact and the database themselves.
+                writeFileSync(snapshotPath, bytes, { flag: "wx", mode: 0o444 });
                 if (carrySnapshots) copyFileSync(committedSnap, copiedSnap);
                 try {
                     const evaluate = deps.evaluateArtifact ?? defaultEvaluateArtifact;
                     evaluation = await evaluate(snapshotPath, kind, deps.projectRoot);
+                    // The recorded digest must describe the bytes the
+                    // evaluator ran: a snapshot replaced during the run
+                    // cannot be recorded.
+                    if (sha256Bytes(snapshotPath) !== bytesDigest) {
+                        throw new Error(
+                            "the evaluation snapshot changed during the run; rerun the command",
+                        );
+                    }
                 } finally {
                     rmSync(snapshotPath, { force: true });
                     // Remove the carried copy AND any snapshot the run

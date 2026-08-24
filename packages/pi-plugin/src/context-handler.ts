@@ -5753,7 +5753,7 @@ function applyNoteNudges(args: {
 			// A persisted hint replays only while every contributing memory is
 			// still auto_search-eligible: a later policy transition must not
 			// keep serving the fragment through the sticky replay.
-			if (!autoSearchHintFragmentsStillEligible(db, decision.memoryIds)) {
+			if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
 				continue;
 			}
 			appendReminderToUserMessageByIdPi(

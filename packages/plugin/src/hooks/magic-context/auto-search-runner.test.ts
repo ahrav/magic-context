@@ -645,8 +645,10 @@ describe("auto-search-runner", () => {
             expect(decisions).toHaveLength(1);
             const decision = decisions[0];
             if (decision.decision !== "hint") throw new Error("expected a hint decision");
-            // The decision binds the contributing memory ids for replay gates.
-            expect(decision.memoryIds).toEqual([4242]);
+            // The decision binds the contributing fragments for replay gates.
+            // The mocked id has no memory row, so the recorded empty hash
+            // fails closed at replay.
+            expect(decision.memoryFragments).toEqual([{ id: 4242, hash: "" }]);
             expect(findUserPromptText(messages[0])).toContain("historian runs on overflow");
 
             // Memory 4242 has no claim link, so the policy treats it as

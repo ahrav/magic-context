@@ -55,6 +55,7 @@ import {
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
+import { getMemoriesByIds } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type {
 	UnifiedSearchOptions,
 	UnifiedSearchResult,
@@ -273,7 +274,7 @@ export async function runAutoSearchHintForPi(args: {
 	// the fragment through the stored text. Mirrors the OpenCode runner.
 	const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
 		if (decision.decision !== "hint") return;
-		if (!autoSearchHintFragmentsStillEligible(db, decision.memoryIds)) {
+		if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
 			sessionLog(
 				sessionId,
 				`auto-search: suppressing persisted hint for ${decision.messageId} — a contributing memory is no longer eligible`,
@@ -411,8 +412,11 @@ export async function runAutoSearchHintForPi(args: {
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode lines 268-270.
 	const payload = `\n\n${packed.text}`;
-	// Record exactly the memories whose fragments the packed hint carries so
-	// replay gating never suppresses on a candidate the token budget dropped.
+	// Record exactly the memories whose fragments the packed hint carries —
+	// each bound to its normalized content hash — so replay gating never
+	// suppresses on a candidate the token budget dropped and never replays a
+	// fragment whose memory was rewritten in place. An unloadable row records
+	// an empty hash and fails closed rather than going silently untracked.
 	const deliveredMemoryIds = [
 		...new Set(
 			packed.delivered
@@ -420,11 +424,21 @@ export async function runAutoSearchHintForPi(args: {
 				.map((result) => result.memoryId),
 		),
 	];
+	const hashById = new Map(
+		getMemoriesByIds(db, deliveredMemoryIds).map((memory) => [
+			memory.id,
+			memory.normalizedHash,
+		]),
+	);
+	const memoryFragments = deliveredMemoryIds.map((id) => ({
+		id,
+		hash: hashById.get(id) ?? "",
+	}));
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",
 		text: payload,
-		memoryIds: deliveredMemoryIds,
+		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
 	if (outcome.kind === "already-present") {

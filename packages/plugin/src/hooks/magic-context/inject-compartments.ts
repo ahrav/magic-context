@@ -147,22 +147,72 @@ function parseRecordedMemoryBlockIds(raw: string | null | undefined): number[] |
     }
 }
 
+/** Hash twin of `parseRecordedMemoryBlockIds` for `memory_block_hashes`. */
+function parseRecordedMemoryBlockHashes(raw: string | null | undefined): string[] | null {
+    if (raw == null || raw === "") return null;
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        return Array.isArray(parsed) && parsed.every((value) => typeof value === "string")
+            ? (parsed as string[])
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * A recorded memory block replays only while every rendered id is still
+ * automatic-eligible AND still carries the exact content that was rendered.
+ * The ids resolve through each claim's current revision, so eligibility
+ * alone cannot see a rewrite-in-place: a superseded revision's cached bytes
+ * must not regain visibility because a later revision of the same memory id
+ * became eligible. Missing or misaligned hash records fail closed — the
+ * rendered content cannot be proven, so the block recomputes.
+ */
+function recordedMemoryBlockStillBacked(
+    db: Database,
+    rawIds: string | null | undefined,
+    rawHashes: string | null | undefined,
+): boolean {
+    const ids = parseRecordedMemoryBlockIds(rawIds);
+    if (ids === null) return false;
+    if (ids.length === 0) return true;
+    const hashes = parseRecordedMemoryBlockHashes(rawHashes);
+    if (hashes === null || hashes.length !== ids.length) return false;
+    const rows = readMemoryPolicyRows(db, ids);
+    if (!ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible)) {
+        return false;
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    const hashRows = db
+        .prepare(
+            // Interpolation is a compile-time placeholder list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT id, normalized_hash AS hash FROM memories WHERE id IN (${placeholders})`,
+        )
+        .all(...ids) as Array<{ id: number; hash: string }>;
+    const currentHashById = new Map(hashRows.map((row) => [row.id, row.hash]));
+    return ids.every((id, index) => currentHashById.get(id) === hashes[index]);
+}
+
 /**
  * A cached memory block replays only while every rendered id is still
- * automatic-eligible: policy transitions must not replay hidden content from
- * the process-local injection cache or the session_meta snapshot. Reads the
- * ids the render recorded in `session_meta.memory_block_ids`.
+ * automatic-eligible and content-identical: policy transitions and in-place
+ * rewrites must not replay stale content from the process-local injection
+ * cache or the session_meta snapshot. Reads the ids and hashes the render
+ * recorded in `session_meta`.
  */
 function sessionMemoryBlockStillEligible(db: Database, sessionId: string): boolean {
     if (!hasClaimEffectivePolicy(db)) return true;
     const row = db
-        .prepare("SELECT memory_block_ids FROM session_meta WHERE session_id = ?")
-        .get(sessionId) as { memory_block_ids: string | null } | null;
-    const ids = parseRecordedMemoryBlockIds(row?.memory_block_ids);
-    if (ids === null) return false;
-    if (ids.length === 0) return true;
-    const rows = readMemoryPolicyRows(db, ids);
-    return ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible);
+        .prepare(
+            "SELECT memory_block_ids, memory_block_hashes FROM session_meta WHERE session_id = ?",
+        )
+        .get(sessionId) as {
+        memory_block_ids: string | null;
+        memory_block_hashes: string | null;
+    } | null;
+    return recordedMemoryBlockStillBacked(db, row?.memory_block_ids, row?.memory_block_hashes);
 }
 
 // ── Degraded-mode re-anchor (#263/#264) ─────────────────────────
@@ -475,27 +525,27 @@ export function prepareCompartmentInjection(
         // hot path (every transform) for a table we fully control.
         const cachedMemory = db
             .prepare(
-                "SELECT memory_block_cache, memory_block_count, memory_block_ids FROM session_meta WHERE session_id = ?",
+                "SELECT memory_block_cache, memory_block_count, memory_block_ids, memory_block_hashes FROM session_meta WHERE session_id = ?",
             )
             .get(sessionId) as {
             memory_block_cache: string;
             memory_block_count: number;
             memory_block_ids: string | null;
+            memory_block_hashes: string | null;
         } | null;
 
         // A cached block replays only while every rendered id is still
-        // automatic-eligible: a policy transition (quarantine, contradiction,
-        // rejection, supersession) must not keep serving hidden content
-        // through this legacy render path until a historian pass happens to
-        // clear the cache.
+        // automatic-eligible AND content-identical: a policy transition
+        // (quarantine, contradiction, rejection, supersession) or an
+        // in-place rewrite must not keep serving stale content through this
+        // legacy render path until a historian pass happens to clear the
+        // cache.
         const cachedBlockStillEligible = (): boolean => {
             if (!hasClaimEffectivePolicy(db)) return true;
-            const cachedIds = parseRecordedMemoryBlockIds(cachedMemory?.memory_block_ids);
-            if (cachedIds === null) return false;
-            if (cachedIds.length === 0) return true;
-            const rows = readMemoryPolicyRows(db, cachedIds);
-            return cachedIds.every(
-                (id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible,
+            return recordedMemoryBlockStillBacked(
+                db,
+                cachedMemory?.memory_block_ids,
+                cachedMemory?.memory_block_hashes,
             );
         };
 
@@ -522,7 +572,10 @@ export function prepareCompartmentInjection(
             // Capture ids of memories actually rendered in the block. Stored in
             // session_meta.memory_block_ids as JSON so ctx_search can hard-filter
             // them out of search results (the agent already sees them in <session-history>).
+            // The aligned hashes bind the cached bytes to the exact content
+            // rendered, so the replay guards can reject a rewrite-in-place.
             const renderedIds = memories.map((m) => m.id);
+            const renderedHashes = memories.map((m) => m.normalizedHash);
 
             // Snapshot so subsequent turns reuse the same block without cache bust.
             // Swallow SQLITE_BUSY: the cache is a pure optimization (the block itself
@@ -533,8 +586,14 @@ export function prepareCompartmentInjection(
             // Issue: https://github.com/cortexkit/magic-context/issues/23
             try {
                 db.prepare(
-                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
-                ).run(memoryBlock ?? "", memoryCount, JSON.stringify(renderedIds), sessionId);
+                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ? WHERE session_id = ?",
+                ).run(
+                    memoryBlock ?? "",
+                    memoryCount,
+                    JSON.stringify(renderedIds),
+                    JSON.stringify(renderedHashes),
+                    sessionId,
+                );
             } catch (error) {
                 const code = (error as { code?: string } | null)?.code;
                 if (code === "SQLITE_BUSY") {
