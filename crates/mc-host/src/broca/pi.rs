@@ -337,13 +337,18 @@ fn pi_terminal_probe(lines: &[u8]) -> bool {
         .any(pi_line_is_terminal_message_end)
 }
 
-/// One-line check for a decisive terminal — an assistant `message_end`
-/// (stopReason `stop`, `length`, `error`, or `aborted`) or the `agent_end`
-/// compatibility shape carrying a final assistant message — the probe-side
-/// mirror of the terminal decision in [`parse_pi_transcript`], including
-/// the rule that a completion still requesting tools is not this run's
-/// terminal. Noise and malformed lines are simply not terminals here; the
-/// full parse renders that verdict.
+/// One-line check for a decisive terminal: only the `agent_end` shape
+/// carrying a final assistant message (stopReason `stop`, `length`,
+/// `error`, or `aborted`) counts — the probe-side mirror of the
+/// authoritative decision in [`parse_pi_transcript`], including the rule
+/// that a completion still requesting tools is not this run's terminal. A
+/// provisional `message_end` is deliberately NOT decisive here: Pi can
+/// supersede it with an automatic retry or finalization
+/// (`subagent-runner.ts` waits for `agent_end`), and arming the short
+/// drain kill on it could destroy the authoritative outcome mid-retry. A
+/// runtime that never emits `agent_end` simply runs to its timeout —
+/// bounded, never wrong. Noise and malformed lines are simply not
+/// terminals here; the full parse renders that verdict.
 fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(line) else {
         return false;
@@ -351,18 +356,17 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
     };
-    let message = match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("message_end") => value.get("message"),
-        Some("agent_end") => value
-            .get("messages")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|messages| {
-                messages.iter().rev().find(|message| {
-                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
-                })
-            }),
-        _ => None,
-    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("agent_end") {
+        return false;
+    }
+    let message = value
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|messages| {
+            messages.iter().rev().find(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            })
+        });
     let Some(message) = message else {
         return false;
     };

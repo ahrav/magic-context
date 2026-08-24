@@ -3056,6 +3056,9 @@ pub struct McHandler {
     /// Module-minted zero-tool dreamer sessions. Prefixes are diagnostics only;
     /// only registered ids may bypass transform after route validation.
     active_dreamer_runs: Arc<Mutex<HashSet<String>>>,
+    /// In-flight `(ledger_session, command_id)` dream-task commands; see
+    /// [`DreamCommandGuard`].
+    inflight_dream_commands: Arc<Mutex<HashSet<(String, String)>>>,
     /// Back-compat facade callers may omit the host tool-call id. Warn once per resolved session
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
@@ -3164,6 +3167,26 @@ impl Drop for DreamerRunGuard {
             .lock()
             .expect("dreamer registry mutex")
             .remove(&self.session_id);
+    }
+}
+
+/// In-flight `(ledger_session, command_id)` marker: exactly one
+/// `dreamer.run_task` executes per durable command identity. A concurrent
+/// duplicate — byte-identical or not, same first model or not — must not
+/// start its own billable chain or race the ledger's INSERT OR IGNORE
+/// with a different outcome, and serializing here also guarantees each
+/// derived child session has at most one live run registration.
+struct DreamCommandGuard {
+    registry: Arc<Mutex<HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for DreamCommandGuard {
+    fn drop(&mut self) {
+        self.registry
+            .lock()
+            .expect("dream command registry mutex")
+            .remove(&self.key);
     }
 }
 
@@ -3539,6 +3562,7 @@ impl McHandler {
             transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
+            inflight_dream_commands: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
         }
     }
@@ -3795,6 +3819,7 @@ impl McHandler {
             transform_page_discard_logs: Mutex::new(Vec::new()),
             state_imports: Mutex::new(StateImportCoordinator::default()),
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
+            inflight_dream_commands: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
         }
     }
@@ -9764,6 +9789,33 @@ impl McHandler {
                 }
             }
         }
+
+        // Exactly one execution per (ledger_session, command_id): a
+        // concurrent duplicate with different prompt bytes or a different
+        // first model would derive its own child session, bypass Broca's
+        // byte-level idempotency, start a second billable chain, and race
+        // the ledger's INSERT OR IGNORE with a different outcome. The
+        // loser returns without any ledger write; its retry replays the
+        // winner's recorded response.
+        let command_key = (ledger_session.clone(), command_id.to_string());
+        {
+            let mut inflight = self
+                .inflight_dream_commands
+                .lock()
+                .expect("dream command registry mutex");
+            if !inflight.insert(command_key.clone()) {
+                return HandlerOutcome::Error {
+                    code: "dreamer_run_failed".to_string(),
+                    message:
+                        "this command is already executing; retry replays its recorded outcome"
+                            .to_string(),
+                };
+            }
+        }
+        let _command_guard = DreamCommandGuard {
+            registry: Arc::clone(&self.inflight_dream_commands),
+            key: command_key,
+        };
 
         let mut attempts = 0usize;
         let mut last_error = String::new();

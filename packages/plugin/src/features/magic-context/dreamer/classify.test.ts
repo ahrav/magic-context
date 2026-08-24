@@ -464,16 +464,16 @@ describe("module-backed classification", () => {
                     ? manifestForItems(call)
                     : acceptAllRows(call);
             });
-            args.deadline = Date.now() + 30_000;
+            args.deadline = Date.now() + 60_000;
 
             await runClassify(args);
 
             const taskCall = calls.find((call) => call.method === "dreamer.run_task");
             expect(taskCall?.timeoutMs).toBeGreaterThan(0);
-            expect(taskCall?.timeoutMs).toBeLessThanOrEqual(30_000);
+            expect(taskCall?.timeoutMs).toBeLessThanOrEqual(60_000);
             const payload = (taskCall?.body as { payload: { timeout_ms: number } }).payload;
             expect(payload.timeout_ms).toBeGreaterThan(0);
-            expect(payload.timeout_ms).toBeLessThanOrEqual(30_000);
+            expect(payload.timeout_ms).toBeLessThanOrEqual(60_000);
         } finally {
             closeQuietly(db);
         }

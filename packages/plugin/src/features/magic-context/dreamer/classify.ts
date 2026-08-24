@@ -76,9 +76,11 @@ const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
 // first and its cancel aborts the handler between the producer run and
 // `purge_session`, leaving the attempt's Broca subprocess (and its
 // memory-pool prompt) alive until the run timeout. The margin covers the
-// module's timeout path: await cutoff, redrain, and session purge
-// (subprocess SIGTERM plus its 5s termination grace).
-const CLASSIFY_MODULE_PURGE_MARGIN_MS = 15_000;
+// module's timeout path AFTER the payload deadline: the `session.delete`
+// unary request (30s producer request timeout), subprocess teardown
+// (SIGTERM plus its 5s termination grace), and dispatch slack — a stalled
+// delete response must not let the transport cancel mid-purge.
+const CLASSIFY_MODULE_PURGE_MARGIN_MS = 40_000;
 
 export interface ClassifyModuleCallArgs {
     sessionId: string;

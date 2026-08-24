@@ -772,57 +772,71 @@ pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
 /// `retryAfter` field, with an optional unit — so an unrelated number later
 /// in the message (a request id, a status reference) is never persisted as
 /// a durable backoff.
+///
+/// Single pass, O(1) extra memory beyond the lowercased copy: a provider
+/// error can be MiBs, and materializing per-token metadata would multiply
+/// this scan's declared one-transcript budget by the token count.
 pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
     let lower = text.to_ascii_lowercase();
-    let tokens: Vec<&str> = lower
+    let mut saw_verb = false;
+    let mut saw_delay_keyword = false;
+    let mut pending: Option<u64> = None;
+    let tokens = lower
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .collect();
-    for (index, token) in tokens.iter().enumerate() {
-        // Closed verb vocabulary: prefix matching would also catch
-        // "retrieval after 300 items".
-        if !matches!(
-            *token,
-            "retry" | "retries" | "retried" | "retrying" | "retryafter"
-        ) {
-            continue;
+        .filter(|token| !token.is_empty());
+    for token in tokens {
+        // A bare number already rode an explicit delay form; this token is
+        // either its unit or unrelated prose (which means seconds).
+        if let Some(value) = pending {
+            return Some(apply_delay_unit(value, token));
         }
-        // "retryafter" — a lowered `retryAfter` field echo — carries the
-        // delay keyword glued to the verb.
-        let (number_index, glued) = if *token == "retryafter" {
-            (index + 1, true)
-        } else {
-            (index + 2, false)
-        };
-        if !glued && !matches!(tokens.get(index + 1).copied(), Some("after") | Some("in")) {
-            continue;
+        if saw_delay_keyword {
+            saw_delay_keyword = false;
+            if let Some((value, unit)) = split_delay_number(token) {
+                if unit.is_empty() {
+                    pending = Some(value);
+                    continue;
+                }
+                return Some(apply_delay_unit(value, unit));
+            }
+            // Not a number: fall through and re-evaluate this token below.
         }
-        let Some(number) = tokens.get(number_index) else {
-            continue;
-        };
-        if let Some(secs) = parse_delay_token(number, tokens.get(number_index + 1).copied()) {
-            return Some(secs);
+        if saw_verb {
+            saw_verb = false;
+            if matches!(token, "after" | "in") {
+                saw_delay_keyword = true;
+                continue;
+            }
+        }
+        match token {
+            // Closed verb vocabulary: prefix matching would also catch
+            // "retrieval after 300 items".
+            "retry" | "retries" | "retried" | "retrying" => saw_verb = true,
+            // A lowered `retryAfter` field echo carries the delay keyword
+            // glued to the verb.
+            "retryafter" => saw_delay_keyword = true,
+            _ => {}
         }
     }
-    None
+    pending.map(|value| value.min(MAX_RETRY_AFTER_SECS))
 }
 
-/// Parses one `<digits>[unit]` token (unit optionally in the next token).
-/// An over-long digit run overflows `u64::from_str`; treat it as the cap
-/// rather than dropping the (real) retry signal entirely.
-fn parse_delay_token(token: &str, next: Option<&str>) -> Option<u64> {
+/// Splits one token into its leading digit run and the remaining glued
+/// unit. An over-long digit run overflows `u64::from_str`; treat it as the
+/// cap rather than dropping the (real) retry signal entirely.
+fn split_delay_number(token: &str) -> Option<(u64, &str)> {
     let digits_end = token
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(token.len());
     if digits_end == 0 {
         return None;
     }
-    let value: u64 = token[..digits_end].parse().unwrap_or(MAX_RETRY_AFTER_SECS);
-    let unit = if digits_end < token.len() {
-        &token[digits_end..]
-    } else {
-        next.unwrap_or("")
-    };
+    let value = token[..digits_end].parse().unwrap_or(MAX_RETRY_AFTER_SECS);
+    Some((value, &token[digits_end..]))
+}
+
+/// Converts a delay to clamped seconds given its (possibly empty) unit.
+fn apply_delay_unit(value: u64, unit: &str) -> u64 {
     let secs = match unit {
         // A bare number after an explicit delay keyword means seconds.
         "" | "s" | "sec" | "secs" | "second" | "seconds" => value,
@@ -833,7 +847,7 @@ fn parse_delay_token(token: &str, next: Option<&str>) -> Option<u64> {
         // an explicit delay form, so it counts as seconds.
         _ => value,
     };
-    Some(secs.min(MAX_RETRY_AFTER_SECS))
+    secs.min(MAX_RETRY_AFTER_SECS)
 }
 
 /// Admits a provider-supplied error code onto the wire only in short
