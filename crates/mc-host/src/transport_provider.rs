@@ -171,12 +171,14 @@ impl TransportProviders {
                 .spawn(move || {
                     while let Ok((provider, ctx, reply)) = job_rx.recv() {
                         // A panicking gate is one failed preparation, not a
-                        // dead worker: the payload is discarded (the same
-                        // containment the composite handler boundary uses)
-                        // and that setup fails closed.
+                        // dead worker. `redact_sync` keeps the panic hook
+                        // from printing a payload that may carry provider
+                        // data; `catch_unwind` (the same containment the
+                        // composite handler boundary uses) keeps the thread
+                        // alive, and that setup fails closed.
                         let outcome =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                provider.prepare(&ctx)
+                                crate::panic_boundary::redact_sync(|| provider.prepare(&ctx))
                             }))
                             .unwrap_or(Err(ProviderFailure::Unavailable));
                         let _ = reply.send(outcome);

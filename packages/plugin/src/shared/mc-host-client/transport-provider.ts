@@ -11,12 +11,15 @@
 import { SubcCallError } from "./errors";
 import type {
     ByteBudget,
+    FrameChannelCloseReason,
     FrameChannelHandlers,
     FrameSendTicket,
     SetupFrameChannel,
 } from "./frame-channel";
 import {
     checkOpaqueSerialized,
+    encodeNegotiateRequest,
+    NEGOTIATION_VERSION,
     type OpaqueObject,
     TRANSPORT_TCP,
     type TransportOffer,
@@ -112,6 +115,12 @@ export class ClientTransportRegistry {
                   },
         );
         offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
+        // Static configuration errors (invalid or duplicate identities, a
+        // provider named "tcp", too many offers) surface here, before any
+        // dial: the encoder's closed-vocabulary rules run against the
+        // snapshot so a bad registry cannot consume a connection setup
+        // budget or retire a healthy authenticated generation.
+        encodeNegotiateRequest({ negotiationVersion: NEGOTIATION_VERSION, offers });
         this.offerSnapshot = offers;
     }
 
@@ -127,6 +136,25 @@ export class ClientTransportRegistry {
         )?.provider;
     }
 }
+
+/**
+ * The closed channel close-reason vocabulary. A provider channel's runtime
+ * `reason` outside this set is provider-controlled text and is replaced:
+ * it would otherwise become `RetirementInfo.reason`, pending-request error
+ * messages, and the `retired` diagnostics event.
+ */
+const CHANNEL_CLOSE_REASONS: ReadonlySet<FrameChannelCloseReason> = new Set([
+    "socket_error",
+    "eof",
+    "truncated_frame",
+    "socket_closed",
+    "socket_timeout",
+    "protocol_violation",
+    "role_violation",
+    "frame_deadline",
+    "write_failed",
+    "control_capacity_exhausted",
+]);
 
 /**
  * R14 provider boundary: replace a provider-owned failure with a bounded
@@ -194,7 +222,13 @@ export function sanitizedCandidateFactory(
         const handlers: FrameChannelHandlers = {
             onFrame: args.handlers.onFrame,
             onClosed: (reason, _error) =>
-                args.handlers.onClosed(reason, sanitizedProviderError(transport, "channel")),
+                args.handlers.onClosed(
+                    // A runtime reason outside the typed vocabulary is
+                    // provider-controlled text; the bounded replacement
+                    // keeps it out of retirement info and diagnostics.
+                    CHANNEL_CLOSE_REASONS.has(reason) ? reason : "protocol_violation",
+                    sanitizedProviderError(transport, "channel"),
+                ),
             onDiagnostic: args.handlers.onDiagnostic,
         };
         let channel: SetupFrameChannel;

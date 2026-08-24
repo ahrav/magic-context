@@ -724,6 +724,12 @@ export class SubcClient {
         // The authenticated bootstrap becomes the finalized generation with
         // its negotiation correlation consumed; the selection stays sticky
         // until retirement (KTD5).
+        // KTD4 stale-success: the frame pump can retire the generation in
+        // the same batch that resolved the negotiation (a coalesced Goodbye
+        // or EOF). A dead generation must not be published or reported
+        // connected; the returned stale conn re-enters recovery in
+        // ensureConnection like the pre-negotiation stale-success path.
+        if (generation.isRetired()) return conn;
         conn.fallbackReason = selection.reason;
         this.active = conn;
         this.liveRoutes.clear();
