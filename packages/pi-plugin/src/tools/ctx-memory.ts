@@ -62,6 +62,7 @@ import {
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
+	bindMemoriesToCurrentRevision,
 	decideMemoryPolicy,
 	exactMemoryContentDigests,
 	filterMemoriesByPolicy,
@@ -812,9 +813,15 @@ export function createCtxMemoryTool(
 						filtered2,
 						"explicit_search",
 					);
+					// Bind loaded bytes to the revision the policy evaluated:
+					// a rewrite between load and policy read must not render
+					// superseded content under the successor's eligibility.
 					return ok(
 						formatMemoryList(
-							policyFiltered.memories.slice(0, limit),
+							bindMemoriesToCurrentRevision(
+								deps.db,
+								policyFiltered.memories,
+							).slice(0, limit),
 							policyFiltered.labels,
 						),
 					);
@@ -845,8 +852,13 @@ export function createCtxMemoryTool(
 						fetched.filter((memory) => memoryVisibleToTool(memory)),
 						"explicit_search",
 					);
+					// Bind loaded bytes to the revision the policy evaluated:
+					// a held-open writer's rewrite from a hidden revision to
+					// an eligible successor must not render the hidden bytes.
 					const memoriesById = new Map<number, Memory>(
-						policyFiltered.memories.map((memory) => [memory.id, memory]),
+						bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories).map(
+							(memory) => [memory.id, memory],
+						),
 					);
 					return ok(
 						formatGetOutput({

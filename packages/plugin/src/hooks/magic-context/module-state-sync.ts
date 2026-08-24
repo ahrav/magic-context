@@ -2106,27 +2106,34 @@ export async function syncModuleState(args: {
             const batches = payload.wireBatches ?? [payload];
             for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
                 const batch = batches[batchIndex];
-                if (
-                    batches.length > 1 &&
-                    batchIndex === batches.length - 1 &&
-                    args.pass.projectPath
-                ) {
-                    // Paged forced syncs retain frozen snapshot rows across
-                    // the awaited page sends above, and the completing batch
-                    // is what makes the module apply them. An epoch bump
-                    // while pages were in flight means a policy or content
-                    // transition landed after the snapshot's policy check —
-                    // abort and rebuild from current state rather than apply
-                    // the stale snapshot to the native store.
-                    const epochAtBuild = (batch.params as { project_memory_epoch?: number })
-                        .project_memory_epoch;
+                if (batchIndex === batches.length - 1 && args.pass.projectPath) {
+                    // The snapshot's policy check ran at payload construction,
+                    // and awaited work (delta probes, earlier page sends) runs
+                    // between then and this completing send. An epoch bump in
+                    // that window means a policy or content transition landed
+                    // after the check — abort and rebuild from current state
+                    // rather than apply the stale snapshot to the native
+                    // store. The workspace fingerprint hashes EVERY member's
+                    // epoch, so a foreign member's transition (which does not
+                    // move the root project epoch) also forces the rebuild.
+                    const params = batch.params as {
+                        project_memory_epoch?: number;
+                        acked_watermarks?: { workspace_fingerprint?: string | null };
+                    };
+                    const epochAtBuild = params.project_memory_epoch;
                     const epochNow =
                         getProjectState(args.pass.db, args.pass.projectPath)?.projectMemoryEpoch ??
                         0;
-                    if (epochAtBuild !== undefined && epochNow !== epochAtBuild) {
+                    const epochMoved = epochAtBuild !== undefined && epochNow !== epochAtBuild;
+                    const fingerprintAtBuild = params.acked_watermarks?.workspace_fingerprint;
+                    const fingerprintMoved =
+                        fingerprintAtBuild !== undefined &&
+                        (resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath)
+                            .workspace?.fingerprint ?? null) !== (fingerprintAtBuild ?? null);
+                    if (epochMoved || fingerprintMoved) {
                         sessionLog(
                             args.pass.sessionId,
-                            `module state sync aborted before completing batch: project memory epoch moved ${epochAtBuild} -> ${epochNow} during paged send; rebuilding`,
+                            `module state sync aborted before completing batch: ${epochMoved ? `project memory epoch moved ${epochAtBuild} -> ${epochNow}` : "workspace fingerprint moved"} during send; rebuilding`,
                         );
                         force = true;
                         continue syncLoop;

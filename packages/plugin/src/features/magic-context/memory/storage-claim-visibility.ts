@@ -314,6 +314,24 @@ export function autoSearchHintFragmentsStillEligible(
     return fragments.every((fragment) => currentHashById.get(fragment.id) === fragment.hash);
 }
 
+/**
+ * Drop rows whose loaded bytes no longer match the current revision. Policy
+ * decisions key on a memory's CURRENT revision; a rewrite committed between
+ * a load and the policy read would otherwise let the new revision's
+ * eligibility (or sanitized label) lend itself to the superseded bytes the
+ * caller already holds — including revealing a hidden revision's content
+ * after a rewrite to an eligible successor. Read-side counterpart of the
+ * write-side prompt-digest bindings.
+ */
+export function bindMemoriesToCurrentRevision(db: Database, memories: readonly Memory[]): Memory[] {
+    if (!hasClaimEffectivePolicy(db)) return [...memories];
+    const digests = exactMemoryContentDigests(
+        db,
+        memories.map((memory) => memory.id),
+    );
+    return memories.filter((memory) => digests.get(memory.id) === sha256Utf8Hex(memory.content));
+}
+
 /** Exact SHA-256 content digests for a bounded id set (replay-gate oracle). */
 export function exactMemoryContentDigests(
     db: Database,

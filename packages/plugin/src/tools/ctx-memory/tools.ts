@@ -26,6 +26,7 @@ import {
 import { invalidateMemory } from "../../features/magic-context/memory/embedding-cache";
 import { computeNormalizedHash } from "../../features/magic-context/memory/normalize-hash";
 import {
+    bindMemoriesToCurrentRevision,
     decideMemoryPolicy,
     exactMemoryContentDigests,
     filterMemoriesByPolicy,
@@ -994,7 +995,13 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         filterByCategory(getMemoriesByProject(deps.db, projectPath), category),
                         "explicit_search",
                     );
-                    const memories = policyFiltered.memories.slice(0, limit);
+                    // Bind loaded bytes to the revision the policy evaluated:
+                    // a rewrite between load and policy read must not render
+                    // superseded content under the successor's eligibility.
+                    const memories = bindMemoriesToCurrentRevision(
+                        deps.db,
+                        policyFiltered.memories,
+                    ).slice(0, limit);
                     return formatMemoryList(memories, policyFiltered.labels);
                 }
 
@@ -1015,8 +1022,13 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         fetched.filter((memory) => memoryVisibleToTool(memory)),
                         "explicit_search",
                     );
+                    // Bind loaded bytes to the revision the policy evaluated:
+                    // a held-open writer's rewrite from a hidden revision to
+                    // an eligible successor must not render the hidden bytes.
                     const memoriesById = new Map<number, Memory>(
-                        policyFiltered.memories.map((memory) => [memory.id, memory]),
+                        bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories).map(
+                            (memory) => [memory.id, memory],
+                        ),
                     );
                     return formatGetOutput({
                         requestedIds: uniqueIds,
