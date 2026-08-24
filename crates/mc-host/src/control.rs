@@ -94,16 +94,51 @@ fn invalid(message: &str) -> ControlAction {
     }
 }
 
+/// Tolerantly classifies a body that failed strict validation. A generic
+/// rejection commits the generation to TCP and leaves it usable, but a
+/// malformed negotiation-family body must reach the authoritative-terminal-
+/// and-close path (§7.7.1), so classification cannot be lost to the strict
+/// parse. Duplicate keys resolve last-wins, matching lenient JSON readers.
+fn is_negotiation_family(body: &[u8]) -> bool {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(fields)) => {
+            fields.get("op").and_then(serde_json::Value::as_str) == Some(OP_TRANSPORT_NEGOTIATE)
+        }
+        _ => false,
+    }
+}
+
+/// The strict negotiation decode for a body already known to be invalid:
+/// yields the `NegotiationError` that routes it to retirement.
+fn malformed_negotiation(body: &[u8]) -> ControlAction {
+    ControlAction::TransportNegotiate(crate::transport_negotiation::decode_negotiate_request(body))
+}
+
 /// Validates and classifies one complete channel-0 `Request` body.
 ///
 /// `binary` is the frame's encoding bit: channel 0 accepts JSON only.
 pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> ControlAction {
     if binary {
+        if is_negotiation_family(body) {
+            // Negotiation-family frames require `binary = 0`; the strict
+            // decoder cannot express that, so the error is built directly.
+            return ControlAction::TransportNegotiate(Err(
+                crate::transport_negotiation::NegotiationError {
+                    code: crate::transport_negotiation::NegotiationErrorCode::MalformedJson,
+                    path: "flags".to_owned(),
+                },
+            ));
+        }
         return invalid("control channel accepts JSON only");
     }
     let root = match strict_json::parse(body) {
         Ok(value) => value,
-        Err(err) => return invalid(err.as_str()),
+        Err(err) => {
+            if is_negotiation_family(body) {
+                return malformed_negotiation(body);
+            }
+            return invalid(err.as_str());
+        }
     };
     let serde_json::Value::Object(fields) = root else {
         return invalid("control request must be a JSON object");
@@ -116,6 +151,9 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
         .saturating_add(1)
         > MAX_CONTROL_DEPTH
     {
+        if fields.get("op").and_then(serde_json::Value::as_str) == Some(OP_TRANSPORT_NEGOTIATE) {
+            return malformed_negotiation(body);
+        }
         return invalid("control request too deeply nested");
     }
 
@@ -681,6 +719,48 @@ mod tests {
     fn duplicate_recognized_field_is_rejected_before_classification() {
         let body = br#"{"op":"route.open","op":"catalog.list","target":{},"identity":{}}"#;
         let action = parse_control(body, false, &two_target_index());
+        assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
+    }
+
+    /// Strict-parse failures inside a negotiation-family body must classify
+    /// as negotiation so they reach the terminal-and-close path (§7.7.1),
+    /// not the generic rejection that commits the generation to TCP.
+    #[test]
+    fn malformed_negotiation_family_bodies_classify_as_negotiation() {
+        // Duplicate key nested inside an offer's opaque parameters.
+        let dup_nested = br#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":1,"a":2}}]}"#;
+        // Duplicate key at the root.
+        let dup_root = br#"{"op":"transport.negotiate","negotiation_version":1,"negotiation_version":1,"offers":[]}"#;
+        for body in [&dup_nested[..], dup_root] {
+            let action = parse_control(body, false, &two_target_index());
+            assert!(
+                matches!(action, ControlAction::TransportNegotiate(Err(_))),
+                "expected TransportNegotiate(Err), got {action:?}"
+            );
+        }
+        // A binary negotiation frame violates the JSON-only encoding rule.
+        let valid = br#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1}]}"#;
+        let action = parse_control(valid, true, &two_target_index());
+        assert!(
+            matches!(action, ControlAction::TransportNegotiate(Err(_))),
+            "expected TransportNegotiate(Err), got {action:?}"
+        );
+        // Deep nesting beyond the control bound stays negotiation-classified.
+        let mut params = String::from("1");
+        for _ in 0..MAX_CONTROL_DEPTH + 2 {
+            params = format!("{{\"k\":{params}}}");
+        }
+        let deep = format!(
+            "{{\"op\":\"transport.negotiate\",\"negotiation_version\":1,\"offers\":[{{\"transport\":\"tcp\",\"capability_version\":1,\"parameters\":{params}}}]}}"
+        );
+        let action = parse_control(deep.as_bytes(), false, &two_target_index());
+        assert!(
+            matches!(action, ControlAction::TransportNegotiate(Err(_))),
+            "expected TransportNegotiate(Err), got {action:?}"
+        );
+        // Non-negotiation bodies with the same defects keep the generic path.
+        let other = br#"{"op":"catalog.list","module_id":"a","module_id":"b"}"#;
+        let action = parse_control(other, false, &two_target_index());
         assert_eq!(reject_code(action), CODE_INVALID_CONTROL_REQUEST);
     }
 

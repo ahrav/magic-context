@@ -723,8 +723,11 @@ enum ControlFlow {
 enum TransportState {
     /// Authenticated bootstrap; nothing selected or committed yet.
     BootstrapTcp,
-    /// The generation is committed to TCP. `late_used` records the one
-    /// allowed late negotiation (`connection_in_use`).
+    /// The generation is committed to TCP. `late_used` is false only while
+    /// the one allowed late negotiation (a first negotiation arriving after
+    /// a non-negotiation request implicitly committed TCP) remains
+    /// available; a negotiation that itself selects TCP consumes the
+    /// allowance, so any further negotiation is a protocol failure.
     TcpCommitted { late_used: bool },
     /// A candidate is being activated; the bootstrap accepts no further
     /// requests.
@@ -834,7 +837,9 @@ async fn handle_negotiate<H: McHostHandler>(
         return respond_tcp(shared, gen, corr, Some(FallbackReason::ConnectionInUse)).await;
     }
     if request.negotiation_version != NEGOTIATION_VERSION {
-        setup.state = TransportState::TcpCommitted { late_used: false };
+        // Negotiation itself selected TCP, so the late-negotiation
+        // allowance (implicit-commit-first only, §7.7.5) is consumed.
+        setup.state = TransportState::TcpCommitted { late_used: true };
         return respond_tcp(
             shared,
             gen,
@@ -874,7 +879,9 @@ async fn handle_negotiate<H: McHostHandler>(
     } else {
         None
     };
-    setup.state = TransportState::TcpCommitted { late_used: false };
+    // Negotiation itself selected TCP: the late-negotiation allowance is
+    // consumed, so a repeated negotiation is a protocol failure (§7.7.5).
+    setup.state = TransportState::TcpCommitted { late_used: true };
     respond_tcp(shared, gen, corr, reason).await
 }
 
@@ -887,19 +894,27 @@ async fn respond_tcp<H: McHostHandler>(
     let body =
         encode_negotiate_response(&NegotiateResponse::Tcp { reason }, TCP_CAPABILITY_VERSION)
             .expect("a tcp selection always encodes");
-    if emit_frame(
-        &shared.egress_budget,
-        gen,
-        FrameType::Response,
-        response_flags(false, true),
-        FrameId::control(corr),
-        body,
-    )
-    .await
-    .is_err()
-    {
-        gen.token.cancel();
-    }
+    // Emission can wait on the shared egress budget; queue it off the read
+    // loop so a contended budget cannot stall Pong reads into a liveness
+    // false-kill. Bounded without a pending permit: the setup state machine
+    // admits at most two TCP negotiation responses per generation.
+    let shared_task = Arc::clone(shared);
+    let gen_task = Arc::clone(gen);
+    shared.spawn_tracked(gen.read_tasks.track_future(async move {
+        if emit_frame(
+            &shared_task.egress_budget,
+            &gen_task,
+            FrameType::Response,
+            response_flags(false, true),
+            FrameId::control(corr),
+            body,
+        )
+        .await
+        .is_err()
+        {
+            gen_task.token.cancel();
+        }
+    }));
     ControlFlow::Continue
 }
 
@@ -1093,14 +1108,15 @@ async fn expect_candidate_request(
         Ok(InboundEvent::Frame(frame))
             if frame.header.ty == FrameType::Request
                 && frame.header.channel == 0
+                && frame.header.epoch == 0
                 && frame.header.corr == corr
                 && !frame.header.flags.is_binary() =>
         {
             Ok(frame)
         }
-        // Anything else — a wrong correlation, an application frame before
-        // commit, a rejected oversize declaration, or channel loss — fails
-        // the whole setup (§7.7.4).
+        // Anything else — a wrong correlation, a nonzero epoch, an
+        // application frame before commit, a rejected oversize declaration,
+        // or channel loss — fails the whole setup (§7.7.4).
         _ => Err(()),
     }
 }

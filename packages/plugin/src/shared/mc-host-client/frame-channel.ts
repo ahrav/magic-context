@@ -22,9 +22,10 @@ import type { Deadline } from "./deadline";
 import { type EnvelopeHeader, FrameType, isLegalHostToConsumerType } from "./protocol";
 
 /**
- * Reasons a channel can close itself. A strict subset of the generation's
- * `RetirementReason` values, so a channel failure retires the generation
- * under the exact reason string the pre-extraction engine used.
+ * Reasons a channel can close itself. Every value except `truncated_frame`
+ * is also a generation `RetirementReason`, so a channel failure retires the
+ * generation under the same reason string; the generation maps
+ * `truncated_frame` to `eof` at the boundary.
  */
 export type FrameChannelCloseReason =
     | "socket_error"

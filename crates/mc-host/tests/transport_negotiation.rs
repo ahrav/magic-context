@@ -922,6 +922,56 @@ async fn late_negotiation_reports_connection_in_use_once_then_retires() {
 }
 
 #[tokio::test]
+async fn repeated_negotiation_after_negotiated_tcp_selection_retires() {
+    // A negotiation that itself selects TCP consumes the late-negotiation
+    // allowance: the allowance exists only for a first negotiation arriving
+    // after an implicit TCP commit (§7.7.5).
+    let host = TestHost::start().await;
+    let mut client = host.client().await;
+
+    let frame = control_response(&mut client, &negotiate_body(tcp_only_offers())).await;
+    assert_eq!(frame.ty, TY_RESPONSE);
+    assert_eq!(frame.json()["selected"]["transport"], "tcp");
+
+    let _ = client
+        .control(&negotiate_body(tcp_only_offers()))
+        .await
+        .expect("send repeated negotiation");
+    assert!(
+        client.closed_within(HOST_BUDGET).await,
+        "negotiation after a negotiated TCP selection is a protocol failure"
+    );
+
+    host.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn duplicate_key_negotiation_settles_with_its_terminal_and_retires() {
+    // Strict-parse failures (duplicate keys at any depth) inside a
+    // negotiation-family body take the authoritative-terminal-and-close
+    // path, never the generic rejection that would commit TCP and leave the
+    // generation usable (§7.7.1).
+    let host = TestHost::start().await;
+    let mut client = host.client().await;
+
+    let dup = r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1,"parameters":{"a":1,"a":2}}]}"#;
+    let corr = client.next_corr();
+    client
+        .send_frame(TY_REQUEST, FLAGS_INTERACTIVE, 0, 0, corr, dup.as_bytes())
+        .await
+        .expect("send duplicate-key negotiation");
+    let frame = client.frame_within(HOST_BUDGET).await.expect("terminal");
+    assert_eq!(frame.corr, corr);
+    assert_eq!(frame.error_code(), "invalid_control_request");
+    assert!(
+        client.closed_within(HOST_BUDGET).await,
+        "malformed negotiation retires the generation after its terminal"
+    );
+
+    host.shutdown_gracefully().await;
+}
+
+#[tokio::test]
 async fn malformed_negotiation_settles_with_its_terminal_and_never_reaches_dispatch() {
     let host = TestHost::start().await;
     let mut client = host.client().await;
@@ -1306,6 +1356,24 @@ async fn activation_failures_retire_candidate_and_bootstrap_without_tcp_continua
             )
             .await
             .expect("send at wrong correlation");
+        assert!(candidate.closed_within(HOST_BUDGET).await);
+        assert!(client.closed_within(HOST_BUDGET).await);
+    }
+
+    // Nonzero epoch: candidate control identity is exactly 0/0/corr (§7.7.4).
+    {
+        let (mut client, mut candidate, token) = grant_over(&host, &mut peers).await;
+        candidate
+            .send_frame(
+                TY_REQUEST,
+                FLAGS_INTERACTIVE,
+                0,
+                7,
+                1,
+                &activate_body(&token),
+            )
+            .await
+            .expect("send with nonzero epoch");
         assert!(candidate.closed_within(HOST_BUDGET).await);
         assert!(client.closed_within(HOST_BUDGET).await);
     }

@@ -1747,6 +1747,9 @@ describe("transport negotiation", () => {
         expect(host.frames.map((f) => f.header.corr)).toEqual([1n, 2n]);
         const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
         expect(connectedEvent.transport).toBe("fake.shm");
+        // Promotion retires the bootstrap internally; that handoff must not
+        // surface as a client-level `retired` event next to `connected`.
+        expect(events.some((e) => e.type === "retired")).toBe(false);
 
         expect(await client.catalogList()).toEqual([]);
         expect(host.frames[2]?.header.corr).toBe(3n);
@@ -1850,6 +1853,31 @@ describe("transport negotiation", () => {
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
         await delay(50);
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isNegotiate).length).toBe(1);
+    });
+
+    test("KTD6: a noncanonical unsupported_operation terminal fails closed without TCP fallback", async () => {
+        // Extra fields disqualify the terminal as legacy evidence: only the
+        // byte-exact `{code, message}` Error body may select TCP fallback.
+        const peer = await startPeer({
+            negotiate: (frame, conn) =>
+                void conn.send({
+                    ty: PeerFrameType.Error,
+                    channel: 0,
+                    epoch: 0,
+                    corr: frame.corr,
+                    body: jsonBody({
+                        code: "unsupported_operation",
+                        message: "unknown control operation",
+                        detail: "extra",
+                    }),
+                }),
+        });
+        const { error } = await connectRejected({ peer });
+        expectCallError(error, "terminal", "unsupported_operation");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
         expect(peer.connections.length).toBe(1);
         expect(conn.frames.filter(isNegotiate).length).toBe(1);
     });

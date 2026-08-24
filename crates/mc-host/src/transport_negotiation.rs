@@ -149,12 +149,18 @@ pub struct ActivationToken(String);
 // Constant-time equality: XOR-fold every byte pair instead of early-exiting on the first mismatch. commentlint: allow(JUDGE)
 impl PartialEq for ActivationToken {
     fn eq(&self, other: &Self) -> bool {
-        self.0
-            .as_bytes()
-            .iter()
-            .zip(other.0.as_bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
+        // The length guard keeps `zip` from truncating the comparison: without
+        // it, tokens of unequal length sharing a prefix would compare equal.
+        // Token length is a fixed public constant, so the early exit leaks
+        // nothing.
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .as_bytes()
+                .iter()
+                .zip(other.0.as_bytes())
+                .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                == 0
     }
 }
 

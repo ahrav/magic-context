@@ -31,6 +31,7 @@ import {
 } from "./connection-file";
 import { armExpiryTimer, Deadline, type MonotonicClock } from "./deadline";
 import { isSubcCallError, SocketTimeoutError, SubcCallError, SubcError } from "./errors";
+import { flagsBinary } from "./protocol";
 import {
     belongsToConnection,
     createRouteHandle,
@@ -47,6 +48,7 @@ import {
     encodeActivateRequest,
     encodeNegotiateRequest,
     type FallbackReason,
+    isLegacyUnsupportedOperationBody,
     NEGOTIATION_VERSION,
     type NegotiateResponse,
     NegotiationError,
@@ -709,7 +711,15 @@ export class SubcClient {
             throw new SubcError("client closed", "client_closed");
         }
         if (selection.kind === "grant") {
-            return await this.activateCandidate(conn, selection, stage);
+            try {
+                return await this.activateCandidate(conn, selection, stage);
+            } catch (error) {
+                // KTD3: activation that died on the owner's setup stage is
+                // owner-budget exhaustion, exactly like the earlier stages;
+                // survivors may coalesce one replacement.
+                if (stage.isExpired()) flight.replaceable = true;
+                throw error;
+            }
         }
         // The authenticated bootstrap becomes the finalized generation with
         // its negotiation correlation consumed; the selection stays sticky
@@ -753,9 +763,14 @@ export class SubcClient {
             if (
                 error instanceof SubcCallError &&
                 error.kind === "terminal" &&
-                error.code === "unsupported_operation"
+                error.errorTerminal !== undefined &&
+                !flagsBinary(error.errorTerminal.flags) &&
+                isLegacyUnsupportedOperationBody(error.errorTerminal.body)
             ) {
-                // Legacy host: retain the authenticated TCP generation.
+                // Only the byte-exact legacy `unsupported_operation` Error
+                // terminal proves a legacy host (KTD6). A body with extra
+                // fields, a non-string message, or a binary flag is
+                // malformed negotiation content and fails closed.
                 return {
                     kind: "tcp",
                     selected: {
@@ -769,7 +784,11 @@ export class SubcClient {
         try {
             // Strict decode against the sent offers: an unoffered selection
             // or any version/field violation is malformed, never fallback
-            // evidence (R12).
+            // evidence (R12). Negotiation-family responses must be UTF-8
+            // JSON with `binary = 0`.
+            if (flagsBinary(terminal.flags)) {
+                throw new NegotiationError("malformed_json", "flags");
+            }
             return decodeNegotiateResponse(terminal.body, offers);
         } catch (error) {
             throw wrapNegotiationError(error);
@@ -836,6 +855,12 @@ export class SubcClient {
                 deadline: stage,
                 options: {},
             });
+            // Negotiation-family responses must be UTF-8 JSON with
+            // `binary = 0`; a mismatched flag is malformed, never
+            // promotion evidence.
+            if (flagsBinary(activate.flags)) {
+                throw new NegotiationError("malformed_json", "flags");
+            }
             decodeActivateResponse(activate.body);
             const commit = await this.awaitRequest(candidate, {
                 channel: 0,
@@ -844,6 +869,9 @@ export class SubcClient {
                 deadline: stage,
                 options: {},
             });
+            if (flagsBinary(commit.flags)) {
+                throw new NegotiationError("malformed_json", "flags");
+            }
             decodeCommitResponse(commit.body);
         } catch (error) {
             const failure = wrapNegotiationError(error);
@@ -886,6 +914,14 @@ export class SubcClient {
             for (const cached of this.routes.values()) {
                 cached.handle = null;
             }
+        } else if (this.active !== null) {
+            // A non-active generation retiring while another connection is
+            // published is internal handoff traffic — the bootstrap retiring
+            // under a freshly promoted candidate. Emitting `retired` here
+            // would interleave a spurious client-level event with the
+            // candidate's `connected`. Setup failures still emit: no
+            // connection is published while a setup flight runs.
+            return;
         }
         this.emitDiagnostics({ type: "retired", reason: info.reason });
     }
@@ -957,7 +993,11 @@ export class SubcClient {
         else signal?.addEventListener("abort", onAbort, { once: true });
         try {
             const terminal = await pending.result;
-            if (terminal.kind === "error") throw terminalFromErrorBody(terminal.body);
+            if (terminal.kind === "error") {
+                const failure = terminalFromErrorBody(terminal.body);
+                failure.errorTerminal = { body: terminal.body, flags: terminal.flags };
+                throw failure;
+            }
             return terminal;
         } catch (error) {
             if (cleanup !== null && error instanceof SubcCallError) {

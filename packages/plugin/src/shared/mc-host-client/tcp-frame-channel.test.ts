@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Deadline } from "./deadline";
 import { ByteBudget, type FrameChannelCloseReason, type InboundFrame } from "./frame-channel";
-import { FrameType, MAX_FRAME_BODY_LEN } from "./protocol";
+import { FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "./protocol";
 import { TcpFrameChannel } from "./tcp-frame-channel";
 import { encodePeerFrame, FakePeer, type FakePeerConnection } from "./test-support/fake-peer";
 import {
@@ -186,11 +186,31 @@ describe("TCP adapter specifics", () => {
 
     test("an RST-style reset reports a socket failure exactly once", async () => {
         const h = await createHarness();
-        h.connection.destroy();
+        h.connection.reset();
         await waitUntil(() => h.closes.length >= 1);
         expect(["socket_error", "socket_closed"]).toContain(h.closes[0]?.reason);
         await delay(20);
         expect(h.closes.length).toBe(1);
+    });
+
+    test("send() rejects a header.len that does not match the body length", async () => {
+        const h = await createHarness();
+        const body = Buffer.from("abc");
+        expect(() =>
+            h.channel.send({
+                header: {
+                    len: body.length + 2,
+                    ver: PROTOCOL_VERSION,
+                    ty: FrameType.Request,
+                    flags: 0,
+                    channel: CHANNEL,
+                    epoch: EPOCH,
+                    corr: 1n,
+                },
+                body,
+            }),
+        ).toThrow(RangeError);
+        expect(h.channel.stats().queuedDataFrames).toBe(0);
     });
 
     test("a body stalled mid-transfer hits the frame deadline", async () => {

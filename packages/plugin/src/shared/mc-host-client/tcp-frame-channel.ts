@@ -266,6 +266,13 @@ export class TcpFrameChannel implements FrameChannel {
         // so a rejected frame can never burn a correlation upstream.
         const headerBytes = Buffer.from(encodeHeader(frame.header));
         const body = asBuffer(frame.body);
+        if (frame.header.len !== body.length) {
+            // A mismatched declaration would desynchronize the peer's frame
+            // parser and corrupt every later frame on the connection.
+            throw new RangeError(
+                `frame header.len (${frame.header.len}) does not match body length (${body.length})`,
+            );
+        }
         const totalBytes = HEADER_LEN + body.length;
         if (
             this.dataFramesQueued + 1 > this.maxQueuedFrames ||
@@ -770,6 +777,11 @@ export class TcpFrameChannel implements FrameChannel {
             }
         } finally {
             this.pumping = false;
+            // A write callback that fires before `currentItem` is cleared
+            // sees `writerIdle() === false` and skips the waiters; re-check
+            // now that the writer state is final so `flush()` callers cannot
+            // hang until their deadline. No-op unless the writer is idle.
+            this.settleFlushWaiters();
         }
     }
 

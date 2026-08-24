@@ -17,6 +17,7 @@ import {
     encodeNegotiateResponse,
     FALLBACK_REASONS,
     FIRST_APPLICATION_CORRELATION,
+    isLegacyUnsupportedOperationBody,
     isValidActivationToken,
     MAX_OFFERS,
     MAX_OPAQUE_BYTES,
@@ -318,6 +319,19 @@ describe("opaque value bounds", () => {
         }
     });
 
+    test("an own __proto__ key stays an own data property", () => {
+        // Assigning "__proto__" onto a normal object invokes the prototype
+        // setter: the subtree would vanish from JSON.stringify (bypassing
+        // the size bound) and mutate the object handed to the provider.
+        const request = decodeNegotiateRequest(
+            bytes(requestWithParameters('{"__proto__":{"polluted":true},"x":1}')),
+        );
+        const parameters = request.offers[0]?.parameters as Record<string, unknown>;
+        expect(Object.hasOwn(parameters, "__proto__")).toBe(true);
+        expect(JSON.stringify(parameters)).toBe('{"__proto__":{"polluted":true},"x":1}');
+        expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+    });
+
     test("the same bounds govern a grant descriptor", () => {
         function grantWithDescriptor(descriptor: string): string {
             return `{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"${VECTOR_TOKEN}","descriptor":${descriptor}}`;
@@ -455,6 +469,35 @@ describe("activation and commit", () => {
         expectCode(() => decodeActivateRequest(bytes(COMMIT_REQ)), "wrong_operation");
         const v2Commit = '{"op":"transport.commit","negotiation_version":2}';
         expectCode(() => decodeCommitRequest(bytes(v2Commit)), "invalid_version");
+    });
+});
+
+describe("legacy unsupported_operation terminal", () => {
+    test("only the exact {code, message} string pair qualifies", () => {
+        expect(
+            isLegacyUnsupportedOperationBody(
+                bytes('{"code":"unsupported_operation","message":"unknown control operation"}'),
+            ),
+        ).toBe(true);
+        for (const body of [
+            // Extra field.
+            '{"code":"unsupported_operation","message":"m","detail":"x"}',
+            // Non-string message.
+            '{"code":"unsupported_operation","message":1}',
+            // Missing message.
+            '{"code":"unsupported_operation"}',
+            // Wrong code.
+            '{"code":"internal_error","message":"m"}',
+            // Duplicate key.
+            '{"code":"x","code":"unsupported_operation","message":"m"}',
+            // Non-object roots and malformed JSON.
+            '"unsupported_operation"',
+            "[]",
+            "{",
+            "",
+        ]) {
+            expect(isLegacyUnsupportedOperationBody(bytes(body))).toBe(false);
+        }
     });
 });
 

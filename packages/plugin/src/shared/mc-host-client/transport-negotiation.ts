@@ -441,7 +441,14 @@ function strictToPlain(value: StrictValue): PlainJson {
         case "array":
             return value.items.map(strictToPlain);
         case "object": {
-            const out: { [key: string]: PlainJson } = {};
+            // Null prototype: an own `"__proto__"` key must become an own
+            // data property. Assigning it onto `{}` would invoke the
+            // inherited prototype setter, handing the provider altered
+            // descriptor data and hiding the subtree from the
+            // `JSON.stringify` size bound in `checkOpaque`.
+            const out: { [key: string]: PlainJson } = Object.create(null) as {
+                [key: string]: PlainJson;
+            };
             for (const [key, entry] of value.entries) {
                 out[key] = strictToPlain(entry);
             }
@@ -664,6 +671,31 @@ function decodeTaggedOnly(bytes: Uint8Array, op: string): void {
     checkClosedFields(fields, ["op", "negotiation_version"], "body");
     requireOp(fields, op);
     requireExactVersion(fields);
+}
+
+/**
+ * True only for the exact legacy `unsupported_operation` Error terminal:
+ * strict UTF-8 JSON `{code, message}` with both fields strings, no extras,
+ * and no duplicate keys. Only this terminal proves a legacy host, so only
+ * it may select TCP fallback (KTD6); every other Error body fails closed.
+ */
+export function isLegacyUnsupportedOperationBody(bytes: Uint8Array): boolean {
+    let fields: Map<string, StrictValue>;
+    try {
+        fields = requireRootObject(bytes);
+        checkClosedFields(fields, ["code", "message"], "body");
+    } catch {
+        return false;
+    }
+    const code = fields.get("code");
+    const message = fields.get("message");
+    return (
+        code !== undefined &&
+        code.kind === "string" &&
+        code.value === "unsupported_operation" &&
+        message !== undefined &&
+        message.kind === "string"
+    );
 }
 
 function requireExactVersion(fields: Map<string, StrictValue>): void {

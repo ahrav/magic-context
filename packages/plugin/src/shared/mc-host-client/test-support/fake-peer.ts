@@ -457,6 +457,19 @@ export class FakePeerConnection {
         this.socket.destroy();
     }
 
+    /**
+     * Deterministic RST toward the client. `destroy()` without an error can
+     * close with an ordinary FIN, which the client reads as `eof`; tests
+     * asserting a socket-failure classification need a real reset. Falls
+     * back to `destroy()` on runtimes without `resetAndDestroy`.
+     */
+    reset(): void {
+        this.stage = "dead";
+        const socket = this.socket as Socket & { resetAndDestroy?: () => void };
+        if (typeof socket.resetAndDestroy === "function") socket.resetAndDestroy();
+        else socket.destroy();
+    }
+
     /** Orderly FIN toward the client. */
     end(): void {
         this.socket.end();
