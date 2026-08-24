@@ -63,6 +63,27 @@ pub fn connection_frame_violation(frame: &RawFrame) -> Option<String> {
             frame.ty, frame.ver
         ));
     }
+    // Generic flag-encoding rules ahead of the per-type shape: reserved
+    // bits 6-7 must be zero, and the 0b11 priority and admission
+    // encodings are reserved values.
+    if frame.flags & 0b1100_0000 != 0 {
+        return Some(format!(
+            "connection frame type {} with reserved flag bits {:#04x}",
+            frame.ty, frame.flags
+        ));
+    }
+    if frame.flags & 0b0000_0110 == 0b0000_0110 {
+        return Some(format!(
+            "connection frame type {} with reserved priority encoding {:#04x}",
+            frame.ty, frame.flags
+        ));
+    }
+    if frame.flags & 0b0011_0000 == 0b0011_0000 {
+        return Some(format!(
+            "connection frame type {} with reserved admission encoding {:#04x}",
+            frame.ty, frame.flags
+        ));
+    }
     match frame.ty {
         TY_PING => {
             if frame.len != 0 {
@@ -104,9 +125,6 @@ pub fn connection_frame_violation(frame: &RawFrame) -> Option<String> {
             }
         }
         TY_PUSH => {
-            if frame.flags & 0b1100_0000 != 0 {
-                return Some(format!("push with reserved flag bits {:#04x}", frame.flags));
-            }
             if frame.channel == 0 || frame.epoch == 0 || frame.corr != 0 {
                 return Some(format!(
                     "push with illegal identity {}/{}/{}",

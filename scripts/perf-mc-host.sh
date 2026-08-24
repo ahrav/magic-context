@@ -244,6 +244,10 @@ stop_host() {
   kill -INT "$HOST_PID" 2>/dev/null || true
   wait "$HOST_PID" 2>/dev/null || true
   rm -rf "$DATA"
+  # Cleared so the EXIT trap cannot re-signal the reaped PID, which the
+  # OS may reassign to an unrelated process before the script exits.
+  HOST_PID=""
+  DATA=""
 }
 
 load() {

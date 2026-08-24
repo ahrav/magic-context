@@ -425,7 +425,18 @@ fn base_manifest(cfg: &CollectConfig, pair: Option<(u32, u32)>) -> Manifest {
         skip_reason: None,
         fail_reason: None,
         sidecars: Vec::new(),
-        collection: None,
+        // The open-loop rate is recorded from creation so skipped and
+        // failed attempts still carry the operating point they were
+        // planned for; the collector overwrites this with the full
+        // configuration on success. Without it, a skip copied onto a
+        // different planned rate path would pass identity binding.
+        collection: if cfg.arm == ARM_TCP_OPEN {
+            let rate =
+                env_parse("MC_IPC_BUDGET_RATE", 0u64).expect("rate validated at config load");
+            Some(serde_json::json!({ "rate_per_sec": rate }))
+        } else {
+            None
+        },
         results: None,
     }
 }
@@ -1163,23 +1174,17 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
             m.run_block
         );
         let name_ok = if m.arm.name == ARM_TCP_OPEN {
-            match m
+            // Every open-loop manifest records its planned rate from
+            // creation, so skipped and failed attempts bind to their
+            // exact operating point too.
+            let rate = m
                 .collection
                 .as_ref()
                 .and_then(|c| c["rate_per_sec"].as_u64())
-            {
-                // A complete open-loop attempt names its exact rate; a
-                // skipped or failed one records no collection, so any
-                // rate suffix on the planned base is acceptable.
-                Some(rate) => actual == format!("{base}-r{rate}"),
-                None if m.state == State::Complete => {
-                    return Err(format!(
-                        "{}: complete open-loop manifest records no rate",
-                        a.dir.display()
-                    ));
-                }
-                None => actual.starts_with(&format!("{base}-r")),
-            }
+                .ok_or_else(|| {
+                    format!("{}: open-loop manifest records no rate", a.dir.display())
+                })?;
+            actual == format!("{base}-r{rate}")
         } else {
             actual == base
         };

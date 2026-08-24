@@ -174,12 +174,8 @@ async fn run_conn(
 ) -> ConnResult {
     let (stream, channel, epoch) = conn;
     let (read_half, mut write_half) = stream.into_split();
-    let body = body_bytes(&opts);
+    let body = Arc::new(body_bytes(&opts));
     let expect_fixture = opts.workload == Workload::Json;
-    // The raw workload echoes the request byte-for-byte, so length
-    // equality is the response contract the reader can check without
-    // retaining a copy of the request.
-    let request_body_len = body.len();
     // The response-length cap tracks the echoed request: the raw
     // workload legitimately echoes multi-megabyte bodies, while
     // MAX_BODY_LEN alone is sized for the fixture and error terminals.
@@ -210,6 +206,7 @@ async fn run_conn(
         let sent_count = Arc::clone(&sent_count);
         let measured_sent = Arc::clone(&measured_sent);
         let sender_done = Arc::clone(&sender_done);
+        let body = Arc::clone(&body);
         let conns = opts.conns as u64;
         tokio::spawn(async move {
             let mut corr: u64 = 1_000_000;
@@ -571,11 +568,11 @@ async fn run_conn(
                     record_failure!(Outcome::UnexpectedFrame, "response flags");
                 } else if expect_fixture && body_buf.as_slice() != FIXTURE_BODY {
                     record_failure!(Outcome::BodyMismatch, "fixture body");
-                } else if !expect_fixture && body_buf.len() != request_body_len {
-                    // The raw echo must return the request's exact
-                    // length; a truncated or empty body with valid flags
-                    // is not a successful echo.
-                    record_failure!(Outcome::BodyMismatch, "raw echo length");
+                } else if !expect_fixture && body_buf.as_slice() != body.as_slice() {
+                    // The raw echo contract is byte-for-byte: a
+                    // same-length corrupted response is not a successful
+                    // echo either.
+                    record_failure!(Outcome::BodyMismatch, "raw echo bytes");
                 } else if measured {
                     result.outcomes.record(Outcome::Success);
                     result.issue_latencies_ns.push(now_ns.saturating_sub(issue));
