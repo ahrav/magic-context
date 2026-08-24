@@ -319,7 +319,30 @@ describe("migration v86: claim trust policy authority", () => {
             );
             expect(() =>
                 insertSubject(db, graph, { originObservationId: foreign.observationId }),
-            ).toThrow(/origin must be evidence for the same revision/);
+            ).toThrow(/origin must be supporting evidence for the same revision/);
+            // Merged lineage is provenance of a DIFFERENT observation, not
+            // evidence supporting this revision: a merged_from link must not
+            // let its observation's taint freeze as the revision origin.
+            const spanId = Number(
+                (
+                    db
+                        .prepare("SELECT source_span_id AS id FROM observations WHERE id = ?")
+                        .get(graph.observationId) as { id: number }
+                ).id,
+            );
+            db.prepare(
+                `INSERT INTO observations (source_span_id, extracted_text, content_sha256, extractor, extractor_version, extractor_run_id, independence_key, created_at)
+                 VALUES (?, 'merged text', ?, 'seed', '1', 'run-merged', 'key-merged', 1)`,
+            ).run(spanId, "c".repeat(64));
+            const mergedObservationId = Number(
+                (db.prepare("SELECT MAX(id) AS id FROM observations").get() as { id: number }).id,
+            );
+            db.prepare(
+                "INSERT INTO claim_evidence (revision_id, observation_id, relation, created_at) VALUES (?, ?, 'merged_from', 1)",
+            ).run(graph.revisionId, mergedObservationId);
+            expect(() =>
+                insertSubject(db, graph, { originObservationId: mergedObservationId }),
+            ).toThrow(/origin must be supporting evidence for the same revision/);
             expect(() => insertSubject(db, graph, { sourceDigest: "d".repeat(64) })).toThrow(
                 /source digest must match the revision content hash/,
             );

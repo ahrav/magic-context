@@ -354,16 +354,21 @@ export function createClaimPolicySchema(db: Database): void {
     ) IS NOT NEW.source_digest
     BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects source digest must match the revision content hash'); END;
 
-    -- A named origin must be evidence FOR this exact revision (R4, KTD2):
-    -- extracted content and self-asserted metadata never select the origin.
+    -- A named origin must be SUPPORTING evidence FOR this exact revision
+    -- (R4, KTD2): extracted content and self-asserted metadata never select
+    -- the origin, and merged lineage ('merged_from') is provenance of a
+    -- different observation, not evidence supporting this revision — an
+    -- importer or merge path must not freeze a merged observation's taint
+    -- as the revision origin.
     CREATE TRIGGER claim_policy_subjects_origin_guard
     BEFORE INSERT ON claim_revision_policy_subjects
     WHEN NEW.origin_observation_id IS NOT NULL AND NOT EXISTS (
         SELECT 1 FROM claim_evidence
         WHERE revision_id = NEW.revision_id
           AND observation_id = NEW.origin_observation_id
+          AND relation = 'supports'
     )
-    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be evidence for the same revision'); END;
+    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be supporting evidence for the same revision'); END;
 
     CREATE TRIGGER claim_maturity_streams_append_only_update
     BEFORE UPDATE ON claim_maturity_streams

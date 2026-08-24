@@ -3515,6 +3515,36 @@ export const MIGRATIONS: Migration[] = [
             assertClaimPolicySchemaForeignKeys(db);
         },
     },
+    {
+        version: 87,
+        description:
+            "claim trust policy: the policy-subject origin guard requires SUPPORTING evidence (merged_from lineage no longer selects the origin)",
+        up(db: Database): void {
+            // The v86 guard accepted any claim_evidence row linking the
+            // observation to the revision, including relation='merged_from';
+            // merged lineage is provenance of a different observation, not
+            // evidence supporting this revision, so an importer or merge
+            // path could freeze the merged observation's taint as the
+            // revision origin. Recreate the trigger (same name, so the v86
+            // replay guard's object inventory is unchanged) with the
+            // relation constrained. Databases created after the fix carry
+            // the corrected body from createClaimPolicySchema; the
+            // drop-and-create replays to identical results there.
+            if (!tableExists(db, "claim_revision_policy_subjects")) return;
+            db.exec(`
+    DROP TRIGGER IF EXISTS claim_policy_subjects_origin_guard;
+    CREATE TRIGGER claim_policy_subjects_origin_guard
+    BEFORE INSERT ON claim_revision_policy_subjects
+    WHEN NEW.origin_observation_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM claim_evidence
+        WHERE revision_id = NEW.revision_id
+          AND observation_id = NEW.origin_observation_id
+          AND relation = 'supports'
+    )
+    BEGIN SELECT RAISE(ABORT, 'claim_revision_policy_subjects origin must be supporting evidence for the same revision'); END;
+            `);
+        },
+    },
 ];
 
 /**

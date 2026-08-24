@@ -1098,6 +1098,13 @@ function readForeignCoverageMemoryIds(args: {
         ownIdentities: args.workspace.ownIdentities,
         shareCategories: args.workspace.shareCategories,
         tableName: "m",
+        // Coverage must name FORMERLY visible rows, not only rows matching
+        // the current share filter: a foreign row reclassified shareable=0
+        // or private-scope leaves the kept snapshot, and if it also left
+        // coverage it would never be deleted from the native store. The
+        // category restriction stays, so this session still cannot prune a
+        // member's non-shared categories.
+        includeClassificationFields: false,
     });
     const ownIdentities = args.workspace.ownIdentities;
     const ownClause =
