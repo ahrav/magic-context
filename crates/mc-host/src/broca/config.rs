@@ -38,13 +38,20 @@ pub const TERMINAL_HEADROOM_BYTES: usize = 4096;
 /// one accounting bound. The supervisor enforces exactly this amount.
 pub const MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Most Broca routes bound at once. The route-identity headroom below is
+/// declared from this constant, so the component enforces it at bind time
+/// regardless of the host's configured `max_routes` — an operator raising
+/// that host limit cannot silently grow Broca's retained identities past
+/// the declared reservation.
+pub const MAX_BOUND_ROUTES: usize = 1024;
+
 /// Worst case for the component's route-identity map, which lives outside
-/// the supervisor's budget: the host permits 1024 routes, each binding a
+/// the supervisor's budget: [`MAX_BOUND_ROUTES`] bound identities, each a
 /// project root of up to 4096 bytes plus a session of up to 256 bytes, with
 /// 128 bytes of key overhead. Declared to the host on top of
 /// [`MAX_RETAINED_BYTES`] so the published reservation remains an actual
 /// ceiling on resident bytes.
-pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = 1024 * (4096 + 256 + 128);
+pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = (MAX_BOUND_ROUTES as u64) * (4096 + 256 + 128);
 
 /// Worst case for live backend transcript capture, also outside the
 /// supervisor's budget: each of the [`MAX_BACKEND_PROCESSES`] concurrent

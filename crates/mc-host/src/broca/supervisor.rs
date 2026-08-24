@@ -57,13 +57,18 @@ impl SessionKey {
     /// Logical bytes the index retains for this key: both map keys plus the
     /// run ID, fingerprint, and entry skeleton, folded into one conservative
     /// constant. String contents dominate; struct overhead stays outside the
-    /// accounting claim, matching `synapse::jobs::job_input_bytes`.
+    /// accounting claim, matching `synapse::jobs::job_input_bytes`. The
+    /// identity strings are retained twice per live or terminal entry — the
+    /// sessions-map key and the run's own key copy — so both are charged; a
+    /// tombstone holds only the map key and is slightly overcharged, which
+    /// keeps the budget a ceiling.
     fn meta_bytes(&self) -> usize {
         const KEY_META_OVERHEAD_BYTES: usize = 128;
         self.project_root
             .as_os_str()
             .len()
             .saturating_add(self.session.len())
+            .saturating_mul(2)
             .saturating_add(KEY_META_OVERHEAD_BYTES)
     }
 }

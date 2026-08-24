@@ -148,10 +148,21 @@ impl CompositeComponent for BrocaComponent {
             harness,
             session: identity.session,
         };
-        self.routes
+        let mut routes = self
+            .routes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(route, key);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The declared route-identity headroom covers exactly
+        // MAX_BOUND_ROUTES identities; binding past it would retain bytes
+        // outside the published reservation whenever the host's own route
+        // limit is configured higher.
+        if routes.len() >= config::MAX_BOUND_ROUTES && !routes.contains_key(&route) {
+            return BindOutcome::Reject {
+                code: "queue_full".to_owned(),
+                message: "broca route capacity is exhausted".to_owned(),
+            };
+        }
+        routes.insert(route, key);
         BindOutcome::Accept
     }
 
