@@ -413,6 +413,12 @@ async fn run_open_loop_inner(
             break;
         }
         let at = start + Duration::from_nanos(scheduled_ns);
+        // The frame is built before the slot arrives, so neither the
+        // recorded scheduler lag (issue minus scheduled) nor the
+        // completion latency carries its construction and allocation
+        // cost; a cap-missed slot simply discards it.
+        let corr = slot + CORR_BASE;
+        let frame = request_frame(channel, epoch, corr);
         // Drain any ready responses while waiting for the next slot.
         loop {
             let now = Instant::now();
@@ -468,8 +474,6 @@ async fn run_open_loop_inner(
             }
             continue;
         }
-        let corr = slot + CORR_BASE;
-        let frame = request_frame(channel, epoch, corr);
         let issue_ns = start.elapsed().as_nanos() as u64;
         // The write is bounded by the arm deadline plus the drain
         // budget: a host that stops reading fills the TCP window and an

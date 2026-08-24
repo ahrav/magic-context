@@ -555,7 +555,7 @@ pub fn median(values: &mut [f64]) -> Option<f64> {
 /// Resamples whole run blocks (never individual requests) with a fixed
 /// seed so re-aggregation is byte-stable.
 pub fn bootstrap_interval(values: &[f64], iterations: u32, seed: u64) -> Option<(f64, f64)> {
-    if values.is_empty() {
+    if values.is_empty() || iterations == 0 {
         return None;
     }
     let mut state = seed.max(1);

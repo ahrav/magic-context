@@ -138,6 +138,10 @@ struct ConnResult {
     sched_lag_ns: Vec<u64>,
     sent: u64,
     measured_scheduled: u64,
+    /// Requests resolved by a response, including pre-warmup traffic:
+    /// `resolved - measured` is the warmup traffic volume in the RESULT
+    /// line, a distinction the window-gated outcome counters lose.
+    resolved: u64,
     outcomes: OutcomeCounts,
     error_codes: HashMap<String, u64>,
     closed_early: bool,
@@ -307,6 +311,7 @@ async fn run_conn(
         sched_lag_ns: Vec::new(),
         sent: 0,
         measured_scheduled: 0,
+        resolved: 0,
         outcomes: OutcomeCounts::default(),
         error_codes: HashMap::new(),
         closed_early: false,
@@ -539,6 +544,7 @@ async fn run_conn(
 
     result.sent = sent_count.load(Ordering::Acquire);
     result.measured_scheduled = measured_sent.load(Ordering::Acquire);
+    result.resolved = resolved;
     result
 }
 
@@ -632,6 +638,7 @@ async fn main() {
     let mut error_codes: HashMap<String, u64> = HashMap::new();
     let mut closed = 0usize;
     let mut inflight_full = 0u64;
+    let mut completed = 0u64;
     for task in tasks {
         let conn = task.await.expect("conn task");
         issue_latencies.extend(conn.issue_latencies_ns);
@@ -641,6 +648,7 @@ async fn main() {
         measured_scheduled += conn.measured_scheduled;
         closed += usize::from(conn.closed_early);
         inflight_full += conn.inflight_full;
+        completed += conn.resolved;
         for (code, count) in conn.error_codes {
             *error_codes.entry(code).or_default() += count;
         }
@@ -675,7 +683,7 @@ async fn main() {
         opts.pipeline,
         opts.secs,
         sent,
-        outcomes.success,
+        completed,
         issue_latencies.len(),
         closed,
         inflight_full,

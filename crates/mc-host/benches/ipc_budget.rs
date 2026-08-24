@@ -172,6 +172,20 @@ impl ChildHost {
             Some(cpu) => cmd.env("MC_IPC_BUDGET_HOST_CPU", cpu.to_string()),
             None => cmd.env_remove("MC_IPC_BUDGET_HOST_CPU"),
         };
+        // Fate-bind the host to this collector: when the collector dies
+        // without unwinding (plain SIGTERM from the runner's interrupt
+        // trap, SIGKILL, OOM), ChildHost::drop never runs, and the
+        // pinned host would otherwise survive as an orphan holding its
+        // CPU and temp directory into subsequent attempts.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::KILL,
+                ))
+                .map_err(std::io::Error::from)
+            });
+        }
         let mut child = cmd.spawn().map_err(|err| format!("spawn host: {err}"))?;
         let stdout = child.stdout.take().expect("piped stdout");
         // The receiver enforces the deadline because BufReader::lines can
@@ -887,6 +901,28 @@ fn run_aggregate() -> i32 {
 
 /// Builds the byte-stable run summary from complete attempts only.
 fn aggregate(run_dir: &Path) -> Result<String, String> {
+    // Attempts holding only a running manifest are crash residue that
+    // finalize-interrupted has not converted; aggregating past them
+    // would publish a complete-looking summary that silently omits
+    // repetitions.
+    let mut unfinalized = 0usize;
+    let entries =
+        std::fs::read_dir(run_dir).map_err(|err| format!("{}: {err}", run_dir.display()))?;
+    for entry in entries {
+        let path = entry.map_err(|err| err.to_string())?.path();
+        if path.is_dir()
+            && path.join(evidence::RUNNING_MANIFEST).is_file()
+            && !path.join(evidence::FINAL_MANIFEST).is_file()
+        {
+            unfinalized += 1;
+        }
+    }
+    if unfinalized > 0 {
+        return Err(format!(
+            "{unfinalized} attempt(s) hold only a running manifest; run \
+             MC_IPC_BUDGET_MODE=finalize-interrupted over this directory first"
+        ));
+    }
     let attempts: Vec<evidence::LoadedAttempt> = evidence::load_attempts(run_dir)?;
     if attempts.is_empty() {
         return Err("run directory holds no finalized attempts".to_owned());

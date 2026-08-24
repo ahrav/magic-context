@@ -241,7 +241,16 @@ stop_host() {
 }
 
 load() {
-  "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt"
+  # Legacy adversarial arms (starvation, greedy, slowreader) drive
+  # failure modes on purpose, and perf_load exits nonzero on transport or
+  # correctness failures. Recording the status keeps the script from
+  # aborting mid-arm under set -e, which would leak the spawned host and
+  # skip the arm's recovery checks and cleanup.
+  local rc=0
+  "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "LOAD_EXIT status=$rc" | tee -a "$OUT/results.txt"
+  fi
 }
 
 LABEL_SUFFIX=""

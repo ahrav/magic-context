@@ -91,7 +91,10 @@ pub fn run_ping_pong(cfg: PingPongConfig) -> Result<PingPongOutput, String> {
     let token = Arc::new(Padded(AtomicU64::new(0)));
     let abort = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(Barrier::new(2));
-    let total_batches = cfg.warmup_batches + cfg.batches;
+    let total_batches = cfg
+        .warmup_batches
+        .checked_add(cfg.batches)
+        .ok_or("warmup_batches + batches overflows u32")?;
     let total_exchanges = u64::from(total_batches) * u64::from(cfg.exchanges_per_batch);
 
     let responder = {
