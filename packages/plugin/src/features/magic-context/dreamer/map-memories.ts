@@ -21,9 +21,11 @@ import {
     recordMemoryMapping,
 } from "../memory";
 import {
+    exactMemoryContentDigests,
     filterMemoriesForMaintenance,
     maintenanceEligibleIdSet,
 } from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
@@ -346,6 +348,19 @@ export async function applyBatchMappings(
         "mappings",
     );
     if (parsed.length === 0) return { mapped: 0, independent: 0 };
+    // The manifest's verdicts describe the PROMPTED bytes: a memory rewritten
+    // while the mapper ran must not have another revision's mapping (a wrong
+    // file set — or an `independent` sentinel that permanently removes the
+    // successor from the verify gate), and a target the policy hid meanwhile
+    // must not be touched. Bind every apply to the prompt-time digest.
+    const promptDigestById = new Map(
+        batch.map((input) => [input.id, sha256Utf8Hex(input.content)]),
+    );
+    const stillApplicable = (
+        id: number,
+        eligible: Set<number>,
+        digests: Map<number, string>,
+    ): boolean => eligible.has(id) && digests.get(id) === promptDigestById.get(id);
 
     // Pre-normalize each mapping's files OUTSIDE the transaction (path
     // normalization does git/realpath I/O). Independent → sentinel (empty set).
@@ -376,12 +391,33 @@ export async function applyBatchMappings(
     let mapped = 0;
     let independent = 0;
     if (args.moduleRoute) {
+        // The native memory.set_mapping handler checks only the CURRENT
+        // revision's hash and carries no policy check, so this filter is the
+        // last gate before the module write.
+        const eligibleForModule = maintenanceEligibleIdSet(
+            args.db,
+            planned.map((item) => item.id),
+            "verification",
+        );
+        const digestsForModule = exactMemoryContentDigests(
+            args.db,
+            planned.map((item) => item.id),
+        );
+        const modulePlanned = planned.filter((item) =>
+            stillApplicable(item.id, eligibleForModule, digestsForModule),
+        );
+        if (modulePlanned.length < planned.length) {
+            log(
+                `[dreamer] map-memories module apply dropped ${planned.length - modulePlanned.length} target(s) hidden or rewritten during evaluation`,
+            );
+        }
+        if (modulePlanned.length === 0) return { mapped: 0, independent: 0 };
         const identities = getModuleMemoryIdentities(
             args.db,
             args.projectIdentity,
-            planned.map((item) => item.id),
+            modulePlanned.map((item) => item.id),
         );
-        const rows = planned.map((item) => {
+        const rows = modulePlanned.map((item) => {
             const identity = identities.get(item.id);
             if (!identity)
                 throw new DreamerModuleFailureError(
@@ -428,7 +464,7 @@ export async function applyBatchMappings(
         const accepted = new Set(
             result.accepted.filter((id): id is number => typeof id === "number"),
         );
-        for (const item of planned) {
+        for (const item of modulePlanned) {
             const identity = identities.get(item.id);
             if (identity && accepted.has(identity.moduleId))
                 item.independent ? (independent += 1) : (mapped += 1);
@@ -437,7 +473,19 @@ export async function applyBatchMappings(
     }
     const now = Date.now();
     runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+        // Re-evaluate while holding the write lock: the awaited file
+        // normalization above yields arbitrarily long.
+        const eligibleInTx = maintenanceEligibleIdSet(
+            args.db,
+            planned.map((item) => item.id),
+            "verification",
+        );
+        const digestsInTx = exactMemoryContentDigests(
+            args.db,
+            planned.map((item) => item.id),
+        );
         for (const item of planned) {
+            if (!stillApplicable(item.id, eligibleInTx, digestsInTx)) continue;
             recordMemoryMapping(args.db, item.id, item.files, now);
             item.independent ? (independent += 1) : (mapped += 1);
         }

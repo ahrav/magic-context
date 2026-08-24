@@ -2104,7 +2104,34 @@ export async function syncModuleState(args: {
         }
         try {
             const batches = payload.wireBatches ?? [payload];
-            for (const batch of batches) {
+            for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+                const batch = batches[batchIndex];
+                if (
+                    batches.length > 1 &&
+                    batchIndex === batches.length - 1 &&
+                    args.pass.projectPath
+                ) {
+                    // Paged forced syncs retain frozen snapshot rows across
+                    // the awaited page sends above, and the completing batch
+                    // is what makes the module apply them. An epoch bump
+                    // while pages were in flight means a policy or content
+                    // transition landed after the snapshot's policy check —
+                    // abort and rebuild from current state rather than apply
+                    // the stale snapshot to the native store.
+                    const epochAtBuild = (batch.params as { project_memory_epoch?: number })
+                        .project_memory_epoch;
+                    const epochNow =
+                        getProjectState(args.pass.db, args.pass.projectPath)?.projectMemoryEpoch ??
+                        0;
+                    if (epochAtBuild !== undefined && epochNow !== epochAtBuild) {
+                        sessionLog(
+                            args.pass.sessionId,
+                            `module state sync aborted before completing batch: project memory epoch moved ${epochAtBuild} -> ${epochNow} during paged send; rebuilding`,
+                        );
+                        force = true;
+                        continue syncLoop;
+                    }
+                }
                 const response = await args.client.call({
                     sessionId: args.pass.sessionId,
                     projectRoot: args.projectRoot,
