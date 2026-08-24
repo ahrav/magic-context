@@ -22,6 +22,7 @@ pub const OP_ROUTE_OPEN: &str = subc_control::ops::ROUTE_OPEN;
 pub const OP_CATALOG_LIST: &str = subc_control::ops::CATALOG_LIST;
 /// `subc_control` does not publish this operation.
 pub const OP_HOST_SHUTDOWN: &str = "host.shutdown";
+pub const OP_TRANSPORT_NEGOTIATE: &str = crate::transport_negotiation::OP_TRANSPORT_NEGOTIATE;
 
 /// `TargetIndex` restricts `route.open` targets to listed `(module, kind)`
 /// pairs.
@@ -73,6 +74,12 @@ pub enum ControlAction {
         identity: RouteIdentity,
     },
     HostShutdown,
+    TransportNegotiate(
+        Result<
+            crate::transport_negotiation::NegotiateRequest,
+            crate::transport_negotiation::NegotiationError,
+        >,
+    ),
     /// Semantic rejection with a trustworthy correlation; one terminal.
     Reject {
         code: &'static str,
@@ -126,6 +133,9 @@ pub fn parse_control(body: &[u8], binary: bool, targets: &TargetIndex) -> Contro
         OP_CATALOG_LIST => parse_catalog_list(&fields),
         OP_ROUTE_OPEN => parse_route_open(&fields, targets),
         OP_HOST_SHUTDOWN => ControlAction::HostShutdown,
+        OP_TRANSPORT_NEGOTIATE => ControlAction::TransportNegotiate(
+            crate::transport_negotiation::decode_negotiate_request(body),
+        ),
         _ => ControlAction::Reject {
             code: CODE_UNSUPPORTED_OPERATION,
             message: "operation is not supported by this host".to_owned(),
@@ -435,7 +445,7 @@ fn serialize_catalog_response(
         op: &'static str,
         generation: u64,
         modules: &'a [CatalogModule<'a>],
-        subc_ops: [&'static str; 3],
+        subc_ops: [&'static str; 4],
     }
 
     let modules: Vec<CatalogModule<'_>> = manifests
@@ -457,7 +467,12 @@ fn serialize_catalog_response(
             op: OP_CATALOG_LIST,
             generation: CATALOG_GENERATION,
             modules: &modules,
-            subc_ops: [OP_ROUTE_OPEN, OP_CATALOG_LIST, OP_HOST_SHUTDOWN],
+            subc_ops: [
+                OP_ROUTE_OPEN,
+                OP_CATALOG_LIST,
+                OP_HOST_SHUTDOWN,
+                OP_TRANSPORT_NEGOTIATE,
+            ],
         },
     )
     .map_err(|_| ())?;
@@ -914,8 +929,15 @@ mod tests {
         );
         assert_eq!(
             unfiltered["subc_ops"],
-            serde_json::json!(["route.open", "catalog.list", "host.shutdown"])
+            serde_json::json!([
+                "route.open",
+                "catalog.list",
+                "host.shutdown",
+                "transport.negotiate"
+            ])
         );
+        assert!(!unfiltered.to_string().contains("transport.activate"));
+        assert!(!unfiltered.to_string().contains("transport.commit"));
         // wake.create must stay absent until implemented (protocol AE10).
         assert!(!unfiltered.to_string().contains("wake.create"));
 

@@ -57,8 +57,21 @@ async fn catalog_is_truthful_and_filters_exactly() {
     );
     assert_eq!(
         json["subc_ops"],
-        serde_json::json!(["route.open", "catalog.list", "host.shutdown"])
+        serde_json::json!([
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "transport.negotiate"
+        ])
     );
+    assert!(!unfiltered
+        .body
+        .windows(18)
+        .any(|w| w == b"transport.activate"));
+    assert!(!unfiltered
+        .body
+        .windows(16)
+        .any(|w| w == b"transport.commit"));
     // The direct host implements only `health.check`; `wake.create` stays
     // excluded so TypeScript wake-plane probing stays fail-open (AE10).
     support::assert_control_ops(&json["modules"], &["health.check"]);
@@ -97,6 +110,8 @@ async fn unsupported_operations_leave_the_generation_usable() {
         "supervisor.list",
         "wake.create",
         "health",
+        "transport.activate",
+        "transport.commit",
     ] {
         let frame = control_once(&mut client, serde_json::json!({"op": op})).await;
         assert_eq!(

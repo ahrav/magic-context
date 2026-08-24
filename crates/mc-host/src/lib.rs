@@ -7,14 +7,20 @@ pub mod config;
 pub mod handler;
 pub mod lifecycle;
 pub mod synapse;
+#[doc(hidden)]
+pub mod transport_negotiation;
+#[doc(hidden)]
+pub mod transport_provider;
 
 mod connection;
 mod control;
 mod dispatch;
+mod frame_channel;
 mod instance;
 mod panic_boundary;
 mod routing;
 mod runtime;
+mod tcp_frame_channel;
 mod wire;
 
 pub use composite::{CompositeComponent, PrimaryComponent, SecondaryComponent, StaticComposite};

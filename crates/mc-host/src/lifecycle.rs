@@ -1221,14 +1221,14 @@ mod tests {
 
         let (server, client) = tokio::io::duplex(64);
         let generation = tokio_util::sync::CancellationToken::new();
-        let (handle, task) = crate::wire::spawn_writer(
+        let (handle, task) = crate::tcp_frame_channel::spawn_writer(
             server,
             2,
             generation.clone(),
             std::time::Duration::from_secs(5),
         );
         handle
-            .send(crate::wire::OutboundFrame {
+            .send(crate::frame_channel::OutboundFrame {
                 bytes: vec![0u8; 8],
                 tail: Vec::new(),
                 charge: crate::wire::ByteCharge::none(),

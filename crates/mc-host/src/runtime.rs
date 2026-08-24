@@ -95,6 +95,7 @@ pub struct HostShared<H> {
     pub liveness: Option<LivenessPolicy>,
     pub targets: crate::control::TargetIndex,
     pub catalog: crate::control::CatalogCache,
+    pub providers: crate::transport_provider::TransportProviders,
     pub registry: RouteRegistry,
     /// Admits inbound frame bodies. The only budget with a blocking
     /// consumer, so nothing whose lifetime outlives a request may draw on it.
@@ -729,6 +730,7 @@ pub async fn run<H: McHostHandler>(
         liveness: config.liveness.clone(),
         targets,
         catalog,
+        providers: config.transport_providers.clone(),
         registry: RouteRegistry::new(config.limits.max_routes),
         ingress_budget: ByteBudget::new(
             config.limits.max_resident_bytes

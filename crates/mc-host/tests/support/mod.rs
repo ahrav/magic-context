@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod fake_transport;
 pub mod raw_client;
 pub mod synapse;
 

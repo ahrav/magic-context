@@ -10,6 +10,18 @@ import { setTimeout as delay } from "node:timers/promises";
 import { ConnectionGeneration, type ConnectionGenerationOptions } from "../connection";
 import { Deadline } from "../deadline";
 import { SubcCallError } from "../errors";
+import type {
+    FrameChannelHandlers,
+    FrameChannelStats,
+    FrameSendHooks,
+    FrameSendTicket,
+    InboundFrame,
+    OutboundFrame,
+    SetupFrameChannel,
+} from "../frame-channel";
+import { type EnvelopeHeader, FrameType, HEADER_LEN, PROTOCOL_VERSION } from "../protocol";
+import type { OpaqueObject } from "../transport-negotiation";
+import type { CandidateChannelArgs, ClientTransportProvider } from "../transport-provider";
 import { FakePeer, type FakePeerOptions } from "./fake-peer";
 
 /** Await a promise that MUST reject and return its rejection value. */
@@ -119,4 +131,283 @@ export function createTrackedHarness(): TrackedHarness {
         },
     };
     return harness;
+}
+
+// ----------------------------------------------------------------------
+// In-process paired candidate transport for injected-provider tests.
+// ----------------------------------------------------------------------
+
+/** One complete frame observed by the host half of the paired channel. */
+export interface CandidateHostFrame {
+    header: EnvelopeHeader;
+    body: Uint8Array;
+}
+
+interface CandidateWaiter {
+    check: () => boolean;
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Scriptable host half of one in-process paired candidate channel. Tests
+ * set `onFrame` to script activation, commit, and application responses;
+ * `close` fails the client half like a lost channel.
+ */
+export class FakeCandidateHost {
+    readonly frames: CandidateHostFrame[] = [];
+    onFrame: ((frame: CandidateHostFrame, host: FakeCandidateHost) => void) | null = null;
+    private channel: FakeCandidateChannel | null = null;
+    private readonly waiters: CandidateWaiter[] = [];
+
+    /** True once the client half was closed or failed. */
+    get channelClosed(): boolean {
+        return this.channel?.isClosed() ?? false;
+    }
+
+    attach(channel: FakeCandidateChannel): void {
+        this.channel = channel;
+    }
+
+    receive(frame: CandidateHostFrame): void {
+        this.frames.push(frame);
+        for (let i = this.waiters.length - 1; i >= 0; i--) {
+            const waiter = this.waiters[i] as CandidateWaiter;
+            if (waiter.check()) {
+                this.waiters.splice(i, 1);
+                clearTimeout(waiter.timer);
+                waiter.resolve();
+            }
+        }
+        this.onFrame?.(frame, this);
+    }
+
+    /** Deliver one frame to the client half. */
+    send(header: Omit<EnvelopeHeader, "len" | "ver">, body: Uint8Array = new Uint8Array(0)): void {
+        this.channel?.deliver({
+            header: { ...header, len: body.length, ver: PROTOCOL_VERSION },
+            body,
+        });
+    }
+
+    /** Deliver one JSON Response on channel 0 to the client half. */
+    respondJson(corr: bigint, value: unknown): void {
+        this.send(
+            { ty: FrameType.Response, flags: 0, channel: 0, epoch: 0, corr },
+            Buffer.from(JSON.stringify(value), "utf8"),
+        );
+    }
+
+    /** Fail the client half with a channel-detected loss. */
+    close(error?: Error): void {
+        this.channel?.failFromPeer(error ?? new Error("fake candidate host closed"));
+    }
+
+    waitFor(check: () => boolean, timeoutMs = 5_000): Promise<void> {
+        if (check()) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            const waiter: CandidateWaiter = {
+                check,
+                resolve,
+                reject,
+                timer: setTimeout(() => {
+                    const index = this.waiters.indexOf(waiter);
+                    if (index >= 0) this.waiters.splice(index, 1);
+                    reject(
+                        new Error(
+                            `fake candidate host timed out waiting; have ${this.frames.length} frames`,
+                        ),
+                    );
+                }, timeoutMs),
+            };
+            this.waiters.push(waiter);
+        });
+    }
+}
+
+interface FakeCandidateChannelOptions {
+    startError?: Error;
+    closeError?: Error;
+}
+
+/**
+ * Client half of the paired candidate channel. Frames transfer in-process
+ * as complete `{header, body}` objects; publication and completion hooks
+ * fire synchronously at `send`, so a queued-cancel is never possible and
+ * `cancel()` reports a possible send.
+ */
+class FakeCandidateChannel implements SetupFrameChannel {
+    private closed = false;
+    private began = false;
+    private readonly inbox: InboundFrame[] = [];
+
+    constructor(
+        private readonly host: FakeCandidateHost,
+        private readonly handlers: FrameChannelHandlers,
+        private readonly options: FakeCandidateChannelOptions,
+    ) {}
+
+    async start(_deadline: Deadline): Promise<{ daemonVer: string }> {
+        if (this.options.startError) throw this.options.startError;
+        return { daemonVer: "fake-candidate/1" };
+    }
+
+    beginFrames(): void {
+        if (this.closed || this.began) return;
+        this.began = true;
+        while (this.inbox.length > 0) {
+            const frame = this.inbox.shift() as InboundFrame;
+            this.handlers.onFrame(frame);
+        }
+    }
+
+    send(frame: OutboundFrame, hooks?: FrameSendHooks): FrameSendTicket {
+        if (this.closed) {
+            throw new SubcCallError("not_sent", "frame channel is closed", "channel_closed");
+        }
+        hooks?.onPublish?.();
+        this.host.receive({ header: frame.header, body: frame.body });
+        hooks?.onComplete?.();
+        return { bytes: HEADER_LEN + frame.body.length, cancel: () => false };
+    }
+
+    sendControl(header: EnvelopeHeader): void {
+        if (this.closed) return;
+        this.host.receive({ header, body: new Uint8Array(0) });
+    }
+
+    flush(_deadline: Deadline): Promise<void> {
+        return Promise.resolve();
+    }
+
+    close(_error?: unknown): void {
+        this.closed = true;
+    }
+
+    isClosed(): boolean {
+        return this.closed;
+    }
+
+    stats(): FrameChannelStats {
+        return {
+            readerHeldBytes: 0,
+            queueHeldBytes: 0,
+            queuedDataFrames: 0,
+            queuedControlFrames: 0,
+            readPaused: false,
+            activeTimers: 0,
+        };
+    }
+
+    deliver(frame: InboundFrame): void {
+        if (this.closed) return;
+        if (!this.began) {
+            this.inbox.push(frame);
+            return;
+        }
+        this.handlers.onFrame(frame);
+    }
+
+    failFromPeer(error: Error): void {
+        if (this.closed) return;
+        this.closed = true;
+        this.handlers.onClosed("socket_closed", this.options.closeError ?? error);
+    }
+}
+
+export interface FakeProviderOptions {
+    transport?: string;
+    capabilityVersion?: number;
+    parameters?: OpaqueObject;
+    /** Thrown from `connect` to exercise the sanitized provider boundary. */
+    connectError?: Error;
+    /** Rejected from the channel's `start` for the same boundary. */
+    startError?: Error;
+}
+
+export interface FakePairedProvider extends ClientTransportProvider {
+    readonly host: FakeCandidateHost;
+    connectCount: number;
+    lastDescriptor: OpaqueObject | null;
+}
+
+/** One injected provider paired with a scriptable in-process host half. */
+export function createFakePairedProvider(options: FakeProviderOptions = {}): FakePairedProvider {
+    const host = new FakeCandidateHost();
+    const provider: FakePairedProvider = {
+        transport: options.transport ?? "fake.shm",
+        capabilityVersion: options.capabilityVersion ?? 1,
+        parameters: options.parameters,
+        host,
+        connectCount: 0,
+        lastDescriptor: null,
+        connect(descriptor: OpaqueObject, args: CandidateChannelArgs): SetupFrameChannel {
+            provider.connectCount += 1;
+            provider.lastDescriptor = descriptor;
+            if (options.connectError) throw options.connectError;
+            const channel = new FakeCandidateChannel(host, args.handlers, {
+                startError: options.startError,
+            });
+            host.attach(channel);
+            return channel;
+        },
+    };
+    return provider;
+}
+
+function candidateBodyJson(frame: CandidateHostFrame): { op?: unknown } | undefined {
+    try {
+        return JSON.parse(Buffer.from(frame.body).toString("utf8")) as { op?: unknown };
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Default host-half script: acknowledge `transport.activate` when the token
+ * matches, acknowledge `transport.commit`, and hand every other Request to
+ * `onRequest`.
+ */
+export function candidateAutoResponder(
+    expectedToken: string,
+    onRequest?: (frame: CandidateHostFrame, host: FakeCandidateHost) => void,
+): (frame: CandidateHostFrame, host: FakeCandidateHost) => void {
+    return (frame, host) => {
+        if (frame.header.ty !== FrameType.Request) return;
+        const parsed = candidateBodyJson(frame) as
+            | { op?: unknown; activation_token?: unknown }
+            | undefined;
+        if (parsed?.op === "transport.activate") {
+            if (parsed.activation_token !== expectedToken) {
+                host.send(
+                    {
+                        ty: FrameType.Error,
+                        flags: 0,
+                        channel: 0,
+                        epoch: 0,
+                        corr: frame.header.corr,
+                    },
+                    Buffer.from(
+                        JSON.stringify({ code: "invalid_control_request", message: "bad token" }),
+                        "utf8",
+                    ),
+                );
+                return;
+            }
+            host.respondJson(frame.header.corr, {
+                op: "transport.activate",
+                negotiation_version: 1,
+            });
+            return;
+        }
+        if (parsed?.op === "transport.commit") {
+            host.respondJson(frame.header.corr, {
+                op: "transport.commit",
+                negotiation_version: 1,
+            });
+            return;
+        }
+        onRequest?.(frame, host);
+    };
 }

@@ -476,7 +476,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn generation(id: u64) -> Arc<GenerationCore> {
-        let (writer, _task) = crate::wire::spawn_writer(
+        let (writer, _task) = crate::tcp_frame_channel::spawn_writer(
             tokio::io::duplex(1024).0,
             8,
             CancellationToken::new(),
@@ -494,6 +494,7 @@ mod tests {
             pings: Mutex::new(HashMap::new()),
             busy_rejects: Arc::new(tokio::sync::Semaphore::new(4)),
             next_ping_corr: AtomicU64::new(1),
+            liveness: Mutex::new(None),
         })
     }
 

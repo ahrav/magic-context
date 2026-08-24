@@ -38,6 +38,26 @@ import {
     type RouteHandle,
     StaleRouteHandleError,
 } from "./route-handle";
+import {
+    ACTIVATION_CORRELATION,
+    commitRequestJson,
+    decodeActivateResponse,
+    decodeCommitResponse,
+    decodeNegotiateResponse,
+    encodeActivateRequest,
+    encodeNegotiateRequest,
+    type FallbackReason,
+    NEGOTIATION_VERSION,
+    type NegotiateResponse,
+    NegotiationError,
+    TRANSPORT_TCP,
+} from "./transport-negotiation";
+import {
+    type ClientTransportProvider,
+    ClientTransportRegistry,
+    sanitizedCandidateFactory,
+    TCP_CAPABILITY_VERSION,
+} from "./transport-provider";
 import type {
     BindIdentity,
     CatalogEntry,
@@ -90,6 +110,10 @@ export interface SubcDiagnosticsEvent {
     readonly daemonVer?: string;
     readonly pid?: number;
     readonly reason?: string;
+    /** Negotiated transport name on `connected` events. */
+    readonly transport?: string;
+    /** Closed-set TCP fallback reason on `connected` events, if any. */
+    readonly fallbackReason?: FallbackReason;
 }
 
 export type SubcDiagnosticsObserver = (event: SubcDiagnosticsEvent) => void;
@@ -135,6 +159,8 @@ export interface SubcClientOptions extends ConnectOptions {
             | "generateNonce"
         >
     >;
+    /** @internal Not part of the consumer contract. */
+    transportProviders?: readonly ClientTransportProvider[];
 }
 
 interface ActiveConnection {
@@ -142,6 +168,10 @@ interface ActiveConnection {
     /** Opaque token binding this connection's route handles. */
     readonly token: object;
     readonly snapshot: ConnectionSnapshot;
+    /** The selected transport remains fixed from publication until retirement. */
+    transport: string;
+    /** Closed-set reason when the selection was an explicit TCP fallback. */
+    fallbackReason?: FallbackReason;
 }
 
 interface CachedManagedRoute {
@@ -348,6 +378,7 @@ export class SubcClient {
     private readonly generationOptions: SubcClientOptions["generationOptions"];
     private readonly diagnostics: SubcDiagnosticsObserver | undefined;
     private readonly maxDiagnosticEventsPerSecond: number;
+    private readonly transportRegistry: ClientTransportRegistry;
 
     private active: ActiveConnection | null = null;
     private connecting: SetupFlight<ActiveConnection> | null = null;
@@ -378,6 +409,7 @@ export class SubcClient {
         this.diagnostics = options.diagnostics;
         this.maxDiagnosticEventsPerSecond =
             options.maxDiagnosticEventsPerSecond ?? DEFAULT_MAX_DIAGNOSTIC_EVENTS_PER_SECOND;
+        this.transportRegistry = new ClientTransportRegistry(options.transportProviders ?? []);
     }
 
     /**
@@ -635,7 +667,12 @@ export class SubcClient {
             onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
             ...this.generationOptions,
         });
-        conn = { generation, token: newConnectionToken(), snapshot };
+        conn = {
+            generation,
+            token: newConnectionToken(),
+            snapshot,
+            transport: TRANSPORT_TCP,
+        };
         try {
             await generation.start(stage);
         } catch (error) {
@@ -649,12 +686,195 @@ export class SubcClient {
             generation.retire("owner_close");
             throw new SubcError("client closed", "client_closed");
         }
+        // KTD4 stale-success: a generation that retired during its own setup
+        // (for example a Goodbye coalesced into the final handshake chunk)
+        // skips negotiation; ensureConnection re-enters recovery under the
+        // caller's unchanged stage.
+        if (generation.isRetired()) return conn;
+        // R5/KTD5: negotiate on authenticated channel 0 BEFORE publication,
+        // so no caller can observe a generation without a selection.
+        let selection: NegotiateResponse;
+        try {
+            selection = await this.negotiateTransport(generation, stage);
+        } catch (error) {
+            generation.retire("negotiation_failed", error);
+            // KTD3: negotiation that died on the owner's setup stage is
+            // owner-budget exhaustion; survivors may coalesce one
+            // replacement.
+            if (stage.isExpired()) flight.replaceable = true;
+            throw error;
+        }
+        if (this.closeStarted) {
+            generation.retire("owner_close");
+            throw new SubcError("client closed", "client_closed");
+        }
+        if (selection.kind === "grant") {
+            return await this.activateCandidate(conn, selection, stage);
+        }
+        // The authenticated bootstrap becomes the finalized generation with
+        // its negotiation correlation consumed; the selection stays sticky
+        // until retirement (KTD5).
+        conn.fallbackReason = selection.reason;
         this.active = conn;
         this.liveRoutes.clear();
         this.emitDiagnostics({
             type: "connected",
             daemonVer: snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
             pid: snapshot.pid,
+            transport: conn.transport,
+            ...(conn.fallbackReason !== undefined ? { fallbackReason: conn.fallbackReason } : {}),
+        });
+        return conn;
+    }
+
+    /**
+     * Send the versioned offer as the generation's first channel-0 request
+     * and classify the outcome under KTD6: an exact legacy
+     * `unsupported_operation` terminal or a strictly decoded selection
+     * continues; every other failure propagates so setup fails closed
+     * without same-generation TCP fallback.
+     */
+    private async negotiateTransport(
+        generation: ConnectionGeneration,
+        stage: Deadline,
+    ): Promise<NegotiateResponse> {
+        const offers = this.transportRegistry.offers();
+        const body = encodeNegotiateRequest({ negotiationVersion: NEGOTIATION_VERSION, offers });
+        let terminal: RequestTerminal;
+        try {
+            terminal = await this.awaitRequest(generation, {
+                channel: 0,
+                epoch: 0,
+                body,
+                deadline: stage,
+                options: {},
+            });
+        } catch (error) {
+            if (
+                error instanceof SubcCallError &&
+                error.kind === "terminal" &&
+                error.code === "unsupported_operation"
+            ) {
+                // Legacy host: retain the authenticated TCP generation.
+                return {
+                    kind: "tcp",
+                    selected: {
+                        transport: TRANSPORT_TCP,
+                        capabilityVersion: TCP_CAPABILITY_VERSION,
+                    },
+                };
+            }
+            throw error;
+        }
+        try {
+            // Strict decode against the sent offers: an unoffered selection
+            // or any version/field violation is malformed, never fallback
+            // evidence (R12).
+            return decodeNegotiateResponse(terminal.body, offers);
+        } catch (error) {
+            throw wrapNegotiationError(error);
+        }
+    }
+
+    /**
+     * KTD4 activate-then-commit barrier over one injected provider
+     * candidate: activation at candidate correlation 1 consumes the one-use
+     * token, commit at correlation 2 finalizes, and only then is the
+     * candidate generation published — with its application correlation
+     * allocator already at 3 — while the bootstrap retires. Any failure or
+     * uncertainty closes BOTH channels without TCP continuation (R12).
+     */
+    private async activateCandidate(
+        bootstrap: ActiveConnection,
+        grant: Extract<NegotiateResponse, { kind: "grant" }>,
+        stage: Deadline,
+    ): Promise<ActiveConnection> {
+        const provider = this.transportRegistry.find(
+            grant.selected.transport,
+            grant.selected.capabilityVersion,
+        );
+        if (!provider) {
+            // Unreachable through the decoder (a selection must name a sent
+            // offer), kept as a fail-closed guard.
+            const failure = new SubcCallError(
+                "terminal",
+                "host granted a transport with no installed provider",
+                "negotiation_failed",
+            );
+            bootstrap.generation.retire("negotiation_failed", failure);
+            throw failure;
+        }
+        const snapshot = bootstrap.snapshot;
+        let conn: ActiveConnection | null = null;
+        const candidate = new ConnectionGeneration({
+            host: snapshot.endpoint.host,
+            port: snapshot.endpoint.port,
+            credentials: { key: snapshot.key, daemonId: snapshot.daemonId },
+            channelFactory: sanitizedCandidateFactory(provider, grant.descriptor),
+            firstCorrelation: ACTIVATION_CORRELATION,
+            onRetired: (info) => {
+                if (conn) this.onGenerationRetired(conn, info);
+            },
+            onRouteGoodbye: (channel, epoch) => {
+                if (conn) this.onRouteGoodbye(conn, channel, epoch);
+            },
+            onDiagnostic: this.diagnostics ? (event) => this.emitDiagnostics(event) : undefined,
+            ...this.generationOptions,
+        });
+        conn = {
+            generation: candidate,
+            token: newConnectionToken(),
+            snapshot,
+            transport: grant.selected.transport,
+        };
+        try {
+            await candidate.start(stage);
+            const activate = await this.awaitRequest(candidate, {
+                channel: 0,
+                epoch: 0,
+                body: encodeActivateRequest(grant.activationToken),
+                deadline: stage,
+                options: {},
+            });
+            decodeActivateResponse(activate.body);
+            const commit = await this.awaitRequest(candidate, {
+                channel: 0,
+                epoch: 0,
+                body: commitRequestJson(),
+                deadline: stage,
+                options: {},
+            });
+            decodeCommitResponse(commit.body);
+        } catch (error) {
+            const failure = wrapNegotiationError(error);
+            candidate.retire("negotiation_failed", failure);
+            bootstrap.generation.retire("negotiation_failed", failure);
+            throw failure;
+        }
+        if (this.closeStarted || candidate.isRetired()) {
+            const failure = this.closeStarted
+                ? new SubcError("client closed", "client_closed")
+                : new SubcCallError(
+                      "not_sent",
+                      "candidate channel retired before promotion",
+                      "negotiation_failed",
+                  );
+            const reason = this.closeStarted ? "owner_close" : "negotiation_failed";
+            candidate.retire(reason, failure);
+            bootstrap.generation.retire(reason, failure);
+            throw failure;
+        }
+        // Atomic promotion: publish the finalized candidate, then retire the
+        // bootstrap; the host already replaced it after the commit response
+        // reached local completion.
+        this.active = conn;
+        this.liveRoutes.clear();
+        bootstrap.generation.retire("owner_close");
+        this.emitDiagnostics({
+            type: "connected",
+            daemonVer: snapshot.daemonVer.slice(0, MAX_DIAGNOSTIC_STRING_LEN),
+            pid: snapshot.pid,
+            transport: conn.transport,
         });
         return conn;
     }
@@ -1200,6 +1420,18 @@ function parseResponseJson(terminal: RequestTerminal): unknown {
             error,
         );
     }
+}
+
+function wrapNegotiationError(error: unknown): Error {
+    if (error instanceof NegotiationError) {
+        return new SubcCallError(
+            "terminal",
+            `transport negotiation failed: ${error.message}`,
+            "negotiation_failed",
+            error,
+        );
+    }
+    return error instanceof Error ? error : new Error(String(error));
 }
 
 function toManagedCallError(error: unknown): SubcCallError {
