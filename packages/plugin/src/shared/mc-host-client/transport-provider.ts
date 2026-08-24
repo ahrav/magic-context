@@ -156,7 +156,13 @@ export function sanitizedCandidateFactory(
                     throw sanitizedProviderError(provider.transport, "start");
                 }
             },
-            beginFrames: () => channel.beginFrames(),
+            beginFrames: () => {
+                try {
+                    channel.beginFrames();
+                } catch {
+                    throw sanitizedProviderError(provider.transport, "channel");
+                }
+            },
             send: (frame, hooks) => {
                 try {
                     return channel.send(frame, hooks);
@@ -178,7 +184,17 @@ export function sanitizedCandidateFactory(
                     throw sanitizedChannelFailure(provider.transport, "flush", error);
                 }
             },
-            close: (error) => channel.close(error),
+            close: (error) => {
+                try {
+                    channel.close(error);
+                } catch {
+                    // Swallowed: close runs inside generation retirement,
+                    // after retirement state is set but before its promise
+                    // resolves — a provider throw here would leave the
+                    // retirement unresolved and the facade's active slot
+                    // stuck. The channel is being abandoned either way.
+                }
+            },
             isClosed: () => channel.isClosed(),
             stats: () => channel.stats(),
         };

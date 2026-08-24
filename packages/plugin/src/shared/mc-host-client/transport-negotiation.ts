@@ -430,16 +430,26 @@ function requireTransportName(fields: Map<string, StrictValue>, pathPrefix: stri
 
 type PlainJson = null | boolean | string | number | PlainJson[] | { [key: string]: PlainJson };
 
-function strictToPlain(value: StrictValue): PlainJson {
+const INTEGER_LITERAL_RE = /^-?(?:0|[1-9]\d*)$/;
+
+function strictToPlain(value: StrictValue, path: string): PlainJson {
     switch (value.kind) {
         case "null":
             return null;
         case "boolean":
         case "string":
+            return value.value;
         case "number":
+            // A JSON integer beyond the double-safe range would silently
+            // round (9007199254740993 becomes ...992), handing the provider
+            // altered identifiers. This client cannot represent it
+            // faithfully, so it is rejected rather than corrupted.
+            if (INTEGER_LITERAL_RE.test(value.raw) && !Number.isSafeInteger(value.value)) {
+                throw new NegotiationError("invalid_type", path);
+            }
             return value.value;
         case "array":
-            return value.items.map(strictToPlain);
+            return value.items.map((item) => strictToPlain(item, path));
         case "object": {
             // Null prototype: an own `"__proto__"` key must become an own
             // data property. Assigning it onto `{}` would invoke the
@@ -450,7 +460,7 @@ function strictToPlain(value: StrictValue): PlainJson {
                 [key: string]: PlainJson;
             };
             for (const [key, entry] of value.entries) {
-                out[key] = strictToPlain(entry);
+                out[key] = strictToPlain(entry, path);
             }
             return out;
         }
@@ -482,7 +492,7 @@ function strictDepth(value: StrictValue): number {
  */
 function checkOpaque(value: StrictValue, path: string): OpaqueObject {
     if (value.kind !== "object") throw new NegotiationError("invalid_type", path);
-    const plain = strictToPlain(value) as OpaqueObject;
+    const plain = strictToPlain(value, path) as OpaqueObject;
     const compactBytes = new TextEncoder().encode(JSON.stringify(plain)).length;
     if (compactBytes > MAX_OPAQUE_BYTES) {
         throw new NegotiationError("opaque_too_large", path);
@@ -676,20 +686,17 @@ function decodeTaggedOnly(bytes: Uint8Array, op: string): void {
 /**
  * The closed set of legacy Error terminal codes that prove
  * `transport.negotiate` was never dispatched, so selecting TCP on this
- * connection is safe (KTD6):
- *
- * - `unsupported_operation` — a pre-negotiation daemon does not know the op.
- * - `server_busy` — a pre-negotiation daemon takes its global pending-request
- *   permit *before* dispatching on `op`, so a saturated one answers
- *   negotiation with this rather than `unsupported_operation`. A
- *   negotiation-aware daemon exempts negotiation from that admission and so
- *   never emits it on the negotiation correlation, which keeps the code
- *   unambiguous evidence of a no-dispatch rejection on a connection that is
- *   still serviceable.
+ * connection is safe (KTD6). Wire doc §7.7.3 names the exact legacy
+ * `unsupported_operation` terminal as the ONLY Error-based continuation
+ * evidence. `server_busy` is deliberately excluded: the doc permits a
+ * compliant negotiation-aware host to reject any control request before
+ * dispatch under load, so the code is not unambiguous legacy evidence —
+ * and it is independently retryable, which retirement plus reconnect
+ * already provides.
  *
  * Every other Error body is malformed negotiation content and fails closed.
  */
-const LEGACY_FALLBACK_CODES: readonly string[] = ["unsupported_operation", "server_busy"];
+const LEGACY_FALLBACK_CODES: readonly string[] = ["unsupported_operation"];
 
 /**
  * The `code` of a strict legacy Error terminal: UTF-8 JSON `{code, message}`
@@ -763,11 +770,13 @@ function plainDepth(value: unknown): number {
  * compact-size bounds, applied to a provider-supplied value about to be
  * serialized, so a provider cannot push an out-of-contract offer or
  * descriptor onto the wire and burn the generation on the host's reject.
- * Bounds are checked on the SERIALIZED form: `toJSON`, `Date`, dropped
+ * Bounds are checked on the SERIALIZED form — `toJSON`, `Date`, dropped
  * `undefined` members, and other JavaScript-only shapes all differ from
- * their pre-serialization value, and only the serialized bytes matter.
+ * their pre-serialization value — and the returned parsed snapshot is what
+ * callers MUST encode: a stateful `toJSON` could otherwise pass validation
+ * and emit a different shape on the second serialization.
  */
-function checkOpaquePlain(value: unknown, path: string): void {
+function checkOpaquePlain(value: unknown, path: string): OpaqueObject {
     const serialized = JSON.stringify(value);
     if (serialized === undefined) {
         throw new NegotiationError("invalid_type", path);
@@ -787,6 +796,7 @@ function checkOpaquePlain(value: unknown, path: string): void {
     if (plainDepth(parsed) > MAX_OPAQUE_DEPTH) {
         throw new NegotiationError("opaque_too_deep", path);
     }
+    return parsed as OpaqueObject;
 }
 
 /**
@@ -816,15 +826,18 @@ export function encodeNegotiateRequest(request: NegotiateRequest): Uint8Array {
         ) {
             throw new NegotiationError("duplicate_offer", path);
         }
-        if (offer.parameters !== undefined) {
-            checkOpaquePlain(offer.parameters, `${path}.parameters`);
-        }
-        return offer.parameters === undefined
+        // The validated snapshot — not the original value — reaches the
+        // wire, so what was checked is exactly what is sent.
+        const parameters =
+            offer.parameters === undefined
+                ? undefined
+                : checkOpaquePlain(offer.parameters, `${path}.parameters`);
+        return parameters === undefined
             ? { transport: offer.transport, capability_version: offer.capabilityVersion }
             : {
                   transport: offer.transport,
                   capability_version: offer.capabilityVersion,
-                  parameters: offer.parameters,
+                  parameters,
               };
     });
     if (!request.offers.some((offer) => offer.transport === TRANSPORT_TCP)) {
@@ -864,7 +877,8 @@ export function encodeNegotiateResponse(response: NegotiateResponse): Uint8Array
     if (!isValidActivationToken(response.activationToken)) {
         throw new NegotiationError("invalid_activation_token", "activation_token");
     }
-    checkOpaquePlain(response.descriptor, "descriptor");
+    // The validated snapshot — not the original value — reaches the wire.
+    const descriptor = checkOpaquePlain(response.descriptor, "descriptor");
     return new TextEncoder().encode(
         JSON.stringify({
             op: OP_TRANSPORT_NEGOTIATE,
@@ -874,7 +888,7 @@ export function encodeNegotiateResponse(response: NegotiateResponse): Uint8Array
                 capability_version: selected.capabilityVersion,
             },
             activation_token: response.activationToken,
-            descriptor: response.descriptor,
+            descriptor,
         }),
     );
 }

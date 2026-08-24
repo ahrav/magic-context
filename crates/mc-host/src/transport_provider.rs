@@ -93,17 +93,38 @@ pub trait InjectedProvider: Send + Sync + 'static {
     fn prepare(&self, ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure>;
 }
 
+/// One registered provider with its identity snapshotted at registration.
+#[derive(Clone)]
+struct ProviderEntry {
+    transport: Box<str>,
+    capability_version: u32,
+    provider: Arc<dyn InjectedProvider>,
+}
+
 /// The host's provider registry. `Default` (production) is empty: TCP is the
 /// implicit bootstrap transport and the only production channel.
 #[derive(Clone, Default)]
 pub struct TransportProviders {
-    injected: Vec<Arc<dyn InjectedProvider>>,
+    injected: Vec<ProviderEntry>,
 }
 
 impl TransportProviders {
     /// Test seam: a registry with injected providers beside implicit TCP.
+    /// Provider-authored `transport()` and `capability_version()` run once,
+    /// here: negotiation lookups on a connection's read loop touch only the
+    /// snapshot, so a slow or blocking metadata method cannot stall reads
+    /// before the setup deadline exists.
     pub fn with_injected(injected: Vec<Arc<dyn InjectedProvider>>) -> Self {
-        Self { injected }
+        Self {
+            injected: injected
+                .into_iter()
+                .map(|provider| ProviderEntry {
+                    transport: provider.transport().into(),
+                    capability_version: provider.capability_version(),
+                    provider,
+                })
+                .collect(),
+        }
     }
 
     /// Provider identity is `(transport, capability_version)`: the same
@@ -115,9 +136,12 @@ impl TransportProviders {
         transport: &str,
         capability_version: u32,
     ) -> Option<&Arc<dyn InjectedProvider>> {
-        self.injected.iter().find(|provider| {
-            provider.transport() == transport && provider.capability_version() == capability_version
-        })
+        self.injected
+            .iter()
+            .find(|entry| {
+                &*entry.transport == transport && entry.capability_version == capability_version
+            })
+            .map(|entry| &entry.provider)
     }
 
     /// True when some provider serves `transport` at any capability version.
@@ -126,13 +150,13 @@ impl TransportProviders {
     pub(crate) fn serves_transport(&self, transport: &str) -> bool {
         self.injected
             .iter()
-            .any(|provider| provider.transport() == transport)
+            .any(|entry| &*entry.transport == transport)
     }
 }
 
 impl fmt::Debug for TransportProviders {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names: Vec<&str> = self.injected.iter().map(|p| p.transport()).collect();
+        let names: Vec<&str> = self.injected.iter().map(|e| &*e.transport).collect();
         f.debug_struct("TransportProviders")
             .field("injected", &names)
             .finish()

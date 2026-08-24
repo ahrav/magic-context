@@ -1859,6 +1859,22 @@ describe("transport negotiation", () => {
         expect(conn.frames.filter(isNegotiate).length).toBe(1);
     });
 
+    test("KTD6: a canonical server_busy negotiation terminal fails closed without TCP fallback", async () => {
+        // Wire doc §7.7.3: the exact legacy `unsupported_operation` terminal
+        // is the only Error-based continuation evidence. A compliant
+        // negotiation-aware host may reject any control request before
+        // dispatch under load, so `server_busy` is not legacy proof.
+        const peer = await startPeer({
+            negotiate: (frame, conn) => void sendErrorBody(conn, frame.corr, "server_busy"),
+        });
+        const { error } = await connectRejected({ peer });
+        expectCallError(error, "terminal", "negotiation_failed");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isNegotiate).length).toBe(1);
+    });
+
     test("KTD6: a noncanonical unsupported_operation terminal fails closed without TCP fallback", async () => {
         // Extra fields disqualify the terminal as legacy evidence: only the
         // byte-exact `{code, message}` Error body may select TCP fallback.

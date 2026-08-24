@@ -817,7 +817,16 @@ async fn handle_negotiate<H: McHostHandler>(
         Err(_) => {
             // §7.7.1: the documented terminal, then retirement. The close
             // fences exactly this authoritative frame, like the
-            // oversized-control path.
+            // oversized-control path. Liveness stops first: the generation
+            // is closing with exactly this frame, and a missed-Pong
+            // invalidation during the bounded egress wait below would
+            // cancel the generation and abort the terminal the contract
+            // requires.
+            let liveness = gen.liveness.lock().expect("liveness lock").take();
+            if let Some(handle) = liveness {
+                handle.stop.cancel();
+                let _ = handle.task.await;
+            }
             let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
             crate::dispatch::emit_authoritative_rejection(
                 shared,

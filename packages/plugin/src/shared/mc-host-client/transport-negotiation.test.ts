@@ -319,6 +319,15 @@ describe("opaque value bounds", () => {
         }
     });
 
+    test("opaque integers beyond the double-safe range are rejected", () => {
+        expectCode(
+            () => decodeNegotiateRequest(bytes(requestWithParameters('{"id":9007199254740993}'))),
+            "invalid_type",
+        );
+        // The largest double-safe integer still round-trips.
+        decodeNegotiateRequest(bytes(requestWithParameters('{"id":9007199254740991}')));
+    });
+
     test("an own __proto__ key stays an own data property", () => {
         // Assigning "__proto__" onto a normal object invokes the prototype
         // setter: the subtree would vanish from JSON.stringify (bypassing
@@ -613,5 +622,26 @@ describe("encode-side validation", () => {
             "opaque_too_large",
         );
         expect(error.path).toBe("descriptor");
+    });
+
+    test("a stateful toJSON cannot emit a different shape than was validated", () => {
+        // checkOpaquePlain serializes once and the validated snapshot is
+        // what reaches the wire, so the second toJSON result never exists.
+        let calls = 0;
+        const sneaky = {
+            toJSON: () => {
+                calls += 1;
+                return calls === 1 ? { ok: true } : "bad";
+            },
+        };
+        const encoded = encodeNegotiateRequest({
+            negotiationVersion: NEGOTIATION_VERSION,
+            offers: [
+                { transport: "shm", capabilityVersion: 1, parameters: sneaky } as TransportOffer,
+                tcpOffer(1),
+            ],
+        });
+        const decoded = decodeNegotiateRequest(encoded);
+        expect(decoded.offers[0]?.parameters).toEqual({ ok: true });
     });
 });
