@@ -15,7 +15,7 @@ use mc_host::broca::supervisor::{SessionKey, Subscription, Supervisor, Superviso
 use mc_host::broca::BrocaComponent;
 use mc_host::CompositeComponent;
 
-use support::broca::{open_broca_route, send_call, send_params, BrocaHost, ScriptedBackend};
+use support::broca::{open_broca_route, send_call, send_params, start_broca_host, ScriptedBackend};
 
 fn key(session: &str) -> SessionKey {
     SessionKey {
@@ -896,7 +896,7 @@ async fn transport_detach_paths_leave_the_run_untouched() {
     let (backend, gate) = ScriptedBackend::gated("survivor output");
     let component = BrocaComponent::new(Arc::clone(&backend) as Arc<_>);
     let supervisor = component.supervisor();
-    let host = BrocaHost::start(component).await;
+    let host = start_broca_host(component).await;
 
     let mut client = host.client().await;
     let (command_ch, command_ep) = open_broca_route(&mut client, "opencode", "s1").await;
@@ -1046,7 +1046,7 @@ async fn host_shutdown_drains_the_supervisor_to_zero_state() {
     let (backend, _gate) = ScriptedBackend::gated("out");
     let component = BrocaComponent::new(Arc::clone(&backend) as Arc<_>);
     let supervisor = component.supervisor();
-    let host = BrocaHost::start(component).await;
+    let host = start_broca_host(component).await;
 
     let mut client = host.client().await;
     let (command_ch, command_ep) = open_broca_route(&mut client, "pi", "s1").await;

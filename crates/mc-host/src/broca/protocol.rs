@@ -172,7 +172,7 @@ fn decode<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, RequestErr
 /// binary rejection, the 512 KiB body cap, and the structural depth bound
 /// (R3, R6). Runs before the supervisor is ever consulted, so an oversize
 /// body is rejected before backend admission.
-pub fn preflight(body: &[u8], binary: bool) -> Result<(), RequestError> {
+fn preflight(body: &[u8], binary: bool) -> Result<(), RequestError> {
     if binary {
         return Err(schema("broca requests are JSON only"));
     }
@@ -187,7 +187,7 @@ pub fn preflight(body: &[u8], binary: bool) -> Result<(), RequestError> {
 
 /// Typed decode after [`preflight`]. Only the five contract methods exist;
 /// anything else is refused without creating state (R3).
-pub fn decode_request(body: &[u8]) -> Result<Request, RequestError> {
+fn decode_request(body: &[u8]) -> Result<Request, RequestError> {
     let envelope: MapOnly<MethodEnvelope> = decode(body)?;
     match envelope.0.method.as_ref() {
         "session.send" => {

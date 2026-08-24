@@ -42,12 +42,8 @@ pub struct BrocaComponent {
 
 impl BrocaComponent {
     pub fn new(backend: Arc<dyn LlmExecutionBackend>) -> Self {
-        Self::with_supervisor(Supervisor::new(backend))
-    }
-
-    pub fn with_supervisor(supervisor: Supervisor) -> Self {
         Self {
-            supervisor: Arc::new(supervisor),
+            supervisor: Arc::new(Supervisor::new(backend)),
             routes: Arc::new(Mutex::new(HashMap::new())),
         }
     }

@@ -1026,12 +1026,6 @@ impl Subscription {
             }
         }
     }
-
-    /// The run this cursor replays; lets a detach test re-subscribe and
-    /// assert byte-identical replay for the same run.
-    pub fn run_id(&self) -> &str {
-        &self.run.run_id
-    }
 }
 
 impl std::fmt::Debug for Subscription {

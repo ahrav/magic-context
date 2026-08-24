@@ -14,9 +14,9 @@ use mc_host::broca::backend::{
     EventSink, FinishReason, LlmExecutionBackend,
 };
 use mc_host::broca::{BrocaComponent, BROCA_MODULE_ID};
-use mc_host::{CancellationToken, HostConfig, HostError, HostLimits, StaticComposite};
+use mc_host::{CancellationToken, StaticComposite};
 
-use super::raw_client::{self, Discovered, RawFrame};
+use super::raw_client::{self, RawFrame};
 
 pub const ROOT: &str = "/workspace/project";
 pub const BUDGET: Duration = Duration::from_secs(5);
@@ -180,87 +180,17 @@ impl LlmExecutionBackend for ScriptedBackend {
 
 /// Real-loopback host whose tertiary is the supplied Broca component, with
 /// the fixed direct-profile catalog shape (magic-context, synapse, broca).
-pub struct BrocaHost {
-    pub info: Discovered,
-    shutdown: CancellationToken,
-    join: Option<tokio::task::JoinHandle<Result<(), HostError>>>,
-    _data_root: tempfile::TempDir,
-}
-
-impl BrocaHost {
-    pub async fn start(component: BrocaComponent) -> Self {
-        let composite = StaticComposite::new(
-            super::synapse::EchoPrimary,
-            super::StubComponent::new("synapse", "management_surface"),
-            component,
-        )
-        .expect("distinct component ids");
-        let data_root = tempfile::tempdir().expect("temp data root");
-        let mut config = HostConfig {
-            data_dir: Some(data_root.path().to_path_buf()),
-            daemon_ver: "mc-host/test".to_owned(),
-            limits: HostLimits {
-                max_resident_bytes: mc_host::config::MIN_RESIDENT_BYTES * 2,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        config.timing.frame_deadline = Duration::from_secs(5);
-        config.timing.shutdown_deadline = Duration::from_secs(5);
-        config.timing.route_close_budget = Duration::from_secs(2);
+pub async fn start_broca_host(component: BrocaComponent) -> super::CompositeTestHost {
+    let composite = StaticComposite::new(
+        super::synapse::EchoPrimary,
+        super::StubComponent::new("synapse", "management_surface"),
+        component,
+    )
+    .expect("distinct component ids");
+    super::CompositeTestHost::start(composite, |config| {
         config.timing.lifecycle_callback_deadline = Duration::from_secs(3);
-
-        let publication = super::connection_file(data_root.path());
-        let shutdown = CancellationToken::new();
-        let run_shutdown = shutdown.clone();
-        let join = tokio::spawn(async move { mc_host::run(composite, config, run_shutdown).await });
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if join.is_finished() {
-                panic!(
-                    "host exited before publishing: {:?}",
-                    join.await.expect("run task joins")
-                );
-            }
-            if std::fs::read(&publication).is_ok() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "host did not publish in time"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let info = raw_client::discover(&publication).expect("publication validates");
-        Self {
-            info,
-            shutdown,
-            join: Some(join),
-            _data_root: data_root,
-        }
-    }
-
-    pub async fn client(&self) -> raw_client::RawClient {
-        raw_client::RawClient::connect(&self.info)
-            .await
-            .expect("authenticated connection")
-    }
-
-    pub async fn shutdown(mut self) -> Result<(), HostError> {
-        self.shutdown.cancel();
-        let join = self.join.take().expect("host runs once");
-        tokio::time::timeout(Duration::from_secs(20), join)
-            .await
-            .expect("host finishes within its shutdown budget")
-            .expect("run task joins")
-    }
-}
-
-impl Drop for BrocaHost {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-    }
+    })
+    .await
 }
 
 pub async fn open_broca_route(

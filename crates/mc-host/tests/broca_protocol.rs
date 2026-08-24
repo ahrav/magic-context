@@ -12,7 +12,8 @@ use mc_host::broca::{config, BrocaComponent};
 use mc_host::{BindOutcome, CompositeComponent, RouteHandle, RouteIdentity};
 
 use support::broca::{
-    call, drain_subscribe, open_broca_route, send_call, send_params, BrocaHost, ScriptedBackend,
+    call, drain_subscribe, open_broca_route, send_call, send_params, start_broca_host,
+    ScriptedBackend,
 };
 
 fn body(value: serde_json::Value) -> Vec<u8> {
@@ -384,7 +385,7 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
     let backend = ScriptedBackend::completing("historian output");
     let component = BrocaComponent::new(Arc::clone(&backend) as Arc<_>);
     let supervisor = component.supervisor();
-    let host = BrocaHost::start(component).await;
+    let host = start_broca_host(component).await;
     let mut client = host.client().await;
     let (command_ch, command_ep) = open_broca_route(&mut client, "opencode", "hist:1").await;
     let (sub_ch, sub_ep) = open_broca_route(&mut client, "opencode", "hist:1").await;
@@ -565,7 +566,7 @@ async fn malformed_requests_over_the_host_create_no_run_state() {
     let backend = ScriptedBackend::completing("out");
     let component = BrocaComponent::new(Arc::clone(&backend) as Arc<_>);
     let supervisor = component.supervisor();
-    let host = BrocaHost::start(component).await;
+    let host = start_broca_host(component).await;
     let mut client = host.client().await;
     let (channel, epoch) = open_broca_route(&mut client, "pi", "s1").await;
 

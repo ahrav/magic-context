@@ -80,7 +80,6 @@ impl std::fmt::Debug for BackendRequest {
 pub enum FinishReason {
     Completed,
     Length,
-    MaxTokens,
     MaxOutputTokens,
 }
 
@@ -89,14 +88,8 @@ impl FinishReason {
         match self {
             Self::Completed => "completed",
             Self::Length => "length",
-            Self::MaxTokens => "max_tokens",
             Self::MaxOutputTokens => "max_output_tokens",
         }
-    }
-
-    /// Whether producer policy treats this reason as a truncated output.
-    pub fn is_length_class(self) -> bool {
-        !matches!(self, Self::Completed)
     }
 }
 
