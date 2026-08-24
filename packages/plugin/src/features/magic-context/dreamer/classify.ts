@@ -494,9 +494,11 @@ async function runClassifyThroughModule(
         memories: chunk.map(toPromptMemory),
         anchors,
     });
-    // Prompt construction consumes the slice budget.
+    // Prompt construction consumes the slice budget. A remainder at or below
+    // the purge margin would give the module an unworkable budget and fail
+    // the task; leaving the chunk unbanked keeps it eligible next slice.
     const remainingMs = Math.min(sliceDeadline, args.deadline) - Date.now();
-    if (remainingMs <= 0) {
+    if (remainingMs <= CLASSIFY_MODULE_PURGE_MARGIN_MS) {
         log("[dreamer] classify: slice budget expired before the module call; chunk left unbanked");
         return null;
     }
@@ -523,8 +525,8 @@ async function runClassifyThroughModule(
                 // Shorter than the transport budget below so the module's own
                 // deadline machinery — not a transport cancel that aborts the
                 // handler mid-cleanup — ends an over-budget run and purges its
-                // attempt session.
-                timeout_ms: Math.max(1, remainingMs - CLASSIFY_MODULE_PURGE_MARGIN_MS),
+                // attempt session. The guard above keeps this positive.
+                timeout_ms: remainingMs - CLASSIFY_MODULE_PURGE_MARGIN_MS,
                 items: chunk.map((candidate) => ({
                     memory_id: candidate.id,
                     content_hash: candidate.normalizedHash,

@@ -555,7 +555,9 @@ describe("module-backed classification", () => {
                 }
                 return acceptAllRows(call);
             });
-            args.deadline = Date.now() + 10_000;
+            // Each chunk's slice must clear the module purge margin, or the
+            // chunk is left unbanked instead of calling the module.
+            args.deadline = Date.now() + 100_000;
 
             await runClassify(args);
 
@@ -563,9 +565,9 @@ describe("module-backed classification", () => {
             // Chunk 1 gets half the budget; chunk 2, as the last chunk, gets the
             // live remainder — larger than its original half share but reduced by
             // the 200ms chunk 1 consumed.
-            expect(taskCalls[0].timeoutMs).toBeLessThanOrEqual(5_000);
-            expect(taskCalls[1].timeoutMs).toBeGreaterThan(5_000);
-            expect(taskCalls[1].timeoutMs).toBeLessThanOrEqual(9_900);
+            expect(taskCalls[0].timeoutMs).toBeLessThanOrEqual(50_000);
+            expect(taskCalls[1].timeoutMs).toBeGreaterThan(50_000);
+            expect(taskCalls[1].timeoutMs).toBeLessThanOrEqual(99_900);
         } finally {
             closeQuietly(db);
         }

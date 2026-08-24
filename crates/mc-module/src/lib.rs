@@ -9737,7 +9737,12 @@ impl McHandler {
                 let Some(ms) = value.as_u64().filter(|ms| *ms > 0) else {
                     return invalid_params_error("classify timeout_ms must be a positive integer");
                 };
-                Some(Instant::now() + Duration::from_millis(ms))
+                // `Instant + Duration` panics on overflow, so an absurd
+                // budget is a parameter error, not a crashed handler task.
+                let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
+                    return invalid_params_error("classify timeout_ms is out of range");
+                };
+                Some(deadline)
             }
         };
 

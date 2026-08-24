@@ -1349,13 +1349,14 @@ async fn saturated_broca_reserves_do_not_block_magic_context_echo() {
     }
     // The blocked cancels below target sat-0's run, which must actually hold
     // a backend permit — a queued run's cancel would settle immediately and
-    // never pin its command permit.
+    // never pin its command permit. The eight permit holders start
+    // concurrently, so the count is awaited rather than asserted: the gate
+    // blocks every completion, making eight the settled value.
     wait_until(
-        || backend.seen().iter().any(|run| run.session == "sat-0"),
-        "sat-0's backend to start",
+        || backend.starts() == 8 && backend.seen().iter().any(|run| run.session == "sat-0"),
+        "sat-0 and all eight backend permit holders to start",
     )
     .await;
-    assert_eq!(backend.starts(), 8, "eight backend permits, eight starts");
 
     // Both subscription positions on every run except the cancel target. commentlint: allow(JUDGE)
     for route in &broca_routes[1..] {
