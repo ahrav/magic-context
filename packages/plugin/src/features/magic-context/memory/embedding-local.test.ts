@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-context";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import {
+    getLocalEmbeddingRecipe,
     isNativeRuntimeMissingError,
     type LocalEmbeddingDtype,
     LocalEmbeddingProvider,
 } from "./embedding-local";
+import { computeNormalizedHash } from "./normalize-hash";
 
 // Part A of issue #128: classify the PERMANENT "native runtime not installed"
 // failure so the provider degrades once (one actionable log line) instead of
@@ -99,7 +102,7 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
         const provider = new LocalEmbeddingProvider();
         const expected = getEmbeddingProviderIdentity({
             provider: "local",
-            model: "Xenova/all-MiniLM-L6-v2",
+            model: "Xenova/bge-small-en-v1.5",
         });
         expect(provider.modelId).toBe(expected);
     });
@@ -143,5 +146,123 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
             "int8" as LocalEmbeddingDtype,
         );
         expect(q8.modelId).not.toBe(int8.modelId);
+    });
+});
+
+// A model's pooling and query instruction come from its own card; applying the
+// wrong ones still produces plausible vectors with quietly wrong rankings, so
+// the recipe is bound to the model id and exercised through the provider's real
+// embed paths here. `initialize()` returns early when a pipeline is already
+// present, which lets these tests inject a recording fake without a new seam.
+describe("local embedding recipes", () => {
+    const BGE_MODEL = "Xenova/bge-small-en-v1.5";
+    const BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
+
+    /** The identity string a local config produced before recipes existed:
+     *  provider + model only. Unlisted models must still hash to exactly this
+     *  (no global re-embed from shipping the recipe feature), while a
+     *  recipe-bound model must NOT — its recipe changes the produced vectors,
+     *  so vectors stored under the pre-recipe identity are a different space. */
+    const preRecipeIdentity = (model: string): string =>
+        `embedding-provider:${computeNormalizedHash(
+            JSON.stringify({
+                provider: "local",
+                model,
+                endpoint: "",
+                apiKeyPresent: false,
+            }),
+        )}`;
+
+    test("unlisted models keep the pre-recipe identity byte-identical", () => {
+        const model = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
+        expect(getEmbeddingProviderIdentity({ provider: "local", model })).toBe(
+            preRecipeIdentity(model),
+        );
+    });
+
+    test("a recipe-bound model folds its recipe into the identity", () => {
+        expect(getEmbeddingProviderIdentity({ provider: "local", model: BGE_MODEL })).not.toBe(
+            preRecipeIdentity(BGE_MODEL),
+        );
+    });
+
+    test("bge-small binds CLS pooling and the query-only instruction", () => {
+        expect(getLocalEmbeddingRecipe(BGE_MODEL)).toEqual({
+            pooling: "cls",
+            queryPrefix: BGE_QUERY_PREFIX,
+        });
+    });
+
+    test("the default model has a bound recipe rather than the symmetric fallback", () => {
+        expect(getLocalEmbeddingRecipe(DEFAULT_LOCAL_EMBEDDING_MODEL)).toEqual({
+            pooling: "cls",
+            queryPrefix: BGE_QUERY_PREFIX,
+        });
+    });
+
+    test("the upstream BAAI id binds the same recipe as the Xenova export", () => {
+        expect(getLocalEmbeddingRecipe("BAAI/bge-small-en-v1.5")).toEqual(
+            getLocalEmbeddingRecipe(BGE_MODEL),
+        );
+    });
+
+    test("unlisted models keep the symmetric mean recipe", () => {
+        expect(getLocalEmbeddingRecipe("Xenova/all-MiniLM-L6-v2")).toEqual({
+            pooling: "mean",
+            queryPrefix: "",
+        });
+    });
+
+    interface RecordedCall {
+        input: string | string[];
+        options: { pooling: "mean" | "cls"; normalize: true };
+    }
+
+    function providerWithRecordingPipeline(model: string): {
+        provider: LocalEmbeddingProvider;
+        calls: RecordedCall[];
+    } {
+        const calls: RecordedCall[] = [];
+        const fake = (input: string | string[], options: RecordedCall["options"]) => {
+            calls.push({ input, options });
+            const count = Array.isArray(input) ? input.length : 1;
+            return Promise.resolve({ data: new Float32Array(4 * count), dims: [count, 4] });
+        };
+        const provider = new LocalEmbeddingProvider(model);
+        (provider as unknown as { pipeline: typeof fake }).pipeline = fake;
+        return { provider, calls };
+    }
+
+    test("embed applies the query instruction for query purpose only", async () => {
+        const { provider, calls } = providerWithRecordingPipeline(BGE_MODEL);
+        await provider.embed("find the parser", undefined, "query");
+        await provider.embed("the parser lives here", undefined, "passage");
+        await provider.embed("no purpose given");
+        expect(calls.map((c) => c.input)).toEqual([
+            `${BGE_QUERY_PREFIX}find the parser`,
+            "the parser lives here",
+            "no purpose given",
+        ]);
+        expect(calls.every((c) => c.options.pooling === "cls")).toBe(true);
+    });
+
+    test("embedBatch prefixes every query text and leaves passages untouched", async () => {
+        const { provider, calls } = providerWithRecordingPipeline(BGE_MODEL);
+        await provider.embedBatch(["a", "b"], undefined, "query");
+        await provider.embedBatch(["c", "d"], undefined, "passage");
+        expect(calls[0]!.input).toEqual([`${BGE_QUERY_PREFIX}a`, `${BGE_QUERY_PREFIX}b`]);
+        expect(calls[1]!.input).toEqual(["c", "d"]);
+        expect(
+            calls.every((c) => c.options.pooling === "cls" && c.options.normalize === true),
+        ).toBe(true);
+    });
+
+    test("an unlisted model embeds queries unprefixed with mean pooling", async () => {
+        const { provider, calls } = providerWithRecordingPipeline(
+            "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+        );
+        await provider.embed("find the parser", undefined, "query");
+        expect(calls[0]!.input).toBe("find the parser");
+        expect(calls[0]!.options.pooling).toBe("mean");
     });
 });

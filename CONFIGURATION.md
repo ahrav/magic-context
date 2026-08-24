@@ -549,8 +549,8 @@ Controls semantic search for cross-session memories.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `provider` | `"local"` \| `"openai-compatible"` \| `"off"` | `"local"` | `"local"` runs `Xenova/all-MiniLM-L6-v2` in-process. `"off"` disables semantic ranking entirely — see below. |
-| `model` | `string` | `"Xenova/all-MiniLM-L6-v2"` | Embedding model. |
+| `provider` | `"local"` \| `"openai-compatible"` \| `"off"` | `"local"` | `"local"` runs `Xenova/bge-small-en-v1.5` in-process. `"off"` disables semantic ranking entirely — see below. |
+| `model` | `string` | `"Xenova/bge-small-en-v1.5"` | Embedding model. The bge model's CLS pooling and query instruction are applied automatically; other models embed symmetrically (mean pooling, no instruction). |
 | `local_dtype` | `string` | — | Local provider only. ONNX model dtype passed to the transformers.js feature-extraction pipeline (`auto`, `fp32`, `fp16`, `q8`, `int8`, `uint8`, `q4`, `bnb4`, `q4f16`, `q2`, `q2f16`, `q1`, `q1f16`). Omitted keeps the default `fp32` behavior. |
 | `endpoint` | `string` | — | Required for `"openai-compatible"`. |
 | `api_key` | `string` | — | Optional API key for remote endpoints. |
@@ -577,7 +577,7 @@ When `provider: "off"`:
 
 > **Not every provider offers embeddings.** OpenRouter and Anthropic's public API do not expose `/embeddings`; use OpenAI, Voyage, Together, LM Studio, or the bundled `"local"` provider instead. `doctor` will flag 404/405 responses and show the actual error.
 
-> **Local provider — `local_dtype` (issue #259):** The default `Xenova/all-MiniLM-L6-v2` model is lightweight but performs poorly when matching queries in one language (e.g. Chinese) to memories in another (e.g. English). A multilingual model such as `Xenova/paraphrase-multilingual-MiniLM-L12-v2` fixes the recall, but its full-precision (`fp32`) ONNX weights are large (~448 MiB) and memory-hungry for a coding-agent process that may run parallel subagents. Set `embedding.local_dtype` to a quantized variant (e.g. `"q8"`) to load a smaller ONNX model (~113 MiB) with comparable retrieval quality and far lower peak RSS. The dtype is passed to the transformers.js `feature-extraction` pipeline and, because it changes the produced vectors, a non-default value folds into the embedding model identity — so switching dtype re-embeds your corpus rather than mixing incompatible vector spaces. Omit the field to keep the default `fp32` behavior; existing installs see zero change on upgrade.
+> **Local provider — `local_dtype` (issue #259):** The default `Xenova/bge-small-en-v1.5` model is English-only and performs poorly when matching queries in one language (e.g. Chinese) to memories in another (e.g. English). A multilingual model such as `Xenova/paraphrase-multilingual-MiniLM-L12-v2` fixes the recall, but its full-precision (`fp32`) ONNX weights are large (~448 MiB) and memory-hungry for a coding-agent process that may run parallel subagents. Set `embedding.local_dtype` to a quantized variant (e.g. `"q8"`) to load a smaller ONNX model (~113 MiB) with comparable retrieval quality and far lower peak RSS. The dtype is passed to the transformers.js `feature-extraction` pipeline and, because it changes the produced vectors, a non-default value folds into the embedding model identity — so switching dtype re-embeds your corpus rather than mixing incompatible vector spaces. Omit the field to keep the default `fp32` behavior; existing installs see zero change on upgrade.
 
 ---
 

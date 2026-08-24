@@ -120,7 +120,7 @@ If you need to downgrade intentionally, run `doctor --force` afterward — it wi
 
 **Symptom:** On first launch, the Magic Context Desktop app makes a network request or seems slow to start.
 
-**Why it happens:** The local embedding model (`Xenova/all-MiniLM-L6-v2`, ~90 MB) is downloaded on first use when `embedding.provider` is `"local"` (the default). This is a one-time download; subsequent launches use the cached model at `~/.local/share/cortexkit/magic-context/models/`.
+**Why it happens:** The local embedding model (`Xenova/bge-small-en-v1.5`, ~130 MB) is downloaded on first use when `embedding.provider` is `"local"` (the default). This is a one-time download; subsequent launches use the cached model at `~/.local/share/cortexkit/magic-context/models/`.
 
 **Fix:** If you want to avoid this download, set `embedding.provider: "off"` in your config (full-text search still works) or point it at a remote endpoint. See the [configuration reference](/reference/configuration/) for embedding options.
 

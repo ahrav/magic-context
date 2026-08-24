@@ -309,7 +309,6 @@ describe("runSetup", () => {
         expect(config.sidekick).not.toHaveProperty("enabled");
         expect(config.embedding).toEqual({
             provider: "local",
-            model: "Xenova/all-MiniLM-L6-v2",
         });
     });
 
