@@ -2563,23 +2563,27 @@ async function executeUnifiedSearch(args: {
                 const surface = options.memoryPolicySurface ?? "explicit_search";
                 const policyRows = readMemoryPolicyRows(db, memoryIds);
                 const digestsNow = exactMemoryContentDigests(db, memoryIds);
-                const droppedIds = new Set<number>();
-                for (const result of results) {
-                    if (result.source !== "memory") continue;
+                // Drop rows the final policy read hides AND refresh every
+                // survivor's trust label from that same read: a memory
+                // marked stale/flagged while the telemetry write waited
+                // stays eligible for explicit search but must carry the new
+                // label (and a row that became clean must shed its old one).
+                return results.flatMap<(typeof results)[number]>((result) => {
+                    if (result.source !== "memory") return [result];
                     const decision = decideMemoryPolicy(policyRows.get(result.memoryId), surface);
                     if (
                         !decision.eligible ||
                         (result.contentDigest !== undefined &&
                             digestsNow.get(result.memoryId) !== result.contentDigest)
                     ) {
-                        droppedIds.add(result.memoryId);
+                        return [];
                     }
-                }
-                if (droppedIds.size > 0) {
-                    return results.filter(
-                        (result) => result.source !== "memory" || !droppedIds.has(result.memoryId),
-                    );
-                }
+                    const { policyLabel: _stale, ...rest } = result;
+                    const refreshed: MemorySearchResult = decision.label
+                        ? { ...rest, policyLabel: decision.label }
+                        : rest;
+                    return [refreshed];
+                });
             }
         }
     }

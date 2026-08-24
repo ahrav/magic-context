@@ -84,6 +84,7 @@ export function ensureMuralRendered(
     // protects LATER rebuilds — this loop protects the render happening now.
     let pool: Memory[] = [];
     let poolStable = false;
+    let stableEpoch = 0;
     for (let attempt = 0; attempt < 2 && !poolStable; attempt += 1) {
         const epochAtLoad = getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0;
         pool = bindMemoriesToCurrentRevision(
@@ -96,6 +97,7 @@ export function ensureMuralRendered(
         );
         poolStable =
             (getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0) === epochAtLoad;
+        if (poolStable) stableEpoch = epochAtLoad;
     }
     if (!poolStable) {
         // Fail closed: the epoch moved during both attempts, so a quarantine
@@ -129,6 +131,20 @@ export function ensureMuralRendered(
     // assemble and deterministic, so an unchanged pool re-derives the same hash
     // and we skip PNG re-encode + DB write entirely.
     const textHash = createHash("sha256").update(rendered.sha256Input).digest("hex");
+
+    // Post-render revalidation: coverage, resolution, and PNG encoding all
+    // ran after the loop's last epoch read, and the image carries no trust
+    // label to demote. A quarantine, rejection, or rewrite landing in that
+    // window must not be reused, upserted, or returned for the current
+    // prompt — fail closed and let the next epoch-driven pass rebuild.
+    if ((getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0) !== stableEpoch) {
+        log(`[mural] skipped for ${projectIdentity}: memory pool changed during render`);
+        return {
+            hasMural: false,
+            rerendered: false,
+            skipReason: "memory pool changed during render",
+        };
+    }
 
     const existing = getMural(db, projectIdentity);
     if (

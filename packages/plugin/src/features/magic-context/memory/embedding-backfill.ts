@@ -81,7 +81,19 @@ export async function ensureMemoryEmbeddings(args: {
         // the transaction succeeds, so a rollback doesn't leave stale Map entries.
         const staged = new Map<number, StoredMemoryEmbedding>();
         args.db.transaction(() => {
+            // Re-bind inside the write transaction: the provider call above
+            // yielded, and the normalized-hash save guard alone cannot
+            // reject a case/whitespace-only rewrite that landed meanwhile —
+            // the save would reinstate the predecessor's vector (and cache
+            // it) under the successor bytes.
+            const digestsInTx = exactMemoryContentDigests(
+                args.db,
+                boundMissing.map((memory) => memory.id),
+            );
             for (const [index, memory] of boundMissing.entries()) {
+                if (digestsInTx.get(memory.id) !== sha256Utf8Hex(memory.content)) {
+                    continue;
+                }
                 const embedding = result.vectors[index];
                 if (!embedding) {
                     continue;
