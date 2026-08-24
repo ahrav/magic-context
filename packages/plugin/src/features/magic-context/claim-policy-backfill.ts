@@ -451,6 +451,10 @@ function seedRevisionInCurrentTransaction(
  *  path for a condition (a deleted or edited artifact) that is rare. */
 const artifactRevalidationLastRunMs = new Map<string, number>();
 const ARTIFACT_REVALIDATION_INTERVAL_MS = 5 * 60 * 1000;
+// A long-lived host cycling through many checkouts accumulates one entry per
+// identity+root pair; the map is not Database-scoped (roots outlive handles),
+// so cap it by evicting oldest-inserted entries instead.
+const ARTIFACT_REVALIDATION_THROTTLE_MAX_ENTRIES = 512;
 
 /** Test seam: clears the per-project throttle. */
 export function __resetArtifactRevalidationThrottleForTests(): void {
@@ -487,7 +491,15 @@ export function revalidateEnforcementArtifacts(
     const throttleKey = `${projectIdentity}\u0000${canonicalRoot}`;
     const last = artifactRevalidationLastRunMs.get(throttleKey) ?? 0;
     if (nowMs - last < ARTIFACT_REVALIDATION_INTERVAL_MS) return;
+    // Refresh insertion order so the cap below evicts the least-recently
+    // PROBED key, then bound the map.
+    artifactRevalidationLastRunMs.delete(throttleKey);
     artifactRevalidationLastRunMs.set(throttleKey, nowMs);
+    while (artifactRevalidationLastRunMs.size > ARTIFACT_REVALIDATION_THROTTLE_MAX_ENTRIES) {
+        const oldest = artifactRevalidationLastRunMs.keys().next().value;
+        if (oldest === undefined) break;
+        artifactRevalidationLastRunMs.delete(oldest);
+    }
     // The filesystem walk runs OFF the caller's synchronous path AND uses
     // asynchronous reads: the probe is invoked from the transform hot path,
     // and a large artifact must not block the event loop even when the
@@ -748,7 +760,8 @@ export function reconcileCompatibilityVerifications(db: Database): number {
         }>;
         if (events.length === 0) break;
         cursor = events[events.length - 1].id;
-        db.transaction(() => {
+        const pageCursor = cursor;
+        runImmediateTransactionWithBusyRetry(db, () => {
             for (const event of events) {
                 if (event.outcome === "verified") {
                     const divergent = db
@@ -784,21 +797,34 @@ export function reconcileCompatibilityVerifications(db: Database): number {
                     bumpEpochForClaimProjectInCurrentTransaction(db, event.claimId);
                 }
             }
-        }).immediate();
+            // The watermark advances WITH the page, inside the same
+            // transaction: a later page throwing (or the process dying)
+            // must not force the next pass to re-scan pages that already
+            // committed real epoch bumps. Monotonic re-read because two
+            // hosts can reconcile the shared database concurrently.
+            const stored = Number(
+                readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
+            );
+            if (pageCursor > stored) {
+                writeMeta(
+                    db,
+                    CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark,
+                    String(pageCursor),
+                );
+            }
+        });
     }
-    // Monotonic advance: two hosts can reconcile the shared database
-    // concurrently, and the slower one's lower maxEventId must not overwrite
-    // a higher stored watermark — re-consuming negative events would bump
-    // project epochs again on every pass and thrash the prompt and native
-    // caches. Re-read inside the write transaction.
-    db.transaction(() => {
+    // Final monotonic advance to maxEventId: the page loop only reaches the
+    // last CONSUMED event id, and an event range with no qualifying outcomes
+    // would otherwise be re-scanned on every pass.
+    runImmediateTransactionWithBusyRetry(db, () => {
         const stored = Number(
             readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
         );
         if (maxEventId > stored) {
             writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark, String(maxEventId));
         }
-    }).immediate();
+    });
     return refreshed;
 }
 

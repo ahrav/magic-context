@@ -16105,7 +16105,14 @@ fn prune_absent_authority_memories_tx(
             .collect::<Vec<_>>()
             .join(",")
     );
-    let mut keep_ids: Vec<i64> = Vec::with_capacity(memories.len());
+    // With a bound store, TypeScript and native row ids are independent
+    // namespaces (the same rule delete_authority_memories_by_id_tx applies):
+    // a mapped incoming id protects its translated NATIVE row, while an
+    // unmapped incoming id only protects the unadopted legacy mirror row
+    // that carries the TypeScript id — it must never shield a same-numbered
+    // module-created native row from the prune.
+    let mut native_keep_ids: Vec<i64> = Vec::new();
+    let mut host_keep_ids: Vec<i64> = Vec::with_capacity(memories.len());
     if let Some(context_store_uuid) = context_store_uuid.as_deref() {
         let mut translated: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
         let mut stmt = tx.prepare(
@@ -16121,41 +16128,67 @@ fn prune_absent_authority_memories_tx(
             translated.insert(source, target);
         }
         for memory in memories {
-            keep_ids.push(*translated.get(&memory.id).unwrap_or(&memory.id));
+            host_keep_ids.push(memory.id);
+            if let Some(target) = translated.get(&memory.id) {
+                native_keep_ids.push(*target);
+            }
         }
     } else {
-        keep_ids.extend(memories.iter().map(|memory| memory.id));
+        host_keep_ids.extend(memories.iter().map(|memory| memory.id));
     }
-    let keep_json = format!(
-        "[{}]",
-        keep_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let to_json = |ids: &[i64]| {
+        format!(
+            "[{}]",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    let host_keep_json = to_json(&host_keep_ids);
+    let native_keep_json = to_json(&native_keep_ids);
     for project in scope_projects {
-        // `context_store_uuid IS ?2` is the NULL-safe comparison: with no
-        // route binding only unadopted mirror rows (NULL uuid) are eligible;
-        // with a binding, this store's adopted rows are eligible too. Rows
-        // from other context stores never match either arm.
+        // Two arms with separate keep sets: unadopted mirror rows (NULL
+        // uuid) share the TypeScript id namespace and survive through the
+        // incoming host ids; this store's adopted rows (bound uuid) survive
+        // only through translated native ids. Rows from other context
+        // stores never match either arm.
         tx.execute(
             "DELETE FROM mc_memory_mappings
               WHERE memory_id IN (
                   SELECT id FROM mc_memories
                    WHERE project_path = ?1
-                     AND (context_store_uuid IS NULL OR context_store_uuid IS ?2)
-                     AND id NOT IN (SELECT value FROM json_each(?3))
+                     AND context_store_uuid IS NULL
+                     AND id NOT IN (SELECT value FROM json_each(?2))
               )",
-            params![project, context_store_uuid, keep_json],
+            params![project, host_keep_json],
         )?;
         tx.execute(
             "DELETE FROM mc_memories
               WHERE project_path = ?1
-                AND (context_store_uuid IS NULL OR context_store_uuid IS ?2)
-                AND id NOT IN (SELECT value FROM json_each(?3))",
-            params![project, context_store_uuid, keep_json],
+                AND context_store_uuid IS NULL
+                AND id NOT IN (SELECT value FROM json_each(?2))",
+            params![project, host_keep_json],
         )?;
+        if let Some(context_store_uuid) = context_store_uuid.as_deref() {
+            tx.execute(
+                "DELETE FROM mc_memory_mappings
+                  WHERE memory_id IN (
+                      SELECT id FROM mc_memories
+                       WHERE project_path = ?1
+                         AND context_store_uuid IS ?2
+                         AND id NOT IN (SELECT value FROM json_each(?3))
+                  )",
+                params![project, context_store_uuid, native_keep_json],
+            )?;
+            tx.execute(
+                "DELETE FROM mc_memories
+                  WHERE project_path = ?1
+                    AND context_store_uuid IS ?2
+                    AND id NOT IN (SELECT value FROM json_each(?3))",
+                params![project, context_store_uuid, native_keep_json],
+            )?;
+        }
     }
     Ok(())
 }

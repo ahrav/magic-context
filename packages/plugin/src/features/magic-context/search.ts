@@ -2544,30 +2544,33 @@ async function executeUnifiedSearch(args: {
     // retrieval_count is telemetry, not correctness: under MODULE authority the
     // TS write path is fenced, so skip the bump rather than failing the search.
     const countRetrievals = options.countRetrievals ?? true;
-    if (countRetrievals) {
+    {
         const memoryIds = results
             .filter((result): result is MemorySearchResult => result.source === "memory")
             .map((result) => result.memoryId);
 
         if (memoryIds.length > 0) {
-            db.transaction(() => {
-                for (const memoryId of memoryIds) {
-                    try {
-                        updateMemoryRetrievalCount(db, memoryId);
-                    } catch (error) {
-                        // Telemetry only — module-managed rows must not fail the search.
-                        if (error instanceof ModuleMemoryAuthorityError) continue;
-                        throw error;
+            if (countRetrievals) {
+                db.transaction(() => {
+                    for (const memoryId of memoryIds) {
+                        try {
+                            updateMemoryRetrievalCount(db, memoryId);
+                        } catch (error) {
+                            // Telemetry only — module-managed rows must not fail the search.
+                            if (error instanceof ModuleMemoryAuthorityError) continue;
+                            throw error;
+                        }
                     }
-                }
-            })();
-            // The telemetry write above is the LAST database boundary before
-            // publication, and its transaction can WAIT behind a concurrent
-            // writer whose commit quarantines, rejects, or rewrites one of
-            // these rows — a transition the lane-level recheck read the old
-            // policy for. Reapply the policy and exact-digest gate here so
-            // the returned set reflects every transition that committed
-            // before publication.
+                })();
+            }
+            // This is the LAST database boundary before publication — and it
+            // runs for EVERY caller, telemetry or not: the auto-search lane
+            // passes countRetrievals: false, and the lane-level recheck can
+            // still read the old policy when a concurrent writer's commit
+            // (which the telemetry transaction may have waited on) hides one
+            // of these rows. Reapply the policy and exact-digest gate so the
+            // returned set reflects every transition that committed before
+            // publication.
             if (hasClaimEffectivePolicy(db)) {
                 const surface = options.memoryPolicySurface ?? "explicit_search";
                 const policyRows = readMemoryPolicyRows(db, memoryIds);

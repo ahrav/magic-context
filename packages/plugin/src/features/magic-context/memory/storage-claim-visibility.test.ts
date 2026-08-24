@@ -5,8 +5,10 @@ import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
 import { resolveMemoriesByIdsForSearch, unifiedSearch } from "../search";
+import { DISPOSITION_KINDS } from "../storage-claim-policy-schema";
 import { initializeDatabase } from "../storage-db";
 import {
+    readActiveDispositions,
     recordDispositionEventInCurrentTransaction,
     refreshEffectivePolicyInCurrentTransaction,
 } from "./storage-claim-policy";
@@ -97,6 +99,89 @@ function quarantine(db: Database, revisionId: number, projectId: number): void {
 }
 
 describe("claim policy surface enforcement", () => {
+    test("readMemoryPolicyRows disposition flags agree with readActiveDispositions for every kind", () => {
+        const db = migratedDb();
+        try {
+            // Exhaustiveness lock: adding a disposition kind must extend the
+            // scenario list below AND the batched SQL in
+            // readMemoryPolicyRows, or this assertion fails first.
+            expect([...DISPOSITION_KINDS].sort()).toEqual(
+                ["disputed", "quarantined", "rejected", "stale"].sort(),
+            );
+            const scenarios: Array<{
+                key: string;
+                apply: (seed: ReturnType<typeof seedMemory>) => void;
+            }> = [
+                ...DISPOSITION_KINDS.map((kind) => ({
+                    key: `event:${kind}`,
+                    apply: (seed: ReturnType<typeof seedMemory>) => {
+                        runInMemoryClaimsWriteTransaction(db, () => {
+                            recordDispositionEventInCurrentTransaction(db, {
+                                revisionId: seed.revisionId,
+                                projectId: seed.projectId,
+                                disposition: kind,
+                                action: "assert",
+                                actor: "host",
+                            });
+                            return undefined;
+                        });
+                    },
+                })),
+                {
+                    key: "conflict:contradicts",
+                    apply: (seed) => {
+                        const other = seedMemory(
+                            db,
+                            `parity-contra-src-${seed.memoryId}`,
+                            `contradictor ${seed.memoryId}`,
+                        );
+                        // 'contradicts' requires left < right (undirected
+                        // canonical order); order the endpoints accordingly.
+                        db.prepare(
+                            `INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at)
+                             VALUES ('contradicts', ?, ?, 1)`,
+                        ).run(
+                            Math.min(other.revisionId, seed.revisionId),
+                            Math.max(other.revisionId, seed.revisionId),
+                        );
+                    },
+                },
+                {
+                    key: "conflict:supersedes",
+                    apply: (seed) => {
+                        const other = seedMemory(
+                            db,
+                            `parity-super-src-${seed.memoryId}`,
+                            `superseder ${seed.memoryId}`,
+                        );
+                        db.prepare(
+                            `INSERT INTO claim_conflicts (relation, left_revision_id, right_revision_id, created_at)
+                             VALUES ('supersedes', ?, ?, 1)`,
+                        ).run(other.revisionId, seed.revisionId);
+                    },
+                },
+            ];
+            for (const [index, scenario] of scenarios.entries()) {
+                const seed = seedMemory(db, `parity-${index}`, `parity content ${index}`);
+                scenario.apply(seed);
+                const row = readMemoryPolicyRows(db, [seed.memoryId]).get(seed.memoryId);
+                if (!row) throw new Error(`policy row missing for ${scenario.key}`);
+                const active = readActiveDispositions(db, seed.revisionId);
+                expect({
+                    scenario: scenario.key,
+                    stale: Boolean(row.stale),
+                    disputed: Boolean(row.disputed),
+                    rejected: Boolean(row.rejected),
+                    quarantined: Boolean(row.quarantined),
+                    contradicted: Boolean(row.contradicted),
+                    superseded: Boolean(row.superseded),
+                }).toEqual({ scenario: scenario.key, ...active });
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("a quarantined memory returns uniform absence on every agent surface", async () => {
         const db = migratedDb();
         try {

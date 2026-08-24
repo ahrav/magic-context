@@ -3300,10 +3300,18 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
     // fallback publishes without a persisted snapshot, so this loop is the
     // only thing standing between a mid-build rewrite/quarantine and the
     // current prompt. On exhaustion, fail closed with an empty pool.
+    // The marker must cover FOREIGN workspace members too: the load below is
+    // workspace-aware, and a quarantine on another member's row bumps THAT
+    // project's epoch, not this one's — the fingerprint aggregates every
+    // member's epoch (same rule as renderM1WithMetadata and the Pi twin).
+    const fallbackStabilityMarker = (): string =>
+        workspace.isWorkspaced
+            ? `ws:${computeWorkspaceEpochFingerprint(options.db, workspace.identities)}`
+            : `ep:${projectPath ? getProjectMemoryEpoch(options.db, projectPath) : 0}`;
     let memories: Memory[] = [];
     let fallbackPoolStable = !projectPath;
     for (let attempt = 0; attempt < 2 && projectPath && !fallbackPoolStable; attempt += 1) {
-        const epochAtLoad = getProjectMemoryEpoch(options.db, projectPath);
+        const markerAtLoad = fallbackStabilityMarker();
         memories = bindMemoriesToCurrentRevision(
             options.db,
             filterMemoriesByPolicy(
@@ -3326,7 +3334,7 @@ function renderFreshM0NonPersisted(options: M0M1RenderOptions): {
                 "auto_inject",
             ).memories,
         );
-        fallbackPoolStable = getProjectMemoryEpoch(options.db, projectPath) === epochAtLoad;
+        fallbackPoolStable = fallbackStabilityMarker() === markerAtLoad;
     }
     if (!fallbackPoolStable) {
         sessionLog(

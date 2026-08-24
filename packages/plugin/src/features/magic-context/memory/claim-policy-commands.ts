@@ -344,6 +344,33 @@ export async function executeClaimApprovalCommand(
                 nonce,
             }),
             mutate: (nonce) => {
+                // Cross-process idempotency: the confirmation nonce is
+                // process-local, so two hosts racing the same
+                // propose+confirm flow would mint two identities and record
+                // the action twice. Derive the identity from the target and
+                // the revision's action ordinal instead — racing writers
+                // read the same ordinal inside their immediate transactions
+                // and the command_identity UNIQUE constraint refuses the
+                // loser, while a legitimate re-approval after a revocation
+                // sees a higher ordinal.
+                const actionOrdinal = Number(
+                    (
+                        deps.db
+                            .prepare(
+                                "SELECT COUNT(*) AS count FROM claim_approval_actions WHERE revision_id = ?",
+                            )
+                            .get(target.revisionId) as { count: number }
+                    ).count,
+                );
+                const commandIdentity = `${action}:${target.revisionId}:${target.digest}:${actionOrdinal}`;
+                const alreadyRecorded = deps.db
+                    .prepare("SELECT 1 FROM claim_approval_actions WHERE command_identity = ?")
+                    .get(commandIdentity);
+                if (alreadyRecorded) {
+                    throw new Error(
+                        "another session recorded this action first; rerun the command to view current state",
+                    );
+                }
                 const recorded = recordApprovalActionInCurrentTransaction(deps.db, {
                     revisionId: target.revisionId,
                     projectId: target.projectId,
@@ -351,7 +378,7 @@ export async function executeClaimApprovalCommand(
                     host: deps.host,
                     sessionId: deps.sessionId,
                     userCommandEvent: `command:${deps.host}:ctx-approve:${nonce}`,
-                    commandIdentity: `${action}:${target.revisionId}:${nonce}`,
+                    commandIdentity,
                     confirmationNonce: nonce,
                     nowMs: deps.nowMs,
                 });
