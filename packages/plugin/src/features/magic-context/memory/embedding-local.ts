@@ -440,13 +440,19 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         maxInputTokens = 512,
         dtype: LocalEmbeddingDtype = DEFAULT_LOCAL_DTYPE,
     ) {
-        this.model = model;
+        // Normalize ONCE and use the same string for the recipe, the identity,
+        // and the pipeline load. The identity function trims independently, so
+        // an untrimmed direct-construction model would otherwise resolve the
+        // symmetric recipe here while the identity hash folds the bound recipe:
+        // vectors and identity would disagree about the space.
+        const normalizedModel = model.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL;
+        this.model = normalizedModel;
         this.maxInputTokens = maxInputTokens;
         this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
-        this.recipe = getLocalEmbeddingRecipe(model);
+        this.recipe = getLocalEmbeddingRecipe(normalizedModel);
         this.modelId = getEmbeddingProviderIdentity({
             provider: "local",
-            model,
+            model: normalizedModel,
             // Only fold non-default dtype into identity so the default config
             // produces the byte-identical identity string as before this field
             // existed (no forced re-embed on upgrade). See issue #259.

@@ -405,16 +405,20 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // registration.
             const snapshot = getProjectEmbeddingSnapshot(project);
             if (!snapshot?.enabled) return false;
-            const isStale = (
+            // Deliberately NARROWER than reembedStalePrimerEmbeddings' staleness
+            // rule: rows with NO embedding at all stay under the threshold gate
+            // above (that is today's scheduling), so only rows whose EXISTING
+            // vector was produced under another identity open the gate early.
+            const hasStaleVector = (
                 embedding: Float32Array | null | undefined,
                 modelId: string | null | undefined,
             ): boolean => Boolean(embedding) && (!modelId || modelId !== snapshot.modelId);
             return (
                 getActivePrimers(db, project).some((primer) =>
-                    isStale(primer.questionEmbedding, primer.questionEmbeddingModelId),
+                    hasStaleVector(primer.questionEmbedding, primer.questionEmbeddingModelId),
                 ) ||
                 getPrimerCandidatesForPromotion(db, project).some((candidate) =>
-                    isStale(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
+                    hasStaleVector(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
                 )
             );
         }
