@@ -96,6 +96,21 @@ pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
 /// fails `E2BIG`.
 pub const MAX_ENV_SNAPSHOT_BYTES: usize = 1536 * 1024;
 
+/// Per-variable charge added to the string bytes when a snapshot is
+/// admitted against [`MAX_ENV_SNAPSHOT_BYTES`].
+///
+/// Counting string bytes alone would let an environment of many short
+/// variables pass the ceiling while each representation of it pays a
+/// per-entry container cost the ceiling never saw: the retained and
+/// adapter vectors hold two `OsString` headers (48 bytes on 64-bit) plus
+/// two heap allocations per entry, `Command`'s map adds its ordering
+/// nodes, and the exec-ready array adds a pointer and a `CString`
+/// allocation per `NAME=VALUE\0`. 128 bytes dominates each of those
+/// shapes, so the charged sum — not just the character data — is what
+/// every simultaneous representation stays under, and
+/// [`ENV_SNAPSHOT_HEADROOM_BYTES`] remains a real peak bound.
+pub const ENV_ENTRY_OVERHEAD_BYTES: usize = 128;
+
 /// Worst case for the environment snapshot and every simultaneous
 /// representation of it during a spawn.
 ///
@@ -104,8 +119,11 @@ pub const MAX_ENV_SNAPSHOT_BYTES: usize = 1536 * 1024;
 /// adapter's assembled child environment, the `Command`'s own map, and the
 /// exec-ready C-string array `spawn` materializes in the parent — the
 /// `pre_exec` hook forces the fork path, so that last one is real. All three
-/// are freed as soon as the child exists. Declared alongside the retained
-/// budget for the same reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+/// are freed as soon as the child exists. Each representation's container
+/// overhead is covered because admission charges
+/// [`ENV_ENTRY_OVERHEAD_BYTES`] per variable against the same ceiling.
+/// Declared alongside the retained budget for the same reason as
+/// [`ROUTE_IDENTITY_HEADROOM_BYTES`].
 pub const ENV_SNAPSHOT_HEADROOM_BYTES: u64 =
     (1 + 3 * MAX_BACKEND_PROCESSES as u64) * MAX_ENV_SNAPSHOT_BYTES as u64;
 

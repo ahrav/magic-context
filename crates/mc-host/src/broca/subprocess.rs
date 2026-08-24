@@ -53,19 +53,39 @@ impl EnvSnapshot {
     /// startup, not per run, so request handling can never observe
     /// request-derived environment mutations.
     ///
-    /// Fails when the environment exceeds [`MAX_ENV_SNAPSHOT_BYTES`], which
-    /// is what makes the component's declared retained reservation a real
-    /// ceiling; see that constant for why this rejects rather than truncates.
+    /// Fails when the environment's charge exceeds
+    /// [`MAX_ENV_SNAPSHOT_BYTES`], which is what makes the component's
+    /// declared retained reservation a real ceiling; see that constant for
+    /// why this rejects rather than truncates.
     pub fn capture() -> io::Result<Self> {
-        let snapshot = Self::from_vars(std::env::vars_os());
+        Self::capture_from(std::env::vars_os())
+    }
+
+    /// The admission behind [`EnvSnapshot::capture`], on explicit variables
+    /// (test seam). Each variable is charged its string bytes plus
+    /// [`ENV_ENTRY_OVERHEAD_BYTES`], so an environment of many short
+    /// variables cannot pass the ceiling while its per-entry container
+    /// costs push each spawn representation past the declared headroom.
+    ///
+    /// [`ENV_ENTRY_OVERHEAD_BYTES`]: super::config::ENV_ENTRY_OVERHEAD_BYTES
+    /// [`MAX_ENV_SNAPSHOT_BYTES`]: super::config::MAX_ENV_SNAPSHOT_BYTES
+    pub fn capture_from(vars: impl IntoIterator<Item = (OsString, OsString)>) -> io::Result<Self> {
+        let snapshot = Self::from_vars(vars);
         let bytes: usize = snapshot
             .vars
             .iter()
-            .map(|(name, value)| name.as_os_str().len() + value.as_os_str().len() + 2)
+            .map(|(name, value)| {
+                name.as_os_str().len()
+                    + value.as_os_str().len()
+                    + 2
+                    + super::config::ENV_ENTRY_OVERHEAD_BYTES
+            })
             .sum();
         if bytes > super::config::MAX_ENV_SNAPSHOT_BYTES {
             return Err(io::Error::other(format!(
-                "startup environment is {bytes} bytes, over the {} byte snapshot ceiling",
+                "startup environment charges {bytes} bytes ({} variables), \
+                 over the {} byte snapshot ceiling",
+                snapshot.vars.len(),
                 super::config::MAX_ENV_SNAPSHOT_BYTES
             )));
         }

@@ -170,6 +170,10 @@ fn main() {
             "env_snapshot_strips_launch_identity",
             env_snapshot_strips_launch_identity,
         ),
+        (
+            "env_snapshot_admission_charges_per_entry_overhead",
+            env_snapshot_admission_charges_per_entry_overhead,
+        ),
         ("merge_cleanup_contract", merge_cleanup_contract),
         (
             "crash_orphaned_run_dirs_swept_only_for_dead_owners",
@@ -2602,6 +2606,42 @@ fn env_snapshot_strips_launch_identity() {
         .map(|(name, _)| name.to_string_lossy().into_owned())
         .collect();
     assert_eq!(names, vec!["KEEP_ME"]);
+}
+
+/// The snapshot ceiling bounds every spawn representation, not just the
+/// character data: each variable also costs `OsString` headers, heap
+/// allocations, a `Command` map node, and an exec-array pointer per entry,
+/// so admission charges a per-entry overhead. An environment of many short
+/// variables must fail even though its raw string bytes sit far under the
+/// ceiling — string bytes alone would admit ~500k three-byte entries whose
+/// container costs multiply across the 25 declared representations.
+fn env_snapshot_admission_charges_per_entry_overhead() {
+    // ~16k tiny variables: ~176 KB of string bytes (well under the 1.5 MiB
+    // ceiling) but ~2.2 MiB once each entry's overhead is charged.
+    let flood: Vec<(OsString, OsString)> = (0..16_384)
+        .map(|n| (os(&format!("V{n:05}")), os("x")))
+        .collect();
+    let string_bytes: usize = flood
+        .iter()
+        .map(|(name, value)| name.len() + value.len() + 2)
+        .sum();
+    assert!(
+        string_bytes < mc_host::broca::config::MAX_ENV_SNAPSHOT_BYTES,
+        "the fixture must be under the ceiling on string bytes alone"
+    );
+    let error = EnvSnapshot::capture_from(flood).expect_err("per-entry overhead trips the ceiling");
+    assert!(
+        error.to_string().contains("snapshot ceiling"),
+        "the rejection names the limit: {error}"
+    );
+
+    // An ordinary environment is unaffected: a hundred realistic variables
+    // charge ~20 KB and admit cleanly.
+    let ordinary: Vec<(OsString, OsString)> = (0..100)
+        .map(|n| (os(&format!("ORDINARY_VAR_{n}")), os("some value")))
+        .collect();
+    let snapshot = EnvSnapshot::capture_from(ordinary).expect("a real environment admits");
+    assert_eq!(snapshot.vars().len(), 100);
 }
 
 /// A harness line's JSON node count is bounded before any DOM is built: an
