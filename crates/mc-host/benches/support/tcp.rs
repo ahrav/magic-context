@@ -307,8 +307,18 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 }
                 return finish_serial(hist, outcomes, measured_scheduled, window_start);
             }
-            if decoded.corr != corr || decoded.ty == raw_client::TY_PING {
+            if !is_request_terminal(decoded.ty) {
                 continue;
+            }
+            if decoded.corr != corr {
+                // One request is in flight on this route, so the only
+                // legal request terminal answers it; anything else is a
+                // wire-protocol regression.
+                return Err(format!(
+                    "wire-protocol violation: unsolicited terminal for correlation {} \
+                     (awaiting {corr})",
+                    decoded.corr
+                ));
             }
             let rtt_ns = issue.elapsed().as_nanos() as u64;
             if !measured {
@@ -443,7 +453,10 @@ async fn run_open_loop_inner(
                             .await;
                             match consumed {
                                 Ok(Ok(())) => {}
-                                Ok(Err(())) => {
+                                Ok(Err(ConsumeFailure::Protocol(reason))) => {
+                                    return Err(format!("wire-protocol violation: {reason}"));
+                                }
+                                Ok(Err(ConsumeFailure::Transport)) => {
                                     state.fail_pending(Outcome::PeerClosed);
                                     truncated = true;
                                     break 'sender;
@@ -529,13 +542,16 @@ async fn run_open_loop_inner(
             match header.step(&mut read_half).await {
                 Ok(None) => Ok(()),
                 Ok(Some(frame)) => state.consume(&mut read_half, frame).await,
-                Err(_) => Err(()),
+                Err(_) => Err(ConsumeFailure::Transport),
             }
         })
         .await;
         match step {
             Ok(Ok(())) => {}
-            Ok(Err(())) => {
+            Ok(Err(ConsumeFailure::Protocol(reason))) => {
+                return Err(format!("wire-protocol violation: {reason}"));
+            }
+            Ok(Err(ConsumeFailure::Transport)) => {
                 state.fail_pending(Outcome::PeerClosed);
                 break;
             }
@@ -572,28 +588,57 @@ struct OpenLoopState {
     body: Vec<u8>,
 }
 
+/// True for frame types that answer a request and must therefore name an
+/// outstanding correlation. Connection-level frames (ping/pong, hello,
+/// goodbye, push, cancel) are legal without one — a shutting-down host
+/// legitimately emits a goodbye — and are simply skipped.
+fn is_request_terminal(ty: u8) -> bool {
+    matches!(
+        ty,
+        TY_RESPONSE | TY_ERROR | raw_client::TY_STREAM_DATA | raw_client::TY_STREAM_END
+    )
+}
+
+/// How one open-loop receive failed: transport failures resolve pending
+/// requests as connection loss, while a wire-protocol violation from a
+/// live host fails the whole attempt with its own reason.
+enum ConsumeFailure {
+    Transport,
+    Protocol(String),
+}
+
 impl OpenLoopState {
     /// Reads the frame body and resolves its pending slot to one outcome.
     async fn consume(
         &mut self,
         read_half: &mut tokio::net::tcp::OwnedReadHalf,
         frame: raw_client::RawFrame,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ConsumeFailure> {
         // Untrusted 32-bit length: refuse the allocation and fail the
-        // connection, since the stream cannot resync past an unread body.
+        // attempt, since the stream cannot resync past an unread body.
         if frame.len > MAX_BODY_LEN {
-            return Err(());
+            return Err(ConsumeFailure::Protocol(format!(
+                "oversized response length {}",
+                frame.len
+            )));
         }
         self.body.resize(frame.len as usize, 0);
         if frame.len > 0 && read_half.read_exact(&mut self.body).await.is_err() {
-            return Err(());
+            return Err(ConsumeFailure::Transport);
         }
-        if frame.ty == raw_client::TY_PING {
+        if !is_request_terminal(frame.ty) {
             return Ok(());
         }
         let now_ns = self.start.elapsed().as_nanos() as u64;
         let Some((scheduled_ns, issue_ns)) = self.pending.remove(&frame.corr) else {
-            return Ok(());
+            // Only pings and responses to issued requests are legal on
+            // this single-route connection: a duplicate terminal or a
+            // never-issued correlation is a wire-protocol regression
+            // that must not finalize successful evidence.
+            return Err(ConsumeFailure::Protocol(format!(
+                "unsolicited terminal for correlation {}",
+                frame.corr
+            )));
         };
         if scheduled_ns < self.warmup_ns {
             return Ok(());
@@ -765,15 +810,19 @@ async fn run_throughput_inner(
             Some(Ok(None)) => continue,
             Some(Ok(Some(decoded))) => decoded,
         };
-        if decoded.ty == raw_client::TY_PING {
+        if !is_request_terminal(decoded.ty) {
             continue;
         }
-        // A frame naming no outstanding request (a duplicate or stale
-        // response) is not a terminal: counting it would trigger an
-        // extra send, quietly deepening the pipeline beyond cfg.depth
-        // and inflating the reported throughput.
+        // A frame naming no outstanding request (a duplicate terminal or
+        // a never-issued correlation) is a wire-protocol regression: it
+        // must neither count as a terminal nor trigger a replacement
+        // send, and silently discarding it would let the attempt
+        // finalize despite the regression.
         if !outstanding.remove(&decoded.corr) {
-            continue;
+            return Err(format!(
+                "wire-protocol violation: unsolicited terminal for correlation {}",
+                decoded.corr
+            ));
         }
         if measured_corr(first_measured, decoded.corr) {
             outcomes.record(classify_terminal(&decoded, (channel, epoch), &body));
@@ -863,9 +912,14 @@ async fn run_throughput_inner(
             match read {
                 Ok(Ok(None)) => {}
                 Ok(Ok(Some(decoded))) => {
-                    // Pings and frames naming no outstanding request are
-                    // skipped exactly as in the measurement loop.
-                    if decoded.ty != raw_client::TY_PING && outstanding.remove(&decoded.corr) {
+                    if is_request_terminal(decoded.ty) {
+                        if !outstanding.remove(&decoded.corr) {
+                            return Err(format!(
+                                "wire-protocol violation: unsolicited terminal for \
+                                 correlation {}",
+                                decoded.corr
+                            ));
+                        }
                         // Every drained response passes the same terminal
                         // validation as an in-window frame: the window
                         // boundary does not exempt the final measured

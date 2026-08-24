@@ -175,14 +175,27 @@ impl ChildHost {
         // without unwinding (plain SIGTERM from the runner's interrupt
         // trap, SIGKILL, OOM), ChildHost::drop never runs, and the
         // pinned host would otherwise survive as an orphan holding its
-        // CPU and temp directory into subsequent attempts.
+        // CPU and temp directory into subsequent attempts. The signal is
+        // installed after fork, so a collector that died in that window
+        // has already reparented this child and no notification will
+        // arrive; the parent-pid recheck closes that race.
+        let collector_pid = std::process::id();
         unsafe {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 rustix::process::set_parent_process_death_signal(Some(
                     rustix::process::Signal::KILL,
                 ))
-                .map_err(std::io::Error::from)
+                .map_err(std::io::Error::from)?;
+                let parent = rustix::process::getppid()
+                    .map(|p| p.as_raw_nonzero().get())
+                    .unwrap_or(0);
+                if parent != collector_pid as i32 {
+                    return Err(std::io::Error::other(
+                        "collector died before the parent-death signal was installed",
+                    ));
+                }
+                Ok(())
             });
         }
         let mut child = cmd.spawn().map_err(|err| format!("spawn host: {err}"))?;
@@ -792,15 +805,7 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
     // an error. Host liveness and correctness stay as gates.
     check_host_alive(&mut host)?;
     check_correctness(&result.outcomes)?;
-    let manifest = attempt.manifest_mut();
-    manifest.collection = Some(serde_json::json!({
-        "depth": cfg.depth,
-        "warmup_secs": cfg.warmup.as_secs(),
-        "measure_secs": cfg.measure.as_secs(),
-    }));
-    manifest.outcomes = Some(result.outcomes.clone());
-    manifest.recorded_samples = Some(result.successful);
-    manifest.results = Some(serde_json::json!({
+    let results = serde_json::json!({
         "depth": cfg.depth,
         "offered": result.offered,
         "terminal": result.terminal,
@@ -809,7 +814,28 @@ fn collect_tcp_throughput(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(),
         "goodput_bytes_per_sec": result.goodput_bytes_per_sec,
         "drained": result.drained,
         "measured_secs": result.measured.as_secs_f64(),
+    });
+    // The throughput arm writes no histogram, so its counters get their
+    // own checksummed sidecar; aggregation compares the manifest's
+    // results and outcomes against it, exactly like the histogram-backed
+    // arms' scalar checks.
+    let record = serde_json::json!({
+        "results": results,
+        "outcomes": result.outcomes,
+    });
+    attempt.add_sidecar(
+        "throughput.json",
+        &serde_json::to_vec_pretty(&record).map_err(|err| err.to_string())?,
+    )?;
+    let manifest = attempt.manifest_mut();
+    manifest.collection = Some(serde_json::json!({
+        "depth": cfg.depth,
+        "warmup_secs": cfg.warmup.as_secs(),
+        "measure_secs": cfg.measure.as_secs(),
     }));
+    manifest.outcomes = Some(result.outcomes.clone());
+    manifest.recorded_samples = Some(result.successful);
+    manifest.results = Some(results);
     Ok(())
 }
 
@@ -1038,6 +1064,33 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                             a.dir.display()
                         ));
                     }
+                }
+            }
+        }
+        if arm.name == ARM_TCP_THROUGHPUT {
+            // The throughput counters live in their checksummed sidecar;
+            // the manifest's copies are otherwise unprotected on their
+            // way into summary.json, and this arm has no histogram to
+            // recompute them from.
+            for a in &complete {
+                evidence::require_declared(a, "throughput.json")?;
+                let raw = std::fs::read(a.dir.join("throughput.json"))
+                    .map_err(|err| format!("{}: throughput.json: {err}", a.dir.display()))?;
+                let record: serde_json::Value = serde_json::from_slice(&raw)
+                    .map_err(|err| format!("{}: throughput.json: {err}", a.dir.display()))?;
+                let manifest_results = a
+                    .manifest
+                    .results
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null);
+                if record["results"] != manifest_results
+                    || record["outcomes"] != serde_json::json!(a.manifest.outcomes)
+                {
+                    return Err(format!(
+                        "{}: manifest results or outcomes disagree with the verified \
+                         throughput.json",
+                        a.dir.display()
+                    ));
                 }
             }
         }
