@@ -61,9 +61,11 @@ ITEMS: dict[str, tuple[tuple[str, str], ...]] = {
         (
             # Amended row: presence plus the test-demanded PartialEq derive
             # (one row, one result). The regex tolerates attribute order,
-            # formatting, and CRLF differences in the published source.
+            # formatting, and CRLF differences in the published source, and
+            # skips any mix of attributes and `//`-style (incl. doc) comment
+            # lines between the derive and the enum keyword.
             "manifest::ConsumerRole (incl. PartialEq)",
-            r"re:#\[derive\([^)]*\bPartialEq\b[^)]*\)\]\s*(?:#\[[^\]]*\]\s*)*pub enum ConsumerRole",
+            r"re:#\[derive\([^)]*\bPartialEq\b[^)]*\)\]\s*(?:#\[[^\]]*\]\s*|//[^\n]*\n\s*)*pub enum ConsumerRole",
         ),
         ("ConsumerRole::ServiceClient", "ServiceClient { of: Vec<String> }"),
         ("manifest::Bindings", "pub struct Bindings"),
