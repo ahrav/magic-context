@@ -115,6 +115,10 @@ fn main() {
         ),
         ("pi_auxiliary_events_ignored", pi_auxiliary_events_ignored),
         (
+            "pi_agent_end_compatibility_terminal",
+            pi_agent_end_compatibility_terminal,
+        ),
+        (
             "pi_extension_stdout_noise_skipped",
             pi_extension_stdout_noise_skipped,
         ),
@@ -1838,6 +1842,27 @@ fn pi_auxiliary_events_ignored() {
     );
     assert!(events.iter().any(
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "aux answer")
+    ));
+}
+
+/// An older Pi delivers its final assistant state only in `agent_end`'s
+/// authoritative messages array; the parser accepts that compatibility
+/// shape when no `message_end` terminal arrived.
+fn pi_agent_end_compatibility_terminal() {
+    let (terminal, events) = run_pi_transcript(&[
+        serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+        serde_json::json!({"type": "agent_start"}),
+        serde_json::json!({"type": "agent_end", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "q"}]},
+            {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "compat answer"}]},
+        ]}),
+    ]);
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "compat answer")
     ));
 }
 

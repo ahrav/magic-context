@@ -479,6 +479,12 @@ impl Supervisor {
                 message: "session deleted",
             },
         );
+        // Reserved before the teardown wait: if a terminal-cap eviction
+        // removes the session while delete waits below, the tombstone must
+        // not depend on budget that other work consumes in the meantime.
+        // The happy path carves its tombstone from the run's own base
+        // charge instead and releases this reservation unused.
+        let reserved_tombstone = self.inner.retained.try_charge(key.meta_bytes());
         wait_work_done(&run).await;
 
         let mut released = Released::default();
@@ -491,6 +497,9 @@ impl Supervisor {
             Some(SessionEntry::Live(current)) if Arc::ptr_eq(current, &run)
         );
         if same_run {
+            if let Some(charge) = reserved_tombstone {
+                released.charges.push(charge);
+            }
             index.sessions.remove(key);
             index.runs.remove(&run.run_id);
             let mut state = lock_run(&run);
@@ -519,26 +528,35 @@ impl Supervisor {
             // A terminal-cap eviction can remove the session between the
             // terminal commit above and this re-lock; without a tombstone
             // the completed delete would silently lose its resurrection
-            // guard (AE7). The evicted run's charges are already released,
-            // so the tombstone is charged fresh against the retained budget
-            // — and skipped silently when the budget refuses, because
-            // delete must never block (the worst case is only the original
-            // no-tombstone race). A key holding a different live run means
-            // a post-eviction send already won; that session is not ours to
-            // tombstone.
-            if let Some(charge) = self.inner.retained.try_charge(key.meta_bytes()) {
-                index.sessions.insert(
-                    key.clone(),
-                    SessionEntry::Tombstone(Tombstone {
-                        created_at: Instant::now(),
-                        _charge: charge,
-                    }),
-                );
-                // The fresh tombstone grew the retained-session count by
-                // one, so the cap is re-enforced here instead of waiting
-                // for the next terminal commit.
-                enforce_terminal_cap(&self.inner, &mut index, &run.run_id, &mut released);
-            }
+            // guard (AE7), letting a byte-identical resend immediately
+            // recreate the "deleted" session. The evicted run's charges are
+            // already released, so the tombstone uses the reservation taken
+            // before the wait (retrying fresh if that failed under the
+            // run's own pressure); only a double failure refuses, loudly,
+            // instead of reporting a deletion whose guard was lost. A key
+            // holding a different live run means a post-eviction send
+            // already won; that session is not ours to tombstone.
+            let charge =
+                reserved_tombstone.or_else(|| self.inner.retained.try_charge(key.meta_bytes()));
+            let Some(charge) = charge else {
+                return Err(app(
+                    "queue_full",
+                    "retained capacity for the deletion tombstone is exhausted",
+                ));
+            };
+            index.sessions.insert(
+                key.clone(),
+                SessionEntry::Tombstone(Tombstone {
+                    created_at: Instant::now(),
+                    _charge: charge,
+                }),
+            );
+            // The fresh tombstone grew the retained-session count by
+            // one, so the cap is re-enforced here instead of waiting
+            // for the next terminal commit.
+            enforce_terminal_cap(&self.inner, &mut index, &run.run_id, &mut released);
+        } else if let Some(charge) = reserved_tombstone {
+            released.charges.push(charge);
         }
         Ok(())
     }
@@ -622,6 +640,12 @@ impl Supervisor {
 
     fn sweep_expired(&self, index: &mut Index, released: &mut Released) {
         sweep_for(&self.inner, index, released);
+        // Retention sweeps also re-enforce the terminal cap: an over-cap
+        // state left behind when subscribers pinned every eviction
+        // candidate would otherwise persist until the next terminal
+        // commit, even after those pins drained. No run is protected here
+        // — the empty id matches none.
+        enforce_terminal_cap(&self.inner, index, "", released);
     }
 
     fn spawn_run(&self, run: Arc<Run>, request: SendRequest) {

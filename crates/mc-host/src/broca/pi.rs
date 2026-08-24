@@ -168,6 +168,10 @@ async fn run_pi_with_provider_fallback(
     if remaining.is_zero() {
         return first;
     }
+    // The first terminal (and its potentially transcript-sized error text)
+    // is no longer needed once the retry is committed; dropping it keeps
+    // the concurrent-buffer peak inside the declared capture headroom.
+    drop(first);
     let mut retry_limits = limits;
     retry_limits.run_timeout = remaining;
     run_pi(
@@ -316,12 +320,13 @@ fn pi_terminal_probe(lines: &[u8]) -> bool {
         .any(pi_line_is_terminal_message_end)
 }
 
-/// One-line check for a terminal assistant `message_end` (stopReason
-/// `stop`, `length`, `error`, or `aborted`) — the probe-side mirror of the
-/// terminal decision in [`parse_pi_transcript`], including the rule that a
-/// completion still requesting tools is not this run's terminal. Noise and
-/// malformed lines are simply not terminals here; the full parse renders
-/// that verdict.
+/// One-line check for a decisive terminal — an assistant `message_end`
+/// (stopReason `stop`, `length`, `error`, or `aborted`) or the `agent_end`
+/// compatibility shape carrying a final assistant message — the probe-side
+/// mirror of the terminal decision in [`parse_pi_transcript`], including
+/// the rule that a completion still requesting tools is not this run's
+/// terminal. Noise and malformed lines are simply not terminals here; the
+/// full parse renders that verdict.
 fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(line) else {
         return false;
@@ -329,10 +334,19 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
     };
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("message_end") {
-        return false;
-    }
-    let Some(message) = value.get("message") else {
+    let message = match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("message_end") => value.get("message"),
+        Some("agent_end") => value
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|messages| {
+                messages.iter().rev().find(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+                })
+            }),
+        _ => None,
+    };
+    let Some(message) = message else {
         return false;
     };
     if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
@@ -350,7 +364,10 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
 
 /// Parses the closed Pi print-mode JSON vocabulary (R18). The terminal
 /// assistant `message_end` (stopReason `stop`, `length`, `error`, or
-/// `aborted` with no tool calls — the run is tool-less) decides the run.
+/// `aborted` with no tool calls — the run is tool-less) decides the run;
+/// when no `message_end` terminal arrived, the `agent_end` compatibility
+/// shape's final assistant message decides instead (the authoritative array
+/// `subagent-runner.ts` reads on older Pi runtimes).
 /// Documented nonterminal events that occur on ordinary tool-less runs
 /// (lifecycle, compaction, retry, queue, and session-state notifications;
 /// `--thinking` emits `thinking_level_changed`) are ignored, but
@@ -390,7 +407,6 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
         match event_type {
             "session"
             | "agent_start"
-            | "agent_end"
             | "turn_start"
             | "turn_end"
             | "message_start"
@@ -414,75 +430,30 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
                 if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
                     continue;
                 }
-                let stop_reason = message
-                    .get("stopReason")
-                    .and_then(serde_json::Value::as_str);
-                let text = assistant_text(message);
-                match stop_reason {
-                    // Intermediate assistant turns (no tools run here, but
-                    // the vocabulary tolerates the spelling) are ignored for
-                    // the terminal decision.
-                    None | Some("toolUse") => {}
-                    // A completion that still requests tools is an
-                    // intermediate turn shape, not this tool-less run's
-                    // terminal (`subagent-runner.ts` applies the same rule):
-                    // committing it would publish text beside an unexecuted
-                    // tool request as the answer.
-                    Some("stop" | "length") if message_requests_tools(message) => {}
-                    Some("stop") => {
-                        events.push(BackendEvent::AssistantText {
-                            text,
-                            finish_reason: None,
-                        });
-                        commit_terminal(
-                            &mut terminal,
-                            BackendTerminal::Completed {
-                                finish_reason: FinishReason::Completed,
-                            },
-                            line_no,
-                        )?;
-                    }
-                    // A length stop is still a completion (AE13): the exact
-                    // length-class reason rides both the unit and the
-                    // terminal so producer policy sees `length_capped`.
-                    Some("length") => {
-                        events.push(BackendEvent::AssistantText {
-                            text,
-                            finish_reason: Some(FinishReason::Length),
-                        });
-                        commit_terminal(
-                            &mut terminal,
-                            BackendTerminal::Completed {
-                                finish_reason: FinishReason::Length,
-                            },
-                            line_no,
-                        )?;
-                    }
-                    Some(reason @ ("error" | "aborted")) => {
-                        let message_text = message
-                            .get("errorMessage")
-                            .and_then(serde_json::Value::as_str)
-                            .map_or_else(
-                                || format!("pi assistant stopped with reason \"{reason}\""),
-                                ToOwned::to_owned,
-                            );
-                        commit_terminal(
-                            &mut terminal,
-                            BackendTerminal::Failed(BackendError {
-                                class: subprocess::classify_failure_text(&message_text),
-                                retry_after_secs: subprocess::retry_after_secs_in_text(
-                                    &message_text,
-                                ),
-                                message: message_text,
-                                provider_code: None,
-                            }),
-                            line_no,
-                        )?;
-                    }
-                    Some(_) => {
-                        return Err(format!("unknown stop reason at line {line_no}"));
-                    }
+                commit_assistant_message(&mut events, &mut terminal, message, line_no)?;
+            }
+            "agent_end" => {
+                // Compatibility: an older Pi delivers its final state only
+                // in `agent_end`'s authoritative messages array — the shape
+                // `subagent-runner.ts` reads. A stream that already
+                // committed its terminal via `message_end` keeps it, so the
+                // two spellings never conflict.
+                if terminal.is_some() {
+                    continue;
                 }
+                let Some(message) = value
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|messages| {
+                        messages.iter().rev().find(|message| {
+                            message.get("role").and_then(serde_json::Value::as_str)
+                                == Some("assistant")
+                        })
+                    })
+                else {
+                    continue;
+                };
+                commit_assistant_message(&mut events, &mut terminal, message, line_no)?;
             }
             _ => return Err(format!("unknown event type at line {line_no}")),
         }
@@ -491,6 +462,86 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
         return Err("output ended without a terminal event".to_owned());
     };
     Ok((events, terminal))
+}
+
+/// Applies the terminal decision for one assistant message, shared by
+/// `message_end` and the `agent_end` compatibility shape: `stop` and
+/// `length` complete the run unless the content still requests tools,
+/// `error`/`aborted` fail it, and intermediate spellings are ignored.
+fn commit_assistant_message(
+    events: &mut Vec<BackendEvent>,
+    terminal: &mut Option<BackendTerminal>,
+    message: &serde_json::Value,
+    line_no: usize,
+) -> Result<(), String> {
+    let stop_reason = message
+        .get("stopReason")
+        .and_then(serde_json::Value::as_str);
+    let text = assistant_text(message);
+    match stop_reason {
+        // Intermediate assistant turns (no tools run here, but
+        // the vocabulary tolerates the spelling) are ignored for
+        // the terminal decision.
+        None | Some("toolUse") => {}
+        // A completion that still requests tools is an
+        // intermediate turn shape, not this tool-less run's
+        // terminal (`subagent-runner.ts` applies the same rule):
+        // committing it would publish text beside an unexecuted
+        // tool request as the answer.
+        Some("stop" | "length") if message_requests_tools(message) => {}
+        Some("stop") => {
+            events.push(BackendEvent::AssistantText {
+                text,
+                finish_reason: None,
+            });
+            commit_terminal(
+                terminal,
+                BackendTerminal::Completed {
+                    finish_reason: FinishReason::Completed,
+                },
+                line_no,
+            )?;
+        }
+        // A length stop is still a completion (AE13): the exact
+        // length-class reason rides both the unit and the
+        // terminal so producer policy sees `length_capped`.
+        Some("length") => {
+            events.push(BackendEvent::AssistantText {
+                text,
+                finish_reason: Some(FinishReason::Length),
+            });
+            commit_terminal(
+                terminal,
+                BackendTerminal::Completed {
+                    finish_reason: FinishReason::Length,
+                },
+                line_no,
+            )?;
+        }
+        Some(reason @ ("error" | "aborted")) => {
+            let message_text = message
+                .get("errorMessage")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(
+                    || format!("pi assistant stopped with reason \"{reason}\""),
+                    ToOwned::to_owned,
+                );
+            commit_terminal(
+                terminal,
+                BackendTerminal::Failed(BackendError {
+                    class: subprocess::classify_failure_text(&message_text),
+                    retry_after_secs: subprocess::retry_after_secs_in_text(&message_text),
+                    message: message_text,
+                    provider_code: None,
+                }),
+                line_no,
+            )?;
+        }
+        Some(_) => {
+            return Err(format!("unknown stop reason at line {line_no}"));
+        }
+    }
+    Ok(())
 }
 
 /// Concatenates the `{type: "text"}` blocks of one Pi assistant message —
