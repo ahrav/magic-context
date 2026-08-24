@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { wakePlaneStatus } from "../src/features/magic-context/smart-notes/wake-plane";
-import { SubcClient } from "../src/shared/mc-host-client";
+import { SubcClient, type SubcDiagnosticsEvent } from "../src/shared/mc-host-client";
 
 const OVERALL_DEADLINE_MS = 60_000;
 const READY_DEADLINE_MS = 15_000;
@@ -149,9 +149,30 @@ try {
     }
     log("production wake-plane probe returned absent");
 
-    const client = await SubcClient.connect({ connectionFile });
+    const events: SubcDiagnosticsEvent[] = [];
+    const client = await SubcClient.connect({
+        connectionFile,
+        diagnostics: (event) => events.push(event),
+    });
     log(`connected (daemonVer=${client.daemonVer})`);
     try {
+        const connectedEvent = events.find((event) => event.type === "connected");
+        assert.equal(
+            connectedEvent?.transport,
+            "tcp",
+            `negotiation must select tcp (got ${connectedEvent?.transport})`,
+        );
+        assert.equal(
+            connectedEvent?.fallbackReason,
+            undefined,
+            `a tcp-only offer must be a direct selection (got ${connectedEvent?.fallbackReason})`,
+        );
+        log("transport.negotiate selected tcp directly");
+
+        const modules = await client.catalogList();
+        assert.ok(Array.isArray(modules), "catalog.list must return a module array");
+        log(`catalog listed ${modules.length} module(s)`);
+
         const handle = await client.routeOpen(
             { kind: "tool_provider", module_id: "perf-echo" },
             {

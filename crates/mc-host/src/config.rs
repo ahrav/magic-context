@@ -191,6 +191,7 @@ pub struct HostTiming {
     pub lifecycle_callback_deadline: Duration,
     /// Settling or cancelling one route's admitted work at route close.
     pub route_close_budget: Duration,
+    pub transport_setup_deadline: Duration,
     /// Whole graceful-shutdown drain.
     pub shutdown_deadline: Duration,
     /// Period between internal handler health probes.
@@ -204,6 +205,7 @@ impl Default for HostTiming {
             frame_deadline: Duration::from_secs(30),
             lifecycle_callback_deadline: Duration::from_secs(30),
             route_close_budget: Duration::from_secs(5),
+            transport_setup_deadline: Duration::from_secs(2),
             shutdown_deadline: Duration::from_secs(10),
             health_interval: Duration::from_secs(30),
         }
@@ -256,6 +258,8 @@ pub struct HostConfig {
     pub timing: HostTiming,
     /// `None` sends no Pings at all.
     pub liveness: Option<LivenessPolicy>,
+    #[doc(hidden)]
+    pub transport_providers: crate::transport_provider::TransportProviders,
 }
 
 impl Default for HostConfig {
@@ -267,6 +271,7 @@ impl Default for HostConfig {
             limits: HostLimits::default(),
             timing: HostTiming::default(),
             liveness: None,
+            transport_providers: crate::transport_provider::TransportProviders::default(),
         }
     }
 }
@@ -319,6 +324,10 @@ impl HostConfig {
                 self.timing.lifecycle_callback_deadline,
             ),
             ("route_close_budget", self.timing.route_close_budget),
+            (
+                "transport_setup_deadline",
+                self.timing.transport_setup_deadline,
+            ),
             ("shutdown_deadline", self.timing.shutdown_deadline),
             ("health_interval", self.timing.health_interval),
         ];

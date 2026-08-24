@@ -447,3 +447,20 @@ describe("route handles", () => {
         expect(() => createRouteHandle(1.5, 1, token)).toThrow(RangeError);
     });
 });
+
+describe("committed catalog capability vector", () => {
+    test("subc_ops advertises transport.negotiate but never the candidate-only operations", () => {
+        const canonical =
+            '{"op":"catalog.list","generation":1,"modules":[],"subc_ops":["route.open","catalog.list","host.shutdown","transport.negotiate"]}';
+        const parsed = JSON.parse(canonical) as { op: string; subc_ops: string[] };
+        expect(parsed.op).toBe("catalog.list");
+        expect(parsed.subc_ops).toEqual([
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "transport.negotiate",
+        ]);
+        expect(canonical).not.toContain("transport.activate");
+        expect(canonical).not.toContain("transport.commit");
+    });
+});

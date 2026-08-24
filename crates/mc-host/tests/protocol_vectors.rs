@@ -192,6 +192,166 @@ fn canonical_route_open_body_is_173_bytes() {
     assert_eq!(parsed["target"]["module_id"], LINKED_MODULE_ID);
 }
 
+#[test]
+fn catalog_capability_vector_includes_negotiate_but_never_the_candidate_ops() {
+    let canonical = concat!(
+        r#"{"op":"catalog.list","generation":1,"modules":[],"#,
+        r#""subc_ops":["route.open","catalog.list","host.shutdown","transport.negotiate"]}"#
+    );
+    let parsed: serde_json::Value = serde_json::from_str(canonical).expect("canonical JSON");
+    assert_eq!(parsed["op"], "catalog.list");
+    assert_eq!(
+        parsed["subc_ops"],
+        serde_json::json!([
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "transport.negotiate"
+        ])
+    );
+    assert!(!canonical.contains("transport.activate"));
+    assert!(!canonical.contains("transport.commit"));
+}
+
+/// The negotiation request is the generation's first control traffic, so it
+/// uses consumer correlation 1 on the bootstrap; activation and commit use
+/// the candidate's reserved correlations 1 and 2.
+#[test]
+fn committed_negotiation_vectors_pin_bodies_and_headers() {
+    struct Vector {
+        name: &'static str,
+        body: &'static str,
+        header_hex: &'static str,
+        ty: u8,
+        flags: u8,
+        corr: u64,
+    }
+
+    const FLAGS_RESPONSE: u8 = FLAGS_INTERACTIVE | 0b0000_1000;
+
+    let vectors = [
+        Vector {
+            name: "tcp-only offer request",
+            body: r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1}]}"#,
+            header_hex: "6a0000000200020000000000000100000000000000",
+            ty: TY_REQUEST,
+            flags: FLAGS_INTERACTIVE,
+            corr: 1,
+        },
+        Vector {
+            name: "ordered shm+tcp offer request",
+            body: r#"{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"shm","capability_version":1,"parameters":{}},{"transport":"tcp","capability_version":1}]}"#,
+            header_hex: "a50000000200020000000000000100000000000000",
+            ty: TY_REQUEST,
+            flags: FLAGS_INTERACTIVE,
+            corr: 1,
+        },
+        Vector {
+            name: "direct tcp selection response",
+            body: r#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1}}"#,
+            header_hex: "6a00000002010a0000000000000100000000000000",
+            ty: TY_RESPONSE,
+            flags: FLAGS_RESPONSE,
+            corr: 1,
+        },
+        Vector {
+            name: "tcp fallback response with reason",
+            body: r#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"tcp","capability_version":1},"reason":"capability_version_mismatch"}"#,
+            header_hex: "9100000002010a0000000000000100000000000000",
+            ty: TY_RESPONSE,
+            flags: FLAGS_RESPONSE,
+            corr: 1,
+        },
+        Vector {
+            name: "non-tcp grant response",
+            body: r#"{"op":"transport.negotiate","negotiation_version":1,"selected":{"transport":"shm","capability_version":1},"activation_token":"00112233445566778899aabbccddeeff","descriptor":{}}"#,
+            header_hex: "b000000002010a0000000000000100000000000000",
+            ty: TY_RESPONSE,
+            flags: FLAGS_RESPONSE,
+            corr: 1,
+        },
+        Vector {
+            name: "candidate activate request (corr 1)",
+            body: r#"{"op":"transport.activate","negotiation_version":1,"activation_token":"00112233445566778899aabbccddeeff"}"#,
+            header_hex: "690000000200020000000000000100000000000000",
+            ty: TY_REQUEST,
+            flags: FLAGS_INTERACTIVE,
+            corr: 1,
+        },
+        Vector {
+            name: "candidate activate response (corr 1)",
+            body: r#"{"op":"transport.activate","negotiation_version":1}"#,
+            header_hex: "3300000002010a0000000000000100000000000000",
+            ty: TY_RESPONSE,
+            flags: FLAGS_RESPONSE,
+            corr: 1,
+        },
+        Vector {
+            name: "candidate commit request (corr 2)",
+            body: r#"{"op":"transport.commit","negotiation_version":1}"#,
+            header_hex: "310000000200020000000000000200000000000000",
+            ty: TY_REQUEST,
+            flags: FLAGS_INTERACTIVE,
+            corr: 2,
+        },
+        Vector {
+            name: "candidate commit response (corr 2)",
+            body: r#"{"op":"transport.commit","negotiation_version":1}"#,
+            header_hex: "3100000002010a0000000000000200000000000000",
+            ty: TY_RESPONSE,
+            flags: FLAGS_RESPONSE,
+            corr: 2,
+        },
+    ];
+
+    for vector in vectors {
+        let header_bytes = hex_to_bytes(vector.header_hex);
+        assert_eq!(header_bytes.len(), HEADER_LEN, "{}", vector.name);
+        let decoded = raw_client::decode_header(&header_bytes);
+        assert_eq!(
+            decoded.len as usize,
+            vector.body.len(),
+            "{}: the pinned header must declare the compact body length",
+            vector.name
+        );
+        assert_eq!(decoded.ver, 2, "{}", vector.name);
+        assert_eq!(decoded.ty, vector.ty, "{}", vector.name);
+        assert_eq!(decoded.flags, vector.flags, "{}", vector.name);
+        assert_eq!(decoded.channel, 0, "{}: channel 0 control", vector.name);
+        assert_eq!(decoded.epoch, 0, "{}: epoch 0 on channel 0", vector.name);
+        assert_eq!(decoded.corr, vector.corr, "{}", vector.name);
+        assert_eq!(
+            raw_client::header(
+                vector.body.len() as u32,
+                vector.ty,
+                vector.flags,
+                0,
+                0,
+                vector.corr
+            ),
+            header_bytes,
+            "{}: encoding must reproduce the committed header",
+            vector.name
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(vector.body).expect("pinned negotiation vector JSON");
+        assert_eq!(parsed["negotiation_version"], 1, "{}", vector.name);
+        assert!(
+            parsed["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("transport.")),
+            "{}",
+            vector.name
+        );
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("reserialize").len(),
+            vector.body.len(),
+            "{}: the pinned body must be compact",
+            vector.name
+        );
+    }
+}
+
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     assert!(hex.len().is_multiple_of(2), "hex must be byte-aligned");
     (0..hex.len())
@@ -802,7 +962,12 @@ async fn three_component_catalog_order_is_pinned() {
     assert_eq!(ids, ["magic-context", "synapse", "broca"]);
     assert_eq!(
         body["subc_ops"],
-        serde_json::json!(["route.open", "catalog.list", "host.shutdown"])
+        serde_json::json!([
+            "route.open",
+            "catalog.list",
+            "host.shutdown",
+            "transport.negotiate"
+        ])
     );
 
     host.shutdown().await.expect("graceful shutdown");
