@@ -46,6 +46,16 @@ pub const MAX_RETAINED_BYTES: u64 = 64 * 1024 * 1024;
 /// ceiling on resident bytes.
 pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = 1024 * (4096 + 256 + 128);
 
+/// Worst case for live backend transcript capture, also outside the
+/// supervisor's budget: each of the [`MAX_BACKEND_PROCESSES`] concurrent
+/// subprocesses buffers up to 4 MiB of stdout plus 64 KiB of stderr (the
+/// subprocess capture bounds), and transcript parsing clones assistant text
+/// into events while the captured stdout is still live — hence the factor
+/// of two. Declared alongside the retained budget for the same reason as
+/// [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 =
+    (MAX_BACKEND_PROCESSES as u64) * (4 * 1024 * 1024 + 64 * 1024) * 2;
+
 /// Most sessions retained in a terminal or deletion-tombstone state (R12);
 /// beyond it the oldest eligible entry is evicted.
 pub const MAX_TERMINAL_SESSIONS: usize = 256;

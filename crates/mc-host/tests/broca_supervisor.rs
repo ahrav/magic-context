@@ -114,12 +114,14 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     let resources = component.resources();
     assert_eq!(resources.reserved_pending_requests, 96);
     assert_eq!(resources.reserved_handler_tasks, 96);
-    // The supervisor's 64 MiB budget plus the route-identity map's worst
-    // case (1024 routes x (4096-byte root + 256-byte session + 128-byte
-    // key overhead)), which is retained outside that budget.
+    // The supervisor's 64 MiB budget plus the two retention classes outside
+    // it: the route-identity map (1024 routes x (4096-byte root + 256-byte
+    // session + 128-byte key overhead)) and live backend transcript capture
+    // (8 backends x (4 MiB stdout + 64 KiB stderr), doubled for the parse
+    // clones held while the capture is still live).
     assert_eq!(
         resources.retained_resident_bytes,
-        64 * 1024 * 1024 + 1024 * (4096 + 256 + 128)
+        64 * 1024 * 1024 + 1024 * (4096 + 256 + 128) + 8 * (4 * 1024 * 1024 + 64 * 1024) * 2
     );
     assert_eq!(resources.route_class, mc_host::RouteClass::Reserved);
 }
@@ -257,6 +259,31 @@ async fn status_reports_exact_states_without_aliases() {
     for id in ["", "unknown", "broca-deadbeef00-1", "run-1", "active"] {
         assert_eq!(supervisor.status(id), Ok("missing"), "{id:?}");
     }
+}
+
+/// A panicking backend must still yield exactly one failed terminal: an
+/// unfinished run would stay `running` forever, hold its active-run slot,
+/// and strand its subscribers.
+#[tokio::test]
+async fn backend_panic_commits_one_failed_terminal() {
+    let backend = ScriptedBackend::with_behavior(|_request, _events, _cancel| {
+        Box::pin(async { panic!("backend bug") })
+    });
+    let supervisor = Supervisor::new(backend as Arc<_>);
+    let run_id = send(&supervisor, "s-panic", "p1");
+    until(
+        || supervisor.status(&run_id) == Ok("failed"),
+        "panicked run fails",
+    )
+    .await;
+    // `finish` ran, so the run slot is free again: a fresh run on another
+    // session still admits and reaches its own terminal.
+    let second = send(&supervisor, "s-after-panic", "p2");
+    until(
+        || supervisor.status(&second) == Ok("failed"),
+        "post-panic run still executes",
+    )
+    .await;
 }
 
 #[tokio::test(start_paused = true)]

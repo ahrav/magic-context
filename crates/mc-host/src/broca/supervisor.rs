@@ -676,10 +676,31 @@ impl Supervisor {
             let sink = EventSink::new(Arc::new(move |event| {
                 append_event(&sink_inner, &sink_run, event)
             }));
-            let terminal = inner
-                .backend
-                .execute(backend_request, sink, run.cancel.clone())
-                .await;
+            // The backend runs in its own tracked task so a panic surfaces
+            // as a join error instead of unwinding past `finish`: an
+            // unfinished run would stay `running` forever, hold its
+            // active-run slot, and strand its subscribers (R10).
+            let backend = Arc::clone(&inner.backend);
+            let backend_cancel = run.cancel.clone();
+            let backend_task = inner
+                .tracker
+                .spawn(async move { backend.execute(backend_request, sink, backend_cancel).await });
+            let terminal = match backend_task.await {
+                Ok(terminal) => terminal,
+                Err(join_error) => {
+                    let message = if join_error.is_panic() {
+                        "backend execution panicked"
+                    } else {
+                        "backend task was aborted"
+                    };
+                    BackendTerminal::Failed(BackendError {
+                        class: ErrorClass::Permanent,
+                        message: message.to_owned(),
+                        retry_after_secs: None,
+                        provider_code: None,
+                    })
+                }
+            };
             // A fired cancel token wins over whatever the backend returned:
             // the control operation already promised a cancellation
             // terminal, and `finish` is first-append-wins anyway.

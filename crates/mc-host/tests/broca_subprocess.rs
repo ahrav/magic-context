@@ -115,6 +115,10 @@ fn main() {
             pi_extension_stdout_noise_skipped,
         ),
         (
+            "pi_tool_requesting_stop_is_not_terminal",
+            pi_tool_requesting_stop_is_not_terminal,
+        ),
+        (
             "undelivered_prompt_rejects_clean_transcript",
             undelivered_prompt_rejects_clean_transcript,
         ),
@@ -1830,6 +1834,48 @@ fn pi_extension_stdout_noise_skipped() {
     let error = failed(&terminal);
     assert!(
         error.message.contains("malformed json at line 1"),
+        "{:?}",
+        error.message
+    );
+}
+
+/// A completion that still carries a `toolCall` block is an intermediate
+/// turn shape, never this tool-less run's terminal: text beside an
+/// unexecuted tool request must not be published as the answer.
+fn pi_tool_requesting_stop_is_not_terminal() {
+    // Followed by a real terminal: the run completes with the final text.
+    let mut lines = vec![
+        serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+        serde_json::json!({"type": "agent_start"}),
+        serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [
+            {"type": "text", "text": "let me check"},
+            {"type": "toolCall", "name": "read_file"},
+        ]}}),
+    ];
+    let terminal_line = serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "real answer"}]}});
+    lines.push(terminal_line);
+    let (terminal, events) = run_pi_transcript(&lines);
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "real answer")
+    ));
+    assert!(!events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "let me check")
+    ));
+
+    // Alone: no terminal ever arrives, so the run fails closed.
+    let (terminal, _) = run_pi_transcript(&[
+        serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+        serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [
+            {"type": "toolCall", "name": "read_file"},
+        ]}}),
+    ]);
+    let error = failed(&terminal);
+    assert!(
+        error.message.contains("without a terminal event"),
         "{:?}",
         error.message
     );

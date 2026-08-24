@@ -252,8 +252,10 @@ fn pi_terminal_probe(lines: &[u8]) -> bool {
 
 /// One-line check for a terminal assistant `message_end` (stopReason
 /// `stop`, `length`, `error`, or `aborted`) — the probe-side mirror of the
-/// terminal decision in [`parse_pi_transcript`]. Noise and malformed lines
-/// are simply not terminals here; the full parse renders that verdict.
+/// terminal decision in [`parse_pi_transcript`], including the rule that a
+/// completion still requesting tools is not this run's terminal. Noise and
+/// malformed lines are simply not terminals here; the full parse renders
+/// that verdict.
 fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(line) else {
         return false;
@@ -270,12 +272,14 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
         return false;
     }
-    matches!(
-        message
-            .get("stopReason")
-            .and_then(serde_json::Value::as_str),
-        Some("stop" | "length" | "error" | "aborted")
-    )
+    match message
+        .get("stopReason")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("stop" | "length") => !message_requests_tools(message),
+        Some("error" | "aborted") => true,
+        _ => false,
+    }
 }
 
 /// Parses the closed Pi print-mode JSON vocabulary (R18). The terminal
@@ -350,6 +354,12 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
                     // the vocabulary tolerates the spelling) are ignored for
                     // the terminal decision.
                     None | Some("toolUse") => {}
+                    // A completion that still requests tools is an
+                    // intermediate turn shape, not this tool-less run's
+                    // terminal (`subagent-runner.ts` applies the same rule):
+                    // committing it would publish text beside an unexecuted
+                    // tool request as the answer.
+                    Some("stop" | "length") if message_requests_tools(message) => {}
                     Some("stop") => {
                         events.push(BackendEvent::AssistantText {
                             text,
@@ -430,4 +440,18 @@ fn assistant_text(message: &serde_json::Value) -> String {
         }
     }
     text
+}
+
+/// Whether an assistant message's content still carries a `toolCall` block:
+/// `subagent-runner.ts` treats a stop as terminal only when no such block is
+/// present, and this run executes without tools.
+fn message_requests_tools(message: &serde_json::Value) -> bool {
+    message
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("toolCall")
+            })
+        })
 }

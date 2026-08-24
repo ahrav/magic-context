@@ -494,11 +494,17 @@ async function runClassifyThroughModule(
         memories: chunk.map(toPromptMemory),
         anchors,
     });
-    // Prompt construction consumes the slice budget. A remainder at or below
-    // the purge margin would give the module an unworkable budget and fail
-    // the task; leaving the chunk unbanked keeps it eligible next slice.
-    const remainingMs = Math.min(sliceDeadline, args.deadline) - Date.now();
-    if (remainingMs <= CLASSIFY_MODULE_PURGE_MARGIN_MS) {
+    // Prompt construction consumes the slice budget. Both budgets below
+    // derive from this one capped remainder: capping only the transport
+    // would let a long slice hand the module a budget that outlives the
+    // transport and reopen the cancel-before-purge race. A remainder at or
+    // below the purge margin would give the module an unworkable budget and
+    // fail the task; leaving the chunk unbanked keeps it eligible next slice.
+    const budgetMs = Math.min(
+        CLASSIFY_MODULE_RUN_TIMEOUT_MS,
+        Math.min(sliceDeadline, args.deadline) - Date.now(),
+    );
+    if (budgetMs <= CLASSIFY_MODULE_PURGE_MARGIN_MS) {
         log("[dreamer] classify: slice budget expired before the module call; chunk left unbanked");
         return null;
     }
@@ -526,7 +532,7 @@ async function runClassifyThroughModule(
                 // deadline machinery — not a transport cancel that aborts the
                 // handler mid-cleanup — ends an over-budget run and purges its
                 // attempt session. The guard above keeps this positive.
-                timeout_ms: remainingMs - CLASSIFY_MODULE_PURGE_MARGIN_MS,
+                timeout_ms: budgetMs - CLASSIFY_MODULE_PURGE_MARGIN_MS,
                 items: chunk.map((candidate) => ({
                     memory_id: candidate.id,
                     content_hash: candidate.normalizedHash,
@@ -536,7 +542,7 @@ async function runClassifyThroughModule(
         signal,
         // The module drives a full producer run (model call included) before replying,
         // so this request carries the classify slice budget, not the transport default.
-        timeoutMs: Math.min(CLASSIFY_MODULE_RUN_TIMEOUT_MS, remainingMs),
+        timeoutMs: budgetMs,
     });
     const result = (response as { result?: unknown } | null)?.result ?? response;
     if (!result || typeof result !== "object")
