@@ -6,6 +6,11 @@ import {
     getProjectEmbeddingSnapshot,
 } from "./embedding";
 import {
+    exactMemoryContentDigests,
+    memoriesEligibleForEmbedding,
+} from "./storage-claim-visibility";
+import { sha256Utf8Hex } from "./storage-claims";
+import {
     type StoredMemoryEmbedding,
     saveEmbeddingIfHashMatches,
 } from "./storage-memory-embeddings";
@@ -42,9 +47,31 @@ export async function ensureMemoryEmbeddings(args: {
             return args.existingEmbeddings;
         }
 
+        // The detailed lane above rechecks at its own drain; this legacy
+        // fallback would otherwise ship the frozen contents straight to the
+        // provider. Revalidate policy eligibility and exact-bind every row
+        // to its current claim revision immediately before the call — a row
+        // hidden or rewritten since the search filter must not be disclosed,
+        // and the post-call save guard cannot undo that disclosure.
+        const eligibleAtCall = memoriesEligibleForEmbedding(
+            args.db,
+            missingMemories.map((memory) => memory.id),
+        );
+        const digestsAtCall = exactMemoryContentDigests(
+            args.db,
+            missingMemories.map((memory) => memory.id),
+        );
+        const boundMissing = missingMemories.filter(
+            (memory) =>
+                eligibleAtCall.has(memory.id) &&
+                digestsAtCall.get(memory.id) === sha256Utf8Hex(memory.content),
+        );
+        if (boundMissing.length === 0) {
+            return args.existingEmbeddings;
+        }
         const result = await embedBatchForProject(
             args.projectIdentity,
-            missingMemories.map((memory) => memory.content),
+            boundMissing.map((memory) => memory.content),
         );
         if (!result) {
             return args.existingEmbeddings;
@@ -54,7 +81,7 @@ export async function ensureMemoryEmbeddings(args: {
         // the transaction succeeds, so a rollback doesn't leave stale Map entries.
         const staged = new Map<number, StoredMemoryEmbedding>();
         args.db.transaction(() => {
-            for (const [index, memory] of missingMemories.entries()) {
+            for (const [index, memory] of boundMissing.entries()) {
                 const embedding = result.vectors[index];
                 if (!embedding) {
                     continue;

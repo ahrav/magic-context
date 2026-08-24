@@ -2140,6 +2140,10 @@ export async function syncModuleState(args: {
     options?: ModuleStateSyncOptions;
 }): Promise<ModuleStateSyncResult> {
     let force = args.force;
+    // Captured from the completing batch of the most recent send, for the
+    // post-send policy revalidation below (the batch list itself is scoped
+    // to the try block).
+    let completingBatchParams: unknown = null;
     const adoption = args.options?.authoritySeqAdoption ?? { used: false };
     const resolveStateSyncDeltas = async (afterGenerationChange = false): Promise<boolean> => {
         let capability = afterGenerationChange ? undefined : args.options?.stateSyncDeltas;
@@ -2189,6 +2193,7 @@ export async function syncModuleState(args: {
         }
         try {
             const batches = payload.wireBatches ?? [payload];
+            completingBatchParams = batches.length > 0 ? batches[batches.length - 1].params : null;
             for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
                 const batch = batches[batchIndex];
                 if (batchIndex === batches.length - 1 && args.pass.projectPath) {
@@ -2268,6 +2273,38 @@ export async function syncModuleState(args: {
             args.state.lastAckedWatermarks = null;
             force = true;
             continue;
+        }
+        // Post-send revalidation: a held-open pre-v86 compatibility writer
+        // appends stale/flagged verification events WITHOUT bumping the
+        // project epoch — including while the awaited sends above were in
+        // flight, a window the pre-send completing-batch check cannot see.
+        // Reconcile first (it projects those events into policy state and
+        // bumps the epoch when any exist), then compare against the built
+        // snapshot; accepting the old watermarks here would leave the module
+        // serving a row the current policy already soft-hides.
+        if (args.pass.projectPath && completingBatchParams !== null) {
+            reconcileCompatibilityVerifications(args.pass.db);
+            const params = completingBatchParams as {
+                project_memory_epoch?: number;
+                acked_watermarks?: { workspace_fingerprint?: string | null };
+            };
+            const epochAtBuild = params.project_memory_epoch;
+            const epochNow =
+                getProjectState(args.pass.db, args.pass.projectPath)?.projectMemoryEpoch ?? 0;
+            const epochMoved = epochAtBuild !== undefined && epochNow !== epochAtBuild;
+            const fingerprintAtBuild = params.acked_watermarks?.workspace_fingerprint;
+            const fingerprintMoved =
+                fingerprintAtBuild !== undefined &&
+                (resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath).workspace
+                    ?.fingerprint ?? null) !== (fingerprintAtBuild ?? null);
+            if (epochMoved || fingerprintMoved) {
+                sessionLog(
+                    args.pass.sessionId,
+                    `module state sync rebuilding after send: ${epochMoved ? `project memory epoch moved ${epochAtBuild} -> ${epochNow}` : "workspace fingerprint moved"} while the sync was in flight`,
+                );
+                force = true;
+                continue;
+            }
         }
         args.state.lastAckedWatermarks = payload.watermarks;
         args.state.lastAckedSeq += 1;

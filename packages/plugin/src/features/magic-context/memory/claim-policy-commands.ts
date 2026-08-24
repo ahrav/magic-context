@@ -100,7 +100,10 @@ interface ResolvedTarget {
  * `resolveTarget` itself stays context-space pure, so the confirmation-time
  * recheck can re-resolve an already-translated id without a second mapping
  * pass redirecting it to an unrelated row. */
-function translateAgentVisibleMemoryId(deps: ClaimCommandDeps, memoryId: number): number {
+function translateAgentVisibleMemoryId(
+    deps: ClaimCommandDeps,
+    memoryId: number,
+): number | { error: string } {
     if (!getAuthorityManagedMarker(deps.db, deps.projectPath)) return memoryId;
     const mapped = deps.db
         .prepare(
@@ -111,7 +114,14 @@ function translateAgentVisibleMemoryId(deps: ClaimCommandDeps, memoryId: number)
     if (mapped != null && Number.isInteger(mapped.contextRowId)) {
         return mapped.contextRowId as number;
     }
-    return memoryId;
+    // FAIL CLOSED on a missing mapping: while MODULE authority is active the
+    // agent-visible id space IS the module's, and a native row mirror-back
+    // has not yet mapped has no claim row to act on. Falling back to the raw
+    // number would present — and record authority for — whatever context row
+    // happens to carry it.
+    return {
+        error: `Memory ${memoryId} has no mirrored claim row yet; retry after the next sync completes.`,
+    };
 }
 
 /** Resolve a memory id to its claim revision INSIDE the active project only:
@@ -297,7 +307,11 @@ export async function executeClaimApprovalCommand(
     if (!Number.isSafeInteger(memoryId) || memoryId <= 0) {
         return { text: `## Claim Approval\n\n${APPROVE_USAGE}`, level: "error" };
     }
-    const target = resolveTarget(deps, translateAgentVisibleMemoryId(deps, memoryId));
+    const translated = translateAgentVisibleMemoryId(deps, memoryId);
+    if (typeof translated !== "number") {
+        return { text: `## Claim Approval — Failed\n\n${translated.error}`, level: "error" };
+    }
+    const target = resolveTarget(deps, translated);
     if ("error" in target) {
         return { text: `## Claim Approval — Failed\n\n${target.error}`, level: "error" };
     }
@@ -548,10 +562,14 @@ export async function executeClaimEnforceCommand(
         if (!Number.isSafeInteger(revokeMemoryId) || revokeMemoryId <= 0) {
             return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
         }
-        const revokeTarget = resolveTarget(
-            deps,
-            translateAgentVisibleMemoryId(deps, revokeMemoryId),
-        );
+        const revokeTranslated = translateAgentVisibleMemoryId(deps, revokeMemoryId);
+        if (typeof revokeTranslated !== "number") {
+            return {
+                text: `## Claim Enforcement — Failed\n\n${revokeTranslated.error}`,
+                level: "error",
+            };
+        }
+        const revokeTarget = resolveTarget(deps, revokeTranslated);
         if ("error" in revokeTarget) {
             return {
                 text: `## Claim Enforcement — Failed\n\n${revokeTarget.error}`,
@@ -664,7 +682,11 @@ export async function executeClaimEnforceCommand(
     if (parts.length !== 2 || !Number.isSafeInteger(memoryId) || memoryId <= 0 || !artifactInput) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
-    const target = resolveTarget(deps, translateAgentVisibleMemoryId(deps, memoryId));
+    const translated = translateAgentVisibleMemoryId(deps, memoryId);
+    if (typeof translated !== "number") {
+        return { text: `## Claim Enforcement — Failed\n\n${translated.error}`, level: "error" };
+    }
+    const target = resolveTarget(deps, translated);
     if ("error" in target) {
         return { text: `## Claim Enforcement — Failed\n\n${target.error}`, level: "error" };
     }
