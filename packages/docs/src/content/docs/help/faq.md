@@ -9,7 +9,7 @@ No. All durable state — messages, compartments, memories — is stored in a lo
 
 The background historian and dreamer agents run as subagents using **your configured model providers**. When they run, your session content is sent to those providers (the same way your primary coding session already sends to them). Magic Context does not introduce any new data recipients beyond the model providers you have already chosen.
 
-Semantic embeddings use the `embedding.provider` setting. The default is `"local"` — the embedding model runs in-process using `Xenova/all-MiniLM-L6-v2`, which never sends data anywhere. If you configure an `openai-compatible` endpoint, embedding queries go to that endpoint only.
+Semantic embeddings use the `embedding.provider` setting. The default is `"local"` — the embedding model runs in-process using `Xenova/bge-small-en-v1.5`, which never sends data anywhere. If you configure an `openai-compatible` endpoint, embedding queries go to that endpoint only.
 
 ## What does it cost to run?
 

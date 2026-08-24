@@ -366,6 +366,22 @@ export function updatePrimerCandidateEmbedding(
     ).run(vectorBlob(vector), modelId, candidateId);
 }
 
+/** Replaces an active primer's question vector, for provider-identity changes:
+ *  search skips any primer whose embedding model id differs from the query's,
+ *  so a primer embedded under a retired identity is semantically invisible
+ *  until rewritten here. */
+export function updatePrimerQuestionEmbedding(
+    db: Database,
+    primerId: number,
+    vector: Float32Array,
+    modelId: string,
+    now = Date.now(),
+): void {
+    db.prepare(
+        "UPDATE primers SET question_embedding = ?, question_embedding_model_id = ?, updated_at = ? WHERE id = ?",
+    ).run(vectorBlob(vector), modelId, now, primerId);
+}
+
 export function getPrimerCandidatesByIds(db: Database, ids: number[]): PrimerCandidate[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");

@@ -3178,7 +3178,7 @@ export type SessionChunkBackfillOutcome =
  * chronologically. Unlike the passive project drain this has no per-sweep cap —
  * the user asked for the whole session — but it still runs under the per-project
  * embedding coordinator lease (mutual exclusion with the passive sweep + sibling
- * processes) and yields between batches so an 8-core MiniLM burst stays
+ * processes) and yields between batches so an 8-core local-inference burst stays
  * interruptible. Idempotent + resumable via chunk_hash; re-running embeds only
  * what's still missing.
  */

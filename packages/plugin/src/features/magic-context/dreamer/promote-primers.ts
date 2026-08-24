@@ -17,6 +17,7 @@ import {
     PRIMER_CANDIDATE_MAX_AGE_MS,
     PRIMER_CANDIDATE_TTL_MS,
     updatePrimerCandidateEmbedding,
+    updatePrimerQuestionEmbedding,
     updatePrimerSupport,
 } from "../storage-primers";
 import {
@@ -63,13 +64,31 @@ async function embedMissingCandidates(
 ): Promise<void> {
     await args.ensureProjectRegistered?.(args.sessionDirectory, args.db);
     assertLeaseHeld("embedding registration");
+    // The empty-batch call resolves the CURRENT provider identity without
+    // running inference. Rows stamped with a different identity are as unusable
+    // as rows with no embedding at all — search skips any vector whose model id
+    // differs from the query's — so a provider change (new default model, dtype
+    // change, recipe change) must select them for re-embedding, or primers
+    // permanently lose semantic retrieval while keeping stale bytes.
+    const current = await embedBatchForProject(args.projectIdentity, [], undefined, "passage");
+    if (!current) return;
+    const isStale = (embedding: Float32Array | null, modelId: string | null): boolean =>
+        !embedding || !modelId || modelId !== current.modelId;
+
     const candidates = getPrimerCandidatesForPromotion(args.db, args.projectIdentity).filter(
-        (candidate) => !candidate.questionEmbedding || !candidate.questionEmbeddingModelId,
+        (candidate) => isStale(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
     );
-    if (candidates.length === 0) return;
+    const primers = getActivePrimers(args.db, args.projectIdentity).filter((primer) =>
+        isStale(primer.questionEmbedding, primer.questionEmbeddingModelId),
+    );
+    if (candidates.length === 0 && primers.length === 0) return;
+
     const batch = await embedBatchForProject(
         args.projectIdentity,
-        candidates.map((candidate) => candidate.question),
+        [
+            ...candidates.map((candidate) => candidate.question),
+            ...primers.map((primer) => primer.question),
+        ],
         undefined,
         "passage",
     );
@@ -80,6 +99,12 @@ async function embedMissingCandidates(
         const vector = batch.vectors[i];
         if (!vector) continue;
         updatePrimerCandidateEmbedding(args.db, candidates[i].id, vector, batch.modelId);
+    }
+    for (let i = 0; i < primers.length; i += 1) {
+        assertLeaseHeld("embedding commit");
+        const vector = batch.vectors[candidates.length + i];
+        if (!vector) continue;
+        updatePrimerQuestionEmbedding(args.db, primers[i].id, vector, batch.modelId);
     }
 }
 

@@ -6,7 +6,12 @@ import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-cont
 import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { log } from "../../../shared/logger";
 import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-permissions";
-import { getEmbeddingProviderIdentity } from "./embedding-identity";
+import {
+    getEmbeddingProviderIdentity,
+    getLocalEmbeddingRecipe,
+    type LocalEmbeddingPooling,
+    type LocalEmbeddingRecipe,
+} from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
 
 /** The dtype enum values accepted by @huggingface/transformers' feature-extraction
@@ -28,34 +33,14 @@ export type LocalEmbeddingDtype =
     | "q1"
     | "q1f16";
 
-export type LocalEmbeddingPooling = "mean" | "cls";
-
-/** How a model's card says its vectors must be produced. Wrong pooling or a
- *  missing query instruction still yields plausible-looking vectors, just
- *  quietly bad rankings, so the recipe is bound to the model id here instead of
- *  being left to configuration. The recipe is a pure function of the model id,
- *  which is why it needs no separate fold into the provider identity. */
-export interface LocalEmbeddingRecipe {
-    pooling: LocalEmbeddingPooling;
-    /** Prepended to `"query"`-purpose inputs only; passages embed unprefixed. */
-    queryPrefix: string;
-}
-
-/** Models without an entry embed symmetrically: mean pooling, no instruction. */
-const SYMMETRIC_RECIPE: LocalEmbeddingRecipe = { pooling: "mean", queryPrefix: "" };
-
-const MODEL_RECIPES: Record<string, LocalEmbeddingRecipe> = {
-    // BGE v1.5 CLS-pools and expects this exact retrieval instruction on short
-    // queries: https://huggingface.co/BAAI/bge-small-en-v1.5#model-usage
-    "Xenova/bge-small-en-v1.5": {
-        pooling: "cls",
-        queryPrefix: "Represent this sentence for searching relevant passages: ",
-    },
-};
-
-export function getLocalEmbeddingRecipe(model: string): LocalEmbeddingRecipe {
-    return MODEL_RECIPES[model] ?? SYMMETRIC_RECIPE;
-}
+// The recipe definitions live in embedding-identity.ts because the recipe
+// participates in the provider identity; re-exported here so provider users
+// keep one import surface for local-embedding concerns.
+export {
+    getLocalEmbeddingRecipe,
+    type LocalEmbeddingPooling,
+    type LocalEmbeddingRecipe,
+} from "./embedding-identity";
 
 /**
  * Cross-process mutex for embedding-model load. When two OpenCode processes

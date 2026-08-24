@@ -7,6 +7,7 @@ import {
     type LocalEmbeddingDtype,
     LocalEmbeddingProvider,
 } from "./embedding-local";
+import { computeNormalizedHash } from "./normalize-hash";
 
 // Part A of issue #128: classify the PERMANENT "native runtime not installed"
 // failure so the provider degrades once (one actionable log line) instead of
@@ -156,6 +157,34 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
 describe("local embedding recipes", () => {
     const BGE_MODEL = "Xenova/bge-small-en-v1.5";
     const BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
+
+    /** The identity string a local config produced before recipes existed:
+     *  provider + model only. Unlisted models must still hash to exactly this
+     *  (no global re-embed from shipping the recipe feature), while a
+     *  recipe-bound model must NOT — its recipe changes the produced vectors,
+     *  so vectors stored under the pre-recipe identity are a different space. */
+    const preRecipeIdentity = (model: string): string =>
+        `embedding-provider:${computeNormalizedHash(
+            JSON.stringify({
+                provider: "local",
+                model,
+                endpoint: "",
+                apiKeyPresent: false,
+            }),
+        )}`;
+
+    test("unlisted models keep the pre-recipe identity byte-identical", () => {
+        const model = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
+        expect(getEmbeddingProviderIdentity({ provider: "local", model })).toBe(
+            preRecipeIdentity(model),
+        );
+    });
+
+    test("a recipe-bound model folds its recipe into the identity", () => {
+        expect(getEmbeddingProviderIdentity({ provider: "local", model: BGE_MODEL })).not.toBe(
+            preRecipeIdentity(BGE_MODEL),
+        );
+    });
 
     test("bge-small binds CLS pooling and the query-only instruction", () => {
         expect(getLocalEmbeddingRecipe(BGE_MODEL)).toEqual({

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
+import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
@@ -423,7 +424,7 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
         log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
         return { issues: 0, unverified: true };
     }
-    log.success("Embedding provider: local (Xenova/all-MiniLM-L6-v2 bundled)");
+    log.success(`Embedding provider: local (${DEFAULT_LOCAL_EMBEDDING_MODEL} bundled)`);
     return { issues: 0 };
 }
 

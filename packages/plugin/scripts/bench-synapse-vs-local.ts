@@ -8,6 +8,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../src/config/schema/magic-context";
 import { SynapseEmbeddingProvider } from "../src/features/magic-context/memory/embedding-synapse";
 import { LocalEmbeddingProvider } from "../src/features/magic-context/memory/embedding-local";
 
@@ -73,7 +74,7 @@ const items = rows.map((r) => ({
     const ms = Date.now() - t;
     const ok = vectors.filter((v) => v !== null).length;
     console.log(
-        `local (${provider.modelId}): ${ok}/${items.length} vectors in ${ms}ms  (${(ms / items.length).toFixed(1)}ms/item, ${((totalChars / 1000) / (ms / 1000)).toFixed(0)}k chars/s)`,
+        `local (${DEFAULT_LOCAL_EMBEDDING_MODEL}): ${ok}/${items.length} vectors in ${ms}ms  (${(ms / items.length).toFixed(1)}ms/item, ${((totalChars / 1000) / (ms / 1000)).toFixed(0)}k chars/s)`,
     );
 }
 
