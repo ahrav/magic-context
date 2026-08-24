@@ -257,16 +257,35 @@ export function sanitizedCandidateFactory(
                     const flags = Number(header.flags);
                     const channelId = Number(header.channel);
                     const epoch = Number(header.epoch);
-                    const corr = BigInt(header.corr);
-                    const body = frame.body;
+                    // Correlation identity must be exact: coercing an
+                    // already-rounded number above MAX_SAFE_INTEGER would
+                    // key this frame to a DIFFERENT pending request once a
+                    // generation's allocator reaches that range.
+                    const rawCorr = header.corr;
+                    if (
+                        typeof rawCorr !== "bigint" &&
+                        !(typeof rawCorr === "number" && Number.isSafeInteger(rawCorr))
+                    ) {
+                        throw new Error("inexact provider correlation");
+                    }
+                    const corr = BigInt(rawCorr);
+                    const providerBody = frame.body;
                     if (
                         ![len, ver, ty, flags, channelId, epoch].every((field) =>
                             Number.isSafeInteger(field),
                         ) ||
-                        !(body instanceof Uint8Array)
+                        !(providerBody instanceof Uint8Array)
                     ) {
                         throw new Error("malformed provider frame");
                     }
+                    if (providerBody.length > args.maxBodyLen) {
+                        throw new Error("oversize provider frame");
+                    }
+                    // Owned copy: a provider that reuses or mutates its read
+                    // buffer after onFrame returns must not change bytes a
+                    // later promise continuation or retained stream item
+                    // decodes.
+                    const body = providerBody.slice();
                     snapshot = {
                         // The safe-integer check bounds `ty`; the shared
                         // wire validation below rejects illegal values.
@@ -289,11 +308,9 @@ export function sanitizedCandidateFactory(
                     // nonzero correlation, say) would reach dispatch as a
                     // legitimate connection close.
                     validateHeader(snapshot.header);
-                    const violation = headerViolation(snapshot.header);
                     if (
-                        violation !== null ||
-                        snapshot.header.len !== body.length ||
-                        body.length > args.maxBodyLen
+                        headerViolation(snapshot.header) !== null ||
+                        snapshot.header.len !== body.length
                     ) {
                         throw new Error("wire-invalid provider frame");
                     }
@@ -411,7 +428,12 @@ export function sanitizedCandidateFactory(
                 return {
                     cancel: () => {
                         try {
-                            return ticket.cancel();
+                            // Exactly `true` is proof of non-publication; a
+                            // truthy non-boolean is not, and treating it as
+                            // proof would let the generation settle
+                            // `not_sent` (replay-eligible) for a frame the
+                            // provider may still publish.
+                            return ticket.cancel() === true;
                         } catch {
                             // A throwing provider ticket must not disrupt
                             // pending-entry settlement; `false` is the
