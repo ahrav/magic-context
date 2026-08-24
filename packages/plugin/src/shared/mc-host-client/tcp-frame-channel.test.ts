@@ -7,8 +7,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { Deadline } from "./deadline";
-import { ByteBudget, type FrameChannelCloseReason, type InboundFrame } from "./frame-channel";
-import { FrameType, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION } from "./protocol";
+import { ByteBudget, type FrameChannelCloseReason } from "./frame-channel";
+import {
+    type EnvelopeHeader,
+    FrameType,
+    MAX_FRAME_BODY_LEN,
+    PROTOCOL_VERSION,
+} from "./protocol";
 import { TcpFrameChannel } from "./tcp-frame-channel";
 import { encodePeerFrame, FakePeer, type FakePeerConnection } from "./test-support/fake-peer";
 import {
@@ -33,7 +38,7 @@ interface TcpHarness {
     channel: TcpFrameChannel;
     budget: ByteBudget;
     connection: FakePeerConnection;
-    received: InboundFrame[];
+    received: { header: EnvelopeHeader; body: Uint8Array }[];
     closes: { reason: FrameChannelCloseReason; error: unknown }[];
 }
 
@@ -72,7 +77,7 @@ describe("TCP adapter specifics", () => {
         if (options.helloTrailer) peer.helloTrailer = options.helloTrailer;
         const maxBodyLen = options.maxBodyLen ?? MAX_FRAME_BODY_LEN;
         const budget = new ByteBudget(maxBodyLen + 1_048_576);
-        const received: InboundFrame[] = [];
+        const received: { header: EnvelopeHeader; body: Uint8Array }[] = [];
         const closes: { reason: FrameChannelCloseReason; error: unknown }[] = [];
         const channel = new TcpFrameChannel({
             host: "127.0.0.1",
@@ -82,7 +87,8 @@ describe("TCP adapter specifics", () => {
             frameDeadlineMs: options.frameDeadlineMs,
             maxBodyLen: options.maxBodyLen,
             handlers: {
-                onFrame: (frame) => received.push(frame),
+                onFrame: (frame) =>
+                    received.push({ header: frame.header, body: frame.body.takeOwned() }),
                 onClosed: (reason, error) => closes.push({ reason, error }),
             },
         });

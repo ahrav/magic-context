@@ -159,7 +159,7 @@ pub fn open_loop_interval_ns(rate_per_sec: u64) -> Result<u64, String> {
     // A truncated interval silently raises the actual arrival rate while
     // every manifest retains the requested label; only exactly
     // representable rates are honest.
-    if 1_000_000_000u64 % rate_per_sec != 0 {
+    if !1_000_000_000u64.is_multiple_of(rate_per_sec) {
         return Err(format!(
             "offered rate {rate_per_sec}/s has no exact nanosecond interval; \
              choose a rate that divides 1e9"

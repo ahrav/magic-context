@@ -234,9 +234,9 @@ impl std::fmt::Debug for RequestOutcome {
     }
 }
 
-/// Request body with its resident-byte charge attached: moving the bytes
-/// anywhere moves the charge with them, so handler code that retains the
-/// body past the callback cannot separate it from its ingress accounting.
+/// Owned semantic request body with its resident-byte charge attached.
+/// Transport bytes are decoded or copied synchronously before construction,
+/// so asynchronous handler work never retains a receive lease.
 pub struct InputBuffer {
     pub(crate) body: Vec<u8>,
     pub(crate) _charge: crate::wire::ByteCharge,
@@ -368,8 +368,8 @@ impl io::Write for OutputBuffer {
 /// ```
 pub struct RequestCtx {
     pub route: RouteHandle,
-    /// Opaque request body. Binary or JSON per `binary`. Carries its
-    /// resident-byte charge, so retaining it keeps its ingress accounting.
+    /// Opaque owned semantic body. Binary or JSON per `binary`.
+    /// Retaining the body retains its ingress byte charge.
     pub body: InputBuffer,
     pub binary: bool,
     pub(crate) cancel: CancellationToken,

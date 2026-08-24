@@ -11,6 +11,7 @@
 import { SubcCallError } from "./errors";
 import {
     type ByteBudget,
+    CopyCounter,
     type FrameChannelCloseReason,
     type FrameChannelDiagnosticType,
     type FrameChannelHandlers,
@@ -19,6 +20,7 @@ import {
     type FrameSendTicket,
     headerViolation,
     type InboundFrame,
+    ReceiveLease,
     type SetupFrameChannel,
 } from "./frame-channel";
 import { type FrameType, MAX_CORRELATION, validateHeader } from "./protocol";
@@ -235,6 +237,9 @@ export function sanitizedCandidateFactory(
         // Wrapped flush() calls settle here on channel close, matching the
         // FrameChannel contract, instead of waiting out their deadlines.
         const flushWaiters = new Set<() => void>();
+        const receiveLeases = new Set<ReceiveLease>();
+        const copyCounter = new CopyCounter();
+        let quarantinedBytes = 0;
         // Single close path: EVERY channel close — provider-reported or
         // wrapper-detected — drains the flush waiters first, so no pending
         // flush outlives the close that should have settled it.
@@ -278,12 +283,12 @@ export function sanitizedCandidateFactory(
                         throw new Error("inexact provider correlation");
                     }
                     const corr = BigInt(rawCorr);
-                    const providerBody = frame.body;
+                    const providerLease = frame.body;
                     if (
                         ![len, ver, ty, flags, channelId, epoch].every((field) =>
                             Number.isSafeInteger(field),
                         ) ||
-                        !(providerBody instanceof Uint8Array)
+                        !(providerLease instanceof ReceiveLease)
                     ) {
                         throw new Error("malformed provider frame");
                     }
@@ -310,10 +315,7 @@ export function sanitizedCandidateFactory(
                     ) {
                         throw new Error("out-of-range provider header field");
                     }
-                    // `length` on a subclass is an overridable accessor, so
-                    // the reported size only sizes the budget reservation;
-                    // the copy's own length below is authoritative.
-                    const reported = Number(providerBody.length);
+                    const reported = Number(providerLease.byteLength);
                     if (!Number.isSafeInteger(reported) || reported > args.maxBodyLen) {
                         throw new Error("oversize provider frame");
                     }
@@ -325,48 +327,40 @@ export function sanitizedCandidateFactory(
                     }
                     args.budget.charge(reported);
                     charged = reported;
-                    // Owned copy through the intrinsic constructor, which
-                    // reads the source's internal slots: a `Uint8Array`
-                    // subclass cannot override it to alias its own storage,
-                    // the way an overridden `slice()` could. Independent
-                    // storage is what keeps a provider's later buffer reuse
-                    // from mutating bytes a promise continuation or retained
-                    // stream item decodes.
-                    const body = new Uint8Array(providerBody);
-                    // Reconcile against the copy's true length: a spoofed
-                    // `length` accessor must not leave the budget carrying a
-                    // charge that does not match the bytes now held.
+                    const body = providerLease.takeOwned();
                     if (body.length !== reported) {
                         throw new Error("provider frame length disagrees with its bytes");
                     }
-                    snapshot = {
-                        // The safe-integer check bounds `ty`; the shared
-                        // wire validation below rejects illegal values.
-                        header: {
-                            len,
-                            ver,
-                            ty: ty as FrameType,
-                            flags,
-                            channel: channelId,
-                            epoch,
-                            corr,
-                        },
-                        body,
+                    const safeHeader = {
+                        len,
+                        ver,
+                        ty: ty as FrameType,
+                        flags,
+                        channel: channelId,
+                        epoch,
+                        corr,
                     };
-                    // A provider channel owes the generation the same
-                    // structural guarantees TcpFrameChannel provides:
-                    // dispatch assumes header legality, the declared length
-                    // matching the body, and the body cap. Without these a
-                    // wire-invalid frame (a channel-0 Goodbye with a
-                    // nonzero correlation, say) would reach dispatch as a
-                    // legitimate connection close.
-                    validateHeader(snapshot.header);
-                    if (
-                        headerViolation(snapshot.header) !== null ||
-                        snapshot.header.len !== body.length
-                    ) {
+                    validateHeader(safeHeader);
+                    if (headerViolation(safeHeader) !== null || safeHeader.len !== reported) {
                         throw new Error("wire-invalid provider frame");
                     }
+                    let safeLease: ReceiveLease;
+                    safeLease = new ReceiveLease(
+                        body.length === 0 ? [] : [body],
+                        (outcome) => {
+                            receiveLeases.delete(safeLease);
+                            if (outcome === "released") {
+                                if (charged > 0) args.budget.release(charged);
+                            } else {
+                                quarantinedBytes += charged;
+                                closeUpstream("protocol_violation", "channel");
+                            }
+                            charged = 0;
+                        },
+                        copyCounter,
+                    );
+                    receiveLeases.add(safeLease);
+                    snapshot = { header: safeHeader, body: safeLease };
                 } catch {
                     if (charged > 0) args.budget.release(charged);
                     closeUpstream("protocol_violation", "channel");
@@ -374,8 +368,14 @@ export function sanitizedCandidateFactory(
                 }
                 try {
                     args.handlers.onFrame(snapshot);
-                } finally {
-                    args.budget.release(charged);
+                } catch {
+                    try {
+                        snapshot.body.release();
+                    } catch {
+                        closeUpstream("protocol_violation", "channel");
+                        return;
+                    }
+                    closeUpstream("protocol_violation", "channel");
                 }
             },
             onClosed: (reason, _error) =>
@@ -437,6 +437,16 @@ export function sanitizedCandidateFactory(
                     channel.beginFrames();
                 } catch {
                     throw sanitizedProviderError(transport, "channel");
+                }
+            },
+            reserve: (header, capacity, hooks) => {
+                try {
+                    return channel.reserve(header, capacity, hooks);
+                } catch {
+                    throw new SubcCallError(
+                        "not_sent",
+                        `transport provider ${transport} failed during send`,
+                    );
                 }
             },
             send: (frame, hooks) => {
@@ -540,6 +550,13 @@ export function sanitizedCandidateFactory(
                     }
                 }),
             close: (error) => {
+                for (const lease of [...receiveLeases]) {
+                    try {
+                        lease.release();
+                    } catch {
+                        continue;
+                    }
+                }
                 // Owner close never fires onClosed (FrameChannel contract),
                 // so wrapper-owned flush waiters settle here too: a
                 // retiring generation must not leave them pending until
@@ -556,7 +573,15 @@ export function sanitizedCandidateFactory(
                 }
             },
             isClosed: () => channel.isClosed(),
-            stats: () => channel.stats(),
+            stats: () => {
+                const stats = channel.stats();
+                return {
+                    ...stats,
+                    activeReceiveLeases: stats.activeReceiveLeases + receiveLeases.size,
+                    quarantinedBytes: stats.quarantinedBytes + quarantinedBytes,
+                    ownedAdapterCopies: stats.ownedAdapterCopies + copyCounter.copies,
+                };
+            },
         };
     };
 }

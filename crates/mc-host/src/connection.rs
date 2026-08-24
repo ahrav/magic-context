@@ -474,7 +474,8 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                         }
                         watermark = header.corr;
                         if header.channel == 0 {
-                            match handle_control(shared, gen, frame, setup).await {
+                            let (corr, action) = decode_control_frame(frame, &shared.targets);
+                            match handle_control(shared, gen, corr, action, setup).await {
                                 ControlFlow::Continue => {}
                                 ControlFlow::Close(exit) => return exit,
                             }
@@ -489,7 +490,7 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                             if commit_transport(setup).is_err() {
                                 return ReadExit::Peer;
                             }
-                            dispatch_request(shared, gen, frame).await;
+                            dispatch_request(shared, gen, frame.into_owned()).await;
                         }
                     }
                     FrameType::Cancel => {
@@ -604,17 +605,28 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
     }
 }
 
+fn decode_control_frame(
+    frame: crate::frame_channel::InboundFrame,
+    targets: &crate::control::TargetIndex,
+) -> (u64, ControlAction) {
+    let corr = frame.header.corr;
+    let binary = frame.header.flags.is_binary();
+    let action = frame.with_lease(|lease| {
+        let body = lease
+            .contiguous_bytes()
+            .expect("TCP compatibility frames are contiguous");
+        parse_control(body, binary, targets)
+    });
+    (corr, action)
+}
+
 async fn handle_control<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    frame: crate::frame_channel::InboundFrame,
+    corr: u64,
+    action: ControlAction,
     setup: &mut ConnectionSetup,
 ) -> ControlFlow {
-    let corr = frame.header.corr;
-    let action = parse_control(&frame.body, frame.header.flags.is_binary(), &shared.targets);
-    // The body and its charge are done: validation is complete.
-    drop(frame);
-
     // Negotiation bypasses pending-request admission because it is setup
     // traffic: exhausted global capacity must not turn a negotiation into a
     // `server_busy` terminal.
@@ -981,6 +993,10 @@ async fn respond_tcp<H: McHostHandler>(
     ControlFlow::Continue
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "candidate grant keeps authenticated setup inputs explicit"
+)]
 async fn grant_candidate<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
@@ -1122,8 +1138,7 @@ async fn run_candidate_setup<H: McHostHandler>(
 ) {
     let exchange = async {
         let frame = expect_candidate_request(&mut receiver, ACTIVATION_CORRELATION).await?;
-        let request = decode_activate_request(&frame.body).map_err(|_| ())?;
-        drop(frame);
+        let request = decode_candidate_activate(frame)?;
         grant
             .consume(&request.activation_token, &binding)
             .map_err(|_| ())?;
@@ -1137,8 +1152,7 @@ async fn run_candidate_setup<H: McHostHandler>(
         .await?;
 
         let frame = expect_candidate_request(&mut receiver, COMMIT_CORRELATION).await?;
-        decode_commit_request(&frame.body).map_err(|_| ())?;
-        drop(frame);
+        decode_candidate_commit(frame)?;
         // Promotion is gated on this exact frame's local completion — not
         // queue admission, not an aggregate flush (KTD4). The receiver is
         // deliberately NOT polled while waiting: an un-promoted host never
@@ -1182,6 +1196,32 @@ async fn run_candidate_setup<H: McHostHandler>(
             bootstrap.writer.discard();
         }
     }
+}
+
+fn decode_candidate_activate(
+    frame: crate::frame_channel::InboundFrame,
+) -> Result<crate::transport_negotiation::ActivateRequest, ()> {
+    frame
+        .with_lease(|lease| {
+            decode_activate_request(
+                lease
+                    .contiguous_bytes()
+                    .expect("TCP compatibility frames are contiguous"),
+            )
+        })
+        .map_err(|_| ())
+}
+
+fn decode_candidate_commit(frame: crate::frame_channel::InboundFrame) -> Result<(), ()> {
+    frame
+        .with_lease(|lease| {
+            decode_commit_request(
+                lease
+                    .contiguous_bytes()
+                    .expect("TCP compatibility frames are contiguous"),
+            )
+        })
+        .map_err(|_| ())
 }
 
 async fn expect_candidate_request(

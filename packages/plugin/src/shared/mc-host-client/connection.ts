@@ -270,7 +270,7 @@ export class ConnectionGeneration {
             this.resolveRetired = resolve;
         });
         const handlers: FrameChannelHandlers = {
-            onFrame: (frame) => this.dispatch(frame.header, frame.body),
+            onFrame: (frame) => this.dispatch(frame.header, frame.body.takeOwned()),
             onClosed: (reason: FrameChannelCloseReason, error) =>
                 this.retire(reason === "truncated_frame" ? "eof" : reason, error),
             onDiagnostic: (type, meta) => this.emitDiagnostic(type, meta),

@@ -4,20 +4,16 @@
 //! The contract is directional: a cloneable [`FrameSender`] admits complete
 //! outbound frames in FIFO order against one logical writer, and a
 //! single-owner [`FrameReceiver`] yields complete, structurally validated
-//! inbound frames. Payload ownership crosses the boundary with the frames
-//! themselves — every body travels with the [`crate::wire::ByteCharge`] that
-//! accounts for it, and the transport holds an outbound charge until the
-//! bytes leave host memory (or forever drops it with the frame on discard).
-//!
-//! Shared lifecycle state (retirement, finish, discard, the generation root)
-//! is carried by cancellation tokens cloned between the sender handles and
-//! the transport's drain task, so either side observing failure retires the
-//! other without a registry or mutable indirection. Role, correlation,
-//! route, and terminal semantics stay above this boundary in the generation
-//! engine; stream mechanics (framing, deadlines, drains, socket close) stay
-//! below it in the transport.
+//! inbound frames. Direct producers fill bounded transport spans through a
+//! cursor and commit one exact length. Receive bytes are visible only through
+//! a lexical [`ReceiveLease`]; compatibility consumers must use the explicit
+//! copying adapter before entering asynchronous work.
 
 use std::future::Future;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use subc_protocol::EnvelopeHeader;
 use tokio::sync::mpsc;
@@ -28,14 +24,10 @@ use tokio_util::sync::CancellationToken;
 pub(crate) mod contract_tests;
 
 /// Why a generation must be retired without any further frame.
-///
-/// The engine branches only on the variant; the payloads are diagnostic
-/// detail that tests assert on to pin which rule fired.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum ReadClose {
-    /// Clean close at a frame boundary before any byte of the next frame:
-    /// orderly close.
+    /// Clean close at a frame boundary before any byte of the next frame.
     CleanEof,
     /// Structural stream corruption or a read deadline expiry.
     Corrupt(&'static str),
@@ -43,31 +35,460 @@ pub enum ReadClose {
     Cancelled,
     /// Transport-level I/O failure.
     Io(std::io::Error),
-    /// The transport-owned realignment after a [`RejectedFrame`] event
-    /// failed. The close is otherwise silent, but the engine's already
-    /// queued authoritative terminal for the rejected correlation must still
-    /// flush (protocol §7.1).
+    /// Realignment after a rejected frame failed.
     RejectedDrainFailed,
 }
 
-/// One admitted inbound frame with its resident-byte charge. The charge
-/// travels with the body: dropping the frame releases its bytes.
+/// Observable count of explicit transport-byte copies.
+///
+/// Direct/leased paths leave this at zero. TCP and compatibility adapters add
+/// exactly one for each body they copy into owned semantic storage.
+#[derive(Clone, Default)]
+pub struct CopyCounter(Arc<AtomicU64>);
+
+impl CopyCounter {
+    pub fn copies(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn record_copy(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Errors from a bounded producer reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProducerError {
+    /// Reserved spans cannot cover the requested bound.
+    BoundExceedsSpans,
+    /// A write would cross the checked bound.
+    Overflow,
+    /// Committed length is greater than the reservation.
+    CommitOutsideReservation,
+    /// Cursor does not equal the committed exact length.
+    Underfill,
+    /// An earlier error already aborted the reservation.
+    Aborted,
+}
+
+/// Cursor-tracked direct producer over backend-owned spans.
+///
+/// `C` is the backend's descriptor/byte charge guard. It moves into
+/// [`ProducedBody`] on success and drops immediately on constructor failure,
+/// overflow, underfill, explicit abort, or ordinary drop. This makes charge
+/// return an ownership property instead of a caller convention.
+#[must_use = "producer reservations must be committed or aborted"]
+pub struct ProducerReservation<'storage, C> {
+    spans: &'storage mut [&'storage mut [u8]],
+    bound: usize,
+    cursor: usize,
+    charge: Option<C>,
+    aborted: bool,
+}
+
+impl<'storage, C> ProducerReservation<'storage, C> {
+    pub fn new(
+        spans: &'storage mut [&'storage mut [u8]],
+        bound: usize,
+        charge: C,
+    ) -> Result<Self, ProducerError> {
+        let capacity = spans
+            .iter()
+            .try_fold(0usize, |total, span| total.checked_add(span.len()));
+        if capacity.is_none_or(|capacity| bound > capacity) {
+            return Err(ProducerError::BoundExceedsSpans);
+        }
+        Ok(Self {
+            spans,
+            bound,
+            cursor: 0,
+            charge: Some(charge),
+            aborted: false,
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.bound
+    }
+
+    pub fn written(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.bound.saturating_sub(self.cursor)
+    }
+
+    /// Writes all bytes or aborts without modifying any span.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), ProducerError> {
+        if self.aborted {
+            return Err(ProducerError::Aborted);
+        }
+        let Some(end) = self.cursor.checked_add(bytes.len()) else {
+            self.abort_on_error();
+            return Err(ProducerError::Overflow);
+        };
+        if end > self.bound {
+            self.abort_on_error();
+            return Err(ProducerError::Overflow);
+        }
+
+        let mut source = bytes;
+        let mut absolute = self.cursor;
+        for span in self.spans.iter_mut() {
+            if source.is_empty() {
+                break;
+            }
+            if absolute >= span.len() {
+                absolute -= span.len();
+                continue;
+            }
+            let available = span.len() - absolute;
+            let take = available.min(source.len());
+            span[absolute..absolute + take].copy_from_slice(&source[..take]);
+            source = &source[take..];
+            absolute = 0;
+        }
+        debug_assert!(
+            source.is_empty(),
+            "validated span capacity must cover write"
+        );
+        self.cursor = end;
+        Ok(())
+    }
+
+    /// Commits exactly `body_len` bytes. No producer view survives this
+    /// consuming transition.
+    pub fn commit(mut self, body_len: usize) -> Result<ProducedBody<'storage, C>, ProducerError> {
+        if self.aborted {
+            return Err(ProducerError::Aborted);
+        }
+        if body_len > self.bound {
+            self.abort_on_error();
+            return Err(ProducerError::CommitOutsideReservation);
+        }
+        if self.cursor != body_len {
+            self.abort_on_error();
+            return Err(ProducerError::Underfill);
+        }
+        Ok(ProducedBody {
+            spans: std::mem::take(&mut self.spans),
+            len: body_len,
+            charge: self.charge.take(),
+        })
+    }
+
+    /// Explicitly returns the reservation and all attached charges.
+    pub fn abort(mut self) {
+        self.abort_on_error();
+    }
+
+    fn abort_on_error(&mut self) {
+        self.aborted = true;
+        drop(self.charge.take());
+    }
+}
+
+/// Exact committed producer body. Backends publish from these segments, then
+/// drop the value to return its descriptor and byte charges once.
+#[must_use = "a committed body must be published or discarded"]
+pub struct ProducedBody<'storage, C> {
+    spans: &'storage mut [&'storage mut [u8]],
+    len: usize,
+    charge: Option<C>,
+}
+
+impl<C> ProducedBody<'_, C> {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn segment_count(&self) -> usize {
+        let mut remaining = self.len;
+        let mut count = 0;
+        for span in self.spans.iter() {
+            if remaining == 0 {
+                break;
+            }
+            if span.is_empty() {
+                continue;
+            }
+            count += 1;
+            remaining = remaining.saturating_sub(span.len());
+        }
+        count
+    }
+
+    pub fn segment(&self, index: usize) -> Option<&[u8]> {
+        let mut remaining = self.len;
+        for (current, span) in self
+            .spans
+            .iter()
+            .filter(|span| !span.is_empty())
+            .enumerate()
+        {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(span.len());
+            if current == index {
+                return Some(&span[..take]);
+            }
+            remaining -= take;
+        }
+        None
+    }
+
+    /// Releases storage and returns the backend charge guard to its owner.
+    pub fn into_charge(mut self) -> C {
+        self.charge
+            .take()
+            .expect("a committed body always owns its charge")
+    }
+}
+
+/// Segmented transport-byte view whose lifetime is lexical and which is
+/// deliberately `!Send` through its `Rc` marker.
+///
+/// The type borrows both spans, so it is also non-`'static`. Only values
+/// decoded from the bytes may leave the synchronous scope.
+pub struct ReceiveLease<'lease> {
+    first: &'lease [u8],
+    second: Option<&'lease [u8]>,
+    tracker: Option<LeaseTracker>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl<'lease> ReceiveLease<'lease> {
+    pub fn contiguous(bytes: &'lease [u8]) -> Self {
+        Self::segmented(bytes, None)
+    }
+
+    pub fn segmented(first: &'lease [u8], second: Option<&'lease [u8]>) -> Self {
+        Self {
+            first,
+            second,
+            tracker: None,
+            _not_send: PhantomData,
+        }
+    }
+
+    fn tracked(first: &'lease [u8], second: Option<&'lease [u8]>, tracker: LeaseTracker) -> Self {
+        tracker.acquire();
+        Self {
+            first,
+            second,
+            tracker: Some(tracker),
+            _not_send: PhantomData,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.first
+            .len()
+            .saturating_add(self.second.map_or(0, <[u8]>::len))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn segment_count(&self) -> usize {
+        usize::from(!self.first.is_empty())
+            + usize::from(self.second.is_some_and(|s| !s.is_empty()))
+    }
+
+    pub fn segment(&self, index: usize) -> Option<&[u8]> {
+        match (index, self.first.is_empty()) {
+            (0, false) => Some(self.first),
+            (0, true) => self.second.filter(|segment| !segment.is_empty()),
+            (1, false) => self.second.filter(|segment| !segment.is_empty()),
+            _ => None,
+        }
+    }
+
+    pub fn contiguous_bytes(&self) -> Option<&[u8]> {
+        self.second.is_none().then_some(self.first)
+    }
+
+    /// Explicit compatibility adapter. One call records one body copy even
+    /// when the body is empty.
+    pub fn to_owned(&self, counter: &CopyCounter) -> Vec<u8> {
+        let mut body = Vec::with_capacity(self.len());
+        body.extend_from_slice(self.first);
+        if let Some(second) = self.second {
+            body.extend_from_slice(second);
+        }
+        counter.record_copy();
+        body
+    }
+}
+
+impl Drop for ReceiveLease<'_> {
+    fn drop(&mut self) {
+        if let Some(tracker) = self.tracker.take() {
+            tracker.release();
+        }
+    }
+}
+
+#[derive(Default)]
+struct LeaseState {
+    active: usize,
+    quarantined: bool,
+}
+
+/// Testable close gate used by transport implementations to prevent reuse
+/// while a receive lease is active.
+#[derive(Clone, Default)]
+pub struct LeaseTracker(Arc<Mutex<LeaseState>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseClose {
+    Drained,
+    Quarantined,
+}
+
+impl LeaseTracker {
+    pub fn lease<'lease>(
+        &self,
+        first: &'lease [u8],
+        second: Option<&'lease [u8]>,
+    ) -> ReceiveLease<'lease> {
+        ReceiveLease::tracked(first, second, self.clone())
+    }
+
+    /// Close never reports reusable storage while any lexical lease is live.
+    /// U1 has no backend wait primitive, so active storage takes the allowed
+    /// bounded-quarantine branch.
+    pub fn close(&self) -> LeaseClose {
+        let mut state = self.0.lock().expect("lease tracker lock");
+        if state.active == 0 && !state.quarantined {
+            LeaseClose::Drained
+        } else {
+            state.quarantined = true;
+            LeaseClose::Quarantined
+        }
+    }
+
+    pub fn active(&self) -> usize {
+        self.0.lock().expect("lease tracker lock").active
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.0.lock().expect("lease tracker lock").quarantined
+    }
+
+    fn acquire(&self) {
+        self.0.lock().expect("lease tracker lock").active += 1;
+    }
+
+    fn release(&self) {
+        let mut state = self.0.lock().expect("lease tracker lock");
+        state.active = state.active.saturating_sub(1);
+    }
+}
+
+/// Transport-owned body storage. The current TCP adapter is contiguous;
+/// candidate backends may supply two arena spans without flattening.
+enum ReceiveBody {
+    Contiguous(Vec<u8>),
+    Segmented(Vec<u8>, Vec<u8>),
+}
+
+/// One admitted inbound frame. Body bytes can only be observed through
+/// [`InboundFrame::with_lease`] or copied through [`InboundFrame::into_owned`].
 pub struct InboundFrame {
+    pub header: EnvelopeHeader,
+    body: ReceiveBody,
+    charge: crate::wire::ByteCharge,
+    copies: CopyCounter,
+}
+
+impl InboundFrame {
+    pub(crate) fn contiguous(
+        header: EnvelopeHeader,
+        body: Vec<u8>,
+        charge: crate::wire::ByteCharge,
+        copies: CopyCounter,
+    ) -> Self {
+        Self {
+            header,
+            body: ReceiveBody::Contiguous(body),
+            charge,
+            copies,
+        }
+    }
+
+    #[allow(dead_code, reason = "shared-memory backends supply wrapped bodies")]
+    pub(crate) fn segmented(
+        header: EnvelopeHeader,
+        first: Vec<u8>,
+        second: Vec<u8>,
+        charge: crate::wire::ByteCharge,
+        copies: CopyCounter,
+    ) -> Self {
+        Self {
+            header,
+            body: ReceiveBody::Segmented(first, second),
+            charge,
+            copies,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn copy_counter(&self) -> CopyCounter {
+        self.copies.clone()
+    }
+
+    pub fn body_len(&self) -> usize {
+        match &self.body {
+            ReceiveBody::Contiguous(body) => body.len(),
+            ReceiveBody::Segmented(first, second) => first.len().saturating_add(second.len()),
+        }
+    }
+
+    /// Runs transport-byte decoding inside a non-escaping lexical scope.
+    pub fn with_lease<T>(&self, decode: impl for<'lease> FnOnce(ReceiveLease<'lease>) -> T) -> T {
+        match &self.body {
+            ReceiveBody::Contiguous(body) => decode(ReceiveLease::contiguous(body)),
+            ReceiveBody::Segmented(first, second) => {
+                decode(ReceiveLease::segmented(first, Some(second)))
+            }
+        }
+    }
+
+    /// TCP/compatibility adapter. Copy completes synchronously, then this
+    /// method drops transport storage before returning owned semantic bytes.
+    pub fn into_owned(self) -> OwnedInboundFrame {
+        let body = self.with_lease(|lease| lease.to_owned(&self.copies));
+        let Self {
+            header,
+            charge,
+            copies: _,
+            body: transport_body,
+        } = self;
+        drop(transport_body);
+        OwnedInboundFrame {
+            header,
+            body,
+            charge,
+        }
+    }
+}
+
+/// Owned semantic input allowed to enter asynchronous handler work.
+pub struct OwnedInboundFrame {
     pub header: EnvelopeHeader,
     pub body: Vec<u8>,
     pub charge: crate::wire::ByteCharge,
 }
 
-/// A frame the transport rejected structurally while preserving (or still
-/// restoring) stream alignment, reported as a bounded event so raw reads
-/// never cross the boundary.
-///
-/// The sole producer is an oversized channel-0 control declaration
-/// (protocol §7.1): the header alone proves the violation, no body is ever
-/// buffered, and the engine owes the correlation one early authoritative
-/// `invalid_control_request` terminal. The transport drains the declared
-/// body before yielding the next event; a failed drain surfaces as
-/// [`ReadClose::RejectedDrainFailed`].
+/// Bounded rejected-frame event.
 pub struct RejectedFrame {
     pub corr: u64,
 }
@@ -77,12 +498,7 @@ pub enum InboundEvent {
     Rejected(RejectedFrame),
 }
 
-/// Receive side of one connection's frame channel: single-owner, yielding
-/// complete inbound frames and bounded rejected-frame events.
-///
-/// Waiting for the next event on an idle channel is unbounded; any per-frame
-/// deadline (for TCP: absolute from the first received header byte) is owned
-/// by the transport behind this boundary (protocol §6.3).
+/// Receive side of one connection's frame channel.
 pub(crate) trait FrameReceiver: Send {
     fn recv(&mut self) -> impl Future<Output = Result<InboundEvent, ReadClose>> + Send;
 }
@@ -115,30 +531,72 @@ impl FrameReceiver for BoxedReceiver {
     }
 }
 
-/// One encoded frame queued for the single logical writer, carrying its
-/// resident-byte charge until the bytes leave host memory.
+/// One encoded frame queued for the single logical writer.
 pub struct OutboundFrame {
     pub bytes: Vec<u8>,
-    /// Body bytes written after `bytes` when the encode path skipped the
-    /// header-prepend copy. Empty for fully encoded frames.
+    /// Body bytes written after `bytes` when encoding avoided a prepend copy.
     pub tail: Vec<u8>,
     pub charge: crate::wire::ByteCharge,
-    /// Local-completion hook: the transport runs it once the frame's bytes
-    /// have fully reached local egress (for TCP: `write_all` returned),
-    /// passing that instant — captured before the hook takes any lock, so
-    /// receivers can compare a peer's answer against write COMPLETION rather
-    /// than against lock ordering. Local completion never claims peer
-    /// receipt. Senders that anchor state on delivery (Ping/Pong liveness)
-    /// pass a hook; a channel that retires before publishing the frame
-    /// drops the hook without running it.
+    /// Local-completion hook, run after every frame byte reaches local egress.
     pub written: Option<Box<dyn FnOnce(Instant) + Send>>,
 }
 
-/// Sender half of one connection's frame channel: cloneable, admitting
-/// complete outbound frames in FIFO order against bounded frame capacity.
+const QUEUED: u8 = 0;
+const CANCELLED: u8 = 1;
+const PUBLISHED: u8 = 2;
+pub(crate) const COMPLETE: u8 = 3;
+
+pub(crate) struct QueuedOutboundFrame {
+    pub(crate) frame: OutboundFrame,
+    pub(crate) state: Arc<AtomicU8>,
+    on_publish: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl QueuedOutboundFrame {
+    pub(crate) fn begin_publication(&mut self) -> bool {
+        if self
+            .state
+            .compare_exchange(QUEUED, PUBLISHED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(on_publish) = self.on_publish.take() {
+            on_publish();
+        }
+        true
+    }
+}
+
+/// Cancellation classification at the irreversible publication boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    NotSent,
+    PossibleSend,
+}
+
+/// Ticket for one admitted complete frame.
+#[derive(Clone)]
+pub struct FrameSendTicket {
+    state: Arc<AtomicU8>,
+}
+
+impl FrameSendTicket {
+    pub fn cancel(&self) -> SendOutcome {
+        match self
+            .state
+            .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => SendOutcome::NotSent,
+            Err(_) => SendOutcome::PossibleSend,
+        }
+    }
+}
+
+/// Sender half of one connection's frame channel.
 #[derive(Clone)]
 pub struct FrameSender {
-    tx: mpsc::Sender<OutboundFrame>,
+    tx: mpsc::Sender<QueuedOutboundFrame>,
     retired: CancellationToken,
     generation: CancellationToken,
     discard: CancellationToken,
@@ -147,28 +605,15 @@ pub struct FrameSender {
 }
 
 impl FrameSender {
-    /// Stops the channel after flushing what is already queued. Needed
-    /// because a handler that retains a `RequestCtx` keeps an
-    /// `Arc<GenerationCore>` — and therefore a sender clone — alive forever,
-    /// so the transport's queue would never report closed and its drain task
-    /// would outlive the connection until the shutdown deadline. Unlike
-    /// `discard`, queued frames (drain terminals, Goodbye) are still
-    /// published.
     pub fn finish(&self) {
         self.finish.cancel();
     }
 
-    /// Retires the channel AND drops every queued frame. Peer-initiated and
-    /// error retirement must close silently (protocol §6.3): cancelling
-    /// producers stops new frames, but responses already queued would still
-    /// flush to the peer without this. Graceful host shutdown never calls
-    /// it — drain terminals and Goodbye must flush.
     pub fn discard(&self) {
         self.discard.cancel();
     }
 
-    /// Queues one encoded frame. Waits for queue capacity, bounded by channel
-    /// retirement; `Err` means the generation can no longer emit frames.
+    /// Legacy admission adapter for callers that do not need a ticket.
     pub async fn send(&self, frame: OutboundFrame) -> Result<(), WriterGone> {
         self.send_before(frame, self.admission_deadline()).await
     }
@@ -177,18 +622,38 @@ impl FrameSender {
         Instant::now() + self.admission_timeout
     }
 
-    /// Queues a frame under an existing operation deadline. Expiry retires the
-    /// generation so no later output can overtake the failed admission.
+    /// Legacy admission adapter for callers that do not need a ticket.
     pub async fn send_before(
         &self,
         frame: OutboundFrame,
         deadline: Instant,
     ) -> Result<(), WriterGone> {
+        self.send_ticket_before(frame, deadline, None)
+            .await
+            .map(drop)
+    }
+
+    /// Admits a complete frame and returns a cancellation ticket. `on_publish`
+    /// runs exactly once immediately before transport publication begins.
+    pub async fn send_ticket_before(
+        &self,
+        frame: OutboundFrame,
+        deadline: Instant,
+        on_publish: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<FrameSendTicket, WriterGone> {
+        let state = Arc::new(AtomicU8::new(QUEUED));
+        let queued = QueuedOutboundFrame {
+            frame,
+            state: Arc::clone(&state),
+            on_publish,
+        };
         tokio::select! {
             biased;
             () = self.retired.cancelled() => Err(WriterGone),
-            sent = timeout_at(deadline, self.tx.send(frame)) => match sent {
-                Ok(sent) => sent.map_err(|_| WriterGone),
+            sent = timeout_at(deadline, self.tx.send(queued)) => match sent {
+                Ok(sent) => sent
+                    .map(|()| FrameSendTicket { state })
+                    .map_err(|_| WriterGone),
                 Err(_) => {
                     self.retired.cancel();
                     self.generation.cancel();
@@ -198,41 +663,41 @@ impl FrameSender {
         }
     }
 
-    /// True once the channel's write side has failed or shut down.
     pub fn is_retired(&self) -> bool {
         self.retired.is_cancelled()
     }
 }
 
-/// The single logical writer is gone: nothing sent through it can publish.
+/// The single logical writer is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterGone;
 
-/// Queue and shared lifecycle state handed to a transport's drain task.
-///
-/// The drain contract: consume `rx` frames strictly in order, publish every
-/// byte of one frame before any byte of the next, run each frame's `written`
-/// hook at local completion, and on failure cancel `retired` AND
-/// `generation` before exiting. `discard` aborts immediately, dropping
-/// queued frames and their charges; `finish` flushes what is queued and then
-/// exits without waiting for inert sender clones.
+/// Queue and lifecycle state handed to a transport drain task.
 pub(crate) struct SenderQueue {
-    pub rx: mpsc::Receiver<OutboundFrame>,
+    rx: mpsc::Receiver<QueuedOutboundFrame>,
     pub retired: CancellationToken,
     pub generation: CancellationToken,
     pub discard: CancellationToken,
     pub finish: CancellationToken,
 }
 
-/// Creates the sender half of a frame channel plus the [`SenderQueue`] a
-/// transport drains. `generation` is the engine's retirement root: the
-/// transport cancels it when publication fails after admission.
+impl SenderQueue {
+    pub(crate) async fn recv(&mut self) -> Option<QueuedOutboundFrame> {
+        self.rx.recv().await
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Result<QueuedOutboundFrame, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+/// Creates a bounded sender and its transport-owned drain queue.
 pub(crate) fn frame_sender(
     queue_frames: usize,
     generation: CancellationToken,
     admission_timeout: Duration,
 ) -> (FrameSender, SenderQueue) {
-    let (tx, rx) = mpsc::channel::<OutboundFrame>(queue_frames);
+    let (tx, rx) = mpsc::channel::<QueuedOutboundFrame>(queue_frames);
     let retired = CancellationToken::new();
     let discard = CancellationToken::new();
     let finish = CancellationToken::new();

@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+[lints.clippy]
+# Shared integration helpers are intentionally compiled into independent test targets.
+duplicate_mod = "allow"
+
 [dependencies]
 # The host implements the published wire authority; module crates continue to
 # use the workspace's sibling dependencies for local SDK co-development.
@@ -31,6 +35,7 @@ tokio = { workspace = true, features = ["test-util", "signal"] }
 rustix = { version = "1.1.4", features = ["stdio"] }
 criterion = "=0.8.2"
 hdrhistogram = "=7.6.0"
+trybuild = "1"
 
 [[test]]
 name = "broca_subprocess"

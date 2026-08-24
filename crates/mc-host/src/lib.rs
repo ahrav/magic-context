@@ -21,7 +21,8 @@ pub mod transport_provider;
 mod connection;
 mod control;
 mod dispatch;
-mod frame_channel;
+#[doc(hidden)]
+pub mod frame_channel;
 mod instance;
 mod panic_boundary;
 mod routing;

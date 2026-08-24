@@ -17,7 +17,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::connection::{GenerationCore, PendingEntry, PendingKey};
 use crate::control::{CODE_CANCELLED, CODE_INTERNAL_ERROR, CODE_SERVER_BUSY, CODE_UNKNOWN_CHANNEL};
-use crate::frame_channel::{InboundFrame, OutboundFrame};
+use crate::frame_channel::{OutboundFrame, OwnedInboundFrame};
 use crate::handler::{
     McHostHandler, OutputBuffer, RequestCtx, RequestOutcome, RouteHandle, StreamClosed,
 };
@@ -683,7 +683,7 @@ pub(crate) async fn emit_authoritative_rejection<H: McHostHandler>(
 pub async fn dispatch_request<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    frame: InboundFrame,
+    frame: OwnedInboundFrame,
 ) {
     let header = frame.header;
     let route = RouteHandle {
@@ -791,7 +791,7 @@ pub async fn dispatch_request<H: McHostHandler>(
             return;
         }
 
-        let InboundFrame {
+        let OwnedInboundFrame {
             body,
             charge: body_charge,
             ..
