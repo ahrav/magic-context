@@ -1394,6 +1394,10 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       memory_block_count INTEGER DEFAULT 0,
       memory_block_ids TEXT DEFAULT '',
       memory_block_hashes TEXT DEFAULT '',
+      -- memory_block_epoch: intentionally NULLABLE. NULL means "no epoch
+      -- stamp" (legacy row or never snapshotted); it never equals a real
+      -- epoch, so such rows rebuild once and then carry a stamp.
+      memory_block_epoch INTEGER,
       -- pending_compaction_marker_state: intentionally NULLABLE without a
       -- default. Absence of a deferred marker is SQL NULL; presence is a
       -- valid JSON blob written via setPendingCompactionMarkerState.
@@ -1702,6 +1706,14 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // carries the exact content that was rendered, so a rewrite-in-place
     // cannot lend the old cached bytes its successor's eligibility.
     ensureColumn(db, "session_meta", "memory_block_hashes", "TEXT DEFAULT ''");
+    // Project memory epoch captured BEFORE the block's memory set was read.
+    // The persisted cache replays only while the current epoch still equals
+    // this stamp: the rendered-ids/hashes checks cannot discover a row that
+    // became newly ELIGIBLE after the render (it was never recorded), and
+    // after a host restart the process-local epoch cache is empty. NULL (the
+    // pre-column value) never equals a real epoch, so legacy rows rebuild
+    // once and then carry a stamp.
+    ensureColumn(db, "session_meta", "memory_block_epoch", "INTEGER");
     ensureColumn(db, "dream_queue", "retry_count", "INTEGER DEFAULT 0");
     ensureColumn(db, "tags", "reasoning_byte_size", "INTEGER DEFAULT 0");
     ensureColumn(db, "tags", "drop_mode", "TEXT DEFAULT 'full'");

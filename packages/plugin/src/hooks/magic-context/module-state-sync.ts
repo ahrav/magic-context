@@ -1,5 +1,8 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { reconcileCompatibilityVerifications } from "../../features/magic-context/claim-policy-backfill";
+import {
+    reconcileCompatibilityVerifications,
+    seedLateCompatibilityRevisions,
+} from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
     autoSearchHintFragmentsStillEligible,
@@ -33,6 +36,7 @@ import {
     getPendingCompactionMarkerState,
     getPersistedTodoSyntheticAnchor,
     peekDeferredExecutePending,
+    recordAutoSearchHintNativeBlockId,
 } from "../../features/magic-context/storage-meta-persisted";
 import { getPendingOps } from "../../features/magic-context/storage-ops";
 import {
@@ -942,13 +946,22 @@ function buildAutoSearchHintSeeds(args: {
         const mapping = moduleRawBlockMappings(args.readRawById(value.messageId)).find(
             (candidate) => candidate.kind === "text",
         );
-        if (!mapping) {
+        // Prefer the live raw mapping; fall back to the block id this
+        // decision was last seeded under. Without the fallback, a hint whose
+        // raw message can no longer be loaded would skip the eligibility
+        // gate below, and a quarantine/rejection/rewrite could never upsert
+        // the empty revocation over the module's stored hint row.
+        const blockId = mapping ? `${value.messageId}#${mapping.blockIndex}` : value.nativeBlockId;
+        if (!blockId) {
             skipped += 1;
             sessionLog(
                 args.sessionId,
-                `module auto-search decision seed skipped message ${value.messageId}: text block is missing`,
+                `module auto-search decision seed skipped message ${value.messageId}: text block is missing and no seeded block id is recorded`,
             );
             continue;
+        }
+        if (mapping && value.nativeBlockId !== blockId) {
+            recordAutoSearchHintNativeBlockId(args.db, args.sessionId, value.messageId, blockId);
         }
         // The same replay gate as the TypeScript and Pi paths: a hint whose
         // contributing memory was hidden or rewritten seeds the empty
@@ -959,8 +972,8 @@ function buildAutoSearchHintSeeds(args: {
             autoSearchHintFragmentsStillEligible(args.db, value.memoryFragments)
                 ? value.text
                 : "";
-        byBlock.set(`${value.messageId}#${mapping.blockIndex}`, {
-            block_id: `${value.messageId}#${mapping.blockIndex}`,
+        byBlock.set(blockId, {
+            block_id: blockId,
             hint_text: hintText,
         });
     }
@@ -1448,6 +1461,18 @@ export async function buildModuleStateSyncPayload(args: {
         sessionLog(
             args.pass.sessionId,
             `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
+    // Sibling straggler probe: a held-open v85 writer can also append a NEW
+    // revision after the startup seeder completed; unseeded revisions read
+    // as automatic-hidden until seeded. One single-row anti-join when idle;
+    // the seed itself runs async and must not fail the sync.
+    try {
+        seedLateCompatibilityRevisions(args.pass.db);
+    } catch (error) {
+        sessionLog(
+            args.pass.sessionId,
+            `late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
         );
     }
     const currentWatermarks = loadModuleWatermarks({

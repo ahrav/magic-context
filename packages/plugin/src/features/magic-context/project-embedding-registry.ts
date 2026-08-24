@@ -2226,16 +2226,37 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             );
             return;
         }
+        // The fallback lane needs the same exact-byte drain filter as the
+        // detailed lane: a rewrite to an eligible revision differing only in
+        // case/whitespace keeps the normalized hash equal, so
+        // saveEmbeddingIfHashMatches alone would persist the loaded
+        // revision's vector for the new bytes.
+        const digestsAtDrain = exactMemoryContentDigests(
+            db,
+            rows.map((row) => row.id),
+        );
+        const boundRows = rows.filter(
+            (row) => digestsAtDrain.get(row.id) === sha256Utf8Hex(row.content),
+        );
+        if (boundRows.length === 0) return;
         const vectors = await embedShadowItems(
             registration,
-            rows.map((row) => ({
+            boundRows.map((row) => ({
                 id: `memory:${row.id}`,
                 text: row.content,
                 contentSha256: contentSha256(row.content),
             })),
         );
         db.transaction(() => {
-            for (const row of rows) {
+            // Re-bind inside the write transaction: the provider call above
+            // yielded, and the normalized-hash guard alone cannot reject a
+            // case/whitespace-only rewrite that landed meanwhile.
+            const digestsAtSave = exactMemoryContentDigests(
+                db,
+                boundRows.map((row) => row.id),
+            );
+            for (const row of boundRows) {
+                if (digestsAtSave.get(row.id) !== sha256Utf8Hex(row.content)) continue;
                 const vector = vectors.get(`memory:${row.id}`);
                 if (vector)
                     saveEmbeddingIfHashMatches(

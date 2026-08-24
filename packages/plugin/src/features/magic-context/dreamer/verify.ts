@@ -26,7 +26,11 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
-import { maintenanceEligibleIdSet } from "../memory/storage-claim-visibility";
+import {
+    exactMemoryContentDigests,
+    maintenanceEligibleIdSet,
+} from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
 import {
     computeClaimRequestDigest,
     hasMemoryClaimsCompatSchema,
@@ -245,16 +249,26 @@ async function verifyOneBatch(
     signal: AbortSignal,
 ): Promise<VerifyBatchResult> {
     // The scope was partitioned once at run start; later batches can wait
-    // behind several provider calls, and a memory quarantined, rejected, or
-    // superseded in the meantime must not reach the child-model prompt.
-    // Re-apply the maintenance policy to this batch's rows immediately
-    // before prompting.
+    // behind several provider calls. A memory quarantined, rejected, or
+    // superseded in the meantime must not reach the child-model prompt, and
+    // a memory REWRITTEN in the meantime must not be prompted with the
+    // frozen revision's bytes (the manifest would then verify or overwrite
+    // the new revision the model never saw). Re-apply the maintenance policy
+    // and bind each member to its loaded bytes immediately before prompting.
     const stillInScope = maintenanceEligibleIdSet(
         args.db,
         batch.map((memory) => memory.id),
         "verification",
     );
-    const eligibleBatch = batch.filter((memory) => stillInScope.has(memory.id));
+    const digestsBeforePrompt = exactMemoryContentDigests(
+        args.db,
+        batch.map((memory) => memory.id),
+    );
+    const eligibleBatch = batch.filter(
+        (memory) =>
+            stillInScope.has(memory.id) &&
+            digestsBeforePrompt.get(memory.id) === sha256Utf8Hex(memory.content),
+    );
     if (eligibleBatch.length < batch.length) {
         log(
             `[dreamer] verify batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since scope partition`,
@@ -391,14 +405,25 @@ export async function applyVerifyManifest(
     );
     const now = Date.now();
     // The model ran for a while; a memory can enter the uniform-absence class
-    // (or leave the maintenance pool) between the prompt and this apply. An
-    // in-flight verification must not verify, rewrite, or archive a row the
-    // policy has since hidden — drop its manifest entries instead.
-    const applicableIds = maintenanceEligibleIdSet(args.db, [...batchIds], "verification");
+    // (or leave the maintenance pool) between the prompt and this apply, and
+    // a rewrite in the same window means the manifest's verdict describes
+    // bytes that no longer exist. An in-flight verification must not verify,
+    // rewrite, or archive such a row — drop its manifest entries instead.
+    // The digest binds to the bytes the model was PROMPTED with.
+    const promptDigestById = new Map(
+        batch.map((memory) => [memory.id, sha256Utf8Hex(memory.content)]),
+    );
+    const stillApplicable = (id: number, eligible: Set<number>, digests: Map<number, string>) =>
+        eligible.has(id) && digests.get(id) === promptDigestById.get(id);
+    const eligibleAtApply = maintenanceEligibleIdSet(args.db, [...batchIds], "verification");
+    const digestsAtApply = exactMemoryContentDigests(args.db, [...batchIds]);
+    const applicableIds = new Set(
+        [...batchIds].filter((id) => stillApplicable(id, eligibleAtApply, digestsAtApply)),
+    );
     const droppedIds = [...batchIds].filter((id) => !applicableIds.has(id));
     if (droppedIds.length > 0) {
         log(
-            `[dreamer] verify manifest dropped ${droppedIds.length} target(s) hidden during evaluation: ${droppedIds.join(", ")}`,
+            `[dreamer] verify manifest dropped ${droppedIds.length} target(s) hidden or rewritten during evaluation: ${droppedIds.join(", ")}`,
         );
     }
     parsed.verified = parsed.verified.filter((entry) => applicableIds.has(entry.id));
@@ -511,7 +536,22 @@ export async function applyVerifyManifest(
         // one lease-guarded transaction allocates one claim project
         // generation per touched project (KTD7).
         withMemoryClaimGenerationContextInCurrentTransaction(args.db, () => {
+            // The apply-time check above precedes several awaited
+            // normalizeFiles calls: re-evaluate policy and prompt-byte
+            // identity as the first operation while holding the write lock,
+            // so a target hidden or rewritten during normalization is
+            // skipped instead of verified, rewritten, or archived.
+            const eligibleInTx = maintenanceEligibleIdSet(
+                args.db,
+                writes.map((write) => write.id),
+                "verification",
+            );
+            const digestsInTx = exactMemoryContentDigests(
+                args.db,
+                writes.map((write) => write.id),
+            );
             for (const w of writes) {
+                if (!stillApplicable(w.id, eligibleInTx, digestsInTx)) continue;
                 const memory = getMemoryById(args.db, w.id);
                 if (!isPrimaryMutable(memory)) continue;
                 if (w.kind === "verify") {

@@ -1,5 +1,8 @@
 import { Buffer } from "node:buffer";
-import { reconcileCompatibilityVerifications } from "../../features/magic-context/claim-policy-backfill";
+import {
+    reconcileCompatibilityVerifications,
+    seedLateCompatibilityRevisions,
+} from "../../features/magic-context/claim-policy-backfill";
 import {
     buildCompartmentBlock,
     type Compartment,
@@ -437,6 +440,18 @@ export function prepareCompartmentInjection(
             `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
         );
     }
+    // Sibling straggler probe: a held-open v85 writer can also append a NEW
+    // revision (not just a verification event) after the startup seeder
+    // completed; unseeded revisions read as automatic-hidden until seeded.
+    // One single-row anti-join when idle; the seed itself runs async.
+    try {
+        seedLateCompatibilityRevisions(db);
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            `late compatibility seed probe failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
     const cached = injectionCache.get(sessionId);
     if (cached && cached.db !== db) {
         // Session ids are unique in production, but tests and explicit database
@@ -542,13 +557,14 @@ export function prepareCompartmentInjection(
         // hot path (every transform) for a table we fully control.
         const cachedMemory = db
             .prepare(
-                "SELECT memory_block_cache, memory_block_count, memory_block_ids, memory_block_hashes FROM session_meta WHERE session_id = ?",
+                "SELECT memory_block_cache, memory_block_count, memory_block_ids, memory_block_hashes, memory_block_epoch FROM session_meta WHERE session_id = ?",
             )
             .get(sessionId) as {
             memory_block_cache: string;
             memory_block_count: number;
             memory_block_ids: string | null;
             memory_block_hashes: string | null;
+            memory_block_epoch: number | null;
         } | null;
 
         // A cached block replays only while every rendered id is still
@@ -559,6 +575,15 @@ export function prepareCompartmentInjection(
         // cache.
         const cachedBlockStillEligible = (): boolean => {
             if (!hasClaimEffectivePolicy(db)) return true;
+            // The rendered-ids/hashes checks below can only vouch for rows
+            // that WERE rendered; a row that became newly eligible after the
+            // render was never recorded, and after a host restart the
+            // process-local epoch cache cannot force the rebuild. The
+            // persisted build-epoch stamp closes that path: any epoch bump
+            // since the snapshot rebuilds the block.
+            if ((cachedMemory?.memory_block_epoch ?? -1) !== buildProjectMemoryEpoch) {
+                return false;
+            }
             return recordedMemoryBlockStillBacked(
                 db,
                 cachedMemory?.memory_block_ids,
@@ -605,12 +630,13 @@ export function prepareCompartmentInjection(
             // Issue: https://github.com/cortexkit/magic-context/issues/23
             try {
                 db.prepare(
-                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ? WHERE session_id = ?",
+                    "UPDATE session_meta SET memory_block_cache = ?, memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ?, memory_block_epoch = ? WHERE session_id = ?",
                 ).run(
                     memoryBlock ?? "",
                     memoryCount,
                     JSON.stringify(renderedIds),
                     JSON.stringify(renderedHashes),
+                    buildProjectMemoryEpoch,
                     sessionId,
                 );
             } catch (error) {

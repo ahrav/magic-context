@@ -12,6 +12,7 @@
  * automatic visibility.
  */
 
+import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite.ts";
 import { isRetryableSqliteBusyError } from "./claims-backfill.ts";
 import {
@@ -423,6 +424,36 @@ function seedRevisionInCurrentTransaction(
  * unexamined negative event on a current revision therefore bumps its
  * claim's project epochs here so those caches refold.
  */
+/** In-flight guard so overlapping transform/sync passes cannot start
+ *  concurrent straggler-seed runs against the same database. */
+let lateSeedInFlight = false;
+
+/**
+ * Seed compatibility revisions appended AFTER the startup seeder finished.
+ * A held-open v85 process can append a claim revision at any time; its
+ * writer creates no policy subject or projection, so the revision reads as
+ * automatic-hidden until seeded. The startup runner's completed-phase
+ * anti-join only fires when the runner is invoked, and startup is its only
+ * scheduled invocation — this probe gives ongoing lanes a cheap way to
+ * notice stragglers (one indexed single-row anti-join when idle) and kick
+ * the bounded async seeder without blocking the calling pass.
+ */
+export function seedLateCompatibilityRevisions(db: Database): void {
+    if (lateSeedInFlight) return;
+    if (!hasClaimPolicySchema(db)) return;
+    if (selectUnseededBatch(db, 0, 1).length === 0) return;
+    lateSeedInFlight = true;
+    void runClaimPolicySeed(db)
+        .catch((error) => {
+            log(
+                `[claim-policy-seed] late-revision seed failed (retrying on a later pass): ${error instanceof Error ? error.message : String(error)}`,
+            );
+        })
+        .finally(() => {
+            lateSeedInFlight = false;
+        });
+}
+
 export function reconcileCompatibilityVerifications(db: Database): number {
     if (!hasClaimPolicySchema(db)) return 0;
     const watermark = Number(

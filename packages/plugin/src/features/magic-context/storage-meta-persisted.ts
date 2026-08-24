@@ -104,8 +104,21 @@ export type AutoSearchHintDecision =
            * fails closed under an effective claim policy.
            */
           memoryFragments?: Array<{ id: number; hash: string }>;
+          /**
+           * The native module block id (`messageId#blockIndex`) this decision
+           * was last seeded under. Recorded on the first successful raw-block
+           * resolution so a later revocation can reach the module's stored
+           * hint row even when the raw message can no longer be loaded.
+           */
+          nativeBlockId?: string;
       }
-    | { messageId: string; decision: "no-hint"; reason: AutoSearchHintNoHintReason };
+    | {
+          messageId: string;
+          decision: "no-hint";
+          reason: AutoSearchHintNoHintReason;
+          /** See the hint variant: last-seeded native module block id. */
+          nativeBlockId?: string;
+      };
 
 export type NoteNudgeDeliveryOutcome =
     | { ok: true; kind: "appended" }
@@ -253,6 +266,7 @@ function isValidAutoSearchHintDecision(value: unknown): value is AutoSearchHintD
     if (value === null || typeof value !== "object") return false;
     const row = value as Record<string, unknown>;
     if (typeof row.messageId !== "string" || row.messageId.length === 0) return false;
+    if (row.nativeBlockId !== undefined && typeof row.nativeBlockId !== "string") return false;
     if (row.decision === "hint") {
         if (typeof row.text !== "string" || row.text.length === 0) return false;
         return (
@@ -1350,6 +1364,34 @@ export function getAutoSearchHintDecisions(
         .prepare("SELECT auto_search_hint_decisions FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { auto_search_hint_decisions?: string | null } | undefined;
     return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision);
+}
+
+/**
+ * Record the native module block id a decision was seeded under. Idempotent;
+ * a lost write only delays revocation-independence until the next successful
+ * raw resolution, so CAS exhaustion is tolerated silently.
+ */
+export function recordAutoSearchHintNativeBlockId(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+    nativeBlockId: string,
+): void {
+    casUpdateJsonArrayColumn(
+        db,
+        sessionId,
+        "auto_search_hint_decisions",
+        isValidAutoSearchHintDecision,
+        (current) => {
+            const index = current.findIndex((decision) => decision.messageId === messageId);
+            if (index < 0) return null;
+            if (current[index].nativeBlockId === nativeBlockId) return null;
+            const next = [...current];
+            next[index] = { ...next[index], nativeBlockId };
+            return next;
+        },
+        { ensureRow: false },
+    );
 }
 
 function casUpdateJsonArrayColumn<T>(
