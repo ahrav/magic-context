@@ -175,6 +175,26 @@ pub enum SubprocessEnd {
     TeardownUnconfirmed,
 }
 
+/// What newly completed stdout says about the run's completion, so the run
+/// loop can shorten its deadline to the drain grace without mistaking a
+/// retryable failure for the end of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeSignal {
+    /// Nothing bearing on completion.
+    Quiet,
+    /// The run ended in a way nothing can supersede.
+    Decisive,
+    /// The run ended in a failure the harness may retry itself. The drain
+    /// still arms — a final failure must not burn the whole run budget and
+    /// come back as a timeout, which would erase its classification — but a
+    /// [`ProbeSignal::Continues`] before the grace expires restores the full
+    /// deadline.
+    Provisional,
+    /// The run is producing more work (a new turn or an automatic retry
+    /// began), so a provisional arming was premature.
+    Continues,
+}
+
 /// Bounded captured output plus the structural end state.
 pub struct SubprocessResult {
     pub stdout: Vec<u8>,
@@ -191,17 +211,20 @@ pub struct SubprocessResult {
 /// so lifecycle completion upstream can never observe a live child (R10).
 ///
 /// `terminal_probe`, when supplied, inspects each region of newly completed
-/// stdout lines exactly once and reports whether it contains a decisive
-/// terminal event — the total probing cost stays linear in the transcript.
-/// The first hit rearms the run deadline to the drain grace, so a harness
-/// that finishes its output without closing its pipes (the Pi print-mode
-/// shutdown gap) ends as a drain kill with the completed transcript instead
-/// of burning the whole run timeout and failing.
+/// stdout lines exactly once and reports what that region says about
+/// completion — the total probing cost stays linear in the transcript. A
+/// terminal rearms the run deadline to the drain grace, so a harness that
+/// finishes its output without closing its pipes (the Pi print-mode shutdown
+/// gap) ends as a drain kill with the completed transcript instead of burning
+/// the whole run timeout and failing. A [`ProbeSignal::Provisional`] terminal
+/// arms the same way but is revocable: if the harness resumes before the
+/// grace expires, the original deadline is restored, so a self-retrying
+/// harness is never killed mid-retry.
 pub async fn run(
     spec: SubprocessSpec,
     limits: &SubprocessLimits,
     cancel: &CancellationToken,
-    terminal_probe: Option<fn(&[u8]) -> bool>,
+    terminal_probe: Option<fn(&[u8]) -> ProbeSignal>,
 ) -> io::Result<SubprocessResult> {
     let SubprocessSpec {
         executable,
@@ -322,9 +345,14 @@ pub async fn run(
     let mut stderr_open = true;
     let mut stdout_chunk = [0u8; 8192];
     let mut stderr_chunk = [0u8; 8192];
-    let deadline = tokio::time::sleep(limits.run_timeout);
+    // Kept so a revoked provisional arming restores the ORIGINAL budget
+    // rather than granting a fresh one: a harness that retries cannot extend
+    // its run by retrying.
+    let run_deadline = tokio::time::Instant::now() + limits.run_timeout;
+    let deadline = tokio::time::sleep_until(run_deadline);
     tokio::pin!(deadline);
     let mut terminal_seen = false;
+    let mut arming_revocable = false;
     // Everything before this offset has already been probed; each complete
     // line is inspected exactly once no matter how the reads chunk it.
     let mut probed_to = 0usize;
@@ -358,7 +386,9 @@ pub async fn run(
                         break Some(SubprocessEnd::StdoutOverflow);
                     }
                     stdout.extend_from_slice(&stdout_chunk[..n]);
-                    if !terminal_seen {
+                    // Probing continues after a revocable arming, because
+                    // the signal that revokes it arrives later.
+                    if !terminal_seen || arming_revocable {
                         if let Some(probe) = terminal_probe {
                             // Only the newly appended bytes are searched for
                             // a line end: everything between `probed_to` and
@@ -371,12 +401,31 @@ pub async fn run(
                                 .rposition(|byte| *byte == b'\n')
                             {
                                 let end = appended_at + last_newline + 1;
-                                if probe(&stdout[probed_to..end]) {
-                                    terminal_seen = true;
-                                    let drain_deadline =
-                                        tokio::time::Instant::now() + limits.drain_grace;
-                                    if drain_deadline < deadline.deadline() {
-                                        deadline.as_mut().reset(drain_deadline);
+                                match probe(&stdout[probed_to..end]) {
+                                    ProbeSignal::Quiet => {}
+                                    signal @ (ProbeSignal::Decisive
+                                    | ProbeSignal::Provisional) => {
+                                        terminal_seen = true;
+                                        arming_revocable =
+                                            signal == ProbeSignal::Provisional;
+                                        let drain_deadline =
+                                            tokio::time::Instant::now() + limits.drain_grace;
+                                        if drain_deadline < deadline.deadline() {
+                                            deadline.as_mut().reset(drain_deadline);
+                                        }
+                                    }
+                                    // Only a revocable arming is undone; a
+                                    // decisive terminal stands whatever
+                                    // follows it. The restored deadline may
+                                    // already be past, which correctly ends
+                                    // the run as a timeout rather than
+                                    // granting the retry free budget.
+                                    ProbeSignal::Continues => {
+                                        if arming_revocable {
+                                            terminal_seen = false;
+                                            arming_revocable = false;
+                                            deadline.as_mut().reset(run_deadline);
+                                        }
                                     }
                                 }
                                 probed_to = end;
@@ -746,6 +795,12 @@ pub fn merge_cleanup(
             error.message = format!("{}; additionally {failure}", error.message);
             BackendTerminal::Failed(error)
         }
+        // Merging a cleanup failure must not downgrade the unresolved
+        // teardown: cancel and delete still cannot claim the work stopped.
+        BackendTerminal::FailedUnresolved(mut error) => {
+            error.message = format!("{}; additionally {failure}", error.message);
+            BackendTerminal::FailedUnresolved(error)
+        }
     }
 }
 
@@ -849,12 +904,16 @@ pub(crate) fn abnormal_end_terminal(
         // Transient: whatever denied the signal (a policy, a credential
         // change) may not deny the next run, and the caller must see that
         // this one did not settle.
-        SubprocessEnd::TeardownUnconfirmed => BackendError {
-            class: ErrorClass::Transient,
-            message: format!("{name} backend process group teardown was not confirmed"),
-            retry_after_secs: None,
-            provider_code: None,
-        },
+        // The one end whose work may still be running: it is reported as a
+        // terminal the supervisor must not treat as proof the work stopped.
+        SubprocessEnd::TeardownUnconfirmed => {
+            return Some(BackendTerminal::FailedUnresolved(BackendError {
+                class: ErrorClass::Transient,
+                message: format!("{name} backend process group teardown was not confirmed"),
+                retry_after_secs: None,
+                provider_code: None,
+            }));
+        }
     };
     Some(BackendTerminal::Failed(error))
 }

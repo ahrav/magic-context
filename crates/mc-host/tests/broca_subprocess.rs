@@ -43,6 +43,8 @@ const TRANSCRIPT_FILE_ENV: &str = "MC_FIXTURE_TRANSCRIPT_FILE";
 const STDERR_ENV: &str = "MC_FIXTURE_STDERR";
 const EXIT_ENV: &str = "MC_FIXTURE_EXIT";
 const BEHAVIOR_ENV: &str = "MC_FIXTURE_BEHAVIOR";
+const RETRY_PAUSE_MS_ENV: &str = "MC_FIXTURE_RETRY_PAUSE_MS";
+const RETRY_ANNOUNCE_MS_ENV: &str = "MC_FIXTURE_RETRY_ANNOUNCE_MS";
 const SECRET_ENV: &str = "MC_FIXTURE_SECRET";
 const SABOTAGE_ENV: &str = "MC_FIXTURE_SABOTAGE_CLEANUP";
 const GROUP_PID_ENV: &str = "MC_FIXTURE_GROUP_PID";
@@ -115,6 +117,14 @@ fn main() {
             pi_lingering_child_drained_after_terminal,
         ),
         ("pi_auxiliary_events_ignored", pi_auxiliary_events_ignored),
+        (
+            "pi_lingering_credential_failure_still_retries_canonical_provider",
+            pi_lingering_credential_failure_still_retries_canonical_provider,
+        ),
+        (
+            "pi_self_retry_revokes_the_drain_arming",
+            pi_self_retry_revokes_the_drain_arming,
+        ),
         (
             "pi_agent_end_compatibility_terminal",
             pi_agent_end_compatibility_terminal,
@@ -411,6 +421,77 @@ mod fixture {
         std::process::exit(0);
     }
 
+    /// Like `alias_auth_retry`, but the failed alias attempt LINGERS after
+    /// its error terminal instead of exiting — Pi's print-mode shutdown gap
+    /// on the failure path. Without a drain armed by that terminal the
+    /// attempt burns the whole run budget and returns a timeout, whose class
+    /// is not `AuthRequired`, so the canonical retry never happens.
+    fn alias_auth_retry_lingering(out: PathBuf) -> ! {
+        let marker = out.join("alias-attempted");
+        if marker.exists() {
+            let lines = [
+                serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+                serde_json::json!({"type": "agent_start"}),
+                serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "canonical answer"}]}}),
+            ];
+            emit_lines(&lines);
+            std::process::exit(0);
+        }
+        fs::write(&marker, b"1").expect("write alias marker");
+        let lines = [
+            serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+            serde_json::json!({"type": "agent_start"}),
+            serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "No API key found for provider", "content": []}}),
+        ];
+        emit_lines(&lines);
+        hang();
+    }
+
+    /// A self-retrying harness: the failed turn's terminal is followed
+    /// immediately by `auto_retry_start`, then a pause LONGER than the drain
+    /// grace, then the retry's own successful terminal. The drain armed by
+    /// the error must be revoked by the retry announcement, or this child is
+    /// killed mid-retry and its answer is lost.
+    fn error_then_retry_after_grace() -> ! {
+        let pause = std::env::var(RETRY_PAUSE_MS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(600);
+        // Flushed ALONE, so the host really arms its drain on this terminal;
+        // batching the retry announcement into the same read would make the
+        // arming never happen and the test prove nothing.
+        emit_lines(&[
+            serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+            serde_json::json!({"type": "agent_start"}),
+            serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "provider overloaded", "content": []}}),
+        ]);
+        // Inside the grace: the revocation must land before the drain fires.
+        std::thread::sleep(Duration::from_millis(
+            std::env::var(RETRY_ANNOUNCE_MS_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(50),
+        ));
+        emit_lines(&[serde_json::json!({"type": "auto_retry_start"})]);
+        // Longer than the grace: only a restored budget survives this.
+        std::thread::sleep(Duration::from_millis(pause));
+        emit_lines(&[
+            serde_json::json!({"type": "auto_retry_end"}),
+            serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "retried answer"}]}}),
+        ]);
+        std::process::exit(0);
+    }
+
+    fn emit_lines(lines: &[serde_json::Value]) {
+        let mut stdout = std::io::stdout();
+        for line in lines {
+            let bytes = serde_json::to_string(line).expect("line");
+            stdout.write_all(bytes.as_bytes()).expect("write line");
+            stdout.write_all(b"\n").expect("write newline");
+        }
+        stdout.flush().expect("flush lines");
+    }
+
     fn flood(secret: &str, to_stderr: bool) -> ! {
         let line = format!("{{\"type\":\"noise\",\"secret\":\"{secret}\"}}\n");
         let stdout = std::io::stdout();
@@ -524,6 +605,10 @@ mod fixture {
             Ok("alias_auth_retry") => {
                 alias_auth_retry(out.expect("alias fixture needs an out dir"));
             }
+            Ok("alias_auth_retry_lingering") => {
+                alias_auth_retry_lingering(out.expect("alias fixture needs an out dir"));
+            }
+            Ok("error_then_retry_after_grace") => error_then_retry_after_grace(),
             // "ignore_stdin_print_transcript" is dispatched before the stdin
             // drain at the top of this function.
             Ok("hang_ignore_term") => hang_ignore_term(out),
@@ -2046,6 +2131,98 @@ fn pi_alias_credential_failure_retries_canonical_provider() {
     assert!(args.iter().any(|arg| arg == "openai/m"), "{args:?}");
     assert!(!args.iter().any(|arg| arg == "openai-codex/m"), "{args:?}");
     assert!(setup.out.path().join("alias-attempted").exists());
+}
+
+/// The credential fallback must survive Pi's shutdown gap on the FAILURE
+/// path. An aliased attempt that reports "no API key" and then lingers has
+/// produced a complete transcript; if the run instead burned its whole
+/// budget and came back as a timeout, the classification would no longer be
+/// `AuthRequired` and the canonical retry — the entire point of the alias
+/// order — would never fire.
+fn pi_lingering_credential_failure_still_retries_canonical_provider() {
+    let setup = RunSetup::new();
+    let limits = SubprocessLimits {
+        run_timeout: Duration::from_secs(30),
+        termination_grace: Duration::from_secs(2),
+        drain_grace: Duration::from_millis(200),
+        max_stdout_bytes: 1024 * 1024,
+        max_stderr_bytes: 64 * 1024,
+    };
+    let backend = pi_backend_with_limits(
+        &setup,
+        &[(BEHAVIOR_ENV, "alias_auth_retry_lingering")],
+        Vec::new(),
+        None,
+        limits,
+    );
+    let started = Instant::now();
+    let (terminal, events) = execute(
+        &backend,
+        request(setup.project.path(), Harness::Pi, "openai/m", None),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the failed attempt's drain, not the run timeout, must end it ({:?})",
+        started.elapsed()
+    );
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "the canonical retry must still run and win: {terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "canonical answer")
+    ));
+    assert!(setup.out.path().join("alias-attempted").exists());
+}
+
+/// A harness that retries a failed turn ITSELF keeps its full budget. The
+/// error terminal arms the drain (so a FINAL error does not idle to the run
+/// timeout), but the retry announcement revokes that arming, so a retry
+/// slower than the two-second grace is not killed mid-flight — which the
+/// runner's one-shot latch cannot do.
+fn pi_self_retry_revokes_the_drain_arming() {
+    let setup = RunSetup::new();
+    let grace = Duration::from_millis(200);
+    let pause = Duration::from_millis(900);
+    let limits = SubprocessLimits {
+        run_timeout: Duration::from_secs(30),
+        termination_grace: Duration::from_secs(2),
+        drain_grace: grace,
+        max_stdout_bytes: 1024 * 1024,
+        max_stderr_bytes: 64 * 1024,
+    };
+    let backend = pi_backend_with_limits(
+        &setup,
+        &[
+            (BEHAVIOR_ENV, "error_then_retry_after_grace"),
+            (RETRY_ANNOUNCE_MS_ENV, "50"),
+            (RETRY_PAUSE_MS_ENV, "900"),
+        ],
+        Vec::new(),
+        None,
+        limits,
+    );
+    let started = Instant::now();
+    let (terminal, events) = execute(
+        &backend,
+        request(setup.project.path(), Harness::Pi, "anthropic/m", None),
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "the retry must not be killed by the revoked drain: {terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "retried answer")
+    ));
+    assert!(
+        elapsed >= pause,
+        "the run must have waited out the retry pause, not the grace ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "and it must still end well inside the run budget ({elapsed:?})"
+    );
 }
 
 /// A completion that still carries a `toolCall` block is an intermediate

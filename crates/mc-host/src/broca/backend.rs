@@ -148,8 +148,15 @@ impl std::fmt::Debug for BackendError {
 /// must all map to one `Failed`; there is deliberately no "unknown" arm.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BackendTerminal {
-    Completed { finish_reason: FinishReason },
+    Completed {
+        finish_reason: FinishReason,
+    },
     Failed(BackendError),
+    /// Failed, AND the harness process tree could not be proven stopped, so
+    /// descendants may still be executing a billable request. Commits the
+    /// same failure terminal as [`BackendTerminal::Failed`], but cancel and
+    /// delete must report failure instead of claiming the work stopped.
+    FailedUnresolved(BackendError),
 }
 
 /// One canonical nonterminal event. Assistant text is the only unit current

@@ -19,7 +19,7 @@ use super::backend::{
     EventSink, FinishReason, Harness, LlmExecutionBackend,
 };
 use super::subprocess::{
-    self, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
+    self, EnvSnapshot, HarnessName, PrivateDir, ProbeSignal, SubprocessLimits, SubprocessSpec,
 };
 
 /// The existing Magic Context Pi recursion guard
@@ -338,10 +338,17 @@ async fn run_pi(
 /// discard the completed answer. The caller feeds each complete line
 /// exactly once, so probing stays linear; arming early on a transcript the
 /// full parse later rejects only shortens the wait for the same failure.
-fn pi_terminal_probe(lines: &[u8]) -> bool {
+fn pi_terminal_probe(lines: &[u8]) -> ProbeSignal {
+    // The LAST meaningful line in the region wins: one read can carry a
+    // failed turn's terminal and the retry's opening message together, and
+    // only their order says whether the run is over.
     lines
         .split(|byte| *byte == b'\n')
-        .any(pi_line_is_terminal_message_end)
+        .map(pi_line_probe_signal)
+        .fold(ProbeSignal::Quiet, |carried, signal| match signal {
+            ProbeSignal::Quiet => carried,
+            decided => decided,
+        })
 }
 
 /// One-line check for the event that ENDS a Pi print-mode run, used only to
@@ -357,28 +364,38 @@ fn pi_terminal_probe(lines: &[u8]) -> bool {
 /// and then sits idle until killed, which is exactly what the drain grace
 /// exists for.
 ///
-/// Only `stop` and `length` arm it. An `error`/`aborted` stop can be
-/// superseded by an automatic retry (`auto_retry_*`), and arming the
-/// two-second drain kill on one could destroy the retry's result; those runs
-/// fall back to the run timeout. `agent_end` still counts for a runtime that
-/// does emit it. A completion still requesting tools is an intermediate turn,
-/// never this tool-less run's terminal. Noise and malformed lines are simply
-/// not terminals here; the full parse renders that verdict.
-fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
+/// `stop` and `length` are decisive. `error` and `aborted` are the same
+/// terminals to the runner, and they must arm the drain too: an aliased
+/// provider with no credentials fails exactly this way, and letting that run
+/// idle to its full timeout would replace the credential failure with
+/// `TimedOut` — which is not `AuthRequired`, so the canonical-provider
+/// fallback would never fire. They arm revocably instead of decisively,
+/// because Pi can retry a failed turn on its own; a following `message_start`
+/// or `auto_retry_*` restores the full deadline, which the runner's one-shot
+/// latch cannot do. `agent_end` is decisive for a runtime that emits it.
+/// A completion still requesting tools is an intermediate turn, never this
+/// tool-less run's terminal. Noise and malformed lines say nothing; the full
+/// parse renders that verdict.
+fn pi_line_probe_signal(line: &[u8]) -> ProbeSignal {
     let Ok(text) = std::str::from_utf8(line) else {
-        return false;
+        return ProbeSignal::Quiet;
     };
     // The probe parses every completed line while capture is still live, so
     // it observes the same node-graph bound as the full parse; an
     // over-structured line is not a terminal here and the full parse
     // renders the bounded failure verdict.
     if !subprocess::json_nodes_within_bound(text) {
-        return false;
-    }
+        return ProbeSignal::Quiet;
+    };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
+        return ProbeSignal::Quiet;
     };
     let message = match value.get("type").and_then(serde_json::Value::as_str) {
+        // A turn opening, or a retry announcing itself, means the run is
+        // still working: whatever provisional terminal preceded it is stale.
+        Some("message_start" | "auto_retry_start" | "auto_retry_end") => {
+            return ProbeSignal::Continues;
+        }
         Some("message_end") => value.get("message"),
         Some("agent_end") => value
             .get("messages")
@@ -391,19 +408,23 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
         _ => None,
     };
     let Some(message) = message else {
-        return false;
+        return ProbeSignal::Quiet;
     };
     if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
-        return false;
+        return ProbeSignal::Quiet;
     }
+    if message_requests_tools(message) {
+        return ProbeSignal::Quiet;
+    }
+    let decisive = value.get("type").and_then(serde_json::Value::as_str) == Some("agent_end");
     match message
         .get("stopReason")
         .and_then(serde_json::Value::as_str)
     {
-        Some("stop" | "length") => !message_requests_tools(message),
-        // Retryable stops do not arm the drain: an automatic retry can
-        // follow, and killing two seconds later would discard its result.
-        _ => false,
+        Some("stop" | "length") => ProbeSignal::Decisive,
+        Some("error" | "aborted") if decisive => ProbeSignal::Decisive,
+        Some("error" | "aborted") => ProbeSignal::Provisional,
+        _ => ProbeSignal::Quiet,
     }
 }
 

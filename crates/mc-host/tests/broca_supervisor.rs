@@ -8,7 +8,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mc_host::broca::backend::{BackendError, ErrorClass, Harness};
+use mc_host::broca::backend::{BackendError, BackendTerminal, ErrorClass, Harness};
 use mc_host::broca::config::{BrocaLimits, TERMINAL_RETENTION};
 use mc_host::broca::protocol::SendRequest;
 use mc_host::broca::supervisor::{SessionKey, Subscription, Supervisor, SupervisorMetrics};
@@ -704,6 +704,58 @@ async fn delete_during_running_waits_purges_and_installs_an_idempotent_tombstone
     assert_eq!(resurrect.code, "session_deleted");
     // The failed resurrection returns its candidate reservations.
     assert_eq!(supervisor.metrics(), after_first);
+}
+
+/// A backend that cannot prove its process tree stopped must not let cancel
+/// or delete report success: `work_done` says only that the run TASK
+/// returned, and treating that as proof of teardown would tell the module a
+/// billable provider descendant had stopped when it may still be running —
+/// after which classification would advance to another model.
+#[tokio::test]
+async fn unproven_teardown_fails_cancel_and_delete() {
+    let backend = ScriptedBackend::with_behavior(|_request, _events, _cancel| {
+        Box::pin(async {
+            BackendTerminal::FailedUnresolved(BackendError {
+                class: ErrorClass::Transient,
+                message: "pi backend process group teardown was not confirmed".to_owned(),
+                retry_after_secs: None,
+                provider_code: None,
+            })
+        })
+    });
+    let supervisor = Supervisor::new(backend as Arc<_>);
+
+    let run_id = send(&supervisor, "s-unproven", "p1");
+    until(
+        || supervisor.status(&key("s-unproven"), &run_id) == Ok("failed"),
+        "the unresolved run still commits its failed terminal",
+    )
+    .await;
+
+    // Cancel: the terminal is already committed, but the teardown remains
+    // unproven, so the caller is told rather than reassured.
+    let cancelled = supervisor
+        .cancel(&key("s-unproven"), &run_id)
+        .await
+        .expect_err("cancel cannot claim an unproven teardown");
+    assert_eq!(cancelled.code, "teardown_unconfirmed");
+
+    // Delete: it still purges and tombstones — retained bytes stay bounded
+    // (R12) and the resurrection guard is installed — and then reports the
+    // same unproven teardown.
+    let deleted = supervisor
+        .delete(&key("s-unproven"))
+        .await
+        .expect_err("delete cannot claim an unproven teardown");
+    assert_eq!(deleted.code, "teardown_unconfirmed");
+    let (request, body) = send_pair("p2");
+    let resurrect = supervisor
+        .send(&key("s-unproven"), request, &body)
+        .expect_err("the tombstone blocks resurrection");
+    assert_eq!(
+        resurrect.code, "session_deleted",
+        "the tombstone must exist despite the reported failure"
+    );
 }
 
 /// The eviction/delete race (AE7): a terminal-cap eviction removes the

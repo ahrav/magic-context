@@ -132,6 +132,11 @@ struct RunState {
     /// Cancel and delete wait on this so no backend work outlives their
     /// completion (R10).
     work_done: bool,
+    /// The backend returned but could NOT prove its process tree stopped, so
+    /// `work_done` is not evidence the work stopped: descendants may still
+    /// be executing a billable request. Cancel and delete report failure
+    /// rather than claiming a teardown they cannot demonstrate.
+    work_unresolved: bool,
     /// Removed from both indices. Subscribers observing this detach instead
     /// of replaying a purged log; a frame a subscriber already holds keeps
     /// its charge until that holder drops it.
@@ -430,6 +435,7 @@ impl Supervisor {
                 terminal_appended: false,
                 subscriber_count: 0,
                 work_done: false,
+                work_unresolved: false,
                 purged: false,
                 completed_at: None,
                 run_permit: Some(run_permit),
@@ -504,7 +510,7 @@ impl Supervisor {
             },
         );
         wait_work_done(&run).await;
-        Ok(())
+        Self::unresolved_teardown_error(&run)
     }
 
     /// Deletes the route's session (F3, R10): cancels any live run, waits
@@ -616,6 +622,27 @@ impl Supervisor {
             enforce_terminal_cap(&self.inner, &mut index, "", Some(key), &mut released);
         } else if let Some(charge) = reserved_tombstone {
             released.charges.push(charge);
+        }
+        drop(index);
+        // Reported only after the purge and tombstone: the local session is
+        // gone either way and retained bytes must stay bounded (R12), but
+        // the caller still has to learn that the harness tree could not be
+        // proven stopped, so it does not treat this delete as proof the work
+        // ended. The registry record left by the run is what a successor
+        // host uses to finish the job.
+        Self::unresolved_teardown_error(&run)
+    }
+
+    /// `Ok` unless the run's backend could not prove its process tree
+    /// stopped. `work_done` only says the run TASK returned; a teardown the
+    /// host could not demonstrate must not be reported as one it did.
+    fn unresolved_teardown_error(run: &Arc<Run>) -> Result<(), RequestError> {
+        if lock_run(run).work_unresolved {
+            return Err(app(
+                "teardown_unconfirmed",
+                "the harness process group could not be confirmed stopped; \
+                 work may still be running",
+            ));
         }
         Ok(())
     }
@@ -1006,6 +1033,14 @@ fn finish(inner: &Arc<Inner>, run: &Arc<Run>, outcome: TerminalOutcome) {
                 Status::Completed,
             ),
             TerminalOutcome::Backend(BackendTerminal::Failed(error)) => {
+                (protocol::error_unit(&run.run_id, error), Status::Failed)
+            }
+            // Same committed terminal as any failure — subscribers and
+            // replay see one failed run — but the unresolved teardown is
+            // recorded so cancel and delete cannot report success over work
+            // that may still be running.
+            TerminalOutcome::Backend(BackendTerminal::FailedUnresolved(error)) => {
+                state.work_unresolved = true;
                 (protocol::error_unit(&run.run_id, error), Status::Failed)
             }
             TerminalOutcome::Cancelled { message } => (
