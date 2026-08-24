@@ -1047,8 +1047,10 @@ export class SubcClient {
                         flags: terminal.flags,
                         // A stream frame ahead of the terminal means the
                         // host produced response data, which cannot prove a
-                        // no-dispatch rejection.
-                        streamed: terminal.stream.length > 0,
+                        // no-dispatch rejection. Read the arrival flag, not
+                        // `stream`: unary mode drains stream bodies
+                        // privately and always reports an empty array.
+                        streamed: terminal.sawStream,
                     };
                 }
                 throw failure;

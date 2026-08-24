@@ -490,8 +490,11 @@ export function sanitizedCandidateFactory(
                             // truthy non-boolean is not, and treating it as
                             // proof would let the generation settle
                             // `not_sent` (replay-eligible) for a frame the
-                            // provider may still publish.
-                            return ticket.cancel() === true;
+                            // provider may still publish. Our own publish
+                            // observation overrides the provider's answer:
+                            // once publication began, no later `true` can
+                            // unsay it.
+                            return !published && ticket.cancel() === true;
                         } catch {
                             // A throwing provider ticket must not disrupt
                             // pending-entry settlement; `false` is the

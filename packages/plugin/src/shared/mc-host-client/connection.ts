@@ -105,6 +105,13 @@ export interface RequestTerminal {
     body: Uint8Array;
     flags: number;
     stream: Uint8Array[];
+    /**
+     * A StreamData frame arrived before this terminal. Unary mode drains
+     * stream bodies privately, so `stream` stays empty there and cannot
+     * report it; a caller that must prove the host produced no response
+     * data before a terminal reads this instead.
+     */
+    sawStream: boolean;
 }
 
 export interface RequestParams {
@@ -711,6 +718,7 @@ export class ConnectionGeneration {
                 body,
                 flags: header.flags,
                 stream: entry.mode === "stream" ? entry.streamItems : [],
+                sawStream: entry.sawStream,
             });
         } else if (header.ty === FrameType.StreamEnd) {
             if (entry.mode === "stream") {
@@ -719,6 +727,7 @@ export class ConnectionGeneration {
                     body: EMPTY_BODY,
                     flags: header.flags,
                     stream: entry.streamItems,
+                    sawStream: entry.sawStream,
                 });
             } else {
                 this.settleCallerReject(
@@ -745,6 +754,7 @@ export class ConnectionGeneration {
                 body,
                 flags: header.flags,
                 stream: entry.mode === "stream" ? entry.streamItems : [],
+                sawStream: entry.sawStream,
             });
         }
         this.finishEntry(entry);
