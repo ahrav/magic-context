@@ -1847,7 +1847,8 @@ fn pi_auxiliary_events_ignored() {
 
 /// An older Pi delivers its final assistant state only in `agent_end`'s
 /// authoritative messages array; the parser accepts that compatibility
-/// shape when no `message_end` terminal arrived.
+/// shape, and when both spellings appear the `agent_end` decision replaces
+/// the provisional `message_end` one.
 fn pi_agent_end_compatibility_terminal() {
     let (terminal, events) = run_pi_transcript(&[
         serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
@@ -1863,6 +1864,23 @@ fn pi_agent_end_compatibility_terminal() {
     );
     assert!(events.iter().any(
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "compat answer")
+    ));
+
+    // Both spellings, differing final state: agent_end is authoritative.
+    let mut lines = pi_success_lines("provisional answer", "stop");
+    lines.push(serde_json::json!({"type": "agent_end", "messages": [
+        {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "authoritative answer"}]},
+    ]}));
+    let (terminal, events) = run_pi_transcript(&lines);
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "authoritative answer")
+    ));
+    assert!(!events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "provisional answer")
     ));
 }
 

@@ -365,9 +365,10 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
 /// Parses the closed Pi print-mode JSON vocabulary (R18). The terminal
 /// assistant `message_end` (stopReason `stop`, `length`, `error`, or
 /// `aborted` with no tool calls — the run is tool-less) decides the run;
-/// when no `message_end` terminal arrived, the `agent_end` compatibility
-/// shape's final assistant message decides instead (the authoritative array
-/// `subagent-runner.ts` reads on older Pi runtimes).
+/// when the `agent_end` compatibility shape carries a decisive final
+/// assistant message (the authoritative array `subagent-runner.ts` prefers
+/// over accumulated message events), that decision replaces the provisional
+/// `message_end` one.
 /// Documented nonterminal events that occur on ordinary tool-less runs
 /// (lifecycle, compaction, retry, queue, and session-state notifications;
 /// `--thinking` emits `thinking_level_changed`) are ignored, but
@@ -382,6 +383,7 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
 fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTerminal), String> {
     let mut events = Vec::new();
     let mut terminal: Option<BackendTerminal> = None;
+    let mut agent_end_final: Option<(serde_json::Value, usize)> = None;
     for (index, line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
             continue;
@@ -433,15 +435,12 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
                 commit_assistant_message(&mut events, &mut terminal, message, line_no)?;
             }
             "agent_end" => {
-                // Compatibility: an older Pi delivers its final state only
-                // in `agent_end`'s authoritative messages array — the shape
-                // `subagent-runner.ts` reads. A stream that already
-                // committed its terminal via `message_end` keeps it, so the
-                // two spellings never conflict.
-                if terminal.is_some() {
-                    continue;
-                }
-                let Some(message) = value
+                // The authoritative final state on runtimes that emit it:
+                // `subagent-runner.ts` prefers this array over accumulated
+                // message events. The decision is deferred to the end of
+                // the parse so it replaces any provisional `message_end`
+                // terminal instead of conflicting with it.
+                if let Some(message) = value
                     .get("messages")
                     .and_then(serde_json::Value::as_array)
                     .and_then(|messages| {
@@ -450,12 +449,22 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
                                 == Some("assistant")
                         })
                     })
-                else {
-                    continue;
-                };
-                commit_assistant_message(&mut events, &mut terminal, message, line_no)?;
+                {
+                    agent_end_final = Some((message.clone(), line_no));
+                }
             }
             _ => return Err(format!("unknown event type at line {line_no}")),
+        }
+    }
+    // The agent_end decision wins when it is decisive; a nonterminal final
+    // assistant (or no agent_end at all) falls back to the message_end
+    // decision so modern transcripts are unaffected.
+    if let Some((message, line_no)) = &agent_end_final {
+        let mut agent_events = Vec::new();
+        let mut agent_terminal = None;
+        commit_assistant_message(&mut agent_events, &mut agent_terminal, message, *line_no)?;
+        if let Some(agent_terminal) = agent_terminal {
+            return Ok((agent_events, agent_terminal));
         }
     }
     let Some(terminal) = terminal else {
