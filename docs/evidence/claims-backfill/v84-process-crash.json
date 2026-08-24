@@ -1,8 +1,8 @@
 {
   "schemaVersion": "claims-process-crash-evidence/v1",
-  "commitUnderTest": "af06688041ce84a75a2c7194f291f58eee923496",
+  "commitUnderTest": "5a3b6c82a59c027c64d9eb1931425b1ac38880a3",
   "dirtyDiffDigestPolicy": "sha256(sorted U6 implementation path + NUL + full file bytes + NUL); evidence file excluded",
-  "dirtyDiffDigest": "0b4d83065b97d648885cd71d9f80b30d36e4dd149ddf3e8226a4a8308aafd150",
+  "dirtyDiffDigest": "ab6666135a65876f1ff0786230f9d5e5c0db9e3491b3f822479f6847e5d7d1bd",
   "implementationFiles": [
     "ARCHITECTURE.md",
     "STRUCTURE.md",
@@ -48,7 +48,7 @@
   },
   "environment": {
     "os": "linux",
-    "release": "6.12.95-124.187.amzn2023.x86_64",
+    "release": "6.12.100-125.179.amzn2023.x86_64",
     "arch": "x64",
     "filesystem": {
       "type": "1021994",

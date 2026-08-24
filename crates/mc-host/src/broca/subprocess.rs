@@ -149,6 +149,10 @@ pub struct SubprocessResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub end: SubprocessEnd,
+    /// Whether the whole prompt reached the child's stdin before it closed.
+    /// A transcript produced without the full prompt answers a truncated
+    /// question, so parsers refuse it even when the end state looks clean.
+    pub prompt_delivered: bool,
 }
 
 /// Spawns and supervises one harness child (KTD6). Returns after the leader
