@@ -22,7 +22,11 @@ import { hasPiMagicContextPackage } from "../lib/pi-package-entry";
 import type { PromptIO } from "../lib/prompts";
 
 type EmbeddingChoice =
-    | { provider: "local"; model: string }
+    // Local carries no model: the plugin's schema default applies at load time,
+    // so a default-model change reaches existing setups without re-running the
+    // wizard. Writing an explicit model here would pin whatever the default was
+    // on setup day.
+    | { provider: "local" }
     | {
           provider: "openai-compatible";
           endpoint: string;
@@ -262,10 +266,16 @@ export function writeMagicContextConfig(
     };
     config.sidekick = compactObject(sidekick);
 
-    config.embedding = {
+    // A local choice clears the remote-provider keys AND any explicitly pinned
+    // model a previous setup run wrote, so re-running the wizard restores the
+    // plugin's default-model behavior instead of preserving a stale pin.
+    config.embedding = compactObject({
         ...((config.embedding as Record<string, unknown> | undefined) ?? {}),
         ...options.embedding,
-    };
+        ...(options.embedding.provider === "local"
+            ? { model: undefined, endpoint: undefined, api_key: undefined }
+            : {}),
+    });
     writeFileAtomic(configPath, `${stringifyJsonc(config, null, 2)}\n`);
 }
 
@@ -280,7 +290,7 @@ async function chooseEmbedding(prompts: PromptIO): Promise<EmbeddingChoice> {
     ]);
 
     if (provider === "local") {
-        return { provider: "local", model: "Xenova/all-MiniLM-L6-v2" };
+        return { provider: "local" };
     }
 
     const endpoint = await prompts.text("Embedding endpoint URL", {

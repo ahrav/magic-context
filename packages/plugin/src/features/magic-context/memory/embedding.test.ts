@@ -67,7 +67,7 @@ describe("embedding module", () => {
             expect(provider.modelId).toBe(
                 getEmbeddingProviderIdentity({
                     provider: "local",
-                    model: "Xenova/all-MiniLM-L6-v2",
+                    model: "Xenova/bge-small-en-v1.5",
                 }),
             );
             expect(provider.isLoaded()).toBe(false);

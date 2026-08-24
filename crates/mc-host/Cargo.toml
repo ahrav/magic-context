@@ -19,7 +19,7 @@ fastembed = { version = "=6.0.0", default-features = false, features = ["ort-loa
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std"] }
 tokio = { workspace = true, features = ["process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-rustix = { version = "1.1.4", features = ["fs", "process"] }
+rustix = { version = "1.1.4", features = ["fs", "process", "thread"] }
 getrandom = "0.2"
 
 [dev-dependencies]
@@ -29,7 +29,13 @@ tokio = { workspace = true, features = ["test-util", "signal"] }
 # `stdio` only serves the broca_subprocess fixture that replaces its own
 # stdin; feature unification keeps production builds on fs+process alone.
 rustix = { version = "1.1.4", features = ["stdio"] }
+criterion = "=0.8.2"
+hdrhistogram = "=7.6.0"
 
 [[test]]
 name = "broca_subprocess"
+harness = false
+
+[[bench]]
+name = "ipc_budget"
 harness = false

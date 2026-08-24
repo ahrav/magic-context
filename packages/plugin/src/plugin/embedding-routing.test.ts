@@ -16,7 +16,7 @@ describe("embedding routing", () => {
         });
         expect(routing.primary).toEqual({
             provider: "local",
-            model: "Xenova/all-MiniLM-L6-v2",
+            model: "Xenova/bge-small-en-v1.5",
         });
         expect(routing.primary).not.toHaveProperty("fallback_provider");
         expect(config.subc?.connection_file).toBe(`${homedir()}/run/subc.json`);

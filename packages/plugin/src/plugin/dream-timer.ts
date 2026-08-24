@@ -8,6 +8,7 @@ import {
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
+import { reembedStalePrimerEmbeddings } from "../features/magic-context/dreamer/promote-primers";
 import {
     PRIVACY_SENSITIVE_CHILD_TASKS,
     PRIVACY_SENSITIVE_CHILD_TITLE_MATCHES,
@@ -516,6 +517,22 @@ async function sweepProject(
             `[magic-context] GC'd ${gcDeleted} stale embedding row(s) for ${reg.projectIdentity} ` +
                 `(memory=${gc.memoryRowsDeleted} commit=${gc.commitRowsDeleted} chunk=${gc.chunkRowsDeleted})`,
         );
+    }
+
+    // Primer re-embedding lives on this always-reachable sweep, not only in the
+    // promote-primers dream task: primer SEARCH stays enabled when dreamer
+    // scheduling is disabled, and search skips vectors whose model id differs
+    // from the query's, so a provider-identity change would otherwise leave
+    // those projects without semantic primer retrieval indefinitely.
+    try {
+        const reembedded = await reembedStalePrimerEmbeddings(db, reg.projectIdentity);
+        if (reembedded > 0) {
+            log(
+                `[magic-context] re-embedded ${reembedded} stale primer row(s) for ${reg.projectIdentity}`,
+            );
+        }
+    } catch (error) {
+        log(`[magic-context] stale-primer re-embed failed for ${reg.projectIdentity}: ${error}`);
     }
 
     const dreamerConfig = reg.dreamerConfig;
