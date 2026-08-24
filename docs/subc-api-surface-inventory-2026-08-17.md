@@ -308,7 +308,7 @@ The three deltas, each isolated to one `rustc` error in
 | --- | --- | --- |
 | Surface breadth | 87 Rust rows, but 83 are shape-identical to MIT source we can take as-is; the module never touches daemon-internal APIs | shims |
 | Semantic depth | The heavy semantics (route.open control plane, epoch/channel demux, at-most-once classification, health probing, bind lifecycle) live on the **daemon** side, which `mc-host` must implement under *either* option. Adoption moves zero semantics into a compatibility layer | shims |
-| Published-source delta | 83 exact / 3 changed / 0 absent; all three deltas are additive one-liners | shims |
+| Published-source delta | 83 exact / 3 changed / 0 absent; all three deltas are one-liners, but they point in different directions: `HandlerOutcome::ErrorWithDetail` and `ErrorBody::new` are additive (add a variant, add a constructor), while `ModuleManifest` is subtractive (the ported struct must omit `scheduled_tasks`, which published 0.10.0 requires) | shims |
 | Ownership boundary | `subc` types are load-bearing inside core module logic — `HandlerOutcome` at 350 sites in `lib.rs`, and `subc_client_rs::async_trait` applied to `mc-module`'s **own** traits in `historian.rs`. Rewriting the boundary means editing core logic that has nothing to do with transport | shims |
 | Verification cost | The compiler-closure pass (`docs/evidence/subc-compiler-closure/`) verified adoption's surface directly against rustc, and adoption keeps the existing `mc-module` test suite as the regression oracle instead of invalidating it — a rewrite would be verified no better | shims |
 

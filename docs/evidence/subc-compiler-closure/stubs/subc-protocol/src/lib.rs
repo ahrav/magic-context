@@ -1,7 +1,9 @@
 //! STRICT compile-closure stub for `subc-protocol` (private 0.12.0).
 //!
 //! Every public item maps to a row in the verified subc API surface
-//! inventory. Function bodies are `unimplemented!()`: this crate exists only
+//! inventory. Function bodies are `unimplemented!()`, except `ErrorBody::new`,
+//! which carries its trivial field-assignment body (and, like every other stub
+//! body, is never executed): this crate exists only
 //! to prove that the inventory is a COMPLETE enumeration of the surface
 //! `mc-module` compiles against. Binaries linked against it must never be
 //! executed.
