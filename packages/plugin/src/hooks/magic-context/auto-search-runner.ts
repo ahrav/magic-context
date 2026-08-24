@@ -24,6 +24,7 @@ import {
     getProjectEmbeddingSnapshot,
 } from "../../features/magic-context/memory/embedding";
 import { autoSearchHintFragmentsStillEligible } from "../../features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
 import { getMemoriesByIds } from "../../features/magic-context/memory/storage-memory";
 import type {
     UnifiedSearchOptions,
@@ -452,8 +453,9 @@ export async function runAutoSearchHint(args: {
     // Prefix with double newline so the hint is a separate block, not glued
     // onto the last word of the user's prompt.
     const payload = `\n\n${hintText}`;
-    // Record which memories contributed fragments — each bound to its
-    // normalized content hash — so replay passes can re-check both policy
+    // Record which memories contributed fragments — each bound to its exact
+    // SHA-256 content digest (the normalized hash cannot tell a rewritten
+    // revision from its predecessor) — so replay passes re-check both policy
     // and content identity against live state. A delivered id whose row
     // cannot be loaded records an empty hash, which can never match a live
     // row: the fragment fails closed rather than silently untracked.
@@ -467,7 +469,7 @@ export async function runAutoSearchHint(args: {
     const hashById = new Map(
         getMemoriesByIds(db, deliveredMemoryIds).map((memory) => [
             memory.id,
-            memory.normalizedHash,
+            sha256Utf8Hex(memory.content),
         ]),
     );
     const memoryFragments = deliveredMemoryIds.map((id) => ({

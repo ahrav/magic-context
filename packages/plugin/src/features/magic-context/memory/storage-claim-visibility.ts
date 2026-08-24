@@ -16,6 +16,7 @@
 
 import type { Database } from "../../../shared/sqlite";
 import { CLAIM_POLICY_VERSION, explicitSearchLabelFromFields } from "./claim-visibility-policy";
+import { sha256Utf8Hex } from "./storage-claims";
 import type { Memory } from "./types";
 
 export type MemoryPolicySurface = "auto_inject" | "auto_search" | "explicit_search";
@@ -277,14 +278,13 @@ export function decideMemoryPolicy(
  * from these memories' fragments under the policy of an earlier pass, and a
  * later policy transition (quarantine, contradiction, rejection) must not
  * keep serving those fragments through the persisted decision. Each fragment
- * is bound to the normalized content hash that produced it, so a memory
- * rewritten in place cannot lend the OLD fragment its NEW revision's
- * eligibility — the ids resolve through the claim's current revision, and
- * only the exact content the hint carries may replay. `undefined` means the
- * contributing set is unknown (a pre-field decision or a reseed that dropped
- * it) and fails closed — an unknown set cannot prove the text holds no
- * hidden fragment, the same discipline as an unknown rendered-id record on
- * the injection path.
+ * is bound to the exact SHA-256 content digest that produced it — the
+ * normalized hash lowercases and collapses whitespace, so it cannot tell a
+ * rewritten revision from its predecessor — and only the exact content the
+ * hint carries may replay. `undefined` means the contributing set is unknown
+ * (a pre-field decision or a reseed that dropped it) and fails closed — an
+ * unknown set cannot prove the text holds no hidden fragment, the same
+ * discipline as an unknown rendered-id record on the injection path.
  */
 export function autoSearchHintFragmentsStillEligible(
     db: Database,
@@ -298,16 +298,25 @@ export function autoSearchHintFragmentsStillEligible(
     if (!ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_search").eligible)) {
         return false;
     }
-    const placeholders = ids.map(() => "?").join(", ");
-    const hashRows = db
+    const currentHashById = exactMemoryContentDigests(db, ids);
+    return fragments.every((fragment) => currentHashById.get(fragment.id) === fragment.hash);
+}
+
+/** Exact SHA-256 content digests for a bounded id set (replay-gate oracle). */
+export function exactMemoryContentDigests(
+    db: Database,
+    memoryIds: readonly number[],
+): Map<number, string> {
+    if (memoryIds.length === 0) return new Map();
+    const placeholders = memoryIds.map(() => "?").join(", ");
+    const rows = db
         .prepare(
             // Interpolation is a compile-time placeholder list, not caller input.
             // pi-lens-ignore: sql-injection
-            `SELECT id, normalized_hash AS hash FROM memories WHERE id IN (${placeholders})`,
+            `SELECT id, content FROM memories WHERE id IN (${placeholders})`,
         )
-        .all(...ids) as Array<{ id: number; hash: string }>;
-    const currentHashById = new Map(hashRows.map((row) => [row.id, row.hash]));
-    return fragments.every((fragment) => currentHashById.get(fragment.id) === fragment.hash);
+        .all(...memoryIds) as Array<{ id: number; content: string }>;
+    return new Map(rows.map((row) => [row.id, sha256Utf8Hex(row.content)]));
 }
 
 /**

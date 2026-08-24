@@ -55,6 +55,7 @@ import {
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
 import { getMemoriesByIds } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import type {
 	UnifiedSearchOptions,
@@ -427,7 +428,7 @@ export async function runAutoSearchHintForPi(args: {
 	const hashById = new Map(
 		getMemoriesByIds(db, deliveredMemoryIds).map((memory) => [
 			memory.id,
-			memory.normalizedHash,
+			sha256Utf8Hex(memory.content),
 		]),
 	);
 	const memoryFragments = deliveredMemoryIds.map((id) => ({

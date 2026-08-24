@@ -476,6 +476,18 @@ export function reconcileCompatibilityVerifications(db: Database): number {
                         refreshRevisionMaturityInCurrentTransaction(db, event.revisionId);
                         refreshed += 1;
                     }
+                    // A verified event can also HEAL a prior soft hide
+                    // (verified -> stale -> verified): the projection never
+                    // stopped reading eligible, so the divergence probe sees
+                    // nothing, but automatic caches keyed on the project
+                    // epoch dropped the row when the stale event bumped it
+                    // and need another bump to pick it back up. Compatibility
+                    // events are rare and watermarked, so the conservative
+                    // bump per claim is cheap.
+                    if (!bumpedClaims.has(event.claimId)) {
+                        bumpedClaims.add(event.claimId);
+                        bumpEpochForClaimProjectInCurrentTransaction(db, event.claimId);
+                    }
                 } else if (!bumpedClaims.has(event.claimId)) {
                     bumpedClaims.add(event.claimId);
                     bumpEpochForClaimProjectInCurrentTransaction(db, event.claimId);

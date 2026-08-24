@@ -13,10 +13,12 @@ import {
 import { V2_MEMORY_CATEGORIES } from "../../features/magic-context/memory/constants";
 import {
     decideMemoryPolicy,
+    exactMemoryContentDigests,
     filterMemoriesByPolicy,
     hasClaimEffectivePolicy,
     readMemoryPolicyRows,
 } from "../../features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
 import {
     getMaxMemoryIdForProjects,
     getMemoriesByProject,
@@ -163,12 +165,14 @@ function parseRecordedMemoryBlockHashes(raw: string | null | undefined): string[
 
 /**
  * A recorded memory block replays only while every rendered id is still
- * automatic-eligible AND still carries the exact content that was rendered.
- * The ids resolve through each claim's current revision, so eligibility
- * alone cannot see a rewrite-in-place: a superseded revision's cached bytes
- * must not regain visibility because a later revision of the same memory id
- * became eligible. Missing or misaligned hash records fail closed — the
- * rendered content cannot be proven, so the block recomputes.
+ * automatic-eligible AND still carries the exact content that was rendered
+ * (SHA-256 of the exact bytes). The ids resolve through each claim's current
+ * revision, so eligibility alone cannot see a rewrite-in-place — and the
+ * normalized hash cannot either, since it lowercases and collapses
+ * whitespace before hashing. A superseded revision's cached bytes must not
+ * regain visibility because a later revision of the same memory id became
+ * eligible. Missing or misaligned hash records fail closed — the rendered
+ * content cannot be proven, so the block recomputes.
  */
 function recordedMemoryBlockStillBacked(
     db: Database,
@@ -184,15 +188,7 @@ function recordedMemoryBlockStillBacked(
     if (!ids.every((id) => decideMemoryPolicy(rows.get(id), "auto_inject").eligible)) {
         return false;
     }
-    const placeholders = ids.map(() => "?").join(", ");
-    const hashRows = db
-        .prepare(
-            // Interpolation is a compile-time placeholder list, not caller input.
-            // pi-lens-ignore: sql-injection
-            `SELECT id, normalized_hash AS hash FROM memories WHERE id IN (${placeholders})`,
-        )
-        .all(...ids) as Array<{ id: number; hash: string }>;
-    const currentHashById = new Map(hashRows.map((row) => [row.id, row.hash]));
+    const currentHashById = exactMemoryContentDigests(db, ids);
     return ids.every((id, index) => currentHashById.get(id) === hashes[index]);
 }
 
@@ -587,9 +583,11 @@ export function prepareCompartmentInjection(
             // session_meta.memory_block_ids as JSON so ctx_search can hard-filter
             // them out of search results (the agent already sees them in <session-history>).
             // The aligned hashes bind the cached bytes to the exact content
-            // rendered, so the replay guards can reject a rewrite-in-place.
+            // rendered (SHA-256 of the exact bytes — the normalized hash
+            // cannot tell a rewritten revision from its predecessor), so the
+            // replay guards can reject a rewrite-in-place.
             const renderedIds = memories.map((m) => m.id);
-            const renderedHashes = memories.map((m) => m.normalizedHash);
+            const renderedHashes = memories.map((m) => sha256Utf8Hex(m.content));
 
             // Snapshot so subsequent turns reuse the same block without cache bust.
             // Swallow SQLITE_BUSY: the cache is a pure optimization (the block itself
