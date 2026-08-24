@@ -119,20 +119,30 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
 }
 
 #[tokio::test]
-async fn concurrent_identical_sends_converge_on_one_run_and_one_backend_start() {
+async fn identical_resend_dedups_and_any_byte_difference_conflicts() {
     let (backend, gate) = ScriptedBackend::gated("out");
     let supervisor = Supervisor::new(Arc::clone(&backend) as Arc<_>);
     let (request, body) = send_pair("same prompt");
 
-    // Both admissions race through the same index lock; the second must
-    // observe the first's published run rather than admit a duplicate.
     let first = supervisor
         .send(&key("s1"), request.clone(), &body)
         .expect("first send admits");
     let second = supervisor
-        .send(&key("s1"), request, &body)
+        .send(&key("s1"), request.clone(), &body)
         .expect("identical resend returns the existing run");
     assert_eq!(first, second);
+
+    // Same parsed request, byte-different body (one inserted space):
+    // idempotency is defined over the exact body bytes (KTD11), so a
+    // semantically identical re-serialization must conflict rather than
+    // dedupe — this fails if the fingerprint were taken over the parsed
+    // structure instead of the raw bytes.
+    let mut spaced = body.clone();
+    spaced.insert(1, b' ');
+    let respaced = supervisor
+        .send(&key("s1"), request, &spaced)
+        .expect_err("a byte-different body for the key conflicts");
+    assert_eq!(respaced.code, "idempotency_conflict");
 
     let (different, different_body) = send_pair("different prompt");
     let conflict = supervisor
@@ -148,6 +158,51 @@ async fn concurrent_identical_sends_converge_on_one_run_and_one_backend_start() 
     )
     .await;
     assert_eq!(backend.starts(), 1, "the resend started no second backend");
+}
+
+/// A true admission race (AE2): two OS threads release from one barrier and
+/// call the synchronous `Supervisor::send` with identical bytes at the same
+/// time, so both really contend on the index lock instead of running
+/// sequentially on one task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn racing_identical_sends_converge_on_one_run_and_one_backend_start() {
+    let (backend, gate) = ScriptedBackend::gated("out");
+    let supervisor = Arc::new(Supervisor::new(Arc::clone(&backend) as Arc<_>));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let mut racers = Vec::new();
+    for _ in 0..2 {
+        let supervisor = Arc::clone(&supervisor);
+        let barrier = Arc::clone(&barrier);
+        let (request, body) = send_pair("same prompt");
+        racers.push(tokio::task::spawn_blocking(move || {
+            barrier.wait();
+            supervisor.send(&key("s1"), request, &body)
+        }));
+    }
+    let mut run_ids = Vec::new();
+    for racer in racers {
+        run_ids.push(
+            racer
+                .await
+                .expect("racer joins")
+                .expect("both racing identical sends succeed"),
+        );
+    }
+    assert_eq!(run_ids[0], run_ids[1], "both racers observe one shared run");
+    assert_eq!(supervisor.metrics().sessions, 1);
+    assert_eq!(supervisor.metrics().live_runs, 1);
+
+    gate.add_permits(1);
+    until(
+        || supervisor.status(&run_ids[0]) == Ok("completed"),
+        "the shared run completes",
+    )
+    .await;
+    assert_eq!(
+        backend.starts(),
+        1,
+        "the race admitted exactly one backend start"
+    );
 }
 
 #[tokio::test]
@@ -532,6 +587,63 @@ async fn delete_during_running_waits_purges_and_installs_an_idempotent_tombstone
     assert_eq!(supervisor.metrics(), after_first);
 }
 
+/// The eviction/delete race (AE7): a terminal-cap eviction removes the
+/// session while `delete` is parked in its work-done wait, so the re-lock
+/// no longer finds the run — the delete must still leave a tombstone
+/// (charged fresh, since the evicted run's charges are gone) rather than
+/// silently losing its resurrection guard.
+#[tokio::test]
+async fn delete_racing_a_terminal_cap_eviction_still_installs_a_tombstone() {
+    let (backend, gate) = ScriptedBackend::gated_ignoring_cancel("out");
+    let limits = BrocaLimits {
+        max_terminal_sessions: 1,
+        max_backend_processes: 1,
+        ..BrocaLimits::default()
+    };
+    let supervisor = Arc::new(Supervisor::with_limits(
+        Arc::clone(&backend) as Arc<_>,
+        limits,
+    ));
+
+    let run_a = send(&supervisor, "s-del", "pa");
+    until(|| backend.starts() == 1, "the deleted run's backend starts").await;
+    let deleter = {
+        let supervisor = Arc::clone(&supervisor);
+        tokio::spawn(async move { supervisor.delete(&key("s-del")).await })
+    };
+    // The cancel-blind backend pins delete in wait_work_done after its
+    // terminal committed, which is exactly the window the eviction races.
+    until(
+        || supervisor.status(&run_a) == Ok("cancelled"),
+        "delete commits the cancellation terminal",
+    )
+    .await;
+
+    // A second session's terminal commit enforces the 1-session cap and
+    // evicts the (older, subscriber-free) deleted session while delete is
+    // still parked. The second run stays queued behind the single backend
+    // permit, so cancelling it settles promptly.
+    let run_b = send(&supervisor, "s-evict", "pb");
+    supervisor.cancel(&run_b).await.expect("cancel the evictor");
+    assert_eq!(
+        supervisor.status(&run_a),
+        Ok("missing"),
+        "the eviction removed the deleted session before delete re-locked"
+    );
+
+    gate.add_permits(1);
+    deleter
+        .await
+        .expect("delete task joins")
+        .expect("delete settles");
+    assert_eq!(supervisor.metrics().tombstones, 1);
+    let (request, body) = send_pair("pa");
+    let resurrect = supervisor
+        .send(&key("s-del"), request, &body)
+        .expect_err("the raced delete still blocks resurrection");
+    assert_eq!(resurrect.code, "session_deleted");
+}
+
 #[tokio::test(start_paused = true)]
 async fn terminal_expiry_and_oldest_eviction_enforce_the_session_caps() {
     let backend = ScriptedBackend::completing("out");
@@ -606,14 +718,14 @@ async fn retained_pressure_sweeps_expired_entries_and_retries_admission_once() {
     assert_eq!(supervisor.metrics().sessions, 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn replay_overflow_commits_one_failed_terminal_and_stops_growth() {
     let backend = ScriptedBackend::flooding(2_000, 10);
     let limits = BrocaLimits {
         max_run_replay_bytes: 12 * 1024,
         ..BrocaLimits::default()
     };
-    let supervisor = Supervisor::with_limits(Arc::clone(&backend) as Arc<_>, limits);
+    let supervisor = Supervisor::with_limits(Arc::clone(&backend) as Arc<_>, limits.clone());
     let run_id = send(&supervisor, "s1", "p");
     until(
         || supervisor.status(&run_id) == Ok("failed"),
@@ -642,6 +754,15 @@ async fn replay_overflow_commits_one_failed_terminal_and_stops_growth() {
         retained_after_failure,
         "no retained growth after the terminal"
     );
+
+    // The truncated replay's accounting must provably release: delete the
+    // session, expire its tombstone, and land back on the construction
+    // baseline.
+    supervisor.delete(&key("s1")).await.expect("delete settles");
+    tokio::time::advance(TERMINAL_RETENTION).await;
+    // Commands sweep expired entries; a status probe is the cheapest one.
+    assert_eq!(supervisor.status("gone"), Ok("missing"));
+    assert_baseline(supervisor.metrics(), &limits, 0);
 }
 
 #[tokio::test(start_paused = true)]

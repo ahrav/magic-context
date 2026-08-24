@@ -13,6 +13,16 @@ use std::time::Duration;
 /// state exists.
 pub const MAX_SEND_BODY_BYTES: usize = 512 * 1024;
 
+/// Largest inline `OPENCODE_CONFIG_CONTENT` document the OpenCode adapter
+/// passes as one environment string. Linux caps a single argv/env string at
+/// MAX_ARG_STRLEN (32 pages ≈ 128 KiB); exceeding it fails exec(2) with
+/// E2BIG, an opaque permanent spawn error. 96 KiB leaves envelope headroom
+/// under that kernel limit. A contract-valid send under
+/// [`MAX_SEND_BODY_BYTES`] can still carry a `system` prompt too large for
+/// this ceiling; the adapter rejects such runs with a structured message
+/// naming the bound instead of letting exec fail opaquely.
+pub const MAX_OPENCODE_CONFIG_BYTES: usize = 96 * 1024;
+
 /// Per-run retained replay cap, including the terminal headroom (R12), so a
 /// run that fills its replay can still record exactly one terminal unit.
 pub const MAX_RUN_REPLAY_BYTES: usize = 1024 * 1024;

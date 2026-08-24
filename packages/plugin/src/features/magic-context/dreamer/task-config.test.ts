@@ -18,12 +18,7 @@ describe("buildClassifyModelChain", () => {
         ).toEqual(["prov/override", "prov/default", "prov/fb-a", "prov/fb-b"]);
     });
 
-    test("without an override the dreamer default leads and historian settings never appear", () => {
-        const historian = {
-            model: "historian/primary",
-            module_model: "historian/module",
-            fallback_models: ["historian/fallback"],
-        };
+    test("without an override the dreamer default leads", () => {
         const dreamer = DreamerConfigSchema.parse({
             model: "prov/dream-default",
             fallback_models: ["prov/fb"],
@@ -37,13 +32,7 @@ describe("buildClassifyModelChain", () => {
             classify?.fallbackModels,
         );
         expect(chain).toEqual(["prov/dream-default", "prov/fb"]);
-        for (const historianModel of [
-            historian.model,
-            historian.module_model,
-            ...historian.fallback_models,
-        ]) {
-            expect(chain).not.toContain(historianModel);
-        }
+        // Historian-model exclusion is asserted by the Rust decoder test `dreamer_run_task_uses_request_chain_and_route_harness` (crates/mc-module/src/lib.rs), where the poisoned chain reaches real production code; a local historian object here does not. commentlint: allow(JUDGE)
     });
 
     test("drops non-canonical entries and yields an empty chain when nothing is configured", () => {

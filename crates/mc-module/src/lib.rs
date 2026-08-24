@@ -17442,6 +17442,8 @@ mod tests {
         harnesses: Mutex<Vec<String>>,
         sessions: Mutex<Vec<String>>,
         purges: Mutex<Vec<String>>,
+        /// `session_events` preserves start/purge order that separate logs lose.
+        session_events: Mutex<Vec<String>>,
         purge_errors: Mutex<VecDeque<HistorianProducerError>>,
         await_timeouts: Mutex<Vec<Duration>>,
         on_await_output: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -17503,6 +17505,11 @@ mod tests {
                 .lock()
                 .expect("sessions mutex")
                 .push(session_id.to_string());
+            self.state
+                .session_events
+                .lock()
+                .expect("session events mutex")
+                .push(format!("start:{session_id}"));
             self.state
                 .prompts
                 .lock()
@@ -17605,6 +17612,11 @@ mod tests {
                 .lock()
                 .expect("purges mutex")
                 .push(session_id.to_string());
+            self.state
+                .session_events
+                .lock()
+                .expect("session events mutex")
+                .push(format!("purge:{session_id}"));
             match self
                 .state
                 .purge_errors
@@ -26504,6 +26516,15 @@ mod tests {
             producer.purges.lock().unwrap().clone(),
             expected,
             "every outcome kind must delete its attempt session before advancing"
+        );
+        let interleaved: Vec<String> = expected
+            .iter()
+            .flat_map(|session| [format!("start:{session}"), format!("purge:{session}")])
+            .collect();
+        assert_eq!(
+            producer.session_events.lock().unwrap().clone(),
+            interleaved,
+            "each attempt's purge must land before the next attempt's start"
         );
     }
 

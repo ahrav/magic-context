@@ -21,7 +21,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use super::backend::{BackendError, BackendTerminal, ErrorClass};
+use super::backend::{
+    BackendError, BackendEvent, BackendTerminal, ErrorClass, EventSink, SinkStatus,
+};
 
 /// Host launch-identity variables stripped from every child environment
 /// (R17): a harness child inheriting these could reconnect to the daemon as
@@ -244,20 +246,24 @@ pub async fn run(
         None => {
             // Clean EOF on both streams: give the leader a bounded grace to
             // exit on its own before forcing it (the transcript is already
-            // complete either way).
-            match tokio::time::timeout(limits.drain_grace, child.wait()).await {
-                Ok(Ok(status)) => {
-                    // The leader is reaped; sweep any descendants it left in
-                    // the group so nothing outlives the run (R10).
-                    kill_group(group, rustix::process::Signal::KILL);
-                    status
-                        .code()
-                        .map_or(SubprocessEnd::Signaled, SubprocessEnd::Exited)
-                }
-                Ok(Err(_)) | Err(_) => {
-                    terminate_group(group, &mut child, limits.termination_grace).await;
-                    SubprocessEnd::DrainKilled
-                }
+            // complete either way). The exit is observed WITHOUT reaping so
+            // the zombie leader keeps the pgid pinned while the descendant
+            // sweep runs — a reaped leader with no surviving descendants
+            // frees the pgid for reuse, and a post-reap sweep could SIGKILL
+            // an unrelated recycled process group.
+            if wait_exited_unreaped(group, limits.drain_grace).await {
+                kill_group(group, rustix::process::Signal::KILL);
+                child
+                    .wait()
+                    .await
+                    .map_or(SubprocessEnd::DrainKilled, |status| {
+                        status
+                            .code()
+                            .map_or(SubprocessEnd::Signaled, SubprocessEnd::Exited)
+                    })
+            } else {
+                terminate_group(group, &mut child, limits.termination_grace).await;
+                SubprocessEnd::DrainKilled
             }
         }
     };
@@ -276,9 +282,46 @@ fn kill_group(group: Option<rustix::process::Pid>, signal: rustix::process::Sign
     }
 }
 
+/// Waits up to `budget` for the leader to exit WITHOUT reaping it, via
+/// `waitid(..., WNOWAIT)`: the unreaped zombie keeps the process group id
+/// pinned, which is what makes the callers' descendant sweep race-free
+/// against pid/pgid recycling. Returns false when the leader is still
+/// running at the deadline (or when no pid is available to poll).
+async fn wait_exited_unreaped(group: Option<rustix::process::Pid>, budget: Duration) -> bool {
+    let Some(pid) = group else {
+        // No pid means no pgid to sweep either, so the caller's fallback
+        // (direct kill-and-reap) is already race-free.
+        return false;
+    };
+    // ponytail: 10ms poll instead of SIGCHLD plumbing — tokio owns the
+    // child's SIGCHLD handling, and a bounded poll is a few syscalls per
+    // run; switch to pidfd if runs-per-second ever makes this measurable.
+    const POLL: Duration = Duration::from_millis(10);
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let options = rustix::process::WaitIdOptions::EXITED
+            | rustix::process::WaitIdOptions::NOWAIT
+            | rustix::process::WaitIdOptions::NOHANG;
+        match rustix::process::waitid(rustix::process::WaitId::Pid(pid), options) {
+            Ok(Some(_)) => return true,
+            // An error means the pid is not our waitable child anymore;
+            // report exited so the caller proceeds to the final reap
+            // instead of spinning on a pid it can never observe.
+            Err(_) => return true,
+            Ok(None) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Graceful group termination: SIGTERM the whole group, escalate to SIGKILL
-/// after the bounded grace, and reap the leader before returning (R10). A
-/// final group SIGKILL sweeps descendants that outlived the leader.
+/// after the bounded grace, sweep the group, and reap the leader before
+/// returning (R10). The final group SIGKILL is sent while the leader is
+/// still an unreaped zombie — the zombie pins the pgid, so the sweep can
+/// never target a recycled process group.
 async fn terminate_group(
     group: Option<rustix::process::Pid>,
     child: &mut tokio::process::Child,
@@ -288,12 +331,15 @@ async fn terminate_group(
     if group.is_none() {
         let _ = child.start_kill();
     }
-    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+    if !wait_exited_unreaped(group, grace).await {
         kill_group(group, rustix::process::Signal::KILL);
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        // SIGKILL cannot be caught, so the leader dies promptly; the bound
+        // only guards against pathological kernel states wedging the run.
+        let _ = wait_exited_unreaped(group, grace).await;
     }
     kill_group(group, rustix::process::Signal::KILL);
+    let _ = child.wait().await;
 }
 
 /// A sensitive-file cleanup failure, reduced to a bounded structural fact
@@ -319,18 +365,24 @@ pub struct PrivateDir {
 
 impl PrivateDir {
     pub fn create(prefix: &str) -> io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
         let base = std::env::temp_dir();
+        // Requesting 0700 at mkdir(2) closes the window where a permissive
+        // umask would briefly leave the fresh directory group/world-visible
+        // before the chmod below lands (R17).
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
         for _ in 0..16 {
             let mut nonce = [0u8; 8];
             getrandom::getrandom(&mut nonce)
                 .map_err(|_| io::Error::other("temp-dir nonce generation failed"))?;
             let candidate = base.join(format!("{prefix}-{:016x}", u64::from_le_bytes(nonce)));
-            // `create_dir` fails on any existing entry, including a planted
+            // `create` fails on any existing entry, including a planted
             // symlink, so success proves the path is fresh and ours.
-            match fs::create_dir(&candidate) {
+            match builder.create(&candidate) {
                 Ok(()) => {
-                    // `create_dir` modes are umask-filtered; force 0700
-                    // explicitly (R17).
+                    // mkdir(2) modes are still umask-filtered; force exactly
+                    // 0700 regardless of the inherited umask (R17).
                     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))?;
                     let meta = fs::symlink_metadata(&candidate)?;
                     if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
@@ -561,8 +613,14 @@ pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
     ErrorClass::Permanent
 }
 
+/// Ceiling on any retry delay extracted from provider output. The text is
+/// untrusted: without a cap, hostile "retry after 99999999999" phrasing
+/// would persist a durable historian backoff decades into the future.
+pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
+
 /// Extracts a retry delay in seconds from "retry after 45s"-style phrasing:
-/// the first digit run after the word "retry" (R18 retry metadata).
+/// the first digit run after the word "retry" (R18 retry metadata), clamped
+/// to [`MAX_RETRY_AFTER_SECS`] because the source text is untrusted.
 pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
     let lower = text.to_ascii_lowercase();
     let after = &lower[lower.find("retry")? + "retry".len()..];
@@ -571,7 +629,51 @@ pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
         .chars()
         .take_while(char::is_ascii_digit)
         .collect();
-    digits.parse().ok()
+    // An over-long digit run overflows u64::from_str; treat it as the cap
+    // rather than dropping the (real) retry signal entirely.
+    Some(digits.parse().map_or(MAX_RETRY_AFTER_SECS, |secs: u64| {
+        secs.min(MAX_RETRY_AFTER_SECS)
+    }))
+}
+
+/// First terminal wins; any second terminal is contradictory and fails the
+/// whole run (R18) — an error after a claimed success must never be
+/// reported as completed, and vice versa. Shared by both harness parsers so
+/// the contradictory-terminal spelling cannot drift.
+pub(crate) fn commit_terminal(
+    slot: &mut Option<BackendTerminal>,
+    terminal: BackendTerminal,
+    line_no: usize,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("contradictory terminal at line {line_no}"));
+    }
+    *slot = Some(terminal);
+    Ok(())
+}
+
+/// The shared post-run gate (KTD6): a transcript is trusted only after a
+/// clean end; the parsed events are emitted until the sink closes; every
+/// abnormal end yields the exact "transcript unavailable" detail so
+/// `finalize` maps it to one canonical failure.
+pub(crate) fn parse_clean_transcript(
+    result: &SubprocessResult,
+    events: &EventSink,
+    parse: impl FnOnce(&[u8]) -> Result<(Vec<BackendEvent>, BackendTerminal), String>,
+) -> Result<BackendTerminal, String> {
+    if !matches!(
+        result.end,
+        SubprocessEnd::Exited(0) | SubprocessEnd::DrainKilled
+    ) {
+        return Err("transcript unavailable".to_owned());
+    }
+    let (parsed_events, terminal) = parse(&result.stdout)?;
+    for event in parsed_events {
+        if events.emit(event) == SinkStatus::Closed {
+            break;
+        }
+    }
+    Ok(terminal)
 }
 
 /// The shared adapter tail (KTD6): abnormal ends win, then the parsed

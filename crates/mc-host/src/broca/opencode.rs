@@ -14,10 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 use super::backend::{
     BackendError, BackendEvent, BackendFuture, BackendRequest, BackendTerminal, ErrorClass,
-    EventSink, FinishReason, LlmExecutionBackend, SinkStatus,
+    EventSink, FinishReason, LlmExecutionBackend,
 };
+use super::config::MAX_OPENCODE_CONFIG_BYTES;
 use super::subprocess::{
-    self, EnvSnapshot, HarnessName, PrivateDir, SubprocessEnd, SubprocessLimits, SubprocessSpec,
+    self, commit_terminal, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
 };
 
 /// Environment guard the globally installed OpenCode plugin checks at the
@@ -121,6 +122,22 @@ async fn run_opencode(
     events: EventSink,
     cancel: CancellationToken,
 ) -> BackendTerminal {
+    let config_content = inline_config(&request);
+    // Linux caps one env string at MAX_ARG_STRLEN (~128 KiB); a config over
+    // that fails exec(2) with E2BIG, an opaque permanent spawn failure.
+    // Rejecting early names the real bound in the terminal instead.
+    if config_content.len() > MAX_OPENCODE_CONFIG_BYTES {
+        return BackendTerminal::Failed(BackendError {
+            class: ErrorClass::Permanent,
+            message: format!(
+                "opencode inline config is {} bytes, over the {} byte environment-string ceiling (system prompt too large)",
+                config_content.len(),
+                MAX_OPENCODE_CONFIG_BYTES
+            ),
+            retry_after_secs: None,
+            provider_code: None,
+        });
+    }
     let dir = match PrivateDir::create("mc-broca-opencode") {
         Ok(dir) => dir,
         Err(err) => return subprocess::spawn_failure(HarnessName::OpenCode, &err),
@@ -146,7 +163,7 @@ async fn run_opencode(
     ));
     child_env.push((
         OsString::from("OPENCODE_CONFIG_CONTENT"),
-        OsString::from(inline_config(&request)),
+        OsString::from(config_content),
     ));
     // Project config, `.opencode/` directories, and local rule files stay
     // unread (KTD7): hidden model work must not load project-controlled
@@ -180,24 +197,7 @@ async fn run_opencode(
 
     // A transcript is trusted only after a clean end; abnormal ends map to
     // one canonical failure in `finalize` regardless of what was printed.
-    let parsed = if matches!(
-        result.end,
-        SubprocessEnd::Exited(0) | SubprocessEnd::DrainKilled
-    ) {
-        match parse_opencode_transcript(&result.stdout) {
-            Ok((parsed_events, terminal)) => {
-                for event in parsed_events {
-                    if events.emit(event) == SinkStatus::Closed {
-                        break;
-                    }
-                }
-                Ok(terminal)
-            }
-            Err(detail) => Err(detail),
-        }
-    } else {
-        Err("transcript unavailable".to_owned())
-    };
+    let parsed = subprocess::parse_clean_transcript(&result, &events, parse_opencode_transcript);
     subprocess::finalize(
         HarnessName::OpenCode,
         &result,
@@ -281,21 +281,6 @@ fn parse_opencode_transcript(
     Ok((events, terminal))
 }
 
-/// First terminal wins; any second terminal is contradictory and fails the
-/// whole run (R18) — an error after a claimed success must never be
-/// reported as completed, and vice versa.
-fn commit_terminal(
-    slot: &mut Option<BackendTerminal>,
-    terminal: BackendTerminal,
-    line_no: usize,
-) -> Result<(), String> {
-    if slot.is_some() {
-        return Err(format!("contradictory terminal at line {line_no}"));
-    }
-    *slot = Some(terminal);
-    Ok(())
-}
-
 /// Maps one OpenCode `error` event to the classified failure the producer
 /// consumes (R18): class, retry delay, and the provider's error name as the
 /// diagnostic code. The message forwarded is the provider's bounded
@@ -333,7 +318,11 @@ fn error_terminal(value: &serde_json::Value) -> BackendTerminal {
     let retry_after_secs = data
         .and_then(|data| data.get("retryAfter"))
         .and_then(serde_json::Value::as_u64)
-        .or_else(|| subprocess::retry_after_secs_in_text(message));
+        .or_else(|| subprocess::retry_after_secs_in_text(message))
+        // The provider-supplied field is as untrusted as the message text:
+        // both are clamped so a hostile value cannot schedule a durable
+        // backoff decades out.
+        .map(|secs| secs.min(subprocess::MAX_RETRY_AFTER_SECS));
     BackendTerminal::Failed(BackendError {
         class,
         message: message.to_owned(),

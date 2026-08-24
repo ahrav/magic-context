@@ -16,10 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::backend::{
     BackendError, BackendEvent, BackendFuture, BackendRequest, BackendTerminal, EventSink,
-    FinishReason, LlmExecutionBackend, SinkStatus,
+    FinishReason, LlmExecutionBackend,
 };
 use super::subprocess::{
-    self, EnvSnapshot, HarnessName, PrivateDir, SubprocessEnd, SubprocessLimits, SubprocessSpec,
+    self, commit_terminal, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
 };
 
 /// The existing Magic Context Pi recursion guard
@@ -232,24 +232,7 @@ async fn run_pi(
         }
     };
 
-    let parsed = if matches!(
-        result.end,
-        SubprocessEnd::Exited(0) | SubprocessEnd::DrainKilled
-    ) {
-        match parse_pi_transcript(&result.stdout) {
-            Ok((parsed_events, terminal)) => {
-                for event in parsed_events {
-                    if events.emit(event) == SinkStatus::Closed {
-                        break;
-                    }
-                }
-                Ok(terminal)
-            }
-            Err(detail) => Err(detail),
-        }
-    } else {
-        Err("transcript unavailable".to_owned())
-    };
+    let parsed = subprocess::parse_clean_transcript(&result, &events, parse_pi_transcript);
     subprocess::finalize(HarnessName::Pi, &result, parsed, &limits, dir.cleanup())
 }
 
@@ -356,20 +339,6 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
         return Err("output ended without a terminal event".to_owned());
     };
     Ok((events, terminal))
-}
-
-/// First terminal wins; a second terminal is contradictory and fails the
-/// run (R18).
-fn commit_terminal(
-    slot: &mut Option<BackendTerminal>,
-    terminal: BackendTerminal,
-    line_no: usize,
-) -> Result<(), String> {
-    if slot.is_some() {
-        return Err(format!("contradictory terminal at line {line_no}"));
-    }
-    *slot = Some(terminal);
-    Ok(())
 }
 
 /// Concatenates the `{type: "text"}` blocks of one Pi assistant message —

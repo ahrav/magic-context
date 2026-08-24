@@ -515,6 +515,30 @@ impl Supervisor {
                 }),
             );
             run.notify.notify_waiters();
+        } else if !index.sessions.contains_key(key) {
+            // A terminal-cap eviction can remove the session between the
+            // terminal commit above and this re-lock; without a tombstone
+            // the completed delete would silently lose its resurrection
+            // guard (AE7). The evicted run's charges are already released,
+            // so the tombstone is charged fresh against the retained budget
+            // — and skipped silently when the budget refuses, because
+            // delete must never block (the worst case is only the original
+            // no-tombstone race). A key holding a different live run means
+            // a post-eviction send already won; that session is not ours to
+            // tombstone.
+            if let Some(charge) = self.inner.retained.try_charge(key.meta_bytes()) {
+                index.sessions.insert(
+                    key.clone(),
+                    SessionEntry::Tombstone(Tombstone {
+                        created_at: Instant::now(),
+                        _charge: charge,
+                    }),
+                );
+                // The fresh tombstone grew the retained-session count by
+                // one, so the cap is re-enforced here instead of waiting
+                // for the next terminal commit.
+                enforce_terminal_cap(&self.inner, &mut index, &run.run_id, &mut released);
+            }
         }
         Ok(())
     }

@@ -86,6 +86,14 @@ fn main() {
             provider_error_metadata_preserved,
         ),
         (
+            "hostile_retry_delays_are_clamped",
+            hostile_retry_delays_are_clamped,
+        ),
+        (
+            "opencode_oversized_inline_config_rejected_before_spawn",
+            opencode_oversized_inline_config_rejected_before_spawn,
+        ),
+        (
             "malformed_outputs_one_bounded_failure",
             malformed_outputs_one_bounded_failure,
         ),
@@ -672,6 +680,19 @@ fn assert_process_gone(pid: u32) {
     panic!("process {pid:?} is still alive");
 }
 
+/// Zero-retry leader probe: polling would also pass when the leader is
+/// reaped after the lifecycle call returned. A recycled PID would make the
+/// probe succeed spuriously.
+fn assert_leader_already_reaped(pid: u32) {
+    let Some(pid) = rustix::process::Pid::from_raw(i32::try_from(pid).expect("pid fits")) else {
+        return;
+    };
+    assert!(
+        rustix::process::test_kill_process(pid).is_err(),
+        "leader {pid:?} still observable after the lifecycle call returned"
+    );
+}
+
 fn read_pid(path: &Path) -> u32 {
     fs::read_to_string(path)
         .expect("pid file")
@@ -1120,6 +1141,7 @@ fn pi_broca_hook_owns_generation_controls() {
     let hook_path = scratch.path().join(PI_BROCA_EXTENSION_FILE);
     fs::write(&hook_path, PI_BROCA_EXTENSION_BYTES).expect("materialize hook");
     let driver_path = scratch.path().join("driver.mjs");
+    // The apply() chain below models the docs-specified handler semantics (returned value replaces the payload, undefined keeps it) from packages/pi-plugin/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md#before_provider_request. commentlint: allow(JUDGE)
     let driver = format!(
         r#"import hook from "file://{hook}";
 const handlers = [];
@@ -1366,6 +1388,72 @@ fn provider_error_metadata_preserved() {
     assert_eq!(failed(&terminal).class, ErrorClass::AuthRequired);
 }
 
+/// Provider-supplied retry delays clamp to 3600 seconds: the text and the
+/// `retryAfter` field are untrusted inputs.
+fn hostile_retry_delays_are_clamped() {
+    let (terminal, _) = run_opencode_transcript(&[serde_json::json!({
+        "type": "error",
+        "error": {"name": "APIError", "data": {"message": "Rate limit exceeded", "statusCode": 429, "retryAfter": 99_999_999_999u64, "isRetryable": true}},
+    })]);
+    assert_eq!(failed(&terminal).retry_after_secs, Some(3600));
+
+    let (terminal, _) = run_opencode_transcript(&[serde_json::json!({
+        "type": "error",
+        "error": {"name": "APIError", "data": {"message": "overloaded, retrying after 99999999999 seconds"}},
+    })]);
+    assert_eq!(failed(&terminal).retry_after_secs, Some(3600));
+
+    let (terminal, _) = run_pi_transcript(&pi_error_lines(
+        "provider overloaded, retry after 99999999999 seconds",
+    ));
+    assert_eq!(failed(&terminal).retry_after_secs, Some(3600));
+
+    // A sane delay under the ceiling passes through unclamped.
+    let (terminal, _) = run_pi_transcript(&pi_error_lines("overloaded, retry after 45 seconds"));
+    assert_eq!(failed(&terminal).retry_after_secs, Some(45));
+}
+
+/// A contract-valid send can carry a `system` prompt whose inline OpenCode
+/// config exceeds Linux's per-env-string MAX_ARG_STRLEN; the adapter must
+/// reject it with a structured message before any child exists.
+fn opencode_oversized_inline_config_rejected_before_spawn() {
+    let setup = RunSetup::new();
+    let transcript = write_transcript(
+        setup.scratch.path(),
+        "success.ndjson",
+        &opencode_success_lines("never reached"),
+    );
+    let backend = opencode_backend(
+        &setup,
+        &[(TRANSCRIPT_FILE_ENV, &transcript.to_string_lossy())],
+        Vec::new(),
+    );
+    let oversized_system = "s".repeat(mc_host::broca::config::MAX_OPENCODE_CONFIG_BYTES + 1);
+    let request = request(
+        setup.project.path(),
+        Harness::OpenCode,
+        "anthropic/claude-test",
+        Some(&oversized_system),
+    );
+    let (terminal, events) = execute(&backend, request);
+    let error = failed(&terminal);
+    assert_eq!(error.class, ErrorClass::Permanent);
+    assert!(
+        error.message.contains("environment-string ceiling"),
+        "{:?}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("ssss"),
+        "the oversized system prompt must not leak into the diagnostic"
+    );
+    assert!(events.is_empty());
+    assert!(
+        !setup.out.path().join("argv.json").exists(),
+        "the rejection must land before any child was spawned"
+    );
+}
+
 fn malformed_outputs_one_bounded_failure() {
     const LINE_SECRET: &str = "SECRET-LINE-SENTINEL";
 
@@ -1500,7 +1588,7 @@ fn output_flood_stopped_and_redacted() {
         assert!(!error.message.contains(FLOOD_SECRET));
         assert!(!error.message.contains(PROMPT_SENTINEL));
         // The leader is reaped before execute resolves.
-        assert_process_gone(read_pid(&setup.out.path().join("leader.pid")));
+        assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     }
 }
 
@@ -1531,7 +1619,7 @@ fn timeout_reaps_leader_and_grandchild() {
     let error = failed(&terminal);
     assert!(error.message.contains("timed out"), "{:?}", error.message);
     assert_eq!(error.class, ErrorClass::Transient);
-    assert_process_gone(read_pid(&setup.out.path().join("leader.pid")));
+    assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     assert_process_gone(read_pid(&setup.out.path().join("grandchild.pid")));
 }
 
@@ -1561,7 +1649,7 @@ fn cancel_reaps_group_with_sigterm_first() {
         run.await.expect("run task joins")
     });
     assert!(matches!(terminal, BackendTerminal::Failed(_)));
-    assert_process_gone(read_pid(&setup.out.path().join("leader.pid")));
+    assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     assert_process_gone(read_pid(&setup.out.path().join("grandchild.pid")));
     // The grandchild observed SIGTERM: the graceful signal went to the
     // whole group, not only the direct child (AE6).
@@ -1609,7 +1697,7 @@ fn sigkill_escalation_when_term_ignored() {
     );
     // The leader saw and ignored SIGTERM; only SIGKILL ended it.
     assert!(setup.out.path().join("got-sigterm").exists());
-    assert_process_gone(read_pid(&setup.out.path().join("leader.pid")));
+    assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
 }
 
 fn broca_send_request() -> (SendRequest, Vec<u8>) {
@@ -1652,7 +1740,7 @@ fn supervisor_delete_reaps_group() {
         // runner ties to a reaped leader (R10).
         supervisor.delete(&key).await.expect("delete succeeds");
     });
-    assert_process_gone(read_pid(&setup.out.path().join("leader.pid")));
+    assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     assert_process_gone(read_pid(&setup.out.path().join("grandchild.pid")));
 }
 
@@ -1680,7 +1768,7 @@ fn supervisor_shutdown_reaps_group() {
             .expect("grandchild readiness");
         supervisor.shutdown().await;
     });
-    assert_process_gone(read_pid(&setup.out.path().join("leader.pid")));
+    assert_leader_already_reaped(read_pid(&setup.out.path().join("leader.pid")));
     assert_process_gone(read_pid(&setup.out.path().join("grandchild.pid")));
 }
 

@@ -74,11 +74,14 @@ describe("Broca-child guard in the plugin entry", () => {
         }
     });
 
-    test("guard values other than \"1\" do not trip the guard", async () => {
-        process.env.MAGIC_CONTEXT_BROCA_CHILD = "0";
-        const server = await freshPluginServer();
-        await expect(server(minimalCtx())).rejects.toThrow(MIGRATION_SENTINEL);
-        expect(migrationSpy).toHaveBeenCalledTimes(1);
+    test('guard values other than "1" do not trip the guard', async () => {
+        for (const value of ["0", "true", ""]) {
+            process.env.MAGIC_CONTEXT_BROCA_CHILD = value;
+            migrationSpy.mockClear();
+            const server = await freshPluginServer();
+            await expect(server(minimalCtx())).rejects.toThrow(MIGRATION_SENTINEL);
+            expect(migrationSpy).toHaveBeenCalledTimes(1);
+        }
     });
 
     test("without the guard, ordinary startup proceeds into registration", async () => {

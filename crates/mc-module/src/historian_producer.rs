@@ -2273,7 +2273,14 @@ mod tests {
             .unwrap_err();
 
         assert!(send_outcome_unknown(&err), "got {err:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A successful `status` call would prove that `start` reconnected
+        // after the second dropped connection: the scripted server keeps
+        // accepting, so only a client parked on the dead connection fails.
+        let followup = client.status("run-x").await;
+        assert!(
+            followup.is_err(),
+            "the producer must not have reconnected after giving up: {followup:?}"
+        );
         assert_eq!(server.log.lock().await.send_bodies.len(), 2);
     }
 

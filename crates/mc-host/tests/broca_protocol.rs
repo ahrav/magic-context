@@ -445,6 +445,47 @@ async fn five_operation_round_trip_matches_the_consumed_wire_shapes() {
     assert_eq!(units[2]["unit"]["type"], "run_finished");
     assert_eq!(units[2]["unit"]["finish_reason"], "completed");
 
+    // The inserted JSON whitespace does not change the parsed request, but
+    // idempotency hashes exact request-body bytes, so this request
+    // conflicts rather than deduplicates.
+    let mut spaced_body = serde_json::to_vec(&serde_json::json!({
+        "method": "session.send",
+        "params": send_params("summarize", Some("role guidance"), "prov/model-a"),
+    }))
+    .expect("body serializes");
+    spaced_body.insert(1, b' ');
+    let corr = client.next_corr();
+    client
+        .send_frame(
+            support::raw_client::TY_REQUEST,
+            support::raw_client::FLAGS_INTERACTIVE,
+            command_ch,
+            command_ep,
+            corr,
+            &spaced_body,
+        )
+        .await
+        .expect("send byte-different body");
+    let (_skipped, conflict) = client
+        .frames_until_corr(corr, support::broca::BUDGET)
+        .await
+        .expect("conflict terminal");
+    assert_eq!(conflict.ty, support::raw_client::TY_ERROR);
+    assert_eq!(conflict.error_code(), "idempotency_conflict");
+
+    // A rejected idempotency conflict leaves later replays unchanged.
+    let corr = send_call(
+        &mut client,
+        sub_ch,
+        sub_ep,
+        "session.subscribe",
+        serde_json::json!({ "from": "start" }),
+    )
+    .await;
+    let (replayed_units, replay_terminal) = drain_subscribe(&mut client, corr).await;
+    assert_eq!(replay_terminal.ty, support::raw_client::TY_STREAM_END);
+    assert_eq!(replayed_units, units);
+
     let status = call(
         &mut client,
         command_ch,
