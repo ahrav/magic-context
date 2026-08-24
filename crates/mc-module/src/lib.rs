@@ -13571,6 +13571,7 @@ fn assemble_state_sync_seed(
     let mut note_nudge_anchors_present = false;
     let mut strip_seeds = Vec::new();
     let mut user_profile = None;
+    let mut memories_delete_ids: Option<Vec<i64>> = None;
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
@@ -13587,6 +13588,11 @@ fn assemble_state_sync_seed(
             user_profile
                 .get_or_insert_with(Vec::new)
                 .append(&mut profile);
+        }
+        if let Some(mut ids) = batch.memories_delete_ids.take() {
+            memories_delete_ids
+                .get_or_insert_with(Vec::new)
+                .append(&mut ids);
         }
     }
     compartments.append(&mut final_batch.compartments);
@@ -13618,8 +13624,16 @@ fn assemble_state_sync_seed(
         // Replace scope rides the completing batch and applies to the whole
         // assembled snapshot; earlier batches never carry it.
         memories_replace_projects: final_batch.memories_replace_projects,
-        // Explicit delete ids ride the completing batch with the replace scope.
-        memories_delete_ids: final_batch.memories_delete_ids,
+        // Delete ids page with the seed items; concatenate every page's list.
+        memories_delete_ids: match (memories_delete_ids, final_batch.memories_delete_ids) {
+            (None, None) => None,
+            (Some(ids), None) => Some(ids),
+            (None, Some(ids)) => Some(ids),
+            (Some(mut ids), Some(mut tail)) => {
+                ids.append(&mut tail);
+                Some(ids)
+            }
+        },
         memory_mutations,
         user_profile,
         workspace: final_batch.workspace,

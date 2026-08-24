@@ -1235,6 +1235,50 @@ describe("module incremental and paged assembly", () => {
         }
     });
 
+    it("pages explicit delete ids with the seed items instead of the completing batch", () => {
+        const watermarks = {
+            compartment_seq: 0,
+            memory_id: 0,
+            memory_mutation_id: 0,
+            m0_mutation_id: 0,
+            last_todo_state_hash: "",
+            project_memory_epoch: 0,
+            project_user_profile_version: 0,
+            reasoning_cleared_through_tag: 0,
+        };
+        // Enough ids that an unpaged completing-batch attachment would blow
+        // the 512 KiB page limit on its own.
+        const deleteIds = Array.from({ length: 90_000 }, (_, index) => 1_000_000_000 + index);
+        const pages = buildPagedModuleStateSyncPayloads({
+            moduleGeneration: 1,
+            expectedShadowSeq: 0,
+            seedId: "seed-delete-ids",
+            seedBoundaryId: null,
+            compartments: [],
+            memories: [],
+            memoryMutations: [],
+            memoriesDeleteIds: deleteIds,
+            userProfile: [],
+            workspace: null,
+            lastTodoState: "",
+            watermarks,
+        });
+        expect(pages.length).toBeGreaterThan(1);
+        expect(
+            pages.flatMap(
+                (page) => (page.params.memories_delete_ids as number[] | undefined) ?? [],
+            ),
+        ).toEqual(deleteIds);
+        for (const page of pages) {
+            expect(
+                moduleWireBodyBytes({
+                    method: "state_sync",
+                    params: page.params,
+                }),
+            ).toBeLessThanOrEqual(MODULE_PAGE_MAX_BYTES);
+        }
+    });
+
     it("does not read memory pools for a todo-only watermark change", async () => {
         const db = createContextDb();
         const sessionId = "ses-todo-only-sync";

@@ -494,6 +494,27 @@ describe("claim enforcement command workflow", () => {
         }
     });
 
+    test("a quoted artifact path with spaces evaluates as one token", async () => {
+        const db = migratedDb();
+        try {
+            const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
+            const seed = await approvedSeed(db, commandDeps, "enf-quoted-path");
+            mkdirSync(join(commandDeps.projectRoot, "integration suite"), { recursive: true });
+            writeFileSync(
+                join(commandDeps.projectRoot, "integration suite", "policy.test.ts"),
+                "test bytes",
+            );
+            const argsText = `${seed.memoryId} "integration suite/policy.test.ts"`;
+            const first = await executeClaimEnforceCommand(commandDeps, argsText);
+            expect(first.level).toBe("warning");
+            const second = await executeClaimEnforceCommand(commandDeps, argsText);
+            expect(second.level).toBe("info");
+            expect(second.text).toContain("ENFORCED");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("artifact revocation removes ENFORCED and a later re-approval cannot restore it", async () => {
         const db = migratedDb();
         try {

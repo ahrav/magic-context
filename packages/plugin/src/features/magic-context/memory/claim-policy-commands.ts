@@ -356,7 +356,22 @@ const ENFORCE_USAGE = [
     "- `/ctx-enforce <memory-id> <artifact-path>` — bind a passing in-project test artifact",
     "- `/ctx-enforce <memory-id> <artifact-path> --kind test|policy|config`",
     "- `/ctx-enforce <memory-id> --revoke` — revoke every valid enforcement artifact",
+    'Quote artifact paths that contain spaces: `/ctx-enforce 12 "tests/integration suite/policy.test.ts"`',
 ].join("\n");
+
+/**
+ * Split command arguments on whitespace while honoring double- and
+ * single-quoted segments, so an artifact path containing spaces survives as
+ * one token. Quotes are removed from the token; there is no escape syntax.
+ */
+function tokenizeCommandArgs(text: string): string[] {
+    const tokens: string[] = [];
+    const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
+    for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
+        tokens.push(match[1] ?? match[2] ?? match[3]);
+    }
+    return tokens;
+}
 
 /** ponytail: the default evaluator only knows `bun test`; policy/config
  * artifact evaluators plug in through `deps.evaluateArtifact` when needed.
@@ -452,7 +467,7 @@ export async function executeClaimEnforceCommand(
     deps: ClaimCommandDeps,
     argsText: string,
 ): Promise<ClaimCommandResult> {
-    const parts = argsText.trim().split(/\s+/).filter(Boolean);
+    const parts = tokenizeCommandArgs(argsText);
     // Artifact revocation is the compromise-response path (KTD6): a revoked
     // approval alone only lowers maturity until the next approval, because
     // supportedMaturity would reuse the still-valid artifact and restore

@@ -984,6 +984,7 @@ type SeedItem =
     | { kind: "compartment"; value: unknown }
     | { kind: "memory"; value: unknown }
     | { kind: "memory_mutation"; value: unknown }
+    | { kind: "memory_delete_id"; value: number }
     | { kind: "drop_seed"; value: ModuleDropSeed }
     | { kind: "pending_agent_drop"; value: ModulePendingDropSeed }
     | { kind: "note_nudge_anchor"; value: ModuleNoteNudgeAnchorSeed }
@@ -1109,8 +1110,10 @@ export function buildPagedModuleStateSyncPayloads(args: {
     /** Full-snapshot replace scope; rides the completing batch so the module
      * prunes after assembling every page's memories. */
     memoriesReplaceProjects?: string[];
-    /** Explicit prune ids for policy-hidden rows the replace scope cannot
-     * name (foreign workspace members); rides the completing batch. */
+    /** Explicit prune ids for rows the replace scope cannot name (foreign
+     * workspace members) or that left the base query (archived, expired).
+     * Paged with the seed items and concatenated by the reassembler, so a
+     * large legacy prune cannot overflow the completing page. */
     memoriesDeleteIds?: number[];
 }): ModuleStateSyncPayload[] {
     const items: SeedItem[] = [
@@ -1121,6 +1124,13 @@ export function buildPagedModuleStateSyncPayloads(args: {
         ...(args.omitAuthorityMemorySections
             ? []
             : args.memoryMutations.map((value) => ({ kind: "memory_mutation", value }) as const)),
+        // Delete ids page with the other seed items: a large legacy project's
+        // hidden-row prune can exceed a single page's budget on its own.
+        ...(args.omitAuthorityMemorySections
+            ? []
+            : (args.memoriesDeleteIds ?? []).map(
+                  (value) => ({ kind: "memory_delete_id", value }) as const,
+              )),
         ...(args.dropSeeds ?? []).map((value) => ({ kind: "drop_seed", value }) as const),
         ...(args.pendingDropSeeds ?? []).map(
             (value) => ({ kind: "pending_agent_drop", value }) as const,
@@ -1139,6 +1149,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         compartments: unknown[];
         memories: unknown[];
         memoryMutations: unknown[];
+        memoriesDeleteIds: number[];
         dropSeeds: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
@@ -1151,6 +1162,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         compartments: [],
         memories: [],
         memoryMutations: [],
+        memoriesDeleteIds: [],
         dropSeeds: [],
         pendingAgentDrops: [],
         noteNudgeAnchors: [],
@@ -1163,6 +1175,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         if (item.kind === "compartment") batch.compartments.push(item.value);
         else if (item.kind === "memory") batch.memories.push(item.value);
         else if (item.kind === "memory_mutation") batch.memoryMutations.push(item.value);
+        else if (item.kind === "memory_delete_id") batch.memoriesDeleteIds.push(item.value);
         else if (item.kind === "drop_seed") batch.dropSeeds.push(item.value);
         else if (item.kind === "pending_agent_drop") batch.pendingAgentDrops.push(item.value);
         else if (item.kind === "note_nudge_anchor") batch.noteNudgeAnchors.push(item.value);
@@ -1178,6 +1191,7 @@ export function buildPagedModuleStateSyncPayloads(args: {
         compartments: unknown[];
         memories: unknown[];
         memoryMutations: unknown[];
+        memoriesDeleteIds: number[];
         dropSeeds?: ModuleDropSeed[];
         pendingAgentDrops: ModulePendingDropSeed[];
         noteNudgeAnchors: ModuleNoteNudgeAnchorSeed[];
@@ -1208,6 +1222,9 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       memories: input.memories,
                       memory_mutations: input.memoryMutations,
                   }),
+            ...(args.omitAuthorityMemorySections || input.memoriesDeleteIds.length === 0
+                ? {}
+                : { memories_delete_ids: input.memoriesDeleteIds }),
             user_profile: input.userProfile,
             ...(args.dropSeeds !== undefined ? { drop_seeds: input.dropSeeds } : {}),
             ...(args.pendingDropSeeds !== undefined
@@ -1231,9 +1248,6 @@ export function buildPagedModuleStateSyncPayloads(args: {
                       ...(args.memoriesReplaceProjects !== undefined &&
                       !args.omitAuthorityMemorySections
                           ? { memories_replace_projects: args.memoriesReplaceProjects }
-                          : {}),
-                      ...(args.memoriesDeleteIds !== undefined && !args.omitAuthorityMemorySections
-                          ? { memories_delete_ids: args.memoriesDeleteIds }
                           : {}),
                       ...(args.dropSeedSkipped !== undefined
                           ? { drop_seed_skipped: args.dropSeedSkipped }
