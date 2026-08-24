@@ -5,7 +5,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
-import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "@magic-context/core/config/schema/magic-context";
+import {
+    DEFAULT_LOCAL_EMBEDDING_MODEL,
+    RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL,
+} from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
@@ -473,6 +476,14 @@ async function checkEmbeddingConfig(
     }
 
     if (provider === undefined || provider === "local") {
+        const pinnedModel = typeof embedding?.model === "string" ? embedding.model.trim() : "";
+        if (pinnedModel === RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL) {
+            log.warn(
+                `Config pins the retired default embedding model (${RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL}). ` +
+                    `It keeps working, but the current default (${DEFAULT_LOCAL_EMBEDDING_MODEL}) ranks better on retrieval. ` +
+                    `Remove the embedding.model line (or rerun setup) to adopt it; stored content re-embeds automatically.`,
+            );
+        }
         return checkLocalEmbeddingRuntimeForDoctor();
     }
 

@@ -25,6 +25,13 @@ export const DEFAULT_HISTORY_BUDGET_PERCENTAGE = 0.15;
 // the model id in embedding-local.ts, so the default stays correct end to end.
 export const DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
 
+/** The previous local default. Setup wizards used to write it as an explicit
+ *  pin, so configs carrying this exact value are almost always echoing the
+ *  then-default rather than expressing a preference. Doctor surfaces those pins
+ *  with the remedy; nothing rewrites a user's config automatically, because the
+ *  file carries no provenance and a deliberate pin must keep working. */
+export const RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+
 // Re-exported from the (DB-free) task registry so the schema and the runtime
 // scheduler share ONE source of truth for task names. DreamingTask remains the
 // agentic tasks (those driven by buildDreamTaskPrompt); CANONICAL_DREAM_TASKS
