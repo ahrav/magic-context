@@ -508,6 +508,16 @@ async fn run_conn(
                     result.closed_early = true;
                     break;
                 }
+                // Goodbye for this route (or the generation) is an
+                // orderly teardown; the run resolves its pending work as
+                // connection loss and the exit gates fail it.
+                if frame.ty == raw_client::TY_GOODBYE
+                    && ((frame.channel, frame.epoch) == (channel, epoch)
+                        || (frame.channel == 0 && frame.epoch == 0))
+                {
+                    result.closed_early = true;
+                    break;
+                }
                 continue;
             }
             result.protocol_violation = Some(format!("server-illegal frame type {}", frame.ty));
@@ -525,15 +535,28 @@ async fn run_conn(
         inflight.add_permits(1);
         resolved += 1;
         let measured = in_window(sched, issue);
+        // Records a validation failure: warmup suppresses recording,
+        // never validation, so a pre-warmup violation fails the run as a
+        // protocol regression instead of hiding behind the boundary.
+        macro_rules! record_failure {
+            ($outcome:expr, $label:expr) => {
+                if measured {
+                    result.outcomes.record($outcome);
+                } else {
+                    result.protocol_violation =
+                        Some(format!("warmup response failed validation ({})", $label));
+                    result.closed_early = true;
+                    break;
+                }
+            };
+        }
         // Route and wire identity: the pending identity on the wire is
         // (channel, epoch, corr), so a frame that resolves an
         // outstanding correlation on the wrong channel, epoch, or wire
         // version is a routing or protocol failure, never a success.
         if (frame.channel, frame.epoch) != (channel, epoch) || frame.ver != raw_client::WIRE_VERSION
         {
-            if measured {
-                result.outcomes.record(Outcome::UnexpectedFrame);
-            }
+            record_failure!(Outcome::UnexpectedFrame, "route or version mismatch");
             if done_wait && resolved >= sent_count.load(Ordering::Acquire) {
                 break;
             }
@@ -545,20 +568,14 @@ async fn run_conn(
                 // (non-binary, last) alongside the body contract; a flag
                 // regression is a wire failure, not a body mismatch.
                 if frame.flags != raw_client::FLAGS_RESPONSE_TEXT_LAST {
-                    if measured {
-                        result.outcomes.record(Outcome::UnexpectedFrame);
-                    }
+                    record_failure!(Outcome::UnexpectedFrame, "response flags");
                 } else if expect_fixture && body_buf.as_slice() != FIXTURE_BODY {
-                    if measured {
-                        result.outcomes.record(Outcome::BodyMismatch);
-                    }
+                    record_failure!(Outcome::BodyMismatch, "fixture body");
                 } else if !expect_fixture && body_buf.len() != request_body_len {
                     // The raw echo must return the request's exact
                     // length; a truncated or empty body with valid flags
                     // is not a successful echo.
-                    if measured {
-                        result.outcomes.record(Outcome::BodyMismatch);
-                    }
+                    record_failure!(Outcome::BodyMismatch, "raw echo length");
                 } else if measured {
                     result.outcomes.record(Outcome::Success);
                     result.issue_latencies_ns.push(now_ns.saturating_sub(issue));
@@ -569,19 +586,15 @@ async fn run_conn(
                 }
             }
             TY_ERROR => {
-                if measured {
-                    result.outcomes.record(Outcome::ProtocolError);
-                }
                 let code = serde_json::from_slice::<serde_json::Value>(&body_buf)
                     .ok()
                     .and_then(|v| v["code"].as_str().map(str::to_owned))
                     .unwrap_or_else(|| "unparsable".to_owned());
                 *result.error_codes.entry(code).or_default() += 1;
+                record_failure!(Outcome::ProtocolError, "error terminal");
             }
             _ => {
-                if measured {
-                    result.outcomes.record(Outcome::UnexpectedFrame);
-                }
+                record_failure!(Outcome::UnexpectedFrame, "stream terminal");
             }
         }
         if done_wait && resolved >= sent_count.load(Ordering::Acquire) {

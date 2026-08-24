@@ -312,6 +312,16 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                     if let Some(violation) = raw_client::connection_frame_violation(&decoded) {
                         return Err(format!("wire-protocol violation: {violation}"));
                     }
+                    // Goodbye for this route (or the generation) is an
+                    // orderly teardown: the in-flight operation resolves
+                    // as connection loss and the truncation gate fails
+                    // the attempt.
+                    if goodbye_retires(&decoded, (channel, epoch)) {
+                        if measured {
+                            outcomes.record(Outcome::PeerClosed);
+                        }
+                        return finish_serial(hist, outcomes, measured_scheduled, window_start);
+                    }
                     continue;
                 }
                 return Err(format!(
@@ -330,10 +340,17 @@ async fn run_serial_inner(publication: &Path, cfg: &SerialConfig) -> Result<Seri
                 ));
             }
             let rtt_ns = issue.elapsed().as_nanos() as u64;
+            // Warmup suppresses recording, never validation: a startup
+            // protocol regression must fail the attempt, not hide behind
+            // the warmup boundary.
+            let outcome = classify_terminal(&decoded, (channel, epoch), &body);
             if !measured {
+                if outcome != Outcome::Success {
+                    return Err(format!("warmup response failed validation ({outcome:?})"));
+                }
                 break;
             }
-            match classify_terminal(&decoded, (channel, epoch), &body) {
+            match outcome {
                 Outcome::Success => record(&mut hist, &mut outcomes, rtt_ns),
                 other => outcomes.record(other),
             }
@@ -619,6 +636,16 @@ fn is_connection_frame(ty: u8) -> bool {
     )
 }
 
+/// True when a well-shaped goodbye closes THIS benchmark connection: the
+/// current route's teardown or the 0/0 generation close. Ignoring either
+/// would let a torn-down connection's straggling responses finalize
+/// successful evidence. A goodbye naming a different route is a stale
+/// idempotent no-op per the contract and stays skippable.
+fn goodbye_retires(frame: &raw_client::RawFrame, route: (u16, u32)) -> bool {
+    frame.ty == raw_client::TY_GOODBYE
+        && ((frame.channel, frame.epoch) == route || (frame.channel == 0 && frame.epoch == 0))
+}
+
 /// How one open-loop receive failed: transport failures resolve pending
 /// requests as connection loss, while a wire-protocol violation from a
 /// live host fails the whole attempt with its own reason.
@@ -651,6 +678,13 @@ impl OpenLoopState {
                 if let Some(violation) = raw_client::connection_frame_violation(&frame) {
                     return Err(ConsumeFailure::Protocol(violation));
                 }
+                // Goodbye for this route (or the generation) is an
+                // orderly teardown: pending requests resolve as
+                // connection loss and the truncation gate fails the
+                // attempt.
+                if goodbye_retires(&frame, self.route) {
+                    return Err(ConsumeFailure::Transport);
+                }
                 return Ok(());
             }
             return Err(ConsumeFailure::Protocol(format!(
@@ -669,10 +703,19 @@ impl OpenLoopState {
                 frame.corr
             )));
         };
+        // Warmup suppresses recording, never validation: a startup
+        // protocol regression must fail the attempt, not hide behind the
+        // warmup boundary.
+        let outcome = classify_terminal(&frame, self.route, &self.body);
         if scheduled_ns < self.warmup_ns {
+            if outcome != Outcome::Success {
+                return Err(ConsumeFailure::Protocol(format!(
+                    "warmup response failed validation ({outcome:?})"
+                )));
+            }
             return Ok(());
         }
-        match classify_terminal(&frame, self.route, &self.body) {
+        match outcome {
             Outcome::Success => {
                 // sched-to-completion spans both the lag and the
                 // issue-to-completion intervals, so it is the largest of
@@ -849,6 +892,18 @@ async fn run_throughput_inner(
                 if let Some(violation) = raw_client::connection_frame_violation(&decoded) {
                     return Err(format!("wire-protocol violation: {violation}"));
                 }
+                // Goodbye for this route (or the generation) is an
+                // orderly teardown: outstanding measured requests
+                // resolve as connection loss and the truncation gate
+                // fails the attempt.
+                if goodbye_retires(&decoded, (channel, epoch)) {
+                    for c in outstanding.drain() {
+                        if measured_corr(first_measured, c) {
+                            outcomes.record(Outcome::PeerClosed);
+                        }
+                    }
+                    break;
+                }
                 continue;
             }
             return Err(format!(
@@ -867,8 +922,14 @@ async fn run_throughput_inner(
                 decoded.corr
             ));
         }
+        // Warmup suppresses recording, never validation: a startup
+        // protocol regression must fail the attempt, not hide behind the
+        // warmup boundary.
+        let outcome = classify_terminal(&decoded, (channel, epoch), &body);
         if measured_corr(first_measured, decoded.corr) {
-            outcomes.record(classify_terminal(&decoded, (channel, epoch), &body));
+            outcomes.record(outcome);
+        } else if outcome != Outcome::Success {
+            return Err(format!("warmup response failed validation ({outcome:?})"));
         }
         let elapsed = start.elapsed();
         if !measuring && elapsed >= cfg.warmup {
@@ -976,6 +1037,13 @@ async fn run_throughput_inner(
                     } else if let Some(violation) = raw_client::connection_frame_violation(&decoded)
                     {
                         return Err(format!("wire-protocol violation: {violation}"));
+                    } else if goodbye_retires(&decoded, (channel, epoch)) {
+                        // An orderly teardown mid-drain: the outstanding
+                        // responses are never coming.
+                        return Err(format!(
+                            "connection closed by goodbye with {} in-flight response(s) undrained",
+                            outstanding.len()
+                        ));
                     }
                     if is_request_terminal(decoded.ty) {
                         // Every drained response passes the same terminal

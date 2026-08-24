@@ -982,7 +982,26 @@ fn run_record_plan() -> i32 {
             let path = out.join("run-plan.json");
             let mut text = serde_json::to_string_pretty(&plan).expect("serialize plan");
             text.push('\n');
-            if let Err(err) = std::fs::write(&path, text) {
+            // Create-new semantics: rewriting an existing plan (say with
+            // a smaller block count after losing a block) would let
+            // aggregation accept the surviving subset, defeating the
+            // completeness guarantee the plan provides.
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            let mut file = match file {
+                Ok(file) => file,
+                Err(err) => {
+                    eprintln!(
+                        "{}: refusing to overwrite the run plan: {err}",
+                        path.display()
+                    );
+                    return 1;
+                }
+            };
+            use std::io::Write;
+            if let Err(err) = file.write_all(text.as_bytes()) {
                 eprintln!("{}: {err}", path.display());
                 return 1;
             }
