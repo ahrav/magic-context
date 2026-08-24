@@ -3457,7 +3457,54 @@ export const MIGRATIONS: Migration[] = [
                     resets.push("cached_m0_project_memory_epoch = NULL");
                 }
                 if (columns.has("auto_search_hint_decisions")) {
-                    resets.push("auto_search_hint_decisions = '[]'");
+                    // Convert instead of clear: each pre-policy hint decision
+                    // becomes a no-hint tombstone that PRESERVES its message
+                    // id. The native store may hold an already-seeded copy of
+                    // the hint text, its seed apply never deletes omitted
+                    // rows, and the seed lane derives block ids from these
+                    // decisions — an emptied list would leave pre-policy hint
+                    // text (potentially unverified fragments) overlaying
+                    // native transforms indefinitely, while a tombstone seeds
+                    // the empty no-result shape over it.
+                    const hintRows = db
+                        .prepare(
+                            `SELECT session_id AS sessionId,
+                                    auto_search_hint_decisions AS decisions
+                               FROM session_meta
+                              WHERE auto_search_hint_decisions IS NOT NULL
+                                AND auto_search_hint_decisions != ''
+                                AND auto_search_hint_decisions != '[]'`,
+                        )
+                        .all() as Array<{ sessionId: string; decisions: string }>;
+                    const updateHints = db.prepare(
+                        "UPDATE session_meta SET auto_search_hint_decisions = ? WHERE session_id = ?",
+                    );
+                    for (const row of hintRows) {
+                        let parsed: unknown = null;
+                        try {
+                            parsed = JSON.parse(row.decisions);
+                        } catch {
+                            parsed = null;
+                        }
+                        const tombstones = Array.isArray(parsed)
+                            ? parsed.flatMap((value) => {
+                                  const messageId =
+                                      value !== null && typeof value === "object"
+                                          ? (value as { messageId?: unknown }).messageId
+                                          : undefined;
+                                  return typeof messageId === "string" && messageId.length > 0
+                                      ? [
+                                            {
+                                                messageId,
+                                                decision: "no-hint",
+                                                reason: "policy-reset",
+                                            },
+                                        ]
+                                      : [];
+                              })
+                            : [];
+                        updateHints.run(JSON.stringify(tombstones), row.sessionId);
+                    }
                 }
                 if (resets.length > 0) {
                     // Interpolation is a compile-time column allowlist, not caller input.

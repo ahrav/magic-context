@@ -225,6 +225,14 @@ describe("migration v86: claim trust policy authority", () => {
                     cached_m0_project_memory_epoch, auto_search_hint_decisions)
                  VALUES ('ses_cache', X'01', X'02', 3, '[{"stale":true}]')`,
             ).run();
+            // A pre-policy hint decision converts to a no-hint tombstone that
+            // keeps its message id: the native store may hold an
+            // already-seeded copy of the hint text, and only a decision with
+            // that id can seed the empty no-result shape over it.
+            db.prepare(
+                `INSERT INTO session_meta (session_id, auto_search_hint_decisions)
+                 VALUES ('ses_hint', '[{"messageId":"msg-1","decision":"hint","text":"pre-policy fragment"},{"messageId":"msg-2","decision":"no-hint","reason":"empty"}]')`,
+            ).run();
             runMigrations(db);
             expect(
                 db
@@ -243,6 +251,15 @@ describe("migration v86: claim trust policy authority", () => {
                     )
                     .get(),
             ).toEqual({ m0: null, m1: null, epoch: null, hints: "[]" });
+            const converted = db
+                .prepare(
+                    "SELECT auto_search_hint_decisions AS hints FROM session_meta WHERE session_id = 'ses_hint'",
+                )
+                .get() as { hints: string };
+            expect(JSON.parse(converted.hints)).toEqual([
+                { messageId: "msg-1", decision: "no-hint", reason: "policy-reset" },
+                { messageId: "msg-2", decision: "no-hint", reason: "policy-reset" },
+            ]);
         } finally {
             closeQuietly(db);
         }

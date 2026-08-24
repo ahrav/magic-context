@@ -85,7 +85,8 @@ export type AutoSearchHintNoHintReason =
     | "empty"
     | "error"
     | "stacked"
-    | "too-short";
+    | "too-short"
+    | "policy-reset";
 
 export type AutoSearchHintDecision =
     | {
@@ -203,6 +204,9 @@ const AUTO_SEARCH_NO_HINT_REASONS = new Set<string>([
     "error",
     "stacked",
     "too-short",
+    // v86 migration tombstone: a pre-policy hint decision converted to
+    // no-hint so its block id can still revoke an already-seeded native hint.
+    "policy-reset",
 ]);
 
 function isPersistedUsageRow(row: unknown): row is PersistedUsageRow {

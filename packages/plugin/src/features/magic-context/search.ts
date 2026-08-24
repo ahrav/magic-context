@@ -23,12 +23,14 @@ import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./me
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
 import {
     decideMemoryPolicy,
+    exactMemoryContentDigests,
     filterMemoriesByPolicy,
     hasClaimEffectivePolicy,
     type MemoryPolicyRow,
     type MemoryPolicySurface,
     readMemoryPolicyRows,
 } from "./memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "./memory/storage-claims";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
@@ -928,33 +930,28 @@ async function searchMemories(args: {
     // The recheck must bind to the LOADED bytes, not just the id: a rewrite
     // committed during the scoring yields makes the unchanged memory id
     // resolve through the new revision, whose eligibility would otherwise
-    // admit the superseded content this lane loaded. Results whose live
-    // hash no longer matches the loaded hash are dropped.
-    const loadedHashById = new Map(memories.map((memory) => [memory.id, memory.normalizedHash]));
-    const currentHashById =
-        hasPolicy && merged.length > 0
-            ? new Map(
-                  (
-                      args.db
-                          .prepare(
-                              // Interpolation is a compile-time placeholder list, not caller input.
-                              // pi-lens-ignore: sql-injection
-                              `SELECT id, normalized_hash AS hash FROM memories WHERE id IN (${merged.map(() => "?").join(", ")})`,
-                          )
-                          .all(...merged.map((result) => result.memoryId)) as Array<{
-                          id: number;
-                          hash: string;
-                      }>
-                  ).map((row) => [row.id, row.hash] as const),
-              )
-            : new Map<number, string>();
+    // admit the superseded content this lane loaded. Exact SHA-256 digests —
+    // the normalized hash lowercases and collapses whitespace, so it cannot
+    // tell a rewritten revision from its predecessor. Only the merged
+    // results' rows are hashed (bounded by the lane limit).
+    const loadedMemoriesById = new Map(memories.map((memory) => [memory.id, memory]));
+    const currentHashById = hasPolicy
+        ? exactMemoryContentDigests(
+              args.db,
+              merged.map((result) => result.memoryId),
+          )
+        : new Map<number, string>();
     const rechecked: MemorySearchResult[] = [];
     for (const result of merged) {
         if (!hasPolicy) {
             rechecked.push(result);
             continue;
         }
-        if (currentHashById.get(result.memoryId) !== loadedHashById.get(result.memoryId)) {
+        const loaded = loadedMemoriesById.get(result.memoryId);
+        if (
+            loaded === undefined ||
+            currentHashById.get(result.memoryId) !== sha256Utf8Hex(loaded.content)
+        ) {
             continue;
         }
         const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);
