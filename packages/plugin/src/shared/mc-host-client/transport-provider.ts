@@ -21,7 +21,7 @@ import {
     type InboundFrame,
     type SetupFrameChannel,
 } from "./frame-channel";
-import { type FrameType, validateHeader } from "./protocol";
+import { type FrameType, MAX_CORRELATION, validateHeader } from "./protocol";
 import {
     checkOpaqueSerialized,
     encodeNegotiateRequest,
@@ -281,6 +281,29 @@ export function sanitizedCandidateFactory(
                         !(providerBody instanceof Uint8Array)
                     ) {
                         throw new Error("malformed provider frame");
+                    }
+                    // Wire widths: `validateHeader` checks flag semantics and
+                    // identity rules but NOT field ranges (those live in
+                    // `encodeHeader`, which an inbound frame never reaches),
+                    // so an out-of-range value like `flags: 256` would pass
+                    // semantic validation and dispatch.
+                    if (
+                        len < 0 ||
+                        len > 0xffff_ffff ||
+                        ver < 0 ||
+                        ver > 0xff ||
+                        ty < 0 ||
+                        ty > 0xff ||
+                        flags < 0 ||
+                        flags > 0xff ||
+                        channelId < 0 ||
+                        channelId > 0xffff ||
+                        epoch < 0 ||
+                        epoch > 0xffff_ffff ||
+                        corr < 0n ||
+                        corr > MAX_CORRELATION
+                    ) {
+                        throw new Error("out-of-range provider header field");
                     }
                     if (providerBody.length > args.maxBodyLen) {
                         throw new Error("oversize provider frame");

@@ -413,10 +413,42 @@ impl std::io::Write for CappedCounter {
     }
 }
 
+/// Iterative depth bound with the §7.1 counting (1 at the subtree root, +1
+/// per nested container). Runs BEFORE any recursive traversal: a
+/// provider-constructed value carries no parser recursion cap the way a
+/// decoded client value does, so a deeply nested descriptor would otherwise
+/// exhaust the connection task's stack inside `serde_json` or `value_depth`
+/// before the bound could reject it.
+fn exceeds_opaque_depth(value: &serde_json::Value, limit: usize) -> bool {
+    let mut pending = vec![(value, 1usize)];
+    while let Some((node, depth)) = pending.pop() {
+        let children: Box<dyn Iterator<Item = &serde_json::Value>> = match node {
+            serde_json::Value::Array(items) => Box::new(items.iter()),
+            serde_json::Value::Object(map) => Box::new(map.values()),
+            _ => continue,
+        };
+        if depth > limit {
+            return true;
+        }
+        for child in children {
+            pending.push((child, depth + 1));
+        }
+    }
+    false
+}
+
 fn check_opaque(value: &serde_json::Value, path: &str) -> Result<(), NegotiationError> {
     if !value.is_object() {
         return Err(NegotiationError::new(
             NegotiationErrorCode::InvalidType,
+            path,
+        ));
+    }
+    // Depth first, iteratively: bounds the recursion depth every later
+    // traversal (serialization below, and any recursive walk) will reach.
+    if exceeds_opaque_depth(value, MAX_OPAQUE_DEPTH) {
+        return Err(NegotiationError::new(
+            NegotiationErrorCode::OpaqueTooDeep,
             path,
         ));
     }
@@ -427,12 +459,6 @@ fn check_opaque(value: &serde_json::Value, path: &str) -> Result<(), Negotiation
     if serde_json::to_writer(&mut counter, value).is_err() {
         return Err(NegotiationError::new(
             NegotiationErrorCode::OpaqueTooLarge,
-            path,
-        ));
-    }
-    if crate::control::value_depth(value) > MAX_OPAQUE_DEPTH {
-        return Err(NegotiationError::new(
-            NegotiationErrorCode::OpaqueTooDeep,
             path,
         ));
     }
