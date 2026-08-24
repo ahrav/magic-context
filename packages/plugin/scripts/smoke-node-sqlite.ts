@@ -23,10 +23,16 @@ import {
     clearMemoryClaimFailpoints,
     createMemoryWithClaimsInCurrentTransaction,
     getCurrentMemoryClaimByLegacyMemoryId,
+    readMemoryClaimLink,
     runInMemoryClaimsWriteTransaction,
     setMemoryClaimFailpoint,
     updateMemoryContentWithClaimsInCurrentTransaction,
 } from "../src/features/magic-context/memory/storage-memory-claims.ts";
+import {
+    readPolicySubject,
+    recordApprovalActionInCurrentTransaction,
+} from "../src/features/magic-context/memory/storage-claim-policy.ts";
+import { createClaimPolicySchema } from "../src/features/magic-context/storage-claim-policy-schema.ts";
 import { readMemoryProjectionRow } from "../src/features/magic-context/memory/storage-memory-projection.ts";
 import { createClaimsAndEvidenceSchema } from "../src/features/magic-context/storage-claims-schema.ts";
 import {
@@ -314,6 +320,12 @@ try {
     `);
     createClaimsAndEvidenceSchema(kernelDb);
     createMemoryClaimsCompatSchema(kernelDb);
+    addObservationSourceTrustClassColumn(kernelDb);
+    createClaimApplicabilitySchema(kernelDb);
+    createClaimPolicySchema(kernelDb);
+    kernelDb.exec(
+        "CREATE TABLE IF NOT EXISTS schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    );
     installMemoryClaimsWriteGuards(kernelDb);
 
     let guardBlocked = false;
@@ -405,6 +417,68 @@ try {
             projectionRow?.status === currentClaim?.state,
         JSON.stringify({ projectionRow, currentClaim }),
     );
+    // v86 claim trust policy under node:sqlite: subject companion rows,
+    // append-only ledger guards, approval flow, and effective projection.
+    {
+        const revisionId = kernelCreated.result.revisionId as number;
+        const subject = readPolicySubject(kernelDb, revisionId);
+        check(
+            "v86 revision writers create a frozen policy subject",
+            subject != null && subject.claimKind === "unknown",
+            JSON.stringify(subject),
+        );
+        const policyRow = kernelDb
+            .prepare(
+                "SELECT effective_maturity AS maturity, auto_eligible AS auto FROM claim_effective_policy WHERE revision_id = ?",
+            )
+            .get(revisionId) as { maturity: string; auto: number } | undefined;
+        check(
+            "v86 effective projection materializes CANDIDATE for an unverified row",
+            policyRow?.maturity === "CANDIDATE" && policyRow?.auto === 0,
+            JSON.stringify(policyRow),
+        );
+        let updateRejected = false;
+        try {
+            kernelDb
+                .prepare(
+                    "UPDATE claim_revision_policy_subjects SET claim_kind = 'descriptive' WHERE revision_id = ?",
+                )
+                .run(revisionId);
+        } catch {
+            updateRejected = true;
+        }
+        check("v86 policy subjects reject UPDATE at the database boundary", updateRejected);
+        const approval = runInMemoryClaimsWriteTransaction(kernelDb, () =>
+            recordApprovalActionInCurrentTransaction(kernelDb, {
+                revisionId,
+                projectId: (readMemoryClaimLink(kernelDb, kernelCreated.result.memoryId) as {
+                    projectId: number;
+                }).projectId,
+                action: "approve",
+                host: "opencode",
+                sessionId: "node-smoke",
+                userCommandEvent: "evt",
+                commandIdentity: "node-smoke-approve",
+                confirmationNonce: "nonce",
+            }),
+        );
+        check("v86 approval action records under node:sqlite", approval.actionId > 0);
+        const replay = runInMemoryClaimsWriteTransaction(kernelDb, () =>
+            recordApprovalActionInCurrentTransaction(kernelDb, {
+                revisionId,
+                projectId: (readMemoryClaimLink(kernelDb, kernelCreated.result.memoryId) as {
+                    projectId: number;
+                }).projectId,
+                action: "approve",
+                host: "opencode",
+                sessionId: "node-smoke",
+                userCommandEvent: "evt",
+                commandIdentity: "node-smoke-approve",
+                confirmationNonce: "nonce",
+            }),
+        );
+        check("v86 approval replay is idempotent", replay.replayed && replay.actionId === approval.actionId);
+    }
     kernelDb.close();
 } finally {
     rmSync(dir, { recursive: true, force: true });

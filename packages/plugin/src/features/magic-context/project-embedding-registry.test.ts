@@ -1906,6 +1906,53 @@ describe("detailed synapse writers apply complete receipt groups atomically", ()
         expect(new Set(rows.map((row) => row.application_group)).size).toBe(1);
     });
 
+    it("an eligible row behind a page-sized policy-hidden prefix still embeds", async () => {
+        const db = useTempDb();
+        const projectIdentity = "git:detailed-hidden-prefix";
+        const host = new DetailedSynapseTestHost();
+        const { getCurrentMemoryClaimByLegacyMemoryId, runInMemoryClaimsWriteTransaction } =
+            await import("./memory/storage-memory-claims");
+        const {
+            recordDispositionEventInCurrentTransaction,
+            refreshEffectivePolicyInCurrentTransaction,
+        } = await import("./memory/storage-claim-policy");
+        // One full id-ordered page (max(4 * batchSize, 64) = 64) of
+        // quarantined rows precedes the only eligible one: the backlog walk
+        // must page past the hidden prefix instead of reading the empty
+        // first page as completion, whatever the prefix length.
+        for (let index = 0; index < 64; index += 1) {
+            const hidden = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "CONSTRAINTS",
+                content: `hidden prefix row ${index}`,
+            });
+            const claim = getCurrentMemoryClaimByLegacyMemoryId(db, hidden.id);
+            if (!claim) throw new Error("expected claim link");
+            runInMemoryClaimsWriteTransaction(db, () => {
+                recordDispositionEventInCurrentTransaction(db, {
+                    revisionId: claim.revisionId,
+                    projectId: claim.projectId,
+                    disposition: "quarantined",
+                    action: "assert",
+                    actor: "host",
+                });
+                refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
+                return undefined;
+            });
+        }
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "eligible row behind the prefix",
+        });
+        registerDetailed(db, projectIdentity, host);
+
+        const embedded = await embedUnembeddedMemoriesForProject(db, projectIdentity, 1);
+
+        expect(embedded).toBe(1);
+        expect(loadAllEmbeddings(db, projectIdentity, SYNAPSE_TEST_LANE_IDENTITY).size).toBe(1);
+    });
+
     it("a rolled-back receipt group returns no vectors to the read path", async () => {
         const db = useTempDb();
         const projectIdentity = "git:detailed-memory-rollback";

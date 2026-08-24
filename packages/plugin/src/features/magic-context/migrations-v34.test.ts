@@ -208,8 +208,8 @@ describe("migration v34/v35 — workspaces", () => {
                     )
                     .all(),
             ).toEqual([
-                { project_path: "git:a", project_memory_epoch: 8 },
-                { project_path: "git:b", project_memory_epoch: 1 },
+                { project_path: "git:a", project_memory_epoch: 9 },
+                { project_path: "git:b", project_memory_epoch: 2 },
             ]);
             expect(
                 db

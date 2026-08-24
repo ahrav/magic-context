@@ -18,10 +18,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
-import { insertMemory } from "../../plugin/src/features/magic-context/memory";
+import { insertMemory, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { TestHarness } from "../src/harness";
+import { openTestDb } from "../src/test-db";
 
 let h: TestHarness;
 
@@ -49,14 +50,17 @@ function computeDirIdentity(directory: string): string {
 
 function seedMemory(h: TestHarness, projectIdentity: string, content: string): void {
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = new Database(dbPath);
+    const db = openTestDb(dbPath, { readwrite: true });
     try {
-        insertMemory(db, {
+        const seeded = insertMemory(db, {
             projectPath: projectIdentity,
             category: "PROJECT_RULES",
             content,
-            sourceType: "historian",
+            sourceType: "user",
         });
+        // Synchronous promotion: the async policy evaluator may not have
+        // marked the row eligible before the next turn renders memory.
+        updateMemoryVerification(db, seeded.id, "verified");
     } finally {
         db.close();
     }

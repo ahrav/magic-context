@@ -678,6 +678,17 @@ struct ModuleStateSyncWire {
     compartments: Vec<ModuleCompartmentWire>,
     #[serde(default)]
     memories: Vec<ModuleMemoryWire>,
+    /// Present when `memories` is a FULL policy snapshot for these projects:
+    /// the store prunes mirrored rows absent from the payload within this
+    /// scope. Absent means incremental upsert-only semantics.
+    #[serde(default)]
+    memories_replace_projects: Option<Vec<String>>,
+    /// Explicit prune: mirrored rows with these ids are deleted before the
+    /// snapshot upsert. Covers policy-hidden rows the replace scope cannot
+    /// name — a foreign workspace member's rows — without granting a
+    /// project-wide prune over that member's non-shared rows.
+    #[serde(default)]
+    memories_delete_ids: Option<Vec<i64>>,
     #[serde(default)]
     memory_mutations: Vec<ModuleMemoryMutationWire>,
     #[serde(default)]
@@ -707,6 +718,11 @@ struct ModuleStateSyncWire {
     auto_search_hint_decisions: Vec<UserHintSeedWire>,
     #[serde(default)]
     auto_search_hint_skipped: usize,
+    /// When true, the host sent its COMPLETE hint-decision list for this
+    /// session: stored hint blocks absent from the list have no backing
+    /// decision the host can still validate and are deleted.
+    #[serde(default)]
+    user_hints_replace_session: bool,
     #[serde(default)]
     todo_synthetic_anchor: Option<Option<TodoSyntheticAnchorSeedWire>>,
     #[serde(default)]
@@ -9214,6 +9230,30 @@ impl McHandler {
             Ok(mutations) => mutations,
             Err(error) => return invalid_params_error(error),
         };
+        // Replace-scope entries are project assertions exactly like memory
+        // rows: validate each against the bound owner / workspace membership
+        // so one sync cannot prune rows outside its authority.
+        let memories_replace_projects = match parsed
+            .memories_replace_projects
+            .take()
+            .map(|projects| {
+                projects
+                    .into_iter()
+                    .map(|project| {
+                        authority_source_path(
+                            Some(&project),
+                            store_project_path,
+                            &member_paths,
+                            has_workspace,
+                        )
+                    })
+                    .collect::<Result<Vec<String>, String>>()
+            })
+            .transpose()
+        {
+            Ok(scope) => scope,
+            Err(error) => return invalid_params_error(error),
+        };
         let acked_watermarks = parsed.acked_watermarks.unwrap_or_else(|| {
             json!({
                 "compartment_seq": compartments.iter().map(|c| c.sequence).max(),
@@ -9243,6 +9283,7 @@ impl McHandler {
             pending_agent_drops_skipped: parsed.pending_agent_drops_skipped,
             user_hint_seeds: &user_hint_seeds,
             auto_search_hint_skipped: parsed.auto_search_hint_skipped,
+            user_hints_replace_session: parsed.user_hints_replace_session,
             note_nudge_anchors: note_nudge_anchors.as_deref(),
             todo_synthetic_anchor: todo_synthetic_anchor.as_ref(),
             todo_synthetic_anchor_present,
@@ -9268,6 +9309,8 @@ impl McHandler {
             reasoning_cleared_through_tag: parsed.reasoning_cleared_through_tag,
             compartments: &compartments,
             memories: &memories,
+            memories_replace_projects: memories_replace_projects.as_deref(),
+            memories_delete_ids: parsed.memories_delete_ids.as_deref(),
             memory_mutations: &memory_mutations,
             user_profile: &user_profile,
             user_profile_present,
@@ -9884,6 +9927,10 @@ impl McHandler {
             updates.push(mc_store::ClassificationUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 importance: row
                     .get("importance")
                     .and_then(Value::as_i64)
@@ -10107,6 +10154,10 @@ impl McHandler {
             updates.push(VerificationUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 verification_status: status.to_string(),
                 updated_content: row
                     .get("updated_content")
@@ -10216,6 +10267,10 @@ impl McHandler {
             updates.push(MappingUpdate {
                 memory_id,
                 content_hash_at_prompt: hash.to_string(),
+                content_sha256_at_prompt: row
+                    .get("content_sha256_at_prompt")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 mapped_files,
             });
         }
@@ -13534,6 +13589,7 @@ fn assemble_state_sync_seed(
     let mut note_nudge_anchors_present = false;
     let mut strip_seeds = Vec::new();
     let mut user_profile = None;
+    let mut memories_delete_ids: Option<Vec<i64>> = None;
     for mut batch in batches {
         compartments.append(&mut batch.compartments);
         memories.append(&mut batch.memories);
@@ -13550,6 +13606,11 @@ fn assemble_state_sync_seed(
             user_profile
                 .get_or_insert_with(Vec::new)
                 .append(&mut profile);
+        }
+        if let Some(mut ids) = batch.memories_delete_ids.take() {
+            memories_delete_ids
+                .get_or_insert_with(Vec::new)
+                .append(&mut ids);
         }
     }
     compartments.append(&mut final_batch.compartments);
@@ -13578,6 +13639,19 @@ fn assemble_state_sync_seed(
         seed_boundary_id: final_batch.seed_boundary_id,
         compartments,
         memories,
+        // Replace scope rides the completing batch and applies to the whole
+        // assembled snapshot; earlier batches never carry it.
+        memories_replace_projects: final_batch.memories_replace_projects,
+        // Delete ids page with the seed items; concatenate every page's list.
+        memories_delete_ids: match (memories_delete_ids, final_batch.memories_delete_ids) {
+            (None, None) => None,
+            (Some(ids), None) => Some(ids),
+            (None, Some(ids)) => Some(ids),
+            (Some(mut ids), Some(mut tail)) => {
+                ids.append(&mut tail);
+                Some(ids)
+            }
+        },
         memory_mutations,
         user_profile,
         workspace: final_batch.workspace,
@@ -13592,6 +13666,7 @@ fn assemble_state_sync_seed(
         note_nudge_anchors: note_nudge_anchors_present.then_some(note_nudge_anchors),
         auto_search_hint_decisions,
         auto_search_hint_skipped: final_batch.auto_search_hint_skipped,
+        user_hints_replace_session: final_batch.user_hints_replace_session,
         todo_synthetic_anchor: final_batch.todo_synthetic_anchor,
         emergency_latches: final_batch.emergency_latches,
         pending_compaction_marker: final_batch.pending_compaction_marker,

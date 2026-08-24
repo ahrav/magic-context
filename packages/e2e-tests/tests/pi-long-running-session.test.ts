@@ -3,13 +3,14 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
-import { insertMemory } from "../../plugin/src/features/magic-context/memory";
+import { insertMemory, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { Database } from "../../plugin/src/shared/sqlite";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { PiTestHarness } from "../src/pi-harness";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
+import { openTestDb } from "../src/test-db";
 
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
 
@@ -156,7 +157,7 @@ function readMeta<T>(h: PiTestHarness, sessionId: string, columns: string): T | 
 }
 
 function writeDb(h: PiTestHarness, fn: (db: Database) => void): void {
-    const db = new Database(h.contextDbPath());
+    const db = openTestDb(h.contextDbPath(), { readwrite: true });
     try {
         fn(db);
     } finally {
@@ -167,12 +168,15 @@ function writeDb(h: PiTestHarness, fn: (db: Database) => void): void {
 function seedMemory(h: PiTestHarness, content: string): void {
     const projectIdentity = resolveProjectIdentity(realpathSync(pathResolve(h.env.workdir)));
     writeDb(h, (db) => {
-        insertMemory(db, {
+        const seeded = insertMemory(db, {
             projectPath: projectIdentity,
             category: "PROJECT_RULES",
             content,
-            sourceType: "historian",
+            sourceType: "user",
         });
+        // Synchronous promotion: the async policy evaluator may not have
+        // marked the row eligible before the next turn renders memory.
+        updateMemoryVerification(db, seeded.id, "verified");
     });
 }
 

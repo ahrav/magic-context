@@ -591,6 +591,7 @@ mod tests {
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
                 auto_search_hint_skipped: 0,
+                user_hints_replace_session: false,
                 note_nudge_anchors: None,
                 todo_synthetic_anchor: None,
                 todo_synthetic_anchor_present: false,
@@ -603,6 +604,8 @@ mod tests {
                 reasoning_cleared_through_tag: None,
                 compartments: &[],
                 memories: &[],
+                memories_replace_projects: None,
+                memories_delete_ids: None,
                 memory_mutations: &[],
                 user_profile: profile,
                 user_profile_present: true,
@@ -1424,6 +1427,7 @@ mod tests {
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash.clone(),
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: Some("project".to_string()),
                     shareable: Some(true),
@@ -1459,6 +1463,7 @@ mod tests {
                 &[mc_store::ClassificationUpdate {
                     memory_id: foreign_id,
                     content_hash_at_prompt: content_hash,
+                    content_sha256_at_prompt: None,
                     importance: None,
                     scope: None,
                     shareable: Some(false),

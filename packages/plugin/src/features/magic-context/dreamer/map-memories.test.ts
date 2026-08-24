@@ -124,6 +124,7 @@ describe("mapMemories disposition", () => {
             const dir = tempProject();
             for (let index = 0; index < 81; index += 1) {
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Independent fact ${index}.`,
@@ -155,6 +156,7 @@ describe("mapMemories disposition", () => {
             const projectIdentity = "git:map-complete";
             const dir = tempProject();
             insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Independent fact.",
@@ -181,6 +183,7 @@ describe("mapMemories disposition", () => {
             const projectIdentity = "git:map-failure";
             const dir = tempProject();
             insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Independent fact.",
@@ -211,6 +214,7 @@ describe("mapMemories retry-time validation", () => {
             const projectIdentity = "git:map-retry-empty";
             const dir = tempProject();
             insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Independent fact.",
@@ -245,12 +249,14 @@ describe("mapMemories retry-time validation", () => {
             const projectIdentity = "git:map-retry-coverage";
             const dir = tempProject();
             const first = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "First fact.",
                 sourceSessionId: "ses",
             });
             insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Second fact.",
@@ -282,6 +288,7 @@ describe("applyBatchMappings", () => {
             const projectIdentity = "git:test";
             const dir = tempProject();
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Fact lives in src/fact.ts.",
@@ -327,6 +334,7 @@ describe("applyBatchMappings", () => {
             const projectIdentity = "git:test";
             const dir = tempProject();
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Fact lives in src/fact.ts.",
@@ -364,12 +372,14 @@ describe("applyBatchMappings", () => {
             const projectIdentity = "git:test-belt";
             const dir = tempProject();
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Fact lives in src/fact.ts.",
                 sourceSessionId: "ses",
             });
             const extra = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Another fact.",
@@ -406,6 +416,7 @@ describe("applyBatchMappings", () => {
             const projectIdentity = "git:test-nested";
             const dir = tempProject();
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Fact lives in src/fact.ts.",
@@ -467,12 +478,14 @@ describe("independent re-queue heal", () => {
             const projectIdentity = "git:map-requeue";
             const dir = tempProject();
             const corrupted = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Fact lives in src/fact.ts.",
                 sourceSessionId: "ses",
             });
             const bystander = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "CONSTRAINTS",
                 content: "Anthropic returns 400 on empty content.",

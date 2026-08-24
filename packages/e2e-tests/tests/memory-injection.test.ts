@@ -2,6 +2,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { promoteMemoryToVerified } from "../src/test-db";
 
 /**
  * Memory injection — regression test for v0.9.1.
@@ -79,6 +80,9 @@ describe("memory injection", () => {
         const writerSessionId = await h.createSession();
         emitMemoryWriteOnce(directive);
         await h.sendPrompt(writerSessionId, "remember the project package-manager rule");
+        // v86 trust policy: an agent write starts CANDIDATE and is hidden
+        // from automatic injection; promote through the real verification API.
+        promoteMemoryToVerified(h.contextDbPath(), directive);
 
         const memorySessionId = await h.createSession();
 

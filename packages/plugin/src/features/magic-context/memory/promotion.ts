@@ -4,6 +4,11 @@ import { CATEGORY_DEFAULT_TTL, PROMOTABLE_CATEGORIES } from "./constants";
 import { embedTextForProject } from "./embedding";
 import { computeNormalizedHash } from "./normalize-hash";
 import {
+    exactMemoryContentDigests,
+    memoriesEligibleForEmbedding,
+} from "./storage-claim-visibility";
+import { sha256Utf8Hex } from "./storage-claims";
+import {
     getMemoryByHash,
     getMemoryById,
     insertMemory,
@@ -93,7 +98,18 @@ export async function embedPromotedFacts(
     projectPath: string,
     refs: PromotedMemoryRef[],
 ): Promise<void> {
+    // One batched eligibility read for the whole promotion batch: the
+    // underlying policy-row query already chunks an IN list, and the surface
+    // is identical for every ref. Each ref still re-checks membership at its
+    // own turn below (the loop awaits provider calls, so eligibility is
+    // re-read per ref against this stale-but-conservative snapshot only for
+    // the initial skip; the hash-guarded save rejects mid-flight edits).
+    const eligible = memoriesEligibleForEmbedding(
+        db,
+        refs.map((ref) => ref.memoryId),
+    );
     for (const ref of refs) {
+        if (!eligible.has(ref.memoryId)) continue;
         await embedAndStoreMemory(db, sessionId, projectPath, ref.memoryId, ref.content);
     }
 }
@@ -106,6 +122,26 @@ async function embedAndStoreMemory(
     content: string,
 ): Promise<void> {
     try {
+        // Hard-hidden / rejected content never leaves the process, remote
+        // embedding providers included. Re-checked here (cheap single-id
+        // read) because earlier refs' provider calls yield arbitrarily long.
+        if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
+            return;
+        }
+        // Bind the captured bytes to the current revision: a rewrite after
+        // publication makes eligibility (and the hash captured below)
+        // describe the NEW revision while `content` still holds the old
+        // promoted bytes — embedding them would disclose a superseded
+        // revision to the provider and store its vector as if it described
+        // the replacement.
+        if (exactMemoryContentDigests(db, [memoryId]).get(memoryId) !== sha256Utf8Hex(content)) {
+            return;
+        }
+        // Policy again AFTER the digest read (two autocommit snapshots): a
+        // hide committed between them leaves the digest unchanged.
+        if (!memoriesEligibleForEmbedding(db, [memoryId]).has(memoryId)) {
+            return;
+        }
         // Capture the row's content hash BEFORE the async provider call: the
         // vector it returns is only valid for the content stored right now. If
         // the memory is edited while the call is in flight, the row's
@@ -119,6 +155,17 @@ async function embedAndStoreMemory(
         const result = await embedTextForProject(projectPath, content);
         if (result) {
             db.transaction(() => {
+                // Re-bind inside the write transaction: the provider call
+                // above yielded, and the normalized-hash guard alone cannot
+                // reject a case/whitespace-only rewrite that landed
+                // meanwhile — the save would reinstate the predecessor's
+                // vector under the successor bytes.
+                if (
+                    exactMemoryContentDigests(db, [memoryId]).get(memoryId) !==
+                    sha256Utf8Hex(content)
+                ) {
+                    return;
+                }
                 saveEmbeddingIfHashMatches(
                     db,
                     memoryId,

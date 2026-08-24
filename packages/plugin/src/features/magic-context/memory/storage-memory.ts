@@ -891,9 +891,12 @@ export function insertMemory(
 
 /**
  * Shared-DB callers can race between their exact-hash pre-check and INSERT. When
- * the unique constraint wins, treat it as the same exact-dedup path the tool uses:
- * bump seen_count/last_seen_at on the existing row and return it instead of
- * surfacing a transient write failure.
+ * the unique constraint wins, return the existing row with `inserted: false`
+ * instead of surfacing a transient write failure. The recovery is non-mutating:
+ * a raced row can be policy-hidden, and its seen count must stay untouched when
+ * the caller answers with the uniform refusal — so the caller owns the
+ * seen-count bump after its visibility decision, exactly as it does for a
+ * duplicate found by its own pre-check lookup.
  */
 export function insertMemoryIdempotent(
     db: Database,
@@ -911,9 +914,8 @@ export function insertMemoryIdempotent(
         if (!existing) {
             throw error;
         }
-        updateMemorySeenCount(db, existing.id);
         return {
-            memory: getMemoryById(db, existing.id) ?? existing,
+            memory: existing,
             inserted: false,
         };
     }

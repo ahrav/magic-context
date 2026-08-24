@@ -23,9 +23,14 @@ import {
 } from "../../features/magic-context/memory";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import {
+    bindMemoriesToCurrentRevision,
+    filterMemoriesByPolicy,
+} from "../../features/magic-context/memory/storage-claim-visibility";
+import {
     getMemoriesByProject,
     ModuleMemoryAuthorityError,
 } from "../../features/magic-context/memory/storage-memory";
+import type { Memory } from "../../features/magic-context/memory/types";
 import {
     clearEmergencyDrainLatch,
     clearEmergencyRecovery,
@@ -48,6 +53,7 @@ import {
 } from "../../features/magic-context/storage-historian-runs";
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { insertPrimerCandidates } from "../../features/magic-context/storage-primers";
+import { getProjectState } from "../../features/magic-context/storage-project-state";
 import { getLatestHistorianInvocationId } from "../../features/magic-context/storage-subagent-invocations";
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { normalizeSDKResponse } from "../../shared";
@@ -417,21 +423,11 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // No temp-file offload needed — the bounded blocks stay well within
         // serialization limits.
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
-        const projectMemory = renderMemoryBlock(memories) ?? "";
 
         const references = buildReferenceBlocks({
             sessionId,
             chunkStart: chunk.startIndex,
             sessionCompartments: priorCompartments,
-        });
-
-        const prompt = buildCompartmentAgentPrompt({
-            seedExamples: references.seedExamples,
-            sessionReferences: references.sessionReferences,
-            projectMemory,
-            inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
-            memoryEnabled: deps.memoryEnabled !== false,
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
@@ -444,6 +440,50 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             { preferResponseOnMissingData: true },
         );
         const sessionDirectory = parentSession?.directory ?? directory;
+
+        // The historian's reference block is an automatic model prompt:
+        // policy-hidden content must not reach it, or a hidden fact can
+        // steer newly generated summaries. Loaded AFTER the awaited session
+        // lookup above so the policy filter and the rendered bytes are
+        // current when the prompt is handed to the provider — a load before
+        // that await could carry a memory hidden or rewritten in the gap.
+        // Stabilized rebuild (same discipline as the m0 fallback): the load
+        // and the provider send are separated by prompt assembly, and a
+        // cross-process transition in that window has no epoch check to
+        // catch it downstream. Re-read until the project memory epoch is
+        // unchanged across the load; fail closed with no memory block on
+        // exhaustion.
+        let memories: Memory[] = [];
+        let memoriesStable = false;
+        for (let attempt = 0; attempt < 2 && !memoriesStable; attempt += 1) {
+            const epochAtLoad = getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0;
+            memories = bindMemoriesToCurrentRevision(
+                db,
+                filterMemoriesByPolicy(
+                    db,
+                    getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+                    "auto_inject",
+                ).memories,
+            );
+            memoriesStable =
+                (getProjectState(db, projectPath)?.projectMemoryEpoch ?? 0) === epochAtLoad;
+        }
+        if (!memoriesStable) {
+            sessionLog(
+                sessionId,
+                "historian memory block unstable after retries (epoch kept moving); omitting memories this pass",
+            );
+            memories = [];
+        }
+        const projectMemory = renderMemoryBlock(memories) ?? "";
+
+        const prompt = buildCompartmentAgentPrompt({
+            seedExamples: references.seedExamples,
+            sessionReferences: references.sessionReferences,
+            projectMemory,
+            inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
+            memoryEnabled: deps.memoryEnabled !== false,
+        });
 
         // Defensive: use MAX(sequence) + 1 rather than .length. These only
         // differ when the current DB state has a gap or non-zero-indexed

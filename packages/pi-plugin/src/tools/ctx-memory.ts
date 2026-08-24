@@ -61,6 +61,15 @@ import {
 	resolveProjectIdentityForSession,
 	storedPathBelongsToIdentity,
 } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	bindMemoriesToCurrentRevision,
+	decideMemoryPolicy,
+	exactMemoryContentDigests,
+	filterMemoriesByPolicy,
+	memoriesEligibleForEmbedding,
+	readMemoryPolicyRows,
+} from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "@magic-context/core/features/magic-context/memory/storage-claims";
 import type { MemoryClaimOperationIdentity } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	ClaimOperationKeyReuseError,
@@ -181,7 +190,10 @@ function normalizeLimit(limit?: number): number {
 	return Math.max(1, Math.floor(limit));
 }
 
-function formatMemoryList(memories: Memory[]): string {
+function formatMemoryList(
+	memories: Memory[],
+	policyLabels?: Map<number, string>,
+): string {
 	if (memories.length === 0) return "No active memories found.";
 
 	const rows = memories.map((m) => ({
@@ -189,6 +201,7 @@ function formatMemoryList(memories: Memory[]): string {
 		category: m.category,
 		status: m.status,
 		verification: m.verificationStatus,
+		trust: policyLabels?.get(m.id) ?? "",
 		updated: new Date(m.updatedAt).toISOString(),
 		content: m.content.replace(/\s+/g, " ").trim(),
 	}));
@@ -197,6 +210,7 @@ function formatMemoryList(memories: Memory[]): string {
 		category: "CATEGORY",
 		status: "STATUS",
 		verification: "VERIFY",
+		trust: "TRUST",
 		updated: "UPDATED",
 		content: "CONTENT",
 	};
@@ -214,6 +228,7 @@ function formatMemoryList(memories: Memory[]): string {
 			headers.verification.length,
 			...rows.map((r) => r.verification.length),
 		),
+		trust: Math.max(headers.trust.length, ...rows.map((r) => r.trust.length)),
 		updated: Math.max(
 			headers.updated.length,
 			...rows.map((r) => r.updated.length),
@@ -225,6 +240,7 @@ function formatMemoryList(memories: Memory[]): string {
 			r.category.padEnd(widths.category),
 			r.status.padEnd(widths.status),
 			r.verification.padEnd(widths.verification),
+			r.trust.padEnd(widths.trust),
 			r.updated.padEnd(widths.updated),
 			r.content,
 		].join(" | ");
@@ -237,6 +253,7 @@ function formatMemoryList(memories: Memory[]): string {
 			"-".repeat(widths.category),
 			"-".repeat(widths.status),
 			"-".repeat(widths.verification),
+			"-".repeat(widths.trust),
 			"-".repeat(widths.updated),
 			"-------",
 		].join("-+-"),
@@ -281,6 +298,7 @@ const getNotVisibleMessage = (id: number): string =>
 function formatGetOutput(args: {
 	requestedIds: number[];
 	memoriesById: Map<number, Memory>;
+	policyLabels?: Map<number, string>;
 }): string {
 	const parts: string[] = [];
 	for (const id of args.requestedIds) {
@@ -288,7 +306,7 @@ function formatGetOutput(args: {
 		if (!memory) {
 			parts.push(getNotVisibleMessage(id));
 		} else {
-			parts.push(formatMemoryList([memory]));
+			parts.push(formatMemoryList([memory], args.policyLabels));
 		}
 	}
 	return parts.join("\n\n");
@@ -352,8 +370,43 @@ function queueEmbedding(args: {
 }) {
 	const snapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
 	if (!snapshot?.enabled) return;
+	// Hard-hidden / rejected content never leaves the process, remote
+	// embedding providers included.
+	if (
+		!memoriesEligibleForEmbedding(args.deps.db, [args.memoryId]).has(
+			args.memoryId,
+		)
+	) {
+		return;
+	}
+	const contentDigest = sha256Utf8Hex(args.content);
 	void (async () => {
 		try {
+			// The queued closure runs after an arbitrary delay: re-check
+			// eligibility at the provider boundary and bind it to the exact
+			// bytes this closure captured, so a quarantine/rejection or
+			// rewrite that landed after enqueue cannot leak the content to
+			// the provider. Mirrors the OpenCode tool.
+			if (
+				!memoriesEligibleForEmbedding(args.deps.db, [args.memoryId]).has(
+					args.memoryId,
+				)
+			) {
+				log(
+					`[magic-context-pi] embedding skipped for memory ${args.memoryId}: no longer eligible at provider drain.`,
+				);
+				return;
+			}
+			if (
+				exactMemoryContentDigests(args.deps.db, [args.memoryId]).get(
+					args.memoryId,
+				) !== contentDigest
+			) {
+				log(
+					`[magic-context-pi] embedding skipped for memory ${args.memoryId}: content changed before the provider call.`,
+				);
+				return;
+			}
 			const result = await embedTextForProject(
 				args.projectIdentity,
 				args.content,
@@ -516,6 +569,21 @@ export function createCtxMemoryTool(
 						? targetIdentityForStoredPath(memory.projectPath) ===
 							projectIdentity
 						: storedPathBelongsToIdentity(memory.projectPath, projectIdentity);
+				// Hard-hidden and rejected rows return uniform absence on every
+				// agent surface — including as MUTATION targets: updating a
+				// policy-hidden memory would mint a fresh current revision
+				// without the old revision's disposition and resurface the
+				// content. One decision covers every id-based branch (update,
+				// merge, archive) for every agent (parity with OpenCode).
+				const memoryPolicyDeniesToolTarget = (
+					memoryIds: readonly number[],
+				): boolean => {
+					const rows = readMemoryPolicyRows(deps.db, memoryIds);
+					return memoryIds.some(
+						(id) =>
+							!decideMemoryPolicy(rows.get(id), "explicit_search").eligible,
+					);
+				};
 				const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
 				if (
 					snapshot
@@ -548,8 +616,23 @@ export function createCtxMemoryTool(
 						const replay = readMemoryClaimOperationResult<{
 							memoryId: number;
 							duplicate?: boolean;
+							denied?: boolean;
 						}>(deps.db, envelope);
 						if (replay) {
+							if (replay.result.denied) {
+								return err(
+									`Error: Memory could not be saved in ${rawCategory}.`,
+								);
+							}
+							// The outcome was stored while the memory was visible;
+							// a quarantine/rejection since then must not leak the
+							// id through a committed-but-unacked retry. Same
+							// uniform refusal as a fresh denial.
+							if (memoryPolicyDeniesToolTarget([replay.result.memoryId])) {
+								return err(
+									`Error: Memory could not be saved in ${rawCategory}.`,
+								);
+							}
 							return ok(
 								replay.result.duplicate
 									? `Memory already exists [ID: ${replay.result.memoryId}] in ${rawCategory} (seen count incremented).`
@@ -568,6 +651,7 @@ export function createCtxMemoryTool(
 										runMemoryClaimOperationInCurrentTransaction<{
 											memoryId: number;
 											duplicate: boolean;
+											denied?: boolean;
 										}>(deps.db, envelope, () => {
 											const existing = getMemoryByHash(
 												deps.db,
@@ -576,6 +660,20 @@ export function createCtxMemoryTool(
 												normalizedHash,
 											);
 											if (existing) {
+												// A policy-hidden duplicate returns uniform
+												// refusal: the UNIQUE row cannot be
+												// re-inserted, and both its id and its seen
+												// count stay undisclosed and untouched.
+												if (memoryPolicyDeniesToolTarget([existing.id])) {
+													return {
+														result: {
+															memoryId: existing.id,
+															duplicate: true,
+															denied: true,
+														},
+														effects: [],
+													};
+												}
 												updateMemorySeenCount(deps.db, existing.id);
 												return {
 													result: { memoryId: existing.id, duplicate: true },
@@ -589,6 +687,26 @@ export function createCtxMemoryTool(
 												sourceSessionId: sessionId,
 												sourceType: dreamerAllowed ? "dreamer" : "agent",
 											});
+											if (!inserted.inserted) {
+												// Raced duplicate recovered from the unique
+												// constraint: same policy-before-mutation
+												// contract as the pre-check branch above — a
+												// hidden row's id and seen count stay
+												// undisclosed and untouched.
+												if (
+													memoryPolicyDeniesToolTarget([inserted.memory.id])
+												) {
+													return {
+														result: {
+															memoryId: inserted.memory.id,
+															duplicate: true,
+															denied: true,
+														},
+														effects: [],
+													};
+												}
+												updateMemorySeenCount(deps.db, inserted.memory.id);
+											}
 											return {
 												result: {
 													memoryId: inserted.memory.id,
@@ -600,6 +718,9 @@ export function createCtxMemoryTool(
 								),
 							)
 							.immediate();
+						if (outcome.result.denied) {
+							return err(`Error: Memory could not be saved in ${rawCategory}.`);
+						}
 						if (outcome.result.duplicate) {
 							return ok(
 								`Memory already exists [ID: ${outcome.result.memoryId}] in ${rawCategory} (seen count incremented).`,
@@ -625,6 +746,9 @@ export function createCtxMemoryTool(
 						normalizedHash,
 					);
 					if (existing) {
+						if (memoryPolicyDeniesToolTarget([existing.id])) {
+							return err(`Error: Memory could not be saved in ${rawCategory}.`);
+						}
 						updateMemorySeenCount(deps.db, existing.id);
 						return ok(
 							`Memory already exists [ID: ${existing.id}] in ${rawCategory} (seen count incremented).`,
@@ -643,6 +767,13 @@ export function createCtxMemoryTool(
 						writeIdentity,
 					);
 					if (!insertResult.inserted) {
+						// The recovery is non-mutating, so the policy decision runs
+						// before the raced row is touched: a hidden duplicate gets the
+						// uniform refusal with its seen count intact.
+						if (memoryPolicyDeniesToolTarget([insertResult.memory.id])) {
+							return err(`Error: Memory could not be saved in ${rawCategory}.`);
+						}
+						updateMemorySeenCount(deps.db, insertResult.memory.id);
 						return ok(
 							`Memory already exists [ID: ${insertResult.memory.id}] in ${rawCategory} (seen count incremented).`,
 						);
@@ -673,7 +804,46 @@ export function createCtxMemoryTool(
 					const filtered2 = category
 						? filtered.filter((m) => m.category === category)
 						: filtered;
-					return ok(formatMemoryList(filtered2.slice(0, limit)));
+					// The explicit-surface decision applies before the limit:
+					// hard-hidden rows get uniform absence; sub-verified rows
+					// keep sanitized trust labels. Same gate as the OpenCode
+					// tool so neither harness is a laxer read path.
+					const policyFiltered = filterMemoriesByPolicy(
+						deps.db,
+						filtered2,
+						"explicit_search",
+					);
+					// Bind loaded bytes to the revision the policy evaluated,
+					// then take the final gate from ONE snapshot: policy and
+					// the exact revision digest are read inside one deferred
+					// read transaction, so the decision and the digest
+					// describe the same revision — and the loaded bytes must
+					// match it.
+					const bound = bindMemoriesToCurrentRevision(
+						deps.db,
+						policyFiltered.memories,
+					);
+					const recheck = deps.db.transaction(() => {
+						const filtered = filterMemoriesByPolicy(
+							deps.db,
+							bound,
+							"explicit_search",
+						);
+						const digests = exactMemoryContentDigests(
+							deps.db,
+							filtered.memories.map((memory) => memory.id),
+						);
+						return {
+							memories: filtered.memories.filter(
+								(memory) =>
+									digests.get(memory.id) === sha256Utf8Hex(memory.content),
+							),
+							labels: filtered.labels,
+						};
+					})();
+					return ok(
+						formatMemoryList(recheck.memories.slice(0, limit), recheck.labels),
+					);
 				}
 
 				if (params.action === "get") {
@@ -696,15 +866,46 @@ export function createCtxMemoryTool(
 					// each requested id exactly once and never reflects a row twice.
 					const uniqueIds = [...new Set(getIds)];
 					const fetched = getMemoriesByIds(deps.db, uniqueIds);
+					const policyFiltered = filterMemoriesByPolicy(
+						deps.db,
+						fetched.filter((memory) => memoryVisibleToTool(memory)),
+						"explicit_search",
+					);
+					// Bind loaded bytes to the revision the policy evaluated,
+					// then take the final gate from ONE snapshot (see the list
+					// branch): the policy decision and the exact revision
+					// digest must describe the same revision, and the loaded
+					// bytes must match it.
+					const bound = bindMemoriesToCurrentRevision(
+						deps.db,
+						policyFiltered.memories,
+					);
+					const recheck = deps.db.transaction(() => {
+						const filtered = filterMemoriesByPolicy(
+							deps.db,
+							bound,
+							"explicit_search",
+						);
+						const digests = exactMemoryContentDigests(
+							deps.db,
+							filtered.memories.map((memory) => memory.id),
+						);
+						return {
+							memories: filtered.memories.filter(
+								(memory) =>
+									digests.get(memory.id) === sha256Utf8Hex(memory.content),
+							),
+							labels: filtered.labels,
+						};
+					})();
 					const memoriesById = new Map<number, Memory>(
-						fetched
-							.filter((memory) => memoryVisibleToTool(memory))
-							.map((memory) => [memory.id, memory]),
+						recheck.memories.map((memory) => [memory.id, memory]),
 					);
 					return ok(
 						formatGetOutput({
 							requestedIds: uniqueIds,
 							memoriesById,
+							policyLabels: recheck.labels,
 						}),
 					);
 				}
@@ -738,6 +939,12 @@ export function createCtxMemoryTool(
 							category: string;
 						}>(deps.db, toClaimOperationEnvelope(updateIdentity));
 						if (replay) {
+							// The stored outcome predates any later
+							// quarantine/rejection: refuse instead of
+							// re-disclosing a now-hidden id on retry.
+							if (memoryPolicyDeniesToolTarget([replay.result.memoryId])) {
+								return err(`Error: Memory with ID ${updateId} was not found.`);
+							}
 							return ok(
 								`Updated memory [ID: ${replay.result.memoryId}] in ${replay.result.category}.`,
 							);
@@ -750,7 +957,11 @@ export function createCtxMemoryTool(
 							? memoryVisibleToTool(memory)
 							: memoryOwnedByTool(memory)
 						: false;
-					if (!memory || !updateAllowed) {
+					if (
+						!memory ||
+						!updateAllowed ||
+						memoryPolicyDeniesToolTarget([updateId])
+					) {
 						return err(`Error: Memory with ID ${updateId} was not found.`);
 					}
 					if (!dreamerAllowed && !isPrimaryMutableMemory(memory)) {
@@ -767,17 +978,32 @@ export function createCtxMemoryTool(
 						normalizedHash,
 					);
 					if (duplicate && duplicate.id !== memory.id) {
+						// Never disclose a policy-hidden duplicate's id; the UNIQUE
+						// constraint forces a refusal either way.
 						return err(
-							`Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`,
+							memoryPolicyDeniesToolTarget([duplicate.id])
+								? "Error: Memory content already exists; choose different content."
+								: `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`,
 						);
 					}
 
 					let replayed = false;
+					let deniedInTransaction = false;
 					deps.db
 						.transaction(() =>
 							withMemoryClaimGenerationContextInCurrentTransaction(
 								deps.db,
 								() => {
+									// The visibility snapshot above ran outside this
+									// transaction: another process can quarantine or
+									// reject the target in the gap, and appending a
+									// successor revision would strip the hidden
+									// revision's disposition. Re-evaluate while
+									// holding the write lock.
+									if (memoryPolicyDeniesToolTarget([memory.id])) {
+										deniedInTransaction = true;
+										return;
+									}
 									if (updateIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
 										// The tool owns the envelope so the stored
 										// result carries the category; the storage
@@ -831,6 +1057,9 @@ export function createCtxMemoryTool(
 							),
 						)
 						.immediate();
+					if (deniedInTransaction) {
+						return err(`Error: Memory with ID ${updateId} was not found.`);
+					}
 					if (replayed) {
 						return ok(
 							`Updated memory [ID: ${memory.id}] in ${memory.category}.`,
@@ -888,6 +1117,14 @@ export function createCtxMemoryTool(
 							category: string;
 						}>(deps.db, toClaimOperationEnvelope(mergeIdentity));
 						if (replay) {
+							// The stored outcome predates any later
+							// quarantine/rejection: refuse instead of
+							// re-disclosing a now-hidden id on retry.
+							if (memoryPolicyDeniesToolTarget([replay.result.memoryId])) {
+								return err(
+									"Error: One or more source memories were not found.",
+								);
+							}
 							const supersededIds = ids.filter(
 								(id) => id !== replay.result.memoryId,
 							);
@@ -914,6 +1151,9 @@ export function createCtxMemoryTool(
 						);
 					}
 					if (sourceMemories.length !== ids.length) {
+						return err("Error: One or more source memories were not found.");
+					}
+					if (memoryPolicyDeniesToolTarget(ids)) {
 						return err("Error: One or more source memories were not found.");
 					}
 
@@ -1015,6 +1255,16 @@ export function createCtxMemoryTool(
 							withMemoryClaimGenerationContextInCurrentTransaction(
 								deps.db,
 								() => {
+									// The source-visibility snapshot ran outside this
+									// transaction: re-evaluate every source while
+									// holding the write lock so a target hidden in
+									// the gap is neither superseded nor resurfaced
+									// through the merged successor.
+									if (memoryPolicyDeniesToolTarget(ids)) {
+										mergeConflict =
+											"Error: One or more source memories were not found.";
+										return;
+									}
 									if (mergeIdentity && hasMemoryClaimsCompatSchema(deps.db)) {
 										const replay = readMemoryClaimOperationResult<{
 											memoryId: number;
@@ -1037,7 +1287,11 @@ export function createCtxMemoryTool(
 											? lockedDuplicate
 											: null;
 									if (lockedDuplicate && !canonicalExisting) {
-										mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+										mergeConflict = memoryPolicyDeniesToolTarget([
+											lockedDuplicate.id,
+										])
+											? "Error: Memory content already exists; choose different content."
+											: `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
 										return;
 									}
 									let canonicalMemory: Memory;
@@ -1196,6 +1450,16 @@ export function createCtxMemoryTool(
 							);
 						});
 					if (archiveReplay) {
+						// The stored outcomes predate any later quarantine or
+						// rejection: refuse instead of re-confirming a
+						// now-hidden id on retry — the same gate fresh
+						// archives and the update replay apply.
+						const deniedId = archiveIds.find((memoryId) =>
+							memoryPolicyDeniesToolTarget([memoryId]),
+						);
+						if (deniedId !== undefined) {
+							return err(`Error: Memory with ID ${deniedId} was not found.`);
+						}
 						const reasonSuffix = trimmedReason ? ` (${trimmedReason})` : "";
 						const idList = archiveIds.join(", ");
 						const plural = archiveIds.length > 1 ? "memories" : "memory";
@@ -1210,7 +1474,11 @@ export function createCtxMemoryTool(
 								? memoryVisibleToTool(memory)
 								: memoryOwnedByTool(memory)
 							: false;
-						if (!memory || !archiveAllowed) {
+						if (
+							!memory ||
+							!archiveAllowed ||
+							memoryPolicyDeniesToolTarget([memoryId])
+						) {
 							return err(`Error: Memory with ID ${memoryId} was not found.`);
 						}
 						if (!dreamerAllowed && !isPrimaryMutableMemory(memory)) {
@@ -1229,11 +1497,25 @@ export function createCtxMemoryTool(
 							projectIdentity: targetIdentityForStoredPath(memory.projectPath),
 						};
 					});
+					let archiveDeniedInTransaction = false;
 					deps.db
 						.transaction(() =>
 							withMemoryClaimGenerationContextInCurrentTransaction(
 								deps.db,
 								() => {
+									// The per-target visibility loop above ran outside
+									// this transaction: re-evaluate the whole batch
+									// while holding the write lock so a target hidden
+									// in the gap is not mutated (all-or-nothing,
+									// matching the batch below).
+									if (
+										memoryPolicyDeniesToolTarget(
+											targets.map((target) => target.memoryId),
+										)
+									) {
+										archiveDeniedInTransaction = true;
+										return;
+									}
 									for (const target of targets) {
 										const replayed = archiveMemory(
 											deps.db,
@@ -1253,6 +1535,9 @@ export function createCtxMemoryTool(
 							),
 						)
 						.immediate();
+					if (archiveDeniedInTransaction) {
+						return err("Error: One or more memories were not found.");
+					}
 					const reasonSuffix = trimmedReason ? ` (${trimmedReason})` : "";
 					const idList = archiveIds.join(", ");
 					const plural = archiveIds.length > 1 ? "memories" : "memory";

@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { revalidateEnforcementArtifacts } from "../../features/magic-context/claim-policy-backfill";
 import {
     type AuthorityModuleClient,
     checksumAuthoritySeedRows,
@@ -10,6 +11,7 @@ import {
     isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
+    resolveProjectRootDirectory,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
@@ -824,6 +826,32 @@ export function createTransform(deps: TransformDeps) {
                 sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
                 return;
             }
+            // Enforcement-artifact revalidation must run in Rust mode too:
+            // the TypeScript renderer's probe call sits after this early
+            // return, and without one here an edited or deleted artifact
+            // never withdraws ENFORCED maturity in a Rust-mode-only
+            // session. Same throttle and failure semantics as the TS-path
+            // call; the directory resolution mirrors the session-directory
+            // cache the TS path consults.
+            if (deps.memoryConfig?.enabled) {
+                try {
+                    const probeDirectory =
+                        deps.sessionDirectoryBySession?.get(sessionId) ??
+                        deps.directory ??
+                        process.cwd();
+                    revalidateEnforcementArtifacts(
+                        db,
+                        resolveProjectIdentity(probeDirectory),
+                        resolveProjectRootDirectory(probeDirectory),
+                    );
+                } catch (error) {
+                    sessionLog(
+                        sessionId,
+                        "artifact revalidation failed (retrying on a later pass):",
+                        error,
+                    );
+                }
+            }
             await rustModeTransform.run(sessionId, messages, output, sessionMeta);
             return;
         }
@@ -1561,6 +1589,26 @@ export function createTransform(deps: TransformDeps) {
                 memoryProjectDirectory,
                 notificationParams,
             );
+        }
+        if (projectIdentity) {
+            // Ongoing enforcement-artifact revalidation: ENFORCED maturity is
+            // earned by exact artifact bytes, and deleting or editing the
+            // recorded file must withdraw the rung instead of standing
+            // forever. Internally throttled (one filesystem pass per project
+            // per interval); failures are non-fatal and retry on a later
+            // pass.
+            try {
+                revalidateEnforcementArtifacts(
+                    db,
+                    projectIdentity,
+                    resolveProjectRootDirectory(memoryProjectDirectory),
+                );
+            } catch (error) {
+                sessionLog(
+                    sessionId,
+                    `enforcement artifact revalidation failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
         }
         // Session-scoped project identity for note-nudge and auto-search, which
         // must target the SESSION's project — not the launch cwd. `deps.projectPath`

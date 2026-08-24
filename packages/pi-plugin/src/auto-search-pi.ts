@@ -54,17 +54,19 @@ import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
+import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import type {
 	UnifiedSearchOptions,
 	UnifiedSearchResult,
 } from "@magic-context/core/features/magic-context/search";
 import { unifiedSearch } from "@magic-context/core/features/magic-context/search";
 import {
+	type AutoSearchHintDecision,
 	type AutoSearchHintNoHintReason,
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { buildAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import { packAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
 import { extractBoundedAutoSearchQuery } from "@magic-context/core/hooks/magic-context/auto-search-prompt";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -123,6 +125,7 @@ async function unifiedSearchWithTimeout(
 				// Auto hints are plugin-internal surfacing, not explicit agent
 				// retrievals; match OpenCode lines 69-73 and search.ts lines 77-84.
 				countRetrievals: false,
+				memoryPolicySurface: "auto_search",
 			}),
 			timeoutPromise,
 		]);
@@ -265,14 +268,26 @@ export async function runAutoSearchHintForPi(args: {
 	if (found === null) return messages;
 
 	const { message: userMsg, messageId: userMsgId } = found;
+	// A persisted hint replays only while every contributing memory is still
+	// auto_search-eligible: a later policy transition must not keep sending
+	// the fragment through the stored text. Mirrors the OpenCode runner.
+	const replayHintIfEligible = (decision: AutoSearchHintDecision): void => {
+		if (decision.decision !== "hint") return;
+		if (!autoSearchHintFragmentsStillEligible(db, decision.memoryFragments)) {
+			sessionLog(
+				sessionId,
+				`auto-search: suppressing persisted hint for ${decision.messageId} — a contributing memory is no longer eligible`,
+			);
+			return;
+		}
+		appendHintToUserMessage(userMsg, decision.text);
+	};
 	const existing = getAutoSearchHintDecisions(db, sessionId);
 	const existingForMessage = existing.find(
 		(decision) => decision.messageId === userMsgId,
 	);
 	if (existingForMessage) {
-		if (existingForMessage.decision === "hint") {
-			appendHintToUserMessage(userMsg, existingForMessage.text);
-		}
+		replayHintIfEligible(existingForMessage);
 		return messages;
 	}
 	if (strictResolutionFailed) {
@@ -294,11 +309,8 @@ export async function runAutoSearchHintForPi(args: {
 			reason,
 		});
 		if (!outcome.ok) return;
-		if (
-			outcome.kind === "already-present" &&
-			outcome.decision.decision === "hint"
-		) {
-			appendHintToUserMessage(userMsg, outcome.decision.text);
+		if (outcome.kind === "already-present") {
+			replayHintIfEligible(outcome.decision);
 		}
 	};
 
@@ -390,24 +402,46 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
-	const hintText = buildAutoSearchHint(results);
-	if (!hintText) {
+	const packed = packAutoSearchHint(results);
+	if (!packed.text) {
 		writeNoHintAndReconcile("empty");
 		return messages;
 	}
 
 	// Prefix with double newline so the hint is a separate block, matching
 	// OpenCode lines 268-270.
-	const payload = `\n\n${hintText}`;
+	const payload = `\n\n${packed.text}`;
+	// Record exactly the memories whose fragments the packed hint carries —
+	// each bound to the exact SHA-256 digest of the LOADED bytes the search
+	// lane ranked (carried on the result itself, so a rewrite between the
+	// lane's recheck and this persist cannot pair the packed text with the
+	// new revision's identity). A result without a digest records an empty
+	// hash and fails closed rather than going silently untracked.
+	const seenFragmentIds = new Set<number>();
+	const memoryFragments: Array<{ id: number; hash: string }> = [];
+	for (const result of packed.delivered) {
+		if (result.source !== "memory" || seenFragmentIds.has(result.memoryId)) {
+			continue;
+		}
+		seenFragmentIds.add(result.memoryId);
+		memoryFragments.push({
+			id: result.memoryId,
+			hash: result.contentDigest ?? "",
+		});
+	}
 	const outcome = appendAutoSearchHintDecision(db, sessionId, {
 		messageId: userMsgId,
 		decision: "hint",
 		text: payload,
+		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	if (outcome.decision.decision === "hint") {
-		appendHintToUserMessage(userMsg, outcome.decision.text);
-	}
+	// Both the CAS-winning fresh decision and a concurrently persisted one go
+	// through the same eligibility gate: a contributing memory can be
+	// quarantined, rejected, or rewritten between the search lane's recheck
+	// and this persist, and the current prompt must never receive a fragment
+	// the policy has since hidden.
+	replayHintIfEligible(outcome.decision);
 	sessionLog(
 		sessionId,
 		`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,

@@ -26,6 +26,16 @@ import {
 import { invalidateMemory } from "../../features/magic-context/memory/embedding-cache";
 import { computeNormalizedHash } from "../../features/magic-context/memory/normalize-hash";
 import {
+    bindMemoriesToCurrentRevision,
+    decideMemoryPolicy,
+    exactMemoryContentDigests,
+    filterMemoriesByPolicy,
+    hasClaimEffectivePolicy,
+    memoriesEligibleForEmbedding,
+    readMemoryPolicyRows,
+} from "../../features/magic-context/memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../../features/magic-context/memory/storage-claims";
+import {
     hasMemoryClassifiedAtColumn,
     hasMemoryShareableColumn,
     type MemoryClaimOperationIdentity,
@@ -58,6 +68,7 @@ import {
     toolCallIdFromContext,
 } from "../../plugin/rust-tool-backends";
 import { sessionLog } from "../../shared/logger";
+import type { Database } from "../../shared/sqlite";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
 import {
@@ -145,7 +156,7 @@ function moduleMemoryText(response: unknown, args: CtxMemoryArgs): string | null
     return null;
 }
 
-function formatMemoryList(memories: Memory[]): string {
+function formatMemoryList(memories: Memory[], policyLabels?: Map<number, string>): string {
     if (memories.length === 0) {
         return "No active memories found.";
     }
@@ -155,6 +166,7 @@ function formatMemoryList(memories: Memory[]): string {
         category: memory.category,
         status: memory.status,
         verification: memory.verificationStatus,
+        trust: policyLabels?.get(memory.id) ?? "",
         updated: new Date(memory.updatedAt).toISOString(),
         content: memory.content.replace(/\s+/g, " ").trim(),
     }));
@@ -163,6 +175,7 @@ function formatMemoryList(memories: Memory[]): string {
         category: "CATEGORY",
         status: "STATUS",
         verification: "VERIFY",
+        trust: "TRUST",
         updated: "UPDATED",
         content: "CONTENT",
     };
@@ -174,6 +187,7 @@ function formatMemoryList(memories: Memory[]): string {
             headers.verification.length,
             ...rows.map((row) => row.verification.length),
         ),
+        trust: Math.max(headers.trust.length, ...rows.map((row) => row.trust.length)),
         updated: Math.max(headers.updated.length, ...rows.map((row) => row.updated.length)),
     };
     const formatRow = (row: (typeof rows)[number] | typeof headers) =>
@@ -182,6 +196,7 @@ function formatMemoryList(memories: Memory[]): string {
             row.category.padEnd(widths.category),
             row.status.padEnd(widths.status),
             row.verification.padEnd(widths.verification),
+            row.trust.padEnd(widths.trust),
             row.updated.padEnd(widths.updated),
             row.content,
         ].join(" | ");
@@ -195,6 +210,7 @@ function formatMemoryList(memories: Memory[]): string {
             "-".repeat(widths.category),
             "-".repeat(widths.status),
             "-".repeat(widths.verification),
+            "-".repeat(widths.trust),
             "-".repeat(widths.updated),
             "-------",
         ].join("-+-"),
@@ -223,6 +239,7 @@ const GET_MAX_IDS = 20;
 function formatGetOutput(args: {
     requestedIds: number[];
     memoriesById: Map<number, Memory>;
+    policyLabels?: Map<number, string>;
 }): string {
     const parts: string[] = [];
     for (const id of args.requestedIds) {
@@ -230,7 +247,7 @@ function formatGetOutput(args: {
         if (!memory) {
             parts.push(GET_NOT_VISIBLE_MESSAGE(id));
         } else {
-            parts.push(formatMemoryList([memory]));
+            parts.push(formatMemoryList([memory], args.policyLabels));
         }
     }
     return parts.join("\n\n");
@@ -247,9 +264,36 @@ function queueMemoryEmbedding(args: {
     if (!snapshot?.enabled) {
         return;
     }
+    // Hard-hidden / rejected content never leaves the process, remote
+    // embedding providers included.
+    if (!memoriesEligibleForEmbedding(args.deps.db, [args.memoryId]).has(args.memoryId)) {
+        return;
+    }
 
     const normalizedHash = computeNormalizedHash(args.content);
+    const contentDigest = sha256Utf8Hex(args.content);
     void (async () => {
+        // The queued closure runs after an arbitrary delay: re-check
+        // eligibility at the provider boundary and bind it to the exact bytes
+        // this closure captured, so a quarantine/rejection or rewrite that
+        // landed after enqueue cannot leak the content to the provider.
+        if (!memoriesEligibleForEmbedding(args.deps.db, [args.memoryId]).has(args.memoryId)) {
+            sessionLog(
+                args.sessionId,
+                `memory embedding skipped for memory ${args.memoryId}: no longer eligible at provider drain.`,
+            );
+            return;
+        }
+        if (
+            exactMemoryContentDigests(args.deps.db, [args.memoryId]).get(args.memoryId) !==
+            contentDigest
+        ) {
+            sessionLog(
+                args.sessionId,
+                `memory embedding skipped for memory ${args.memoryId}: content changed before the provider call.`,
+            );
+            return;
+        }
         const result = await embedTextForProject(args.projectPath, args.content);
         if (!result) {
             sessionLog(
@@ -293,6 +337,36 @@ function getValidatedCategory(category: string | undefined): MemoryCategory | nu
     }
 
     return trimmedCategory;
+}
+
+/**
+ * Map native `module_row_id` values to TypeScript `memories.id` through the
+ * mirror. The two id spaces are allowed to differ (`mirror_identity` records
+ * the pairing per project), so a module-lane id must be translated before any
+ * claims-database lookup. An id without an identity row maps to nothing: it
+ * names a native row the mirror has not synced back, which has no claim or
+ * policy row to consult yet. When the mirror table does not exist (module
+ * authority was never prepared on this database) ids map to themselves.
+ */
+function translateModuleMemoryIds(
+    db: Database,
+    projectPath: string,
+    ids: readonly number[],
+): Map<number, number> {
+    const hasMirror = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mirror_identity'")
+        .get();
+    if (!hasMirror) return new Map(ids.map((id) => [id, id]));
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = db
+        .prepare(
+            `SELECT module_row_id AS moduleId, context_row_id AS contextId
+               FROM mirror_identity
+              WHERE domain = 'memories' AND module_project = ?
+                AND module_row_id IN (${placeholders})`,
+        )
+        .all(projectPath, ...ids) as Array<{ moduleId: number; contextId: number }>;
+    return new Map(rows.map((row) => [row.moduleId, row.contextId]));
 }
 
 function getDisabledMessage(): string {
@@ -502,6 +576,90 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         if (!memoryBackend) {
                             return "Error: Rust memory authority is active, but this module transport does not support ctx_memory.";
                         }
+                        // The native store carries no claim-policy fields; the
+                        // TypeScript claims database stays the policy
+                        // authority. Gate id-based targets here so a row the
+                        // policy hides after mirroring cannot be read or
+                        // mutated through the module lane. Agent-visible ids
+                        // under MODULE authority are native module_row_id
+                        // values, so translate them through the mirror before
+                        // keying the claims database.
+                        // Sub-verified rows stay readable through explicit get
+                        // but must keep their sanitized trust labels: the
+                        // native response text carries none, so the labels
+                        // collected here are attached to the get output below,
+                        // matching the TypeScript path's TRUST framing.
+                        const moduleGetTrustLabels = new Map<number, string>();
+                        if (args.ids && args.ids.length > 0 && hasClaimEffectivePolicy(deps.db)) {
+                            const contextIdByModuleId = translateModuleMemoryIds(
+                                deps.db,
+                                projectPath,
+                                args.ids,
+                            );
+                            const policyRows = readMemoryPolicyRows(deps.db, [
+                                ...contextIdByModuleId.values(),
+                            ]);
+                            const denied = args.ids.find((id) => {
+                                const contextId = contextIdByModuleId.get(id);
+                                return (
+                                    contextId !== undefined &&
+                                    !decideMemoryPolicy(
+                                        policyRows.get(contextId),
+                                        "explicit_search",
+                                    ).eligible
+                                );
+                            });
+                            if (denied !== undefined) {
+                                return args.action === "merge"
+                                    ? "Error: One or more source memories were not found."
+                                    : `Error: Memory with ID ${denied} was not found.`;
+                            }
+                            if (args.action === "get") {
+                                for (const id of args.ids) {
+                                    const contextId = contextIdByModuleId.get(id);
+                                    if (contextId === undefined) continue;
+                                    const decision = decideMemoryPolicy(
+                                        policyRows.get(contextId),
+                                        "explicit_search",
+                                    );
+                                    if (decision.label) {
+                                        moduleGetTrustLabels.set(id, decision.label);
+                                    }
+                                }
+                            }
+                        }
+                        // A write carries no ids, but the native store dedups
+                        // by normalized hash and returns the existing row's id
+                        // (bumping its seen count). The TypeScript claims
+                        // database stays the policy authority, so content that
+                        // duplicates a policy-hidden row must get the same
+                        // uniform refusal the TS-authority write path returns
+                        // instead of confirming the hidden row's existence.
+                        if (
+                            args.action === "write" &&
+                            args.content &&
+                            hasClaimEffectivePolicy(deps.db)
+                        ) {
+                            const category = getValidatedCategory(args.category?.trim() ?? "");
+                            const duplicate = category
+                                ? getMemoryByHash(
+                                      deps.db,
+                                      projectPath,
+                                      category,
+                                      computeNormalizedHash(args.content.trim()),
+                                  )
+                                : null;
+                            if (duplicate) {
+                                const policyRows = readMemoryPolicyRows(deps.db, [duplicate.id]);
+                                const decision = decideMemoryPolicy(
+                                    policyRows.get(duplicate.id),
+                                    "explicit_search",
+                                );
+                                if (!decision.eligible) {
+                                    return `Error: Memory could not be saved in ${category}.`;
+                                }
+                            }
+                        }
                         try {
                             const text = moduleMemoryText(
                                 await memoryBackend({
@@ -518,6 +676,73 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 }),
                                 args,
                             );
+                            // Post-call revalidation: the native request is
+                            // an await window and the native store carries no
+                            // policy fields — a quarantine or rejection
+                            // committed while it ran must not be published
+                            // (get) or confirmed (mutations). Re-run the same
+                            // decision the pre-call gate used; a target
+                            // hidden mid-flight gets the uniform not-found
+                            // refusal, and a native mutation that already
+                            // applied is reconciled by the deletion lane on
+                            // the epoch bump that hid the row. Get trust
+                            // labels are rebuilt from this fresh read so a
+                            // label change during the call is also honored.
+                            if (
+                                text !== null &&
+                                !text.startsWith("Error:") &&
+                                args.ids &&
+                                args.ids.length > 0 &&
+                                hasClaimEffectivePolicy(deps.db)
+                            ) {
+                                const contextIdByModuleId = translateModuleMemoryIds(
+                                    deps.db,
+                                    projectPath,
+                                    args.ids,
+                                );
+                                const policyRows = readMemoryPolicyRows(deps.db, [
+                                    ...contextIdByModuleId.values(),
+                                ]);
+                                const deniedNow = args.ids.find((id) => {
+                                    const contextId = contextIdByModuleId.get(id);
+                                    return (
+                                        contextId !== undefined &&
+                                        !decideMemoryPolicy(
+                                            policyRows.get(contextId),
+                                            "explicit_search",
+                                        ).eligible
+                                    );
+                                });
+                                if (deniedNow !== undefined) {
+                                    return args.action === "merge"
+                                        ? "Error: One or more source memories were not found."
+                                        : `Error: Memory with ID ${deniedNow} was not found.`;
+                                }
+                                if (args.action === "get") {
+                                    moduleGetTrustLabels.clear();
+                                    for (const id of args.ids) {
+                                        const contextId = contextIdByModuleId.get(id);
+                                        if (contextId === undefined) continue;
+                                        const decision = decideMemoryPolicy(
+                                            policyRows.get(contextId),
+                                            "explicit_search",
+                                        );
+                                        if (decision.label) {
+                                            moduleGetTrustLabels.set(id, decision.label);
+                                        }
+                                    }
+                                }
+                            }
+                            if (
+                                text !== null &&
+                                !text.startsWith("Error:") &&
+                                moduleGetTrustLabels.size > 0
+                            ) {
+                                const labelLines = [...moduleGetTrustLabels.entries()].map(
+                                    ([id, label]) => `- ID ${id}: ${label}`,
+                                );
+                                return `${text}\n\nTrust labels (sub-verified results):\n${labelLines.join("\n")}`;
+                            }
                             return (
                                 text ??
                                 "Error: Rust module returned an invalid ctx_memory response."
@@ -590,6 +815,20 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     workspaceIdentitySet.identities.length > 1
                         ? targetIdentityForStoredPath(memory.projectPath) === projectPath
                         : memoryBelongsToProject(memory, projectPath);
+                // Hard-hidden and rejected rows return uniform absence on
+                // every agent surface — including as MUTATION targets:
+                // updating a policy-hidden memory would mint a fresh current
+                // revision without the old revision's disposition and
+                // resurface the content. One decision covers every id-based
+                // branch (update, merge, archive) for every agent, so the
+                // dreamer cannot feed hidden content back into its prompts
+                // either.
+                const memoryPolicyDeniesToolTarget = (memoryIds: readonly number[]): boolean => {
+                    const rows = readMemoryPolicyRows(deps.db, memoryIds);
+                    return memoryIds.some(
+                        (id) => !decideMemoryPolicy(rows.get(id), "explicit_search").eligible,
+                    );
+                };
                 const embeddingSnapshot = getProjectEmbeddingSnapshot(projectPath);
                 if (
                     embeddingSnapshot
@@ -628,8 +867,19 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         const replay = readMemoryClaimOperationResult<{
                             memoryId: number;
                             duplicate?: boolean;
+                            denied?: boolean;
                         }>(deps.db, envelope);
                         if (replay) {
+                            if (replay.result.denied) {
+                                return `Error: Memory could not be saved in ${category}.`;
+                            }
+                            // The outcome was stored while the memory was
+                            // visible; a quarantine/rejection since then must
+                            // not leak the id through a committed-but-unacked
+                            // retry. Same uniform refusal as a fresh denial.
+                            if (memoryPolicyDeniesToolTarget([replay.result.memoryId])) {
+                                return `Error: Memory could not be saved in ${category}.`;
+                            }
                             return replay.result.duplicate
                                 ? `Memory already exists [ID: ${replay.result.memoryId}] in ${category} (seen count incremented).`
                                 : `Saved memory [ID: ${replay.result.memoryId}] in ${category}.`;
@@ -644,6 +894,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                     runMemoryClaimOperationInCurrentTransaction<{
                                         memoryId: number;
                                         duplicate: boolean;
+                                        denied?: boolean;
                                     }>(deps.db, envelope, () => {
                                         const existing = getMemoryByHash(
                                             deps.db,
@@ -652,6 +903,21 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                             normalizedHash,
                                         );
                                         if (existing) {
+                                            // A policy-hidden duplicate returns
+                                            // uniform refusal: the UNIQUE row
+                                            // cannot be re-inserted, and both
+                                            // its id and its seen count must
+                                            // stay undisclosed and untouched.
+                                            if (memoryPolicyDeniesToolTarget([existing.id])) {
+                                                return {
+                                                    result: {
+                                                        memoryId: existing.id,
+                                                        duplicate: true,
+                                                        denied: true,
+                                                    },
+                                                    effects: [],
+                                                };
+                                            }
                                             updateMemorySeenCount(deps.db, existing.id);
                                             return {
                                                 result: { memoryId: existing.id, duplicate: true },
@@ -668,6 +934,26 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                                     ? "dreamer"
                                                     : getSourceType(deps),
                                         });
+                                        if (!inserted.inserted) {
+                                            // Raced duplicate recovered from the unique
+                                            // constraint: same policy-before-mutation
+                                            // contract as the pre-check branch above —
+                                            // a hidden row's id and seen count stay
+                                            // undisclosed and untouched.
+                                            if (
+                                                memoryPolicyDeniesToolTarget([inserted.memory.id])
+                                            ) {
+                                                return {
+                                                    result: {
+                                                        memoryId: inserted.memory.id,
+                                                        duplicate: true,
+                                                        denied: true,
+                                                    },
+                                                    effects: [],
+                                                };
+                                            }
+                                            updateMemorySeenCount(deps.db, inserted.memory.id);
+                                        }
                                         return {
                                             result: {
                                                 memoryId: inserted.memory.id,
@@ -679,6 +965,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 ),
                             )
                             .immediate();
+                        if (outcome.result.denied) {
+                            return `Error: Memory could not be saved in ${category}.`;
+                        }
                         if (outcome.result.duplicate) {
                             if (!outcome.replayed) {
                                 requestRustMemorySync(deps, toolContext.sessionID);
@@ -705,6 +994,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         normalizedHash,
                     );
                     if (existingMemory) {
+                        if (memoryPolicyDeniesToolTarget([existingMemory.id])) {
+                            return `Error: Memory could not be saved in ${category}.`;
+                        }
                         updateMemorySeenCount(deps.db, existingMemory.id);
                         requestRustMemorySync(deps, toolContext.sessionID);
                         return `Memory already exists [ID: ${existingMemory.id}] in ${category} (seen count incremented).`;
@@ -725,6 +1017,14 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         writeIdentity,
                     );
                     if (!insertResult.inserted) {
+                        // The recovery is non-mutating, so the policy decision
+                        // runs before the raced row is touched: a hidden
+                        // duplicate gets the uniform refusal with its seen
+                        // count intact.
+                        if (memoryPolicyDeniesToolTarget([insertResult.memory.id])) {
+                            return `Error: Memory could not be saved in ${category}.`;
+                        }
+                        updateMemorySeenCount(deps.db, insertResult.memory.id);
                         requestRustMemorySync(deps, toolContext.sessionID);
                         return `Memory already exists [ID: ${insertResult.memory.id}] in ${category} (seen count incremented).`;
                     }
@@ -744,12 +1044,38 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 if (args.action === "list") {
                     const limit = normalizeLimit(args.limit);
                     const category = normalizeCategory(args.category);
-                    const memories = filterByCategory(
-                        getMemoriesByProject(deps.db, projectPath),
-                        category,
-                    ).slice(0, limit);
-
-                    return formatMemoryList(memories);
+                    // The explicit-surface decision applies before the limit:
+                    // hard-hidden rows get uniform absence; sub-verified rows
+                    // keep sanitized trust labels.
+                    const policyFiltered = filterMemoriesByPolicy(
+                        deps.db,
+                        filterByCategory(getMemoriesByProject(deps.db, projectPath), category),
+                        "explicit_search",
+                    );
+                    // Final gate from ONE snapshot: policy and the exact
+                    // revision digest are read inside one deferred read
+                    // transaction, so the decision and the digest describe
+                    // the same revision — and the loaded bytes must match
+                    // it. Separate autocommit reads let a rewrite or hide
+                    // committed between them publish superseded or hidden
+                    // content.
+                    const bound = bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories);
+                    const recheck = deps.db.transaction(() => {
+                        const filtered = filterMemoriesByPolicy(deps.db, bound, "explicit_search");
+                        const digests = exactMemoryContentDigests(
+                            deps.db,
+                            filtered.memories.map((memory) => memory.id),
+                        );
+                        return {
+                            memories: filtered.memories.filter(
+                                (memory) =>
+                                    digests.get(memory.id) === sha256Utf8Hex(memory.content),
+                            ),
+                            labels: filtered.labels,
+                        };
+                    })();
+                    const memories = recheck.memories.slice(0, limit);
+                    return formatMemoryList(memories, recheck.labels);
                 }
 
                 if (args.action === "get") {
@@ -764,14 +1090,37 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     // each requested id exactly once and never reflects a row twice.
                     const uniqueIds = [...new Set(getIds)];
                     const fetched = getMemoriesByIds(deps.db, uniqueIds);
+                    const policyFiltered = filterMemoriesByPolicy(
+                        deps.db,
+                        fetched.filter((memory) => memoryVisibleToTool(memory)),
+                        "explicit_search",
+                    );
+                    // Final gate from ONE snapshot (see the list branch): the
+                    // policy decision and the exact revision digest must
+                    // describe the same revision, and the loaded bytes must
+                    // match it.
+                    const bound = bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories);
+                    const recheck = deps.db.transaction(() => {
+                        const filtered = filterMemoriesByPolicy(deps.db, bound, "explicit_search");
+                        const digests = exactMemoryContentDigests(
+                            deps.db,
+                            filtered.memories.map((memory) => memory.id),
+                        );
+                        return {
+                            memories: filtered.memories.filter(
+                                (memory) =>
+                                    digests.get(memory.id) === sha256Utf8Hex(memory.content),
+                            ),
+                            labels: filtered.labels,
+                        };
+                    })();
                     const memoriesById = new Map<number, Memory>(
-                        fetched
-                            .filter((memory) => memoryVisibleToTool(memory))
-                            .map((memory) => [memory.id, memory]),
+                        recheck.memories.map((memory) => [memory.id, memory]),
                     );
                     return formatGetOutput({
                         requestedIds: uniqueIds,
                         memoriesById,
+                        policyLabels: recheck.labels,
                     });
                 }
 
@@ -803,6 +1152,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             category: string;
                         }>(deps.db, toClaimOperationEnvelope(updateIdentity));
                         if (replay) {
+                            // The stored outcome predates any later
+                            // quarantine/rejection: refuse instead of
+                            // re-disclosing a now-hidden id on retry.
+                            if (memoryPolicyDeniesToolTarget([replay.result.memoryId])) {
+                                return `Error: Memory with ID ${updateId} was not found.`;
+                            }
                             return `Updated memory [ID: ${replay.result.memoryId}] in ${replay.result.category}.`;
                         }
                     }
@@ -814,7 +1169,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             ? memoryVisibleToTool(memory)
                             : memoryOwnedByTool(memory)
                         : false;
-                    if (!memory || !rawProjectPath || !updateAllowed) {
+                    if (
+                        !memory ||
+                        !rawProjectPath ||
+                        !updateAllowed ||
+                        memoryPolicyDeniesToolTarget([updateId])
+                    ) {
                         return `Error: Memory with ID ${updateId} was not found.`;
                     }
                     if (toolContext.agent !== DREAMER_AGENT && !isPrimaryMutableMemory(memory)) {
@@ -828,14 +1188,29 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         normalizedHash,
                     );
                     if (duplicate && duplicate.id !== memory.id) {
-                        return `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`;
+                        // Never disclose a policy-hidden duplicate's id; the
+                        // UNIQUE constraint forces a refusal either way.
+                        return memoryPolicyDeniesToolTarget([duplicate.id])
+                            ? "Error: Memory content already exists; choose different content."
+                            : `Error: Memory content already exists as ID ${duplicate.id}; merge or archive duplicates instead.`;
                     }
 
                     const projectIdentity = targetIdentityForStoredPath(rawProjectPath);
                     let replayed = false;
+                    let deniedInTransaction = false;
                     deps.db
                         .transaction(() =>
                             withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
+                                // The visibility snapshot above ran outside
+                                // this transaction: another process can
+                                // quarantine or reject the target in the gap,
+                                // and appending a successor revision would
+                                // strip the hidden revision's disposition.
+                                // Re-evaluate while holding the write lock.
+                                if (memoryPolicyDeniesToolTarget([memory.id])) {
+                                    deniedInTransaction = true;
+                                    return;
+                                }
                                 if (updateIdentity && claimsSchema) {
                                     // The tool owns the envelope so the stored
                                     // result carries the category; the storage
@@ -888,6 +1263,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             }),
                         )
                         .immediate();
+                    if (deniedInTransaction) {
+                        return `Error: Memory with ID ${updateId} was not found.`;
+                    }
                     if (replayed) {
                         return `Updated memory [ID: ${memory.id}] in ${memory.category}.`;
                     }
@@ -942,6 +1320,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             category: string;
                         }>(deps.db, toClaimOperationEnvelope(mergeIdentity));
                         if (replay) {
+                            // The stored outcome predates any later
+                            // quarantine/rejection: refuse instead of
+                            // re-disclosing a now-hidden id on retry.
+                            if (memoryPolicyDeniesToolTarget([replay.result.memoryId])) {
+                                return "Error: One or more source memories were not found.";
+                            }
                             const supersededIds = ids.filter((id) => id !== replay.result.memoryId);
                             return `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${replay.result.memoryId}] in ${replay.result.category}; superseded [${supersededIds.join(", ")}].`;
                         }
@@ -960,6 +1344,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             : "Error: A valid category is required when action is 'merge'.";
                     }
                     if (sourceMemories.length !== ids.length) {
+                        return "Error: One or more source memories were not found.";
+                    }
+                    if (memoryPolicyDeniesToolTarget(ids)) {
                         return "Error: One or more source memories were not found.";
                     }
                     // Cross-identity consolidation is a DREAMER-ONLY capability: the
@@ -1055,6 +1442,16 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     const canonicalMemoryId = deps.db
                         .transaction(() =>
                             withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
+                                // The source-visibility snapshot ran outside
+                                // this transaction: re-evaluate every source
+                                // while holding the write lock so a target
+                                // hidden in the gap is neither superseded nor
+                                // resurfaced through the merged successor.
+                                if (memoryPolicyDeniesToolTarget(ids)) {
+                                    mergeConflict =
+                                        "Error: One or more source memories were not found.";
+                                    return null;
+                                }
                                 if (mergeIdentity && claimsSchema) {
                                     const replay = readMemoryClaimOperationResult<{
                                         memoryId: number;
@@ -1076,7 +1473,11 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                         ? lockedDuplicate
                                         : null;
                                 if (lockedDuplicate && !canonicalExisting) {
-                                    mergeConflict = `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
+                                    mergeConflict = memoryPolicyDeniesToolTarget([
+                                        lockedDuplicate.id,
+                                    ])
+                                        ? "Error: Memory content already exists; choose different content."
+                                        : `Error: Memory content already exists as ID ${lockedDuplicate.id}; update or archive existing duplicates instead.`;
                                     return null;
                                 }
 
@@ -1215,6 +1616,16 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         );
                     });
                     if (archiveReplay) {
+                        // The stored outcomes predate any later quarantine or
+                        // rejection: refuse instead of re-confirming a
+                        // now-hidden id on retry — the same gate fresh
+                        // archives and the update replay apply.
+                        const deniedId = archiveIds.find((memoryId) =>
+                            memoryPolicyDeniesToolTarget([memoryId]),
+                        );
+                        if (deniedId !== undefined) {
+                            return `Error: Memory with ID ${deniedId} was not found.`;
+                        }
                         const idList = archiveIds.join(", ");
                         const plural = archiveIds.length > 1 ? "memories" : "memory";
                         return args.reason?.trim()
@@ -1234,7 +1645,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 ? memoryVisibleToTool(memory)
                                 : memoryOwnedByTool(memory)
                             : false;
-                        if (!memory || !rawProjectPath || !archiveAllowed) {
+                        if (
+                            !memory ||
+                            !rawProjectPath ||
+                            !archiveAllowed ||
+                            memoryPolicyDeniesToolTarget([memoryId])
+                        ) {
                             return `Error: Memory with ID ${memoryId} was not found.`;
                         }
                         if (
@@ -1252,9 +1668,23 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         });
                     }
 
+                    let archiveDeniedInTransaction = false;
                     deps.db
                         .transaction(() =>
                             withMemoryClaimGenerationContextInCurrentTransaction(deps.db, () => {
+                                // The per-target visibility loop above ran
+                                // outside this transaction: re-evaluate the
+                                // whole batch while holding the write lock so
+                                // a target hidden in the gap is not mutated
+                                // (all-or-nothing, matching the batch below).
+                                if (
+                                    memoryPolicyDeniesToolTarget(
+                                        targets.map((target) => target.memoryId),
+                                    )
+                                ) {
+                                    archiveDeniedInTransaction = true;
+                                    return;
+                                }
                                 for (const target of targets) {
                                     const replayed = archiveMemory(
                                         deps.db,
@@ -1273,6 +1703,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                             }),
                         )
                         .immediate();
+                    if (archiveDeniedInTransaction) {
+                        return "Error: One or more memories were not found.";
+                    }
                     requestRustMemorySync(deps, toolContext.sessionID);
                     const idList = targets.map((t) => t.memoryId).join(", ");
                     const plural = targets.length > 1 ? "memories" : "memory";

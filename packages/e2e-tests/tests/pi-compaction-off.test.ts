@@ -11,7 +11,7 @@ import {
 import { join } from "node:path";
 
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
-import { insertMemory } from "../../plugin/src/features/magic-context/memory/storage-memory";
+import { insertMemory, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory/storage-memory";
 import { PiTestHarness } from "../src/pi-harness";
 import { openTestDb } from "../src/test-db";
 
@@ -57,12 +57,15 @@ describe("Pi compaction-off mode", () => {
 			);
 			const db = openTestDb(h.contextDbPath(), { readwrite: true });
 			try {
-				insertMemory(db, {
+				const seeded = insertMemory(db, {
 					projectPath: resolveProjectIdentity(realpathSync(h.env.workdir)),
 					category: "ARCHITECTURE",
 					content: "Pi compaction-off memory survives native compaction.",
-					sourceType: "historian",
+					sourceType: "user",
 				});
+				// Synchronous promotion: the async policy evaluator may not have
+				// marked the row eligible before the next turn renders memory.
+				updateMemoryVerification(db, seeded.id, "verified");
 			} finally {
 				db.close();
 			}

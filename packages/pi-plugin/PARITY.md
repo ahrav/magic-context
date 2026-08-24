@@ -345,7 +345,7 @@ deliberate and source-justified.
   structurally eliminates the stale-signature mismatch and needs no gate.
   **Redacted blocks are the exception**: they serialize `redacted` BEFORE the
   empty-thinking check (`transform-messages.ts`, `anthropic.ts`), so emptying one
-  + dropping its signature would put a malformed redacted block (no data, no sig)
+  - dropping its signature would put a malformed redacted block (no data, no sig)
   on the wire. They carry no plaintext to save, so Pi keeps them verbatim — safe
   and byte-stable.
 
@@ -956,7 +956,7 @@ Both harness twins now pre-execute a due fold off-wire and feed the shared `fold
 ### Model-key and model-indexed lookup audit
 
 | Site | Comparison / lookup discipline |
-|---|---|
+| --- | --- |
 | Pi `readCurrentMarkersFromCompartments` and `readFrozenM0InputsPi` | Canonicalize the live Pi-native model before marker persistence. |
 | Pi `mustMaterializePi` | Canonicalizes both live `hard.modelKey` and stored `cachedM0ModelKey`; aliases match, genuinely different models fold once. |
 | Pi `cachedPiRowMatchesSnapshot` | Canonicalizes both cached-row and in-process snapshot keys before the soft-refresh CAS comparison. |
@@ -967,3 +967,17 @@ Both harness twins now pre-execute a due fold off-wire and feed the shared `fold
 | `last_observed_model_key` | Write paths canonicalize it and OpenCode readers canonicalize both sides. Pi's pressure writer does not populate this OpenCode usage-attribution field, so an empty value on the incident session is expected; Pi HARD-fold identity comes from `liveModelBySession`, not this column. |
 
 Workspace fingerprints preserve the distinction between SQL `NULL` (not workspaced) and a non-empty hash. The compare normalizes only nullish values to `null`; it does not coerce `NULL` to `""`. A legacy zero-length fingerprint would therefore trigger one self-healing fold whose write stores the current `null`, not a per-pass loop.
+
+## 33. Claim policy: native memory mirror is pre-filtered, not sidecar-synchronized
+
+OpenCode and Pi apply the same claim-policy decisions (one shared evaluator,
+same commands, same labels, same automatic gates). The native module lane
+differs in mechanism, not in trust posture: instead of a separate policy
+sidecar protocol, the TypeScript host pre-filters the `mc_memories` mirror to
+policy-eligible automatic rows before any state-sync page leaves the host, and
+automatic-eligibility flips bump the project memory epoch so the module
+re-seeds. The module therefore never holds policy-hidden content, and Rust
+carries no taint or maturity derivation. Consequence: native explicit memory
+surfaces are stricter than TypeScript explicit search (candidate/labeled rows
+are absent natively until they reach effective VERIFIED). U8's retrieval
+projection replaces this producer.

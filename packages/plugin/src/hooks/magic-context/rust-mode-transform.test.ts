@@ -2047,7 +2047,12 @@ describe("Rust mode authority adapter", () => {
         expect(Buffer.byteLength(JSON.stringify(requestBodies[1]))).toBeLessThan(
             MODULE_PAGE_MAX_BYTES,
         );
-        expect(steadyElapsed).toBeLessThan(100);
+        // Loose wall-clock ceiling: the contract under test is the O(1)
+        // steady-state shape asserted above (empty page + tail delta), not a
+        // latency SLO. 100ms held locally but flaked on loaded CI runners; a
+        // linear re-send of 1,000 messages costs far more than 500ms there,
+        // so the bound still catches the regression this test guards.
+        expect(steadyElapsed).toBeLessThan(500);
     });
 
     it("keeps a multi-frame tail delta paged instead of rebuilding the full wire", async () => {
