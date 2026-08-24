@@ -311,7 +311,16 @@ export function autoSearchHintFragmentsStillEligible(
         return false;
     }
     const currentHashById = exactMemoryContentDigests(db, ids);
-    return fragments.every((fragment) => currentHashById.get(fragment.id) === fragment.hash);
+    if (!fragments.every((fragment) => currentHashById.get(fragment.id) === fragment.hash)) {
+        return false;
+    }
+    // The policy and digest reads above are separate autocommit snapshots: a
+    // hide committed BETWEEN them leaves the digest unchanged and would pass.
+    // Repeating the policy check after the digest read makes the policy read
+    // the LAST snapshot, so any hide committed before this line is caught;
+    // a rewrite committed between them changed the digest and already failed.
+    const rowsAfter = readMemoryPolicyRows(db, ids);
+    return ids.every((id) => decideMemoryPolicy(rowsAfter.get(id), "auto_search").eligible);
 }
 
 /**
@@ -560,7 +569,15 @@ export function recordedMemoryBlockStillBacked(
         return false;
     }
     const currentHashById = exactMemoryContentDigests(db, ids);
-    return ids.every((id, index) => currentHashById.get(id) === hashes[index]);
+    if (!ids.every((id, index) => currentHashById.get(id) === hashes[index])) {
+        return false;
+    }
+    // Same two-snapshot hazard as the sticky-hint gate: a hide committed
+    // between the policy read and the digest read leaves the digest
+    // unchanged. Repeat the policy check after the digest read so the
+    // policy snapshot is the last one taken.
+    const rowsAfter = readMemoryPolicyRows(db, ids);
+    return ids.every((id) => decideMemoryPolicy(rowsAfter.get(id), "auto_inject").eligible);
 }
 
 /**

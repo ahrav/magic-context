@@ -458,17 +458,37 @@ function explicitDispositionActive(
  * ponytail: derivation lineage of model summaries is not detectable for
  * legacy rows; U2 writers keep summaries on the source's independence_key. */
 export function countIndependentEvidenceGroups(db: Database, revisionId: number): number {
-    const row = db
+    // JOINT independence, not marginal cardinalities: the minimum of three
+    // distinct counts reads 2 for (keyA,run1,X), (keyA,run2,Y), (keyB,run1,Y)
+    // even though every pair shares a key, a run, or content — promoting a
+    // revision to CORROBORATED on evidence that is not independently rooted.
+    // The only consumer threshold is >= 2, so an exact pairwise scan for one
+    // fully-distinct pair decides the count; the row cap only bounds the
+    // quadratic scan and CANNOT under-report the >= 2 answer for realistic
+    // corpora (any fully-distinct pair inside the cap still fires).
+    const rows = db
         .prepare(
-            `SELECT COUNT(DISTINCT o.independence_key) AS byKey,
-                    COUNT(DISTINCT o.extractor_run_id) AS byRun,
-                    COUNT(DISTINCT o.content_sha256) AS byContent
+            `SELECT o.independence_key AS key, o.extractor_run_id AS run,
+                    o.content_sha256 AS content
              FROM claim_evidence e
              JOIN observations o ON o.id = e.observation_id
-             WHERE e.revision_id = ? AND e.relation = 'supports'`,
+             WHERE e.revision_id = ? AND e.relation = 'supports'
+             LIMIT 500`,
         )
-        .get(revisionId) as { byKey: number; byRun: number; byContent: number };
-    return Math.min(row.byKey, row.byRun, row.byContent);
+        .all(revisionId) as Array<{ key: string; run: string; content: string }>;
+    if (rows.length === 0) return 0;
+    for (let a = 0; a < rows.length; a += 1) {
+        for (let b = a + 1; b < rows.length; b += 1) {
+            if (
+                rows[a].key !== rows[b].key &&
+                rows[a].run !== rows[b].run &&
+                rows[a].content !== rows[b].content
+            ) {
+                return 2;
+            }
+        }
+    }
+    return 1;
 }
 
 /** Exact explicit-user evidence for this revision: a supports observation

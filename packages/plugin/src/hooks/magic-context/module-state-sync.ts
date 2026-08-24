@@ -218,6 +218,10 @@ export interface ModuleStateSyncPayload {
      * installs, retained for the post-send recheck. Top-level (not in
      * `params`), so it never crosses the wire. */
     memorySnapshotDigests?: ReadonlyMap<number, string>;
+    /** Digest per content-carrying mutation row (by mutation id), retained
+     * for the same post-send recheck — mutations install content the
+     * snapshot digests do not cover. Top-level, never crosses the wire. */
+    memoryMutationDigests?: ReadonlyMap<number, { targetMemoryId: number; digest: string }>;
 }
 
 /** The subset of sender state needed to serialize a state-sync payload. */
@@ -1812,6 +1816,11 @@ export async function buildModuleStateSyncPayload(args: {
     const userProfile = includeUserProfile
         ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)
         : [];
+    // Retained for the post-send recheck: a held-open compatibility writer
+    // can rewrite a mutation target while the sends are in flight without
+    // bumping the epoch, and the snapshot digests do not cover mutation
+    // content.
+    const boundMutationDigests = new Map<number, { targetMemoryId: number; digest: string }>();
     const memoryMutations = (() => {
         if (!memoryMutationsChanged || !args.pass.projectPath) return [];
         const rows = getMemoryMutationsForRenderByProjects(
@@ -1842,6 +1851,14 @@ export async function buildModuleStateSyncPayload(args: {
                 args.pass.sessionId,
                 `module sync dropped ${rows.length - bound.length} mutation(s) whose bytes no longer match the policy-evaluated revision`,
             );
+        }
+        for (const row of bound) {
+            if (typeof row.newContent === "string") {
+                boundMutationDigests.set(row.id, {
+                    targetMemoryId: row.targetMemoryId,
+                    digest: sha256Utf8Hex(row.newContent),
+                });
+            }
         }
         return bound.map((row) => ({
             id: row.id,
@@ -1988,10 +2005,16 @@ export async function buildModuleStateSyncPayload(args: {
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
-        return { ...wireBatches[0], wireBatches, memorySnapshotDigests };
+        return {
+            ...wireBatches[0],
+            wireBatches,
+            memorySnapshotDigests,
+            memoryMutationDigests: boundMutationDigests,
+        };
     }
     const livePayload: ModuleStateSyncPayload = {
         memorySnapshotDigests,
+        memoryMutationDigests: boundMutationDigests,
         method: "state_sync",
         params: {
             shadow_generation: args.state.moduleGeneration,
@@ -2334,6 +2357,29 @@ export async function syncModuleState(args: {
                     sessionLog(
                         args.pass.sessionId,
                         `module state sync rebuilding after send: ${rewritten.length} snapshot row(s) rewritten while the sync was in flight`,
+                    );
+                    force = true;
+                    continue;
+                }
+            }
+            // Mutations carry content the snapshot digests do not cover:
+            // re-prove each sent mutation's bytes against the claim-revision
+            // oracle the same way, or the sender would ack the mutation
+            // watermark for content a compatibility writer superseded while
+            // the call was in flight.
+            const sentMutationDigests = payload.memoryMutationDigests;
+            if (sentMutationDigests !== undefined && sentMutationDigests.size > 0) {
+                const targets = [...sentMutationDigests.values()].map(
+                    (entry) => entry.targetMemoryId,
+                );
+                const digestsNow = exactMemoryContentDigests(args.pass.db, targets);
+                const rewrittenMutations = [...sentMutationDigests.values()].filter(
+                    (entry) => digestsNow.get(entry.targetMemoryId) !== entry.digest,
+                );
+                if (rewrittenMutations.length > 0) {
+                    sessionLog(
+                        args.pass.sessionId,
+                        `module state sync rebuilding after send: ${rewrittenMutations.length} mutation target(s) rewritten while the sync was in flight`,
                     );
                     force = true;
                     continue;
