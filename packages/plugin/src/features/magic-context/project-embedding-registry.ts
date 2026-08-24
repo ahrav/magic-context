@@ -2143,7 +2143,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
         const db = dbForShadowQueue.get(item.projectIdentity);
         if (!db) return;
         const placeholders = item.ids.map(() => "?").join(",");
-        const rows = db
+        const loaded = db
             .prepare(
                 `SELECT id, content, normalized_hash FROM memories
                  WHERE project_path = ? AND id IN (${placeholders}) AND status = 'active'`,
@@ -2153,6 +2153,16 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             content: string;
             normalized_hash: string;
         }>;
+        // Re-check policy at drain time: a memory embedded while eligible can
+        // be quarantined or rejected while its shadow item waits behind other
+        // queue or backfill work, and uniform-absence content must not leave
+        // the process through the shadow provider. Every shadow path drains
+        // through this function, so this is the single choke point.
+        const eligibleIds = memoriesEligibleForEmbedding(
+            db,
+            loaded.map((row) => row.id),
+        );
+        const rows = loaded.filter((row) => eligibleIds.has(row.id));
         const shadowLane = getDetailedLane(item.projectIdentity, "shadow");
         if (shadowLane) {
             await embedMemoryRowsDetailed(

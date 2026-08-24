@@ -559,6 +559,12 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         // under MODULE authority are native module_row_id
                         // values, so translate them through the mirror before
                         // keying the claims database.
+                        // Sub-verified rows stay readable through explicit get
+                        // but must keep their sanitized trust labels: the
+                        // native response text carries none, so the labels
+                        // collected here are attached to the get output below,
+                        // matching the TypeScript path's TRUST framing.
+                        const moduleGetTrustLabels = new Map<number, string>();
                         if (args.ids && args.ids.length > 0 && hasClaimEffectivePolicy(deps.db)) {
                             const contextIdByModuleId = translateModuleMemoryIds(
                                 deps.db,
@@ -582,6 +588,19 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 return args.action === "merge"
                                     ? "Error: One or more source memories were not found."
                                     : `Error: Memory with ID ${denied} was not found.`;
+                            }
+                            if (args.action === "get") {
+                                for (const id of args.ids) {
+                                    const contextId = contextIdByModuleId.get(id);
+                                    if (contextId === undefined) continue;
+                                    const decision = decideMemoryPolicy(
+                                        policyRows.get(contextId),
+                                        "explicit_search",
+                                    );
+                                    if (decision.label) {
+                                        moduleGetTrustLabels.set(id, decision.label);
+                                    }
+                                }
                             }
                         }
                         // A write carries no ids, but the native store dedups
@@ -632,6 +651,16 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                 }),
                                 args,
                             );
+                            if (
+                                text !== null &&
+                                !text.startsWith("Error:") &&
+                                moduleGetTrustLabels.size > 0
+                            ) {
+                                const labelLines = [...moduleGetTrustLabels.entries()].map(
+                                    ([id, label]) => `- ID ${id}: ${label}`,
+                                );
+                                return `${text}\n\nTrust labels (sub-verified results):\n${labelLines.join("\n")}`;
+                            }
                             return (
                                 text ??
                                 "Error: Rust module returned an invalid ctx_memory response."

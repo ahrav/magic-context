@@ -407,33 +407,18 @@ export function prepareCompartmentInjection(
     // still eligible, and a zero-memory entry has no ids at all). Entries
     // record the project memory epoch at build time; a changed epoch
     // rebuilds. The persisted memory_block cache replays by id-eligibility
-    // alone, so it is reset with the process entry — otherwise the rebuild
-    // would replay the stale block from session_meta and keep omitting the
-    // newly eligible memory. This check runs on cache-busting passes too:
-    // their rebuild consults session_meta directly, and skipping the reset
-    // there would refresh the process entry's epoch while the stale
-    // persisted block keeps replaying. An unchanged epoch replays
-    // byte-stable.
+    // alone, so the rebuild below must skip it — carried as an in-call flag
+    // rather than a database reset, which could fail on SQLITE_BUSY while
+    // the rebuild stamps a fresh-epoch entry and never retries. This check
+    // runs on cache-busting passes too: their rebuild consults session_meta
+    // directly. An unchanged epoch replays byte-stable.
+    let forceMemoryBlockRecompute = false;
     if (
         usableCached !== undefined &&
         usableCached.projectMemoryEpoch !== getProjectMemoryEpoch(db, projectPath)
     ) {
         clearInjectionCache(sessionId);
-        try {
-            db.prepare(
-                "UPDATE session_meta SET memory_block_cache = '', memory_block_count = 0, memory_block_ids = NULL WHERE session_id = ?",
-            ).run(sessionId);
-        } catch (error) {
-            const code = (error as { code?: string } | null)?.code;
-            if (code !== "SQLITE_BUSY") throw error;
-            // The reset is an optimization freshener; a busy writer means the
-            // rebuild recomputes from a possibly stale persisted block for one
-            // turn, which the next pass retries.
-            sessionLog(
-                sessionId,
-                "memory_block_cache epoch reset hit SQLITE_BUSY, retrying next pass",
-            );
-        }
+        forceMemoryBlockRecompute = true;
     }
     const revalidatedCached = injectionCache.get(sessionId);
     const replayableCached = revalidatedCached?.db === db ? revalidatedCached : undefined;
@@ -514,7 +499,11 @@ export function prepareCompartmentInjection(
             );
         };
 
-        if (cachedMemory?.memory_block_cache && cachedBlockStillEligible()) {
+        if (
+            cachedMemory?.memory_block_cache &&
+            !forceMemoryBlockRecompute &&
+            cachedBlockStillEligible()
+        ) {
             memoryBlock = cachedMemory.memory_block_cache;
             memoryCount = cachedMemory.memory_block_count;
         } else {
