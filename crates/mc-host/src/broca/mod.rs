@@ -42,11 +42,6 @@ pub struct BrocaComponent {
 
 impl BrocaComponent {
     pub fn new(backend: Arc<dyn LlmExecutionBackend>) -> Self {
-        // Kill harness process groups a crashed predecessor left behind
-        // before this component can answer any status request: recovery
-        // treats an unknown run as `missing` and may refire it, which must
-        // never race a still-executing orphan.
-        let _ = subprocess::group_registry::sweep_orphaned_groups();
         Self {
             supervisor: Arc::new(Supervisor::new(backend)),
             routes: Arc::new(Mutex::new(HashMap::new())),
@@ -269,6 +264,17 @@ impl SecondaryComponent for BrocaComponent {
     async fn initialize(&self) -> Result<(), InitError> {
         // No artifact to load: the deterministic or subprocess backend was
         // constructed by the caller, and run state is process-local (R11).
+        //
+        // Kill harness process groups a crashed predecessor left behind.
+        // This belongs here, not in `new`: initialization runs after the
+        // runtime holds the exclusive instance lock, so the predecessor is
+        // provably gone. Sweeping at construction would race — a
+        // predecessor still alive then has its entries skipped (live
+        // owner), and if it crashes while the successor is still retrying
+        // the lock, nothing would ever sweep them. Recovery treats an
+        // unknown run as `missing` and may refire it, which must never
+        // race a still-executing orphan.
+        let _ = subprocess::group_registry::sweep_orphaned_groups();
         Ok(())
     }
 }

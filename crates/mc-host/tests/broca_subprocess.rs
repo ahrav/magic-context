@@ -162,6 +162,10 @@ fn main() {
         ),
         ("merge_cleanup_contract", merge_cleanup_contract),
         (
+            "oversized_json_structure_rejected_without_capping_prose",
+            oversized_json_structure_rejected_without_capping_prose,
+        ),
+        (
             "group_registry_sweep_kills_only_dead_owner_groups",
             group_registry_sweep_kills_only_dead_owner_groups,
         ),
@@ -2391,6 +2395,51 @@ fn env_snapshot_strips_launch_identity() {
         .map(|(name, _)| name.to_string_lossy().into_owned())
         .collect();
     assert_eq!(names, vec!["KEEP_ME"]);
+}
+
+/// A harness line's JSON node count is bounded before any DOM is built: an
+/// array of tiny values amplifies far past its byte length, which the
+/// capture budget does not model. Prose commas inside strings are content,
+/// not structure, and must never trip the bound.
+fn oversized_json_structure_rejected_without_capping_prose() {
+    // Node flood: ~40k array elements in an otherwise-ignored lifecycle
+    // event, well past the 32_768 bound but only ~80 KB of bytes.
+    let flood = format!(
+        "{{\"type\":\"session\",\"id\":\"s\",\"pad\":[{}]}}",
+        vec!["0"; 40_000].join(",")
+    );
+    let setup = RunSetup::new();
+    let path = setup.scratch.path().join("flood.ndjson");
+    fs::write(&path, format!("{flood}\n")).expect("transcript");
+    let backend = pi_backend(
+        &setup,
+        &[(TRANSCRIPT_FILE_ENV, &path.to_string_lossy())],
+        Vec::new(),
+        None,
+    );
+    let (terminal, _) = execute(
+        &backend,
+        request(setup.project.path(), Harness::Pi, "anthropic/m", None),
+    );
+    let error = failed(&terminal);
+    assert!(
+        error.message.contains("json structure too large at line 1"),
+        "a node flood must end as one bounded parse failure: {:?}",
+        error.message
+    );
+    assert!(error.message.len() < 300, "diagnostic is unbounded");
+
+    // The same comma count as prose inside an assistant message: content,
+    // not structure — this must still parse and deliver its text.
+    let prose = "a,".repeat(40_000);
+    let (terminal, events) = run_pi_transcript(&pi_success_lines(&prose, "stop"));
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "prose commas must not trip the structural bound: {terminal:?}"
+    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, BackendEvent::AssistantText { text, .. } if text == &prose)));
 }
 
 fn merge_cleanup_contract() {

@@ -353,6 +353,13 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(line) else {
         return false;
     };
+    // The probe parses every completed line while capture is still live, so
+    // it observes the same node-graph bound as the full parse; an
+    // over-structured line is not a terminal here and the full parse
+    // renders the bounded failure verdict.
+    if !subprocess::json_nodes_within_bound(text) {
+        return false;
+    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return false;
     };
@@ -421,6 +428,11 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
         let Ok(text) = std::str::from_utf8(line) else {
             return Err(format!("non-utf8 output at line {line_no}"));
         };
+        // Bounded before the DOM exists: an unbounded node graph would
+        // escape the capture budget this scan is charged against.
+        if !subprocess::json_nodes_within_bound(text) {
+            return Err(format!("json structure too large at line {line_no}"));
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
             return Err(format!("malformed json at line {line_no}"));
         };

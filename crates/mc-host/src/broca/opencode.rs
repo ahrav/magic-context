@@ -229,6 +229,11 @@ fn parse_opencode_transcript(
         let Ok(text) = std::str::from_utf8(line) else {
             return Err(format!("non-utf8 output at line {line_no}"));
         };
+        // Bounded before the DOM exists: an unbounded node graph would
+        // escape the capture budget this scan is charged against.
+        if !subprocess::json_nodes_within_bound(text) {
+            return Err(format!("json structure too large at line {line_no}"));
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
             return Err(format!("malformed json at line {line_no}"));
         };

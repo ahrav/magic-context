@@ -888,6 +888,54 @@ fn apply_delay_unit(value: u64, unit: &str) -> u64 {
     secs.min(MAX_RETRY_AFTER_SECS)
 }
 
+/// Ceiling on JSON structural cardinality in one harness output line.
+///
+/// An untyped `serde_json::Value` parse allocates a node per array element
+/// and object entry, so a line of tiny values (`[0,0,0,...]`) amplifies far
+/// beyond its byte length — the capture budget models a parsed line as
+/// transcript-sized, not as a node graph. Bounding the node count keeps the
+/// worst-case DOM on the order of a megabyte, inside the existing
+/// per-backend capture headroom, without capping line LENGTH (a legitimate
+/// assistant message is one long line).
+///
+/// Generous for the closed print-mode vocabulary: a real event carries
+/// message and content-block structure in the tens to low thousands.
+pub(crate) const MAX_LINE_JSON_NODES: usize = 32_768;
+
+/// Whether `text` stays within [`MAX_LINE_JSON_NODES`]. Counts only
+/// structural punctuation OUTSIDE string literals: prose commas in an
+/// assistant message are content, not nodes, and must never trip the bound.
+/// Single pass, no allocation.
+pub(crate) fn json_nodes_within_bound(text: &str) -> bool {
+    let mut nodes = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for byte in text.as_bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            // Each opener or separator admits at most one more node.
+            b'{' | b'[' | b',' => {
+                nodes += 1;
+                if nodes > MAX_LINE_JSON_NODES {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Admits a provider-supplied error code onto the wire only in short
 /// identifier shape: provider output can echo prompt or credential content
 /// (R19), so anything beyond `[A-Za-z0-9_.-]{1,64}` is dropped rather than
