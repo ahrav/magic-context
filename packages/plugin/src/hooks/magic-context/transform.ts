@@ -826,6 +826,32 @@ export function createTransform(deps: TransformDeps) {
                 sessionLog(sessionId, "rust transform unavailable; using raw passthrough");
                 return;
             }
+            // Enforcement-artifact revalidation must run in Rust mode too:
+            // the TypeScript renderer's probe call sits after this early
+            // return, and without one here an edited or deleted artifact
+            // never withdraws ENFORCED maturity in a Rust-mode-only
+            // session. Same throttle and failure semantics as the TS-path
+            // call; the directory resolution mirrors the session-directory
+            // cache the TS path consults.
+            if (deps.memoryConfig?.enabled) {
+                try {
+                    const probeDirectory =
+                        deps.sessionDirectoryBySession?.get(sessionId) ??
+                        deps.directory ??
+                        process.cwd();
+                    revalidateEnforcementArtifacts(
+                        db,
+                        resolveProjectIdentity(probeDirectory),
+                        resolveProjectRootDirectory(probeDirectory),
+                    );
+                } catch (error) {
+                    sessionLog(
+                        sessionId,
+                        "artifact revalidation failed (retrying on a later pass):",
+                        error,
+                    );
+                }
+            }
             await rustModeTransform.run(sessionId, messages, output, sessionMeta);
             return;
         }
