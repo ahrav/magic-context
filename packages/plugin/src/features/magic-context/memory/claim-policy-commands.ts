@@ -497,7 +497,11 @@ export async function executeClaimEnforceCommand(
     // Strict flag validation, mirroring /ctx-approve: a mistyped flag
     // (`--revok`) must not silently select a different action — for enforce
     // it would run a full evaluation treating the flag as a path argument.
-    const unknownFlags = parts.filter((part) => part.startsWith("--") && part !== "--revoke");
+    // Supported flags: --revoke (revocation) and --kind <value> (artifact
+    // kind, value validated by the parser below).
+    const unknownFlags = parts.filter(
+        (part) => part.startsWith("--") && part !== "--revoke" && part !== "--kind",
+    );
     if (unknownFlags.length > 0) {
         return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
     }
@@ -751,6 +755,10 @@ export async function executeClaimEnforceCommand(
                     artifactKind: kind,
                     canonicalPath: canonical.canonicalPath,
                     bytesDigest,
+                    // Revalidation only rehashes from this checkout: clones
+                    // and worktrees share the project identity, and another
+                    // checkout legitimately lacks the same relative path.
+                    enforcedFromRoot: deps.projectRoot,
                     evaluator: evaluated.evaluator,
                     evaluatorVersion: evaluated.evaluatorVersion,
                     evaluatorResult: evaluated.result,

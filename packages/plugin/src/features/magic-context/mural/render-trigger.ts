@@ -4,8 +4,12 @@ import { piModelRefToCanonical } from "../../../shared/harness-provider-map";
 import { log } from "../../../shared/logger";
 import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
-import { getMemoriesByProject } from "../memory";
-import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
+import { getMemoriesByProject, type Memory } from "../memory";
+import {
+    bindMemoriesToCurrentRevision,
+    filterMemoriesByPolicy,
+} from "../memory/storage-claim-visibility";
+import { getProjectState } from "../storage-project-state";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
 import { renderMural } from "./render-mural";
 import type { MuralWireOptions } from "./resolve-mural";
@@ -71,11 +75,28 @@ export function ensureMuralRendered(
     // memories-only reader) keeps policy-hidden rows — including
     // contradicted/quarantined ones — out of both the coverage denominator and
     // the rendered image, on a channel that carries no trust label.
-    const pool = filterMemoriesByPolicy(
-        db,
-        getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
-        "auto_inject",
-    ).memories;
+    // The pool is loaded, policy-filtered, byte-bound, and epoch-stabilized
+    // in a bounded loop: a rewrite between load and policy read must not let
+    // revision B's eligibility render revision A's still-hash-current cue
+    // into the automatically injected image, and a quarantine landing
+    // mid-resolve retries against fresh state. The mural resolution runs
+    // outside the m0 snapshot transaction, so its own epoch marker only
+    // protects LATER rebuilds — this loop protects the render happening now.
+    let pool: Memory[] = [];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        const epochAtLoad = getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0;
+        pool = bindMemoriesToCurrentRevision(
+            db,
+            filterMemoriesByPolicy(
+                db,
+                getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
+                "auto_inject",
+            ).memories,
+        );
+        if ((getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0) === epochAtLoad) {
+            break;
+        }
+    }
     const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (
         coverage.activeMemoryCount === 0 ||

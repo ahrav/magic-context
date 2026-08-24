@@ -241,7 +241,14 @@ export function createClaimPolicySchema(db: Database): void {
         policy_version INTEGER NOT NULL CHECK (
             typeof(policy_version) = 'integer' AND policy_version >= 1
         ),
-        recorded_at INTEGER NOT NULL
+        recorded_at INTEGER NOT NULL,
+        -- enforced_from_root: the filesystem root the evaluation ran in.
+        -- Clones and worktrees of one repository share a project identity,
+        -- so revalidation must only rehash an artifact from the checkout
+        -- that enforced it — checkout B legitimately lacks (or differs at)
+        -- the same relative path. Intentionally NULLABLE: legacy rows carry
+        -- no root and are skipped by revalidation.
+        enforced_from_root TEXT
     );
     CREATE INDEX idx_claim_enforcement_artifacts_revision
         ON claim_enforcement_artifacts(revision_id, id);

@@ -301,6 +301,37 @@ describe("claim enforcement command workflow", () => {
         }
     });
 
+    test("the supported --kind flag passes validation; unknown flags are rejected", async () => {
+        const db = migratedDb();
+        try {
+            const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
+            const seed = await approvedSeed(db, commandDeps, "enf-kind");
+            writeFileSync(join(commandDeps.projectRoot, "kind.test.ts"), "test bytes");
+            // --kind is a documented flag and must reach the value parser,
+            // not the unknown-flag rejection.
+            const first = await executeClaimEnforceCommand(
+                commandDeps,
+                `${seed.memoryId} kind.test.ts --kind test`,
+            );
+            expect(first.level).toBe("warning");
+            const second = await executeClaimEnforceCommand(
+                commandDeps,
+                `${seed.memoryId} kind.test.ts --kind test`,
+            );
+            expect(second.text).toContain("ENFORCED");
+            // A mistyped flag returns usage instead of being treated as a
+            // path argument (or, for approve, the opposite action).
+            const mistyped = await executeClaimEnforceCommand(
+                commandDeps,
+                `${seed.memoryId} kind.test.ts --revok`,
+            );
+            expect(mistyped.level).toBe("error");
+            expect(mistyped.text).toContain("Usage");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("a failing artifact records the attempt but never ENFORCED", async () => {
         const db = migratedDb();
         try {

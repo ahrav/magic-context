@@ -3545,6 +3545,20 @@ export const MIGRATIONS: Migration[] = [
             `);
         },
     },
+    {
+        version: 88,
+        description:
+            "claim trust policy: enforcement artifacts record the checkout root that enforced them (revalidation scopes to it)",
+        up(db: Database): void {
+            // Clones and worktrees of one repository share a project
+            // identity, so artifact revalidation must only rehash from the
+            // checkout that ran the enforcement — checkout B legitimately
+            // lacks or differs at the same relative path. NULL (legacy rows)
+            // reads as "owning checkout unknown" and revalidation skips it.
+            if (!tableExists(db, "claim_enforcement_artifacts")) return;
+            ensureColumn(db, "claim_enforcement_artifacts", "enforced_from_root", "TEXT");
+        },
+    },
 ];
 
 /**

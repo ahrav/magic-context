@@ -475,6 +475,10 @@ export function revalidateEnforcementArtifacts(
     if (!projectRow) return;
     const artifacts = db
         .prepare(
+            // Scoped to artifacts THIS checkout enforced: clones and
+            // worktrees share the project identity, and another checkout
+            // legitimately lacks or differs at the same relative path — a
+            // NULL owning root (legacy row) is unjudgeable and skipped.
             `SELECT artifact.id AS id, artifact.revision_id AS revisionId,
                     artifact.canonical_path AS canonicalPath,
                     artifact.bytes_digest AS bytesDigest,
@@ -483,12 +487,13 @@ export function revalidateEnforcementArtifacts(
                JOIN claim_revisions ON claim_revisions.id = artifact.revision_id
               WHERE artifact.project_id = ?
                 AND artifact.evaluator_result = 'pass'
+                AND artifact.enforced_from_root = ?
                 AND NOT EXISTS (
                     SELECT 1 FROM claim_enforcement_artifact_events event
                     WHERE event.artifact_id = artifact.id AND event.action = 'revoked'
                 )`,
         )
-        .all(projectRow.id) as Array<{
+        .all(projectRow.id, projectRoot) as Array<{
         id: number;
         revisionId: number;
         canonicalPath: string;

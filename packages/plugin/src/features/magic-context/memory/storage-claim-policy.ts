@@ -314,6 +314,9 @@ export interface RecordEnforcementArtifactInput {
     evaluator: string;
     evaluatorVersion: string;
     evaluatorResult: EnforcementArtifactResult;
+    /** Filesystem root the evaluation ran in; revalidation only rehashes
+     *  from this checkout (clones/worktrees share the project identity). */
+    enforcedFromRoot?: string | null;
     nowMs?: number;
 }
 
@@ -328,8 +331,8 @@ export function recordEnforcementArtifactInCurrentTransaction(
             `INSERT INTO claim_enforcement_artifacts
                 (revision_id, project_id, artifact_kind, canonical_path, bytes_digest,
                  git_anchor_id, evaluator, evaluator_version, evaluator_result,
-                 revision_digest, policy_version, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 revision_digest, policy_version, recorded_at, enforced_from_root)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
             input.revisionId,
@@ -344,6 +347,7 @@ export function recordEnforcementArtifactInCurrentTransaction(
             revision.digest,
             CLAIM_POLICY_VERSION,
             input.nowMs ?? Date.now(),
+            input.enforcedFromRoot ?? null,
         );
     return Number(result.lastInsertRowid);
 }
@@ -474,28 +478,48 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
  * class on the observation itself, so retained legacy metadata cannot
  * qualify later rewrites.
  *
- * At or below the boundary BOTH branches are further restricted to the
- * claim's FIRST revision: the pre-v86 rewrite path passed the retained
- * `user` source type into the new observation and left the revision
- * metadata untouched, so a later revision's explicit-user stamp can be
- * model-authored replacement bytes. First revisions come from the original
- * user write or legacy adoption and keep their stated provenance. A missing
+ * Both branches are restricted to the claim's FIRST revision — with one
+ * carve-out. The pre-v86 rewrite path passed the retained `user` source
+ * type into the new observation and left the revision metadata untouched,
+ * so a later revision's explicit-user stamp can be model-authored
+ * replacement bytes; a held-open pre-v86 writer keeps producing such
+ * observations AFTER the seed boundary too, so the boundary alone cannot
+ * clear them. First revisions come from the original user write or legacy
+ * adoption and keep their stated provenance. The carve-out: a post-boundary
+ * later revision whose bytes still equal the first revision's bytes (the
+ * v86 classification path re-observes unchanged content) keeps its
+ * evidence, because no writer can smuggle new content through it. A missing
  * boundary key reads as 0 (never seeded): every revision on such a database
  * was written by a build that classifies rewrites as model inference. */
 export function hasExplicitUserEvidence(db: Database, revisionId: number): boolean {
     const byObservation = db
         .prepare(
+            // Post-boundary observations are NOT unconditionally trusted:
+            // a held-open pre-v86 writer's rewrite path copies the retained
+            // `user` trust class onto the model-authored successor's
+            // observation. A post-boundary later revision qualifies only
+            // while its bytes ARE still the claim's first-revision bytes
+            // (the v86 classification path re-observes unchanged content;
+            // no v86 path authors NEW user-content revisions), so a
+            // content-changing compatibility rewrite can never ride the
+            // copied stamp to VERIFIED.
             `SELECT 1 FROM claim_evidence e
              JOIN observations o ON o.id = e.observation_id
              JOIN claim_revisions cr ON cr.id = e.revision_id
              WHERE e.revision_id = ? AND e.relation = 'supports'
                AND o.source_trust_class = 'explicit_user'
                AND (
-                   e.revision_id > COALESCE((
-                       SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
-                       WHERE key = 'claim_policy_seed_boundary_revision_id'
-                   ), 0)
-                   OR cr.revision = 1
+                   cr.revision = 1
+                   OR (
+                       e.revision_id > COALESCE((
+                           SELECT CAST(value AS INTEGER) FROM schema_migrations_meta
+                           WHERE key = 'claim_policy_seed_boundary_revision_id'
+                       ), 0)
+                       AND cr.content_sha256 = (
+                           SELECT first.content_sha256 FROM claim_revisions first
+                           WHERE first.claim_id = cr.claim_id AND first.revision = 1
+                       )
+                   )
                )
              LIMIT 1`,
         )
