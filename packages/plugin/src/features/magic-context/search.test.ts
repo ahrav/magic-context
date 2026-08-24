@@ -215,16 +215,17 @@ describe("unifiedSearch", () => {
         expect(Object.keys(memories[0]).sort()).toEqual([
             "category",
             "content",
+            "contentDigest",
             "matchType",
             "memoryId",
+            "policyLabel",
             "score",
             "source",
             "sourceName",
         ]);
         expect(statements.some((sql) => /\bmemories(?:_fts)?\b/i.test(sql))).toBeTrue();
-        expect(
-            statements.some((sql) => /legacy_memory_claims|claim_revisions|\bclaims\b/i.test(sql)),
-        ).toBeFalse();
+        expect(statements.some((sql) => /claim_effective_policy/i.test(sql))).toBeTrue();
+        expect(statements.some((sql) => /claim_revisions\.content\b/i.test(sql))).toBeFalse();
     });
 
     it("returns ranked results across memories and messages (no facts)", async () => {
@@ -2434,11 +2435,15 @@ describe("resolveMemoriesByIdsForSearch (R35)", () => {
         });
 
         const memoryReads = counter.matching(/(FROM|JOIN) memories\b/);
-        expect(memoryReads.length).toBe(1);
+        // Exactly two id-bounded reads: the CROSS JOIN id fetch and the
+        // exact-digest binding check. Neither may widen to a project or
+        // workspace scan.
+        expect(memoryReads.length).toBe(2);
         expect(memoryReads[0].sql).toContain("json_each");
         expect(memoryReads[0].sql).toContain(
             "CROSS JOIN memories ON memories.id = requested.value",
         );
+        expect(memoryReads[1].sql).toContain("WHERE m.id IN");
         expect(counter.matching(/FROM memories\s+WHERE project_path/).length).toBe(0);
     });
 });

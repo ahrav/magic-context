@@ -129,10 +129,18 @@ export function updateMemoryProjectionContent(
     nowMs?: number,
 ): void {
     db.prepare(
+        // A user-sourced row demotes to 'agent' on rewrite: the stored bytes
+        // are no longer user-authored, and a later same-content revision
+        // (the automatic classification writes one, keyed on the row's
+        // source_type) would otherwise carry explicit_user provenance and
+        // promote model-authored bytes to VERIFIED. The rewrite observation
+        // itself already uses model provenance (liveRewriteSourceType); this
+        // keeps the projection column telling the same truth.
         `UPDATE memories
             SET content = ?, normalized_hash = ?, updated_at = ?, shareable = 0,
                 classified_at = NULL, mural_cue = NULL, mural_cue_hash = NULL,
-                mural_cue_at = NULL, mural_cue_rejection_count = 0
+                mural_cue_at = NULL, mural_cue_rejection_count = 0,
+                source_type = CASE WHEN source_type = 'user' THEN 'agent' ELSE source_type END
           WHERE id = ?`,
     ).run(content, normalizedHash, nowMs ?? Date.now(), id);
     db.prepare("DELETE FROM memory_embeddings WHERE memory_id = ?").run(id);

@@ -34,6 +34,7 @@ import type {
 	MagicContextConfig,
 	SidekickConfig,
 } from "@magic-context/core/config/schema/magic-context";
+import { runClaimPolicySeedStartup } from "@magic-context/core/features/magic-context/claim-policy-backfill-startup";
 import { runClaimsBackfillStartup } from "@magic-context/core/features/magic-context/claims-backfill-startup";
 import {
 	summarizeDreamSchedule,
@@ -43,7 +44,10 @@ import {
 	type FailClosedReason,
 	formatFailClosedBlockingMessage,
 } from "@magic-context/core/features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	resolveProjectIdentityForSession,
+	resolveProjectRootDirectory,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import { detectOverflow } from "@magic-context/core/features/magic-context/overflow-detection";
 import { runSessionProjectBackfill } from "@magic-context/core/features/magic-context/session-project-backfill";
@@ -102,6 +106,7 @@ import { resolveFallbackChain } from "@magic-context/core/shared/resolve-fallbac
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 
 import { handlePiCloneSessionStart } from "./clone-inheritance";
+import { registerCtxApproveCommand } from "./commands/ctx-approve";
 import {
 	type PiSidekickConfig,
 	registerCtxAugCommand,
@@ -111,6 +116,7 @@ import {
 	maybeAutoEmbedPiSession,
 	registerCtxEmbedCommand,
 } from "./commands/ctx-embed";
+import { registerCtxEnforceCommand } from "./commands/ctx-enforce";
 import { registerCtxFlushCommand } from "./commands/ctx-flush";
 import { registerCtxRecompCommand } from "./commands/ctx-recomp";
 import { registerCtxSessionUpgradeCommand } from "./commands/ctx-session-upgrade";
@@ -478,9 +484,17 @@ function scheduleStartupBackfills(
 	db: ContextDatabase,
 	run = runClaimsBackfillStartup,
 ): Promise<unknown> {
-	return run(db, { log: warn }).catch((err) => {
-		warn(`[claims-backfill] background runner failed: ${err}`);
-	});
+	// The two runners are independent: an unseeded revision reads as
+	// automatic-hidden, so chaining the policy seed behind the claims backfill
+	// would hide every pre-existing memory whenever that backfill fails.
+	return Promise.all([
+		run(db, { log: warn }).catch((err) => {
+			warn(`[claims-backfill] background runner failed: ${err}`);
+		}),
+		runClaimPolicySeedStartup(db, { log: warn }).catch((err) => {
+			warn(`[claim-policy-seed] background runner failed: ${err}`);
+		}),
+	]);
 }
 
 function getPiMessageModel(message: unknown): {
@@ -1298,6 +1312,29 @@ async function startPiMagicContextRuntime(
 
 	registerCtxFlushCommand(pi, { db, compactionOff });
 	info("registered /ctx-flush");
+
+	// Approval/enforcement resolve against the identity-owning ROOT, not the
+	// invoking cwd: a /cd into a subdirectory of the same repository keeps
+	// the ancestor-resolved identity, and artifact paths must canonicalize
+	// against that same root or in-repo paths read as escapes.
+	const resolveCommandProject = (ctx: { cwd: string }) => ({
+		projectDir: resolveProjectRootDirectory(ctx.cwd),
+		projectIdentity: resolveCurrentProjectDeps(ctx).projectIdentity,
+	});
+	registerCtxApproveCommand(pi, {
+		db,
+		projectDir,
+		projectIdentity,
+		resolveProject: resolveCommandProject,
+	});
+	info("registered /ctx-approve");
+	registerCtxEnforceCommand(pi, {
+		db,
+		projectDir,
+		projectIdentity,
+		resolveProject: resolveCommandProject,
+	});
+	info("registered /ctx-enforce");
 
 	// /ctx-recomp uses its own PiSubagentRunner instance — recomp can run
 	// concurrently with normal historian, and giving each its own runner

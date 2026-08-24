@@ -27,6 +27,11 @@ import {
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import {
+    exactMemoryContentDigests,
+    maintenanceEligibleIdSet,
+} from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
+import {
     computeClaimRequestDigest,
     hasMemoryClaimsCompatSchema,
     runInMemoryClaimsWriteTransaction,
@@ -263,6 +268,39 @@ async function verifyOneBatch(
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create verify session.");
 
+        // The scope was partitioned once at run start; later batches wait
+        // behind provider calls, and child-session creation above is itself
+        // an await. A memory quarantined, rejected, or superseded in the
+        // meantime must not reach the child-model prompt, and a memory
+        // REWRITTEN in the meantime must not be prompted with the frozen
+        // revision's bytes (the manifest would then verify or overwrite the
+        // new revision the model never saw). Re-apply the maintenance policy
+        // and bind each member to its loaded bytes immediately before the
+        // prompt is built and submitted.
+        const stillInScope = maintenanceEligibleIdSet(
+            args.db,
+            batch.map((memory) => memory.id),
+            "verification",
+        );
+        const digestsBeforePrompt = exactMemoryContentDigests(
+            args.db,
+            batch.map((memory) => memory.id),
+        );
+        const eligibleBatch = batch.filter(
+            (memory) =>
+                stillInScope.has(memory.id) &&
+                digestsBeforePrompt.get(memory.id) === sha256Utf8Hex(memory.content),
+        );
+        if (eligibleBatch.length < batch.length) {
+            log(
+                `[dreamer] verify batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since scope partition`,
+            );
+        }
+        if (eligibleBatch.length === 0) {
+            return { verified: 0, updated: 0, archived: 0 };
+        }
+        batch = eligibleBatch;
+
         const prompt = buildVerifyPrompt(args.projectIdentity, batch);
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,
@@ -369,6 +407,37 @@ export async function applyVerifyManifest(
         "verify",
     );
     const now = Date.now();
+    // The model ran for a while; a memory can enter the uniform-absence class
+    // (or leave the maintenance pool) between the prompt and this apply, and
+    // a rewrite in the same window means the manifest's verdict describes
+    // bytes that no longer exist. An in-flight verification must not verify,
+    // rewrite, or archive such a row — drop its manifest entries instead.
+    // The digest binds to the bytes the model was PROMPTED with.
+    const promptDigestById = new Map(
+        batch.map((memory) => [memory.id, sha256Utf8Hex(memory.content)]),
+    );
+    const stillApplicable = (id: number, eligible: Set<number>, digests: Map<number, string>) =>
+        eligible.has(id) && digests.get(id) === promptDigestById.get(id);
+    const eligibleAtApply = maintenanceEligibleIdSet(args.db, [...batchIds], "verification");
+    const digestsAtApply = exactMemoryContentDigests(args.db, [...batchIds]);
+    // Policy again AFTER the digest read (two autocommit snapshots): a hide
+    // committed between them leaves the digest unchanged.
+    const eligibleAfterApply = maintenanceEligibleIdSet(args.db, [...batchIds], "verification");
+    const applicableIds = new Set(
+        [...batchIds].filter(
+            (id) =>
+                stillApplicable(id, eligibleAtApply, digestsAtApply) && eligibleAfterApply.has(id),
+        ),
+    );
+    const droppedIds = [...batchIds].filter((id) => !applicableIds.has(id));
+    if (droppedIds.length > 0) {
+        log(
+            `[dreamer] verify manifest dropped ${droppedIds.length} target(s) hidden or rewritten during evaluation: ${droppedIds.join(", ")}`,
+        );
+    }
+    parsed.verified = parsed.verified.filter((entry) => applicableIds.has(entry.id));
+    parsed.updated = parsed.updated.filter((entry) => applicableIds.has(entry.id));
+    parsed.archived = parsed.archived.filter((entry) => applicableIds.has(entry.id));
 
     // Pre-normalize files OUTSIDE the transaction (git/realpath I/O). For each
     // affected id, the COMPLETE backing set the agent reports.
@@ -408,12 +477,45 @@ export async function applyVerifyManifest(
     let updated = 0;
     let archived = 0;
     if (args.moduleRoute) {
+        // The apply-time check above precedes the awaited normalizeFiles
+        // calls, and the native memory.set_verification handler validates
+        // only the normalized hash (which cannot reject a case/whitespace
+        // rewrite) and carries no claim-policy check. Repeat the policy and
+        // prompt-byte validation immediately before constructing the module
+        // rows — the module branch returns before the transaction-time
+        // recheck that guards the local route.
+        const eligibleForModule = maintenanceEligibleIdSet(
+            args.db,
+            writes.map((write) => write.id),
+            "verification",
+        );
+        const digestsForModule = exactMemoryContentDigests(
+            args.db,
+            writes.map((write) => write.id),
+        );
+        // Policy again AFTER the digest read (two autocommit snapshots).
+        const eligibleForModuleAfter = maintenanceEligibleIdSet(
+            args.db,
+            writes.map((write) => write.id),
+            "verification",
+        );
+        const moduleWrites = writes.filter(
+            (write) =>
+                stillApplicable(write.id, eligibleForModule, digestsForModule) &&
+                eligibleForModuleAfter.has(write.id),
+        );
+        if (moduleWrites.length < writes.length) {
+            log(
+                `[dreamer] verify module apply dropped ${writes.length - moduleWrites.length} target(s) hidden or rewritten during normalization`,
+            );
+        }
+        if (moduleWrites.length === 0) return { verified: 0, updated: 0, archived: 0 };
         const identities = getModuleMemoryIdentities(
             args.db,
             args.projectIdentity,
-            writes.map((write) => write.id),
+            moduleWrites.map((write) => write.id),
         );
-        const rows = writes.map((write) => {
+        const rows = moduleWrites.map((write) => {
             const identity = identities.get(write.id);
             if (!identity)
                 throw new DreamerModuleFailureError(
@@ -423,6 +525,16 @@ export async function applyVerifyManifest(
             return {
                 memory_id: identity.moduleId,
                 content_hash_at_prompt: identity.normalizedHash,
+                // Exact prompted bytes: `stillApplicable` above proved the
+                // claim-revision digest equals the sha256 of the bytes the
+                // model saw, and the native handler compares it against the
+                // row's exact content inside its transaction — the
+                // normalized hash alone cannot reject a case/whitespace-only
+                // rewrite landing between this preflight and that
+                // transaction.
+                ...(digestsForModule.get(write.id) !== undefined
+                    ? { content_sha256_at_prompt: digestsForModule.get(write.id) }
+                    : {}),
                 verification_status: write.kind === "verify" ? "verified" : write.kind,
                 ...(write.kind === "update" ? { updated_content: write.content } : {}),
                 ...(write.kind === "archive" ? { archive_reason: write.reason } : {}),
@@ -462,7 +574,7 @@ export async function applyVerifyManifest(
         const accepted = new Set(
             result.accepted.filter((id): id is number => typeof id === "number"),
         );
-        for (const write of writes) {
+        for (const write of moduleWrites) {
             const identity = identities.get(write.id);
             if (!identity || !accepted.has(identity.moduleId)) continue;
             if (write.kind === "verify") verified += 1;
@@ -476,7 +588,22 @@ export async function applyVerifyManifest(
         // one lease-guarded transaction allocates one claim project
         // generation per touched project (KTD7).
         withMemoryClaimGenerationContextInCurrentTransaction(args.db, () => {
+            // The apply-time check above precedes several awaited
+            // normalizeFiles calls: re-evaluate policy and prompt-byte
+            // identity as the first operation while holding the write lock,
+            // so a target hidden or rewritten during normalization is
+            // skipped instead of verified, rewritten, or archived.
+            const eligibleInTx = maintenanceEligibleIdSet(
+                args.db,
+                writes.map((write) => write.id),
+                "verification",
+            );
+            const digestsInTx = exactMemoryContentDigests(
+                args.db,
+                writes.map((write) => write.id),
+            );
             for (const w of writes) {
+                if (!stillApplicable(w.id, eligibleInTx, digestsInTx)) continue;
                 const memory = getMemoryById(args.db, w.id);
                 if (!isPrimaryMutable(memory)) continue;
                 if (w.kind === "verify") {

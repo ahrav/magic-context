@@ -16,7 +16,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
-import { insertMemory } from "../../features/magic-context/memory";
+import { insertMemory as insertMemoryRaw } from "../../features/magic-context/memory";
 import {
     __resetProjectIdentityForTests,
     resolveProjectIdentity,
@@ -50,6 +50,11 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { createTransform } from "./transform";
+
+// Policy reclassification: automatic injection requires effective-VERIFIED
+// rows, so these fixtures use explicit-user origin memories.
+const insertMemory: typeof insertMemoryRaw = (db, input) =>
+    insertMemoryRaw(db, { sourceType: "user", ...input });
 
 type TestMessage = {
     info: {

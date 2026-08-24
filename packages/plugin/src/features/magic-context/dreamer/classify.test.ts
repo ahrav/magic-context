@@ -159,6 +159,7 @@ describe("runClassify disposition", () => {
 function addMemoriesForDisposition(db: Database, projectIdentity: string, count: number): void {
     for (let index = 0; index < count; index += 1) {
         insertMemory(db, {
+            sourceType: "user",
             projectPath: projectIdentity,
             category: "ARCHITECTURE",
             content: `Classification fact ${index}.`,
@@ -173,6 +174,7 @@ describe("applyClassifications", () => {
         try {
             const projectIdentity = "git:test";
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Important project fact.",
@@ -208,6 +210,7 @@ describe("applyClassifications", () => {
         try {
             const projectIdentity = "git:test";
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Important project fact.",
@@ -303,6 +306,7 @@ describe("module-backed classification", () => {
             { length: count },
             (_, index) =>
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Module-backed memory ${index}`,

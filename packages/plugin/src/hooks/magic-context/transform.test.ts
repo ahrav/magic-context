@@ -8,7 +8,7 @@ import {
     replaceAllCompartmentState,
     replaceAllCompartments,
 } from "../../features/magic-context/compartment-storage";
-import { insertMemory } from "../../features/magic-context/memory";
+import { insertMemory as insertMemoryRaw } from "../../features/magic-context/memory";
 import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
 import {
     __resetMessageIndexAsyncForTests,
@@ -55,6 +55,11 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getSlot, resetLkgSlotsForTest } from "./lkg-slot";
 import { createTransform } from "./transform";
+
+// Policy reclassification: automatic injection requires effective-VERIFIED
+// rows, so these fixtures use explicit-user origin memories.
+const insertMemory: typeof insertMemoryRaw = (db, input) =>
+    insertMemoryRaw(db, { sourceType: "user", ...input });
 
 type TextPart = { type: "text"; text: string };
 type ToolPart = {

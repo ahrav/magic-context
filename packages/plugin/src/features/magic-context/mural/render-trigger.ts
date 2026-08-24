@@ -4,6 +4,12 @@ import { piModelRefToCanonical } from "../../../shared/harness-provider-map";
 import { log } from "../../../shared/logger";
 import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
+import { getMemoriesByProject, type Memory } from "../memory";
+import {
+    bindMemoriesToCurrentRevision,
+    filterMemoriesByPolicy,
+} from "../memory/storage-claim-visibility";
+import { getProjectState } from "../storage-project-state";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
 import { renderMural } from "./render-mural";
 import type { MuralWireOptions } from "./resolve-mural";
@@ -63,7 +69,44 @@ export function ensureMuralRendered(
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
 ): EnsureMuralResult {
-    const coverage = getMuralCoverage(db, projectIdentity);
+    // The mural is folded into m[0] as an image, so it is an AUTOMATIC
+    // injection channel and must use the same `auto_inject` decision the m[0]
+    // text pool uses. Filtering here (not inside resolve-mural, which stays a
+    // memories-only reader) keeps policy-hidden rows — including
+    // contradicted/quarantined ones — out of both the coverage denominator and
+    // the rendered image, on a channel that carries no trust label.
+    // The pool is loaded, policy-filtered, byte-bound, and epoch-stabilized
+    // in a bounded loop: a rewrite between load and policy read must not let
+    // revision B's eligibility render revision A's still-hash-current cue
+    // into the automatically injected image, and a quarantine landing
+    // mid-resolve retries against fresh state. The mural resolution runs
+    // outside the m0 snapshot transaction, so its own epoch marker only
+    // protects LATER rebuilds — this loop protects the render happening now.
+    let pool: Memory[] = [];
+    let poolStable = false;
+    let stableEpoch = 0;
+    for (let attempt = 0; attempt < 2 && !poolStable; attempt += 1) {
+        const epochAtLoad = getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0;
+        pool = bindMemoriesToCurrentRevision(
+            db,
+            filterMemoriesByPolicy(
+                db,
+                getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
+                "auto_inject",
+            ).memories,
+        );
+        poolStable =
+            (getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0) === epochAtLoad;
+        if (poolStable) stableEpoch = epochAtLoad;
+    }
+    if (!poolStable) {
+        // Fail closed: the epoch moved during both attempts, so a quarantine
+        // committed after the last policy read could sit in this pool. Skip
+        // the render this pass; the next epoch-driven pass rebuilds.
+        log(`[mural] skipped for ${projectIdentity}: memory pool unstable (epoch kept moving)`);
+        return { hasMural: false, rerendered: false, skipReason: "memory pool unstable" };
+    }
+    const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (
         coverage.activeMemoryCount === 0 ||
         !muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount)
@@ -76,7 +119,7 @@ export function ensureMuralRendered(
         return { hasMural: false, rerendered: false, skipReason };
     }
 
-    const entries = resolveMural(db, projectIdentity, budgetTokens);
+    const entries = resolveMural(db, projectIdentity, budgetTokens, pool);
     if (entries.length === 0) {
         // Empty overflow pool → no mural block. Leave any stale stored row alone
         // so the dashboard can still show the last render.
@@ -88,6 +131,20 @@ export function ensureMuralRendered(
     // assemble and deterministic, so an unchanged pool re-derives the same hash
     // and we skip PNG re-encode + DB write entirely.
     const textHash = createHash("sha256").update(rendered.sha256Input).digest("hex");
+
+    // Post-render revalidation: coverage, resolution, and PNG encoding all
+    // ran after the loop's last epoch read, and the image carries no trust
+    // label to demote. A quarantine, rejection, or rewrite landing in that
+    // window must not be reused, upserted, or returned for the current
+    // prompt — fail closed and let the next epoch-driven pass rebuild.
+    if ((getProjectState(db, projectIdentity)?.projectMemoryEpoch ?? 0) !== stableEpoch) {
+        log(`[mural] skipped for ${projectIdentity}: memory pool changed during render`);
+        return {
+            hasMural: false,
+            rerendered: false,
+            skipReason: "memory pool changed during render",
+        };
+    }
 
     const existing = getMural(db, projectIdentity);
     if (

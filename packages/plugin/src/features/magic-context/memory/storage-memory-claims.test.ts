@@ -6,9 +6,15 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { inspectClaimsBackfillReconciliation } from "../claims-backfill";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import {
+    appendMaturityAssertionInCurrentTransaction,
+    recordApprovalActionInCurrentTransaction,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "./storage-claim-policy";
 import { sha256Utf8Hex } from "./storage-claims";
 import {
     applyModuleMemoryDeltaWithClaimsInCurrentTransaction,
+    bumpEpochForClaimProjectInCurrentTransaction,
     ClaimOperationKeyReuseError,
     canonicalMemoryProjectPathSql,
     claimStateFromMemoryStatus,
@@ -342,7 +348,7 @@ describe("memory/claims kernel: content and classification updates", () => {
         expect(head).toEqual({ pathsState: "known", path: "src/lineage.ts" });
     });
 
-    test("a content update on a verified memory records a verified event on the new revision", () => {
+    test("a content update on a verified memory withdraws verification instead of carrying it", () => {
         const db = track(migratedDb());
         const projectionSeed = createSeedMemory(db, "verified-update-seed", "projection verified");
         const sideTableSeed = createSeedMemory(db, "side-verified-update-seed", "side verified");
@@ -370,23 +376,26 @@ describe("memory/claims kernel: content and classification updates", () => {
                 }),
             );
             expect(outcome.result.revisionId).not.toBeNull();
-            // The verified event attaches to the NEW current revision, with a
-            // matching evidence effect in the operation's outbox.
+            // Verification attests the OLD bytes: the rewritten revision must
+            // NOT inherit a verified event, or arbitrary replacement content
+            // would keep VERIFIED maturity and automatic visibility.
             expect(
                 db
                     .prepare(
                         "SELECT outcome, verifier FROM verification_events WHERE revision_id = ?",
                     )
                     .all(outcome.result.revisionId),
-            ).toEqual([{ outcome: "verified", verifier: "kernel-test" }]);
-            expect(
-                count(
-                    db,
-                    "claim_change_outbox",
-                    `effect_type = 'evidence' AND effect_key = 'memory:${seeded.memoryId}:evidence'
-                     AND operation_id = (SELECT id FROM claim_operations WHERE operation_key = '${key}')`,
-                ),
-            ).toBe(1);
+            ).toEqual([]);
+            // The projection lands in the withdrawn shape ('unverified' with a
+            // positive verified_at), which blocks the side-table carry in the
+            // adoption paths while keeping history.
+            const row = db
+                .prepare(
+                    "SELECT verification_status AS status, verified_at AS at FROM memories WHERE id = ?",
+                )
+                .get(seeded.memoryId) as { status: string; at: number | null };
+            expect(row.status).toBe("unverified");
+            expect(row.at ?? 0).toBeGreaterThan(0);
         }
     });
 
@@ -1129,6 +1138,42 @@ describe("memory/claims kernel: lifecycle, merge, and verification", () => {
             metadata_json: JSON.stringify({ archive_reason: "done" }),
         });
         expect(count(db, "claim_change_outbox", "effect_type = 'lifecycle'")).toBe(1);
+    });
+
+    test("archive with a reason carries verification onto the metadata-only successor", () => {
+        const db = track(migratedDb());
+        const seeded = createSeedMemory(db, "archive-verified-seed", "verified archive target");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                "UPDATE memories SET verification_status = 'verified', verified_at = 123 WHERE id = ?",
+            ).run(seeded.memoryId);
+        });
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            setMemoryStatusWithClaimsInCurrentTransaction(
+                db,
+                envelope("archive-verified-1", { id: seeded.memoryId }),
+                {
+                    memoryId: seeded.memoryId,
+                    status: "archived",
+                    metadataJson: JSON.stringify({ archive_reason: "done" }),
+                },
+            ),
+        );
+        // The metadata replacement appends a same-content successor; the
+        // exact bytes the verification attested are unchanged, so the new
+        // current revision owes its own verified event — otherwise restoring
+        // the memory later leaves unchanged content hidden until it is
+        // verified again. The archive event still lands with the state
+        // change.
+        expect(outcome.result.revisionId).not.toBeNull();
+        expect(
+            db
+                .prepare(
+                    "SELECT outcome FROM verification_events WHERE revision_id = ? ORDER BY id",
+                )
+                .all(outcome.result.revisionId)
+                .map((row) => (row as { outcome: string }).outcome),
+        ).toEqual(["verified", "archive"]);
     });
 
     test("delete retires the claim, removes the projection, and retains the crosswalk", () => {
@@ -3480,5 +3525,230 @@ describe("memory/claims kernel: removal-path first-adoption announcements", () =
             { effectKey: `memory:${rawId}:evidence`, effectType: "evidence" },
             { effectKey: `memory:${rawId}:upsert`, effectType: "upsert" },
         ]);
+    });
+});
+
+describe("memory/claims kernel: claim trust policy companions", () => {
+    function policySubject(db: Database, revisionId: number): Record<string, unknown> | null {
+        return (
+            (db
+                .prepare(
+                    `SELECT claim_kind AS claimKind, origin_taint AS originTaint,
+                            origin_observation_id AS originObservationId
+                     FROM claim_revision_policy_subjects WHERE revision_id = ?`,
+                )
+                .get(revisionId) as Record<string, unknown> | undefined) ?? null
+        );
+    }
+
+    function effectivePolicy(db: Database, revisionId: number): Record<string, unknown> | null {
+        return (
+            (db
+                .prepare(
+                    `SELECT effective_maturity AS maturity, origin_taint AS taint,
+                            auto_eligible AS auto, explicit_eligible AS explicit
+                     FROM claim_effective_policy WHERE revision_id = ?`,
+                )
+                .get(revisionId) as Record<string, unknown> | undefined) ?? null
+        );
+    }
+
+    function createUserMemory(
+        db: Database,
+        key: string,
+        content: string,
+    ): { memoryId: number; claimId: number; revisionId: number } {
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            createMemoryWithClaimsInCurrentTransaction(db, envelope(key, { key, content }), {
+                projectPath: PROJECT,
+                category: "CONSTRAINTS",
+                content,
+                normalizedHash: `hash:${content}`,
+                importance: 60,
+                sourceSessionId: "ses-kernel",
+                sourceType: "user",
+                nowMs: 1_000,
+            }),
+        );
+        return {
+            memoryId: outcome.result.memoryId,
+            claimId: outcome.result.claimId as number,
+            revisionId: outcome.result.revisionId as number,
+        };
+    }
+
+    test("every new revision receives a frozen policy subject and effective projection", () => {
+        const db = track(migratedDb());
+        const agentSeed = createSeedMemory(db, "pol-agent", "agent-authored fact");
+        expect(policySubject(db, agentSeed.revisionId)).toEqual({
+            claimKind: "unknown",
+            originTaint: "ASSISTANT_INFERENCE",
+            originObservationId: expect.any(Number),
+        });
+        expect(effectivePolicy(db, agentSeed.revisionId)).toEqual({
+            maturity: "CANDIDATE",
+            taint: "ASSISTANT_INFERENCE",
+            auto: 0,
+            explicit: 1,
+        });
+
+        const userSeed = createUserMemory(db, "pol-user", "user-authored preference");
+        expect(policySubject(db, userSeed.revisionId)).toMatchObject({
+            originTaint: "USER_EXPLICIT",
+        });
+        expect(effectivePolicy(db, userSeed.revisionId)).toEqual({
+            maturity: "VERIFIED",
+            taint: "USER_EXPLICIT",
+            auto: 1,
+            explicit: 1,
+        });
+    });
+
+    test("a model rewrite of a user memory does not inherit explicit-user trust", () => {
+        const db = track(migratedDb());
+        const seed = createUserMemory(db, "pol-rewrite", "original user text");
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-rewrite-2", { next: true }),
+                {
+                    memoryId: seed.memoryId,
+                    content: "model-authored replacement",
+                    normalizedHash: "hash:model-authored replacement",
+                    nowMs: 2_000,
+                },
+            ),
+        );
+        const successorId = outcome.result.revisionId as number;
+        expect(successorId).not.toBe(seed.revisionId);
+        expect(policySubject(db, successorId)).toMatchObject({
+            originTaint: "ASSISTANT_INFERENCE",
+        });
+        expect(effectivePolicy(db, successorId)).toMatchObject({
+            maturity: "CANDIDATE",
+            auto: 0,
+        });
+        // The original revision keeps its own frozen subject and history.
+        expect(policySubject(db, seed.revisionId)).toMatchObject({
+            originTaint: "USER_EXPLICIT",
+        });
+    });
+
+    test("a trusted verification promotes the current revision to effective VERIFIED", () => {
+        const db = track(migratedDb());
+        const seed = createSeedMemory(db, "pol-verify", "verifiable fact");
+        expect(effectivePolicy(db, seed.revisionId)).toMatchObject({
+            maturity: "CANDIDATE",
+            auto: 0,
+        });
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryVerificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-verify-2", { status: "verified" }),
+                { memoryId: seed.memoryId, verificationStatus: "verified", nowMs: 2_000 },
+            ),
+        );
+        expect(effectivePolicy(db, seed.revisionId)).toMatchObject({
+            maturity: "VERIFIED",
+            auto: 1,
+        });
+        expect(count(db, "claim_maturity_assertions", "maturity = 'VERIFIED'")).toBe(1);
+    });
+
+    test("a content successor never inherits approval from its predecessor", () => {
+        const db = track(migratedDb());
+        const seed = createUserMemory(db, "pol-approve", "approved directive");
+        const projectId = readMemoryClaimLink(db, seed.memoryId)?.projectId as number;
+        runInMemoryClaimsWriteTransaction(db, () => {
+            const approval = recordApprovalActionInCurrentTransaction(db, {
+                revisionId: seed.revisionId,
+                projectId,
+                action: "approve",
+                host: "opencode",
+                sessionId: "ses-kernel",
+                userCommandEvent: "evt-approve",
+                commandIdentity: "cmd-pol-approve",
+                confirmationNonce: "nonce",
+            });
+            appendMaturityAssertionInCurrentTransaction(db, {
+                revisionId: seed.revisionId,
+                projectId,
+                maturity: "APPROVED",
+                actor: "user-command",
+                approvalActionId: approval.actionId,
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, seed.revisionId);
+            return undefined;
+        });
+        expect(effectivePolicy(db, seed.revisionId)).toMatchObject({ maturity: "APPROVED" });
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-approve-2", { next: true }),
+                {
+                    memoryId: seed.memoryId,
+                    content: "edited directive",
+                    normalizedHash: "hash:edited directive",
+                    nowMs: 3_000,
+                },
+            ),
+        );
+        const successorId = outcome.result.revisionId as number;
+        expect(effectivePolicy(db, successorId)).toMatchObject({
+            maturity: "CANDIDATE",
+            auto: 0,
+        });
+        expect(count(db, "claim_approval_actions", `revision_id = ${successorId}`)).toBe(0);
+    });
+
+    test("classification-only changes leave the original revision's maturity unchanged", () => {
+        const db = track(migratedDb());
+        const seed = createSeedMemory(db, "pol-classify", "classified fact");
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryClassificationWithClaimsInCurrentTransaction(
+                db,
+                envelope("pol-classify-2", { importance: 90 }),
+                { memoryId: seed.memoryId, importance: 90, nowMs: 2_000 },
+            ),
+        );
+        const heads = db
+            .prepare(
+                `SELECT stream.revision_id AS revisionId, head.maturity AS maturity
+                 FROM claim_maturity_heads head
+                 JOIN claim_maturity_streams stream ON stream.id = head.stream_id
+                 ORDER BY stream.revision_id`,
+            )
+            .all() as Array<{ revisionId: number; maturity: string }>;
+        const original = heads.find((row) => row.revisionId === seed.revisionId);
+        expect(original?.maturity).toBe("CANDIDATE");
+    });
+});
+
+describe("memory/claims kernel: project epoch invalidation", () => {
+    function epochOf(db: Database, projectPath: string): number {
+        const row = db
+            .prepare(
+                "SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
+            )
+            .get(projectPath) as { epoch: number } | null | undefined;
+        return row?.epoch ?? 0;
+    }
+
+    test("a bump lands on the canonical identity even when the linked memory keeps an older path", () => {
+        const db = track(migratedDb());
+        const seed = createSeedMemory(db, "epoch-alias", "epoch alias content");
+        // The project's canonical identity moves on (e.g. a dir:->git:
+        // upgrade); the linked memory row keeps the identity it was created
+        // under, which survives only as an alias.
+        const moved = "git:kernel-project-moved";
+        db.prepare(
+            "UPDATE projects SET canonical_identity = ? WHERE id = (SELECT project_id FROM claims WHERE id = ?)",
+        ).run(moved, seed.claimId);
+        const storedBefore = epochOf(db, PROJECT);
+        const canonicalBefore = epochOf(db, moved);
+        bumpEpochForClaimProjectInCurrentTransaction(db, seed.claimId);
+        // Sessions reading either identity observe the change.
+        expect(epochOf(db, PROJECT)).toBe(storedBefore + 1);
+        expect(epochOf(db, moved)).toBe(canonicalBefore + 1);
     });
 });

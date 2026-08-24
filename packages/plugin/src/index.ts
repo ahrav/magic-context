@@ -10,6 +10,7 @@ import { loadPluginConfigDetailed } from "./config";
 import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
 import { getMagicContextBuiltinCommands } from "./features/builtin-commands/commands";
+import { runClaimPolicySeedStartup } from "./features/magic-context/claim-policy-backfill-startup";
 import { runClaimsBackfillStartup } from "./features/magic-context/claims-backfill-startup";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
@@ -290,6 +291,14 @@ const server: Plugin = async (ctx) => {
                 scheduleAfterBootQuiet(() => {
                     runClaimsBackfillStartup(db).catch((err) => {
                         log(`[claims-backfill] background runner failed: ${err}`);
+                    });
+                });
+                // Independent of the backfill above: an unseeded revision reads
+                // as automatic-hidden, so chaining this behind that backfill
+                // would hide every pre-existing memory whenever it fails.
+                scheduleAfterBootQuiet(() => {
+                    runClaimPolicySeedStartup(db).catch((err) => {
+                        log(`[claim-policy-seed] background runner failed: ${err}`);
                     });
                 });
             }

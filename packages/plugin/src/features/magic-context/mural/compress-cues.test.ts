@@ -164,6 +164,7 @@ describe("runCompressCues disposition", () => {
             const projectIdentity = "git:cues-deadline";
             for (let index = 0; index < 41; index += 1) {
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Cue fact ${index}.`,
@@ -190,6 +191,7 @@ describe("runCompressCues disposition", () => {
         try {
             const projectIdentity = "git:cues-complete";
             insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Cue fact.",
@@ -212,6 +214,7 @@ describe("runCompressCues disposition", () => {
         try {
             const projectIdentity = "git:cues-failure";
             insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "ARCHITECTURE",
                 content: "Cue fact.",
@@ -240,6 +243,7 @@ describe("runCompressCues disposition", () => {
             const projectIdentity = "git:cues-floor-stop";
             for (let index = 0; index < 41; index += 1) {
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Cue fact ${index}.`,
@@ -273,6 +277,7 @@ describe("runCompressCues disposition", () => {
             // 120 memories = exactly 3 chunks of 40.
             for (let index = 0; index < 120; index += 1) {
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Cue fact ${index}.`,
@@ -305,6 +310,7 @@ describe("runCompressCues disposition", () => {
             const projectIdentity = "git:cues-provider-outage";
             for (let index = 0; index < 120; index += 1) {
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Cue outage fact ${index}.`,
@@ -345,6 +351,7 @@ describe("runCompressCues disposition", () => {
             const projectIdentity = "git:cues-validation";
             for (let index = 0; index < 120; index += 1) {
                 insertMemory(db, {
+                    sourceType: "user",
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
                     content: `Cue fact ${index}.`,
@@ -384,12 +391,14 @@ describe("cue validation precision", () => {
         try {
             const projectIdentity = "git:cues-live-shape";
             const prMemory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "KNOWN_ISSUES",
                 content: "PR #21729 tracks the parser fix.",
                 sourceSessionId: "ses",
             });
             const issueMemory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "KNOWN_ISSUES",
                 content: "Issue #31638 tracks the retry loop.",
@@ -423,6 +432,7 @@ describe("cue rejection latch", () => {
         try {
             const projectIdentity = "git:cues-latch";
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "KNOWN_ISSUES",
                 content: "The repeater must remain stable for issue #31638.",
@@ -467,6 +477,7 @@ describe("cue rejection latch", () => {
         try {
             const projectIdentity = "git:cues-latch-reset";
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: projectIdentity,
                 category: "KNOWN_ISSUES",
                 content: "Original issue #31638 content.",
@@ -515,6 +526,7 @@ describe("mural cue storage", () => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: "git:p",
                 category: "ARCHITECTURE",
                 content: "some fact",
@@ -533,6 +545,7 @@ describe("mural cue storage", () => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: "git:managed-cues",
                 category: "ARCHITECTURE",
                 content: "authoritative content",
@@ -572,6 +585,7 @@ describe("mural cue storage", () => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: "git:p",
                 category: "NAMING",
                 content: "old content",
@@ -602,12 +616,14 @@ describe("applyCues (per-cue validation, skip-not-reject, hash-race)", () => {
         const db = freshDb();
         try {
             const good = insertMemory(db, {
+                sourceType: "user",
                 projectPath: "git:p",
                 category: "ARCHITECTURE",
                 content: "good fact",
                 sourceSessionId: "s",
             });
             const bad = insertMemory(db, {
+                sourceType: "user",
                 projectPath: "git:p",
                 category: "CONSTRAINTS",
                 content: "bad fact",
@@ -634,6 +650,7 @@ describe("applyCues (per-cue validation, skip-not-reject, hash-race)", () => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: "git:p",
                 category: "ARCHITECTURE",
                 content: "original content",
@@ -682,6 +699,7 @@ describe("applyCues (per-cue validation, skip-not-reject, hash-race)", () => {
         const db = freshDb();
         try {
             const memory = insertMemory(db, {
+                sourceType: "user",
                 projectPath: "git:p",
                 category: "NAMING",
                 content: "in chunk",

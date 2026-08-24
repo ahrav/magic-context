@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -56,17 +57,41 @@ function toPosixPath(value: string): string {
     return value.split(path.sep).join("/");
 }
 
-function isWithin(root: string, candidate: string): boolean {
+/** True when `candidate` stays at or below `root` (no `..` escape). Shared
+ * with the enforcement-artifact canonicalizer so the security-sensitive
+ * escape predicate has exactly one implementation. */
+export function isWithin(root: string, candidate: string): boolean {
     const rel = path.relative(root, candidate);
     return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-function safeRealpath(value: string): string | null {
+/** Resolve symlinks, or null when the path does not exist. Shared with the
+ * enforcement-artifact canonicalizer. */
+export function safeRealpath(value: string): string | null {
     try {
         return realpathSync.native(value);
     } catch {
         return null;
     }
+}
+
+/** SHA-256 hex of a file's bytes, read whole. The single implementation for
+ * enforcement-artifact digests: record time and revalidation must hash
+ * identically or valid artifacts read as drifted (and vice versa). Use the
+ * streaming variant on paths where a large file would pin the event loop. */
+export function sha256FileSync(absolutePath: string): string {
+    return createHash("sha256").update(readFileSync(absolutePath)).digest("hex");
+}
+
+/** Streamed SHA-256: read and hash yield per chunk, so hashing a large
+ *  artifact never pins the event loop the way a whole-buffer
+ *  createHash().update() would. Digest-identical to `sha256FileSync`. */
+export async function sha256FileStreaming(absolutePath: string): Promise<string> {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(absolutePath)) {
+        hash.update(chunk as Buffer);
+    }
+    return hash.digest("hex");
 }
 
 export async function resolveGitTopLevel(cwd: string): Promise<string | null> {

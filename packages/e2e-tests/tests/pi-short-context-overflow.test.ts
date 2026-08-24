@@ -119,9 +119,23 @@ describe("pi short context accumulating overflow", () => {
         const turnErrors: Array<{ turn: number; error: string }> = [];
         const turns = 30;
 
+        // Background passes (historian publish, deferred compaction) can hold
+        // the agent busy briefly after agent_end; a prompt sent in that window
+        // fails with "Agent is already processing". Slow CI runners widen the
+        // window, so wait for idle state between back-to-back turns.
+        const waitForIdle = async (): Promise<void> => {
+            const deadline = Date.now() + 30_000;
+            while (Date.now() < deadline) {
+                const state = await h.getState().catch(() => null);
+                if (state && !state.isStreaming && !state.isCompacting) return;
+                await new Promise((r) => setTimeout(r, 250));
+            }
+        };
+
         for (let i = 1; i <= turns; i++) {
             const reqBefore = h.mock.requests().length;
             try {
+                await waitForIdle();
                 const turn = await h.sendPrompt(`user turn ${i}: continue.`, {
                     timeoutMs: 60_000,
                     continueSession: true,

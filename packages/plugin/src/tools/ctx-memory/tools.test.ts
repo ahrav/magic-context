@@ -2054,6 +2054,174 @@ describe("createCtxMemoryTools on a migrated v84 database (claims kernel, U3)", 
         ).map((row) => row.content);
     }
 
+    it("hides quarantined memories from get and list and labels sub-verified rows", async () => {
+        const write = await tools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Quarantine target fact." },
+            toolContext(),
+        );
+        expect(write).toContain("Saved memory [ID:");
+        const [memory] = getMemoriesByProject(db, OWN_PROJECT);
+
+        // A fresh agent-written memory is CANDIDATE: visible with a trust label.
+        const fetched = await tools.ctx_memory.execute(
+            { action: "get", ids: [memory.id] },
+            toolContext(),
+        );
+        expect(fetched).toContain("Quarantine target fact.");
+        expect(fetched).toContain("candidate");
+
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+        if (!claim) throw new Error("expected claim link");
+        const {
+            recordDispositionEventInCurrentTransaction,
+            refreshEffectivePolicyInCurrentTransaction,
+        } = await import("../../features/magic-context/memory/storage-claim-policy");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: claim.revisionId,
+                projectId: claim.projectId,
+                disposition: "quarantined",
+                action: "assert",
+                actor: "host",
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
+            return undefined;
+        });
+
+        const got = await tools.ctx_memory.execute(
+            { action: "get", ids: [memory.id] },
+            toolContext(),
+        );
+        expect(got).not.toContain("Quarantine target fact.");
+        const relisted = await tools.ctx_memory.execute(
+            { action: "list" },
+            toolContext("ses-memory", DREAMER_AGENT),
+        );
+        expect(relisted).not.toContain("Quarantine target fact.");
+    });
+
+    it("refuses a module-lane write whose content duplicates a policy-hidden row", async () => {
+        const write = await tools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Hidden duplicate target." },
+            toolContext(),
+        );
+        expect(write).toContain("Saved memory [ID:");
+        const [memory] = getMemoriesByProject(db, OWN_PROJECT);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+        if (!claim) throw new Error("expected claim link");
+        const {
+            recordDispositionEventInCurrentTransaction,
+            refreshEffectivePolicyInCurrentTransaction,
+        } = await import("../../features/magic-context/memory/storage-claim-policy");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: claim.revisionId,
+                projectId: claim.projectId,
+                disposition: "quarantined",
+                action: "assert",
+                actor: "host",
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
+            return undefined;
+        });
+
+        const routed: string[] = [];
+        const moduleTools = createCtxMemoryTools({
+            db,
+            resolveProjectPath: () => OWN_PROJECT,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                memory: async (request) => {
+                    routed.push(request.action);
+                    return { content: [{ type: "text", text: `module ${request.action}` }] };
+                },
+            },
+        });
+        // The same bytes get the TS-authority uniform refusal without
+        // reaching the native backend: the native store dedups against its
+        // own policy-filtered mirror, so dispatching would either mint a
+        // divergent row or confirm the hidden row's existence.
+        const refused = await moduleTools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Hidden duplicate target." },
+            toolContext(),
+        );
+        expect(refused).toBe("Error: Memory could not be saved in CONSTRAINTS.");
+        expect(routed).toEqual([]);
+        // Fresh content still dispatches to the module lane.
+        const dispatched = await moduleTools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Fresh module content." },
+            toolContext(),
+        );
+        expect(dispatched).toContain("module write");
+        expect(routed).toEqual(["write"]);
+    });
+
+    it("translates module-lane ids through the mirror before the policy gate", async () => {
+        const write = await tools.ctx_memory.execute(
+            { action: "write", category: "CONSTRAINTS", content: "Mirror-mapped hidden row." },
+            toolContext(),
+        );
+        expect(write).toContain("Saved memory [ID:");
+        const [memory] = getMemoriesByProject(db, OWN_PROJECT);
+        const claim = getCurrentMemoryClaimByLegacyMemoryId(db, memory.id);
+        if (!claim) throw new Error("expected claim link");
+        const {
+            recordDispositionEventInCurrentTransaction,
+            refreshEffectivePolicyInCurrentTransaction,
+        } = await import("../../features/magic-context/memory/storage-claim-policy");
+        runInMemoryClaimsWriteTransaction(db, () => {
+            recordDispositionEventInCurrentTransaction(db, {
+                revisionId: claim.revisionId,
+                projectId: claim.projectId,
+                disposition: "quarantined",
+                action: "assert",
+                actor: "host",
+            });
+            refreshEffectivePolicyInCurrentTransaction(db, claim.revisionId);
+            return undefined;
+        });
+        // The two id spaces are allowed to differ: the mirror maps a native
+        // module row id to the hidden TypeScript row.
+        const moduleId = memory.id + 9000;
+        db.prepare(
+            "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
+        ).run(OWN_PROJECT, moduleId, memory.id);
+
+        const routed: Array<readonly number[] | undefined> = [];
+        const moduleTools = createCtxMemoryTools({
+            db,
+            resolveProjectPath: () => OWN_PROJECT,
+            memoryEnabled: true,
+            embeddingEnabled: false,
+            rustToolBackends: {
+                authorityState: async () => "MODULE",
+                memory: async (request) => {
+                    routed.push(request.ids);
+                    return { content: [{ type: "text", text: `module ${request.action}` }] };
+                },
+            },
+        });
+        // The module id resolves through the mirror to the hidden row and is
+        // refused before dispatch — keying the claims database by the raw
+        // module id would consult the wrong (or no) policy row.
+        const denied = await moduleTools.ctx_memory.execute(
+            { action: "get", ids: [moduleId] },
+            toolContext(),
+        );
+        expect(denied).toBe(`Error: Memory with ID ${moduleId} was not found.`);
+        expect(routed).toEqual([]);
+        // An id with no identity row names a fresh native row the mirror has
+        // not synced back; there is no claim to protect and it dispatches.
+        const passed = await moduleTools.ctx_memory.execute(
+            { action: "get", ids: [moduleId + 1] },
+            toolContext(),
+        );
+        expect(passed).toContain("module get");
+        expect(routed).toEqual([[moduleId + 1]]);
+    });
+
     it("writing the same content twice keeps one projection row and one revision while telemetry increments", async () => {
         const write = await tools.ctx_memory.execute(
             { action: "write", category: "CONSTRAINTS", content: "Use bun for scripts." },

@@ -20,8 +20,12 @@ import {
 } from "../synapse-detailed-test-support";
 import { ensureMemoryEmbeddings } from "./embedding-backfill";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
+import { sha256Utf8Hex } from "./storage-claims";
 import { insertMemory } from "./storage-memory";
-import { runInMemoryClaimsWriteTransaction } from "./storage-memory-claims";
+import {
+    runInMemoryClaimsWriteTransaction,
+    updateMemoryContentWithClaimsInCurrentTransaction,
+} from "./storage-memory-claims";
 import { loadAllEmbeddings } from "./storage-memory-embeddings";
 
 class FakeEmbeddingProvider implements EmbeddingProvider {
@@ -172,12 +176,26 @@ describe("ensureMemoryEmbeddings (read-path backfill)", () => {
             existingEmbeddings: new Map(),
         });
         await started;
-        // The in-flight vector was computed from the old content.
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare(
-                "UPDATE memories SET content = ?, normalized_hash = ?, updated_at = ? WHERE id = ?",
-            ).run("New memory body (edited)", "new-memory-hash", Date.now(), memory.id);
-        });
+        // The in-flight vector was computed from the old content. The edit
+        // goes through the claims kernel so the row and the claim's current
+        // revision advance together — the digest oracle reads the claim's
+        // current revision, and a diverging raw UPDATE would (correctly)
+        // read as an unvalidatable row and block the re-embed below.
+        runInMemoryClaimsWriteTransaction(db, () =>
+            updateMemoryContentWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "embedding-backfill-test",
+                    operationKey: `rewrite:${memory.id}`,
+                    requestDigest: sha256Utf8Hex(`rewrite:${memory.id}`),
+                },
+                {
+                    memoryId: memory.id,
+                    content: "New memory body (edited)",
+                    normalizedHash: "new-memory-hash",
+                },
+            ),
+        );
         release?.();
 
         const cache = await inFlight;

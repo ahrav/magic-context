@@ -85,11 +85,40 @@ export type AutoSearchHintNoHintReason =
     | "empty"
     | "error"
     | "stacked"
-    | "too-short";
+    | "too-short"
+    | "policy-reset";
 
 export type AutoSearchHintDecision =
-    | { messageId: string; decision: "hint"; text: string }
-    | { messageId: string; decision: "no-hint"; reason: AutoSearchHintNoHintReason };
+    | {
+          messageId: string;
+          decision: "hint";
+          text: string;
+          /**
+           * Memories whose fragments the hint text carries, each bound to the
+           * normalized content hash that produced it. Replay gates re-check
+           * both against live state so a memory hidden after the hint was
+           * computed — or rewritten in place, even if the replacement later
+           * becomes eligible — stops being served; a decision without the
+           * field (written before the field existed, or reseeded through a
+           * lane that drops it) cannot prove its fragments are clean and
+           * fails closed under an effective claim policy.
+           */
+          memoryFragments?: Array<{ id: number; hash: string }>;
+          /**
+           * The native module block id (`messageId#blockIndex`) this decision
+           * was last seeded under. Recorded on the first successful raw-block
+           * resolution so a later revocation can reach the module's stored
+           * hint row even when the raw message can no longer be loaded.
+           */
+          nativeBlockId?: string;
+      }
+    | {
+          messageId: string;
+          decision: "no-hint";
+          reason: AutoSearchHintNoHintReason;
+          /** See the hint variant: last-seeded native module block id. */
+          nativeBlockId?: string;
+      };
 
 export type NoteNudgeDeliveryOutcome =
     | { ok: true; kind: "appended" }
@@ -188,6 +217,9 @@ const AUTO_SEARCH_NO_HINT_REASONS = new Set<string>([
     "error",
     "stacked",
     "too-short",
+    // v86 migration tombstone: a pre-policy hint decision converted to
+    // no-hint so its block id can still revoke an already-seeded native hint.
+    "policy-reset",
 ]);
 
 function isPersistedUsageRow(row: unknown): row is PersistedUsageRow {
@@ -234,8 +266,20 @@ function isValidAutoSearchHintDecision(value: unknown): value is AutoSearchHintD
     if (value === null || typeof value !== "object") return false;
     const row = value as Record<string, unknown>;
     if (typeof row.messageId !== "string" || row.messageId.length === 0) return false;
+    if (row.nativeBlockId !== undefined && typeof row.nativeBlockId !== "string") return false;
     if (row.decision === "hint") {
-        return typeof row.text === "string" && row.text.length > 0;
+        if (typeof row.text !== "string" || row.text.length === 0) return false;
+        return (
+            row.memoryFragments === undefined ||
+            (Array.isArray(row.memoryFragments) &&
+                row.memoryFragments.every(
+                    (fragment) =>
+                        fragment !== null &&
+                        typeof fragment === "object" &&
+                        Number.isInteger((fragment as { id?: unknown }).id) &&
+                        typeof (fragment as { hash?: unknown }).hash === "string",
+                ))
+        );
     }
     if (row.decision === "no-hint") {
         return typeof row.reason === "string" && AUTO_SEARCH_NO_HINT_REASONS.has(row.reason);
@@ -1320,6 +1364,34 @@ export function getAutoSearchHintDecisions(
         .prepare("SELECT auto_search_hint_decisions FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { auto_search_hint_decisions?: string | null } | undefined;
     return parseJsonArray(row?.auto_search_hint_decisions, isValidAutoSearchHintDecision);
+}
+
+/**
+ * Record the native module block id a decision was seeded under. Idempotent;
+ * a lost write only delays revocation-independence until the next successful
+ * raw resolution, so CAS exhaustion is tolerated silently.
+ */
+export function recordAutoSearchHintNativeBlockId(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+    nativeBlockId: string,
+): void {
+    casUpdateJsonArrayColumn(
+        db,
+        sessionId,
+        "auto_search_hint_decisions",
+        isValidAutoSearchHintDecision,
+        (current) => {
+            const index = current.findIndex((decision) => decision.messageId === messageId);
+            if (index < 0) return null;
+            if (current[index].nativeBlockId === nativeBlockId) return null;
+            const next = [...current];
+            next[index] = { ...next[index], nativeBlockId };
+            return next;
+        },
+        { ensureRow: false },
+    );
 }
 
 function casUpdateJsonArrayColumn<T>(

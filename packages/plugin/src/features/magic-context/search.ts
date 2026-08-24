@@ -15,13 +15,23 @@ import {
     type Memory,
     ModuleMemoryAuthorityError,
     peekProjectEmbeddings,
-    searchMemoriesFTS,
-    searchMemoriesFTSUnion,
+    searchMemoriesFTSWithinIds,
     updateMemoryRetrievalCount,
 } from "./memory";
 import { cosineSimilarity } from "./memory/cosine-similarity";
 import { embedText, getProjectEmbeddingSnapshot, isEmbeddingEnabled } from "./memory/embedding";
 import type { EmbeddingPurpose } from "./memory/embedding-provider";
+import {
+    bindMemoriesToCurrentRevision,
+    decideMemoryPolicy,
+    exactMemoryContentDigests,
+    filterMemoriesByPolicy,
+    hasClaimEffectivePolicy,
+    type MemoryPolicyRow,
+    type MemoryPolicySurface,
+    readMemoryPolicyRows,
+} from "./memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "./memory/storage-claims";
 import { sanitizeFtsQuery } from "./memory/storage-memory-fts";
 import { getIndexedMessageCorpusSize } from "./message-index";
 import {
@@ -193,6 +203,7 @@ export interface UnifiedSearchOptions {
     /** `candidateDepth` sets the per-lane candidate count; `limit` controls
      *  returned results. */
     candidateDepth?: number;
+    memoryPolicySurface?: "auto_search" | "explicit_search";
 }
 
 export interface MemorySearchResult {
@@ -203,6 +214,12 @@ export interface MemorySearchResult {
     category: string;
     matchType: "semantic" | "fts" | "hybrid";
     sourceName?: string;
+    policyLabel?: string;
+    /** Exact SHA-256 digest of the LOADED memory bytes this result was ranked
+     * from. Consumers that persist replay state (auto-search hints) bind to
+     * this digest so a rewrite committed after the lane's recheck cannot pair
+     * the old packed text with the new revision's identity. */
+    contentDigest?: string;
 }
 
 export interface MessageSearchResult {
@@ -633,24 +650,14 @@ async function getSemanticScores(args: {
     return pruneToLaneCeiling(semanticScores);
 }
 
-function getFtsMatches(args: {
+function getFtsEligibleMatches(args: {
     db: Database;
-    projectPath: string;
+    memoryIds: readonly number[];
     query: string;
     limit: number;
-    workspace?: SearchWorkspaceContext;
 }): Memory[] {
     try {
-        return args.workspace?.isWorkspaced
-            ? searchMemoriesFTSUnion(
-                  args.db,
-                  args.workspace.expandedIdentities,
-                  args.query,
-                  args.limit,
-                  args.workspace.ownIdentities,
-                  args.workspace.shareCategories,
-              )
-            : searchMemoriesFTS(args.db, args.projectPath, args.query, args.limit);
+        return searchMemoriesFTSWithinIds(args.db, args.memoryIds, args.query, args.limit);
     } catch (error) {
         log(
             `[search] FTS query failed for "${args.query}": ${error instanceof Error ? error.message : String(error)}`,
@@ -784,6 +791,7 @@ async function searchMemories(args: {
     /** The unified filter span; the lane's first span depends on it so the
      *  causal chain includes filter and workspace-resolution cost. */
     filterSpanId?: number | null;
+    policySurface: MemoryPolicySurface;
 }): Promise<{ results: MemorySearchResult[]; laneSpanId: number | null }> {
     if (!args.memoryEnabled) {
         return { results: [], laneSpanId: null };
@@ -796,7 +804,7 @@ async function searchMemories(args: {
             parent: rootSpanId,
             dependsOn: args.filterSpanId != null ? [args.filterSpanId] : [],
         }) ?? null;
-    const memories = args.workspace?.isWorkspaced
+    const loaded = args.workspace?.isWorkspaced
         ? getMemoriesByProjects(
               args.db,
               args.workspace.expandedIdentities,
@@ -806,6 +814,10 @@ async function searchMemories(args: {
               args.workspace.shareCategories,
           )
         : getMemoriesByProject(args.db, args.projectPath);
+    // Policy eligibility applies before candidate limits and scoring, so an
+    // ineligible row never consumes a result slot.
+    const policyFilter = filterMemoriesByPolicy(args.db, loaded, args.policySurface);
+    const memories = policyFilter.memories;
     hydrationSpan?.end("ok", { rows: memories.length });
     if (memories.length === 0) {
         return { results: [], laneSpanId: hydrationSpan?.id ?? null };
@@ -820,12 +832,17 @@ async function searchMemories(args: {
             parent: rootSpanId,
             dependsOn: hydrationDeps,
         }) ?? null;
-    const ftsMatches = getFtsMatches({
+    const candidateLimit = args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT;
+    // The FTS query ranks WITHIN the eligible id set, so hidden matches can
+    // neither consume candidate slots nor force a widening scan: one bounded
+    // fetch returns the top-ranked eligible matches exactly, however many
+    // hidden rows outrank them, and pins the semantic lane to rows that
+    // survive the policy filter.
+    const ftsMatches = getFtsEligibleMatches({
         db: args.db,
-        projectPath: args.projectPath,
+        memoryIds: memories.map((memory) => memory.id),
         query: args.query,
-        limit: args.candidateLimit ?? FTS_SEMANTIC_CANDIDATE_LIMIT,
-        workspace: args.workspace,
+        limit: candidateLimit,
     });
     lexicalSpan?.end("ok", { candidatesOut: ftsMatches.length });
     const ftsScores = getFtsScores(ftsMatches);
@@ -907,9 +924,54 @@ async function searchMemories(args: {
         // identity only, not an executed lane bound).
         effectiveK: args.candidateLimit ?? args.limit,
     });
+    // Policy recheck before results leave the lane: a transition committed
+    // during scoring must not publish newly hidden content.
+    const hasPolicy = hasClaimEffectivePolicy(args.db);
+    const recheckRows = hasPolicy
+        ? readMemoryPolicyRows(
+              args.db,
+              merged.map((result) => result.memoryId),
+          )
+        : new Map<number, MemoryPolicyRow>();
+    // The recheck must bind to the LOADED bytes, not just the id: a rewrite
+    // committed during the scoring yields makes the unchanged memory id
+    // resolve through the new revision, whose eligibility would otherwise
+    // admit the superseded content this lane loaded. Exact SHA-256 digests —
+    // the normalized hash lowercases and collapses whitespace, so it cannot
+    // tell a rewritten revision from its predecessor. Only the merged
+    // results' rows are hashed (bounded by the lane limit).
+    const loadedMemoriesById = new Map(memories.map((memory) => [memory.id, memory]));
+    const currentHashById = hasPolicy
+        ? exactMemoryContentDigests(
+              args.db,
+              merged.map((result) => result.memoryId),
+          )
+        : new Map<number, string>();
+    const rechecked: MemorySearchResult[] = [];
+    for (const result of merged) {
+        if (!hasPolicy) {
+            rechecked.push(result);
+            continue;
+        }
+        const loaded = loadedMemoriesById.get(result.memoryId);
+        if (loaded === undefined) continue;
+        const loadedDigest = sha256Utf8Hex(loaded.content);
+        if (currentHashById.get(result.memoryId) !== loadedDigest) {
+            continue;
+        }
+        const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);
+        if (!decision.eligible) continue;
+        // The digest of the LOADED bytes rides the result so hint persistence
+        // binds to exactly what was ranked and packed, not a later reload.
+        rechecked.push({
+            ...result,
+            contentDigest: loadedDigest,
+            ...(decision.label ? { policyLabel: decision.label } : {}),
+        });
+    }
     // The lane's terminal span: the unified fusion span depends on it so
     // critical-path analysis can follow the memory lane.
-    return { results: merged, laneSpanId: topKSpan?.id ?? null };
+    return { results: rechecked, laneSpanId: topKSpan?.id ?? null };
 }
 
 /** Linear decay message scoring.
@@ -1970,8 +2032,24 @@ export function resolveMemoriesByIdsForSearch(args: {
         ownIdentities: workspace.isWorkspaced ? workspace.ownIdentities : undefined,
         shareCategories: workspace.isWorkspaced ? workspace.shareCategories : null,
     });
+    // Direct-ID lookup routes through the same explicit-surface decision as
+    // text search: hard-hidden rows return uniform absence. The binder then
+    // drops rows rewritten between load and policy read, so revision B's
+    // eligibility (and label) can never lend itself to superseded revision A
+    // bytes — including revealing A after a hidden target was rewritten.
+    const policyFilter = filterMemoriesByPolicy(args.db, fetched, "explicit_search");
+    // Reapply the policy on the BOUND rows: a quarantine or label transition
+    // committed between the first policy read and the binding must not
+    // publish the hidden row or a stale label — this lane short-circuits
+    // before executeUnifiedSearch's final recheck.
+    const recheck = filterMemoriesByPolicy(
+        args.db,
+        bindMemoriesToCurrentRevision(args.db, policyFilter.memories),
+        "explicit_search",
+    );
+    const bound = recheck.memories;
     const ordered: Memory[] = [];
-    for (const memory of fetched) {
+    for (const memory of bound) {
         if (args.visibleMemoryIds?.has(memory.id)) continue;
         ordered.push(memory);
         if (ordered.length >= args.limit) break;
@@ -1979,7 +2057,7 @@ export function resolveMemoriesByIdsForSearch(args: {
     if (ordered.length === 0) {
         return null;
     }
-    return memoriesToIdLookupResults({
+    const results = memoriesToIdLookupResults({
         memories: ordered,
         limit: args.limit,
         sourceNameByMemoryId: sourceNamesForSearchMemories({
@@ -1987,6 +2065,10 @@ export function resolveMemoriesByIdsForSearch(args: {
             projectPath: args.projectPath,
             workspace,
         }),
+    });
+    return results.map((result) => {
+        const label = recheck.labels.get(result.memoryId);
+        return label ? { ...result, policyLabel: label } : result;
     });
 }
 
@@ -2394,6 +2476,7 @@ async function executeUnifiedSearch(args: {
                   rootSpanId: rootId,
                   semanticGateSpanId: semanticDeps.length > 0 ? semanticDeps[0] : null,
                   filterSpanId: workspaceSpan?.id ?? filterSpan?.id ?? null,
+                  policySurface: options.memoryPolicySurface ?? "explicit_search",
               })
             : Promise.resolve({
                   results: [] as MemorySearchResult[],
@@ -2461,23 +2544,68 @@ async function executeUnifiedSearch(args: {
     // retrieval_count is telemetry, not correctness: under MODULE authority the
     // TS write path is fenced, so skip the bump rather than failing the search.
     const countRetrievals = options.countRetrievals ?? true;
-    if (countRetrievals) {
+    {
         const memoryIds = results
             .filter((result): result is MemorySearchResult => result.source === "memory")
             .map((result) => result.memoryId);
 
         if (memoryIds.length > 0) {
-            db.transaction(() => {
-                for (const memoryId of memoryIds) {
-                    try {
-                        updateMemoryRetrievalCount(db, memoryId);
-                    } catch (error) {
-                        // Telemetry only — module-managed rows must not fail the search.
-                        if (error instanceof ModuleMemoryAuthorityError) continue;
-                        throw error;
+            if (countRetrievals) {
+                db.transaction(() => {
+                    for (const memoryId of memoryIds) {
+                        try {
+                            updateMemoryRetrievalCount(db, memoryId);
+                        } catch (error) {
+                            // Telemetry only — module-managed rows must not fail the search.
+                            if (error instanceof ModuleMemoryAuthorityError) continue;
+                            throw error;
+                        }
                     }
-                }
-            })();
+                })();
+            }
+            // This is the LAST database boundary before publication — and it
+            // runs for EVERY caller, telemetry or not: the auto-search lane
+            // passes countRetrievals: false, and the lane-level recheck can
+            // still read the old policy when a concurrent writer's commit
+            // (which the telemetry transaction may have waited on) hides one
+            // of these rows. Reapply the policy and exact-digest gate so the
+            // returned set reflects every transition that committed before
+            // publication.
+            if (hasClaimEffectivePolicy(db)) {
+                const surface = options.memoryPolicySurface ?? "explicit_search";
+                // ONE snapshot for both facts: as separate autocommit
+                // statements, a transition committing between them pairs a
+                // stale eligible decision with an unchanged digest (hide
+                // after digest) or a fresh decision with superseded bytes
+                // (rewrite after digest). A deferred read transaction pins
+                // one WAL snapshot, so the decision and the digest describe
+                // the same revision — and the loaded bytes must match it.
+                const { policyRows, digestsNow } = db.transaction(() => ({
+                    policyRows: readMemoryPolicyRows(db, memoryIds),
+                    digestsNow: exactMemoryContentDigests(db, memoryIds),
+                }))();
+                // Drop rows the final policy read hides AND refresh every
+                // survivor's trust label from that same read: a memory
+                // marked stale/flagged while the telemetry write waited
+                // stays eligible for explicit search but must carry the new
+                // label (and a row that became clean must shed its old one).
+                return results.flatMap<(typeof results)[number]>((result) => {
+                    if (result.source !== "memory") return [result];
+                    const decision = decideMemoryPolicy(policyRows.get(result.memoryId), surface);
+                    if (
+                        !decision.eligible ||
+                        (result.contentDigest !== undefined &&
+                            digestsNow.get(result.memoryId) !== result.contentDigest)
+                    ) {
+                        return [];
+                    }
+                    const { policyLabel: _stale, ...rest } = result;
+                    const refreshed: MemorySearchResult = decision.label
+                        ? { ...rest, policyLabel: decision.label }
+                        : rest;
+                    return [refreshed];
+                });
+            }
         }
     }
 

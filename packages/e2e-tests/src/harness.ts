@@ -275,14 +275,7 @@ export class TestHarness {
      */
     contextDb(): Database {
         if (this.contextDbCached) return this.contextDbCached;
-        // Plugin v0.16+ uses the shared cortexkit/magic-context path so OpenCode
-        // and Pi can share state. See packages/plugin/src/shared/data-path.ts.
-        const dbPath = join(
-            this.opencode.env.dataDir,
-            "cortexkit",
-            "magic-context",
-            "context.db",
-        );
+        const dbPath = this.contextDbPath();
         if (!existsSync(dbPath)) {
             throw new Error(`context.db not found at ${dbPath} — plugin may not have initialized yet.`);
         }
@@ -290,15 +283,21 @@ export class TestHarness {
         return this.contextDbCached;
     }
 
-    /** Whether the plugin has created its database yet. */
-    hasContextDb(): boolean {
-        const dbPath = join(
+    /** Absolute path of the shared context.db (may not exist yet). */
+    contextDbPath(): string {
+        // Plugin v0.16+ uses the shared cortexkit/magic-context path so OpenCode
+        // and Pi can share state. See packages/plugin/src/shared/data-path.ts.
+        return join(
             this.opencode.env.dataDir,
             "cortexkit",
             "magic-context",
             "context.db",
         );
-        return existsSync(dbPath);
+    }
+
+    /** Whether the plugin has created its database yet. */
+    hasContextDb(): boolean {
+        return existsSync(this.contextDbPath());
     }
 
     /** Poll until `predicate` returns true or `timeoutMs` elapses. */

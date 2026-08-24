@@ -36,6 +36,7 @@ function freshDb(): Database {
 
 function mem(db: Database, projectPath: string, content: string): number {
     const m = insertMemory(db, {
+        sourceType: "user",
         projectPath,
         category: "ARCHITECTURE",
         content,

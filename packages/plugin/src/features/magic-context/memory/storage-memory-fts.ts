@@ -82,6 +82,37 @@ export function searchMemoriesFTS(
     );
 }
 
+const withinSearchStatements = registerStatsDependentStatementCache(
+    new WeakMap<Database, PreparedStatement>(),
+);
+
+/**
+ * Rank FTS matches WITHIN an explicit id set. The id set is authoritative —
+ * callers pass ids that already passed status, expiry, workspace, and policy
+ * filtering — so the query needs no other predicates and returns the
+ * top-ranked members of the set in one bounded fetch. Restricting inside SQL
+ * is what keeps a hidden-heavy corpus cheap: ranking globally and filtering
+ * afterwards must either widen without bound or truncate eligible matches.
+ */
+export function searchMemoriesFTSWithinIds(
+    db: Database,
+    memoryIds: readonly number[],
+    query: string,
+    limit: number,
+): Memory[] {
+    if (memoryIds.length === 0 || limit <= 0) return [];
+    const trimmedQuery = query.trim();
+    if (trimmedQuery.length === 0) return [];
+    const sanitized = sanitizeFtsQuery(trimmedQuery);
+    if (sanitized.length === 0) return [];
+    const statement = getStatsDependentStatement(db, withinSearchStatements, () =>
+        db.prepare(
+            `SELECT ${getMemorySelectColumns(db)} FROM memories_fts INNER JOIN memories ON memories.id = memories_fts.rowid ${getMemoryStatsJoin(db)} WHERE memories.id IN (SELECT value FROM json_each(?)) AND memories_fts MATCH ? ORDER BY bm25(memories_fts), updatedAt DESC, memories.id ASC LIMIT ?`,
+        ),
+    );
+    return memoryRowsFromQuery(db, statement.all(JSON.stringify(memoryIds), sanitized, limit));
+}
+
 export function searchMemoriesFTSUnion(
     db: Database,
     projectPaths: readonly string[],

@@ -4,8 +4,18 @@ import { describe, expect, test } from "bun:test";
 
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { insertMemory, setMemoryClassification } from "../memory";
-import { getCurrentMemoryClaimByLegacyMemoryId } from "../memory/storage-memory-claims";
+import { getMemoriesByProject, insertMemory, setMemoryClassification } from "../memory";
+import {
+    recordDispositionEventInCurrentTransaction,
+    refreshEffectivePolicyInCurrentTransaction,
+} from "../memory/storage-claim-policy";
+import { filterMemoriesByPolicy } from "../memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "../memory/storage-claims";
+import {
+    getCurrentMemoryClaimByLegacyMemoryId,
+    runInMemoryClaimsWriteTransaction,
+    updateMemoryVerificationWithClaimsInCurrentTransaction,
+} from "../memory/storage-memory-claims";
 import type { Memory } from "../memory/types";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
@@ -21,7 +31,39 @@ function freshDb(): Database {
     return db;
 }
 
-/** Insert a memory, classify its importance, and give it a hash-current cue. */
+/** The gated pool `ensureMuralRendered` builds a mural from. */
+function muralPool(db: Database, projectIdentity: string) {
+    return filterMemoriesByPolicy(
+        db,
+        getMemoriesByProject(db, projectIdentity, ["active", "permanent"]),
+        "auto_inject",
+    ).memories;
+}
+
+/** Promote a memory to VERIFIED so it passes the auto_inject policy gate. */
+function verifyMemory(db: Database, memoryId: number): void {
+    runInMemoryClaimsWriteTransaction(db, () =>
+        updateMemoryVerificationWithClaimsInCurrentTransaction(
+            db,
+            {
+                producer: "mural-test",
+                operationKey: `verify:${memoryId}`,
+                requestDigest: sha256Utf8Hex(`verify:${memoryId}`),
+            },
+            { memoryId, verificationStatus: "verified" },
+        ),
+    );
+}
+
+/**
+ * Insert a memory, classify its importance, give it a hash-current cue, and
+ * verify it.
+ *
+ * The mural is an automatic injection channel, so it renders only rows that
+ * pass the `auto_inject` policy gate (effective VERIFIED+). A freshly inserted
+ * memory projects as CANDIDATE and is correctly invisible to the mural, so the
+ * verification step is what makes these fixtures represent a renderable pool.
+ */
 function seedCuedMemory(
     db: Database,
     project: string,
@@ -36,6 +78,7 @@ function seedCuedMemory(
         sourceSessionId: "s",
     });
     setMemoryClassification(db, memory.id, { importance });
+    verifyMemory(db, memory.id);
     setMuralCue(
         db,
         memory.projectPath,
@@ -43,6 +86,23 @@ function seedCuedMemory(
         `cue-${memory.id}`,
         computeCueContentHash(content),
     );
+    return memory;
+}
+
+/** A verified (policy-eligible) memory with no mural cue. */
+function seedUncuedMemory(
+    db: Database,
+    project: string,
+    category: Memory["category"],
+    content: string,
+): Memory {
+    const memory = insertMemory(db, {
+        projectPath: project,
+        category,
+        content,
+        sourceSessionId: "s",
+    });
+    verifyMemory(db, memory.id);
     return memory;
 }
 
@@ -55,6 +115,10 @@ describe("resolveMural", () => {
             const memory = seedCuedMemory(db, project, "ARCHITECTURE", content, 73);
             expect(getCurrentMemoryClaimByLegacyMemoryId(db, memory.id)?.content).toBe(content);
 
+            // The pool is policy-filtered by the CALLER (that read touches
+            // claim tables by design); the assertion below is that the mural
+            // resolver itself stays a memories-only reader.
+            const pool = muralPool(db, project);
             const statements: string[] = [];
             const originalPrepare = db.prepare.bind(db);
             db.prepare = ((sql: string) => {
@@ -63,7 +127,7 @@ describe("resolveMural", () => {
             }) as typeof db.prepare;
             let entries: ReturnType<typeof resolveMural>;
             try {
-                entries = resolveMural(db, project, 1);
+                entries = resolveMural(db, project, 1, pool);
             } finally {
                 db.prepare = originalPrepare;
             }
@@ -108,7 +172,7 @@ describe("resolveMural", () => {
                 );
                 ids.push(m.id);
             }
-            const entries = resolveMural(db, project, 200);
+            const entries = resolveMural(db, project, 200, muralPool(db, project));
             // Some memories fit the 200-token budget (excluded from the mural),
             // the rest overflow (included). So the mural is a strict subset.
             expect(entries.length).toBeGreaterThan(0);
@@ -147,7 +211,7 @@ describe("resolveMural", () => {
                 computeCueContentHash("OLD content"),
             );
 
-            const entries = resolveMural(db, project, 1);
+            const entries = resolveMural(db, project, 1, muralPool(db, project));
             const idsOut = entries.map((entry) => entry.id);
             expect(idsOut).toContain(cued.id);
             expect(idsOut).not.toContain(unCued.id);
@@ -167,7 +231,7 @@ describe("resolveMural", () => {
             const archHigh = seedCuedMemory(db, project, "ARCHITECTURE", "arch high imp", 90);
             const naming = seedCuedMemory(db, project, "NAMING", "naming fact", 90);
 
-            const entries = resolveMural(db, project, 1);
+            const entries = resolveMural(db, project, 1, muralPool(db, project));
             const order = entries.map((entry) => entry.id);
             // ARCHITECTURE band first (high before low), then NAMING band.
             expect(order.indexOf(archHigh.id)).toBeLessThan(order.indexOf(archLow.id));
@@ -176,7 +240,9 @@ describe("resolveMural", () => {
             // Append-stability: inserting a NEW same-band, same-importance memory
             // (a higher id) must land AFTER the existing one, never reshuffle it.
             const archHigh2 = seedCuedMemory(db, project, "ARCHITECTURE", "arch high 2", 90);
-            const after = resolveMural(db, project, 1).map((entry) => entry.id);
+            const after = resolveMural(db, project, 1, muralPool(db, project)).map(
+                (entry) => entry.id,
+            );
             expect(after.indexOf(archHigh.id)).toBeLessThan(after.indexOf(archHigh2.id));
             // The pre-existing relative order (archHigh before archLow) is intact.
             expect(after.indexOf(archHigh.id)).toBeLessThan(after.indexOf(archLow.id));
@@ -202,18 +268,69 @@ describe("mural coverage gate", () => {
                 if (i < 10) {
                     seedCuedMemory(db, project, "ARCHITECTURE", `cued fact ${i}`, 50);
                 } else {
-                    insertMemory(db, {
-                        projectPath: project,
-                        category: "ARCHITECTURE",
-                        content: `uncued fact ${i}`,
-                        sourceSessionId: "s",
-                    });
+                    // Uncued but still policy-eligible: coverage is measured
+                    // over the pool the mural may actually render, so these
+                    // must pass the auto_inject gate to dilute it.
+                    seedUncuedMemory(db, project, "ARCHITECTURE", `uncued fact ${i}`);
                 }
             }
             const result = ensureMuralRendered(db, project, 1);
             expect(result.hasMural).toBe(false);
             expect(result.rerendered).toBe(false);
             expect(result.skipReason).toContain("10/40");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a quarantined memory is excluded from the mural pool and its image", () => {
+        const db = freshDb();
+        try {
+            const project = "git:mural-policy";
+            for (let i = 0; i < 6; i++) {
+                seedCuedMemory(db, project, "ARCHITECTURE", `visible mural fact ${i}`, 50);
+            }
+            const hidden = seedCuedMemory(
+                db,
+                project,
+                "ARCHITECTURE",
+                "quarantined mural secret",
+                99,
+            );
+            // The mural is an image, so absence has to be asserted on the
+            // resolved entries: a hard-hidden row must never reach the render.
+            const before = resolveMural(db, project, 1, muralPool(db, project));
+            expect(before.map((entry) => entry.id)).toContain(hidden.id);
+
+            const link = getCurrentMemoryClaimByLegacyMemoryId(db, hidden.id);
+            if (!link) throw new Error("expected a claim link for the seeded memory");
+            runInMemoryClaimsWriteTransaction(db, () => {
+                recordDispositionEventInCurrentTransaction(db, {
+                    revisionId: link.revisionId,
+                    projectId: link.projectId,
+                    disposition: "quarantined",
+                    action: "assert",
+                    actor: "host",
+                });
+                refreshEffectivePolicyInCurrentTransaction(db, link.revisionId);
+                return undefined;
+            });
+
+            const after = resolveMural(db, project, 1, muralPool(db, project));
+            expect(after.map((entry) => entry.id)).not.toContain(hidden.id);
+            // And the injection path agrees: the PERSISTED manifest is the
+            // artifact later renders serve from, so absence must hold on its
+            // stored memory ids, not just on a fresh resolver pass.
+            const rendered = ensureMuralRendered(db, project, 1);
+            expect(rendered.hasMural).toBe(true);
+            const persisted = getMural(db, project);
+            if (!persisted) throw new Error("expected a persisted mural manifest");
+            expect(persisted.memoryIds).not.toContain(hidden.id);
+            expect(
+                resolveMural(db, project, 1, muralPool(db, project)).some(
+                    (entry) => entry.id === hidden.id,
+                ),
+            ).toBe(false);
         } finally {
             closeQuietly(db);
         }

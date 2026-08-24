@@ -1460,3 +1460,136 @@ describe("createMagicContextCommandHandler", () => {
         );
     });
 });
+
+describe("ctx-approve and ctx-enforce", () => {
+    it("reports unavailable without an active project and never reaches the model", async () => {
+        const db = createTestDb();
+        const sendNotification = mock(async () => {});
+        const handler = createMagicContextCommandHandler({
+            db,
+            protectedTags: 3,
+            sendNotification,
+        });
+        for (const command of ["ctx-approve", "ctx-enforce"] as const) {
+            await expectSentinel(
+                handler["command.execute.before"](
+                    { command, sessionID: "ses-approve", arguments: "1" },
+                    makeOutput(""),
+                    {},
+                ),
+                `__CONTEXT_MANAGEMENT_${command.toUpperCase()}_HANDLED__`,
+            );
+        }
+        const texts = (sendNotification.mock.calls as Array<[string, string]>).map(
+            ([, text]) => text,
+        );
+        expect(texts.join("\n")).toContain("No active project is configured");
+    });
+
+    it("refuses approval commands from subagent sessions", async () => {
+        const db = createTestDb();
+        insertSessionMeta(db, "ses-sub-approve");
+        db.prepare("UPDATE session_meta SET is_subagent = 1 WHERE session_id = ?").run(
+            "ses-sub-approve",
+        );
+        const sendNotification = mock(async () => {});
+        const handler = createMagicContextCommandHandler({
+            db,
+            protectedTags: 3,
+            projectPath: "git:approve-handler",
+            projectRoot: "/tmp",
+            sendNotification,
+        });
+        await expectSentinel(
+            handler["command.execute.before"](
+                { command: "ctx-approve", sessionID: "ses-sub-approve", arguments: "1" },
+                makeOutput(""),
+                {},
+            ),
+            "__CONTEXT_MANAGEMENT_CTX-APPROVE_HANDLED__",
+        );
+        expect(sendNotification).toHaveBeenCalledWith(
+            "ses-sub-approve",
+            expect.stringContaining("user-only"),
+            {},
+        );
+    });
+
+    it("runs the shared two-step approval workflow against a migrated database", async () => {
+        const { initializeDatabase } = await import("../../features/magic-context/storage-db");
+        const { runMigrations } = await import("../../features/magic-context/migrations");
+        const { runInMemoryClaimsWriteTransaction, createMemoryWithClaimsInCurrentTransaction } =
+            await import("../../features/magic-context/memory/storage-memory-claims");
+        const { sha256Utf8Hex } = await import(
+            "../../features/magic-context/memory/storage-claims"
+        );
+        const { clearClaimCommandConfirmationsForTests } = await import(
+            "../../features/magic-context/memory/claim-policy-commands"
+        );
+        clearClaimCommandConfirmationsForTests();
+        const db = new Database(":memory:");
+        db.exec("PRAGMA foreign_keys=ON");
+        initializeDatabase(db);
+        runMigrations(db);
+        const projectPath = "git:approve-handler";
+        const outcome = runInMemoryClaimsWriteTransaction(db, () =>
+            createMemoryWithClaimsInCurrentTransaction(
+                db,
+                {
+                    producer: "handler-test",
+                    operationKey: "seed-1",
+                    requestDigest: sha256Utf8Hex("seed-1"),
+                },
+                {
+                    projectPath,
+                    category: "CONSTRAINTS",
+                    content: "handler approval target",
+                    normalizedHash: "hash:handler approval target",
+                    importance: 60,
+                    sourceSessionId: "ses-handler",
+                    sourceType: "agent",
+                    nowMs: 1_000,
+                },
+            ),
+        );
+        const memoryId = outcome.result.memoryId;
+        const sendNotification = mock(async () => {});
+        const handler = createMagicContextCommandHandler({
+            db,
+            protectedTags: 3,
+            projectPath,
+            projectRoot: "/tmp",
+            sendNotification,
+        });
+        const run = () =>
+            expectSentinel(
+                handler["command.execute.before"](
+                    {
+                        command: "ctx-approve",
+                        sessionID: "ses-handler",
+                        arguments: String(memoryId),
+                    },
+                    makeOutput(""),
+                    {},
+                ),
+                "__CONTEXT_MANAGEMENT_CTX-APPROVE_HANDLED__",
+            );
+        await run();
+        await run();
+        const texts = (sendNotification.mock.calls as Array<[string, string]>).map(
+            ([, text]) => text,
+        );
+        expect(texts[0]).toContain("Confirmation Required");
+        expect(texts[1]).toContain("Recorded");
+        expect(
+            (
+                db
+                    .prepare(
+                        "SELECT COUNT(*) AS count FROM claim_approval_actions WHERE action = 'approve'",
+                    )
+                    .get() as { count: number }
+            ).count,
+        ).toBe(1);
+        clearClaimCommandConfirmationsForTests();
+    });
+});

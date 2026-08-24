@@ -41,6 +41,7 @@ import {
 } from "../../features/magic-context/fail-closed-block";
 import {
     resolveProjectIdentityForSession,
+    resolveProjectRootDirectory,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import {
@@ -1411,6 +1412,22 @@ export function createMagicContextHook(deps: MagicContextDeps) {
         transformMode: deps.config.transform_mode,
         rustModeModuleClient,
         projectRoot: deps.directory,
+        projectPath,
+        // /ctx-approve and /ctx-enforce validate artifact IDs against the
+        // INVOKING session's project: a session resumed in (or moved to)
+        // another directory must not approve or execute artifacts for the
+        // launch project. Same per-call resolution as the ctx_memory tool.
+        // Artifact paths canonicalize against the identity-owning ROOT (the
+        // git root for a repo subdirectory), or in-repo paths read as escapes.
+        resolveProjectForSession: (sessionId) => {
+            const directory = sessionDirectoryBySession.get(sessionId) ?? deps.directory;
+            return {
+                projectPath:
+                    resolveProjectIdentityForSession(directory, deps.config.allow_home_project) ??
+                    undefined,
+                projectRoot: resolveProjectRootDirectory(directory),
+            };
+        },
         commitClusterTrigger: deps.config.commit_cluster_trigger,
         getLiveModelKey: (sessionId) => {
             // Use DB fallback so /ctx-status shows the correct model-specific

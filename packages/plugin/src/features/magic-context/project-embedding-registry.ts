@@ -52,6 +52,11 @@ import {
     SynapseEmbeddingProvider,
 } from "./memory/embedding-synapse";
 import {
+    exactMemoryContentDigests,
+    memoriesEligibleForEmbedding,
+} from "./memory/storage-claim-visibility";
+import { sha256Utf8Hex } from "./memory/storage-claims";
+import {
     getMemoryEmbedCoverage,
     hasMemoryEmbedding,
     saveEmbedding,
@@ -1294,6 +1299,35 @@ function shadowBackfillMissingIds(
         shadowModelId,
         projectIdentity,
     );
+    if (scope === "memory") {
+        // Policy-hidden rows must be excluded HERE, not only at drain: the
+        // id-ordered missing set otherwise re-selects the same hidden head
+        // every pump, the drain filter writes nothing, the stall detector
+        // retires the scope as stalled_no_progress, and every eligible row
+        // with a higher id stays unbackfilled until re-registration. Page
+        // past hidden prefixes with a cursor, exactly like the primary
+        // backfill walk.
+        const pageSize = Math.max(limit * 4, 64);
+        let cursor = 0;
+        const out: string[] = [];
+        for (;;) {
+            const page = db
+                .prepare(`${sql} AND m.id > ?${orderBy} LIMIT ?`)
+                .all(...params, cursor, pageSize) as Array<{ id: number }>;
+            if (page.length === 0) break;
+            const eligible = memoriesEligibleForEmbedding(
+                db,
+                page.map((row) => row.id),
+            );
+            for (const row of page) {
+                if (out.length >= limit) break;
+                if (eligible.has(row.id)) out.push(String(row.id));
+            }
+            if (out.length >= limit || page.length < pageSize) break;
+            cursor = page[page.length - 1].id;
+        }
+        return out;
+    }
     const rows = db.prepare(`${sql}${orderBy} LIMIT ?`).all(...params, limit) as Array<{
         id: number | string;
     }>;
@@ -1314,6 +1348,19 @@ function countShadowBackfillMissing(
         shadowModelId,
         projectIdentity,
     );
+    if (scope === "memory") {
+        // Same policy predicate the selector applies: a quarantined or
+        // rejected row is deliberately never drained, so counting it here
+        // would leave a permanent nonzero "Remaining" with no queued work
+        // that can reduce it.
+        const rows = db.prepare(sql).all(...params) as Array<{ id: number }>;
+        if (rows.length === 0) return 0;
+        const eligible = memoriesEligibleForEmbedding(
+            db,
+            rows.map((row) => row.id),
+        );
+        return rows.filter((row) => eligible.has(row.id)).length;
+    }
     return (
         db.prepare(`SELECT COUNT(*) AS count FROM (${sql})`).get(...params) as { count: number }
     ).count;
@@ -1752,6 +1799,33 @@ async function embedMemoryRowsDetailed(
     memories: readonly { id: number; content: string }[],
     signal?: AbortSignal,
 ): Promise<Map<number, Float32Array>> {
+    // The caller's eligibility check can be arbitrarily stale by the time
+    // this runs (batches wait behind other awaited provider work, and other
+    // processes share the database): re-filter at the provider boundary and
+    // bind each row to the exact captured bytes, so a quarantine/rejection
+    // or rewrite landing after selection cannot leak content to the
+    // provider.
+    const eligibleAtDrain = memoriesEligibleForEmbedding(
+        db,
+        memories.map((memory) => memory.id),
+    );
+    const digestsAtDrain = exactMemoryContentDigests(
+        db,
+        memories.map((memory) => memory.id),
+    );
+    // Policy again AFTER the digest read (two autocommit snapshots): a hide
+    // committed between them leaves the digest unchanged.
+    const eligibleAfterDrain = memoriesEligibleForEmbedding(
+        db,
+        memories.map((memory) => memory.id),
+    );
+    memories = memories.filter(
+        (memory) =>
+            eligibleAtDrain.has(memory.id) &&
+            digestsAtDrain.get(memory.id) === sha256Utf8Hex(memory.content) &&
+            eligibleAfterDrain.has(memory.id),
+    );
+    if (memories.length === 0) return new Map();
     const specs = [...memories]
         .sort((a, b) => a.id - b.id)
         .map((memory) => ({
@@ -2142,7 +2216,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
         const db = dbForShadowQueue.get(item.projectIdentity);
         if (!db) return;
         const placeholders = item.ids.map(() => "?").join(",");
-        const rows = db
+        const loaded = db
             .prepare(
                 `SELECT id, content, normalized_hash FROM memories
                  WHERE project_path = ? AND id IN (${placeholders}) AND status = 'active'`,
@@ -2152,6 +2226,16 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             content: string;
             normalized_hash: string;
         }>;
+        // Re-check policy at drain time: a memory embedded while eligible can
+        // be quarantined or rejected while its shadow item waits behind other
+        // queue or backfill work, and uniform-absence content must not leave
+        // the process through the shadow provider. Every shadow path drains
+        // through this function, so this is the single choke point.
+        const eligibleIds = memoriesEligibleForEmbedding(
+            db,
+            loaded.map((row) => row.id),
+        );
+        const rows = loaded.filter((row) => eligibleIds.has(row.id));
         const shadowLane = getDetailedLane(item.projectIdentity, "shadow");
         if (shadowLane) {
             await embedMemoryRowsDetailed(
@@ -2162,16 +2246,47 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             );
             return;
         }
+        // The fallback lane needs the same exact-byte drain filter as the
+        // detailed lane: a rewrite to an eligible revision differing only in
+        // case/whitespace keeps the normalized hash equal, so
+        // saveEmbeddingIfHashMatches alone would persist the loaded
+        // revision's vector for the new bytes.
+        const digestsAtDrain = exactMemoryContentDigests(
+            db,
+            rows.map((row) => row.id),
+        );
+        // Policy again AFTER the digest read (two autocommit snapshots,
+        // mirroring the detailed lane): a hide committed after `eligibleIds`
+        // was read leaves the digest unchanged, and these bytes are about to
+        // reach the embedding provider.
+        const eligibleAfterDrain = memoriesEligibleForEmbedding(
+            db,
+            rows.map((row) => row.id),
+        );
+        const boundRows = rows.filter(
+            (row) =>
+                digestsAtDrain.get(row.id) === sha256Utf8Hex(row.content) &&
+                eligibleAfterDrain.has(row.id),
+        );
+        if (boundRows.length === 0) return;
         const vectors = await embedShadowItems(
             registration,
-            rows.map((row) => ({
+            boundRows.map((row) => ({
                 id: `memory:${row.id}`,
                 text: row.content,
                 contentSha256: contentSha256(row.content),
             })),
         );
         db.transaction(() => {
-            for (const row of rows) {
+            // Re-bind inside the write transaction: the provider call above
+            // yielded, and the normalized-hash guard alone cannot reject a
+            // case/whitespace-only rewrite that landed meanwhile.
+            const digestsAtSave = exactMemoryContentDigests(
+                db,
+                boundRows.map((row) => row.id),
+            );
+            for (const row of boundRows) {
+                if (digestsAtSave.get(row.id) !== sha256Utf8Hex(row.content)) continue;
                 const vector = vectors.get(`memory:${row.id}`);
                 if (vector)
                     saveEmbeddingIfHashMatches(
@@ -2617,7 +2732,7 @@ function getLoadUnembeddedMemoriesStatement(db: Database): PreparedStatement {
     let stmt = loadUnembeddedMemoriesStatements.get(db);
     if (!stmt) {
         stmt = db.prepare(
-            "SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL LIMIT ?",
+            "SELECT m.id AS id, m.content AS content, m.normalized_hash AS normalized_hash FROM memories m LEFT JOIN memory_embeddings me ON m.id = me.memory_id AND me.model_id = ? WHERE m.project_path = ? AND m.status = 'active' AND me.memory_id IS NULL AND m.id > ? ORDER BY m.id LIMIT ?",
         );
         loadUnembeddedMemoriesStatements.set(db, stmt);
     }
@@ -2633,9 +2748,42 @@ export async function embedUnembeddedMemoriesForProject(
     if (!snapshot?.enabled) return 0;
 
     const normalizedBatchSize = Math.max(1, Math.floor(batchSize));
-    const memories = getLoadUnembeddedMemoriesStatement(db)
-        .all(snapshot.modelId, projectIdentity, normalizedBatchSize)
-        .filter(isUnembeddedMemoryRow);
+    // Hard-hidden / rejected content never leaves the process, remote
+    // embedding providers included — and hidden rows are deliberately never
+    // embedded, so they sit in this backlog indefinitely. Walk the backlog in
+    // fixed-size id-ordered pages: each page bounds memory (a growing LIMIT
+    // would page most of the table in at once), and the walk runs to table
+    // exhaustion so no hidden prefix — of any length — can starve an eligible
+    // row behind it.
+    const pageSize = Math.max(normalizedBatchSize * 4, 64);
+    let cursor = 0;
+    const memories: { id: number; content: string; normalized_hash: string }[] = [];
+    for (;;) {
+        const page = getLoadUnembeddedMemoriesStatement(db).all(
+            snapshot.modelId,
+            projectIdentity,
+            cursor,
+            pageSize,
+        );
+        const fetched = page.filter(isUnembeddedMemoryRow);
+        const nextCursor = fetched.length > 0 ? fetched[fetched.length - 1].id : cursor;
+        const embeddable = memoriesEligibleForEmbedding(
+            db,
+            fetched.map((memory) => memory.id),
+        );
+        for (const memory of fetched) {
+            if (memories.length >= normalizedBatchSize) break;
+            if (embeddable.has(memory.id)) memories.push(memory);
+        }
+        if (
+            memories.length >= normalizedBatchSize ||
+            page.length < pageSize ||
+            nextCursor <= cursor
+        ) {
+            break;
+        }
+        cursor = nextCursor;
+    }
     if (memories.length === 0) return 0;
 
     try {
@@ -2656,9 +2804,29 @@ export async function embedUnembeddedMemoriesForProject(
             }
             return written.size;
         }
+        // Same drain-boundary recheck as the detailed lane: the page-walk
+        // precheck above is stale once any await has run. Bind each row to
+        // the exact captured bytes too — a rewrite to an eligible revision
+        // differing only in case/whitespace keeps the normalized hash equal,
+        // so saveEmbeddingIfHashMatches alone would persist the superseded
+        // revision's vector for the new bytes.
+        const eligibleAtDrain = memoriesEligibleForEmbedding(
+            db,
+            memories.map((memory) => memory.id),
+        );
+        const digestsAtDrain = exactMemoryContentDigests(
+            db,
+            memories.map((memory) => memory.id),
+        );
+        const stillEligible = memories.filter(
+            (memory) =>
+                eligibleAtDrain.has(memory.id) &&
+                digestsAtDrain.get(memory.id) === sha256Utf8Hex(memory.content),
+        );
+        if (stillEligible.length === 0) return 0;
         const result = await embedItemsForProject(
             projectIdentity,
-            memories.map((memory) => ({
+            stillEligible.map((memory) => ({
                 id: `memory:${memory.id}`,
                 text: memory.content,
                 contentSha256: contentSha256(memory.content),
@@ -2668,7 +2836,17 @@ export async function embedUnembeddedMemoriesForProject(
 
         let embeddedCount = 0;
         db.transaction(() => {
-            for (const memory of memories) {
+            // Re-bind inside the write transaction: the provider call above
+            // yielded, and the normalized-hash guard alone cannot reject a
+            // case/whitespace-only rewrite that landed meanwhile — the save
+            // would reinstate the predecessor's vector under the successor
+            // bytes. Same discipline as the shadow drain.
+            const digestsAtSave = exactMemoryContentDigests(
+                db,
+                stillEligible.map((memory) => memory.id),
+            );
+            for (const memory of stillEligible) {
+                if (digestsAtSave.get(memory.id) !== sha256Utf8Hex(memory.content)) continue;
                 const embedding = result.vectors.get(`memory:${memory.id}`);
                 if (!embedding) continue;
                 if (
@@ -2687,7 +2865,7 @@ export async function embedUnembeddedMemoriesForProject(
         enqueueShadowEmbeddingItems(
             projectIdentity,
             "memory",
-            memories
+            stillEligible
                 .filter((memory) => result.vectors.has(`memory:${memory.id}`))
                 .map((memory) => String(memory.id)),
         );

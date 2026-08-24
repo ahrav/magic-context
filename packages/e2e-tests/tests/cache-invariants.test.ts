@@ -30,7 +30,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
-import { insertMemory, updateMemoryContent } from "../../plugin/src/features/magic-context/memory";
+import { insertMemory, updateMemoryContent, updateMemoryVerification } from "../../plugin/src/features/magic-context/memory";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import type { Memory } from "../../plugin/src/features/magic-context/memory/types";
@@ -44,6 +44,7 @@ import {
 } from "../src/cache-analysis";
 import { TestHarness } from "../src/harness";
 import type { MockUsage } from "../src/mock-provider/server";
+import { openTestDb } from "../src/test-db";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
@@ -193,7 +194,7 @@ function projectIdentity(): string {
 
 function writeContextDb<T>(fn: (db: Database) => T): T {
     const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
-    const db = new Database(dbPath);
+    const db = openTestDb(dbPath, { readwrite: true });
     try {
         return fn(db);
     } finally {
@@ -202,14 +203,47 @@ function writeContextDb<T>(fn: (db: Database) => T): T {
 }
 
 function seedMemory(content: string, category: Memory["category"] = "PROJECT_RULES"): number {
-    return writeContextDb((db) =>
-        insertMemory(db, {
+    return writeContextDb((db) => {
+        const id = insertMemory(db, {
             projectPath: projectIdentity(),
             category,
             content,
-            sourceType: "historian",
-        }).id,
+            // v86 trust policy: explicit-user origin rows are auto-eligible,
+            // but the effective policy is computed by an ASYNC evaluator; a
+            // synchronous verification promotion makes eligibility
+            // deterministic before the next turn materializes m[0].
+            sourceType: "user",
+        }).id;
+        updateMemoryVerification(db, id, "verified");
+        return id;
+    });
+}
+
+function projectEpoch(): number {
+    return writeContextDb(
+        (db) =>
+            (
+                db
+                    .prepare(
+                        "SELECT project_memory_epoch AS epoch FROM project_state WHERE project_path = ?",
+                    )
+                    .get(projectIdentity()) as { epoch: number } | null
+            )?.epoch ?? 0,
     );
+}
+
+/** Pin the project epoch to a captured value. Eligible writes and
+ * verification promotions bump the epoch, which HARD-refolds m[0]; the
+ * m[1] delta lanes under test only fire when memory ids advance WITHOUT an
+ * epoch change, so tests pin the epoch back after seeding. */
+function setProjectEpoch(epoch: number): void {
+    writeContextDb((db) => {
+        db.prepare(
+            `INSERT INTO project_state (project_path, project_memory_epoch)
+             VALUES (?, ?)
+             ON CONFLICT(project_path) DO UPDATE SET project_memory_epoch = excluded.project_memory_epoch`,
+        ).run(projectIdentity(), epoch);
+    });
 }
 
 /**
@@ -617,7 +651,9 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // an m[1] delta via the readNewMemoriesForM1 watermark.
                 h.mock.setDefault({ text: "B10 pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B10 turn 4: high usage marks the next pass execute.");
+                const epochBeforeAdditive = projectEpoch();
                 seedMemory("B10 fresh rule: always run the full gate before a release.");
+                setProjectEpoch(epochBeforeAdditive);
                 setDefer("B10 surface");
                 await h.sendPrompt(sessionId, "B10 turn 5: execute pass surfaces the new memory.");
 
@@ -714,7 +750,14 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                 // Turn 4 records high usage so turn 5 is the cache-busting pass.
                 h.mock.setDefault({ text: "B11 pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B11 turn 4: high usage marks the next pass execute.");
+                const epochBeforeUpdate = projectEpoch();
                 queueMemoryUpdate(memId, "B11 revised rule: deploys go straight to production with a feature flag.");
+                // A content rewrite withdraws verification (the successor revision
+                // starts CANDIDATE); re-verify through the real API so the revised
+                // row stays render-eligible, then pin the epoch so the mutation
+                // rides the m[1] delta instead of HARD-refolding m[0].
+                writeContextDb((db) => updateMemoryVerification(db, memId, "verified"));
+                setProjectEpoch(epochBeforeUpdate);
                 setDefer("B11 reconcile");
                 await h.sendPrompt(sessionId, "B11 turn 5: execute pass renders the memory-updates delta.");
 
@@ -794,7 +837,9 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
 
                 h.mock.setDefault({ text: "B12 pressure", usage: EXECUTE_USAGE });
                 await h.sendPrompt(sessionId, "B12 turn 4: high usage marks next pass execute.");
+                const epochBeforeSeed = projectEpoch();
                 seedMemory("B12 delta rule: keep the cache prefix byte-identical across defer passes.");
+                setProjectEpoch(epochBeforeSeed);
                 setDefer("B12 surface");
                 await h.sendPrompt(sessionId, "B12 turn 5: execute pass surfaces the memory into m[1].");
 
