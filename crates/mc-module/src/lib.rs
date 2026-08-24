@@ -9910,7 +9910,12 @@ impl McHandler {
                 // the chain, not end it and be ledgered as this command's
                 // durable response. The caller stays the authority for
                 // interpreting the values it applies.
-                Ok(result) => match validate_classify_manifest(&result.text, &expected_ids) {
+                //
+                // A length-capped generation is an attempt failure even when
+                // its prefix happens to parse: the caller rejects
+                // `truncated`, so accepting one here would ledger a response
+                // no caller can use and burn the remaining chain.
+                Ok(result) => match length_capped_or_invalid(&result, &expected_ids) {
                     Ok(()) => {
                         output = Some((model.clone(), result, child_session, producer));
                         break;
@@ -13212,6 +13217,22 @@ fn classify_attempt_timeout(ceiling: Duration, deadline: Option<Instant>) -> Dur
         None => ceiling,
         Some(deadline) => ceiling.min(deadline.saturating_duration_since(Instant::now())),
     }
+}
+
+/// The accept predicate for one classify attempt: usable output, then a
+/// manifest that covers exactly the requested memories. A length-capped
+/// generation is rejected even when its truncated prefix parses, because the
+/// caller refuses `truncated` output — accepting one would write a durable
+/// response no caller can use and leave the remaining chain unavailable to
+/// every retry.
+fn length_capped_or_invalid(
+    result: &historian_producer::ProducerOutput,
+    expected_ids: &BTreeSet<i64>,
+) -> Result<(), String> {
+    if result.length_capped {
+        return Err("a length-capped generation".to_owned());
+    }
+    validate_classify_manifest(&result.text, expected_ids)
 }
 
 fn replay_dream_task_response(response_json: &str) -> HandlerOutcome {
@@ -26531,6 +26552,49 @@ mod tests {
             text: "<classify></classify>".to_string(),
             length_capped: false,
         })
+    }
+
+    /// A length-capped generation is an attempt failure even when its
+    /// truncated prefix parses: the caller refuses `truncated` output, so
+    /// accepting one would ledger a response no caller can use and leave no
+    /// fallback model for any retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dreamer_run_task_advances_past_a_length_capped_attempt() {
+        let producer = Arc::new(ProducerState::default());
+        producer.await_results.lock().unwrap().extend([
+            Ok(ProducerOutput {
+                text: "<classify></classify>".to_string(),
+                length_capped: true,
+            }),
+            classify_envelope_output(),
+        ]);
+        let (producer, outcome) = dreamer_classify_outcome(
+            &producer,
+            json!({
+                "prompt_body": "classify",
+                "items": [],
+                "model_chain": ["test/capped-model", "test/whole-model"],
+            }),
+            "length-capped",
+        )
+        .await;
+        let response = match outcome {
+            HandlerOutcome::Response(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap(),
+            other => panic!("the chain must recover from a capped attempt: {other:?}"),
+        };
+        assert_eq!(response["ok"], json!(true));
+        assert_eq!(response["truncated"], json!(false));
+        assert_eq!(
+            response["diagnostics"]["model"],
+            json!("test/whole-model"),
+            "the capped attempt must not be the accepted one"
+        );
+        assert_eq!(producer.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            producer.purges.lock().unwrap().len(),
+            2,
+            "the capped attempt's session must be purged before advancing"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

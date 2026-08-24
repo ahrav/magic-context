@@ -19,7 +19,7 @@ use super::backend::{
     EventSink, FinishReason, LlmExecutionBackend,
 };
 use super::subprocess::{
-    self, commit_terminal, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
+    self, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
 };
 
 /// The existing Magic Context Pi recursion guard
@@ -409,8 +409,7 @@ fn pi_line_is_terminal_message_end(line: &[u8]) -> bool {
 /// but fails to parse, or any undocumented event, still fails to one
 /// bounded terminal whose detail never quotes the line (R19).
 fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTerminal), String> {
-    let mut events = Vec::new();
-    let mut terminal: Option<BackendTerminal> = None;
+    let mut provisional: Option<(Option<BackendEvent>, BackendTerminal)> = None;
     let mut agent_end_final: Option<(serde_json::Value, usize)> = None;
     for (index, line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
@@ -465,7 +464,16 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
                 if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
                     continue;
                 }
-                commit_assistant_message(&mut events, &mut terminal, message, line_no)?;
+                // Provisional, not committed: Pi's automatic retry emits a
+                // terminal `message_end` for the failed attempt and another
+                // for the retry, so a later decision SUPERSEDES an earlier
+                // one (together with its assistant text) instead of
+                // colliding with it under first-terminal-wins arbitration,
+                // which would reject a legitimately retried run as a
+                // contradictory transcript.
+                if let Some(decision) = assistant_message_terminal(message, line_no)? {
+                    provisional = Some(decision);
+                }
             }
             "agent_end" => {
                 // The authoritative final state on runtimes that emit it:
@@ -490,83 +498,74 @@ fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTermi
         }
     }
     // The agent_end decision wins when it is decisive; a nonterminal final
-    // assistant (or no agent_end at all) falls back to the message_end
-    // decision so modern transcripts are unaffected.
+    // assistant (or no agent_end at all) falls back to the last provisional
+    // `message_end` decision so modern transcripts are unaffected.
     if let Some((message, line_no)) = &agent_end_final {
-        let mut agent_events = Vec::new();
-        let mut agent_terminal = None;
-        commit_assistant_message(&mut agent_events, &mut agent_terminal, message, *line_no)?;
-        if let Some(agent_terminal) = agent_terminal {
-            return Ok((agent_events, agent_terminal));
+        if let Some((text, terminal)) = assistant_message_terminal(message, *line_no)? {
+            return Ok((text.into_iter().collect(), terminal));
         }
     }
-    let Some(terminal) = terminal else {
+    let Some((text, terminal)) = provisional else {
         return Err("output ended without a terminal event".to_owned());
     };
-    Ok((events, terminal))
+    Ok((text.into_iter().collect(), terminal))
 }
 
-/// Applies the terminal decision for one assistant message, shared by
-/// `message_end` and the `agent_end` compatibility shape: `stop` and
-/// `length` complete the run unless the content still requests tools,
-/// `error`/`aborted` fail it, and intermediate spellings are ignored.
-fn commit_assistant_message(
-    events: &mut Vec<BackendEvent>,
-    terminal: &mut Option<BackendTerminal>,
+/// The terminal decision for one assistant message plus the assistant text
+/// that belongs with it, shared by `message_end` and the authoritative
+/// `agent_end` shape: `stop` and `length` complete the run unless the
+/// content still requests tools, `error`/`aborted` fail it, and intermediate
+/// spellings are not this run's terminal (`None`).
+///
+/// Only the winning decision's text is published, so a superseded attempt
+/// cannot contribute its text to the answer.
+fn assistant_message_terminal(
     message: &serde_json::Value,
     line_no: usize,
-) -> Result<(), String> {
+) -> Result<Option<(Option<BackendEvent>, BackendTerminal)>, String> {
     let stop_reason = message
         .get("stopReason")
         .and_then(serde_json::Value::as_str);
     let text = assistant_text(message);
-    match stop_reason {
+    let decision = match stop_reason {
         // Intermediate assistant turns (no tools run here, but
         // the vocabulary tolerates the spelling) are ignored for
         // the terminal decision.
-        None | Some("toolUse") => {}
+        None | Some("toolUse") => None,
         // A completion that still requests tools is an
         // intermediate turn shape, not this tool-less run's
         // terminal (`subagent-runner.ts` applies the same rule):
         // committing it would publish text beside an unexecuted
         // tool request as the answer.
-        Some("stop" | "length") if message_requests_tools(message) => {}
-        Some("stop") => {
-            events.push(BackendEvent::AssistantText {
+        Some("stop" | "length") if message_requests_tools(message) => None,
+        Some("stop") => Some((
+            Some(BackendEvent::AssistantText {
                 text,
                 finish_reason: None,
-            });
-            commit_terminal(
-                terminal,
-                BackendTerminal::Completed {
-                    finish_reason: FinishReason::Completed,
-                },
-                line_no,
-            )?;
-        }
+            }),
+            BackendTerminal::Completed {
+                finish_reason: FinishReason::Completed,
+            },
+        )),
         // A length stop is still a completion (AE13): the exact
         // length-class reason rides both the unit and the
         // terminal so producer policy sees `length_capped`.
-        Some("length") => {
-            events.push(BackendEvent::AssistantText {
+        Some("length") => Some((
+            Some(BackendEvent::AssistantText {
                 text,
                 finish_reason: Some(FinishReason::Length),
-            });
-            commit_terminal(
-                terminal,
-                BackendTerminal::Completed {
-                    finish_reason: FinishReason::Length,
-                },
-                line_no,
-            )?;
-        }
+            }),
+            BackendTerminal::Completed {
+                finish_reason: FinishReason::Length,
+            },
+        )),
         Some(reason @ ("error" | "aborted")) => {
             let provider_text = message
                 .get("errorMessage")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            commit_terminal(
-                terminal,
+            Some((
+                None,
                 // The provider text steers classification but never rides
                 // the wire — it can echo prompt or credential content
                 // (R19); the emitted message is host-authored from the
@@ -577,14 +576,13 @@ fn commit_assistant_message(
                     message: format!("pi assistant stopped with reason \"{reason}\""),
                     provider_code: None,
                 }),
-                line_no,
-            )?;
+            ))
         }
         Some(_) => {
             return Err(format!("unknown stop reason at line {line_no}"));
         }
-    }
-    Ok(())
+    };
+    Ok(decision)
 }
 
 /// Concatenates the `{type: "text"}` blocks of one Pi assistant message —

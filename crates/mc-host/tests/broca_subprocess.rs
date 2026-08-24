@@ -162,6 +162,10 @@ fn main() {
         ),
         ("merge_cleanup_contract", merge_cleanup_contract),
         (
+            "pi_auto_retry_supersedes_the_failed_attempts_terminal",
+            pi_auto_retry_supersedes_the_failed_attempts_terminal,
+        ),
+        (
             "oversized_json_structure_rejected_without_capping_prose",
             oversized_json_structure_rejected_without_capping_prose,
         ),
@@ -2440,6 +2444,48 @@ fn oversized_json_structure_rejected_without_capping_prose() {
     assert!(events
         .iter()
         .any(|event| matches!(event, BackendEvent::AssistantText { text, .. } if text == &prose)));
+}
+
+/// Pi's automatic retry emits a terminal `message_end` for the failed
+/// attempt and another for the retry, so `message_end` decisions are
+/// provisional: the last one wins and only its text is published. Treating
+/// them as committed terminals rejected a legitimately retried run as a
+/// contradictory transcript.
+fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
+    let mut lines = vec![
+        serde_json::json!({"type": "session", "id": "s", "version": "1", "timestamp": 1, "cwd": "/"}),
+        serde_json::json!({"type": "agent_start"}),
+        // Failed attempt: a terminal error message_end...
+        serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "error", "errorMessage": "provider overloaded", "content": [{"type": "text", "text": "PARTIAL-DISCARDED"}]}}),
+        serde_json::json!({"type": "auto_retry_start"}),
+        serde_json::json!({"type": "auto_retry_end"}),
+        // ...then the retry's own terminal.
+        serde_json::json!({"type": "message_end", "message": {"role": "assistant", "stopReason": "stop", "content": [{"type": "text", "text": "retried answer"}]}}),
+    ];
+    let (terminal, events) = run_pi_transcript(&lines);
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "the retry's terminal must supersede the failed attempt's: {terminal:?}"
+    );
+    let texts: Vec<&str> = events
+        .iter()
+        .map(|event| match event {
+            BackendEvent::AssistantText { text, .. } => text.as_str(),
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["retried answer"],
+        "only the winning attempt's text may be published"
+    );
+
+    // The authoritative agent_end still overrides the last provisional one.
+    lines.push(serde_json::json!({"type": "agent_end", "messages": [{"role": "assistant", "stopReason": "error", "errorMessage": "final state failed", "content": []}]}));
+    let (terminal, _) = run_pi_transcript(&lines);
+    assert!(
+        matches!(terminal, BackendTerminal::Failed(_)),
+        "agent_end stays authoritative over provisional message_end: {terminal:?}"
+    );
 }
 
 fn merge_cleanup_contract() {
