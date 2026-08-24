@@ -9,6 +9,7 @@ import {
     getMemoriesByProjects,
     readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
+import type { MemoryStatus } from "../../features/magic-context/memory/types";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getCompartments,
@@ -1524,17 +1525,31 @@ export async function buildModuleStateSyncPayload(args: {
         "auto_inject",
     ).memories;
     // The replace scope above cannot cover foreign workspace members, so a
-    // previously mirrored foreign row that the policy now hides would survive
-    // in the native store until one of the member's own sessions syncs.
-    // Explicit id deletions close that gap: every row this snapshot covers
-    // that the policy filtered OUT is named individually, which prunes stale
-    // hidden rows in any member's project without granting this session a
-    // project-wide prune over a foreign member's non-shared rows.
+    // previously mirrored foreign row that the policy now hides — or that was
+    // archived or expired since it was mirrored — would survive in the native
+    // store until one of the member's own sessions syncs. Explicit id
+    // deletions close that gap: the coverage query re-runs the snapshot's own
+    // visibility scope with every status and no expiry cutoff, and every
+    // covered row absent from the kept snapshot is named individually. This
+    // prunes stale rows in any member's project without granting this
+    // session a project-wide prune over a foreign member's non-shared rows
+    // (non-shared categories are outside the coverage scope entirely).
     const memoriesDeleteIds = (() => {
         if (!(args.force || epochChanged) || omitAuthorityMemorySections) return undefined;
         if (!args.pass.projectPath) return undefined;
         const keptIds = new Set(memoryRows.map((memory) => memory.id));
-        const hidden = allMemories
+        const allStatuses: MemoryStatus[] = ["active", "permanent", "archived"];
+        const covered = workspace.workspace
+            ? getMemoriesByProjects(
+                  args.pass.db,
+                  workspace.expandedIdentities,
+                  allStatuses,
+                  0,
+                  workspace.ownIdentities,
+                  workspace.shareCategories,
+              )
+            : getMemoriesByProject(args.pass.db, args.pass.projectPath, allStatuses, 0);
+        const hidden = covered
             .filter((memory) => !keptIds.has(memory.id))
             .map((memory) => memory.id);
         return hidden.length > 0 ? hidden : undefined;

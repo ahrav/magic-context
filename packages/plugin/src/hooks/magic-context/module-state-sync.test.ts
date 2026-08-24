@@ -510,6 +510,24 @@ describe("module state sync section deltas", () => {
                 .prepare("SELECT id FROM memories WHERE normalized_hash = 'hash-delete-ids-test'")
                 .get() as { id: number }
         ).id;
+        // An archived row leaves the snapshot's base query entirely, so the
+        // subtraction must derive from the coverage scope (all statuses, no
+        // expiry cutoff) or a previously mirrored row that was archived would
+        // never be named for deletion.
+        runInMemoryClaimsWriteTransaction(db, () => {
+            db.prepare(
+                `INSERT INTO memories (project_path, category, content, normalized_hash,
+                    first_seen_at, created_at, updated_at, last_seen_at, status)
+                 VALUES (?, 'CONSTRAINTS', 'archived mirrored row', 'hash-delete-ids-archived', 1, 1, 1, 1, 'archived')`,
+            ).run(projectPath);
+        });
+        const archivedId = (
+            db
+                .prepare(
+                    "SELECT id FROM memories WHERE normalized_hash = 'hash-delete-ids-archived'",
+                )
+                .get() as { id: number }
+        ).id;
         const baseline = loadModuleWatermarks({ db, sessionId, projectPath: projectPath });
         const state = {
             ...syncState(),
@@ -524,7 +542,10 @@ describe("module state sync section deltas", () => {
         const snapshotIds = (params.memories as Array<{ id: number }>).map((row) => row.id);
         expect(snapshotIds).toContain(eligible.id);
         expect(snapshotIds).not.toContain(hiddenId);
-        expect(params.memories_delete_ids).toEqual([hiddenId]);
+        expect(snapshotIds).not.toContain(archivedId);
+        expect((params.memories_delete_ids as number[]).sort()).toEqual(
+            [hiddenId, archivedId].sort(),
+        );
     });
 
     it("uses omitted sections only after the module advertises the delta capability", async () => {
