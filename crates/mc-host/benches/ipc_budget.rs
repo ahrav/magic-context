@@ -1009,6 +1009,37 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
                 }),
             );
         }
+        if arm.name == ARM_TCP_OPEN {
+            // Open-loop block scalars must agree with their checksummed
+            // sidecars, exactly like the paired-gap scalars: the
+            // manifest's results object is otherwise unprotected on its
+            // way into summary.json.
+            for a in &complete {
+                let checks: [(&str, &str, f64); 5] = [
+                    ("sched_to_completion.hist", "sched_p50_ns", 0.50),
+                    ("sched_to_completion.hist", "sched_p99_ns", 0.99),
+                    ("issue_to_completion.hist", "issue_p50_ns", 0.50),
+                    ("issue_to_completion.hist", "issue_p99_ns", 0.99),
+                    ("scheduler_lag.hist", "lag_p99_ns", 0.99),
+                ];
+                for (file, field, quantile) in checks {
+                    let recomputed = evidence::read_histogram(a, file)?.value_at_quantile(quantile);
+                    let recorded = a
+                        .manifest
+                        .results
+                        .as_ref()
+                        .and_then(|r| r[field].as_u64())
+                        .ok_or_else(|| format!("{}: missing {field}", a.dir.display()))?;
+                    if recomputed != recorded {
+                        return Err(format!(
+                            "{}: {field} {recorded} disagrees with the verified {file} \
+                             value {recomputed}",
+                            a.dir.display()
+                        ));
+                    }
+                }
+            }
+        }
         let per_block: Vec<serde_json::Value> = complete
             .iter()
             .map(|a| {
@@ -1054,15 +1085,20 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
     }
 
     let gaps = evidence::paired_gaps(&attempts)?;
-    // Gap statistics never pool topology classes: same-L3 and cross-NUMA
-    // pairs measure different hardware paths, so each class gets its own
-    // median and bootstrap interval, keyed by class label.
+    // Gap statistics never pool topology classes or CPU pairs: rows from
+    // different classes or different ordered pairs measure different
+    // hardware paths, so each (class, pair) gets its own median and
+    // bootstrap interval.
     let mut gaps_by_class: std::collections::BTreeMap<String, (Vec<f64>, Vec<f64>)> =
         std::collections::BTreeMap::new();
     for g in &gaps {
-        let entry = gaps_by_class
-            .entry(g.class.clone().unwrap_or_default())
-            .or_default();
+        let label = format!(
+            "{}@{},{}",
+            g.class.clone().unwrap_or_default(),
+            g.pair.0,
+            g.pair.1
+        );
+        let entry = gaps_by_class.entry(label).or_default();
         entry.0.push(g.ratio);
         entry.1.push(g.gap_ns);
     }

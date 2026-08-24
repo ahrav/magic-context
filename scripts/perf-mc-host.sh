@@ -241,17 +241,36 @@ stop_host() {
 }
 
 load() {
-  # Legacy adversarial arms (starvation, greedy, slowreader) drive
-  # failure modes on purpose, and perf_load exits nonzero on transport or
+  # Normal arms propagate a perf_load failure: an invalid run must fail
+  # the script. The EXIT trap below still tears the host down on abort.
+  "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt"
+}
+
+load_tolerant() {
+  # Adversarial arms (starvation, greedy, slowreader) drive failure
+  # modes on purpose, and perf_load exits nonzero on transport or
   # correctness failures. Recording the status keeps the script from
-  # aborting mid-arm under set -e, which would leak the spawned host and
-  # skip the arm's recovery checks and cleanup.
+  # aborting mid-arm under set -e so the arm's recovery checks and
+  # cleanup still run.
   local rc=0
   "$BIN/perf_load" "$PUB" --workload "${PERF_WORKLOAD:-raw}" "$@" | tee -a "$OUT/results.txt" || rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "LOAD_EXIT status=$rc" | tee -a "$OUT/results.txt"
   fi
 }
+
+# Tears the arm's host down on any exit, including a set -e abort from a
+# failed normal-arm load; every step tolerates an already-stopped host.
+cleanup_host() {
+  if [[ -n "${HOST_PID:-}" ]]; then
+    kill -INT "$HOST_PID" 2>/dev/null || true
+    wait "$HOST_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${DATA:-}" && -d "${DATA:-}" ]]; then
+    rm -rf "$DATA"
+  fi
+}
+trap cleanup_host EXIT
 
 LABEL_SUFFIX=""
 case "$ARM" in
@@ -280,30 +299,30 @@ large)
   ;;
 slowreader)
   start_host
-  load --label A3-stall --stall-big 2 --payload 33554432 --secs 40 &
+  load_tolerant --label A3-stall --stall-big 2 --payload 33554432 --secs 40 &
   STALL_PID=$!
   sleep 2
-  load --label A3-victims --conns 8 --payload 256 --rate 2000 --secs 30
+  load_tolerant --label A3-victims --conns 8 --payload 256 --rate 2000 --secs 30
   wait "$STALL_PID" || true
   stop_host
   ;;
 greedy)
   start_host
-  load --label A4-greedy --conns 1 --payload 256 --pipeline 512 --secs 25 &
+  load_tolerant --label A4-greedy --conns 1 --payload 256 --pipeline 512 --secs 25 &
   GREEDY_PID=$!
   sleep 2
-  load --label A4-victims --conns 8 --payload 256 --rate 800 --secs 20
+  load_tolerant --label A4-victims --conns 8 --payload 256 --rate 800 --secs 20
   wait "$GREEDY_PID" || true
   stop_host
   ;;
 starvation)
   start_host
-  load --label A5-hogs --conns 3 --payload 8388608 --sleep-ms 2000 --pipeline 8 --secs 25 &
+  load_tolerant --label A5-hogs --conns 3 --payload 8388608 --sleep-ms 2000 --pipeline 8 --secs 25 &
   HOG_PID=$!
   sleep 2
-  load --label A5-victims --conns 2 --payload 256 --rate 400 --secs 20
+  load_tolerant --label A5-victims --conns 2 --payload 256 --rate 400 --secs 20
   wait "$HOG_PID" || true
-  load --label A5-recovery --conns 2 --payload 256 --rate 400 --secs 10
+  load_tolerant --label A5-recovery --conns 2 --payload 256 --rate 400 --secs 10
   stop_host
   ;;
 strace)

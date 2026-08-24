@@ -504,7 +504,12 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
                         attempt.dir.display()
                     ));
                 }
-                atomic.insert(key, rtt);
+                if atomic.insert(key.clone(), rtt).is_some() {
+                    return Err(format!(
+                        "{}: duplicate atomic observation for its block/class/pair key",
+                        attempt.dir.display()
+                    ));
+                }
             }
             ARM_TCP_SERIAL => {
                 let p50 = results
@@ -520,7 +525,12 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
                         attempt.dir.display()
                     ));
                 }
-                tcp.insert(key, p50);
+                if tcp.insert(key.clone(), p50).is_some() {
+                    return Err(format!(
+                        "{}: duplicate serial observation for its block/class/pair key",
+                        attempt.dir.display()
+                    ));
+                }
             }
             _ => {}
         }

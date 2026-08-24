@@ -173,6 +173,12 @@ async fn run_conn(
     let (read_half, mut write_half) = stream.into_split();
     let body = body_bytes(&opts);
     let expect_fixture = opts.workload == Workload::Json;
+    // The response-length cap tracks the echoed request: the raw
+    // workload legitimately echoes multi-megabyte bodies, while
+    // MAX_BODY_LEN alone is sized for the fixture and error terminals.
+    let max_response_len = u32::try_from(body.len())
+        .unwrap_or(u32::MAX)
+        .max(perf_measurement::MAX_BODY_LEN);
 
     let inflight = Arc::new(Semaphore::new(if opts.rate > 0 {
         opts.inflight_cap
@@ -446,7 +452,7 @@ async fn run_conn(
                     // Untrusted 32-bit length: refuse the allocation and
                     // fail the connection, since the stream cannot resync
                     // past an unread body.
-                    if frame.len > perf_measurement::MAX_BODY_LEN {
+                    if frame.len > max_response_len {
                         result.closed_early = true;
                         break;
                     }
