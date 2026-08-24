@@ -525,6 +525,26 @@ export function revalidateEnforcementArtifacts(
         if (drifted === null) continue;
         try {
             runInMemoryClaimsWriteTransaction(db, () => {
+                // Re-read the FILE inside the transaction too: an artifact
+                // edited or removed and then restored to its recorded bytes
+                // between the check above and this write must not be
+                // permanently revoked while valid — the same
+                // bytes-at-commit discipline the enforcement command applies
+                // before recording.
+                try {
+                    if (
+                        existsSync(absolute) &&
+                        createHash("sha256").update(readFileSync(absolute)).digest("hex") ===
+                            artifact.bytesDigest
+                    ) {
+                        return;
+                    }
+                } catch {
+                    // Unreadable at commit time is indistinguishable from
+                    // transient I/O; keep the artifact and retry on a later
+                    // probe.
+                    return;
+                }
                 // Re-check inside the transaction: a concurrent revocation
                 // must not be doubled. Every drifted artifact is revoked —
                 // not only the latest — because an older still-valid pass
