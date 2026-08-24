@@ -738,14 +738,14 @@ pub(crate) fn parse_failure(harness: HarnessName, detail: &str) -> BackendTermin
 /// mentions retries, so those classes are checked first.
 pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
     let lower = text.to_ascii_lowercase();
-    const AUTH: [&str; 6] = [
+    const AUTH: [&str; 5] = [
         "api key",
         "unauthorized",
         "authentication",
         "credential",
-        "401",
         "forbidden",
     ];
+    const AUTH_CODES: [&str; 2] = ["401", "403"];
     // Broca-path provider text never leaves this process (the wire message
     // is host-authored, R19), so this list — not the module scheduler's
     // regex set, which only sees text on its own non-Broca paths — is the
@@ -774,28 +774,49 @@ pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
         "model_context_window_exceeded",
         "context size has been exceeded",
     ];
-    const TRANSIENT: [&str; 10] = [
+    const TRANSIENT: [&str; 8] = [
         "rate limit",
         "rate_limit",
-        "429",
         "overloaded",
         "timeout",
         "timed out",
         "temporarily",
         "try again",
         "unavailable",
-        "503",
     ];
-    if AUTH.iter().any(|needle| lower.contains(needle)) {
+    const TRANSIENT_CODES: [&str; 3] = ["429", "503", "529"];
+    if AUTH.iter().any(|needle| lower.contains(needle))
+        || AUTH_CODES
+            .iter()
+            .any(|code| contains_status_code(&lower, code))
+    {
         return ErrorClass::AuthRequired;
     }
     if OVERFLOW.iter().any(|needle| lower.contains(needle)) {
         return ErrorClass::ContextOverflow;
     }
-    if TRANSIENT.iter().any(|needle| lower.contains(needle)) {
+    if TRANSIENT.iter().any(|needle| lower.contains(needle))
+        || TRANSIENT_CODES
+            .iter()
+            .any(|code| contains_status_code(&lower, code))
+    {
         return ErrorClass::Transient;
     }
     ErrorClass::Permanent
+}
+
+/// Whether `haystack` contains `code` as a standalone number rather than as
+/// digits inside a longer one. A plain substring match reads `401` out of an
+/// unrelated request id like `req-40123`, and misreading a provider failure
+/// as `AuthRequired` is expensive: the historian path treats it as fatal for
+/// every remaining model from that provider, and the Pi adapter spends a
+/// canonical-provider retry on it.
+fn contains_status_code(haystack: &str, code: &str) -> bool {
+    haystack.match_indices(code).any(|(index, _)| {
+        let before = haystack[..index].chars().next_back();
+        let after = haystack[index + code.len()..].chars().next();
+        before.is_none_or(|c| !c.is_ascii_digit()) && after.is_none_or(|c| !c.is_ascii_digit())
+    })
 }
 
 /// Ceiling on any retry delay extracted from provider output. The text is
@@ -1123,10 +1144,15 @@ pub mod group_registry {
         Ok(Some(pgrp))
     }
 
-    fn boot_id() -> String {
-        fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .map(|id| id.trim().to_owned())
-            .unwrap_or_default()
+    /// The current boot's identity. Fallible on purpose: substituting a
+    /// placeholder would make every existing record compare as a different
+    /// boot, and the sweep would delete them all without checking or
+    /// killing their groups — destroying the evidence AND skipping the kill
+    /// in one step.
+    fn boot_id() -> io::Result<String> {
+        Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+            .trim()
+            .to_owned())
     }
 
     /// The registry directory, shared by every host incarnation of this
@@ -1210,7 +1236,7 @@ pub mod group_registry {
             let path = dir.join(format!("{leader_pid}-{:016x}", u64::from_le_bytes(nonce)));
             let body = format!(
                 "v1\n{}\n{leader_pid} {leader_start}\n{owner_pid} {owner_start}\n",
-                boot_id()
+                boot_id().ok()?
             );
             fs::write(&path, body).ok()?;
             Some(Self { path })
@@ -1238,7 +1264,7 @@ pub mod group_registry {
     /// only evidence that the orphan exists.
     pub fn sweep_orphaned_groups() -> io::Result<usize> {
         let dir = registry_dir()?;
-        let current_boot = boot_id();
+        let current_boot = boot_id()?;
         let mut killed = 0;
         for file in fs::read_dir(&dir)? {
             let path = file?.path();

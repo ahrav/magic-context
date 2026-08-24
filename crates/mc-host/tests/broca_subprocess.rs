@@ -1518,6 +1518,24 @@ fn provider_error_metadata_preserved() {
     // Pi auth failure classified from the provider message.
     let (terminal, _) = run_pi_transcript(&pi_error_lines("No API key found for openai-codex"));
     assert_eq!(failed(&terminal).class, ErrorClass::AuthRequired);
+
+    // A numeric status code only counts as a standalone number: digits
+    // inside an unrelated identifier must not classify the failure, because
+    // a false AuthRequired is fatal for every remaining model of that
+    // provider on the historian path and burns a canonical-provider retry
+    // on the Pi path.
+    let (terminal, _) = run_pi_transcript(&pi_error_lines(
+        "upstream refused the call (request id req-40123, trace 5031)",
+    ));
+    assert_eq!(
+        failed(&terminal).class,
+        ErrorClass::Permanent,
+        "digits inside an identifier must not be read as 401/503"
+    );
+    let (terminal, _) = run_pi_transcript(&pi_error_lines("provider returned 401 for this key"));
+    assert_eq!(failed(&terminal).class, ErrorClass::AuthRequired);
+    let (terminal, _) = run_pi_transcript(&pi_error_lines("upstream said 503, try later"));
+    assert_eq!(failed(&terminal).class, ErrorClass::Transient);
 }
 
 /// Provider-supplied retry delays clamp to 3600 seconds: the text and the
