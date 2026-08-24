@@ -413,7 +413,7 @@ async function runIssueFlow(): Promise<number> {
 // resolver error in the log. Shared by the explicit-`local` branch AND the
 // no-config / default-provider path (local is the default, so a missing config
 // still means local embeddings).
-function checkLocalEmbeddingRuntimeForDoctor(): {
+function checkLocalEmbeddingRuntimeForDoctor(activeModel = DEFAULT_LOCAL_EMBEDDING_MODEL): {
     issues: number;
     localRuntimeBroken?: boolean;
     unverified?: boolean;
@@ -427,7 +427,7 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
         log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
         return { issues: 0, unverified: true };
     }
-    log.success(`Embedding provider: local (${DEFAULT_LOCAL_EMBEDDING_MODEL} bundled)`);
+    log.success(`Embedding provider: local (${activeModel})`);
     return { issues: 0 };
 }
 
@@ -484,7 +484,7 @@ async function checkEmbeddingConfig(
                     `Remove the embedding.model line (or rerun setup) to adopt it; stored content re-embeds automatically.`,
             );
         }
-        return checkLocalEmbeddingRuntimeForDoctor();
+        return checkLocalEmbeddingRuntimeForDoctor(pinnedModel || DEFAULT_LOCAL_EMBEDDING_MODEL);
     }
 
     if (provider !== "openai-compatible") {

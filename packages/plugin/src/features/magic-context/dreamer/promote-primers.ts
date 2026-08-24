@@ -58,33 +58,38 @@ function canonicalQuestionFromCluster(
     return first.endsWith("?") ? first : `${first}?`;
 }
 
-async function embedMissingCandidates(
-    args: PromotePrimersArgs,
-    assertLeaseHeld: (phase: string) => void,
-): Promise<void> {
-    await args.ensureProjectRegistered?.(args.sessionDirectory, args.db);
-    assertLeaseHeld("embedding registration");
+/** Re-embeds primer candidates and active primers whose vectors are missing or
+ *  were produced under a retired provider identity. Search skips any vector
+ *  whose model id differs from the query's, so stale rows are semantically
+ *  invisible until rewritten. Runs from the always-reachable project sweep as
+ *  well as the promotion pass, because primer SEARCH stays enabled even when
+ *  dreamer scheduling is disabled. `checkpoint` runs before each write so the
+ *  promotion path can assert its lease mid-batch; the sweep path passes
+ *  nothing — the writes are idempotent (equivalent vectors under the same
+ *  identity), so concurrent sweeps waste at most a little compute.
+ *  Returns the number of rows rewritten. */
+export async function reembedStalePrimerEmbeddings(
+    db: Database,
+    projectIdentity: string,
+    checkpoint?: () => void,
+): Promise<number> {
     // The empty-batch call resolves the CURRENT provider identity without
-    // running inference. Rows stamped with a different identity are as unusable
-    // as rows with no embedding at all — search skips any vector whose model id
-    // differs from the query's — so a provider change (new default model, dtype
-    // change, recipe change) must select them for re-embedding, or primers
-    // permanently lose semantic retrieval while keeping stale bytes.
-    const current = await embedBatchForProject(args.projectIdentity, [], undefined, "passage");
-    if (!current) return;
+    // running inference.
+    const current = await embedBatchForProject(projectIdentity, [], undefined, "passage");
+    if (!current) return 0;
     const isStale = (embedding: Float32Array | null, modelId: string | null): boolean =>
         !embedding || !modelId || modelId !== current.modelId;
 
-    const candidates = getPrimerCandidatesForPromotion(args.db, args.projectIdentity).filter(
-        (candidate) => isStale(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
+    const candidates = getPrimerCandidatesForPromotion(db, projectIdentity).filter((candidate) =>
+        isStale(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
     );
-    const primers = getActivePrimers(args.db, args.projectIdentity).filter((primer) =>
+    const primers = getActivePrimers(db, projectIdentity).filter((primer) =>
         isStale(primer.questionEmbedding, primer.questionEmbeddingModelId),
     );
-    if (candidates.length === 0 && primers.length === 0) return;
+    if (candidates.length === 0 && primers.length === 0) return 0;
 
     const batch = await embedBatchForProject(
-        args.projectIdentity,
+        projectIdentity,
         [
             ...candidates.map((candidate) => candidate.question),
             ...primers.map((primer) => primer.question),
@@ -92,20 +97,35 @@ async function embedMissingCandidates(
         undefined,
         "passage",
     );
-    assertLeaseHeld("embedding commit");
-    if (!batch) return;
+    checkpoint?.();
+    if (!batch) return 0;
+    let written = 0;
     for (let i = 0; i < candidates.length; i += 1) {
-        assertLeaseHeld("embedding commit");
+        checkpoint?.();
         const vector = batch.vectors[i];
         if (!vector) continue;
-        updatePrimerCandidateEmbedding(args.db, candidates[i].id, vector, batch.modelId);
+        updatePrimerCandidateEmbedding(db, candidates[i].id, vector, batch.modelId);
+        written += 1;
     }
     for (let i = 0; i < primers.length; i += 1) {
-        assertLeaseHeld("embedding commit");
+        checkpoint?.();
         const vector = batch.vectors[candidates.length + i];
         if (!vector) continue;
-        updatePrimerQuestionEmbedding(args.db, primers[i].id, vector, batch.modelId);
+        updatePrimerQuestionEmbedding(db, primers[i].id, vector, batch.modelId);
+        written += 1;
     }
+    return written;
+}
+
+async function embedMissingCandidates(
+    args: PromotePrimersArgs,
+    assertLeaseHeld: (phase: string) => void,
+): Promise<void> {
+    await args.ensureProjectRegistered?.(args.sessionDirectory, args.db);
+    assertLeaseHeld("embedding registration");
+    await reembedStalePrimerEmbeddings(args.db, args.projectIdentity, () =>
+        assertLeaseHeld("embedding commit"),
+    );
 }
 
 function pruneExpiredPrimerCandidatesForProject(
