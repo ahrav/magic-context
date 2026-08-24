@@ -119,10 +119,12 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     // session + 128-byte key overhead)), live backend capture
     // (8 backends x ((4 MiB stdout + 64 KiB stderr) x 5 parse-time copies
     // + one 512 KiB request body retained across the Pi provider
-    // fallback's aliased attempt)), and the uncharged deletion-tombstone
-    // worst case (256 sessions x the tripled key-meta bound), and the
+    // fallback's aliased attempt)), the uncharged deletion-tombstone
+    // worst case (256 sessions x the tripled key-meta bound), the
     // environment snapshot plus every simultaneous per-spawn copy of it
-    // (25 x the 1.5 MiB capture ceiling).
+    // (25 x the 1.5 MiB capture ceiling), and the adapter-owned variables
+    // riding each spawn's three transient copies (24 x the 96 KiB inline
+    // config plus its 8 KiB control-variable slack).
     assert_eq!(
         resources.retained_resident_bytes,
         64 * 1024 * 1024
@@ -130,6 +132,7 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
             + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024)
             + 256 * ((4096 + 256) * 3 + 128)
             + (1 + 3 * 8) * 1536 * 1024
+            + 3 * 8 * (96 * 1024 + 8 * 1024)
     );
     assert_eq!(resources.route_class, mc_host::RouteClass::Reserved);
 }

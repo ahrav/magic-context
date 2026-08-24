@@ -111,6 +111,15 @@ pub const MAX_ENV_SNAPSHOT_BYTES: usize = 1536 * 1024;
 /// [`ENV_SNAPSHOT_HEADROOM_BYTES`] remains a real peak bound.
 pub const ENV_ENTRY_OVERHEAD_BYTES: usize = 128;
 
+/// Bytes each ADAPTER adds to a spawn's child environment beyond the
+/// captured snapshot. The OpenCode inline config (`OPENCODE_CONFIG_CONTENT`,
+/// up to [`MAX_OPENCODE_CONFIG_BYTES`]) dominates; the database path, the
+/// project-config kill switch, the child marker, and Pi's model, thinking,
+/// and token/temperature controls ride in the slack. These variables live
+/// in the same three per-spawn representations as the snapshot itself, so
+/// they multiply by the same factor in the declared headroom.
+pub const ADAPTER_ENV_HEADROOM_BYTES: u64 = MAX_OPENCODE_CONFIG_BYTES as u64 + 8 * 1024;
+
 /// Worst case for the environment snapshot and every simultaneous
 /// representation of it during a spawn.
 ///
@@ -119,13 +128,15 @@ pub const ENV_ENTRY_OVERHEAD_BYTES: usize = 128;
 /// adapter's assembled child environment, the `Command`'s own map, and the
 /// exec-ready C-string array `spawn` materializes in the parent — the
 /// `pre_exec` hook forces the fork path, so that last one is real. All three
-/// are freed as soon as the child exists. Each representation's container
-/// overhead is covered because admission charges
-/// [`ENV_ENTRY_OVERHEAD_BYTES`] per variable against the same ceiling.
-/// Declared alongside the retained budget for the same reason as
+/// are freed as soon as the child exists, and all three carry the adapter's
+/// own additions ([`ADAPTER_ENV_HEADROOM_BYTES`]) on top of the snapshot.
+/// Each representation's container overhead is covered because admission
+/// charges [`ENV_ENTRY_OVERHEAD_BYTES`] per variable against the same
+/// ceiling. Declared alongside the retained budget for the same reason as
 /// [`ROUTE_IDENTITY_HEADROOM_BYTES`].
-pub const ENV_SNAPSHOT_HEADROOM_BYTES: u64 =
-    (1 + 3 * MAX_BACKEND_PROCESSES as u64) * MAX_ENV_SNAPSHOT_BYTES as u64;
+pub const ENV_SNAPSHOT_HEADROOM_BYTES: u64 = (1 + 3 * MAX_BACKEND_PROCESSES as u64)
+    * MAX_ENV_SNAPSHOT_BYTES as u64
+    + 3 * MAX_BACKEND_PROCESSES as u64 * ADAPTER_ENV_HEADROOM_BYTES;
 
 /// The complete retained-byte reservation the component declares to the
 /// host: the supervisor's enforced budget plus the retention classes that

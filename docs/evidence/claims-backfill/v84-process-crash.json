@@ -1,8 +1,8 @@
 {
   "schemaVersion": "claims-process-crash-evidence/v1",
-  "commitUnderTest": "b17bd9495cedaf539fc8bb4eaa10269e55ec262e",
+  "commitUnderTest": "3faf7e3a5b4fe5094f4a7b433700a5ec882b533c",
   "dirtyDiffDigestPolicy": "sha256(sorted U6 implementation path + NUL + full file bytes + NUL); evidence file excluded",
-  "dirtyDiffDigest": "284bade66b16526a4d37de56b308b7f71dc4ae4fa95832fd271c600a97724e06",
+  "dirtyDiffDigest": "536942cba1cb2ebe9907b177a108d99557bd47885708e3aa60b62d3839f8d779",
   "implementationFiles": [
     "ARCHITECTURE.md",
     "STRUCTURE.md",

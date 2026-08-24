@@ -1437,13 +1437,15 @@ pub mod group_registry {
         Ok(Some((state, start)))
     }
 
-    /// Whether any live process still belongs to process group `pgid`.
+    /// Whether any RUNNABLE process still belongs to process group `pgid`.
     /// Used only after the group's recorded leader is gone: the kernel
     /// keeps a pgid reserved while the group has members, so survivors
-    /// found here can only be members of the recorded group. A scan that
-    /// cannot be completed is an error, never "no members" — that answer
-    /// would both skip the kill and delete the record proving the orphan
-    /// exists.
+    /// found here can only be members of the recorded group. Zombies do
+    /// not count — a dead-but-unreaped member cannot execute work, cannot
+    /// receive a signal, and is reaped by its parent (or init) on its own
+    /// schedule the sweep does not control. A scan that cannot be
+    /// completed is an error, never "no members" — that answer would both
+    /// skip the kill and delete the record proving the orphan exists.
     pub(crate) fn group_has_members(pgid: i32) -> io::Result<bool> {
         scan_group_members(pgid, None)
     }
@@ -1470,8 +1472,10 @@ pub mod group_registry {
                 continue;
             }
             // A process that exits mid-scan is simply not a member.
-            match proc_stat_pgrp(pid) {
-                Ok(Some(pgrp)) if pgrp == pgid => return Ok(true),
+            match proc_stat_pgrp_state(pid) {
+                Ok(Some((pgrp, state))) if pgrp == pgid && state != 'Z' && state != 'X' => {
+                    return Ok(true)
+                }
                 Ok(_) => {}
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
@@ -1480,19 +1484,23 @@ pub mod group_registry {
         Ok(false)
     }
 
-    /// The process group of `pid` (field 5 of `/proc/<pid>/stat`, the third
-    /// field after comm).
-    fn proc_stat_pgrp(pid: i32) -> io::Result<Option<i32>> {
+    /// The process group and state of `pid` (fields 5 and 3 of
+    /// `/proc/<pid>/stat`: the third and first fields after comm).
+    fn proc_stat_pgrp_state(pid: i32) -> io::Result<Option<(i32, char)>> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let unreadable = || io::Error::other("unreadable /proc stat format");
         let rest = stat.rsplit_once(')').ok_or_else(unreadable)?.1;
-        let pgrp = rest
-            .split_ascii_whitespace()
-            .nth(2)
+        let mut fields = rest.split_ascii_whitespace();
+        let state = fields
+            .next()
+            .and_then(|field| field.chars().next())
+            .ok_or_else(unreadable)?;
+        let pgrp = fields
+            .nth(1)
             .ok_or_else(unreadable)?
             .parse()
             .map_err(|_| unreadable())?;
-        Ok(Some(pgrp))
+        Ok(Some((pgrp, state)))
     }
 
     /// The current boot's identity. Fallible on purpose: substituting a
@@ -1691,10 +1699,47 @@ pub mod group_registry {
                         Err(err) => return Err(err.into()),
                     }
                 }
+                // A signalled group is not a resolved group: a member in
+                // uninterruptible kernel state — or one the mixed-credential
+                // group signal could not reach — survives the SIGKILL, and
+                // removing the record here would delete the only evidence
+                // of that work while recovery refires the run beside the
+                // survivor. The record is removed only once membership
+                // provably drains; otherwise the sweep fails and startup
+                // refuses to proceed over an unresolved group, exactly as
+                // it does for an unverifiable scan.
+                if !wait_group_empty_blocking(entry.leader_pid, SWEEP_MEMBER_GRACE)? {
+                    return Err(io::Error::other(
+                        "a swept group's members could not be confirmed stopped",
+                    ));
+                }
             }
             remove_swept_record(&path)?;
         }
         Ok(killed)
+    }
+
+    /// How long the sweep waits for a SIGKILLed group's membership to
+    /// drain. SIGKILL is uncatchable, so members die within milliseconds
+    /// unless wedged in uninterruptible kernel state; the grace only
+    /// bounds that pathological wait before startup fails closed.
+    const SWEEP_MEMBER_GRACE: Duration = Duration::from_secs(5);
+
+    /// Polls [`group_has_members`] until the group is provably empty or
+    /// `budget` elapses. Blocking on purpose: the sweep runs once at
+    /// startup, before any request work exists to starve. Scan errors
+    /// propagate — an unverifiable scan must never read as "empty".
+    fn wait_group_empty_blocking(pgid: i32, budget: Duration) -> io::Result<bool> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if !group_has_members(pgid)? {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Removes a record whose group has been resolved. A record already gone
