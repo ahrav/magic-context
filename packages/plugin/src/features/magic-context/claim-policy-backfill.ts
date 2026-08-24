@@ -14,6 +14,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { isAbsolute, join, normalize, sep } from "node:path";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite.ts";
@@ -473,27 +474,26 @@ export function revalidateEnforcementArtifacts(
     const last = artifactRevalidationLastRunMs.get(throttleKey) ?? 0;
     if (nowMs - last < ARTIFACT_REVALIDATION_INTERVAL_MS) return;
     artifactRevalidationLastRunMs.set(throttleKey, nowMs);
-    // The filesystem walk (existsSync + readFileSync + hashing per enforced
-    // artifact) runs OFF the caller's synchronous path: the probe is invoked
-    // from the transform hot path, and a large artifact must not delay a
-    // live prompt. The throttle above already coalesces concurrent passes.
-    setImmediate(() => {
-        try {
-            revalidateEnforcementArtifactsNow(db, projectIdentity, projectRoot, nowMs);
-        } catch (error) {
+    // The filesystem walk runs OFF the caller's synchronous path AND uses
+    // asynchronous reads: the probe is invoked from the transform hot path,
+    // and a large artifact must not block the event loop even when the
+    // deferred callback runs — each read and hash yields. The throttle
+    // above already coalesces concurrent passes.
+    void revalidateEnforcementArtifactsNow(db, projectIdentity, projectRoot, nowMs).catch(
+        (error) => {
             log(
                 `[claim-policy] artifact revalidation failed (retrying on a later probe): ${error instanceof Error ? error.message : String(error)}`,
             );
-        }
-    });
+        },
+    );
 }
 
-function revalidateEnforcementArtifactsNow(
+async function revalidateEnforcementArtifactsNow(
     db: Database,
     projectIdentity: string,
     projectRoot: string,
     nowMs: number,
-): void {
+): Promise<void> {
     if (!existsSync(projectRoot)) return;
     const projectRow = db
         .prepare("SELECT id FROM projects WHERE canonical_identity = ?")
@@ -536,15 +536,18 @@ function revalidateEnforcementArtifactsNow(
         }
         const absolute = join(projectRoot, relative);
         let drifted: string | null = null;
-        if (!existsSync(absolute)) {
-            drifted = "artifact file missing";
-        } else {
-            try {
-                const digest = createHash("sha256").update(readFileSync(absolute)).digest("hex");
-                if (digest !== artifact.bytesDigest) drifted = "artifact bytes drifted";
-            } catch {
-                // Unreadable is indistinguishable from transient I/O; do not
-                // revoke on a read error.
+        try {
+            // Asynchronous read: hashing a large artifact must not pin the
+            // event loop; ENOENT means the file is gone (a drift), any other
+            // read error is indistinguishable from transient I/O.
+            const digest = createHash("sha256")
+                .update(await readFile(absolute))
+                .digest("hex");
+            if (digest !== artifact.bytesDigest) drifted = "artifact bytes drifted";
+        } catch (error) {
+            if ((error as { code?: string } | null)?.code === "ENOENT") {
+                drifted = "artifact file missing";
+            } else {
                 continue;
             }
         }
