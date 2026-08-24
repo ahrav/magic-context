@@ -127,7 +127,7 @@ Durable project memory, semantic search, and recall features.
 | `embedding` | object | — | Embedding provider configuration |
 | `embedding.provider` | `"local"` \\| `"openai-compatible"` \\| `"off"` \\| `"synapse"` | `"local"` | Embedding provider. 'local' uses Xenova/bge-small-en-v1.5, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings. |
 | `embedding.fallback_provider` | `"local"` \\| `"openai-compatible"` \\| `"off"` | — | Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid. |
-| `embedding.model` | string | — | Embedding model name. Required for openai-compatible, ignored for local. |
+| `embedding.model` | string | — | Embedding model name. Required for openai-compatible. For local it selects the ONNX model AND its embedding recipe: recognized models (Xenova/bge-small-en-v1.5, BAAI/bge-small-en-v1.5) get their card's pooling and query instruction; any other model embeds symmetrically (mean pooling, no instruction). |
 | `embedding.endpoint` | string | — | API endpoint URL. Required when provider is openai-compatible. |
 | `embedding.api_key` | string | — | API key for remote embedding provider (optional) |
 | `embedding.input_type` | string | — | Default input_type for stored/indexed (passage) embeddings in the request body. Required by some openai-compatible providers (e.g. NVIDIA NIM). Omitted from the request when unset. |

@@ -320,7 +320,9 @@ const BaseEmbeddingConfigSchema = z
         model: z
             .string()
             .optional()
-            .describe("Embedding model name. Required for openai-compatible, ignored for local."),
+            .describe(
+                "Embedding model name. Required for openai-compatible. For local it selects the ONNX model AND its embedding recipe: recognized models (Xenova/bge-small-en-v1.5, BAAI/bge-small-en-v1.5) get their card's pooling and query instruction; any other model embeds symmetrically (mean pooling, no instruction).",
+            ),
         endpoint: z
             .string()
             .optional()

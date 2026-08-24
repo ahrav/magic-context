@@ -10,7 +10,7 @@ import { getPendingSmartNotes } from "../storage-notes";
 import {
     countPrimerCandidatesForProject,
     getActivePrimers,
-    getPrimerCandidatesForPromotion,
+    hasPrimerRowsWithStaleEmbeddings,
 } from "../storage-primers";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
 import { getTaskScheduleState } from "./storage-task-schedule";
@@ -400,27 +400,15 @@ export function evaluateTaskGate(task: DreamTaskName, ctx: TaskGateContext): boo
             // search skips those vectors outright, so a project with active
             // primers but too few candidates would otherwise keep semantic
             // primer retrieval disabled indefinitely. Open the gate when stale
-            // rows exist. An unregistered project has no current identity to
-            // compare against (and nobody searching it); it stays closed until
-            // registration.
+            // rows exist. The check is a pure SQL EXISTS (no BLOB decode) per
+            // this module's cheap-gate contract, and deliberately NARROWER than
+            // reembedStalePrimerEmbeddings' staleness rule: rows with NO
+            // embedding at all stay under the threshold gate above. An
+            // unregistered project has no current identity to compare against
+            // (and nobody searching it); it stays closed until registration.
             const snapshot = getProjectEmbeddingSnapshot(project);
             if (!snapshot?.enabled) return false;
-            // Deliberately NARROWER than reembedStalePrimerEmbeddings' staleness
-            // rule: rows with NO embedding at all stay under the threshold gate
-            // above (that is today's scheduling), so only rows whose EXISTING
-            // vector was produced under another identity open the gate early.
-            const hasStaleVector = (
-                embedding: Float32Array | null | undefined,
-                modelId: string | null | undefined,
-            ): boolean => Boolean(embedding) && (!modelId || modelId !== snapshot.modelId);
-            return (
-                getActivePrimers(db, project).some((primer) =>
-                    hasStaleVector(primer.questionEmbedding, primer.questionEmbeddingModelId),
-                ) ||
-                getPrimerCandidatesForPromotion(db, project).some((candidate) =>
-                    hasStaleVector(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
-                )
-            );
+            return hasPrimerRowsWithStaleEmbeddings(db, project, snapshot.modelId);
         }
 
         case "refresh-primers":
