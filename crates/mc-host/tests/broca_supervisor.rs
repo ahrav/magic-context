@@ -837,13 +837,15 @@ async fn shutdown_counts_runs_with_unproven_teardown() {
     );
 }
 
-/// The eviction/delete race (AE7): a terminal-cap eviction removes the
-/// session while `delete` is parked in its work-done wait, so the re-lock
-/// no longer finds the run — the delete must still leave a tombstone
-/// (charged fresh, since the evicted run's charges are gone) rather than
-/// silently losing its resurrection guard.
+/// A terminal run whose backend is still tearing down is never evicted
+/// (AE7): unindexing it would let a later cancel or delete resolve through
+/// the unknown-run success path without ever seeing the teardown verdict,
+/// and would release charges for state the task still holds. The parked
+/// delete therefore always finds its own run at the re-lock and installs
+/// its tombstone through the ordinary purge path, even under terminal-cap
+/// pressure from another session's commit.
 #[tokio::test]
-async fn delete_racing_a_terminal_cap_eviction_still_installs_a_tombstone() {
+async fn terminal_cap_never_evicts_a_run_awaiting_teardown() {
     let (backend, gate) = ScriptedBackend::gated_ignoring_cancel("out");
     let limits = BrocaLimits {
         max_terminal_sessions: 1,
@@ -862,26 +864,26 @@ async fn delete_racing_a_terminal_cap_eviction_still_installs_a_tombstone() {
         tokio::spawn(async move { supervisor.delete(&key("s-del")).await })
     };
     // The cancel-blind backend pins delete in wait_work_done after its
-    // terminal committed, which is exactly the window the eviction races.
+    // terminal committed, which is exactly the window a cap eviction
+    // would race.
     until(
         || supervisor.status(&key("s-del"), &run_a) == Ok("cancelled"),
         "delete commits the cancellation terminal",
     )
     .await;
 
-    // A second session's terminal commit enforces the 1-session cap and
-    // evicts the (older, subscriber-free) deleted session while delete is
-    // still parked. The second run stays queued behind the single backend
-    // permit, so cancelling it settles promptly.
+    // A second session's terminal commit enforces the 1-session cap while
+    // delete is still parked. The second run stays queued behind the single
+    // backend permit, so cancelling it settles promptly.
     let run_b = send(&supervisor, "s-evict", "pb");
     supervisor
         .cancel(&key("s-evict"), &run_b)
         .await
-        .expect("cancel the evictor");
+        .expect("cancel the second session's run");
     assert_eq!(
         supervisor.status(&key("s-del"), &run_a),
-        Ok("missing"),
-        "the eviction removed the deleted session before delete re-locked"
+        Ok("cancelled"),
+        "a run awaiting teardown must survive cap pressure"
     );
 
     gate.add_permits(1);
@@ -889,11 +891,16 @@ async fn delete_racing_a_terminal_cap_eviction_still_installs_a_tombstone() {
         .await
         .expect("delete task joins")
         .expect("delete settles");
+    assert_eq!(
+        supervisor.status(&key("s-del"), &run_a),
+        Ok("missing"),
+        "the settled delete purged its run"
+    );
     assert_eq!(supervisor.metrics().tombstones, 1);
     let (request, body) = send_pair("pa");
     let resurrect = supervisor
         .send(&key("s-del"), request, &body)
-        .expect_err("the raced delete still blocks resurrection");
+        .expect_err("the delete still blocks resurrection");
     assert_eq!(resurrect.code, "session_deleted");
 }
 

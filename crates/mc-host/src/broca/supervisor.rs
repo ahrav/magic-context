@@ -586,20 +586,22 @@ impl Supervisor {
             );
             run.notify.notify_waiters();
         } else if !index.sessions.contains_key(key) {
-            // A terminal-cap eviction can remove the session between the
-            // terminal commit above and this re-lock; without a tombstone
-            // the completed delete would silently lose its resurrection
-            // guard (AE7), letting a byte-identical resend immediately
-            // recreate the "deleted" session. The evicted run's charges are
-            // already released, so the tombstone uses the reservation taken
-            // before the wait, retrying fresh if that failed under the
-            // run's own pressure. If both fail the tombstone installs
-            // UNCHARGED: one key of transient accounting slack in a corner
-            // that already required total budget exhaustion beats either a
-            // missing guard or a failed delete whose retry would find no
-            // entry and report success guardless. A key holding a
-            // different live run means a post-eviction send already won;
-            // that session is not ours to tombstone.
+            // Defense in depth for the resurrection guard (AE7): eviction
+            // and retention both skip runs whose task has not returned, so
+            // no sweep removes this session while delete is parked in its
+            // work-done wait — but a removal path this branch cannot see
+            // must still not complete the delete guardless, letting a
+            // byte-identical resend immediately recreate the "deleted"
+            // session. The removed run's charges are already released, so
+            // the tombstone uses the reservation taken before the wait,
+            // retrying fresh if that failed under the run's own pressure.
+            // If both fail the tombstone installs UNCHARGED: one key of
+            // transient accounting slack in a corner that already required
+            // total budget exhaustion beats either a missing guard or a
+            // failed delete whose retry would find no entry and report
+            // success guardless. A key holding a different live run means a
+            // post-removal send already won; that session is not ours to
+            // tombstone.
             let charge = reserved_tombstone
                 .or_else(|| self.inner.retained.try_charge(key.meta_bytes()))
                 .unwrap_or_else(ByteCharge::none);
@@ -1135,9 +1137,17 @@ fn enforce_terminal_cap(
                     if !state.terminal_appended {
                         continue;
                     }
+                    // A terminal run whose backend is still tearing down is
+                    // not evictable: removing it would unindex the run, so a
+                    // later cancel or delete resolves through the unknown-run
+                    // success path and never sees the `work_unresolved` the
+                    // backend may still report — and it would release charges
+                    // for state the task still holds. The set of such runs is
+                    // bounded by the backend permits, and the cap loop
+                    // already tolerates transiently unevictable entries.
                     (
                         state.completed_at,
-                        state.subscriber_count == 0 && run.run_id != keep_run_id,
+                        state.work_done && state.subscriber_count == 0 && run.run_id != keep_run_id,
                     )
                 }
             };
@@ -1206,7 +1216,12 @@ fn sweep_for(inner: &Arc<Inner>, index: &mut Index, released: &mut Released) {
             }
             SessionEntry::Live(run) => {
                 let state = lock_run(run);
-                state.subscriber_count == 0
+                // Retention expiry applies the same teardown gate as the
+                // cap: a run whose task has not returned keeps its index
+                // entry so control operations can still observe its
+                // teardown verdict.
+                state.work_done
+                    && state.subscriber_count == 0
                     && state
                         .completed_at
                         .is_some_and(|at| now.saturating_duration_since(at) >= retention)

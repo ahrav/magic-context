@@ -640,10 +640,12 @@ fn kill_group_fenced(
 }
 
 /// Graceful group termination: SIGTERM the whole group, escalate to SIGKILL
-/// after the bounded grace, sweep the group, and reap the leader before
-/// returning (R10). The final group SIGKILL is sent while the leader is
-/// still an unreaped zombie — the zombie pins the pgid, so the sweep can
-/// never target a recycled process group.
+/// after the bounded grace, sweep the group, and reap the leader within one
+/// more grace before returning (R10). The final group SIGKILL is sent while
+/// the leader is still an unreaped zombie — the zombie pins the pgid, so the
+/// sweep can never target a recycled process group. A leader that stays
+/// unreapable past the final grace is reported as an error so the run ends
+/// as an unconfirmed teardown instead of wedging its task.
 async fn terminate_group(
     group: Option<rustix::process::Pid>,
     child: &mut tokio::process::Child,
@@ -662,8 +664,21 @@ async fn terminate_group(
         exit = wait_exited_unreaped(group, grace).await;
     }
     let signalled = kill_group_fenced(group, exit, rustix::process::Signal::KILL);
-    let _ = child.wait().await;
-    signalled
+    // Bounded reap: SIGKILL makes the leader waitable promptly unless it is
+    // wedged in uninterruptible kernel state, and an unbounded wait there
+    // would hold `work_done` hostage — cancel, delete, and shutdown all
+    // park on it — turning the advertised finite teardown into an
+    // indefinite request or host shutdown that retains the instance lock.
+    // An unreapable leader is an unconfirmed teardown: the error makes the
+    // caller retain the crash record so a successor sweeps the group, and
+    // the abandoned zombie keeps the pgid pinned against reuse until the
+    // runtime's orphan reaper collects it.
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(_) => signalled,
+        Err(_) => Err(io::Error::other(
+            "harness leader was not reapable within the termination grace",
+        )),
+    }
 }
 
 /// A sensitive-file cleanup failure, reduced to a bounded structural fact
