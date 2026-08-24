@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-
+import { reconcileCompatibilityVerifications } from "../../features/magic-context/claim-policy-backfill";
 import type { Compartment } from "../../features/magic-context/compartment-storage";
 import {
     filterMemoriesByPolicy,
@@ -56,6 +56,13 @@ import { isRecord } from "../../shared/record-type-guard";
 import { resolveTodowriteAvailability } from "./ctx-reduce-availability";
 import { isModuleTransportGenerationChangedResult } from "./module-transport";
 import { MODULE_PAGE_MAX_BYTES, moduleRawBlockMappings, moduleWireBodyBytes } from "./module-wire";
+
+/** Ceiling for a single live (non-seed) state_sync body. Well under the
+ * transport frame limit; an epoch-driven replacement snapshot that exceeds
+ * it escalates to the paged seed protocol instead of risking an oversized
+ * frame that would permanently block the policy transition. */
+const MODULE_LIVE_SYNC_MAX_BYTES = 8 * 1024 * 1024;
+
 import {
     readRawSessionMessageOrdinalById,
     readRawSessionMessagePartsById,
@@ -1409,12 +1416,31 @@ export async function buildModuleStateSyncPayload(args: {
     options?: ModuleStateSyncOptions;
     seedId?: string;
 }): Promise<
-    ModuleStateSyncPayload | null | "m0_mutation" | "mismatch" | "unresolved" | "seed_budget"
+    | ModuleStateSyncPayload
+    | null
+    | "m0_mutation"
+    | "mismatch"
+    | "unresolved"
+    | "seed_budget"
+    | "frame_budget"
 > {
     const workspace = resolveModuleWorkspaceContext(args.pass.db, args.pass.projectPath);
     // One authority pool has one writer. While MODULE owns memories, this sender only mirrors
     // module changes back to TypeScript and must not send the TypeScript view in the other direction.
     const omitAuthorityMemorySections = args.options?.authorityState === "MODULE";
+    // A held-open v85 writer can append compatibility verification events at
+    // any time, not just before startup; reconcile them before reading
+    // watermarks so a resulting epoch bump is visible to THIS pass. The
+    // reconciler is watermark-guarded (one MAX probe when idle) and its
+    // failure must not fail the sync — an unmoved watermark retries next pass.
+    try {
+        reconcileCompatibilityVerifications(args.pass.db);
+    } catch (error) {
+        sessionLog(
+            args.pass.sessionId,
+            `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
     const currentWatermarks = loadModuleWatermarks({
         db: args.pass.db,
         sessionId: args.pass.sessionId,
@@ -1817,7 +1843,7 @@ export async function buildModuleStateSyncPayload(args: {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
         return { ...wireBatches[0], wireBatches };
     }
-    return {
+    const livePayload: ModuleStateSyncPayload = {
         method: "state_sync",
         params: {
             shadow_generation: args.state.moduleGeneration,
@@ -1848,6 +1874,20 @@ export async function buildModuleStateSyncPayload(args: {
         },
         watermarks: currentWatermarks,
     };
+    // An epoch-driven replacement snapshot loads the full eligible set into
+    // one live request; a large project can exceed the module's frame limit,
+    // and an oversized frame would permanently block the policy transition
+    // from reaching the native mirror. Escalate to the paged seed protocol
+    // instead — the caller retries the same sync with force, which routes
+    // through buildPagedModuleStateSyncPayloads above.
+    if (
+        epochChanged &&
+        moduleWireBodyBytes({ method: "state_sync", params: livePayload.params }) >
+            MODULE_LIVE_SYNC_MAX_BYTES
+    ) {
+        return "frame_budget";
+    }
+    return livePayload;
 }
 
 export interface ModuleStateSyncClient {
@@ -1982,6 +2022,15 @@ export async function syncModuleState(args: {
             options: { ...args.options, stateSyncDeltas },
         });
         if (payload === null) return { status: "no_change" };
+        if (payload === "frame_budget") {
+            // The live snapshot exceeded the single-frame budget; the paged
+            // seed protocol carries the same replacement content in bounded
+            // pages. The force path never returns this sentinel, so the
+            // escalation cannot loop.
+            if (force) throw new Error("module state sync frame_budget after escalation");
+            force = true;
+            continue;
+        }
         if (
             payload === "m0_mutation" ||
             payload === "mismatch" ||

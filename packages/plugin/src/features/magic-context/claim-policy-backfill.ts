@@ -423,7 +423,7 @@ function seedRevisionInCurrentTransaction(
  * unexamined negative event on a current revision therefore bumps its
  * claim's project epochs here so those caches refold.
  */
-export function reconcileCompatibilityVerificationsAtStartup(db: Database): number {
+export function reconcileCompatibilityVerifications(db: Database): number {
     if (!hasClaimPolicySchema(db)) return 0;
     const watermark = Number(
         readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,

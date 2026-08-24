@@ -5,7 +5,7 @@ import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     getClaimPolicySeedStatus,
-    reconcileCompatibilityVerificationsAtStartup,
+    reconcileCompatibilityVerifications,
     runClaimPolicySeed,
 } from "./claim-policy-backfill";
 import { runClaimPolicySeedStartup } from "./claim-policy-backfill-startup";
@@ -513,10 +513,10 @@ describe("claim policy seed", () => {
                 )
                 .run(ids.corroborated);
             expect(eligibility()).toBe(0);
-            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(1);
+            expect(reconcileCompatibilityVerifications(fx.db)).toBe(1);
             expect(eligibility()).toBe(1);
             // Idempotent: a reconciled projection stops matching the probe.
-            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(0);
+            expect(reconcileCompatibilityVerifications(fx.db)).toBe(0);
             // Event-watermarked: a projection that reads ineligible while its
             // newest verified event was already examined (the legitimately
             // ineligible shape) never re-matches on later startups...
@@ -525,7 +525,7 @@ describe("claim policy seed", () => {
                     "UPDATE claim_effective_policy SET auto_eligible = 0 WHERE revision_id = ?",
                 )
                 .run(ids.corroborated);
-            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(0);
+            expect(reconcileCompatibilityVerifications(fx.db)).toBe(0);
             expect(eligibility()).toBe(0);
             // ...until a new raw event re-opens examination.
             fx.db
@@ -533,7 +533,7 @@ describe("claim policy seed", () => {
                     "INSERT INTO verification_events (revision_id, outcome, verifier, created_at) VALUES (?, 'verified', 'held-open-writer', 9100)",
                 )
                 .run(ids.corroborated);
-            expect(reconcileCompatibilityVerificationsAtStartup(fx.db)).toBe(1);
+            expect(reconcileCompatibilityVerifications(fx.db)).toBe(1);
             expect(eligibility()).toBe(1);
         } finally {
             closeQuietly(fx.db);

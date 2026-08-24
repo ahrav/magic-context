@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { reconcileCompatibilityVerifications } from "../../features/magic-context/claim-policy-backfill";
 import {
     buildCompartmentBlock,
     type Compartment,
@@ -427,6 +428,19 @@ export function prepareCompartmentInjection(
 ): PreparedCompartmentInjection | null {
     // On defer (cache-safe) passes, replay the cached injection result so that
     // historian publications between passes do not bust the prompt-cache prefix.
+    // Before any replay gate runs, reconcile compatibility verification events
+    // a held-open v85 writer may have appended since startup: a reconciled
+    // event bumps the project epoch, which the gates below then observe in
+    // this same pass. The reconciler is watermark-guarded (one MAX probe when
+    // idle); a failure retries next pass with the watermark unmoved.
+    try {
+        reconcileCompatibilityVerifications(db);
+    } catch (error) {
+        sessionLog(
+            sessionId,
+            `compatibility verification reconcile failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+        );
+    }
     const cached = injectionCache.get(sessionId);
     if (cached && cached.db !== db) {
         // Session ids are unique in production, but tests and explicit database
