@@ -42,6 +42,11 @@ pub struct BrocaComponent {
 
 impl BrocaComponent {
     pub fn new(backend: Arc<dyn LlmExecutionBackend>) -> Self {
+        // Kill harness process groups a crashed predecessor left behind
+        // before this component can answer any status request: recovery
+        // treats an unknown run as `missing` and may refire it, which must
+        // never race a still-executing orphan.
+        let _ = subprocess::group_registry::sweep_orphaned_groups();
         Self {
             supervisor: Arc::new(Supervisor::new(backend)),
             routes: Arc::new(Mutex::new(HashMap::new())),

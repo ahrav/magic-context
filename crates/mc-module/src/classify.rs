@@ -11,6 +11,11 @@ use std::time::Duration;
 pub const CLASSIFY_TASK: &str = "classify";
 /// Host-rendered prompt bodies are bounded before they reach the provider leg.
 pub const MAX_CLASSIFY_PROMPT_BYTES: usize = 256 * 1024;
+/// Every chain entry is a potential billable provider run (each failed
+/// attempt advances to the next model), so the request-supplied chain is
+/// capped before any run starts — otherwise the wire path's only bound on
+/// sequential provider attempts would be the request body's byte ceiling.
+pub const MAX_CLASSIFY_MODEL_CHAIN: usize = 8;
 /// Classifier generation calibration, kept separate from historian calibration.
 pub const CLASSIFY_TEMPERATURE: f64 = 0.1;
 pub const CLASSIFY_MAX_OUTPUT_TOKENS: u32 = 32_000;

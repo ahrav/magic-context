@@ -96,7 +96,7 @@ use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext
 use classify::{
     attempt_child_session_id, has_manifest_envelope, CLASSIFY_AWAIT_TIMEOUT,
     CLASSIFY_MAX_OUTPUT_TOKENS, CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK,
-    CLASSIFY_TEMPERATURE, MAX_CLASSIFY_PROMPT_BYTES,
+    CLASSIFY_TEMPERATURE, MAX_CLASSIFY_MODEL_CHAIN, MAX_CLASSIFY_PROMPT_BYTES,
 };
 use config::{derive_historian_chunk_tokens, ConfigCache, McModuleConfig};
 use healing::{tail_reclaim, SerializerProfile};
@@ -9713,6 +9713,11 @@ impl McHandler {
         };
         if models.is_empty() {
             return invalid_params_error("classify model_chain must not be empty");
+        }
+        if models.len() > MAX_CLASSIFY_MODEL_CHAIN {
+            return invalid_params_error(format!(
+                "classify model_chain exceeds {MAX_CLASSIFY_MODEL_CHAIN} entries"
+            ));
         }
         let mut model_chain = Vec::with_capacity(models.len());
         for model in models {
@@ -26433,6 +26438,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dreamer_run_task_requires_explicit_canonical_model_chain() {
+        // One entry past the attempt cap: every entry is a potential
+        // billable provider run, so an oversized chain must die before
+        // any run starts.
+        let oversized_chain = json!({
+            "prompt_body": "classify",
+            "items": [],
+            "model_chain": (0..=MAX_CLASSIFY_MODEL_CHAIN)
+                .map(|i| format!("prov/m{i}"))
+                .collect::<Vec<_>>(),
+        });
         for payload in [
             json!({ "prompt_body": "classify", "items": [] }),
             json!({ "prompt_body": "classify", "items": [], "model_chain": [] }),
@@ -26440,6 +26455,7 @@ mod tests {
             json!({ "prompt_body": "classify", "items": [], "model_chain": ["/model"] }),
             json!({ "prompt_body": "classify", "items": [], "model_chain": ["prov/"] }),
             json!({ "prompt_body": "classify", "items": [], "model_chain": [7] }),
+            oversized_chain,
         ] {
             let producer = Arc::new(ProducerState::default());
             let (producer, outcome) =

@@ -45,6 +45,7 @@ const EXIT_ENV: &str = "MC_FIXTURE_EXIT";
 const BEHAVIOR_ENV: &str = "MC_FIXTURE_BEHAVIOR";
 const SECRET_ENV: &str = "MC_FIXTURE_SECRET";
 const SABOTAGE_ENV: &str = "MC_FIXTURE_SABOTAGE_CLEANUP";
+const GROUP_PID_ENV: &str = "MC_FIXTURE_GROUP_PID";
 
 const PROMPT_SENTINEL: &str = "PROMPT-SENTINEL user text";
 const SYSTEM_SENTINEL: &str = "SYSTEM-SENTINEL system role";
@@ -160,6 +161,10 @@ fn main() {
             env_snapshot_strips_launch_identity,
         ),
         ("merge_cleanup_contract", merge_cleanup_contract),
+        (
+            "group_registry_sweep_kills_only_dead_owner_groups",
+            group_registry_sweep_kills_only_dead_owner_groups,
+        ),
     ];
     // cargo-nextest requires each `--list --format terse` output line to end in `: test`.
     if args.iter().any(|arg| arg == "--list") {
@@ -212,11 +217,26 @@ mod fixture {
         match mode {
             "harness" => harness(),
             "grandchild" => grandchild(),
+            "record_group" => record_group(),
             other => {
                 eprintln!("unknown fixture mode {other}");
                 std::process::exit(70);
             }
         }
+    }
+
+    /// Stands in for a host that crashes after spawning: records the given
+    /// leader's group in the crash registry and exits WITHOUT running
+    /// destructors, so the record survives like it would a real crash.
+    fn record_group() {
+        let leader: i32 = std::env::var(GROUP_PID_ENV)
+            .ok()
+            .and_then(|pid| pid.parse().ok())
+            .expect("fixture leader pid");
+        let record = mc_host::broca::subprocess::group_registry::GroupRecord::record(leader)
+            .expect("record leader group");
+        std::mem::forget(record);
+        std::process::exit(0);
     }
 
     fn out_dir() -> Option<PathBuf> {
@@ -2363,4 +2383,67 @@ fn merge_cleanup_contract() {
     assert_eq!(error.class, ErrorClass::Transient);
     assert!(error.message.contains("run completed (completed)"));
     assert!(error.message.contains("cleanup failed"));
+}
+
+/// The crash sweep kills a recorded group only when its recording host is
+/// dead and its leader is provably the recorded process; records owned by
+/// a live host survive untouched, so concurrent hosts never sweep each
+/// other's live runs.
+fn group_registry_sweep_kills_only_dead_owner_groups() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    use mc_host::broca::subprocess::group_registry::{sweep_orphaned_groups, GroupRecord};
+
+    let spawn_leader = || {
+        let mut cmd = std::process::Command::new("/bin/sleep");
+        cmd.arg("30");
+        cmd.process_group(0);
+        cmd.spawn().expect("spawn sleep leader")
+    };
+
+    // Orphan: recorded by a stand-in host (the record_group fixture) that
+    // exits without cleanup, exactly like a crashed host.
+    let mut orphan = spawn_leader();
+    let status = std::process::Command::new(std::env::current_exe().expect("current exe"))
+        .env(FIXTURE_MODE_ENV, "record_group")
+        .env(GROUP_PID_ENV, orphan.id().to_string())
+        .status()
+        .expect("run record_group fixture");
+    assert!(status.success(), "fixture host failed: {status:?}");
+
+    // Survivor: recorded by THIS process, which is alive during the sweep.
+    let mut survivor = spawn_leader();
+    let survivor_record =
+        GroupRecord::record(i32::try_from(survivor.id()).expect("pid fits")).expect("record");
+
+    assert!(
+        sweep_orphaned_groups() >= 1,
+        "sweep must kill at least the orphaned group"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let orphan_status = loop {
+        if let Some(status) = orphan.try_wait().expect("wait orphan") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "orphan leader survived the sweep"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        orphan_status.signal(),
+        Some(9),
+        "the orphan leader must die by SIGKILL"
+    );
+
+    assert!(
+        survivor.try_wait().expect("poll survivor").is_none(),
+        "the sweep must not touch a live host's group"
+    );
+
+    drop(survivor_record);
+    let _ = survivor.kill();
+    let _ = survivor.wait();
 }

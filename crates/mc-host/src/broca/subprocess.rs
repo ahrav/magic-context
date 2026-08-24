@@ -200,20 +200,26 @@ pub async fn run(
     // that never run the drop backstop — otherwise an orphaned harness
     // keeps executing a billable run that the replacement host reports as
     // `missing`, and recovery could refire it. `pdeathsig` covers only the
-    // leader; descendants lose their pipes with it, and the group sweep
-    // covers every ordinary path. The re-parent check closes the window
-    // where the host dies between fork and prctl.
+    // leader; the startup sweep in [`group_registry`] handles descendants
+    // that survive it, and the group sweep covers every ordinary path.
     //
+    // The parent check closes the window where the host dies between fork
+    // and prctl. It compares against the host's own pid captured pre-fork —
+    // not against init — so a host legitimately running as PID 1 (container
+    // entrypoint) still spawns; only an actual re-parent aborts.
+    let host_pid = std::process::id();
     // SAFETY: the hook runs post-fork/pre-exec, where only async-signal-safe
-    // operations are permitted. Both calls are raw syscalls (prctl,
+    // operations are permitted. All three calls are raw syscalls (prctl,
     // getppid) with no allocation, locking, or libc state access.
     #[allow(unsafe_code)]
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
-            match rustix::process::getppid() {
-                Some(parent) if parent.as_raw_nonzero().get() != 1 => Ok(()),
-                _ => Err(io::Error::other("host exited before spawn completed")),
+            let parent = rustix::process::getppid().map(|pid| pid.as_raw_nonzero().get() as u32);
+            if parent == Some(host_pid) {
+                Ok(())
+            } else {
+                Err(io::Error::other("host exited before spawn completed"))
             }
         });
     }
@@ -227,6 +233,12 @@ pub async fn run(
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
         .and_then(rustix::process::Pid::from_raw);
+    // Crash record for the startup sweep: if this host dies without running
+    // any kill path below, the next incarnation uses this entry to kill the
+    // surviving group. `Drop` removes it, covering every exit of this
+    // function once the group has been reaped in-process.
+    let _group_record =
+        group.and_then(|g| group_registry::GroupRecord::record(g.as_raw_nonzero().get()));
 
     // Prompt delivery is concurrent with output draining: a child that
     // fills its stdout pipe before reading stdin must not deadlock us.
@@ -801,4 +813,181 @@ pub(crate) fn finalize(
         },
     };
     merge_cleanup(terminal, cleanup)
+}
+
+/// Crash-orphan registry: one file per live harness process group, so a
+/// replacement host can kill groups a crashed predecessor left behind.
+///
+/// `pdeathsig` fate-binds only the group leader — provider or extension
+/// descendants survive it and can keep executing a billable request that
+/// the replacement host reports as `missing` (and recovery would refire).
+/// The sweep closes that gap at the only crash-safe point available to an
+/// unprivileged host: the next startup, before any status can be answered.
+///
+/// Kill authority is deliberately narrow. An entry's group is killed only
+/// when the recording host is provably dead AND the recorded leader is
+/// provably the same process (pid, start time, and boot id all match). A
+/// group whose leader already exited is unlinked without a kill: a fully
+/// dead group's pgid can be recycled by an unrelated process, and killing
+/// on group membership alone could hit it. The accepted residue is
+/// leaderless descendants after a host crash, which lose their pipes with
+/// the leader and exit on their own.
+pub mod group_registry {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+
+    /// Reads a process's start time (clock ticks since boot, field 22 of
+    /// `/proc/<pid>/stat`). `None` means the pid does not exist — or the
+    /// stat format was unreadable, which the callers treat identically
+    /// because neither state can prove identity.
+    fn proc_start_time(pid: i32) -> Option<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The comm field may contain spaces and parentheses; everything
+        // after the LAST ')' is whitespace-delimited. starttime is the
+        // 20th field after comm (0-indexed 19).
+        let rest = stat.rsplit_once(')')?.1;
+        rest.split_ascii_whitespace().nth(19)?.parse().ok()
+    }
+
+    fn boot_id() -> String {
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|id| id.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// The registry directory, shared by every host incarnation of this
+    /// uid. Pre-existing directories are accepted only when they are a
+    /// real directory we own with no group/world access — the sweep kills
+    /// processes named by these files, so a directory another uid can
+    /// write into would be a kill-by-proxy primitive.
+    fn registry_dir() -> io::Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        let uid = rustix::process::getuid().as_raw();
+        let dir = std::env::temp_dir().join(format!("mc-broca-groups-{uid}"));
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+        let meta = fs::symlink_metadata(&dir)?;
+        if !meta.file_type().is_dir()
+            || meta.file_type().is_symlink()
+            || meta.uid() != uid
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(io::Error::other("group registry dir is not private"));
+        }
+        Ok(dir)
+    }
+
+    struct Entry {
+        boot_id: String,
+        leader_pid: i32,
+        leader_start: u64,
+        owner_pid: i32,
+        owner_start: u64,
+    }
+
+    impl Entry {
+        fn parse(text: &str) -> Option<Self> {
+            let mut lines = text.lines();
+            if lines.next()? != "v1" {
+                return None;
+            }
+            let boot_id = lines.next()?.to_owned();
+            let pid_line = |lines: &mut std::str::Lines| -> Option<(i32, u64)> {
+                let (pid, start) = lines.next()?.split_once(' ')?;
+                Some((pid.parse().ok()?, start.parse().ok()?))
+            };
+            let (leader_pid, leader_start) = pid_line(&mut lines)?;
+            let (owner_pid, owner_start) = pid_line(&mut lines)?;
+            Some(Self {
+                boot_id,
+                leader_pid,
+                leader_start,
+                owner_pid,
+                owner_start,
+            })
+        }
+    }
+
+    /// A live registry entry. Removal is by `Drop`, so holding one in the
+    /// spawning function's scope covers every exit path — once the group
+    /// is reaped in-process, the crash record must not outlive it.
+    pub struct GroupRecord {
+        path: PathBuf,
+    }
+
+    impl GroupRecord {
+        /// Records `leader_pid`'s group. Best-effort by contract: this is
+        /// the third backstop behind `pdeathsig` and the in-process kill
+        /// paths, so a registry failure must not fail the run.
+        pub fn record(leader_pid: i32) -> Option<Self> {
+            let leader_start = proc_start_time(leader_pid)?;
+            let owner_pid = std::process::id() as i32;
+            let owner_start = proc_start_time(owner_pid)?;
+            let dir = registry_dir().ok()?;
+            let mut nonce = [0u8; 8];
+            getrandom::getrandom(&mut nonce).ok()?;
+            let path = dir.join(format!("{leader_pid}-{:016x}", u64::from_le_bytes(nonce)));
+            let body = format!(
+                "v1\n{}\n{leader_pid} {leader_start}\n{owner_pid} {owner_start}\n",
+                boot_id()
+            );
+            fs::write(&path, body).ok()?;
+            Some(Self { path })
+        }
+    }
+
+    impl Drop for GroupRecord {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    /// Kills process groups recorded by dead host incarnations and removes
+    /// their entries; returns how many groups were signalled. Entries whose
+    /// owning host is still alive are left untouched, so concurrent hosts
+    /// (including test processes) never sweep each other's live runs.
+    pub fn sweep_orphaned_groups() -> usize {
+        let Ok(dir) = registry_dir() else {
+            return 0;
+        };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return 0;
+        };
+        let current_boot = boot_id();
+        let mut killed = 0;
+        for file in entries.flatten() {
+            let path = file.path();
+            let entry = fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| Entry::parse(&t));
+            let Some(entry) = entry else {
+                let _ = fs::remove_file(&path);
+                continue;
+            };
+            // A different boot means every recorded process is gone and
+            // both pids may have been reissued: never kill, just clean up.
+            if entry.boot_id != current_boot {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            if proc_start_time(entry.owner_pid) == Some(entry.owner_start) {
+                continue;
+            }
+            if proc_start_time(entry.leader_pid) == Some(entry.leader_start) {
+                if let Some(group) = rustix::process::Pid::from_raw(entry.leader_pid) {
+                    let _ =
+                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                    killed += 1;
+                }
+            }
+            let _ = fs::remove_file(&path);
+        }
+        killed
+    }
 }
