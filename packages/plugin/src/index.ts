@@ -69,9 +69,13 @@ import { closeQuietly } from "./shared/sqlite-helpers";
 import { setStoragePrivatePermissionEnforcement } from "./shared/storage-permissions";
 
 const server: Plugin = async (ctx) => {
-    // Broca child processes must not initialize Magic Context.
+    // Broca child processes must not initialize Magic Context. The buffered
+    // logger is off limits here: it arms a flush timer and appends to the
+    // Magic Context log file, both of which this guard exists to prevent.
+    // stderr is side-effect-free and the host captures it as bounded
+    // diagnostics (stdout would corrupt the transcript stream).
     if (process.env.MAGIC_CONTEXT_BROCA_CHILD === "1") {
-        log(
+        console.error(
             "[magic-context] broca child detected (MAGIC_CONTEXT_BROCA_CHILD=1); skipping plugin startup",
         );
         return {};

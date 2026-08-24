@@ -9746,8 +9746,18 @@ impl McHandler {
             }
         };
 
-        if let Ok(Some(recorded)) = store.load_dream_task_command(&ledger_session, command_id) {
-            return replay_dream_task_response(&recorded.response_json);
+        // A ledger read failure must not look like "no record": replaying a
+        // command whose durable response exists would start a second
+        // billable run, so the read fails closed and the caller retries.
+        match store.load_dream_task_command(&ledger_session, command_id) {
+            Ok(Some(recorded)) => return replay_dream_task_response(&recorded.response_json),
+            Ok(None) => {}
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "dreamer_ledger_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
         }
 
         let mut attempts = 0usize;

@@ -157,19 +157,22 @@ impl CompositeComponent for BrocaComponent {
         let Some(key) = self.key_of_route(ctx.route) else {
             return app_error("internal_error", "route is not bound to a broca session");
         };
-        // Strict decode before any permit or state (R3, admission flow).
-        // Parser scratch and the owned request strings stay on the host's
-        // scratch pool (KTD2): the body itself is already charged to
-        // ingress, and the supervisor charges only what it retains.
-        let request = match protocol::parse_request(&ctx.body, ctx.binary) {
-            Ok(request) => request,
-            Err(error) => return request_error(error),
-        };
+        // Parser scratch is reserved BEFORE decoding (KTD2): `parse_request`
+        // materializes owned prompt/system/model strings up to the body
+        // size, and up to the full callback fan-in could otherwise hold
+        // those copies outside the resident-byte budget before learning the
+        // pool is exhausted. The reservation depends only on the body
+        // length, so decode strictness is unchanged for admitted requests;
+        // the supervisor charges only what it retains.
         let Some(_scratch) = ctx.try_reserve_resident(ctx.body.len() + 512) else {
             return app_error(
                 "queue_full",
                 "resident capacity for request handling is exhausted",
             );
+        };
+        let request = match protocol::parse_request(&ctx.body, ctx.binary) {
+            Ok(request) => request,
+            Err(error) => return request_error(error),
         };
         match request {
             Request::Send(send) => match self.supervisor.send(&key, send, &ctx.body) {

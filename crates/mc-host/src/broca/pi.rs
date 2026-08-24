@@ -258,14 +258,25 @@ fn pi_terminal_probe(stdout: &[u8]) -> bool {
 /// compaction, retry, queue, and session-state notifications) is ignored:
 /// Pi emits them on ordinary runs (`--thinking` emits
 /// `thinking_level_changed`, provider retries emit `auto_retry_*`), so
-/// rejecting them would fail otherwise valid transcripts. Anything outside
-/// the documented vocabulary still fails to one bounded terminal whose
-/// detail never quotes the line (R19).
+/// rejecting them would fail otherwise valid transcripts. Lines that do not
+/// claim to be JSON objects are extension stdout noise (a co-loaded
+/// provider extension printing "[Worker] Ready" — the classification
+/// `subagent-runner.ts` uses) and are skipped; a line that starts with `{`
+/// but fails to parse, or any undocumented event, still fails to one
+/// bounded terminal whose detail never quotes the line (R19).
 fn parse_pi_transcript(stdout: &[u8]) -> Result<(Vec<BackendEvent>, BackendTerminal), String> {
     let mut events = Vec::new();
     let mut terminal: Option<BackendTerminal> = None;
     for (index, line) in stdout.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
+            continue;
+        }
+        if line
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .copied()
+            != Some(b'{')
+        {
             continue;
         }
         let line_no = index + 1;

@@ -111,6 +111,10 @@ fn main() {
         ),
         ("pi_auxiliary_events_ignored", pi_auxiliary_events_ignored),
         (
+            "pi_extension_stdout_noise_skipped",
+            pi_extension_stdout_noise_skipped,
+        ),
+        (
             "undelivered_prompt_rejects_clean_transcript",
             undelivered_prompt_rejects_clean_transcript,
         ),
@@ -1768,6 +1772,67 @@ fn pi_auxiliary_events_ignored() {
     assert!(events.iter().any(
         |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "aux answer")
     ));
+}
+
+/// Co-loaded provider extensions write plain-text banners to Pi's stdout;
+/// lines that do not claim to be JSON are noise, while a line that starts
+/// with `{` but fails to parse still fails the run closed.
+fn pi_extension_stdout_noise_skipped() {
+    let setup = RunSetup::new();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"[Worker] Ready\n");
+    for line in pi_success_lines("noisy answer", "stop") {
+        bytes.extend_from_slice(serde_json::to_string(&line).expect("line").as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"provider banner: shutting down\n");
+    let path = setup.scratch.path().join("noisy.ndjson");
+    fs::write(&path, bytes).expect("transcript");
+    let backend = pi_backend(
+        &setup,
+        &[(TRANSCRIPT_FILE_ENV, &path.to_string_lossy())],
+        Vec::new(),
+        None,
+    );
+    let (terminal, events) = execute(
+        &backend,
+        request(setup.project.path(), Harness::Pi, "anthropic/m", None),
+    );
+    assert!(
+        matches!(terminal, BackendTerminal::Completed { .. }),
+        "{terminal:?}"
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::AssistantText { text, .. } if text == "noisy answer")
+    ));
+
+    // A malformed line that claims to be a JSON event is corruption, not
+    // noise.
+    let setup = RunSetup::new();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"{broken json\n");
+    for line in pi_success_lines("unreached", "stop") {
+        bytes.extend_from_slice(serde_json::to_string(&line).expect("line").as_bytes());
+        bytes.push(b'\n');
+    }
+    let path = setup.scratch.path().join("claimed.ndjson");
+    fs::write(&path, bytes).expect("transcript");
+    let backend = pi_backend(
+        &setup,
+        &[(TRANSCRIPT_FILE_ENV, &path.to_string_lossy())],
+        Vec::new(),
+        None,
+    );
+    let (terminal, _) = execute(
+        &backend,
+        request(setup.project.path(), Harness::Pi, "anthropic/m", None),
+    );
+    let error = failed(&terminal);
+    assert!(
+        error.message.contains("malformed json at line 1"),
+        "{:?}",
+        error.message
+    );
 }
 
 /// A child that emits a valid transcript without consuming the prompt (its
