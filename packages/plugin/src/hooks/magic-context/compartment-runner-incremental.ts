@@ -418,28 +418,11 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         // No temp-file offload needed — the bounded blocks stay well within
         // serialization limits.
         const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        // The historian's reference block is an automatic model prompt:
-        // policy-hidden content must not reach it, or a hidden fact can
-        // steer newly generated summaries.
-        const memories = filterMemoriesByPolicy(
-            db,
-            getMemoriesByProject(db, projectPath, ["active", "permanent"]),
-            "auto_inject",
-        ).memories;
-        const projectMemory = renderMemoryBlock(memories) ?? "";
 
         const references = buildReferenceBlocks({
             sessionId,
             chunkStart: chunk.startIndex,
             sessionCompartments: priorCompartments,
-        });
-
-        const prompt = buildCompartmentAgentPrompt({
-            seedExamples: references.seedExamples,
-            sessionReferences: references.sessionReferences,
-            projectMemory,
-            inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
-            memoryEnabled: deps.memoryEnabled !== false,
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
@@ -452,6 +435,27 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             { preferResponseOnMissingData: true },
         );
         const sessionDirectory = parentSession?.directory ?? directory;
+
+        // The historian's reference block is an automatic model prompt:
+        // policy-hidden content must not reach it, or a hidden fact can
+        // steer newly generated summaries. Loaded AFTER the awaited session
+        // lookup above so the policy filter and the rendered bytes are
+        // current when the prompt is handed to the provider — a load before
+        // that await could carry a memory hidden or rewritten in the gap.
+        const memories = filterMemoriesByPolicy(
+            db,
+            getMemoriesByProject(db, projectPath, ["active", "permanent"]),
+            "auto_inject",
+        ).memories;
+        const projectMemory = renderMemoryBlock(memories) ?? "";
+
+        const prompt = buildCompartmentAgentPrompt({
+            seedExamples: references.seedExamples,
+            sessionReferences: references.sessionReferences,
+            projectMemory,
+            inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
+            memoryEnabled: deps.memoryEnabled !== false,
+        });
 
         // Defensive: use MAX(sequence) + 1 rather than .length. These only
         // differ when the current DB state has a gap or non-zero-indexed

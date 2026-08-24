@@ -468,12 +468,37 @@ export async function applyVerifyManifest(
     let updated = 0;
     let archived = 0;
     if (args.moduleRoute) {
+        // The apply-time check above precedes the awaited normalizeFiles
+        // calls, and the native memory.set_verification handler validates
+        // only the normalized hash (which cannot reject a case/whitespace
+        // rewrite) and carries no claim-policy check. Repeat the policy and
+        // prompt-byte validation immediately before constructing the module
+        // rows — the module branch returns before the transaction-time
+        // recheck that guards the local route.
+        const eligibleForModule = maintenanceEligibleIdSet(
+            args.db,
+            writes.map((write) => write.id),
+            "verification",
+        );
+        const digestsForModule = exactMemoryContentDigests(
+            args.db,
+            writes.map((write) => write.id),
+        );
+        const moduleWrites = writes.filter((write) =>
+            stillApplicable(write.id, eligibleForModule, digestsForModule),
+        );
+        if (moduleWrites.length < writes.length) {
+            log(
+                `[dreamer] verify module apply dropped ${writes.length - moduleWrites.length} target(s) hidden or rewritten during normalization`,
+            );
+        }
+        if (moduleWrites.length === 0) return { verified: 0, updated: 0, archived: 0 };
         const identities = getModuleMemoryIdentities(
             args.db,
             args.projectIdentity,
-            writes.map((write) => write.id),
+            moduleWrites.map((write) => write.id),
         );
-        const rows = writes.map((write) => {
+        const rows = moduleWrites.map((write) => {
             const identity = identities.get(write.id);
             if (!identity)
                 throw new DreamerModuleFailureError(
@@ -522,7 +547,7 @@ export async function applyVerifyManifest(
         const accepted = new Set(
             result.accepted.filter((id): id is number => typeof id === "number"),
         );
-        for (const write of writes) {
+        for (const write of moduleWrites) {
             const identity = identities.get(write.id);
             if (!identity || !accepted.has(identity.moduleId)) continue;
             if (write.kind === "verify") verified += 1;

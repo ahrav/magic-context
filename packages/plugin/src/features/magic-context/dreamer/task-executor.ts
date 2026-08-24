@@ -1164,20 +1164,9 @@ async function runAgenticTask(
 
     // verify / verify-broad / classify-memories now run via their own non-agentic
     // manifest runners and never reach runAgenticTask. The agentic path handles
-    // curate / maintain-docs only.
-    let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
-    if (task === "curate") {
-        curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
-        log(`[dreamer] curate pool: in_scope=${curateMemories.length}`);
-    }
-
-    const taskPrompt = buildDreamTaskPrompt(task, {
-        projectPath: projectIdentity,
-        lastDreamAt: lastRunAt ? String(lastRunAt) : null,
-        existingDocs,
-        userMemories,
-        curate: curateMemories ? { memories: curateMemories } : undefined,
-    });
+    // curate / maintain-docs only. The curate pool is loaded AFTER the awaited
+    // child-session creation below — a pool frozen before that await could
+    // carry a memory hidden or rewritten in the gap into the child prompt.
 
     const abortController = new AbortController();
     let leaseLost = false;
@@ -1211,6 +1200,24 @@ async function runAgenticTask(
         childSessionId = typeof created?.id === "string" ? created.id : null;
         if (!childSessionId) throw new Error("Dreamer could not create its child session.");
         const sessionId = childSessionId;
+
+        // Load the curate pool and build the prompt only now, past the
+        // awaited child-session creation: the maintenance filter runs on
+        // current policy state and the rendered bytes are current when the
+        // prompt is submitted. The later ctx_memory target gates prevent
+        // mutation of hidden rows but cannot undo disclosure to the child.
+        let curateMemories: ReturnType<typeof loadActiveMemoryPromptMemories> | undefined;
+        if (task === "curate") {
+            curateMemories = loadActiveMemoryPromptMemories(db, projectIdentity);
+            log(`[dreamer] curate pool: in_scope=${curateMemories.length}`);
+        }
+        const taskPrompt = buildDreamTaskPrompt(task, {
+            projectPath: projectIdentity,
+            lastDreamAt: lastRunAt ? String(lastRunAt) : null,
+            existingDocs,
+            userMemories,
+            curate: curateMemories ? { memories: curateMemories } : undefined,
+        });
 
         const remainingMs = Math.max(0, deadline - Date.now());
         const run = await shared.promptSyncWithValidatedOutputRetry(
