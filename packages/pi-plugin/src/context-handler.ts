@@ -36,6 +36,7 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { revalidateEnforcementArtifacts } from "@magic-context/core/features/magic-context/claim-policy-backfill";
 import {
 	acquireCompartmentLease,
 	COMPARTMENT_LEASE_RENEWAL_MS,
@@ -44,7 +45,10 @@ import {
 } from "@magic-context/core/features/magic-context/compartment-lease";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
 import { isFailClosedBlockingError } from "@magic-context/core/features/magic-context/fail-closed-block";
-import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import {
+	resolveProjectIdentityForSession,
+	resolveProjectRootDirectory,
+} from "@magic-context/core/features/magic-context/memory/project-identity";
 import { autoSearchHintFragmentsStillEligible } from "@magic-context/core/features/magic-context/memory/storage-claim-visibility";
 import {
 	clearSessionTracking,
@@ -2097,6 +2101,24 @@ export function registerPiContextHandler(
 					options.allowHomeProject,
 				) ?? "";
 			updateSessionProjectTracking(sessionId, projectIdentity, options.db);
+			if (projectIdentity) {
+				// Ongoing enforcement-artifact revalidation, mirroring the
+				// OpenCode transform: a deleted or edited artifact withdraws
+				// the ENFORCED rung instead of standing forever. Internally
+				// throttled; failures are non-fatal.
+				try {
+					revalidateEnforcementArtifacts(
+						options.db,
+						projectIdentity,
+						resolveProjectRootDirectory(projectDirectory),
+					);
+				} catch (error) {
+					sessionLog(
+						sessionId,
+						`enforcement artifact revalidation failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			}
 			logTransformTiming(
 				sessionId,
 				"findSessionId",

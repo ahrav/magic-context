@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { revalidateEnforcementArtifacts } from "../../features/magic-context/claim-policy-backfill";
 import {
     type AuthorityModuleClient,
     checksumAuthoritySeedRows,
@@ -10,6 +11,7 @@ import {
     isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
+    resolveProjectRootDirectory,
     takeDubiousOwnershipProjectIdentityWarning,
 } from "../../features/magic-context/memory/project-identity";
 import { scheduleReconciliation } from "../../features/magic-context/message-index-async";
@@ -1561,6 +1563,26 @@ export function createTransform(deps: TransformDeps) {
                 memoryProjectDirectory,
                 notificationParams,
             );
+        }
+        if (projectIdentity) {
+            // Ongoing enforcement-artifact revalidation: ENFORCED maturity is
+            // earned by exact artifact bytes, and deleting or editing the
+            // recorded file must withdraw the rung instead of standing
+            // forever. Internally throttled (one filesystem pass per project
+            // per interval); failures are non-fatal and retry on a later
+            // pass.
+            try {
+                revalidateEnforcementArtifacts(
+                    db,
+                    projectIdentity,
+                    resolveProjectRootDirectory(memoryProjectDirectory),
+                );
+            } catch (error) {
+                sessionLog(
+                    sessionId,
+                    `enforcement artifact revalidation failed (retrying next pass): ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
         }
         // Session-scoped project identity for note-nudge and auto-search, which
         // must target the SESSION's project — not the launch cwd. `deps.projectPath`

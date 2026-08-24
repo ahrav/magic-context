@@ -12,6 +12,9 @@
  * automatic visibility.
  */
 
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, join, normalize, sep } from "node:path";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite.ts";
 import { isRetryableSqliteBusyError } from "./claims-backfill.ts";
@@ -27,10 +30,12 @@ import {
     hasClaimPolicySchema,
     readPolicySupport,
     refreshEffectivePolicyInCurrentTransaction,
+    revokeEnforcementArtifactInCurrentTransaction,
 } from "./memory/storage-claim-policy.ts";
 import {
     bumpEpochForClaimProjectInCurrentTransaction,
     refreshRevisionMaturityInCurrentTransaction,
+    runInMemoryClaimsWriteTransaction,
 } from "./memory/storage-memory-claims.ts";
 import { readSchemaMeta as readMeta, writeSchemaMeta as writeMeta } from "./schema-meta.ts";
 import type { SourceTrustClass } from "./storage-claim-applicability-schema.ts";
@@ -424,6 +429,127 @@ function seedRevisionInCurrentTransaction(
  * unexamined negative event on a current revision therefore bumps its
  * claim's project epochs here so those caches refold.
  */
+/** Per-project throttle for the artifact-revalidation probe: rehashing every
+ *  enforced artifact on every transform pass would put file I/O on the hot
+ *  path for a condition (a deleted or edited artifact) that is rare. */
+const artifactRevalidationLastRunMs = new Map<string, number>();
+const ARTIFACT_REVALIDATION_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Test seam: clears the per-project throttle. */
+export function __resetArtifactRevalidationThrottleForTests(): void {
+    artifactRevalidationLastRunMs.clear();
+}
+
+/**
+ * Re-verify that every currently valid enforcement artifact still exists on
+ * disk with the recorded bytes. ENFORCED maturity is earned by a passing
+ * evaluation of exact artifact bytes; editing or deleting the recorded
+ * `canonical_path` after the fact would otherwise leave the rung standing
+ * forever, because validity reads only the stored `pass` result and explicit
+ * revocation events. A missing or digest-drifted artifact gets a revocation
+ * event plus a policy refresh, so `supportedMaturity` falls back to the
+ * revision's next supported rung. A missing PROJECT ROOT is treated as
+ * "cannot judge" (checkout absent or moved) and revokes nothing.
+ */
+export function revalidateEnforcementArtifacts(
+    db: Database,
+    projectIdentity: string,
+    projectRoot: string,
+    nowMs = Date.now(),
+): void {
+    if (!hasClaimPolicySchema(db)) return;
+    const last = artifactRevalidationLastRunMs.get(projectIdentity) ?? 0;
+    if (nowMs - last < ARTIFACT_REVALIDATION_INTERVAL_MS) return;
+    artifactRevalidationLastRunMs.set(projectIdentity, nowMs);
+    if (!existsSync(projectRoot)) return;
+    const projectRow = db
+        .prepare("SELECT id FROM projects WHERE canonical_identity = ?")
+        .get(projectIdentity) as { id: number } | null | undefined;
+    if (!projectRow) return;
+    const artifacts = db
+        .prepare(
+            `SELECT artifact.id AS id, artifact.revision_id AS revisionId,
+                    artifact.canonical_path AS canonicalPath,
+                    artifact.bytes_digest AS bytesDigest,
+                    claim_revisions.claim_id AS claimId
+               FROM claim_enforcement_artifacts artifact
+               JOIN claim_revisions ON claim_revisions.id = artifact.revision_id
+              WHERE artifact.project_id = ?
+                AND artifact.evaluator_result = 'pass'
+                AND NOT EXISTS (
+                    SELECT 1 FROM claim_enforcement_artifact_events event
+                    WHERE event.artifact_id = artifact.id AND event.action = 'revoked'
+                )`,
+        )
+        .all(projectRow.id) as Array<{
+        id: number;
+        revisionId: number;
+        canonicalPath: string;
+        bytesDigest: string;
+        claimId: number;
+    }>;
+    for (const artifact of artifacts) {
+        // canonical_path is recorded project-relative and traversal-checked
+        // at record time; re-guard here so a corrupted row cannot make the
+        // probe hash a file outside the owning root.
+        const relative = normalize(artifact.canonicalPath);
+        if (isAbsolute(relative) || relative === ".." || relative.startsWith(`..${sep}`)) {
+            continue;
+        }
+        const absolute = join(projectRoot, relative);
+        let drifted: string | null = null;
+        if (!existsSync(absolute)) {
+            drifted = "artifact file missing";
+        } else {
+            try {
+                const digest = createHash("sha256").update(readFileSync(absolute)).digest("hex");
+                if (digest !== artifact.bytesDigest) drifted = "artifact bytes drifted";
+            } catch {
+                // Unreadable is indistinguishable from transient I/O; do not
+                // revoke on a read error.
+                continue;
+            }
+        }
+        if (drifted === null) continue;
+        try {
+            runInMemoryClaimsWriteTransaction(db, () => {
+                // Re-check inside the transaction: a concurrent revocation
+                // must not be doubled. Every drifted artifact is revoked —
+                // not only the latest — because an older still-valid pass
+                // row becomes the support again the moment a newer one is
+                // revoked.
+                const stillValid = db
+                    .prepare(
+                        `SELECT 1 FROM claim_enforcement_artifacts artifact
+                          WHERE artifact.id = ?
+                            AND NOT EXISTS (
+                                SELECT 1 FROM claim_enforcement_artifact_events event
+                                WHERE event.artifact_id = artifact.id
+                                  AND event.action = 'revoked'
+                            )`,
+                    )
+                    .get(artifact.id);
+                if (!stillValid) return;
+                revokeEnforcementArtifactInCurrentTransaction(
+                    db,
+                    artifact.id,
+                    `revalidation: ${drifted}`,
+                    nowMs,
+                );
+                refreshEffectivePolicyInCurrentTransaction(db, artifact.revisionId, { nowMs });
+                bumpEpochForClaimProjectInCurrentTransaction(db, artifact.claimId);
+            });
+            log(
+                `[claim-policy] revoked enforcement artifact ${artifact.id} for revision ${artifact.revisionId}: ${drifted}`,
+            );
+        } catch (error) {
+            log(
+                `[claim-policy] artifact revalidation revoke failed (retrying on a later probe): ${error instanceof Error ? error.message : String(error)}`,
+            );
+        }
+    }
+}
+
 /** In-flight guard so overlapping transform/sync passes cannot start
  *  concurrent straggler-seed runs against the same database. */
 let lateSeedInFlight = false;

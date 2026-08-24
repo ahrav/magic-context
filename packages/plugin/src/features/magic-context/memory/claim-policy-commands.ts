@@ -258,8 +258,20 @@ export async function executeClaimApprovalCommand(
 ): Promise<ClaimCommandResult> {
     const parts = argsText.trim().split(/\s+/).filter(Boolean);
     const revoke = parts.includes("--revoke");
-    const idText = parts.find((part) => !part.startsWith("--"));
-    const memoryId = idText != null ? Number(idText) : Number.NaN;
+    // Strict argument validation: a mistyped flag (`--revok`) must not
+    // silently select the OPPOSITE authority action, and a repeat within the
+    // confirmation window would then commit it. Exactly one id, and the only
+    // supported flag is --revoke.
+    const idParts = parts.filter((part) => !part.startsWith("--"));
+    const flagParts = parts.filter((part) => part.startsWith("--"));
+    if (
+        idParts.length !== 1 ||
+        flagParts.some((flag) => flag !== "--revoke") ||
+        flagParts.length > 1
+    ) {
+        return { text: `## Claim Approval\n\n${APPROVE_USAGE}`, level: "error" };
+    }
+    const memoryId = Number(idParts[0]);
     if (!Number.isSafeInteger(memoryId) || memoryId <= 0) {
         return { text: `## Claim Approval\n\n${APPROVE_USAGE}`, level: "error" };
     }
@@ -482,14 +494,21 @@ export async function executeClaimEnforceCommand(
     argsText: string,
 ): Promise<ClaimCommandResult> {
     const parts = tokenizeCommandArgs(argsText);
+    // Strict flag validation, mirroring /ctx-approve: a mistyped flag
+    // (`--revok`) must not silently select a different action — for enforce
+    // it would run a full evaluation treating the flag as a path argument.
+    const unknownFlags = parts.filter((part) => part.startsWith("--") && part !== "--revoke");
+    if (unknownFlags.length > 0) {
+        return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
+    }
     // Artifact revocation is the compromise-response path (KTD6): a revoked
     // approval alone only lowers maturity until the next approval, because
     // supportedMaturity would reuse the still-valid artifact and restore
     // ENFORCED. Revoking covers every valid artifact for the revision so the
     // rung must be re-earned with a fresh evaluation.
     if (parts.includes("--revoke")) {
-        const revokeIdText = parts.find((part) => !part.startsWith("--"));
-        const revokeMemoryId = revokeIdText != null ? Number(revokeIdText) : Number.NaN;
+        const revokeIds = parts.filter((part) => !part.startsWith("--"));
+        const revokeMemoryId = revokeIds.length === 1 ? Number(revokeIds[0]) : Number.NaN;
         if (!Number.isSafeInteger(revokeMemoryId) || revokeMemoryId <= 0) {
             return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
         }
