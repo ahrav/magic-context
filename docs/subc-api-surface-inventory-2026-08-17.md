@@ -62,7 +62,8 @@ checkout at all.
 Reproduction artifacts in this repository:
 
 - `docs/evidence/verify-rust-surface.py` + `.out` — per-row presence check against the
-  published crate sources (85 present, 2 absent).
+  published crate sources (86 results, one per published-crate row: 84 present,
+  2 absent).
 - `docs/evidence/verify-ts-surface.py` + `.out` — per-row presence check against the exact
   npm 0.4.1 declarations (34 present, 0 absent).
 - `docs/evidence/subc-surface-probe/` — a compiling Rust probe that replays every
@@ -191,9 +192,9 @@ protocol-visible, **L** lifecycle-critical, **E** error/recovery-critical.
 | `RouteBindRequest` | `lib.rs:11265` | prod | `.handle.channel`, `.identity.{project_root, harness, session}` | exact | P |
 | `RouteHandle` | `lib.rs:11285` | prod | `.channel: u16` | exact | P |
 | `BindDecision` / `::accept()` | `lib.rs:11280` | prod | accept every route; project resolution, not authorization | exact | L |
-| `serve_with` | `main.rs` (bin `ck-mc`) | prod | `(&Path, ModuleManifest, H) -> Result<(), _>`; owns `--subc` connect, auth, HELLO{manifest}, HELLO_ACK, and dispatch | exact | L |
+| `serve_with` | `main.rs` (bin `ck-mc`) | prod | `(&Path, ModuleManifest, H) -> Result<(), E>` where the opaque error `E` must implement `std::error::Error + Send + Sync` — `main` propagates it with `?` into `Box<dyn Error + Send + Sync>` (published `SubcModuleError` satisfies this); owns `--subc` connect, auth, HELLO{manifest}, HELLO_ACK, and dispatch | exact | L |
 | `SubcConsumer` | `session_resolver.rs`, `tests/real_daemon.rs` | prod + test | consumer role | exact | L |
-| `SubcConsumer::connect` | same | prod + test | `(&Path, ConsumerOptions)` | exact | L |
+| `SubcConsumer::connect` | same | prod + test | `(&Path, ConsumerOptions)`; the opaque error must implement `Display` — `session_resolver.rs:97` maps it with `error.to_string()` (published `ConsumerError` implements `Display` + `Error`) | exact | L |
 | `SubcConsumer::call` | same | prod + test | `(RouteTarget, BindIdentity, Vec<u8>, CallOptions) -> Result<Vec<u8>, CallError>`; managed route.open + request + terminal wait, with route-open retry | exact | E |
 | `SubcConsumer::close_route` | `session_resolver.rs` | prod | `(RouteTarget, BindIdentity, CloseRouteOptions)` | exact | L |
 | `SubcConsumer::close` | `session_resolver.rs`, `tests/real_daemon.rs` | prod + test | `async`, no result | exact | L |
@@ -353,10 +354,18 @@ directly from `historian_producer.rs` rather than only through the SDK:
 MIT source for all of the above is in the four published crates, so c50.2 is a
 *confirm-and-trim* exercise rather than a design-from-scratch one.
 
-### `magic-context-c50.4` (Rust compatibility work)
+### `magic-context-c50.4` (Rust boundary port)
 
-- Vendor or depend on published `subc-protocol` 0.10.0, `subc-transport` 0.5.0,
-  `subc-control` 0.1.1, `subc-client-rs` 0.3.0 (all MIT, one upstream commit).
+> Superseded alongside the Decision section above: c50.4 now ports `mc-module`
+> directly to the mc-host SDK with **no** `subc-*` compatibility crates — do not
+> vendor or depend on the published crates as the implementation. The bullets
+> below are preserved as the original adoption-path analysis; what carries over
+> to the direct port is the inventory itself (the port's coverage checklist),
+> the three deltas as wire-behavior facts, and the `subc-core` analysis.
+
+- ~~Vendor or depend on published~~ `subc-protocol` 0.10.0, `subc-transport` 0.5.0,
+  `subc-control` 0.1.1, `subc-client-rs` 0.3.0 (all MIT, one upstream commit)
+  remain the reference sources for wire semantics only.
 - Apply exactly the three deltas above.
 - Do **not** treat `docs/evidence/subc-surface-probe/` as the implementation; it is
   evidence and stays excluded from the workspace.

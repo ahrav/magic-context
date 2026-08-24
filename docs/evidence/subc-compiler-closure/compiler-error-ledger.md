@@ -47,7 +47,11 @@ Diagnostics quoted from `compiler-closure.log`.
   16856 | |                 of: vec!["thalamus".to_string()]
   ```
 
-- **Stub change:** derived `PartialEq, Eq` on `subc_protocol::manifest::ConsumerRole`.
+- **Stub change:** derived `PartialEq` on `subc_protocol::manifest::ConsumerRole`.
+  (The fix as first applied also derived `Eq`, which no diagnostic demands —
+  `==` desugaring and `assert_eq!` require only `PartialEq` — so the entry-3
+  strictness sweep stripped it; see entry 3's removed-items list. The final
+  stub derives `Debug, PartialEq`, the `Debug` demanded separately in entry 3.)
 - **Inventory impact:** existing row's required shape amended to include
   `PartialEq` (test-demanded). Published 0.10.0 derives `PartialEq` on
   `ConsumerRole`, so the row stays **exact**.
@@ -85,9 +89,10 @@ Serde impls retained without individual diagnostics are wire-contract rows
 round-trip"; `ModuleHelloAckBody.storage` deserialization), and the `Default`
 derives are recorded in the `CallOptions`/`CloseRouteOptions` rows
 (`RetryBackoff`'s `Default` is structural to `CallOptions`'s). The sweep also
-proved two impls **un-demanded** and removed them: `std::error::Error` for
-`CallError` and for the opaque connect error (their rows record only
-`Display` + `Debug`).
+proved three additions **un-demanded** and removed them: `std::error::Error`
+for `CallError` and for the opaque connect error (their rows record only
+`Display` + `Debug`), and the `Eq` derive that entry 2's fix had added
+alongside the demanded `PartialEq` on `ConsumerRole`.
 
 ## Non-entries (observed, deliberately not stub changes)
 

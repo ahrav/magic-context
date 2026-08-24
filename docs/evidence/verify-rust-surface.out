@@ -22,8 +22,7 @@ PRESENT  subc-protocol    manifest::ModuleManifest
 PRESENT  subc-protocol    ModuleManifest.scheduled_tasks
 PRESENT  subc-protocol    manifest::TrustTier
 PRESENT  subc-protocol    manifest::ProviderRole
-PRESENT  subc-protocol    manifest::ConsumerRole
-PRESENT  subc-protocol    ConsumerRole PartialEq
+PRESENT  subc-protocol    manifest::ConsumerRole (incl. PartialEq)
 PRESENT  subc-protocol    ConsumerRole::ServiceClient
 PRESENT  subc-protocol    manifest::Bindings
 PRESENT  subc-protocol    manifest::StorageBinding

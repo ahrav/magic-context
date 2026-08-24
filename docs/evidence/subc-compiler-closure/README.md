@@ -95,8 +95,15 @@ body; it was never executed, like the rest of the stubs.
 - `docs/subc-api-surface-inventory-2026-08-17.md` updated: `Ping` row added,
   `ConsumerRole` row amended, totals and closure section reconciled.
 - `docs/evidence/verify-rust-surface.py` re-run against the published crate
-  sources with the two new checks; `verify-rust-surface.out` regenerated
-  (85 present, 2 absent — the two `changed` rows whose text probes cannot appear in the published source; the third `changed` row, `ModuleManifest`, probes present).
+  sources with the two new checks; `verify-rust-surface.out` regenerated.
+  Its 86 results map one-to-one onto the 86 published-crate rows (the 87-row
+  total minus `subc-core`, the unpublished daemon edge): 84 present, 2 absent —
+  the two `changed` rows whose text probes cannot appear in the published
+  source; the third `changed` row, `ModuleManifest`, probes present. The
+  amended `ConsumerRole` row carries one combined presence-plus-`PartialEq`
+  probe rather than a second result.
 - `docs/evidence/subc-surface-probe/tests/test_only_surface.rs` extended with
-  the `Ping` and `ConsumerRole == ConsumerRole` shapes;
+  the `Ping` and `ConsumerRole` equality shapes plus compile-time assertions
+  for every trait bound the closure pass added to inventory rows (`Debug`,
+  `Clone`, `PartialEq`, `std::error::Error` on the named types);
   `cargo check --all-targets` against the published crates passes.

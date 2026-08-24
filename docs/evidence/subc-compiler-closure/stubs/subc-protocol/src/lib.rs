@@ -6,10 +6,10 @@
 //! `mc-module` compiles against. Binaries linked against it must never be
 //! executed.
 //!
-//! Positive control: `FrameType::Ping` is DELIBERATELY OMITTED at seed time so
-//! the pass proves the compiler actually detects an inventory miss
-//! (`tests/broca_roundtrip.rs` uses it). It is added only after the diagnostic
-//! is captured in the compiler-error ledger.
+//! Positive control: `FrameType::Ping` (present below) was deliberately left
+//! out of the seeded stub so the pass had to prove the compiler detects an
+//! inventory miss; `compiler-error-ledger.md` entry 1 records the diagnostic
+//! that demanded it.
 #![allow(clippy::new_without_default)]
 
 use std::path::PathBuf;
@@ -94,9 +94,10 @@ pub enum FrameType {
     StreamData,
     StreamEnd,
     Goodbye,
-    /// Ledger entry 1: demanded by `tests/broca_roundtrip.rs:544`
-    /// (`frame.header.ty != FrameType::Ping`, E0599 captured pre-fix in the
-    /// combined log). Genuine inventory completeness miss; row appended.
+    /// The producer's liveness check compares against this variant
+    /// (`frame.header.ty != FrameType::Ping`, `tests/broca_roundtrip.rs:544`).
+    /// This is the seed omission the pass had to detect; the captured
+    /// diagnostic is `compiler-error-ledger.md` entry 1.
     Ping,
 }
 
@@ -184,11 +185,10 @@ pub mod manifest {
     }
 
     /// Row: `manifest::ConsumerRole::ServiceClient` — `{ of: Vec<String> }`.
-    /// Ledger entry 2: the unit-test harness compares `manifest().consumes`
-    /// with `assert_eq!` (mc-module lib.rs:16853, E0369), so the private crate
-    /// must also expose `PartialEq` on this enum (E0369) — and `Debug`
-    /// (E0277), since `assert_eq!` formats both sides on failure. Inventory
-    /// row updated.
+    /// `PartialEq` is required because a unit test compares
+    /// `manifest().consumes` with `assert_eq!` (mc-module lib.rs:16853), and
+    /// `Debug` because `assert_eq!` formats both sides on failure. See
+    /// `compiler-error-ledger.md` entry 2.
     #[derive(Debug, PartialEq)]
     pub enum ConsumerRole {
         ServiceClient { of: Vec<String> },
