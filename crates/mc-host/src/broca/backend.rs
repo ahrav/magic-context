@@ -119,8 +119,14 @@ impl ErrorClass {
 #[derive(Clone, PartialEq, Eq)]
 pub struct BackendError {
     pub class: ErrorClass,
+    /// Always host-authored (R19): provider failure text steers
+    /// classification inside the parsers but is never stored here, because
+    /// this message rides the wire into module state and caller logs and
+    /// provider output can echo prompt, memory-pool, or credential content.
     pub message: String,
     pub retry_after_secs: Option<u64>,
+    /// Provider-supplied code, admitted only in short identifier shape
+    /// (see `sanitized_provider_code`).
     pub provider_code: Option<String>,
 }
 

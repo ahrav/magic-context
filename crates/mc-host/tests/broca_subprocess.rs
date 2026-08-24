@@ -1434,7 +1434,14 @@ fn provider_error_metadata_preserved() {
     assert_eq!(error.class, ErrorClass::Transient);
     assert_eq!(error.retry_after_secs, Some(120));
     assert_eq!(error.provider_code.as_deref(), Some("APIError"));
-    assert!(error.message.contains("Rate limit exceeded"));
+    // Provider text steers classification but never rides the wire (R19):
+    // the emitted message is host-authored and structural.
+    assert!(
+        !error.message.contains("Rate limit exceeded"),
+        "provider text must not be forwarded: {:?}",
+        error.message
+    );
+    assert!(error.message.contains("status 429"));
 
     // Authentication failure by status code.
     let (terminal, _) = run_opencode_transcript(&[serde_json::json!({
@@ -2345,7 +2352,10 @@ fn cleanup_failure_never_unqualified_success() {
     let (terminal, _) = execute(&backend, request_failure);
     let error = failed(&terminal);
     assert_eq!(error.class, ErrorClass::AuthRequired);
-    assert!(error.message.contains("No API key found"));
+    // The provider text steered classification (AuthRequired above) but is
+    // redacted from the wire message (R19).
+    assert!(!error.message.contains("No API key found"));
+    assert!(error.message.contains("stopped with reason \"error\""));
     assert!(
         error.message.contains("cleanup failed"),
         "{:?}",
@@ -2446,4 +2456,56 @@ fn group_registry_sweep_kills_only_dead_owner_groups() {
     drop(survivor_record);
     let _ = survivor.kill();
     let _ = survivor.wait();
+
+    // Leaderless orphan: the leader exits after forking a grandchild into
+    // its group — the shape pdeathsig leaves behind when it kills only the
+    // leader. The sweep must still kill the surviving group member.
+    let mut leader = std::process::Command::new("/bin/sh");
+    leader.args(["-c", "sleep 30 & echo $!; sleep 2"]);
+    leader.process_group(0);
+    leader.stdout(std::process::Stdio::piped());
+    let mut leader = leader.spawn().expect("spawn leaderless-group shell");
+    let grandchild: i32 = {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().expect("piped stdout"))
+            .read_line(&mut line)
+            .expect("read grandchild pid");
+        line.trim().parse().expect("grandchild pid")
+    };
+    // Record while the leader is still alive (its `sleep 2` window), from
+    // a stand-in host that then dies.
+    let status = std::process::Command::new(std::env::current_exe().expect("current exe"))
+        .env(FIXTURE_MODE_ENV, "record_group")
+        .env(GROUP_PID_ENV, leader.id().to_string())
+        .status()
+        .expect("run record_group fixture");
+    assert!(status.success(), "fixture host failed: {status:?}");
+    let leader_exit = leader.wait().expect("leader exits on its own");
+    assert!(leader_exit.success(), "shell leader must exit cleanly");
+
+    assert!(
+        sweep_orphaned_groups() >= 1,
+        "sweep must kill the leaderless group"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        // Killed and reaped by init: /proc entry gone (or briefly zombie).
+        let state = fs::read_to_string(format!("/proc/{grandchild}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_ascii_whitespace().next().map(str::to_owned))
+            });
+        match state.as_deref() {
+            None | Some("Z") => break,
+            Some(_) => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "leaderless grandchild survived the sweep"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

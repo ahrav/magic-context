@@ -545,19 +545,20 @@ fn commit_assistant_message(
             )?;
         }
         Some(reason @ ("error" | "aborted")) => {
-            let message_text = message
+            let provider_text = message
                 .get("errorMessage")
                 .and_then(serde_json::Value::as_str)
-                .map_or_else(
-                    || format!("pi assistant stopped with reason \"{reason}\""),
-                    ToOwned::to_owned,
-                );
+                .unwrap_or_default();
             commit_terminal(
                 terminal,
+                // The provider text steers classification but never rides
+                // the wire — it can echo prompt or credential content
+                // (R19); the emitted message is host-authored from the
+                // closed stop-reason vocabulary.
                 BackendTerminal::Failed(BackendError {
-                    class: subprocess::classify_failure_text(&message_text),
-                    retry_after_secs: subprocess::retry_after_secs_in_text(&message_text),
-                    message: message_text,
+                    class: subprocess::classify_failure_text(provider_text),
+                    retry_after_secs: subprocess::retry_after_secs_in_text(provider_text),
+                    message: format!("pi assistant stopped with reason \"{reason}\""),
                     provider_code: None,
                 }),
                 line_no,

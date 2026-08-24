@@ -343,8 +343,14 @@ fn error_terminal(value: &serde_json::Value) -> BackendTerminal {
         .map(|secs| secs.min(subprocess::MAX_RETRY_AFTER_SECS));
     BackendTerminal::Failed(BackendError {
         class,
-        message: message.to_owned(),
+        // Host-authored: the provider text above steers classification but
+        // never rides the wire — it can echo prompt, memory-pool, or
+        // credential content (R19).
+        message: match status_code {
+            Some(code) => format!("opencode provider reported an error (status {code})"),
+            None => "opencode provider reported an error".to_owned(),
+        },
         retry_after_secs,
-        provider_code: name.map(ToOwned::to_owned),
+        provider_code: name.and_then(subprocess::sanitized_provider_code),
     })
 }

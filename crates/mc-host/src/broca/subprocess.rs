@@ -179,13 +179,20 @@ pub async fn run(
     cancel: &CancellationToken,
     terminal_probe: Option<fn(&[u8]) -> bool>,
 ) -> io::Result<SubprocessResult> {
-    let mut command = tokio::process::Command::new(&spec.executable);
+    let SubprocessSpec {
+        executable,
+        args,
+        env,
+        working_dir,
+        stdin: prompt,
+    } = spec;
+    let mut command = tokio::process::Command::new(&executable);
     command
-        .args(&spec.args)
+        .args(&args)
         // No inherited environment: the child sees exactly the snapshot
         // plus adapter control variables (R17).
         .env_clear()
-        .current_dir(&spec.working_dir)
+        .current_dir(&working_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -223,11 +230,22 @@ pub async fn run(
             }
         });
     }
-    for (name, value) in &spec.env {
+    for (name, value) in &env {
         command.env(name, value);
     }
 
     let mut child = command.spawn()?;
+    // The `Command` and the adapter's env vector each hold a full copy of
+    // the child environment, which can approach the platform exec limit;
+    // both are freed as soon as the child exists so concurrent runs retain
+    // no environment-sized allocations for their lifetime (the spawned
+    // child keeps its own kernel-side copy, and `kill_on_drop` transferred
+    // to the `Child` at spawn).
+    drop(command);
+    drop(env);
+    drop(args);
+    drop(executable);
+    drop(working_dir);
     // With process_group(0) the leader's pid IS the group id.
     let group = child
         .id()
@@ -244,7 +262,6 @@ pub async fn run(
     // fills its stdout pipe before reading stdin must not deadlock us.
     // stdin is closed (dropped) after delivery so print-mode reads see EOF.
     let mut stdin_pipe = child.stdin.take();
-    let prompt = spec.stdin;
     let mut stdin_task = tokio::spawn(async move {
         let Some(mut stdin) = stdin_pipe.take() else {
             return true;
@@ -749,6 +766,19 @@ pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
     }))
 }
 
+/// Admits a provider-supplied error code onto the wire only in short
+/// identifier shape: provider output can echo prompt or credential content
+/// (R19), so anything beyond `[A-Za-z0-9_.-]{1,64}` is dropped rather than
+/// forwarded.
+pub(crate) fn sanitized_provider_code(code: &str) -> Option<String> {
+    (!code.is_empty()
+        && code.len() <= 64
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+    .then(|| code.to_owned())
+}
+
 /// First terminal wins; any second terminal is contradictory and fails the
 /// whole run (R18) — an error after a claimed success must never be
 /// reported as completed, and vice versa. Shared by both harness parsers so
@@ -825,13 +855,14 @@ pub(crate) fn finalize(
 /// unprivileged host: the next startup, before any status can be answered.
 ///
 /// Kill authority is deliberately narrow. An entry's group is killed only
-/// when the recording host is provably dead AND the recorded leader is
-/// provably the same process (pid, start time, and boot id all match). A
-/// group whose leader already exited is unlinked without a kill: a fully
-/// dead group's pgid can be recycled by an unrelated process, and killing
-/// on group membership alone could hit it. The accepted residue is
-/// leaderless descendants after a host crash, which lose their pipes with
-/// the leader and exit on their own.
+/// when the recording host is provably dead AND the group is provably the
+/// recorded one: either the leader still runs with the recorded pid, start
+/// time, and boot id — or the leader is gone but processes remain in its
+/// group, which the kernel's pgid reservation proves are descendants of
+/// the recorded run (a pid in use as a pgid is not reallocated, so a
+/// reissued leader pid conversely proves the whole group is gone). The
+/// remaining TOCTOU — the group emptying between the membership check and
+/// the kill — is the same window every `kill(-pgid)` caller accepts.
 pub mod group_registry {
     use std::os::unix::fs::MetadataExt;
 
@@ -842,12 +873,35 @@ pub mod group_registry {
     /// stat format was unreadable, which the callers treat identically
     /// because neither state can prove identity.
     fn proc_start_time(pid: i32) -> Option<u64> {
+        proc_stat_field(pid, 19)
+    }
+
+    /// Reads one whitespace-delimited `/proc/<pid>/stat` field by its
+    /// 0-based index AFTER the comm field (which may itself contain spaces
+    /// and parentheses; everything after the LAST ')' is unambiguous).
+    /// starttime is index 19, pgrp is index 2.
+    fn proc_stat_field(pid: i32, index: usize) -> Option<u64> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // The comm field may contain spaces and parentheses; everything
-        // after the LAST ')' is whitespace-delimited. starttime is the
-        // 20th field after comm (0-indexed 19).
         let rest = stat.rsplit_once(')')?.1;
-        rest.split_ascii_whitespace().nth(19)?.parse().ok()
+        rest.split_ascii_whitespace().nth(index)?.parse().ok()
+    }
+
+    /// Whether any live process still belongs to process group `pgid`.
+    /// Used only after the group's recorded leader is gone: the kernel
+    /// keeps a pgid reserved while the group has members, so survivors
+    /// found here can only be members of the recorded group.
+    fn group_has_members(pgid: i32) -> bool {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+        entries.flatten().any(|proc_entry| {
+            proc_entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+                .and_then(|pid| proc_stat_field(pid, 2))
+                .is_some_and(|pgrp| pgrp == pgid as u64)
+        })
     }
 
     fn boot_id() -> String {
@@ -979,7 +1033,21 @@ pub mod group_registry {
             if proc_start_time(entry.owner_pid) == Some(entry.owner_start) {
                 continue;
             }
-            if proc_start_time(entry.leader_pid) == Some(entry.leader_start) {
+            let group_live = match proc_start_time(entry.leader_pid) {
+                // Same pid and start time: provably the recorded leader.
+                Some(start) if start == entry.leader_start => true,
+                // The leader's pid was reissued to another process. That is
+                // impossible while the recorded group still has members (a
+                // pid in use as a pgid is not reallocated), so the group is
+                // provably gone.
+                Some(_) => false,
+                // The leader was reaped (pdeathsig kills only the leader).
+                // Members keep the pgid reserved, so any process still in
+                // that group can only be a surviving descendant of the
+                // recorded run.
+                None => group_has_members(entry.leader_pid),
+            };
+            if group_live {
                 if let Some(group) = rustix::process::Pid::from_raw(entry.leader_pid) {
                     let _ =
                         rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
