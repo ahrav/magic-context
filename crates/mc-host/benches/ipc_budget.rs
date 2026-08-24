@@ -1081,12 +1081,21 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
              MC_IPC_BUDGET_MODE=finalize-interrupted over this directory first"
         ));
     }
-    // Script-driven runs persist their planned attempt set at creation;
-    // a deleted or omitted attempt directory leaves no residue for the
-    // manifest checks above, and a partial run would otherwise
-    // summarize as a valid smaller experiment.
+    // The persisted plan is required: a lost or omitted run-plan.json
+    // would otherwise skip the completeness check and let a partial copy
+    // summarize as a valid smaller experiment — the exact failure the
+    // plan exists to prevent. (Runs predating the plan file also predate
+    // the record sidecars, so they are already rejected below and need
+    // the harness at their collection commit.)
     let plan_path = run_dir.join("run-plan.json");
-    if plan_path.is_file() {
+    if !plan_path.is_file() {
+        return Err(format!(
+            "{}: run-plan.json is missing; rerun MC_IPC_BUDGET_MODE=record-plan with this \
+             run's block and rate configuration before aggregating",
+            run_dir.display()
+        ));
+    }
+    {
         let raw =
             std::fs::read(&plan_path).map_err(|err| format!("{}: {err}", plan_path.display()))?;
         let plan: serde_json::Value = serde_json::from_slice(&raw)
@@ -1106,6 +1115,43 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         }
     }
     let attempts: Vec<evidence::LoadedAttempt> = evidence::load_attempts(run_dir)?;
+    // Every complete attempt's directory name must match the identity
+    // its manifest records: presence alone would let a renamed or
+    // copied attempt satisfy the plan while measuring a different
+    // operating point (an r80000 directory posing as r20000).
+    for a in &attempts {
+        if a.manifest.state != State::Complete {
+            continue;
+        }
+        let m = &a.manifest;
+        let mut expected = format!(
+            "{}-{}-b{:02}",
+            m.arm.name,
+            m.arm.class.clone().unwrap_or_default(),
+            m.run_block
+        );
+        if m.arm.name == ARM_TCP_OPEN {
+            let rate = m
+                .collection
+                .as_ref()
+                .and_then(|c| c["rate_per_sec"].as_u64())
+                .ok_or_else(|| {
+                    format!("{}: open-loop manifest records no rate", a.dir.display())
+                })?;
+            expected.push_str(&format!("-r{rate}"));
+        }
+        let actual = a
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if actual != expected {
+            return Err(format!(
+                "{}: directory name does not match its manifest identity (expected {expected})",
+                a.dir.display()
+            ));
+        }
+    }
     if attempts.is_empty() {
         return Err("run directory holds no finalized attempts".to_owned());
     }
