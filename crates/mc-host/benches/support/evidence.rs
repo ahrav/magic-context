@@ -326,14 +326,20 @@ pub fn verify_sidecars(attempt: &LoadedAttempt) -> Result<(), String> {
     Ok(())
 }
 
-/// True when two complete manifests may enter one aggregate: same schema,
-/// workload, build, host, and collection configuration.
+/// True when two complete manifests come from one measurement
+/// environment: same schema, workload, build, and host. Cross-arm
+/// comparisons (gap pairing) check this alone, because each arm's
+/// collection configuration necessarily differs from every other arm's.
+pub fn same_environment(a: &Manifest, b: &Manifest) -> bool {
+    a.schema == b.schema && a.workload == b.workload && a.build == b.build && a.host == b.host
+}
+
+/// True when two complete manifests may enter one merged aggregate: same
+/// environment and the same collection configuration. Within one arm a
+/// collection mismatch means differently-shaped workloads (different
+/// rates, depths, or operation counts) that must never pool.
 pub fn compatible(a: &Manifest, b: &Manifest) -> bool {
-    a.schema == b.schema
-        && a.workload == b.workload
-        && a.build == b.build
-        && a.host == b.host
-        && a.collection == b.collection
+    same_environment(a, b) && a.collection == b.collection
 }
 
 /// Errors unless `file` is declared exactly once in the manifest's
@@ -436,7 +442,11 @@ pub fn paired_gaps(attempts: &[LoadedAttempt]) -> Result<Vec<GapRow>, String> {
     let mut atomic: BTreeMap<GapKey, f64> = BTreeMap::new();
     let mut tcp: BTreeMap<GapKey, f64> = BTreeMap::new();
     for attempt in &complete {
-        if !compatible(&reference.manifest, &attempt.manifest) {
+        // Pairing spans arms, so it checks the shared environment only;
+        // requiring collection equality here would reject every
+        // multi-arm run directory, since each arm records a different
+        // collection schema.
+        if !same_environment(&reference.manifest, &attempt.manifest) {
             return Err(format!(
                 "{}: incompatible manifest excluded from pairing",
                 attempt.dir.display()

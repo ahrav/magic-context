@@ -108,6 +108,10 @@ fn write_complete(
     }
     let m = attempt.manifest_mut();
     m.histogram = Some(HistogramConfig::default());
+    // Arm-specific, as in real runs: pairing must span arms whose
+    // collection schemas differ, while merges within one arm require
+    // collection equality.
+    m.collection = Some(serde_json::json!({"fixture_arm": arm}));
     m.results = Some(results);
     attempt.finalize(State::Complete).unwrap();
 }
@@ -268,6 +272,7 @@ fn incompatible_manifests_never_merge_or_pair() {
             )
             .unwrap();
         attempt.manifest_mut().histogram = Some(HistogramConfig::default());
+        attempt.manifest_mut().collection = Some(serde_json::json!({"fixture_arm": ARM_ATOMIC}));
         attempt.manifest_mut().results = Some(serde_json::json!({"median_batch_rtt_ns": 700.0}));
         attempt.finalize(State::Complete).unwrap();
 
@@ -393,9 +398,9 @@ fn gap_join_requires_matching_block_and_pair() {
         .add_histogram("issue_to_terminal.hist", &small_histogram(&[20_000]))
         .unwrap();
     attempt.manifest_mut().histogram = Some(HistogramConfig::default());
+    attempt.manifest_mut().collection = Some(serde_json::json!({"fixture_arm": ARM_TCP_SERIAL}));
     attempt.manifest_mut().results = Some(serde_json::json!({"p50_ns": serial_p50(&[20_000])}));
     attempt.finalize(State::Complete).unwrap();
-
     let loaded = evidence::load_attempts(dir.path()).unwrap();
     assert!(evidence::paired_gaps(&loaded).unwrap().is_empty());
 }
