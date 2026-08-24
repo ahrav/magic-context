@@ -19,8 +19,15 @@ import {
     type FakePeerConnection,
     type PeerFrame,
     PeerFrameType,
+    type PeerNegotiateResponder,
 } from "./test-support/fake-peer";
-import { rejection, waitUntil, writeConnectionFile } from "./test-support/test-util";
+import {
+    candidateAutoResponder,
+    createFakePairedProvider,
+    rejection,
+    waitUntil,
+    writeConnectionFile,
+} from "./test-support/test-util";
 import type { BindIdentity, RouteTarget } from "./types";
 
 const IDENTITY: BindIdentity = {
@@ -844,6 +851,8 @@ describe("SubcClient facade", () => {
         const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
         expect(connectedEvent.daemonVer).toBe("fake-peer/0.0.1");
         expect(connectedEvent.pid).toBe(process.pid);
+        expect(connectedEvent.transport).toBe("tcp");
+        expect(connectedEvent.fallbackReason).toBeUndefined();
 
         const allowedKeys = new Set([
             "type",
@@ -856,6 +865,8 @@ describe("SubcClient facade", () => {
             "daemonVer",
             "pid",
             "reason",
+            "transport",
+            "fallbackReason",
         ]);
         for (const event of events) {
             expect(Object.isFrozen(event)).toBe(true);
@@ -947,7 +958,9 @@ describe("SubcClient facade", () => {
             "terminal",
             "missing_identity",
         );
-        expect(conn.frames.length).toBe(0);
+        // The setup negotiation is the only frame the peer ever saw.
+        expect(conn.frames.length).toBe(1);
+        expect(isControlOp(conn.frames[0] as PeerFrame, "transport.negotiate")).toBe(true);
     });
 });
 
@@ -1461,6 +1474,637 @@ describe("deadline-independent setup coalescing", () => {
         // Deterministic local failure: no backoff spin, no wire traffic.
         expect(sleeps).toBe(0);
         expect(conn.frames.filter(isRouteOpen).length).toBe(0);
+    });
+});
+
+describe("transport negotiation", () => {
+    const GRANT_TOKEN = "00112233445566778899aabbccddeeff";
+    const isNegotiate = (frame: PeerFrame): boolean => isControlOp(frame, "transport.negotiate");
+
+    function negotiateResponder(makeBody: (frame: PeerFrame) => unknown): PeerNegotiateResponder {
+        return (frame, conn) => {
+            const value = makeBody(frame);
+            const body = Buffer.isBuffer(value)
+                ? value
+                : Buffer.from(JSON.stringify(value), "utf8");
+            void conn.send({
+                ty: PeerFrameType.Response,
+                channel: 0,
+                epoch: 0,
+                corr: frame.corr,
+                body,
+            });
+        };
+    }
+
+    function grantBody(descriptor: Record<string, unknown> = {}): unknown {
+        return {
+            op: "transport.negotiate",
+            negotiation_version: 1,
+            selected: { transport: "fake.shm", capability_version: 1 },
+            activation_token: GRANT_TOKEN,
+            descriptor,
+        };
+    }
+
+    function errorGraphText(root: unknown): string {
+        const seen = new Set<object>();
+        const parts: string[] = [];
+        const visit = (value: unknown): void => {
+            if (typeof value === "string") {
+                parts.push(value);
+                return;
+            }
+            if (value === null || typeof value !== "object" || seen.has(value)) return;
+            seen.add(value);
+            if (value instanceof Uint8Array) {
+                const bytes = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+                parts.push(bytes.toString("latin1"), bytes.toString("utf8"));
+                return;
+            }
+            if (value instanceof Error) {
+                parts.push(value.name, value.message, value.stack ?? "");
+                // `cause` and AggregateError `errors` are non-enumerable, so
+                // the Object.values walk below never reaches them.
+                visit(value.cause);
+                visit((value as Partial<AggregateError>).errors);
+            }
+            for (const entry of Object.values(value)) visit(entry);
+        };
+        visit(root);
+        return parts.join("\n");
+    }
+
+    async function connectRejected(
+        overrides: Partial<SubcClientOptions> & { peer?: FakePeer } = {},
+    ): Promise<{ peer: FakePeer; error: unknown; filePath: string }> {
+        const peer = overrides.peer ?? (await startPeer());
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        const { peer: _peer, ...options } = overrides;
+        const error = await rejection(
+            SubcClient.connect({
+                connectionFile: filePath,
+                handshakeTimeoutMs: 500,
+                ...options,
+            }),
+        );
+        return { peer, error, filePath };
+    }
+
+    test("negotiation is the first frame at correlation 1 and gates publication", async () => {
+        const peer = await startPeer({ negotiate: "silent" });
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        let settled = false;
+        const connectPromise = SubcClient.connect({ connectionFile: filePath }).then((client) => {
+            settled = true;
+            clients.push(client);
+            return client;
+        });
+        connectPromise.catch(() => {});
+        const conn = await peer.waitForConnection();
+        await conn.authenticated;
+        const cursor = frameCursor(conn);
+        const negotiate = await cursor.next(isNegotiate);
+        expect(conn.frames[0]).toBe(negotiate);
+        expect(negotiate.corr).toBe(1n);
+        expect(negotiate.body.toString("utf8")).toBe(
+            '{"op":"transport.negotiate","negotiation_version":1,"offers":[{"transport":"tcp","capability_version":1}]}',
+        );
+        await delay(50);
+        expect(settled).toBe(false);
+        await sendResponse(conn, negotiate.corr, {
+            op: "transport.negotiate",
+            negotiation_version: 1,
+            selected: { transport: "tcp", capability_version: 1 },
+        });
+        const client = await connectPromise;
+        const catalogPromise = client.catalogList();
+        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
+        expect(catalogFrame.corr).toBe(2n);
+        await sendResponse(conn, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        expect(await catalogPromise).toEqual([]);
+    });
+
+    test("AE2: legacy unsupported_operation keeps the same TCP generation without a second negotiation", async () => {
+        const events: SubcDiagnosticsEvent[] = [];
+        const peer = await startPeer({ negotiate: "unsupported-op" });
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        const client = await SubcClient.connect({
+            connectionFile: filePath,
+            diagnostics: (event) => events.push(event),
+        });
+        clients.push(client);
+        const conn = await peer.waitForConnection();
+        const cursor = frameCursor(conn);
+        await cursor.next(isNegotiate);
+
+        const openPromise = client.routeOpen(TOOL_TARGET, IDENTITY);
+        const openFrame = await cursor.next(isRouteOpen);
+        await sendRouteOpenOk(conn, openFrame.corr, 7, 1);
+        const handle = await openPromise;
+        const requestPromise = client.request(handle, { ping: 1 });
+        const requestFrame = await cursor.next(isRoutedRequest(7));
+        await sendResponse(conn, requestFrame.corr, { pong: 1 }, 7, 1);
+        expect(await requestPromise).toEqual({ pong: 1 });
+
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isNegotiate).length).toBe(1);
+        const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
+        expect(connectedEvent.transport).toBe("tcp");
+    });
+
+    test("AE3: capability mismatch selects sticky TCP; reconnect runs one fresh flight", async () => {
+        const events: SubcDiagnosticsEvent[] = [];
+        const provider = createFakePairedProvider();
+        const peer = await startPeer({
+            negotiate: negotiateResponder(() => ({
+                op: "transport.negotiate",
+                negotiation_version: 1,
+                selected: { transport: "tcp", capability_version: 1 },
+                reason: "capability_version_mismatch",
+            })),
+        });
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        const client = await SubcClient.connect({
+            connectionFile: filePath,
+            transportProviders: [provider],
+            diagnostics: (event) => events.push(event),
+        });
+        clients.push(client);
+        const conn = await peer.waitForConnection();
+        const cursor = frameCursor(conn);
+        const negotiate = await cursor.next(isNegotiate);
+        expect(bodyJson(negotiate)).toEqual({
+            op: "transport.negotiate",
+            negotiation_version: 1,
+            offers: [
+                { transport: "fake.shm", capability_version: 1 },
+                { transport: "tcp", capability_version: 1 },
+            ],
+        });
+        const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
+        expect(connectedEvent.transport).toBe("tcp");
+        expect(connectedEvent.fallbackReason).toBe("capability_version_mismatch");
+
+        const catalogPromise = client.catalogList();
+        const catalogFrame = await cursor.next((f) => isControlOp(f, "catalog.list"));
+        await sendResponse(conn, catalogFrame.corr, { op: "catalog.list", modules: [] });
+        await catalogPromise;
+        expect(conn.frames.filter(isNegotiate).length).toBe(1);
+        expect(provider.connectCount).toBe(0);
+
+        conn.destroy();
+        await waitUntil(() => events.some((e) => e.type === "retired"));
+        const catalog2 = client.catalogList();
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        expect(conn2.clientAuthValid).toBe(true);
+        const cursor2 = frameCursor(conn2);
+        const catalogFrame2 = await cursor2.next((f) => isControlOp(f, "catalog.list"));
+        await sendResponse(conn2, catalogFrame2.corr, { op: "catalog.list", modules: [] });
+        expect(await catalog2).toEqual([]);
+        expect(conn2.frames.filter(isNegotiate).length).toBe(1);
+        expect(peer.connections.length).toBe(2);
+        expect(provider.connectCount).toBe(0);
+    });
+
+    test("concurrent callers share one connection and one negotiation", async () => {
+        const events: SubcDiagnosticsEvent[] = [];
+        const { client, conn, peer } = await connected({
+            identity: IDENTITY,
+            diagnostics: (event) => events.push(event),
+        });
+        conn.destroy();
+        await waitUntil(() => events.some((e) => e.type === "retired"));
+
+        const call1 = client.call("magic-context", "c1");
+        const call2 = client.call("magic-context", "c2");
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        const cursor2 = frameCursor(conn2);
+        const open = await cursor2.next(isRouteOpen);
+        await sendRouteOpenOk(conn2, open.corr, 7, 1);
+        const bodyA = await cursor2.next(isRoutedRequest(7));
+        const bodyB = await cursor2.next(isRoutedRequest(7));
+        await sendResponse(conn2, bodyA.corr, { ok: 1 }, 7, 1);
+        await sendResponse(conn2, bodyB.corr, { ok: 2 }, 7, 1);
+        await Promise.all([call1, call2]);
+        expect(peer.connections.length).toBe(2);
+        expect(conn2.frames.filter(isNegotiate).length).toBe(1);
+    });
+
+    test("AE4: injected grant activates at corr 1/2, applications start at 3, bootstrap sees nothing after the grant", async () => {
+        const provider = createFakePairedProvider();
+        const descriptor = { channel_hint: 42 };
+        provider.host.onFrame = candidateAutoResponder(GRANT_TOKEN, (frame, host) => {
+            if (frame.header.channel === 5) {
+                host.send(
+                    {
+                        ty: PeerFrameType.Response,
+                        flags: 0,
+                        channel: 5,
+                        epoch: 1,
+                        corr: frame.header.corr,
+                    },
+                    Buffer.from(JSON.stringify({ echoed: true }), "utf8"),
+                );
+                return;
+            }
+            const parsed = JSON.parse(Buffer.from(frame.body).toString("utf8")) as {
+                op?: string;
+            };
+            if (parsed.op === "catalog.list") {
+                host.respondJson(frame.header.corr, { op: "catalog.list", modules: [] });
+            } else if (parsed.op === "route.open") {
+                host.respondJson(frame.header.corr, {
+                    op: "route.open",
+                    route_channel: 5,
+                    route_epoch: 1,
+                });
+            }
+        });
+        const events: SubcDiagnosticsEvent[] = [];
+        const peer = await startPeer({
+            negotiate: negotiateResponder(() => grantBody(descriptor)),
+        });
+        const filePath = freshFilePath();
+        await writeConnectionFile(filePath, peer);
+        const client = await SubcClient.connect({
+            connectionFile: filePath,
+            transportProviders: [provider],
+            diagnostics: (event) => events.push(event),
+        });
+        clients.push(client);
+        const conn = await peer.waitForConnection();
+        expect(provider.connectCount).toBe(1);
+        expect(provider.lastDescriptor).toEqual(descriptor);
+
+        const host = provider.host;
+        expect(host.frames.map((f) => f.header.corr)).toEqual([1n, 2n]);
+        const connectedEvent = events.find((e) => e.type === "connected") as SubcDiagnosticsEvent;
+        expect(connectedEvent.transport).toBe("fake.shm");
+        // Promotion retires the bootstrap internally; that handoff must not
+        // surface as a client-level `retired` event next to `connected`.
+        expect(events.some((e) => e.type === "retired")).toBe(false);
+
+        expect(await client.catalogList()).toEqual([]);
+        expect(host.frames[2]?.header.corr).toBe(3n);
+        const handle = await client.routeOpen(TOOL_TARGET, IDENTITY);
+        expect(await client.request(handle, { hello: true })).toEqual({ echoed: true });
+
+        host.send({ ty: PeerFrameType.Ping, flags: 0, channel: 0, epoch: 0, corr: 99n });
+        await host.waitFor(() =>
+            host.frames.some((f) => f.header.ty === PeerFrameType.Pong && f.header.corr === 99n),
+        );
+
+        expect(conn.frames.length).toBe(1);
+        expect(isNegotiate(conn.frames[0] as PeerFrame)).toBe(true);
+        await conn.closed;
+
+        await client.closeAsync();
+        await host.waitFor(() =>
+            host.frames.some(
+                (f) => f.header.ty === PeerFrameType.Goodbye && f.header.channel === 0,
+            ),
+        );
+        const corrs = host.frames
+            .filter((f) => f.header.ty === PeerFrameType.Request)
+            .map((f) => f.header.corr);
+        expect(corrs.slice(0, 2)).toEqual([1n, 2n]);
+        expect(corrs.slice(2).every((corr) => corr >= 3n)).toBe(true);
+    });
+
+    const decodeRejections: [string, (frame: PeerFrame) => unknown][] = [
+        [
+            "a selection without a selected entry",
+            () => ({ op: "transport.negotiate", negotiation_version: 1 }),
+        ],
+        [
+            "an unoffered selection",
+            () => ({
+                op: "transport.negotiate",
+                negotiation_version: 1,
+                selected: { transport: "tcp", capability_version: 9 },
+            }),
+        ],
+        [
+            "a recursive duplicate key inside the descriptor",
+            () =>
+                Buffer.from(
+                    '{"op":"transport.negotiate","negotiation_version":1,' +
+                        '"selected":{"transport":"fake.shm","capability_version":1},' +
+                        `"activation_token":"${GRANT_TOKEN}","descriptor":{"a":1,"a":2}}`,
+                    "utf8",
+                ),
+        ],
+        [
+            "an out-of-vocabulary fallback reason",
+            () => ({
+                op: "transport.negotiate",
+                negotiation_version: 1,
+                selected: { transport: "tcp", capability_version: 1 },
+                reason: "reason-sentinel-4c1d",
+            }),
+        ],
+        [
+            "a malformed activation token",
+            () => ({
+                op: "transport.negotiate",
+                negotiation_version: 1,
+                selected: { transport: "fake.shm", capability_version: 1 },
+                activation_token: "NOT-HEX",
+                descriptor: {},
+            }),
+        ],
+    ];
+    for (const [name, makeBody] of decodeRejections) {
+        test(`AE5: ${name} rejects connect fail-closed without TCP resumption`, async () => {
+            const provider = createFakePairedProvider();
+            const peer = await startPeer({ negotiate: negotiateResponder(makeBody) });
+            const { error } = await connectRejected({ peer, transportProviders: [provider] });
+            const failure = expectCallError(error, "terminal", "negotiation_failed");
+            expect(errorGraphText(failure)).not.toContain("sentinel");
+            const conn = peer.connections[0] as FakePeerConnection;
+            await conn.closed;
+            expect(peer.connections.length).toBe(1);
+            expect(conn.frames.filter(isNegotiate).length).toBe(1);
+            expect(provider.connectCount).toBe(0);
+        });
+    }
+
+    test("KTD6: a non-legacy terminal error rejects connect fail-closed without TCP fallback", async () => {
+        const events: SubcDiagnosticsEvent[] = [];
+        const peer = await startPeer({
+            negotiate: (frame, conn) => void sendErrorBody(conn, frame.corr, "internal_error"),
+        });
+        const { error } = await connectRejected({
+            peer,
+            diagnostics: (event) => events.push(event),
+        });
+        // The host's raw error body is peer-controlled; the caller sees a
+        // bounded negotiation failure, never the wire message (R14).
+        expectCallError(error, "terminal", "negotiation_failed");
+        await waitUntil(() =>
+            events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
+        );
+        expect(events.some((e) => e.type === "connected")).toBe(false);
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        await delay(50);
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isNegotiate).length).toBe(1);
+    });
+
+    test("KTD6: a canonical server_busy negotiation terminal fails closed without TCP fallback", async () => {
+        // Wire doc §7.7.3: the exact legacy `unsupported_operation` terminal
+        // is the only Error-based continuation evidence. A compliant
+        // negotiation-aware host may reject any control request before
+        // dispatch under load, so `server_busy` is not legacy proof.
+        const peer = await startPeer({
+            negotiate: (frame, conn) => void sendErrorBody(conn, frame.corr, "server_busy"),
+        });
+        const { error } = await connectRejected({ peer });
+        expectCallError(error, "terminal", "negotiation_failed");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isNegotiate).length).toBe(1);
+    });
+
+    test("KTD6: a noncanonical unsupported_operation terminal fails closed without TCP fallback", async () => {
+        // Extra fields disqualify the terminal as legacy evidence: only the
+        // byte-exact `{code, message}` Error body may select TCP fallback.
+        const peer = await startPeer({
+            negotiate: (frame, conn) =>
+                void conn.send({
+                    ty: PeerFrameType.Error,
+                    channel: 0,
+                    epoch: 0,
+                    corr: frame.corr,
+                    body: jsonBody({
+                        code: "unsupported_operation",
+                        message: "unknown control operation",
+                        detail: "extra",
+                    }),
+                }),
+        });
+        const { error } = await connectRejected({ peer });
+        expectCallError(error, "terminal", "negotiation_failed");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+        expect(conn.frames.filter(isNegotiate).length).toBe(1);
+    });
+
+    test("AE5: negotiation timeout rejects connect and closes the channel", async () => {
+        const peer = await startPeer({ negotiate: "silent" });
+        const { error } = await connectRejected({ peer, handshakeTimeoutMs: 300 });
+        expectCallError(error, "outcome_unknown", "deadline_expired");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("AE5: a host-rejected activation closes candidate and bootstrap", async () => {
+        const provider = createFakePairedProvider();
+        provider.host.onFrame = candidateAutoResponder("ffffffffffffffffffffffffffffffff");
+        const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody()) });
+        const { error } = await connectRejected({ peer, transportProviders: [provider] });
+        // The host's Error terminal is peer-controlled: the caller sees the
+        // bounded negotiation failure, never the wire code (R14).
+        expectCallError(error, "terminal", "negotiation_failed");
+        expect(provider.host.channelClosed).toBe(true);
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("AE5: a provider start() that never settles cannot strand candidate setup", async () => {
+        const provider = createFakePairedProvider({ startHang: true });
+        const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody({})) });
+        const { error } = await connectRejected({
+            peer,
+            transportProviders: [provider],
+            handshakeTimeoutMs: 300,
+        });
+        // The generation's setup timer retires the candidate; the raced
+        // start observes retirement instead of stranding activateCandidate
+        // on a promise the provider never settles, and the surfaced error
+        // is the retirement cause (the setup timer's timeout).
+        expect((error as Error).name).toBe("SocketTimeoutError");
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("AE5: an invalid commit response closes candidate and bootstrap", async () => {
+        const provider = createFakePairedProvider();
+        provider.host.onFrame = (frame, host) => {
+            if (frame.header.ty !== PeerFrameType.Request) return;
+            const parsed = JSON.parse(Buffer.from(frame.body).toString("utf8")) as {
+                op?: string;
+            };
+            if (parsed.op === "transport.activate") {
+                host.respondJson(frame.header.corr, {
+                    op: "transport.activate",
+                    negotiation_version: 1,
+                });
+            } else if (parsed.op === "transport.commit") {
+                host.respondJson(frame.header.corr, {
+                    op: "transport.commit",
+                    negotiation_version: 1,
+                    extra: "field-sentinel-2b8e",
+                });
+            }
+        };
+        const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody()) });
+        const { error } = await connectRejected({ peer, transportProviders: [provider] });
+        const failure = expectCallError(error, "terminal", "negotiation_failed");
+        expect(errorGraphText(failure)).not.toContain("sentinel");
+        expect(provider.host.channelClosed).toBe(true);
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("AE5: candidate loss during activation closes both channels", async () => {
+        const provider = createFakePairedProvider();
+        provider.host.onFrame = (frame, host) => {
+            if (frame.header.ty === PeerFrameType.Request) {
+                host.close(new Error("loss-sentinel-6a9f"));
+            }
+        };
+        const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody()) });
+        const { error } = await connectRejected({ peer, transportProviders: [provider] });
+        expect(errorGraphText(error)).not.toContain("sentinel");
+        expect(provider.host.channelClosed).toBe(true);
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("AE5/R14: provider failures and grant data never reach error graphs or diagnostics", async () => {
+        const provider = createFakePairedProvider({
+            startError: new Error("provider-sentinel-9b2c"),
+        });
+        const events: SubcDiagnosticsEvent[] = [];
+        const peer = await startPeer({
+            negotiate: negotiateResponder(() => grantBody({ secret: "descriptor-sentinel-7f3a" })),
+        });
+        const { error } = await connectRejected({
+            peer,
+            transportProviders: [provider],
+            diagnostics: (event) => events.push(event),
+        });
+        expect(provider.connectCount).toBe(1);
+        const graph = errorGraphText(error);
+        expect(graph).not.toContain("sentinel");
+        expect(graph).not.toContain(GRANT_TOKEN);
+        const serialized = JSON.stringify(events, (_k, v) => (typeof v === "bigint" ? `${v}` : v));
+        expect(serialized).not.toContain("sentinel");
+        expect(serialized).not.toContain(GRANT_TOKEN);
+    });
+
+    test("AE5/R14: a provider whose connect() throws still retires the bootstrap", async () => {
+        // The generation constructor invokes the provider synchronously, so
+        // this failure surfaces before candidate activation begins; the
+        // authenticated bootstrap must not be left alive.
+        const provider = createFakePairedProvider({
+            connectError: new Error("provider-sentinel-3d1e"),
+        });
+        const events: SubcDiagnosticsEvent[] = [];
+        const peer = await startPeer({
+            negotiate: negotiateResponder(() => grantBody({})),
+        });
+        const { error } = await connectRejected({
+            peer,
+            transportProviders: [provider],
+            diagnostics: (event) => events.push(event),
+        });
+        expect(provider.connectCount).toBe(1);
+        expect(errorGraphText(error)).not.toContain("sentinel");
+        await waitUntil(() =>
+            events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
+        );
+        const conn = peer.connections[0] as FakePeerConnection;
+        await conn.closed;
+        expect(peer.connections.length).toBe(1);
+    });
+
+    test("AE7: a base wire mismatch fails before dial and never invokes the provider registry", async () => {
+        const provider = createFakePairedProvider();
+        const peer = await startPeer();
+        const filePath = freshFilePath();
+        const json = JSON.stringify({
+            schema: 1,
+            wire_version: 3,
+            endpoints: [{ host: "127.0.0.1", port: peer.port }],
+            key: Array.from(peer.key),
+            daemon_id: Array.from(peer.daemonId),
+            pid: process.pid,
+            daemon_ver: "fake-peer/0.0.1",
+        });
+        await writeFile(filePath, json, { mode: 0o600 });
+        const error = await rejection(
+            SubcClient.connect({ connectionFile: filePath, transportProviders: [provider] }),
+        );
+        expect((error as Error).name).toBe("ConnectionFileError");
+        await delay(30);
+        expect(peer.connections.length).toBe(0);
+        expect(provider.connectCount).toBe(0);
+    });
+
+    test("owner close during negotiation exposes no connection and launches no replacement", async () => {
+        const events: SubcDiagnosticsEvent[] = [];
+        const { client, conn, peer } = await connected({
+            handshakeTimeoutMs: 400,
+            diagnostics: (event) => events.push(event),
+        });
+        conn.destroy();
+        await waitUntil(() => events.some((e) => e.type === "retired"));
+        peer.negotiateMode = "silent";
+
+        const pendingCatalog = rejection(client.catalogList());
+        const conn2 = await nthConnection(peer, 2);
+        await conn2.authenticated;
+        const cursor2 = frameCursor(conn2);
+        await cursor2.next(isNegotiate);
+        const closePromise = client.closeAsync();
+        await pendingCatalog;
+        await closePromise;
+        await conn2.closed;
+        await rejection(client.catalogList());
+        await delay(100);
+        expect(peer.connections.length).toBe(2);
+    });
+
+    test("owner close during activation reaps candidate and bootstrap without replacement", async () => {
+        const provider = createFakePairedProvider();
+        provider.host.onFrame = () => {};
+        const events: SubcDiagnosticsEvent[] = [];
+        const { client, conn, peer } = await connected({
+            handshakeTimeoutMs: 400,
+            transportProviders: [provider],
+            diagnostics: (event) => events.push(event),
+        });
+        conn.destroy();
+        await waitUntil(() => events.some((e) => e.type === "retired"));
+        peer.negotiateMode = negotiateResponder(() => grantBody());
+
+        const pendingCatalog = rejection(client.catalogList());
+        await provider.host.waitFor(() => provider.host.frames.length >= 1);
+        const closePromise = client.closeAsync();
+        await pendingCatalog;
+        await closePromise;
+        expect(provider.host.channelClosed).toBe(true);
+        const conn2 = peer.connections[1] as FakePeerConnection;
+        await conn2.closed;
+        await delay(100);
+        expect(peer.connections.length).toBe(2);
     });
 });
 

@@ -37,6 +37,14 @@ export class SubcCallError extends Error {
     /** The facade attaches `cleanup` when a caller abort produces this error. */
     cleanup?: Promise<void>;
 
+    /**
+     * Raw wire Error terminal (body plus frame flags) for callers that must
+     * validate the exact terminal shape — negotiation's legacy-fallback
+     * classification accepts only a byte-exact `unsupported_operation`
+     * terminal, which the parsed `code` alone cannot prove.
+     */
+    errorTerminal?: { body: Uint8Array; flags: number; streamed: boolean };
+
     constructor(
         readonly kind: SubcCallErrorKind,
         message: string,

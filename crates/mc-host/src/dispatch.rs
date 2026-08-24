@@ -17,14 +17,13 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::connection::{GenerationCore, PendingEntry, PendingKey};
 use crate::control::{CODE_CANCELLED, CODE_INTERNAL_ERROR, CODE_SERVER_BUSY, CODE_UNKNOWN_CHANNEL};
+use crate::frame_channel::{InboundFrame, OutboundFrame};
 use crate::handler::{
     McHostHandler, OutputBuffer, RequestCtx, RequestOutcome, RouteHandle, StreamClosed,
 };
 use crate::routing::{BindInstall, CloseDecision};
 use crate::runtime::HostShared;
-use crate::wire::{
-    encode_owned_frame, pure_header_flags, response_flags, FrameId, InboundFrame, OutboundFrame,
-};
+use crate::wire::{encode_owned_frame, pure_header_flags, response_flags, FrameId};
 
 /// First-terminal-wins arbiter for one correlation.
 ///

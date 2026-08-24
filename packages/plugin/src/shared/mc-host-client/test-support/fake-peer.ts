@@ -98,11 +98,25 @@ function hmacProof(
 
 export type PeerAuthMode = "accept" | "wrong-proof" | "malformed" | "stall" | "destroy-on-hello";
 
+/** The callback controls the response to one decoded `transport.negotiate` request. */
+export type PeerNegotiateResponder = (frame: PeerFrame, connection: FakePeerConnection) => void;
+
+/**
+ * The peer uses this mode to answer a client `transport.negotiate` request.
+ *
+ * - `echo-tcp` (default): respond with TCP and the offered TCP capability
+ *   version, or `1` when absent, with no fallback reason.
+ * - `unsupported-op`: send an Error frame with code `unsupported_operation`.
+ * - `silent`: record the frame without responding.
+ */
+export type PeerNegotiateMode = "echo-tcp" | "unsupported-op" | "silent" | PeerNegotiateResponder;
+
 export interface FakePeerOptions {
     authMode?: PeerAuthMode;
     key?: Buffer;
     daemonId?: Buffer;
     daemonVer?: string;
+    negotiate?: PeerNegotiateMode;
 }
 
 export interface PeerSendOptions {
@@ -154,6 +168,8 @@ export class FakePeerConnection {
             daemonId: Buffer;
             /** Sampled at ServerHello time so tests can flip it per dial. */
             helloTrailer: () => Buffer | null;
+            /** Read once per decoded `transport.negotiate` request. */
+            negotiate: () => PeerNegotiateMode;
         },
     ) {
         this.socket = socket;
@@ -219,8 +235,64 @@ export class FakePeerConnection {
             };
             this.buffer = this.buffer.subarray(PEER_HEADER_LEN + len);
             this.frames.push(frame);
+            this.maybeServeNegotiate(frame);
             this.notifyWaiters();
         }
+    }
+
+    /** Parses request bodies with plain `JSON.parse`, never the production client decoder. */
+    private maybeServeNegotiate(frame: PeerFrame): void {
+        if (frame.ty !== PeerFrameType.Request || frame.channel !== 0) return;
+        let parsed: { op?: unknown; offers?: unknown } | undefined;
+        try {
+            parsed = JSON.parse(frame.body.toString("utf8")) as { op?: unknown; offers?: unknown };
+        } catch {
+            return;
+        }
+        if (parsed?.op !== "transport.negotiate") return;
+        const mode = this.options.negotiate();
+        if (mode === "silent") return;
+        if (typeof mode === "function") {
+            mode(frame, this);
+            return;
+        }
+        if (mode === "unsupported-op") {
+            this.socket.write(
+                encodePeerFrame({
+                    ty: PeerFrameType.Error,
+                    corr: frame.corr,
+                    body: Buffer.from(
+                        JSON.stringify({
+                            code: "unsupported_operation",
+                            message: "unknown control operation",
+                        }),
+                        "utf8",
+                    ),
+                }),
+            );
+            return;
+        }
+        const offers = Array.isArray(parsed.offers) ? parsed.offers : [];
+        const tcp = offers.find(
+            (offer) => (offer as { transport?: unknown })?.transport === "tcp",
+        ) as { capability_version?: number } | undefined;
+        this.socket.write(
+            encodePeerFrame({
+                ty: PeerFrameType.Response,
+                corr: frame.corr,
+                body: Buffer.from(
+                    JSON.stringify({
+                        op: "transport.negotiate",
+                        negotiation_version: 1,
+                        selected: {
+                            transport: "tcp",
+                            capability_version: tcp?.capability_version ?? 1,
+                        },
+                    }),
+                    "utf8",
+                ),
+            }),
+        );
     }
 
     private takeAuthMessage(): unknown | undefined {
@@ -385,6 +457,19 @@ export class FakePeerConnection {
         this.socket.destroy();
     }
 
+    /**
+     * Deterministic RST toward the client. `destroy()` without an error can
+     * close with an ordinary FIN, which the client reads as `eof`; tests
+     * asserting a socket-failure classification need a real reset. Falls
+     * back to `destroy()` on runtimes without `resetAndDestroy`.
+     */
+    reset(): void {
+        this.stage = "dead";
+        const socket = this.socket as Socket & { resetAndDestroy?: () => void };
+        if (typeof socket.resetAndDestroy === "function") socket.resetAndDestroy();
+        else socket.destroy();
+    }
+
     /** Orderly FIN toward the client. */
     end(): void {
         this.socket.end();
@@ -403,6 +488,7 @@ export class FakePeer {
      * enable it after an initial clean connection.
      */
     helloTrailer: Buffer | null = null;
+    negotiateMode: PeerNegotiateMode;
 
     private readonly server: Server;
     private readonly connectionWaiters: ((connection: FakePeerConnection) => void)[] = [];
@@ -415,12 +501,14 @@ export class FakePeer {
         this.server = server;
         this.key = options.key ?? randomBytes(32);
         this.daemonId = options.daemonId ?? randomBytes(16);
+        this.negotiateMode = options.negotiate ?? "echo-tcp";
         const connectionOptions = {
             authMode: options.authMode ?? ("accept" as PeerAuthMode),
             daemonVer: options.daemonVer ?? "fake-peer/0.0.1",
             key: this.key,
             daemonId: this.daemonId,
             helloTrailer: () => this.helloTrailer,
+            negotiate: () => this.negotiateMode,
         };
         server.on("connection", (socket: Socket) => {
             const connection = new FakePeerConnection(socket, connectionOptions);

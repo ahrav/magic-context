@@ -18,17 +18,27 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::control::{parse_control, ControlAction, CODE_INVALID_CONTROL_REQUEST};
 use crate::dispatch::{
-    close_generation, dispatch_request, emit_error_terminal, handle_cancel, open_route,
+    close_generation, dispatch_request, emit_error_terminal, emit_frame, handle_cancel, open_route,
+};
+use crate::frame_channel::{
+    BoxedReceiver, FrameReceiver, FrameSender, InboundEvent, OutboundFrame, ReadClose,
+    RejectedFrame,
 };
 use crate::handler::McHostHandler;
 use crate::routing::CloseDecision;
 use crate::runtime::HostShared;
-use crate::wire::{
-    drain_declared_body, encode_owned_frame, pure_header_flags, read_frame, FrameId, OutboundFrame,
-    ReadClose, ReadEvent, WriterHandle,
+use crate::tcp_frame_channel::TcpFrameChannel;
+use crate::transport_negotiation::{
+    activate_response_json, commit_response_json, decode_activate_request, decode_commit_request,
+    encode_negotiate_response, FallbackReason, NegotiateRequest, NegotiateResponse,
+    NegotiationError, SelectedTransport, ACTIVATION_CORRELATION, COMMIT_CORRELATION,
+    NEGOTIATION_VERSION, TRANSPORT_TCP,
 };
-
-const READ_BUFFER_BYTES: usize = 64 * 1024;
+use crate::transport_provider::{
+    fresh_activation_token, Candidate, GrantBinding, GrantRecord, InjectedProvider,
+    PreparedCandidate, ProviderContext, TCP_CAPABILITY_VERSION,
+};
+use crate::wire::{encode_owned_frame, pure_header_flags, response_flags, FrameId};
 
 /// Key of one pending consumer request: (channel, epoch, correlation).
 /// Direction is implied — this map holds only consumer-originated requests;
@@ -74,6 +84,14 @@ pub struct PendingEntry {
     pub settlement: Arc<crate::dispatch::Settlement>,
 }
 
+/// A running liveness loop and the token that stops only it, so a grant can
+/// stop and join bootstrap Pings without retiring the rest of the
+/// generation.
+pub struct LivenessHandle {
+    pub stop: CancellationToken,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
 /// Generation-owned state shared with the registry and dispatch tasks.
 pub struct GenerationCore {
     pub id: u64,
@@ -89,7 +107,7 @@ pub struct GenerationCore {
     /// Releases the connection owner after shutdown has queued Goodbye, so it
     /// cannot tear down the writer while the producer fence is draining.
     pub shutdown_complete: CancellationToken,
-    pub writer: WriterHandle,
+    pub writer: FrameSender,
     /// channel -> epoch for routes this generation may dispatch on. Lookup
     /// only; the registry owns insertion at bind and removal at close.
     pub membership: Mutex<HashMap<u16, u32>>,
@@ -101,6 +119,9 @@ pub struct GenerationCore {
     /// unbounded tasks through them.
     pub busy_rejects: Arc<tokio::sync::Semaphore>,
     pub next_ping_corr: std::sync::atomic::AtomicU64,
+    /// The generation's liveness loop, if one runs. Taken by the grant path
+    /// to stop and join it before publishing a selection.
+    pub liveness: Mutex<Option<LivenessHandle>>,
 }
 
 /// Runs one accepted socket to completion: authenticate, promote into
@@ -109,6 +130,15 @@ pub struct GenerationCore {
 /// `handshake_permit` is held from before the first byte is read; it releases
 /// on every exit path once authenticated capacity is acquired or the socket
 /// dies (protocol §5.1).
+///
+/// This task is the connection's setup owner: it holds the authenticated
+/// connection permit for the whole setup (bounding prepared candidates by
+/// `max_connections`), owns the bootstrap and candidate cancellation roots,
+/// keeps the generation visible to shutdown through the connection registry,
+/// and reaps the unpromoted candidate and its I/O task. A TCP selection
+/// (explicit or by omission) keeps serving the bootstrap channel directly; a
+/// committed grant retires the bootstrap and serves the promoted candidate
+/// with a fresh generation whose application correlations start at 3.
 pub async fn run_connection<H: McHostHandler>(
     shared: Arc<HostShared<H>>,
     mut stream: TcpStream,
@@ -145,22 +175,75 @@ pub async fn run_connection<H: McHostHandler>(
     let gen_token = CancellationToken::new();
     let read_cancel = gen_token.child_token();
     let (read_half, write_half) = stream.into_split();
-    let read_half = tokio::io::BufReader::with_capacity(READ_BUFFER_BYTES, read_half);
-    let (writer, writer_task) = crate::wire::spawn_writer_tracked(
+    let (writer, channel, channel_io) = TcpFrameChannel::start(
+        read_half,
         write_half,
         shared.limits.writer_queue_frames,
-        gen_token.clone(),
         shared.timing.frame_deadline,
-        &shared.tracker,
+        shared.ingress_budget.clone(),
+        gen_token.clone(),
+        read_cancel.clone(),
     );
-    let mut writer_task = AbortOnDropHandle::new(writer_task);
-    // Retained past `gen`: the writer must be told to stop even when a
-    // handler still holds a sender clone through a retained RequestCtx.
-    let writer_finish = writer.clone();
+    let writer_task = AbortOnDropHandle::new(shared.tracker.spawn(channel_io));
+    let gen = new_generation(&shared, gen_token, read_cancel, writer);
+    let handoff = serve_generation(
+        &shared,
+        gen,
+        channel,
+        writer_task,
+        ConnectionSetup::bootstrap(),
+    )
+    .await;
 
-    let gen = Arc::new(GenerationCore {
+    let Some(handoff) = handoff else {
+        return;
+    };
+    let io_task = handoff.io.lock().expect("candidate io lock").take();
+    let promoted = handoff
+        .promoted
+        .lock()
+        .expect("candidate promotion lock")
+        .take();
+    match promoted {
+        Some(receiver) => {
+            let io_task =
+                AbortOnDropHandle::new(io_task.expect("candidate io is spawned at grant"));
+            let gen = new_generation(
+                &shared,
+                handoff.root.clone(),
+                handoff.read_cancel.clone(),
+                handoff.sender.clone(),
+            );
+            serve_generation(
+                &shared,
+                gen,
+                receiver,
+                io_task,
+                ConnectionSetup::provider_active(),
+            )
+            .await;
+        }
+        None => {
+            // The candidate never promoted: reap it here so the setup owner
+            // — not the provider — is what guarantees resource release.
+            handoff.sender.discard();
+            handoff.root.cancel();
+            if let Some(io) = io_task {
+                let _ = io.await;
+            }
+        }
+    }
+}
+
+fn new_generation<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    token: CancellationToken,
+    read_cancel: CancellationToken,
+    writer: FrameSender,
+) -> Arc<GenerationCore> {
+    Arc::new(GenerationCore {
         id: shared.gen_counter.fetch_add(1, Ordering::SeqCst),
-        token: gen_token,
+        token,
         read_cancel,
         read_tasks: TaskTracker::new(),
         shutdown_complete: CancellationToken::new(),
@@ -170,13 +253,29 @@ pub async fn run_connection<H: McHostHandler>(
         pings: Mutex::new(HashMap::new()),
         busy_rejects: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BUSY_REJECTS)),
         next_ping_corr: std::sync::atomic::AtomicU64::new(1),
-    });
+        liveness: Mutex::new(None),
+    })
+}
+
+/// Serves one finalized frame channel to retirement: register, read, drain,
+/// close. Returns the candidate handoff if the read loop granted one, so the
+/// caller can promote or reap it after this channel is fully torn down.
+async fn serve_generation<H: McHostHandler, C: FrameReceiver>(
+    shared: &Arc<HostShared<H>>,
+    gen: Arc<GenerationCore>,
+    channel: C,
+    mut io_task: AbortOnDropHandle<()>,
+    mut setup: ConnectionSetup,
+) -> Option<Arc<CandidateHandoff>> {
+    // Retained past `gen`: the writer must be told to stop even when a
+    // handler still holds a sender clone through a retained RequestCtx.
+    let writer_finish = gen.writer.clone();
     // Register the read loop before publishing the generation. Its tracker
     // token prevents shutdown from observing an empty producer set between
     // insertion and the first read-loop poll.
     let read_task = gen
         .read_tasks
-        .track_future(read_loop(&shared, &gen, read_half));
+        .track_future(read_loop(shared, &gen, channel, &mut setup));
     {
         let mut connections = shared.connections.lock().expect("connections lock");
         // The token check closes the window between a committed
@@ -184,17 +283,22 @@ pub async fn run_connection<H: McHostHandler>(
         // sequence storing `draining`: a socket accepted just before the
         // commit must not register a new generation after it.
         if shared.draining.load(Ordering::SeqCst) || shared.shutdown.is_cancelled() {
-            return;
+            return None;
         }
         connections.insert(gen.id, Arc::clone(&gen));
     }
 
-    if let Some(liveness) = shared.liveness.clone() {
+    if let Some(policy) = shared.liveness.clone() {
+        // A child of `read_cancel` so retirement still stops the loop; the
+        // grant path cancels only this child to stop Pings alone.
+        let stop = gen.read_cancel.child_token();
         let gen_ping = Arc::clone(&gen);
-        shared.spawn_tracked(
-            gen.read_tasks
-                .track_future(liveness_loop(gen_ping, liveness)),
-        );
+        let task = shared.spawn_tracked(gen.read_tasks.track_future(liveness_loop(
+            gen_ping,
+            policy,
+            stop.clone(),
+        )));
+        *gen.liveness.lock().expect("liveness lock") = Some(LivenessHandle { stop, task });
     }
 
     let read_exit = read_task.await;
@@ -238,7 +342,11 @@ pub async fn run_connection<H: McHostHandler>(
         gen.shutdown_complete.cancelled().await;
     }
 
-    close_generation(&shared, &gen, begun_closes).await;
+    close_generation(shared, &gen, begun_closes).await;
+    // The candidate driver (tracked in `read_tasks`, so already joined) is
+    // the only writer of the promotion slot; taking the handoff after the
+    // wait is what makes the transfer race-free.
+    let handoff = setup.handoff.take();
     drop(gen);
     // Every legitimate producer is done (read tasks joined, routes closed,
     // generation dropped); any surviving sender is an inert handler-held
@@ -250,7 +358,8 @@ pub async fn run_connection<H: McHostHandler>(
     // the old `route_close_budget` cap could abort a drain that graceful
     // shutdown promised to flush, while a stalled peer still cannot hold the
     // join beyond the writer's self-retirement.
-    let _ = (&mut writer_task).await;
+    let _ = (&mut io_task).await;
+    handoff
 }
 
 /// Why the read side of a connection stopped. Only a host-cancelled read may
@@ -270,58 +379,77 @@ enum ReadExit {
 }
 
 /// Serves validated frames until close. Returning retires the generation.
-async fn read_loop<H: McHostHandler>(
+async fn read_loop<H: McHostHandler, C: FrameReceiver>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    mut reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut channel: C,
+    setup: &mut ConnectionSetup,
 ) -> ReadExit {
     // Highest consumer Request correlation seen; any non-increasing Request
-    // closes the generation before dispatch (protocol §8.3, V44).
-    let mut watermark: u64 = 0;
+    // closes the generation before dispatch (protocol §8.3, V44). A promoted
+    // candidate starts at 2 so application correlations begin at 3 (§7.7.4).
+    let mut watermark: u64 = setup.initial_watermark;
+    // Written-signal of the most recent rejected-frame terminal: if the
+    // transport's realignment then fails, the close fences exactly that
+    // authoritative frame (protocol §7.1).
+    let mut reject_written: Option<tokio::sync::oneshot::Receiver<()>> = None;
 
     loop {
-        let event = match read_frame(
-            &mut reader,
-            shared.timing.frame_deadline,
-            &shared.ingress_budget,
-            &gen.read_cancel,
-        )
-        .await
-        {
+        let event = match channel.recv().await {
             Ok(event) => event,
             Err(ReadClose::Cancelled) => return ReadExit::HostCancelled,
+            Err(ReadClose::RejectedDrainFailed) => {
+                // The queued early terminal is authoritative for its
+                // correlation even when the declared body then fails
+                // (protocol §7.1): the close stays silent otherwise, but
+                // that one frame must survive to flush.
+                return match reject_written.take() {
+                    Some(terminal_rx) => ReadExit::PeerKeepQueue(terminal_rx),
+                    None => ReadExit::Peer,
+                };
+            }
             Err(ReadClose::CleanEof) | Err(ReadClose::Corrupt(_)) | Err(ReadClose::Io(_)) => {
                 return ReadExit::Peer
             }
         };
 
         match event {
-            ReadEvent::OversizeControl { header, deadline } => {
+            InboundEvent::Rejected(RejectedFrame { corr }) => {
                 // The correlation is trustworthy from the header alone; the
-                // early terminal is authoritative even if the drain then fails
-                // (protocol §7.1). The watermark still applies first. Emitted
-                // off-reader (bounded) like the other no-permit rejections so
-                // contended egress cannot block this reader from a queued
-                // Pong while the declared body waits to be drained.
-                if header.corr <= watermark {
+                // early terminal is authoritative even if the transport's
+                // drain then fails (protocol §7.1). The watermark still
+                // applies first. Emitted off-reader (bounded) like the other
+                // no-permit rejections so contended egress cannot block this
+                // reader from a queued Pong while the declared body waits to
+                // be drained.
+                if corr <= watermark {
                     return ReadExit::Peer;
                 }
-                watermark = header.corr;
+                watermark = corr;
+                // An over-cap channel-0 Request is still a consumer request:
+                // it commits the generation to TCP, and during candidate
+                // setup it is a protocol failure (protocol §7.7.5), exactly
+                // like the requests that pass the cap.
+                if commit_transport(setup).is_err() {
+                    return ReadExit::Peer;
+                }
                 // Off-reader like the other rejections (contended egress
                 // must not block this reader from a queued Pong), but with a
-                // written-signal: if the body drain below fails, the close
-                // fences exactly this authoritative frame (protocol §7.1).
-                // Oversized-control frames consume no pending permit, so the
-                // per-generation rejection semaphore is what bounds these
-                // emissions. Acquired BEFORE spawning: past the bound a peer
-                // streaming oversize bodies would otherwise accumulate tasks,
-                // oneshots, and captured Arcs, so exhaustion retires instead.
+                // written-signal: if the transport's body drain on the next
+                // `recv` fails, the close fences exactly this authoritative
+                // frame (protocol §7.1). Rejected frames consume no pending
+                // permit, so the per-generation rejection semaphore is what
+                // bounds these emissions. Acquired BEFORE spawning: past the
+                // bound a peer streaming oversize bodies would otherwise
+                // accumulate tasks, oneshots, and captured Arcs, so
+                // exhaustion retires instead.
                 let Ok(reject_permit) = gen.busy_rejects.clone().try_acquire_owned() else {
                     gen.token.cancel();
                     gen.writer.discard();
                     return ReadExit::Peer;
                 };
                 let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+                reject_written = Some(terminal_rx);
                 let shared_task = Arc::clone(shared);
                 let gen_task = Arc::clone(gen);
                 shared.spawn_tracked(gen.read_tasks.track_future(async move {
@@ -329,25 +457,15 @@ async fn read_loop<H: McHostHandler>(
                     crate::dispatch::emit_authoritative_rejection(
                         &shared_task,
                         &gen_task,
-                        FrameId::control(header.corr),
+                        FrameId::control(corr),
                         CODE_INVALID_CONTROL_REQUEST,
                         "control body exceeds profile cap",
                         terminal_tx,
                     )
                     .await;
                 }));
-                if drain_declared_body(&mut reader, header.len, deadline, &gen.read_cancel)
-                    .await
-                    .is_err()
-                {
-                    // The queued early terminal is authoritative for its
-                    // correlation even when the declared body then fails
-                    // (protocol §7.1): the close stays silent otherwise, but
-                    // that one frame must survive to flush.
-                    return ReadExit::PeerKeepQueue(terminal_rx);
-                }
             }
-            ReadEvent::Frame(frame) => {
+            InboundEvent::Frame(frame) => {
                 let header = frame.header;
                 match header.ty {
                     FrameType::Request => {
@@ -356,9 +474,19 @@ async fn read_loop<H: McHostHandler>(
                         }
                         watermark = header.corr;
                         if header.channel == 0 {
-                            handle_control(shared, gen, frame).await;
+                            match handle_control(shared, gen, frame, setup).await {
+                                ControlFlow::Continue => {}
+                                ControlFlow::Close(exit) => return exit,
+                            }
                         } else {
                             if header.epoch == 0 {
+                                return ReadExit::Peer;
+                            }
+                            // A routed request is application-bearing: it
+                            // commits the generation to TCP, and during
+                            // candidate setup it is a protocol failure
+                            // (protocol §7.7.5).
+                            if commit_transport(setup).is_err() {
                                 return ReadExit::Peer;
                             }
                             dispatch_request(shared, gen, frame).await;
@@ -368,6 +496,9 @@ async fn read_loop<H: McHostHandler>(
                         // Structural shape: current nonzero route, nonzero
                         // correlation (protocol §6.2 table).
                         if header.channel == 0 || header.epoch == 0 || header.corr == 0 {
+                            return ReadExit::Peer;
+                        }
+                        if matches!(setup.state, TransportState::CandidateSetup) {
                             return ReadExit::Peer;
                         }
                         handle_cancel(gen, (header.channel, header.epoch, header.corr));
@@ -424,6 +555,9 @@ async fn read_loop<H: McHostHandler>(
                         if header.epoch == 0 || header.corr != 0 {
                             return ReadExit::Peer;
                         }
+                        if matches!(setup.state, TransportState::CandidateSetup) {
+                            return ReadExit::Peer;
+                        }
                         // The Closing transition is synchronous, so any later
                         // frame on this route observes `unknown_channel`; the
                         // drain and route-gone callback run on a tracked task
@@ -473,12 +607,28 @@ async fn read_loop<H: McHostHandler>(
 async fn handle_control<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
-    frame: crate::wire::InboundFrame,
-) {
+    frame: crate::frame_channel::InboundFrame,
+    setup: &mut ConnectionSetup,
+) -> ControlFlow {
     let corr = frame.header.corr;
     let action = parse_control(&frame.body, frame.header.flags.is_binary(), &shared.targets);
     // The body and its charge are done: validation is complete.
     drop(frame);
+
+    // Negotiation bypasses pending-request admission because it is setup
+    // traffic: exhausted global capacity must not turn a negotiation into a
+    // `server_busy` terminal.
+    let action = match action {
+        ControlAction::TransportNegotiate(decoded) => {
+            return handle_negotiate(shared, gen, corr, decoded, setup).await;
+        }
+        action => action,
+    };
+    // Non-negotiation channel-0 requests commit the generation to TCP;
+    // during candidate setup they are a protocol failure (protocol §7.7.5).
+    if commit_transport(setup).is_err() {
+        return ControlFlow::Close(ReadExit::Peer);
+    }
 
     // Every channel-0 request — including semantic rejections — is one
     // consumer request against the global unsettled bound; at capacity the
@@ -508,7 +658,7 @@ async fn handle_control<H: McHostHandler>(
             "pending request capacity exhausted",
         )
         .await;
-        return;
+        return ControlFlow::Continue;
     };
 
     match action {
@@ -573,7 +723,528 @@ async fn handle_control<H: McHostHandler>(
                 open_route(shared_task, gen_task, corr, target, identity).await;
             }));
         }
+        ControlAction::TransportNegotiate(_) => {
+            unreachable!("negotiation is intercepted before control admission")
+        }
     }
+    ControlFlow::Continue
+}
+
+/// What the setup-aware control path tells the read loop to do next.
+enum ControlFlow {
+    Continue,
+    Close(ReadExit),
+}
+
+/// Transport-setup state for one served channel (protocol §7.7.5).
+/// `Retired` has no variant: it is the read loop returning a [`ReadExit`].
+/// The candidate-side stages (`CandidatePrepared`, `Activating`,
+/// `AwaitingCommit`) are the sequential control flow of
+/// [`run_candidate_setup`]; the bootstrap observes them all as
+/// [`TransportState::CandidateSetup`].
+enum TransportState {
+    /// Authenticated bootstrap; nothing selected or committed yet.
+    BootstrapTcp,
+    /// The generation is committed to TCP. `late_used` is false only while
+    /// the one allowed late negotiation (a first negotiation arriving after
+    /// a non-negotiation request implicitly committed TCP) remains
+    /// available; a negotiation that itself selects TCP consumes the
+    /// allowance, so any further negotiation is a protocol failure.
+    TcpCommitted { late_used: bool },
+    /// A candidate is being activated; the bootstrap accepts no further
+    /// requests.
+    CandidateSetup,
+    /// Serving a promoted candidate; selection is sticky until retirement.
+    ProviderActive,
+}
+
+pub(crate) struct ConnectionSetup {
+    state: TransportState,
+    initial_watermark: u64,
+    handoff: Option<Arc<CandidateHandoff>>,
+}
+
+impl ConnectionSetup {
+    fn bootstrap() -> Self {
+        Self {
+            state: TransportState::BootstrapTcp,
+            initial_watermark: 0,
+            handoff: None,
+        }
+    }
+
+    /// Correlations 1 and 2 were consumed by activation and commit, so the
+    /// first application request on a promoted candidate is 3 (§7.7.4).
+    fn provider_active() -> Self {
+        Self {
+            state: TransportState::ProviderActive,
+            initial_watermark: COMMIT_CORRELATION,
+            handoff: None,
+        }
+    }
+}
+
+/// Shared handle for one prepared candidate: the sender and cancellation
+/// roots both the driver and the setup owner can reach, plus the promotion
+/// slot the driver fills after the commit response reaches local completion.
+pub(crate) struct CandidateHandoff {
+    sender: FrameSender,
+    root: CancellationToken,
+    read_cancel: CancellationToken,
+    promoted: Mutex<Option<BoxedReceiver>>,
+    io: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// The first consumer request that is not `transport.negotiate` commits the
+/// generation to TCP (protocol §7.7); during candidate setup any such
+/// request is a protocol failure.
+fn commit_transport(setup: &mut ConnectionSetup) -> Result<(), ()> {
+    match setup.state {
+        TransportState::BootstrapTcp => {
+            setup.state = TransportState::TcpCommitted { late_used: false };
+            Ok(())
+        }
+        TransportState::CandidateSetup => Err(()),
+        TransportState::TcpCommitted { .. } | TransportState::ProviderActive => Ok(()),
+    }
+}
+
+async fn handle_negotiate<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    gen: &Arc<GenerationCore>,
+    corr: u64,
+    decoded: Result<NegotiateRequest, NegotiationError>,
+    setup: &mut ConnectionSetup,
+) -> ControlFlow {
+    match setup.state {
+        // Selection is sticky (§7.7.5): a repeated negotiation, or any
+        // negotiation while a candidate is being set up or after promotion,
+        // is a protocol failure.
+        TransportState::CandidateSetup
+        | TransportState::ProviderActive
+        | TransportState::TcpCommitted { late_used: true } => {
+            return ControlFlow::Close(ReadExit::Peer);
+        }
+        TransportState::BootstrapTcp | TransportState::TcpCommitted { late_used: false } => {}
+    }
+    let request = match decoded {
+        Ok(request) => request,
+        Err(_) => {
+            // §7.7.1: the documented terminal, then retirement. The close
+            // fences exactly this authoritative frame, like the
+            // oversized-control path. Liveness stops first: the generation
+            // is closing with exactly this frame, and a missed-Pong
+            // invalidation during the bounded egress wait below would
+            // cancel the generation and abort the terminal the contract
+            // requires.
+            let liveness = gen.liveness.lock().expect("liveness lock").take();
+            if let Some(handle) = liveness {
+                handle.stop.cancel();
+                let _ = handle.task.await;
+            }
+            let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+            crate::dispatch::emit_authoritative_rejection(
+                shared,
+                gen,
+                FrameId::control(corr),
+                CODE_INVALID_CONTROL_REQUEST,
+                "malformed transport negotiation",
+                terminal_tx,
+            )
+            .await;
+            return ControlFlow::Close(ReadExit::PeerKeepQueue(terminal_rx));
+        }
+    };
+    // Fallback always names the exact offered tcp entry (§7.7.3); with tcp
+    // offered only at versions this host does not speak, no offered entry is
+    // serveable and the setup fails closed.
+    if !request.offers.iter().any(|offer| {
+        offer.transport == TRANSPORT_TCP && offer.capability_version == TCP_CAPABILITY_VERSION
+    }) {
+        return ControlFlow::Close(ReadExit::Peer);
+    }
+    if matches!(setup.state, TransportState::TcpCommitted { .. }) {
+        setup.state = TransportState::TcpCommitted { late_used: true };
+        return respond_tcp(
+            shared,
+            gen,
+            corr,
+            request.negotiation_version,
+            Some(FallbackReason::ConnectionInUse),
+        )
+        .await;
+    }
+    if request.negotiation_version != NEGOTIATION_VERSION {
+        // Negotiation itself selected TCP, so the late-negotiation
+        // allowance (implicit-commit-first only, §7.7.5) is consumed.
+        setup.state = TransportState::TcpCommitted { late_used: true };
+        return respond_tcp(
+            shared,
+            gen,
+            corr,
+            request.negotiation_version,
+            Some(FallbackReason::NegotiationVersionMismatch),
+        )
+        .await;
+    }
+    // The first serveable offer in client preference order wins.
+    let mut capability_mismatch = false;
+    let mut non_tcp_offered = false;
+    for offer in &request.offers {
+        if offer.transport == TRANSPORT_TCP {
+            if offer.capability_version == TCP_CAPABILITY_VERSION {
+                break;
+            }
+            continue;
+        }
+        non_tcp_offered = true;
+        // Provider identity is `(transport, capability_version)`: a
+        // name-only lookup would hide a serveable provider behind a
+        // mismatched sibling at the same name.
+        match shared
+            .providers
+            .find(&offer.transport, offer.capability_version)
+        {
+            Some(provider) => {
+                let provider = Arc::clone(provider);
+                let selected = SelectedTransport {
+                    transport: offer.transport.clone(),
+                    capability_version: offer.capability_version,
+                };
+                return grant_candidate(
+                    shared,
+                    gen,
+                    corr,
+                    request.negotiation_version,
+                    selected,
+                    provider,
+                    offer.parameters.clone(),
+                    setup,
+                )
+                .await;
+            }
+            // Known transport at another version: name the real cause
+            // (§7.7.3) rather than reporting it as unavailable.
+            None if shared.providers.serves_transport(&offer.transport) => {
+                capability_mismatch = true;
+            }
+            None => {}
+        }
+    }
+    let reason = if capability_mismatch {
+        Some(FallbackReason::CapabilityVersionMismatch)
+    } else if non_tcp_offered {
+        Some(FallbackReason::Unavailable)
+    } else {
+        None
+    };
+    // Negotiation itself selected TCP: the late-negotiation allowance is
+    // consumed, so a repeated negotiation is a protocol failure (§7.7.5).
+    setup.state = TransportState::TcpCommitted { late_used: true };
+    respond_tcp(shared, gen, corr, request.negotiation_version, reason).await
+}
+
+async fn respond_tcp<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    gen: &Arc<GenerationCore>,
+    corr: u64,
+    negotiation_version: u32,
+    reason: Option<FallbackReason>,
+) -> ControlFlow {
+    let body = encode_negotiate_response(
+        &NegotiateResponse::Tcp { reason },
+        negotiation_version,
+        TCP_CAPABILITY_VERSION,
+    )
+    .expect("a tcp selection always encodes");
+    // Emission can wait on the shared egress budget; queue it off the read
+    // loop so a contended budget cannot stall Pong reads into a liveness
+    // false-kill. Bounded without a pending permit: the setup state machine
+    // admits at most two TCP negotiation responses per generation.
+    let shared_task = Arc::clone(shared);
+    let gen_task = Arc::clone(gen);
+    shared.spawn_tracked(gen.read_tasks.track_future(async move {
+        if emit_frame(
+            &shared_task.egress_budget,
+            &gen_task,
+            FrameType::Response,
+            response_flags(false, true),
+            FrameId::control(corr),
+            body,
+        )
+        .await
+        .is_err()
+        {
+            gen_task.token.cancel();
+        }
+    }));
+    ControlFlow::Continue
+}
+
+async fn grant_candidate<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    gen: &Arc<GenerationCore>,
+    corr: u64,
+    negotiation_version: u32,
+    selected: SelectedTransport,
+    provider: Arc<dyn InjectedProvider>,
+    offer_parameters: Option<serde_json::Value>,
+    setup: &mut ConnectionSetup,
+) -> ControlFlow {
+    let ctx = ProviderContext::new(
+        shared.ingress_budget.clone(),
+        shared.limits.writer_queue_frames,
+        shared.timing.frame_deadline,
+        offer_parameters,
+    );
+    // The setup deadline exists before any provider code runs, and the
+    // KTD9 attachment gate inside `prepare` executes on the registry's one
+    // dedicated worker thread: a provider that stalls cannot pin the read
+    // loop, hold the connection permit past the configured setup budget,
+    // or occupy a fresh blocking-pool worker per reconnect. On timeout the
+    // job's eventual result is dropped, releasing the candidate.
+    let deadline = Instant::now() + shared.timing.transport_setup_deadline;
+    // KTD4 order: bootstrap liveness is stopped AND joined before the
+    // selection is published — no bootstrap Ping can race the client onto
+    // two live channels. It stops HERE, before the preparation wait,
+    // because that wait blocks this generation's sole read loop: a
+    // `prepare` slower than `ping_interval + pong_deadline` would
+    // otherwise leave a timely Pong unread and let liveness invalidate a
+    // healthy generation. Every path past this point either publishes the
+    // selection or closes the generation, so no bootstrap needs probing
+    // again.
+    let liveness = gen.liveness.lock().expect("liveness lock").take();
+    if let Some(handle) = liveness {
+        handle.stop.cancel();
+        let _ = handle.task.await;
+    }
+    let reply = shared.providers.prepare_on_worker(provider, ctx);
+    // A provider failure — including a stalled gate — is not fallback
+    // evidence (§7.7.3): the setup fails closed with no same-generation
+    // TCP continuation.
+    let PreparedCandidate {
+        descriptor,
+        candidate_id,
+        candidate,
+    } = match timeout_at(deadline, reply).await {
+        Ok(Ok(Ok(prepared))) => prepared,
+        _ => return ControlFlow::Close(ReadExit::Peer),
+    };
+    let token = fresh_activation_token();
+    let binding = GrantBinding {
+        daemon_id: shared.daemon_id,
+        bootstrap_generation: gen.id,
+        negotiation_correlation: corr,
+        transport: selected.transport.clone(),
+        capability_version: selected.capability_version,
+        candidate_id,
+    };
+    let grant = GrantRecord::new(binding.clone(), token.clone());
+    let body = match encode_negotiate_response(
+        &NegotiateResponse::Grant {
+            selected,
+            activation_token: token,
+            descriptor,
+        },
+        negotiation_version,
+        TCP_CAPABILITY_VERSION,
+    ) {
+        Ok(body) => body,
+        // An out-of-bounds provider descriptor fails closed before any
+        // candidate task exists; dropping the candidate releases its
+        // resources.
+        Err(_) => return ControlFlow::Close(ReadExit::Peer),
+    };
+    let Candidate {
+        sender,
+        receiver,
+        io,
+        root,
+        read_cancel,
+    } = candidate;
+    let io_task = shared.spawn_tracked(io);
+    let handoff = Arc::new(CandidateHandoff {
+        sender,
+        root,
+        read_cancel,
+        promoted: Mutex::new(None),
+        io: Mutex::new(Some(io_task)),
+    });
+    let shared_task = Arc::clone(shared);
+    let gen_task = Arc::clone(gen);
+    let handoff_task = Arc::clone(&handoff);
+    // Tracked in `read_tasks` so both connection teardown and shutdown wait
+    // for the driver before reading the promotion slot.
+    shared.spawn_tracked(gen.read_tasks.track_future(run_candidate_setup(
+        shared_task,
+        gen_task,
+        handoff_task,
+        receiver,
+        grant,
+        binding,
+        deadline,
+    )));
+    setup.state = TransportState::CandidateSetup;
+    setup.handoff = Some(handoff);
+    // Publishing the selection is the last step. A failed emission retires
+    // the bootstrap; the driver observes `read_cancel` and reaps the
+    // candidate.
+    if emit_frame(
+        &shared.egress_budget,
+        gen,
+        FrameType::Response,
+        response_flags(false, true),
+        FrameId::control(corr),
+        body,
+    )
+    .await
+    .is_err()
+    {
+        gen.token.cancel();
+    }
+    ControlFlow::Continue
+}
+
+/// Drives one candidate's activation (correlation 1) and commit
+/// (correlation 2) exchanges (protocol §7.7.4). Success stores the receiver
+/// in the promotion slot and retires the bootstrap without touching the
+/// candidate; every other outcome — wrong token, wrong correlation, an
+/// application frame before commit, deadline expiry, channel loss, bootstrap
+/// retirement — retires both channels with no TCP continuation.
+async fn run_candidate_setup<H: McHostHandler>(
+    shared: Arc<HostShared<H>>,
+    bootstrap: Arc<GenerationCore>,
+    handoff: Arc<CandidateHandoff>,
+    mut receiver: BoxedReceiver,
+    grant: GrantRecord,
+    binding: GrantBinding,
+    deadline: Instant,
+) {
+    let exchange = async {
+        let frame = expect_candidate_request(&mut receiver, ACTIVATION_CORRELATION).await?;
+        let request = decode_activate_request(&frame.body).map_err(|_| ())?;
+        drop(frame);
+        grant
+            .consume(&request.activation_token, &binding)
+            .map_err(|_| ())?;
+        send_candidate_response(
+            &shared,
+            &handoff,
+            ACTIVATION_CORRELATION,
+            activate_response_json(),
+            None,
+        )
+        .await?;
+
+        let frame = expect_candidate_request(&mut receiver, COMMIT_CORRELATION).await?;
+        decode_commit_request(&frame.body).map_err(|_| ())?;
+        drop(frame);
+        // Promotion is gated on this exact frame's local completion — not
+        // queue admission, not an aggregate flush (KTD4). The receiver is
+        // deliberately NOT polled while waiting: an un-promoted host never
+        // consumes candidate frames, so a request pipelined ahead of the
+        // commit response stays buffered and is observed only by the
+        // promoted generation, where every setup invariant already holds.
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        send_candidate_response(
+            &shared,
+            &handoff,
+            COMMIT_CORRELATION,
+            commit_response_json(),
+            Some(written_tx),
+        )
+        .await?;
+        written_rx.await.map_err(|_| ())
+    };
+    let outcome = tokio::select! {
+        biased;
+        // A completed exchange must win over a simultaneous bootstrap
+        // retirement: after the commit response reaches local completion
+        // the client may promote and retire the bootstrap before this task
+        // is polled again, and that healthy grant must not be discarded.
+        outcome = timeout_at(deadline, exchange) => outcome.unwrap_or(Err(())),
+        // Bootstrap retirement (including host shutdown) reaps a candidate
+        // whose exchange is still pending.
+        () = bootstrap.read_cancel.cancelled() => Err(()),
+    };
+    match outcome {
+        Ok(()) => {
+            *handoff.promoted.lock().expect("candidate promotion lock") = Some(receiver);
+            // Atomic transfer: retire the bootstrap without touching the
+            // candidate.
+            bootstrap.token.cancel();
+            bootstrap.writer.discard();
+        }
+        Err(()) => {
+            handoff.sender.discard();
+            handoff.root.cancel();
+            bootstrap.token.cancel();
+            bootstrap.writer.discard();
+        }
+    }
+}
+
+async fn expect_candidate_request(
+    receiver: &mut BoxedReceiver,
+    corr: u64,
+) -> Result<crate::frame_channel::InboundFrame, ()> {
+    match receiver.recv().await {
+        Ok(InboundEvent::Frame(frame))
+            if frame.header.ty == FrameType::Request
+                && frame.header.channel == 0
+                && frame.header.epoch == 0
+                && frame.header.corr == corr
+                && !frame.header.flags.is_binary() =>
+        {
+            Ok(frame)
+        }
+        // Anything else — a wrong correlation, a nonzero epoch, an
+        // application frame before commit, a rejected oversize declaration,
+        // or channel loss — fails the whole setup (§7.7.4).
+        _ => Err(()),
+    }
+}
+
+async fn send_candidate_response<H: McHostHandler>(
+    shared: &Arc<HostShared<H>>,
+    handoff: &CandidateHandoff,
+    corr: u64,
+    body: Vec<u8>,
+    written_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), ()> {
+    let deadline = handoff.sender.admission_deadline();
+    let frame_bytes = u32::try_from(body.len() + subc_protocol::HEADER_LEN).map_err(|_| ())?;
+    let charge = tokio::select! {
+        biased;
+        () = handoff.root.cancelled() => return Err(()),
+        charge = timeout_at(deadline, shared.egress_budget.charge(frame_bytes)) => {
+            charge.map_err(|_| ())?
+        }
+    };
+    let bytes = encode_owned_frame(
+        FrameType::Response,
+        response_flags(false, true),
+        FrameId::control(corr),
+        body,
+    )
+    .map_err(|_| ())?;
+    handoff
+        .sender
+        .send_before(
+            OutboundFrame {
+                bytes,
+                tail: Vec::new(),
+                charge,
+                written: written_tx.map(|tx| {
+                    Box::new(move |_completed_at: Instant| {
+                        let _ = tx.send(());
+                    }) as Box<dyn FnOnce(Instant) + Send>
+                }),
+            },
+            deadline,
+        )
+        .await
+        .map_err(|_| ())
 }
 
 /// Clones a startup-cached catalog only after its encoded size is charged,
@@ -648,7 +1319,11 @@ async fn reserve_catalog_frame(
 /// independent of consumer correlations (protocol §8.3): a Ping correlation
 /// numerically equal to a pending consumer correlation cannot cross-settle
 /// because Pongs only match this map.
-async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::LivenessPolicy) {
+async fn liveness_loop(
+    gen: Arc<GenerationCore>,
+    policy: crate::config::LivenessPolicy,
+    stop: CancellationToken,
+) {
     let mut next_ping_at = Instant::now() + policy.ping_interval;
     loop {
         // Wake at the sooner of the next Ping tick and the earliest
@@ -665,7 +1340,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
                 .map_or(next_ping_at, |deadline| deadline.min(next_ping_at))
         };
         tokio::select! {
-            () = gen.read_cancel.cancelled() => return,
+            () = stop.cancelled() => return,
             () = tokio::time::sleep_until(wake_at) => {}
         }
         let now = Instant::now();
@@ -749,7 +1424,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
             }
             let _ = written_tx.send(());
         });
-        let send = gen.writer.send(crate::wire::OutboundFrame {
+        let send = gen.writer.send(crate::frame_channel::OutboundFrame {
             bytes,
             tail: Vec::new(),
             charge: crate::wire::ByteCharge::none(),
@@ -757,7 +1432,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         });
         let sent = tokio::select! {
             biased;
-            () = gen.read_cancel.cancelled() => return,
+            () = stop.cancelled() => return,
             sent = send => sent,
         };
         if sent.is_err() {
@@ -767,7 +1442,7 @@ async fn liveness_loop(gen: Arc<GenerationCore>, policy: crate::config::Liveness
         // already anchored the deadline and flipped `written` inside the
         // writer task; this await only paces the loop.
         tokio::select! {
-            () = gen.read_cancel.cancelled() => return,
+            () = stop.cancelled() => return,
             written = written_rx => {
                 if written.is_err() {
                     // Writer retired before the Ping reached the socket.
@@ -806,8 +1481,12 @@ mod tests {
         let generation = CancellationToken::new();
         let read_cancel = generation.child_token();
         let (server, mut client) = tokio::io::duplex(4096);
-        let (writer, writer_task) =
-            crate::wire::spawn_writer(server, 4, generation.clone(), Duration::from_secs(1));
+        let (writer, writer_task) = crate::tcp_frame_channel::spawn_writer(
+            server,
+            4,
+            generation.clone(),
+            Duration::from_secs(1),
+        );
         let gen = Arc::new(GenerationCore {
             id: 1,
             token: generation,
@@ -820,6 +1499,7 @@ mod tests {
             pings: Mutex::new(HashMap::new()),
             busy_rejects: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BUSY_REJECTS)),
             next_ping_corr: std::sync::atomic::AtomicU64::new(1),
+            liveness: Mutex::new(None),
         });
         let budget = crate::wire::ByteBudget::new(4096);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -906,8 +1586,12 @@ mod tests {
         let budget = crate::wire::ByteBudget::new(frame_bytes as u64);
         let generation = CancellationToken::new();
         let (server, client) = tokio::io::duplex(64);
-        let (writer, writer_task) =
-            crate::wire::spawn_writer(server, 1, generation.clone(), Duration::from_secs(1));
+        let (writer, writer_task) = crate::tcp_frame_channel::spawn_writer(
+            server,
+            1,
+            generation.clone(),
+            Duration::from_secs(1),
+        );
         let gen = GenerationCore {
             id: 1,
             token: generation,
@@ -920,6 +1604,7 @@ mod tests {
             pings: Mutex::new(HashMap::new()),
             busy_rejects: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_BUSY_REJECTS)),
             next_ping_corr: std::sync::atomic::AtomicU64::new(1),
+            liveness: Mutex::new(None),
         };
 
         let frame = reserve_catalog_frame(
