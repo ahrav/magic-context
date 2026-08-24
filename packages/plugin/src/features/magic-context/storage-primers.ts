@@ -366,6 +366,50 @@ export function updatePrimerCandidateEmbedding(
     ).run(vectorBlob(vector), modelId, candidateId);
 }
 
+/** Replaces an active primer's question vector, for provider-identity changes:
+ *  search skips any primer whose embedding model id differs from the query's,
+ *  so a primer embedded under a retired identity is semantically invisible
+ *  until rewritten here. */
+export function updatePrimerQuestionEmbedding(
+    db: Database,
+    primerId: number,
+    vector: Float32Array,
+    modelId: string,
+    now = Date.now(),
+): void {
+    db.prepare(
+        "UPDATE primers SET question_embedding = ?, question_embedding_model_id = ?, updated_at = ? WHERE id = ?",
+    ).run(vectorBlob(vector), modelId, now, primerId);
+}
+
+/** Whether any active primer or promotion candidate carries a vector produced
+ *  under an identity other than `currentModelId`. Pure EXISTS checks so gate
+ *  evaluation never loads or decodes embedding BLOBs; rows with NO embedding
+ *  are deliberately excluded — those belong to the promotion threshold's
+ *  ordinary scheduling, not the stale-identity repair path. */
+export function hasPrimerRowsWithStaleEmbeddings(
+    db: Database,
+    projectPath: string,
+    currentModelId: string,
+): boolean {
+    const row = db
+        .prepare(
+            `SELECT EXISTS (
+                SELECT 1 FROM primers
+                 WHERE project_path = ? AND status = 'active'
+                   AND question_embedding IS NOT NULL
+                   AND (question_embedding_model_id IS NULL OR question_embedding_model_id != ?)
+             ) OR EXISTS (
+                SELECT 1 FROM primer_candidates
+                 WHERE project_path = ?
+                   AND question_embedding IS NOT NULL
+                   AND (question_embedding_model_id IS NULL OR question_embedding_model_id != ?)
+             ) AS stale`,
+        )
+        .get(projectPath, currentModelId, projectPath, currentModelId) as { stale: number } | null;
+    return Boolean(row?.stale);
+}
+
 export function getPrimerCandidatesByIds(db: Database, ids: number[]): PrimerCandidate[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");

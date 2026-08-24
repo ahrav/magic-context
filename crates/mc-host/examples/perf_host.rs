@@ -12,6 +12,12 @@ use mc_host::{
     ManifestSnapshot, McHostHandler, RequestCtx, RequestOutcome, RouteHandle, RouteIdentity,
 };
 
+// The fixture-echo contract (manifest, bind, echo semantics) has exactly one
+// definition, shared with the ipc-budget tests, so the `compact-json-v1`
+// workload identity always names the same server behavior.
+#[path = "../tests/support/echo_host.rs"]
+mod echo_host;
+
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -32,40 +38,29 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
-struct EchoHandler;
+/// Shared echo handler plus the perf-only mode-byte sleep branch: a request
+/// body starting with byte 1 carries a little-endian u32 sleep duration in
+/// milliseconds, applied before the delegated echo.
+struct EchoHandler {
+    inner: echo_host::EchoHandler,
+}
 
 impl McHostHandler for EchoHandler {
     fn manifests(&self) -> Vec<ManifestSnapshot> {
-        vec![ManifestSnapshot {
-            module_id: "perf-echo".to_owned(),
-            module_version: "0.0.0".to_owned(),
-            provides: vec![serde_json::json!({
-                "role": "tool_provider",
-                "tools": [{
-                    "name": "echo",
-                    "execution_mode": "pure",
-                    "schema": {"type": "object"}
-                }],
-                "identity_scope": ["session", "project"],
-                "concurrency": "module_managed",
-                "emits_push": false,
-                "sub_supervises": false
-            })],
-            control_ops: Vec::new(),
-        }]
+        self.inner.manifests()
     }
 
-    async fn initialize(&self, _init: HostInit) -> Result<(), InitError> {
-        Ok(())
+    async fn initialize(&self, init: HostInit) -> Result<(), InitError> {
+        self.inner.initialize(init).await
     }
 
     async fn bind(
         &self,
-        _route: RouteHandle,
-        _target: mc_host::RouteTarget,
-        _identity: RouteIdentity,
+        route: RouteHandle,
+        target: mc_host::RouteTarget,
+        identity: RouteIdentity,
     ) -> BindOutcome {
-        BindOutcome::Accept
+        self.inner.bind(route, target, identity).await
     }
 
     async fn handle(&self, ctx: RequestCtx) -> RequestOutcome {
@@ -73,27 +68,20 @@ impl McHostHandler for EchoHandler {
             let ms = u32::from_le_bytes(ctx.body[1..5].try_into().expect("4 bytes"));
             tokio::time::sleep(Duration::from_millis(u64::from(ms))).await;
         }
-        let Ok(mut body) = ctx.reserve_output(ctx.body.len()).await else {
-            return RequestOutcome::Error {
-                code: "internal_error".to_owned(),
-                message: "output reservation unavailable".to_owned(),
-            };
-        };
-        body.extend_from_slice(&ctx.body)
-            .expect("reservation matches request length");
-        RequestOutcome::Response {
-            body,
-            binary: ctx.binary,
-        }
+        self.inner.handle(ctx).await
     }
 
-    async fn route_gone(&self, _route: RouteHandle) {}
+    async fn route_gone(&self, route: RouteHandle) {
+        self.inner.route_gone(route).await
+    }
 
     async fn health(&self) -> HealthReport {
-        HealthReport::ok()
+        self.inner.health().await
     }
 
-    async fn shutdown(&self) {}
+    async fn shutdown(&self) {
+        self.inner.shutdown().await
+    }
 }
 
 #[tokio::main]
@@ -113,12 +101,17 @@ async fn main() {
         config.timing.frame_deadline = deadline;
     }
 
-    let publication = data_dir
-        .join("cortexkit")
-        .join("run")
+    let publication = mc_host::runtime_dir_path(Some(&data_dir))
+        .expect("runtime dir")
         .join(mc_host::CONNECTION_FILE_NAME);
     let shutdown = CancellationToken::new();
-    let host = tokio::spawn(mc_host::run(EchoHandler, config, shutdown.clone()));
+    let host = tokio::spawn(mc_host::run(
+        EchoHandler {
+            inner: echo_host::EchoHandler,
+        },
+        config,
+        shutdown.clone(),
+    ));
 
     while !publication.exists() {
         if host.is_finished() {

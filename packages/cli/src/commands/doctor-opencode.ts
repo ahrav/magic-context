@@ -5,6 +5,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
+import {
+    DEFAULT_LOCAL_EMBEDDING_MODEL,
+    RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL,
+} from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
     type EmbeddingProbeOutcome,
@@ -409,7 +413,7 @@ async function runIssueFlow(): Promise<number> {
 // resolver error in the log. Shared by the explicit-`local` branch AND the
 // no-config / default-provider path (local is the default, so a missing config
 // still means local embeddings).
-function checkLocalEmbeddingRuntimeForDoctor(): {
+function checkLocalEmbeddingRuntimeForDoctor(activeModel = DEFAULT_LOCAL_EMBEDDING_MODEL): {
     issues: number;
     localRuntimeBroken?: boolean;
     unverified?: boolean;
@@ -423,7 +427,7 @@ function checkLocalEmbeddingRuntimeForDoctor(): {
         log.warn(`Local embedding runtime unverified: ${runtime.reason}`);
         return { issues: 0, unverified: true };
     }
-    log.success("Embedding provider: local (Xenova/all-MiniLM-L6-v2 bundled)");
+    log.success(`Embedding provider: local (${activeModel})`);
     return { issues: 0 };
 }
 
@@ -472,7 +476,15 @@ async function checkEmbeddingConfig(
     }
 
     if (provider === undefined || provider === "local") {
-        return checkLocalEmbeddingRuntimeForDoctor();
+        const pinnedModel = typeof embedding?.model === "string" ? embedding.model.trim() : "";
+        if (pinnedModel === RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL) {
+            log.warn(
+                `Config pins the retired default embedding model (${RETIRED_DEFAULT_LOCAL_EMBEDDING_MODEL}). ` +
+                    `It keeps working, but the current default (${DEFAULT_LOCAL_EMBEDDING_MODEL}) ranks better on retrieval. ` +
+                    `Remove the embedding.model line (or rerun setup) to adopt it; stored content re-embeds automatically.`,
+            );
+        }
+        return checkLocalEmbeddingRuntimeForDoctor(pinnedModel || DEFAULT_LOCAL_EMBEDDING_MODEL);
     }
 
     if (provider !== "openai-compatible") {

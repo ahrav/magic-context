@@ -5,6 +5,26 @@ Owner: PR 6 perf pipeline. No repository performance policy exists; nothing
 here is a pass/fail threshold. Numbers are evidence for optimization
 decisions on `crates/mc-host` only.
 
+> **Erratum (IPC budget follow-up).** Three properties of this contract
+> make its numbers non-comparable with the IPC budget in
+> [mc-host-ipc-budget.md](./mc-host-ipc-budget.md), which is the
+> authority for transport comparisons going forward:
+>
+> 1. **Closed-loop latency did not use the documented actual-send
+>    boundary.** The load generator subtracted the *scheduled* timestamp
+>    in closed-loop arms too, so "closed-loop p50" here includes
+>    in-flight permit queueing, and headline closed-loop arms pipelined
+>    32 requests — those values are queued completion latency, not
+>    serial RTT.
+> 2. **Raw request bodies.** Arms used a mode-byte + zero-fill body, not
+>    the committed compact JSON fixture that matches the production
+>    client's small-message shape.
+> 3. **No topology contract.** Runs did not pin or verify CPU pairs, so
+>    no hardware floor can be paired with these numbers.
+>
+> The results below stay frozen as recorded; do not infer improvements
+> or regressions by comparing them against IPC-budget values.
+
 ## System under test
 
 - `crates/mc-host` host runtime, release build (`--release`,
@@ -20,10 +40,10 @@ decisions on `crates/mc-host` only.
 
 ## Metrics and semantics
 
-- **Completion latency**: terminal receipt minus *scheduled* send time
-  (open-loop arms) — coordinated-omission honest. Closed-loop arms measure
-  from actual send and are labeled closed-loop; they estimate ceilings, not
-  latency.
+- **Completion latency**: terminal receipt minus *scheduled* send time —
+  in every arm, including closed-loop (see erratum item 1). Closed-loop
+  values therefore include in-flight permit queueing and estimate
+  ceilings, not serial RTT.
 - **Throughput**: completed terminals / wall seconds of send window.
 - Percentiles computed over all requests of one run (exact, sorted vector).
 - Steady state: first 10% of the send window discarded as warmup.
@@ -70,7 +90,8 @@ exists.
 
 Environment: dev-dsk 128×CPU, kernel 6.12.95, rustc 1.97.1, shared box
 (1-min load 39–42 at run start; treat single-digit-percent deltas as noise).
-Raw runs: `docs/perf/runs/baseline-99a12e8e/` and `docs/perf/runs/candidate-opt1/`.
+Raw runs: `docs/perf/runs/baseline-99a12e8e/` and `docs/perf/runs/candidate-opt1/`,
+kept on the measurement host (`docs/perf/runs/` is git-ignored).
 
 Candidate changes: buffered connection reads (64 KiB), uninitialized body
 read via `read_buf`+`take`, split large-frame writes (no header-prepend

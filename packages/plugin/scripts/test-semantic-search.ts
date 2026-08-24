@@ -25,7 +25,7 @@ async function main() {
     await ensureEmbeddingModel();
 
     // Embed query
-    const queryEmbedding = await embedText(query);
+    const queryEmbedding = await embedText(query, undefined, "query");
     if (!queryEmbedding) {
         console.error("Failed to embed query");
         process.exit(1);

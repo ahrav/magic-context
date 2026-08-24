@@ -9,7 +9,7 @@ import {
     PRIMER_PROMOTION_THRESHOLD,
     summarizePrimerCluster,
 } from "../primer-clustering";
-import { embedBatchForProject } from "../project-embedding-registry";
+import { embedBatchForProject, getProjectEmbeddingSnapshot } from "../project-embedding-registry";
 import {
     createPrimer,
     getActivePrimers,
@@ -17,6 +17,7 @@ import {
     PRIMER_CANDIDATE_MAX_AGE_MS,
     PRIMER_CANDIDATE_TTL_MS,
     updatePrimerCandidateEmbedding,
+    updatePrimerQuestionEmbedding,
     updatePrimerSupport,
 } from "../storage-primers";
 import {
@@ -57,30 +58,90 @@ function canonicalQuestionFromCluster(
     return first.endsWith("?") ? first : `${first}?`;
 }
 
+/** Rows re-embedded per provider call. Bounds local inference memory and stays
+ *  under remote batch limits; writes land after every chunk, so an interrupted
+ *  or partially failed run keeps its progress and the next sweep resumes with
+ *  only the remainder. */
+const REEMBED_CHUNK_SIZE = 32;
+
+/** Re-embeds primer candidates and active primers whose vectors are missing or
+ *  were produced under a retired provider identity. Search skips any vector
+ *  whose model id differs from the query's, so stale rows are semantically
+ *  invisible until rewritten. Runs from the always-reachable project sweep as
+ *  well as the promotion pass, because primer SEARCH stays enabled even when
+ *  dreamer scheduling is disabled. `checkpoint` runs before each write so the
+ *  promotion path can assert its lease mid-batch; the sweep path passes
+ *  nothing — the writes are idempotent (equivalent vectors under the same
+ *  identity), so concurrent sweeps waste at most a little compute.
+ *  Returns the number of rows rewritten. */
+export async function reembedStalePrimerEmbeddings(
+    db: Database,
+    projectIdentity: string,
+    checkpoint?: () => void,
+): Promise<number> {
+    // Embeddings can be configured off while project maintenance keeps
+    // running; a registration may then still exist and accept work. Semantic
+    // primer search is disabled in that configuration, so re-embedding would
+    // only initialize (or download) a model nobody queries. The snapshot's
+    // memory-lane enablement is the same guard the promote-primers gate uses.
+    if (!getProjectEmbeddingSnapshot(projectIdentity)?.enabled) return 0;
+    // The empty-batch call resolves the CURRENT provider identity without
+    // running inference.
+    const current = await embedBatchForProject(projectIdentity, [], undefined, "passage");
+    if (!current) return 0;
+    const isStale = (embedding: Float32Array | null, modelId: string | null): boolean =>
+        !embedding || !modelId || modelId !== current.modelId;
+
+    type StaleRow = { kind: "candidate" | "primer"; id: number; question: string };
+    const rows: StaleRow[] = [
+        ...getPrimerCandidatesForPromotion(db, projectIdentity)
+            .filter((c) => isStale(c.questionEmbedding, c.questionEmbeddingModelId))
+            .map((c): StaleRow => ({ kind: "candidate", id: c.id, question: c.question })),
+        ...getActivePrimers(db, projectIdentity)
+            .filter((p) => isStale(p.questionEmbedding, p.questionEmbeddingModelId))
+            .map((p): StaleRow => ({ kind: "primer", id: p.id, question: p.question })),
+    ];
+    if (rows.length === 0) return 0;
+
+    let written = 0;
+    for (let offset = 0; offset < rows.length; offset += REEMBED_CHUNK_SIZE) {
+        const chunk = rows.slice(offset, offset + REEMBED_CHUNK_SIZE);
+        const batch = await embedBatchForProject(
+            projectIdentity,
+            chunk.map((row) => row.question),
+            undefined,
+            "passage",
+        );
+        checkpoint?.();
+        // A failed chunk ends the run rather than hammering a struggling
+        // provider; rows already written stay written, and the next sweep
+        // picks up the remainder.
+        if (!batch) return written;
+        for (let i = 0; i < chunk.length; i += 1) {
+            checkpoint?.();
+            const vector = batch.vectors[i];
+            if (!vector) continue;
+            const row = chunk[i];
+            if (row.kind === "candidate") {
+                updatePrimerCandidateEmbedding(db, row.id, vector, batch.modelId);
+            } else {
+                updatePrimerQuestionEmbedding(db, row.id, vector, batch.modelId);
+            }
+            written += 1;
+        }
+    }
+    return written;
+}
+
 async function embedMissingCandidates(
     args: PromotePrimersArgs,
     assertLeaseHeld: (phase: string) => void,
 ): Promise<void> {
     await args.ensureProjectRegistered?.(args.sessionDirectory, args.db);
     assertLeaseHeld("embedding registration");
-    const candidates = getPrimerCandidatesForPromotion(args.db, args.projectIdentity).filter(
-        (candidate) => !candidate.questionEmbedding || !candidate.questionEmbeddingModelId,
+    await reembedStalePrimerEmbeddings(args.db, args.projectIdentity, () =>
+        assertLeaseHeld("embedding commit"),
     );
-    if (candidates.length === 0) return;
-    const batch = await embedBatchForProject(
-        args.projectIdentity,
-        candidates.map((candidate) => candidate.question),
-        undefined,
-        "passage",
-    );
-    assertLeaseHeld("embedding commit");
-    if (!batch) return;
-    for (let i = 0; i < candidates.length; i += 1) {
-        assertLeaseHeld("embedding commit");
-        const vector = batch.vectors[i];
-        if (!vector) continue;
-        updatePrimerCandidateEmbedding(args.db, candidates[i].id, vector, batch.modelId);
-    }
 }
 
 function pruneExpiredPrimerCandidatesForProject(
