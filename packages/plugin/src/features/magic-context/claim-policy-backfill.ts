@@ -583,6 +583,12 @@ async function revalidateEnforcementArtifactsNow(
             const live = await realpath(absolute);
             if (!isWithin(rootReal, live)) {
                 drifted = "artifact escapes the owning root";
+            } else if (!statSync(live).isFile()) {
+                // A FIFO or other non-regular replacement would make the
+                // streamed read below block forever waiting for a writer —
+                // the pass would never reach the revoking transaction, and
+                // each throttle window would strand another hung stream.
+                drifted = "artifact replaced by a non-file";
             } else {
                 // Streamed hash: reading AND hashing yield per chunk, so a
                 // large artifact never pins the event loop. ENOENT means the
@@ -729,9 +735,7 @@ export function seedLateCompatibilityRevisions(db: Database): void {
 
 export function reconcileCompatibilityVerifications(db: Database): number {
     if (!hasClaimPolicySchema(db)) return 0;
-    const watermark = Number(
-        readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
-    );
+    const watermark = readIntMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark);
     const maxEventId = (
         db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM verification_events").get() as {
             id: number;
@@ -807,9 +811,7 @@ export function reconcileCompatibilityVerifications(db: Database): number {
             // must not force the next pass to re-scan pages that already
             // committed real epoch bumps. Monotonic re-read because two
             // hosts can reconcile the shared database concurrently.
-            const stored = Number(
-                readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
-            );
+            const stored = readIntMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark);
             if (pageCursor > stored) {
                 writeMeta(
                     db,
@@ -831,9 +833,7 @@ export function reconcileCompatibilityVerifications(db: Database): number {
     // would otherwise be re-scanned on every pass. A busy outcome is safe to
     // drop — the next pass re-derives the same advance.
     runImmediateTransactionWithBusyRetrySync(db, () => {
-        const stored = Number(
-            readMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark) ?? 0,
-        );
+        const stored = readIntMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark);
         if (maxEventId > stored) {
             writeMeta(db, CLAIM_POLICY_SEED_META_KEYS.reconcileEventWatermark, String(maxEventId));
         }

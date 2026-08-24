@@ -814,16 +814,33 @@ export function createCtxMemoryTool(
 						"explicit_search",
 					);
 					// Bind loaded bytes to the revision the policy evaluated,
-					// then REAPPLY the policy on the bound rows: a rewrite
-					// between load and policy read must not render superseded
-					// content, and a quarantine or label transition between
-					// the first policy read and the bind must not publish the
-					// hidden row or the stale label.
-					const recheck = filterMemoriesByPolicy(
+					// then take the final gate from ONE snapshot: policy and
+					// the exact revision digest are read inside one deferred
+					// read transaction, so the decision and the digest
+					// describe the same revision — and the loaded bytes must
+					// match it.
+					const bound = bindMemoriesToCurrentRevision(
 						deps.db,
-						bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories),
-						"explicit_search",
+						policyFiltered.memories,
 					);
+					const recheck = deps.db.transaction(() => {
+						const filtered = filterMemoriesByPolicy(
+							deps.db,
+							bound,
+							"explicit_search",
+						);
+						const digests = exactMemoryContentDigests(
+							deps.db,
+							filtered.memories.map((memory) => memory.id),
+						);
+						return {
+							memories: filtered.memories.filter(
+								(memory) =>
+									digests.get(memory.id) === sha256Utf8Hex(memory.content),
+							),
+							labels: filtered.labels,
+						};
+					})();
 					return ok(
 						formatMemoryList(recheck.memories.slice(0, limit), recheck.labels),
 					);
@@ -855,16 +872,32 @@ export function createCtxMemoryTool(
 						"explicit_search",
 					);
 					// Bind loaded bytes to the revision the policy evaluated,
-					// then REAPPLY the policy on the bound rows: a held-open
-					// writer's rewrite must not render hidden bytes, and a
-					// quarantine or label transition between the first policy
-					// read and the bind must not publish the hidden row or
-					// the stale label.
-					const recheck = filterMemoriesByPolicy(
+					// then take the final gate from ONE snapshot (see the list
+					// branch): the policy decision and the exact revision
+					// digest must describe the same revision, and the loaded
+					// bytes must match it.
+					const bound = bindMemoriesToCurrentRevision(
 						deps.db,
-						bindMemoriesToCurrentRevision(deps.db, policyFiltered.memories),
-						"explicit_search",
+						policyFiltered.memories,
 					);
+					const recheck = deps.db.transaction(() => {
+						const filtered = filterMemoriesByPolicy(
+							deps.db,
+							bound,
+							"explicit_search",
+						);
+						const digests = exactMemoryContentDigests(
+							deps.db,
+							filtered.memories.map((memory) => memory.id),
+						);
+						return {
+							memories: filtered.memories.filter(
+								(memory) =>
+									digests.get(memory.id) === sha256Utf8Hex(memory.content),
+							),
+							labels: filtered.labels,
+						};
+					})();
 					const memoriesById = new Map<number, Memory>(
 						recheck.memories.map((memory) => [memory.id, memory]),
 					);
