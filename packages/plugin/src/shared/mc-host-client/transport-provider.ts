@@ -47,24 +47,33 @@ export interface ClientTransportProvider {
 /** Ordered provider set consulted once per connection setup (KTD5: selection is sticky). */
 export class ClientTransportRegistry {
     private readonly offerSnapshot: readonly TransportOffer[];
+    private readonly entries: readonly {
+        transport: string;
+        capabilityVersion: number;
+        provider: ClientTransportProvider;
+    }[];
 
-    constructor(private readonly providers: readonly ClientTransportProvider[]) {
+    constructor(providers: readonly ClientTransportProvider[]) {
         // Provider-authored getters and `toJSON` run once, here — never on
         // an authenticated connection's setup path, where synchronous
         // provider code could hold the socket and shared flight
-        // indefinitely and a throwing getter would escape unsanitized. The
-        // validated parsed snapshot is pure data with no live provider
-        // references.
-        const offers: TransportOffer[] = providers.map((provider) => {
-            const parameters = provider.parameters;
+        // indefinitely and a throwing getter would escape unsanitized. Both
+        // the offer list and grant resolution read only this snapshot.
+        this.entries = providers.map((provider) => ({
+            transport: provider.transport,
+            capabilityVersion: provider.capabilityVersion,
+            provider,
+        }));
+        const offers: TransportOffer[] = this.entries.map((entry) => {
+            const parameters = entry.provider.parameters;
             return parameters === undefined
                 ? {
-                      transport: provider.transport,
-                      capabilityVersion: provider.capabilityVersion,
+                      transport: entry.transport,
+                      capabilityVersion: entry.capabilityVersion,
                   }
                 : {
-                      transport: provider.transport,
-                      capabilityVersion: provider.capabilityVersion,
+                      transport: entry.transport,
+                      capabilityVersion: entry.capabilityVersion,
                       parameters: checkOpaquePlain(parameters, "parameters"),
                   };
         });
@@ -78,11 +87,10 @@ export class ClientTransportRegistry {
     }
 
     find(transport: string, capabilityVersion: number): ClientTransportProvider | undefined {
-        return this.providers.find(
-            (provider) =>
-                provider.transport === transport &&
-                provider.capabilityVersion === capabilityVersion,
-        );
+        return this.entries.find(
+            (entry) =>
+                entry.transport === transport && entry.capabilityVersion === capabilityVersion,
+        )?.provider;
     }
 }
 

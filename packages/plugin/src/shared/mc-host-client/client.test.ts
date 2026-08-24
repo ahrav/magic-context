@@ -1914,7 +1914,9 @@ describe("transport negotiation", () => {
         provider.host.onFrame = candidateAutoResponder("ffffffffffffffffffffffffffffffff");
         const peer = await startPeer({ negotiate: negotiateResponder(() => grantBody()) });
         const { error } = await connectRejected({ peer, transportProviders: [provider] });
-        expectCallError(error, "terminal", "invalid_control_request");
+        // The host's Error terminal is peer-controlled: the caller sees the
+        // bounded negotiation failure, never the wire code (R14).
+        expectCallError(error, "terminal", "negotiation_failed");
         expect(provider.host.channelClosed).toBe(true);
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
