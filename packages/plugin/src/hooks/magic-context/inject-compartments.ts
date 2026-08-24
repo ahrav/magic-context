@@ -106,8 +106,9 @@ type InjectionCacheEntry =
           compartmentEndMessageId: string;
           renderedBytes: number;
           /** Project memory epoch at build time; a later bump means a policy
-           * transition may have made a memory newly eligible, so a
-           * zero-memory entry must rebuild instead of replaying absence. */
+           * transition may have hidden or newly exposed a memory, so the
+           * entry (and the persisted block cache) must rebuild instead of
+           * replaying a stale snapshot. */
           projectMemoryEpoch: number;
       }
     | {
@@ -401,17 +402,38 @@ export function prepareCompartmentInjection(
     ) {
         clearInjectionCache(sessionId);
     }
-    // The zero-memory twin: a policy transition can also make a memory NEWLY
-    // eligible, and an entry that rendered no memories has no recorded ids to
-    // re-check — the epoch it was built under is the signal. A changed epoch
-    // rebuilds; an unchanged epoch replays byte-stable absence.
+    // The epoch twin: a policy transition can also make a memory NEWLY
+    // eligible, which the id-recheck above cannot see (every rendered id is
+    // still eligible, and a zero-memory entry has no ids at all). Entries
+    // record the project memory epoch at build time; a changed epoch
+    // rebuilds. The persisted memory_block cache replays by id-eligibility
+    // alone, so it is reset with the process entry — otherwise the rebuild
+    // would replay the stale block from session_meta and keep omitting the
+    // newly eligible memory. This check runs on cache-busting passes too:
+    // their rebuild consults session_meta directly, and skipping the reset
+    // there would refresh the process entry's epoch while the stale
+    // persisted block keeps replaying. An unchanged epoch replays
+    // byte-stable.
     if (
-        !isCacheBusting &&
         usableCached !== undefined &&
-        (usableCached.kind === "empty" || usableCached.injection.memoryCount === 0) &&
         usableCached.projectMemoryEpoch !== getProjectMemoryEpoch(db, projectPath)
     ) {
         clearInjectionCache(sessionId);
+        try {
+            db.prepare(
+                "UPDATE session_meta SET memory_block_cache = '', memory_block_count = 0, memory_block_ids = NULL WHERE session_id = ?",
+            ).run(sessionId);
+        } catch (error) {
+            const code = (error as { code?: string } | null)?.code;
+            if (code !== "SQLITE_BUSY") throw error;
+            // The reset is an optimization freshener; a busy writer means the
+            // rebuild recomputes from a possibly stale persisted block for one
+            // turn, which the next pass retries.
+            sessionLog(
+                sessionId,
+                "memory_block_cache epoch reset hit SQLITE_BUSY, retrying next pass",
+            );
+        }
     }
     const revalidatedCached = injectionCache.get(sessionId);
     const replayableCached = revalidatedCached?.db === db ? revalidatedCached : undefined;

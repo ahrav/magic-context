@@ -16,11 +16,13 @@ import type { EnforcementArtifactKind } from "../storage-claim-policy-schema";
 import {
     appendMaturityAssertionInCurrentTransaction,
     currentApprovalActionId,
+    currentValidArtifactIds,
     readMaturityHead,
     readPolicySubject,
     recordApprovalActionInCurrentTransaction,
     recordEnforcementArtifactInCurrentTransaction,
     refreshEffectivePolicyInCurrentTransaction,
+    revokeEnforcementArtifactInCurrentTransaction,
 } from "./storage-claim-policy";
 import { sha256Utf8Hex } from "./storage-claims";
 import {
@@ -353,6 +355,7 @@ const ENFORCE_USAGE = [
     "Usage:",
     "- `/ctx-enforce <memory-id> <artifact-path>` — bind a passing in-project test artifact",
     "- `/ctx-enforce <memory-id> <artifact-path> --kind test|policy|config`",
+    "- `/ctx-enforce <memory-id> --revoke` — revoke every valid enforcement artifact",
 ].join("\n");
 
 /** ponytail: the default evaluator only knows `bun test`; policy/config
@@ -450,6 +453,103 @@ export async function executeClaimEnforceCommand(
     argsText: string,
 ): Promise<ClaimCommandResult> {
     const parts = argsText.trim().split(/\s+/).filter(Boolean);
+    // Artifact revocation is the compromise-response path (KTD6): a revoked
+    // approval alone only lowers maturity until the next approval, because
+    // supportedMaturity would reuse the still-valid artifact and restore
+    // ENFORCED. Revoking covers every valid artifact for the revision so the
+    // rung must be re-earned with a fresh evaluation.
+    if (parts.includes("--revoke")) {
+        const revokeIdText = parts.find((part) => !part.startsWith("--"));
+        const revokeMemoryId = revokeIdText != null ? Number(revokeIdText) : Number.NaN;
+        if (!Number.isSafeInteger(revokeMemoryId) || revokeMemoryId <= 0) {
+            return { text: `## Claim Enforcement\n\n${ENFORCE_USAGE}`, level: "error" };
+        }
+        const revokeTarget = resolveTarget(deps, revokeMemoryId);
+        if ("error" in revokeTarget) {
+            return {
+                text: `## Claim Enforcement — Failed\n\n${revokeTarget.error}`,
+                level: "error",
+            };
+        }
+        const artifactIds = currentValidArtifactIds(deps.db, revokeTarget.revisionId);
+        if (artifactIds.length === 0) {
+            return {
+                text: `## Claim Enforcement — Failed\n\nRevision ${revokeTarget.revisionId} has no currently valid enforcement artifact to revoke.`,
+                level: "error",
+            };
+        }
+        let revokeOutcome: Awaited<
+            ReturnType<typeof runConfirmedClaimMutation<{ revokedCount: number }>>
+        >;
+        try {
+            revokeOutcome = await runConfirmedClaimMutation(deps, {
+                command: "ctx-enforce",
+                argsKey: `revoke:${revokeMemoryId}`,
+                target: revokeTarget,
+                producer: `claim-enforcement:${deps.host}`,
+                operationKey: (nonce) => `enforce-revoke:${revokeTarget.revisionId}:${nonce}`,
+                request: (nonce) => ({
+                    action: "revoke-artifacts",
+                    revisionId: revokeTarget.revisionId,
+                    digest: revokeTarget.digest,
+                    nonce,
+                }),
+                mutate: (nonce) => {
+                    // Re-read inside the transaction: the confirmation window
+                    // is not a lock, and an artifact recorded between the two
+                    // steps must be revoked with the rest.
+                    const liveArtifactIds = currentValidArtifactIds(
+                        deps.db,
+                        revokeTarget.revisionId,
+                    );
+                    for (const artifactId of liveArtifactIds) {
+                        revokeEnforcementArtifactInCurrentTransaction(
+                            deps.db,
+                            artifactId,
+                            `user-command:${deps.host}:ctx-enforce-revoke:${nonce}`,
+                            deps.nowMs,
+                        );
+                    }
+                    refreshEffectivePolicyInCurrentTransaction(deps.db, revokeTarget.revisionId, {
+                        nowMs: deps.nowMs,
+                    });
+                    const effects: MemoryClaimEffect[] = [
+                        {
+                            effectKey: `policy:${revokeTarget.revisionId}:enforcement`,
+                            projectId: revokeTarget.projectId,
+                            claimId: revokeTarget.claimId,
+                            effectType: "lifecycle",
+                        },
+                    ];
+                    return { result: { revokedCount: liveArtifactIds.length }, effects };
+                },
+            });
+        } catch (error) {
+            return {
+                text: `## Claim Enforcement — Failed\n\n${error instanceof Error ? error.message : String(error)}`,
+                level: "error",
+            };
+        }
+        if (revokeOutcome.pending) {
+            return {
+                text: confirmationText(
+                    `/ctx-enforce ${revokeMemoryId} --revoke`,
+                    "Enforcement Revocation",
+                    deps,
+                    revokeTarget,
+                ),
+                level: "warning",
+            };
+        }
+        return {
+            text: [
+                "## Claim Enforcement — Revoked",
+                "",
+                `Revoked ${revokeOutcome.result.revokedCount} enforcement artifact${revokeOutcome.result.revokedCount === 1 ? "" : "s"} for revision ${revokeTarget.revisionId} (digest \`${revokeTarget.digest.slice(0, 12)}…\`). ENFORCED support must be re-earned with a fresh evaluation.`,
+            ].join("\n"),
+            level: "info",
+        };
+    }
     const kindFlagIndex = parts.indexOf("--kind");
     let kind: EnforcementArtifactKind = "test";
     if (kindFlagIndex >= 0) {

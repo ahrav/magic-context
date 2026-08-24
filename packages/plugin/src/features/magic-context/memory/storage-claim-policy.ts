@@ -360,6 +360,26 @@ export function revokeEnforcementArtifactInCurrentTransaction(
     return Number(result.lastInsertRowid);
 }
 
+/**
+ * Every passing, unrevoked enforcement artifact for the revision. Revocation
+ * must cover the full set: revoking only the latest would let a re-approval
+ * restore ENFORCED through an older still-valid artifact.
+ */
+export function currentValidArtifactIds(db: Database, revisionId: number): number[] {
+    const rows = db
+        .prepare(
+            `SELECT artifact.id AS id FROM claim_enforcement_artifacts artifact
+             WHERE artifact.revision_id = ? AND artifact.evaluator_result = 'pass'
+               AND NOT EXISTS (
+                   SELECT 1 FROM claim_enforcement_artifact_events event
+                   WHERE event.artifact_id = artifact.id AND event.action = 'revoked'
+               )
+             ORDER BY artifact.id ASC`,
+        )
+        .all(revisionId) as Array<{ id: number }>;
+    return rows.map((row) => row.id);
+}
+
 // ---------------------------------------------------------------------------
 // Current-support fact readers (R15): append-only history in, booleans out.
 // ---------------------------------------------------------------------------

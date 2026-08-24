@@ -493,4 +493,48 @@ describe("claim enforcement command workflow", () => {
             closeQuietly(db);
         }
     });
+
+    test("artifact revocation removes ENFORCED and a later re-approval cannot restore it", async () => {
+        const db = migratedDb();
+        try {
+            const commandDeps = deps(db, { evaluateArtifact: passEvaluator });
+            const seed = await approvedSeed(db, commandDeps, "enf-artifact-revoke");
+            writeFileSync(join(commandDeps.projectRoot, "gate.test.ts"), "test bytes");
+            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
+            await executeClaimEnforceCommand(commandDeps, `${seed.memoryId} gate.test.ts`);
+            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("ENFORCED");
+
+            // Two-step confirmation, mirroring approval revocation.
+            const first = await executeClaimEnforceCommand(
+                commandDeps,
+                `${seed.memoryId} --revoke`,
+            );
+            expect(first.level).toBe("warning");
+            const second = await executeClaimEnforceCommand(
+                commandDeps,
+                `${seed.memoryId} --revoke`,
+            );
+            expect(second.level).toBe("info");
+            expect(second.text).toContain("Revoked 1 enforcement artifact");
+            expect(effectiveMaturityOf(db, seed.revisionId)).not.toBe("ENFORCED");
+
+            // The compromise-response regression: an approval cycle must not
+            // resurrect ENFORCED through the revoked artifact.
+            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
+            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId} --revoke`);
+            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId}`);
+            await executeClaimApprovalCommand(commandDeps, `${seed.memoryId}`);
+            expect(effectiveMaturityOf(db, seed.revisionId)).toBe("APPROVED");
+
+            // Nothing left to revoke: the command reports the empty set.
+            const empty = await executeClaimEnforceCommand(
+                commandDeps,
+                `${seed.memoryId} --revoke`,
+            );
+            expect(empty.level).toBe("error");
+            expect(empty.text).toContain("no currently valid enforcement artifact");
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });

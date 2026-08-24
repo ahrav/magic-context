@@ -378,3 +378,14 @@ export function filterMemoriesByPolicy(
     }
     return { memories: kept, labels };
 }
+
+/** Id-level twin of `filterMemoriesByPolicy` for callers that hold only ids. */
+export function filterMemoryIdsByPolicy(
+    db: Database,
+    memoryIds: readonly number[],
+    surface: MemoryPolicySurface,
+): number[] {
+    if (!hasClaimEffectivePolicy(db)) return [...memoryIds];
+    const rows = readMemoryPolicyRows(db, memoryIds);
+    return memoryIds.filter((id) => decideMemoryPolicy(rows.get(id), surface).eligible);
+}

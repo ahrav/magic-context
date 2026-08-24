@@ -1,7 +1,10 @@
 import { createHmac, randomUUID } from "node:crypto";
 
 import type { Compartment } from "../../features/magic-context/compartment-storage";
-import { filterMemoriesByPolicy } from "../../features/magic-context/memory/storage-claim-visibility";
+import {
+    filterMemoriesByPolicy,
+    filterMemoryIdsByPolicy,
+} from "../../features/magic-context/memory/storage-claim-visibility";
 import {
     buildWorkspaceMemorySqlFilter,
     getMaxMemoryIdForProjects,
@@ -1580,15 +1583,26 @@ export async function buildModuleStateSyncPayload(args: {
         merged_from: memory.mergedFrom,
         metadata_json: memory.metadataJson,
     }));
+    // Mutation targets cross the boundary with `new_content`, so they get the
+    // same automatic policy as the snapshot rows: a hidden target's update
+    // must not ship its bytes through the mutation lane (a held-open compat
+    // writer can advance the mutation watermark without an epoch bump). The
+    // reader still force-includes visibility-mutation targets, so removal
+    // signals for previously mirrored rows are unaffected; the row itself is
+    // repaired by the next full snapshot's replace scope and delete ids.
     const renderedMemoryIds = memoryMutationsChanged
         ? args.force
-            ? allMemories.map((memory) => memory.id)
-            : readRenderedMemoryIds({
-                  db: args.pass.db,
-                  projectPath: args.pass.projectPath,
-                  workspace,
-                  nowMs: args.pass.nowMs,
-              })
+            ? memoryRows.map((memory) => memory.id)
+            : filterMemoryIdsByPolicy(
+                  args.pass.db,
+                  readRenderedMemoryIds({
+                      db: args.pass.db,
+                      projectPath: args.pass.projectPath,
+                      workspace,
+                      nowMs: args.pass.nowMs,
+                  }),
+                  "auto_inject",
+              )
         : [];
     const userProfile = includeUserProfile
         ? getActiveUserMemories(args.pass.db).map((memory) => memory.content)

@@ -16063,13 +16063,16 @@ fn prune_absent_authority_memories_tx(
     }
     Ok(())
 }
-
 /// Delete explicitly named mirrored memory rows. The host names ids the
 /// policy hides from the native lane but that the replace scope cannot
 /// reach — a foreign workspace member's rows — so the guard is the same
 /// context-store ownership check the scope prune applies, not a project
-/// scope: with no route binding only unadopted mirror rows (NULL uuid) are
-/// eligible; with a binding, this store's adopted rows are eligible too.
+/// scope. Ids translate through the authority seed mapping first; with a
+/// bound store, TypeScript and native row ids are independent namespaces,
+/// so an unmapped id must never be treated as a native row id (it could
+/// name an unrelated module-created row). Unmapped ids still prune the
+/// unadopted legacy mirror arm, whose NULL-uuid rows share the TypeScript
+/// id namespace.
 fn delete_authority_memories_by_id_tx(
     tx: &rusqlite::Transaction<'_>,
     route_project_root: &str,
@@ -16079,34 +16082,59 @@ fn delete_authority_memories_by_id_tx(
         return Ok(());
     }
     let context_store_uuid = authority_route_context_store_uuid_tx(tx, route_project_root)?;
-    let mut delete_ids: Vec<i64> = Vec::with_capacity(ids.len());
+    let mut mapped_ids: Vec<i64> = Vec::new();
+    let mut unmapped_ids: Vec<i64> = Vec::new();
     for id in ids {
-        let translated = authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), *id)?;
-        delete_ids.push(translated.unwrap_or(*id));
+        match authority_memory_id_for_source_tx(tx, context_store_uuid.as_deref(), *id)? {
+            Some(translated) => mapped_ids.push(translated),
+            None => unmapped_ids.push(*id),
+        }
     }
-    let ids_json = format!(
-        "[{}]",
-        delete_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    tx.execute(
-        "DELETE FROM mc_memory_mappings
-          WHERE memory_id IN (
-              SELECT id FROM mc_memories
-               WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
-                 AND id IN (SELECT value FROM json_each(?2))
-          )",
-        params![context_store_uuid, ids_json],
-    )?;
-    tx.execute(
-        "DELETE FROM mc_memories
-          WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
-            AND id IN (SELECT value FROM json_each(?2))",
-        params![context_store_uuid, ids_json],
-    )?;
+    let to_json = |ids: &[i64]| {
+        format!(
+            "[{}]",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    if !mapped_ids.is_empty() {
+        let ids_json = to_json(&mapped_ids);
+        tx.execute(
+            "DELETE FROM mc_memory_mappings
+              WHERE memory_id IN (
+                  SELECT id FROM mc_memories
+                   WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
+                     AND id IN (SELECT value FROM json_each(?2))
+              )",
+            params![context_store_uuid, ids_json],
+        )?;
+        tx.execute(
+            "DELETE FROM mc_memories
+              WHERE (context_store_uuid IS NULL OR context_store_uuid IS ?1)
+                AND id IN (SELECT value FROM json_each(?2))",
+            params![context_store_uuid, ids_json],
+        )?;
+    }
+    if !unmapped_ids.is_empty() {
+        let ids_json = to_json(&unmapped_ids);
+        tx.execute(
+            "DELETE FROM mc_memory_mappings
+              WHERE memory_id IN (
+                  SELECT id FROM mc_memories
+                   WHERE context_store_uuid IS NULL
+                     AND id IN (SELECT value FROM json_each(?1))
+              )",
+            params![ids_json],
+        )?;
+        tx.execute(
+            "DELETE FROM mc_memories
+              WHERE context_store_uuid IS NULL
+                AND id IN (SELECT value FROM json_each(?1))",
+            params![ids_json],
+        )?;
+    }
     Ok(())
 }
 
@@ -26931,7 +26959,7 @@ mod shadow_tests {
             .with_conn_fenced(|tx| {
                 tx.execute(
                     "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
-                     VALUES ('context', ?1, 'memories', 'MODULE')",
+                     VALUES ('context', ?1, 'memories', 'TS')",
                     params![identity],
                 )?;
                 tx.execute(
@@ -27191,6 +27219,72 @@ mod shadow_tests {
             })
             .unwrap();
         assert_eq!(mapping_count, 0);
+    }
+
+    #[test]
+    fn state_sync_delete_ids_never_treat_unmapped_ids_as_native_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let route_project_root = "/worktrees/repo";
+        let identity = "git:identity";
+        store
+            .inner
+            .with_conn_fenced(|tx| {
+                tx.execute(
+                    "INSERT INTO mc_authority(context_store_uuid, project, domain, state)
+                     VALUES ('context', ?1, 'memories', 'TS')",
+                    params![identity],
+                )?;
+                tx.execute(
+                    "INSERT INTO mc_authority_route_bindings(route_project_root, context_store_uuid, project)
+                     VALUES (?1, 'context', ?2)",
+                    params![route_project_root, identity],
+                )?;
+                // A module-created native row whose id collides with an
+                // unmapped TypeScript id named for deletion. TS and native
+                // ids are independent namespaces under a binding, so this
+                // row must survive.
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, status,
+                          first_seen_at, created_at, updated_at, last_seen_at,
+                          context_store_uuid, context_row_id)
+                     VALUES (77, ?1, 'CONFIG_VALUES', 'module fact', 'module-hash', 'active',
+                             0, 0, 0, 0, 'context', 9001)",
+                    params![identity],
+                )?;
+                // An adopted row mapped from TypeScript id 55 to native id 88.
+                tx.execute(
+                    "INSERT INTO mc_memories
+                         (id, project_path, category, content, normalized_hash, status,
+                          first_seen_at, created_at, updated_at, last_seen_at,
+                          context_store_uuid, context_row_id)
+                     VALUES (88, ?1, 'CONFIG_VALUES', 'adopted fact', 'adopted-hash', 'active',
+                             0, 0, 0, 0, 'context', 55)",
+                    params![identity],
+                )?;
+                // Delete ids: 55 (mapped -> native 88) and 77 (unmapped; its
+                // raw value may only touch the NULL-uuid legacy arm).
+                delete_authority_memories_by_id_tx(tx, route_project_root, &[55, 77])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let rows = store
+            .inner
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT id, COALESCE(context_store_uuid, 'null') FROM mc_memories ORDER BY id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap();
+        // The module-created row (id 77, uuid 'context') survives the raw 77
+        // delete; the adopted row (native 88) is gone via its mapping.
+        assert_eq!(rows, vec![(77, "context".to_string())]);
     }
 
     #[test]
