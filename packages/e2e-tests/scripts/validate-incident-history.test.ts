@@ -57,6 +57,7 @@ function fixtureFiles(): FixtureFiles {
                         verifier_binding: {
                             driver: "demo/driver",
                             verifier: "demo/verifier",
+                            binding_status: "declared",
                             invalid_state_evidence: ["false success narration fixture"],
                         },
                         blocked_by: [],

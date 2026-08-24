@@ -1,4 +1,1047 @@
 {
     "schema": "incident-catalog/v1",
-    "families": []
+    "families": [
+        {
+            "id": "fam-archived-reobservation",
+            "title": "Archived re-observation (A5)",
+            "source_claims": [
+                "claim-audit-a5"
+            ],
+            "variants": [
+                {
+                    "id": "var-a5-archived-reobservation",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-audit-a5"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "the audited path is the shared TS memory implementation; OpenCode is the canonical cross-cutting audit harness"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "Rust module owns its own memory authority; the audited behavior is the TS implementation"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-a5-1",
+                        "fingerprint": "cdd43a8c8b701e1264ea289d00adb36c01b586fc7c787ee7207bb17eb52d17b1"
+                    },
+                    "normative_checks": [
+                        "check-a5-archived-row-preserved",
+                        "check-a5-recurrence-incremented",
+                        "check-a5-no-active-duplicate",
+                        "check-a5-no-agent-recall"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveArchivedReobservation",
+                        "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyArchivedReobservation",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "re-observation creates a second active row",
+                            "archived row revived without an explicit restore",
+                            "archived content visible to agent recall"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-supersede-reconciliation",
+            "title": "Supersede reconciliation (A10/A41)",
+            "source_claims": [
+                "claim-audit-a10",
+                "claim-audit-a41"
+            ],
+            "variants": [
+                {
+                    "id": "var-a10-supersede-effective-context",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-audit-a10",
+                        "claim-audit-a41"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "the audited path is the shared TS memory implementation; OpenCode is the canonical cross-cutting audit harness"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "Rust module owns its own memory authority; the audited behavior is the TS implementation"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-a10-1",
+                        "fingerprint": "4418d27519d6c757c01b33fa839f123b40e2eb0f17ed478aa03ab51df972400f"
+                    },
+                    "normative_checks": [
+                        "check-a10-effective-context-reconciled",
+                        "check-a10-hard-fold-convergence",
+                        "check-a10-no-dual-authority"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveSupersedeReconciliation",
+                        "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifySupersedeReconciliation",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "old and new claims both authoritative after the supersede",
+                            "stale cached m0 without the m1 correction"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-historian-failure-dump",
+            "title": "Historian failure dump containment (A28)",
+            "source_claims": [
+                "claim-audit-a28"
+            ],
+            "variants": [
+                {
+                    "id": "var-a28-historian-dump-containment",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-audit-a28"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "the historian failure-dump path under test is the OpenCode compartment runner"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "the Rust stack publishes through the hermetic Broca producer, not the audited dump path"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-a28-1",
+                        "fingerprint": "1d65f3fb16d1ff93202d9b4f60be639a3b0eca305849115b10f28ffb69173d3b"
+                    },
+                    "normative_checks": [
+                        "check-a28-project-local-dump",
+                        "check-a28-gitignore-coverage",
+                        "check-a28-report-redaction",
+                        "check-a28-metacharacter-safety"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/audit-background-lifecycle.ts#driveHistorianFailureDump",
+                        "verifier": "src/incident-pool/scenarios/audit-background-lifecycle.ts#verifyHistorianFailureDump",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "dump written outside the isolated project",
+                            "dump not covered by gitignore",
+                            "synthetic canary present in published artifacts",
+                            "terminal metacharacters escape as a command or side effect"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-historian-inconsistent-state",
+            "title": "Historian inconsistent-state claim (bead wording beside A28)",
+            "source_claims": [
+                "claim-bead-historian-inconsistent-state"
+            ],
+            "variants": [
+                {
+                    "id": "var-historian-inconsistent-state-claim",
+                    "lane": "adjudication-only",
+                    "source_claims": [
+                        "claim-bead-historian-inconsistent-state"
+                    ],
+                    "applicability": null,
+                    "semantic_revision": {
+                        "id": "rev-historian-inconsistent-1",
+                        "fingerprint": "2ea63fb4a07e1417eed9dda760bb0cf827fbb81d2e6056c1acc06b6b049646e9"
+                    },
+                    "normative_checks": [],
+                    "verifier_binding": null,
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-embedding-freshness",
+            "title": "Embedding freshness (A32)",
+            "source_claims": [
+                "claim-audit-a32"
+            ],
+            "variants": [
+                {
+                    "id": "var-a32-stale-embedding-recall",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-audit-a32"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "Pi embeddings are disabled; the semantic-lane precondition cannot hold on Pi"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "memory embeddings are owned by the TS plugin sweep; Rust has no equivalent stale-vector surface"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-a32-1",
+                        "fingerprint": "e78f6e2c7e8d698aa5d7e8744e8e21a7b65252a5c84b1b5562e87d7556dbe2a7"
+                    },
+                    "normative_checks": [
+                        "check-a32-fresh-semantic-recall",
+                        "check-a32-stale-vector-replaced"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveEmbeddingFreshness",
+                        "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyEmbeddingFreshness",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "lexical overlap accidentally satisfies recall without the semantic lane",
+                            "query succeeds against a re-embedded (fresh) vector presented as stale"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-cross-source-rank",
+            "title": "Cross-source rank remap (A44)",
+            "source_claims": [
+                "claim-audit-a44"
+            ],
+            "variants": [
+                {
+                    "id": "var-a44-cross-source-rank-remap",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-audit-a44"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "ctx_search ranking is the shared TS implementation; OpenCode is the canonical audit harness"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "ctx_search ranking is the shared TS implementation; Rust does not own this surface"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-a44-1",
+                        "fingerprint": "328776f0f8c91f09cb85cd6dfe9efe0acf6757917782669de8fec725e53d79a6"
+                    },
+                    "normative_checks": [
+                        "check-a44-known-better-memory-outranks",
+                        "check-a44-two-candidate-nonvacuity"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/audit-memory-search.ts#driveCrossSourceRank",
+                        "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyCrossSourceRank",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "verifier fed only one eligible candidate",
+                            "message hit missing so the ordering is vacuously correct"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-lease-loss-residual-write",
+            "title": "Lease-loss residual write (A47)",
+            "source_claims": [
+                "claim-audit-a47"
+            ],
+            "variants": [
+                {
+                    "id": "var-a47-lease-loss-residual-write",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-audit-a47"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "the agentic curate path under test is the OpenCode dreamer child-session loop"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "the dreamer lease and agentic memory tasks are TS plugin surfaces"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-a47-1",
+                        "fingerprint": "acf4b1eccfc3002194325a1d6b2d412c63a72c61d09470523c63ded848e70c76"
+                    },
+                    "normative_checks": [
+                        "check-a47-no-post-lease-loss-commit",
+                        "check-a47-single-terminal-lease-event",
+                        "check-a47-child-released"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/audit-background-lifecycle.ts#driveLeaseLossResidualWrite",
+                        "verifier": "src/incident-pool/scenarios/audit-background-lifecycle.ts#verifyLeaseLossResidualWrite",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "lease never acquired before the guarded write",
+                            "replacement ownership never committed",
+                            "guarded write never attempted so the trace is vacuous"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-pending-note-recall",
+            "title": "Pending smart-note recall (A54)",
+            "source_claims": [
+                "claim-audit-a54"
+            ],
+            "variants": [
+                {
+                    "id": "var-a54-pending-note-recall",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-audit-a54"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "smart notes and ctx_search are the shared TS implementation; OpenCode is the canonical audit harness"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "smart notes are a TS plugin surface with no Rust module equivalent"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-a54-1",
+                        "fingerprint": "d1ed8e83a05351fc765322e6db8d1b36e14a752e493df8592886d19459b5043b"
+                    },
+                    "normative_checks": [
+                        "check-a54-explicit-search-pending-status",
+                        "check-a54-no-unprompted-surfacing"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/audit-memory-search.ts#drivePendingNoteRecall",
+                        "verifier": "src/incident-pool/scenarios/audit-memory-search.ts#verifyPendingNoteRecall",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "pending note surfaces on an ordinary turn without an explicit search",
+                            "explicit search result omits the pending status label"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-wrong-dreamer-archival",
+            "title": "Wrong Dreamer archival (bead wording, verify-prompt risk language)",
+            "source_claims": [
+                "claim-bead-wrong-dreamer-archival"
+            ],
+            "variants": [
+                {
+                    "id": "var-wrong-dreamer-archival-claim",
+                    "lane": "adjudication-only",
+                    "source_claims": [
+                        "claim-bead-wrong-dreamer-archival"
+                    ],
+                    "applicability": null,
+                    "semantic_revision": {
+                        "id": "rev-wrong-archival-1",
+                        "fingerprint": "02b51299480d07c7323a26afc0719cf6e1a5a9135410b84db00a731e8f7006c5"
+                    },
+                    "normative_checks": [],
+                    "verifier_binding": null,
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-first-render-tag-stability",
+            "title": "First-render tag stability (parity A1/A3)",
+            "source_claims": [
+                "claim-parity-a1",
+                "claim-parity-a3"
+            ],
+            "variants": [
+                {
+                    "id": "var-parity-a1-pure-defer-stability",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-parity-a1"
+                    ],
+                    "applicability": {
+                        "harness": "rust",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "the TS transform never exhibited the first-render tag transition; the shared driver still runs green under tests/cache-invariants.test.ts"
+                            },
+                            {
+                                "harness": "pi",
+                                "reason": "the defect was Rust-module tag activation; Pi cache stability has its own pi-cache-invariants coverage"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-parity-a1-1",
+                        "fingerprint": "fcb69c8868f257942726870cb84d6273e4d74a2dcbf03488c232fb922f6b04a7"
+                    },
+                    "normative_checks": [
+                        "check-a1-defer-request-floor",
+                        "check-a1-zero-prefix-busts"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/source-linked-regressions.ts#driveFirstRenderPureDeferStability",
+                        "verifier": "src/incident-pool/scenarios/source-linked-regressions.ts#verifyFirstRenderPureDeferStability",
+                        "binding_status": "live",
+                        "invalid_state_evidence": [
+                            "crafted bust observation is rejected (source-linked-regressions.test.ts)",
+                            "crafted below-floor request count is rejected (source-linked-regressions.test.ts)"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-parity-a3-ctx-reduce-survival",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-parity-a3"
+                    ],
+                    "applicability": {
+                        "harness": "rust",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "same root cause and shared driver as parity A1; the OpenCode green suite runs it via tests/cache-invariants.test.ts"
+                            },
+                            {
+                                "harness": "pi",
+                                "reason": "the defect was Rust-module tag activation; Pi cache stability has its own pi-cache-invariants coverage"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-parity-a3-1",
+                        "fingerprint": "43f65c562edf2966904c53543c8215cf0c60b9fd85395291798850070b44f136"
+                    },
+                    "normative_checks": [
+                        "check-a3-reduce-on-wire",
+                        "check-a3-zero-prefix-busts",
+                        "check-a3-reduce-retained-final-wire"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/source-linked-regressions.ts#driveAgedCtxReduceSurvival",
+                        "verifier": "src/incident-pool/scenarios/source-linked-regressions.ts#verifyAgedCtxReduceSurvival",
+                        "binding_status": "live",
+                        "invalid_state_evidence": [
+                            "crafted vanished-ctx_reduce final wire is rejected (source-linked-regressions.test.ts)",
+                            "crafted bust observation is rejected (source-linked-regressions.test.ts)"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-synthetic-todo-handoff",
+            "title": "Synthetic todo handoff (parity Todo 1-5, Rust)",
+            "source_claims": [
+                "claim-parity-todo-1",
+                "claim-parity-todo-2",
+                "claim-parity-todo-3",
+                "claim-parity-todo-4",
+                "claim-parity-todo-5"
+            ],
+            "variants": [
+                {
+                    "id": "var-todo-1-synthetic-injection",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-parity-todo-1"
+                    ],
+                    "applicability": {
+                        "harness": "rust",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode synthetic todo behavior is green and stays covered by tests/todo-synthesis.test.ts"
+                            },
+                            {
+                                "harness": "pi",
+                                "reason": "the Pi interface gap is a separate family (fam-pi-todo-gap) and must not satisfy Rust results"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-todo-1-1",
+                        "fingerprint": "07eff0a4d81ac6f7b1130edcfc44474ce0d5460749a62bed2460cf92a68e55a3"
+                    },
+                    "normative_checks": [
+                        "check-todo1-synthetic-pair-present",
+                        "check-todo1-todo-state-captured"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoSyntheticInjection",
+                        "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoSyntheticInjection",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "no todowrite tool execution so the reproduction precondition fails",
+                            "synthetic pair injected with the wrong deterministic call id"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-todo-2-defer-replay",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-parity-todo-2"
+                    ],
+                    "applicability": {
+                        "harness": "rust",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode replay behavior is green under tests/todo-synthesis.test.ts"
+                            },
+                            {
+                                "harness": "pi",
+                                "reason": "interface-specific Pi variants live in fam-pi-todo-gap"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-todo-2-1",
+                        "fingerprint": "3258f5318bfee3c9262e1760b7c2bc63bdc7f343b7dce37736b79e9c88490e10"
+                    },
+                    "normative_checks": [
+                        "check-todo2-byte-identical-replay"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoDeferReplay",
+                        "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoDeferReplay",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "replay bytes compared against a mutated synthetic pair"
+                        ]
+                    },
+                    "blocked_by": [
+                        "var-todo-1-synthetic-injection"
+                    ],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-todo-3-newer-todo-deferral",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-parity-todo-3"
+                    ],
+                    "applicability": {
+                        "harness": "rust",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode deferral behavior is green under tests/todo-synthesis.test.ts"
+                            },
+                            {
+                                "harness": "pi",
+                                "reason": "interface-specific Pi variants live in fam-pi-todo-gap"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-todo-3-1",
+                        "fingerprint": "ee1a0e2405dc2260cd17abf1d9d74dace09bf1e678fa5c387a8a269592895cf5"
+                    },
+                    "normative_checks": [
+                        "check-todo3-newer-todo-deferred"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoNewerDeferral",
+                        "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoNewerDeferral",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "newer real todo folded early presented as correct deferral"
+                        ]
+                    },
+                    "blocked_by": [
+                        "var-todo-1-synthetic-injection"
+                    ],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-todo-4-legacy-anchor-heal",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-parity-todo-4"
+                    ],
+                    "applicability": {
+                        "harness": "rust",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode self-heal behavior is green under tests/todo-synthesis.test.ts"
+                            },
+                            {
+                                "harness": "pi",
+                                "reason": "interface-specific Pi variants live in fam-pi-todo-gap"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-todo-4-1",
+                        "fingerprint": "dd844808cb5a261cebc9449872fadbf163c7b865d4c865ed48b76b46ea96935c"
+                    },
+                    "normative_checks": [
+                        "check-todo4-legacy-anchor-self-heal"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoLegacyAnchorHeal",
+                        "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoLegacyAnchorHeal",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "anchor row with correct bytes but wrong persisted state linkage"
+                        ]
+                    },
+                    "blocked_by": [
+                        "var-todo-1-synthetic-injection"
+                    ],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-todo-5-terminal-clear",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-parity-todo-5"
+                    ],
+                    "applicability": {
+                        "harness": "rust",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode terminal clearing is green under tests/todo-synthesis.test.ts"
+                            },
+                            {
+                                "harness": "pi",
+                                "reason": "interface-specific Pi variants live in fam-pi-todo-gap"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-todo-5-1",
+                        "fingerprint": "119981d8a6177243285465974238f741a1bb8ada89869ea19f621f197451a3ca"
+                    },
+                    "normative_checks": [
+                        "check-todo5-terminal-state-clears-anchor"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-synthetic-todo.ts#driveTodoTerminalClear",
+                        "verifier": "src/incident-pool/scenarios/parity-synthetic-todo.ts#verifyTodoTerminalClear",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "terminal clearing simulated while no active pair ever existed"
+                        ]
+                    },
+                    "blocked_by": [
+                        "var-todo-1-synthetic-injection"
+                    ],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-pi-todo-gap",
+            "title": "Pi synthetic todo gap (declared-red suite)",
+            "source_claims": [
+                "claim-pi-todo-synthesis-gap"
+            ],
+            "variants": [
+                {
+                    "id": "var-pi-todo-capture",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-pi-todo-synthesis-gap"
+                    ],
+                    "applicability": {
+                        "harness": "pi",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode capture behavior is green; this family is the Pi interface gap and must not inflate other harnesses"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "the five Rust variants are a separate family; Pi results cannot satisfy or replace them"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-pi-todo-capture-1",
+                        "fingerprint": "fca7ef177a3d3ab76a19cea07a62203b00dc40434f0212265a2920635eed2869"
+                    },
+                    "normative_checks": [
+                        "check-pi-todo-capture-last-state"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoCapture",
+                        "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoCapture",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "subagent todowrite captured as parent session state"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-pi-todo-synthetic-injection",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-pi-todo-synthesis-gap"
+                    ],
+                    "applicability": {
+                        "harness": "pi",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode injection behavior is green; this family is the Pi interface gap"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "Rust injection variants live in fam-synthetic-todo-handoff"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-pi-todo-injection-1",
+                        "fingerprint": "3fb9172caa4f22a875bd4230ce32cb9cdc3128b2700e64637d1910084f0f7398"
+                    },
+                    "normative_checks": [
+                        "check-pi-todo-synthetic-pair-injected"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoInjection",
+                        "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoInjection",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "synthetic pair injected without a captured snapshot"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-pi-todo-defer-replay",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-pi-todo-synthesis-gap"
+                    ],
+                    "applicability": {
+                        "harness": "pi",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode replay behavior is green; this family is the Pi interface gap"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "Rust replay variants live in fam-synthetic-todo-handoff"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-pi-todo-replay-1",
+                        "fingerprint": "211009b292f8894b9ed2f5576c3b3a0d63ae5d2d2fa43017d764a5104aad942f"
+                    },
+                    "normative_checks": [
+                        "check-pi-todo-byte-identical-replay"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoDeferReplay",
+                        "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoDeferReplay",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "replay compared while no synthetic anchor was persisted"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-pi-todo-anchor-lifecycle",
+                    "lane": "known-red",
+                    "source_claims": [
+                        "claim-pi-todo-synthesis-gap"
+                    ],
+                    "applicability": {
+                        "harness": "pi",
+                        "omitted": [
+                            {
+                                "harness": "opencode",
+                                "reason": "OpenCode anchor lifecycle is green; this family is the Pi interface gap"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "Rust anchor variants live in fam-synthetic-todo-handoff"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-pi-todo-anchor-1",
+                        "fingerprint": "1b277097b9e351ce7862fd254c3d767fd5e48beb8f13f82f7666cd2dfac44902"
+                    },
+                    "normative_checks": [
+                        "check-pi-todo-anchor-clear-and-subagent-gate"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/parity-pi-todo.ts#drivePiTodoAnchorLifecycle",
+                        "verifier": "src/incident-pool/scenarios/parity-pi-todo.ts#verifyPiTodoAnchorLifecycle",
+                        "binding_status": "declared",
+                        "invalid_state_evidence": [
+                            "terminal-only state leaves the synthetic anchor in place"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-parity-harness-gaps",
+            "title": "Parity harness gaps (B9, long-running composite)",
+            "source_claims": [
+                "claim-parity-b9",
+                "claim-parity-long-running-composite"
+            ],
+            "variants": [
+                {
+                    "id": "var-parity-b9-producer-gap",
+                    "lane": "adjudication-only",
+                    "source_claims": [
+                        "claim-parity-b9"
+                    ],
+                    "applicability": null,
+                    "semantic_revision": {
+                        "id": "rev-parity-b9-1",
+                        "fingerprint": "7b46a7fb1d1e8a0b4babb0deea3bfde1d8b386595b4dd7cd30c95ae1dc0e43ce"
+                    },
+                    "normative_checks": [],
+                    "verifier_binding": null,
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-parity-long-composite-gap",
+                    "lane": "adjudication-only",
+                    "source_claims": [
+                        "claim-parity-long-running-composite"
+                    ],
+                    "applicability": null,
+                    "semantic_revision": {
+                        "id": "rev-parity-long-composite-1",
+                        "fingerprint": "f5136657dc02f1b687cc3b132ea6833a3435fabc524511a745494716947f31c0"
+                    },
+                    "normative_checks": [],
+                    "verifier_binding": null,
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        },
+        {
+            "id": "fam-thinking-block-flake",
+            "title": "Thinking-block flake and green successor",
+            "source_claims": [
+                "claim-thinking-block-flake"
+            ],
+            "variants": [
+                {
+                    "id": "var-thinking-flake-adjudication",
+                    "lane": "adjudication-only",
+                    "source_claims": [
+                        "claim-thinking-block-flake"
+                    ],
+                    "applicability": null,
+                    "semantic_revision": {
+                        "id": "rev-thinking-flake-1",
+                        "fingerprint": "ddca6ade6a5bf95d87b93a4f098110b552b977d7be62c773e9ffebbf40fe53de"
+                    },
+                    "normative_checks": [],
+                    "verifier_binding": null,
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-thinking-nudge-anchor",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-thinking-block-flake"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "tests/pi-thinking-block-safety.test.ts owns the Pi-interface coverage"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "the shared driver asserts the Rust cleared-reasoning shape when invoked under MC_E2E_MODE=rust; canonical scheduling is OpenCode"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-thinking-a-1",
+                        "fingerprint": "e7ffe64e29f72a4ab283b6c8f522cdda81411cebe9854ff6d9198ecb0992017d"
+                    },
+                    "normative_checks": [
+                        "check-thinking-a-no-nudge-in-signed-assistant",
+                        "check-thinking-a-signature-byte-stable",
+                        "check-thinking-a-nonvacuous-inspection"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/source-linked-regressions.ts#driveThinkingNudgeAnchor",
+                        "verifier": "src/incident-pool/scenarios/source-linked-regressions.ts#verifyThinkingNudgeAnchor",
+                        "binding_status": "live",
+                        "invalid_state_evidence": [
+                            "crafted nudge marker inside a signed assistant is rejected (source-linked-regressions.test.ts)",
+                            "crafted vacuous zero-inspection observation is rejected (source-linked-regressions.test.ts)"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-thinking-dropped-shell",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-thinking-block-flake"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "tests/pi-thinking-block-safety.test.ts owns the Pi-interface coverage"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "the shared driver asserts the Rust whole-arc supersede shape when invoked under MC_E2E_MODE=rust; canonical scheduling is OpenCode"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-thinking-b-1",
+                        "fingerprint": "5a59f4bd25141f7cddd99b8bc05e4967de5ce79dfc5e86d8d3c4e75dd8d459a6"
+                    },
+                    "normative_checks": [
+                        "check-thinking-b-drop-emitted",
+                        "check-thinking-b-paste-body-absent",
+                        "check-thinking-b-shell-preserved",
+                        "check-thinking-b-signed-replay-intact",
+                        "check-thinking-b-turn-boundary-preserved"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/source-linked-regressions.ts#driveThinkingDroppedShell",
+                        "verifier": "src/incident-pool/scenarios/source-linked-regressions.ts#verifyThinkingDroppedShell",
+                        "binding_status": "live",
+                        "invalid_state_evidence": [
+                            "crafted merged-adjacent-assistant observation is rejected (source-linked-regressions.test.ts)",
+                            "crafted surviving paste body is rejected (source-linked-regressions.test.ts)"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                },
+                {
+                    "id": "var-thinking-image-survival",
+                    "lane": "green",
+                    "source_claims": [
+                        "claim-thinking-block-flake"
+                    ],
+                    "applicability": {
+                        "harness": "opencode",
+                        "omitted": [
+                            {
+                                "harness": "pi",
+                                "reason": "tests/pi-thinking-block-safety.test.ts owns the Pi-interface coverage"
+                            },
+                            {
+                                "harness": "rust",
+                                "reason": "the shared driver asserts the Rust covered-history shape when invoked under MC_E2E_MODE=rust; canonical scheduling is OpenCode"
+                            }
+                        ]
+                    },
+                    "semantic_revision": {
+                        "id": "rev-thinking-c-1",
+                        "fingerprint": "f1dc80b179ead53ce9783d709841f2eba2d4312f0000b97be6d8f2ea82f70001"
+                    },
+                    "normative_checks": [
+                        "check-thinking-c-drop-emitted",
+                        "check-thinking-c-dropped-text-absent",
+                        "check-thinking-c-shell-preserved",
+                        "check-thinking-c-image-part-survives"
+                    ],
+                    "verifier_binding": {
+                        "driver": "src/incident-pool/scenarios/source-linked-regressions.ts#driveThinkingImageSurvival",
+                        "verifier": "src/incident-pool/scenarios/source-linked-regressions.ts#verifyThinkingImageSurvival",
+                        "binding_status": "live",
+                        "invalid_state_evidence": [
+                            "crafted stripped-image observation is rejected (source-linked-regressions.test.ts)",
+                            "crafted surviving dropped text is rejected (source-linked-regressions.test.ts)"
+                        ]
+                    },
+                    "blocked_by": [],
+                    "evidence_refs": []
+                }
+            ]
+        }
+    ]
 }

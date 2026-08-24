@@ -81,6 +81,7 @@ function variantFixture(id: string, overrides: Partial<IncidentVariant> = {}): I
         verifier_binding: {
             driver: "demo/driver",
             verifier: "demo/verifier",
+            binding_status: "declared",
             invalid_state_evidence: ["stale-plus-current coexistence fixture"],
         },
         blocked_by: [],

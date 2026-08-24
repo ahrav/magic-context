@@ -45,6 +45,13 @@ import {
 import { TestHarness } from "../src/harness";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
+import {
+    driveAgedCtxReduceSurvival,
+    driveFirstRenderPureDeferStability,
+    failedCheckIds,
+    verifyAgedCtxReduceSurvival,
+    verifyFirstRenderPureDeferStability,
+} from "../src/incident-pool/scenarios/source-linked-regressions";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 const HISTORIAN_SYSTEM_MARKER = "the hippocampus of a long-running coding agent";
@@ -280,34 +287,6 @@ function bumpProjectEpoch(): void {
     });
 }
 
-/** Emit a single ctx_reduce tool call on the first main-agent request that exposes it. */
-function emitCtxReduceOnce(drop: string): void {
-    let emitted = false;
-    h.mock.addMatcher((body) => {
-        if (emitted) return null;
-        const sys = JSON.stringify(body.system ?? "");
-        if (!sys.includes("## Magic Context")) return null;
-        const tools = Array.isArray(body.tools) ? body.tools : [];
-        const name = tools
-            .map((t) => (t && typeof t === "object" ? (t as { name?: unknown }).name : null))
-            .find((n) => typeof n === "string" && /ctx_reduce/.test(n)) as string | undefined;
-        if (!name) return null;
-        emitted = true;
-        return {
-            content: [
-                {
-                    type: "tool_use",
-                    id: `toolu_ci_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
-                    name,
-                    input: { drop },
-                },
-            ],
-            stop_reason: "tool_use" as const,
-            usage: DEFER_USAGE,
-        };
-    });
-}
-
 function emitMemoryToolOnce(input: Record<string, unknown>): () => boolean {
     let emitted = false;
     h.mock.addMatcher((body) => {
@@ -377,31 +356,21 @@ async function waitForRustCompartment(sessionId: string): Promise<void> {
     throw new Error("waitForRustCompartment timed out after 60000ms");
 }
 
-function assertNoBusts(label: string): void {
-    const requests = mainAgentRequests(h.mock.requests());
-    const busts = findBusts(requests);
-    if (busts.length > 0) {
-        // Surface the exact wire divergence so a CI failure is actionable.
-        console.error(`[cache-invariant:${label}] ${busts.length} bust(s):\n${formatBustReport(busts)}`);
-    }
-    expect({ label, busts: busts.length }).toEqual({ label, busts: 0 });
-}
-
 describe("cache invariants — replay class", () => {
     describe("#given a low-pressure conversation (A1)", () => {
         describe("#when several pure-defer turns grow the tail", () => {
             it("#then the cached prefix never busts across defer passes", async () => {
-                //#given / #when
-                const sessionId = await h.createSession();
-                for (let i = 1; i <= 6; i++) {
-                    setDefer(`A1 reply ${i}`);
-                    await h.sendPrompt(sessionId, `A1 turn ${i}: low-pressure cache-stability probe.`);
-                }
+                const observation = await driveFirstRenderPureDeferStability(h);
 
-                //#then
-                const requests = mainAgentRequests(h.mock.requests());
-                expect(requests.length).toBeGreaterThanOrEqual(6);
-                assertNoBusts("A1-low-pressure-defer");
+                if (observation.bustReport) {
+                    console.error(
+                        `[cache-invariant:A1-low-pressure-defer] ${observation.bustCount} bust(s):\n${observation.bustReport}`,
+                    );
+                }
+                expect(observation.mainRequestCount).toBeGreaterThanOrEqual(6);
+                const result = verifyFirstRenderPureDeferStability(observation);
+                expect(failedCheckIds(result)).toEqual([]);
+                expect(result.verdict).toBe("pass");
             }, 120_000);
         });
     });
@@ -446,37 +415,18 @@ describe("cache invariants — replay class", () => {
     describe("#given an aged ctx_reduce call in the conversation (A3 — the regression)", () => {
         describe("#when pure-defer turns grow the tail past the protected window", () => {
             it("#then the ctx_reduce message never vanishes mid-prefix and the prefix never busts", async () => {
-                //#given — a normal turn, then a turn that emits a real ctx_reduce
-                // tool call, then enough defer growth to push it well past
-                // protected_tags (1).
-                const sessionId = await h.createSession();
-                setDefer("A3 reply 1");
-                await h.sendPrompt(sessionId, "A3 turn 1: establish baseline content.");
+                const observation = await driveAgedCtxReduceSurvival(h);
 
-                emitCtxReduceOnce("99999");
-                setDefer("A3 reply 2 (after ctx_reduce tool call)");
-                await h.sendPrompt(sessionId, "A3 turn 2: this turn issues a ctx_reduce call.");
-
-                // Capture the wire signature of the ctx_reduce call once it's on
-                // the wire, then grow the conversation with pure-defer turns.
-                let sawReduceOnWire = false;
-                for (let i = 3; i <= 8; i++) {
-                    setDefer(`A3 defer reply ${i}`);
-                    await h.sendPrompt(sessionId, `A3 turn ${i}: defer growth ages the ctx_reduce call.`);
-                    const body = JSON.stringify(h.mock.lastRequest()?.body ?? {});
-                    if (body.includes("ctx_reduce")) sawReduceOnWire = true;
+                if (observation.bustReport) {
+                    console.error(
+                        `[cache-invariant:A3-ctx_reduce-defer-growth] ${observation.bustCount} bust(s):\n${observation.bustReport}`,
+                    );
                 }
-
-                //#then — across the whole post-ctx_reduce window, zero busts.
-                // Pre-fix, one of these defer passes would strip the aged
-                // ctx_reduce call mid-prefix (vanish + shift) → a bust here.
-                expect(sawReduceOnWire).toBe(true);
-                assertNoBusts("A3-ctx_reduce-defer-growth");
-
-                // And the ctx_reduce call must still be present on the final wire
-                // (never silently removed on a defer pass).
-                const finalBody = JSON.stringify(mainAgentRequests(h.mock.requests()).at(-1)?.body ?? {});
-                expect(finalBody).toContain("ctx_reduce");
+                expect(observation.sawReduceOnWire).toBe(true);
+                expect(observation.finalWireHasCtxReduce).toBe(true);
+                const result = verifyAgedCtxReduceSurvival(observation);
+                expect(failedCheckIds(result)).toEqual([]);
+                expect(result.verdict).toBe("pass");
             }, 150_000);
         });
     });

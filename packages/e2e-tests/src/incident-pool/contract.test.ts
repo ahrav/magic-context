@@ -55,6 +55,7 @@ function variant(id: string, overrides: Partial<IncidentVariant> = {}): Incident
         verifier_binding: {
             driver: "audit-memory-search/driver",
             verifier: "audit-memory-search/verifier",
+            binding_status: "declared",
             invalid_state_evidence: ["false success narration with wrong lifecycle state"],
         },
         blocked_by: [],
@@ -241,12 +242,43 @@ describe("incident catalog contract", () => {
                         verifier_binding: {
                             driver: "d",
                             verifier: "v",
+                            binding_status: "declared",
                             invalid_state_evidence: [],
                         },
                     }),
                 ]),
             ),
         ).toThrow(/at least one crafted invalid state/);
+    });
+
+    it("rejects a binding status outside declared/live", () => {
+        expect(() =>
+            parseIncidentCatalog(
+                catalog([
+                    variant("var-red-one", {
+                        verifier_binding: {
+                            driver: "d",
+                            verifier: "v",
+                            binding_status: "pending_unit" as never,
+                            invalid_state_evidence: ["crafted invalid state"],
+                        },
+                    }),
+                ]),
+            ),
+        ).toThrow(/binding_status: must be one of declared, live/);
+        expect(() =>
+            parseIncidentCatalog(
+                catalog([
+                    variant("var-red-one", {
+                        verifier_binding: {
+                            driver: "d",
+                            verifier: "v",
+                            invalid_state_evidence: ["crafted invalid state"],
+                        } as never,
+                    }),
+                ]),
+            ),
+        ).toThrow(/must contain exactly/);
     });
 
     it("rejects dynamic check labels that could carry fixture data", () => {

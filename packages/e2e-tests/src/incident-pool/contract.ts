@@ -41,6 +41,9 @@ export type AdjudicationKind = (typeof ADJUDICATION_KINDS)[number];
 export const BASELINE_VERDICTS = ["green", "red"] as const;
 export type BaselineVerdict = (typeof BASELINE_VERDICTS)[number];
 
+export const BINDING_STATUSES = ["declared", "live"] as const;
+export type BindingStatus = (typeof BINDING_STATUSES)[number];
+
 export const PROHIBITED_DATA_CLASSES = [
     "credential",
     "raw_prompt",
@@ -105,6 +108,7 @@ export interface HarnessApplicability {
 export interface VerifierBinding {
     driver: string;
     verifier: string;
+    binding_status: BindingStatus;
     invalid_state_evidence: string[];
 }
 
@@ -294,7 +298,7 @@ function parseApplicability(raw: unknown, label: string): HarnessApplicability {
 
 function parseVerifierBinding(raw: unknown, label: string): VerifierBinding {
     const record = asRecord(raw, label);
-    requireExactKeys(record, ["driver", "verifier", "invalid_state_evidence"], label);
+    requireExactKeys(record, ["driver", "verifier", "binding_status", "invalid_state_evidence"], label);
     const evidence = asArray(record.invalid_state_evidence, `${label}.invalid_state_evidence`).map(
         (entry, i) => asNonEmptyString(entry, `${label}.invalid_state_evidence[${i}]`),
     );
@@ -302,6 +306,7 @@ function parseVerifierBinding(raw: unknown, label: string): VerifierBinding {
     return {
         driver: asNonEmptyString(record.driver, `${label}.driver`),
         verifier: asNonEmptyString(record.verifier, `${label}.verifier`),
+        binding_status: asEnum(record.binding_status, BINDING_STATUSES, `${label}.binding_status`),
         invalid_state_evidence: evidence,
     };
 }
