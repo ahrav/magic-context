@@ -43,6 +43,13 @@ import { AdmissionClass, Priority } from "./types";
 
 const DEFAULT_CLEANUP_TICKET_MS = 5_000;
 /**
+ * How long setup lets a retired channel's `start()` settle before the
+ * retirement cause wins the race: long enough for a rejection triggered by
+ * the same event-loop turn as the retirement, short enough that a provider
+ * promise that never settles cannot meaningfully extend teardown.
+ */
+const RETIREMENT_SETTLE_GRACE_MS = 50;
+/**
  * Fixed header/control overhead admitted above one maximum body (KTD7): the
  * aggregate cap must still accept one exact 64 MiB frame plus headers,
  * reserved control frames, and small control-plane bodies.
@@ -568,34 +575,43 @@ export class ConnectionGeneration {
             // Raced against retirement: a provider channel whose start()
             // never settles — or ignores the close() that retirement issues
             // — must not strand setup after the timer above has already
-            // retired this generation. Both branches attach handlers, so
-            // the losing promise can never surface as an unhandled
-            // rejection.
+            // retired this generation. Retirement waits one grace beat
+            // before winning: a start() rejection caused by the same
+            // failure (the auth reader observing the socket close) settles
+            // within the window and keeps its richer classification, and
+            // both branches attach handlers, so no promise is left
+            // unhandled.
             const result = await new Promise<{ daemonVer: string }>((resolve, reject) => {
                 let settled = false;
+                let fallback: ReturnType<typeof setTimeout> | null = null;
+                const settle = (complete: () => void): void => {
+                    if (settled) return;
+                    settled = true;
+                    if (fallback !== null) clearTimeout(fallback);
+                    complete();
+                };
                 void this.retired.then((info) => {
-                    if (!settled) {
-                        settled = true;
-                        reject(
-                            new SocketClosedError(
-                                `connection retired during setup: ${info.reason}`,
+                    if (settled) return;
+                    fallback = setTimeout(
+                        () =>
+                            settle(() =>
+                                reject(
+                                    info.error instanceof Error
+                                        ? info.error
+                                        : new SocketClosedError(
+                                              `connection retired during setup: ${info.reason}`,
+                                          ),
+                                ),
                             ),
-                        );
-                    }
+                        RETIREMENT_SETTLE_GRACE_MS,
+                    );
                 });
                 this.channel.start(deadline).then(
-                    (value) => {
-                        if (!settled) {
-                            settled = true;
-                            resolve(value);
-                        }
-                    },
-                    (error: unknown) => {
-                        if (!settled) {
-                            settled = true;
-                            reject(error instanceof Error ? error : new Error(String(error)));
-                        }
-                    },
+                    (value) => settle(() => resolve(value)),
+                    (error: unknown) =>
+                        settle(() =>
+                            reject(error instanceof Error ? error : new Error(String(error))),
+                        ),
                 );
             });
             if (this.retiredInfo) {

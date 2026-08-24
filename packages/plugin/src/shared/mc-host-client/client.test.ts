@@ -1933,8 +1933,9 @@ describe("transport negotiation", () => {
         });
         // The generation's setup timer retires the candidate; the raced
         // start observes retirement instead of stranding activateCandidate
-        // on a promise the provider never settles.
-        expect((error as Error).name).toBe("SocketClosedError");
+        // on a promise the provider never settles, and the surfaced error
+        // is the retirement cause (the setup timer's timeout).
+        expect((error as Error).name).toBe("SocketTimeoutError");
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
         expect(peer.connections.length).toBe(1);
