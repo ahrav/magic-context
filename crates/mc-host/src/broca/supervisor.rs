@@ -536,19 +536,17 @@ impl Supervisor {
             // guard (AE7), letting a byte-identical resend immediately
             // recreate the "deleted" session. The evicted run's charges are
             // already released, so the tombstone uses the reservation taken
-            // before the wait (retrying fresh if that failed under the
-            // run's own pressure); only a double failure refuses, loudly,
-            // instead of reporting a deletion whose guard was lost. A key
-            // holding a different live run means a post-eviction send
-            // already won; that session is not ours to tombstone.
-            let charge =
-                reserved_tombstone.or_else(|| self.inner.retained.try_charge(key.meta_bytes()));
-            let Some(charge) = charge else {
-                return Err(app(
-                    "queue_full",
-                    "retained capacity for the deletion tombstone is exhausted",
-                ));
-            };
+            // before the wait, retrying fresh if that failed under the
+            // run's own pressure. If both fail the tombstone installs
+            // UNCHARGED: one key of transient accounting slack in a corner
+            // that already required total budget exhaustion beats either a
+            // missing guard or a failed delete whose retry would find no
+            // entry and report success guardless. A key holding a
+            // different live run means a post-eviction send already won;
+            // that session is not ours to tombstone.
+            let charge = reserved_tombstone
+                .or_else(|| self.inner.retained.try_charge(key.meta_bytes()))
+                .unwrap_or_else(ByteCharge::none);
             index.sessions.insert(
                 key.clone(),
                 SessionEntry::Tombstone(Tombstone {
