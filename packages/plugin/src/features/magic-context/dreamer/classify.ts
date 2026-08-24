@@ -21,7 +21,10 @@ import {
     type Memory,
     setMemoryClassification,
 } from "../memory";
-import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
+import {
+    filterMemoriesForMaintenance,
+    maintenanceEligibleIdSet,
+} from "../memory/storage-claim-visibility";
 import { recordChildInvocation } from "../subagent-token-capture";
 import {
     buildClassifyPrompt,
@@ -336,6 +339,26 @@ async function classifyOneChunk(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<{ classified: number; changed: number }> {
+    // The candidate pool was frozen once at run start; later chunks can wait
+    // behind several provider calls, and a memory quarantined, rejected, or
+    // superseded in the meantime must not reach the child-model prompt.
+    // `candidate.id` is the authority's id space (the module id on the module
+    // route); the policy recheck keys on the context row's id.
+    const stillEligible = maintenanceEligibleIdSet(
+        args.db,
+        chunk.map((candidate) => candidate.contextMemory.id),
+        "hygiene",
+    );
+    const eligibleChunk = chunk.filter((candidate) =>
+        stillEligible.has(candidate.contextMemory.id),
+    );
+    if (eligibleChunk.length < chunk.length) {
+        log(
+            `[dreamer] classify chunk dropped ${chunk.length - eligibleChunk.length} member(s) hidden since pool selection`,
+        );
+    }
+    if (eligibleChunk.length === 0) return { classified: 0, changed: 0 };
+    chunk = eligibleChunk;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);

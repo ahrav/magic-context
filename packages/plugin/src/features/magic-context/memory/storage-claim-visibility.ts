@@ -338,21 +338,40 @@ export function filterMemoriesForMaintenance(
     memories: readonly Memory[],
     lane: "verification" | "hygiene",
 ): Memory[] {
-    if (!hasClaimEffectivePolicy(db)) return [...memories];
-    const rows = readMemoryPolicyRows(
+    const eligible = maintenanceEligibleIdSet(
         db,
         memories.map((memory) => memory.id),
+        lane,
     );
-    return memories.filter((memory) => {
-        const row = rows.get(memory.id);
+    return memories.filter((memory) => eligible.has(memory.id));
+}
+
+/**
+ * Id-keyed form of `filterMemoriesForMaintenance` for drain-time rechecks:
+ * maintenance loops freeze their candidate pool once at run start, but later
+ * batches can wait behind several provider calls, so each batch re-applies
+ * the policy to its ids immediately before prompting or applying. Policy
+ * rows are read fresh from the database on every call.
+ */
+export function maintenanceEligibleIdSet(
+    db: Database,
+    memoryIds: readonly number[],
+    lane: "verification" | "hygiene",
+): Set<number> {
+    if (!hasClaimEffectivePolicy(db)) return new Set(memoryIds);
+    const rows = readMemoryPolicyRows(db, memoryIds);
+    const eligible = new Set<number>();
+    for (const id of memoryIds) {
+        const row = rows.get(id);
         if (row == null || !row.projected || row.policyVersion > CLAIM_POLICY_VERSION) {
-            return false;
+            continue;
         }
-        if (row.hardHidden || row.contradicted || row.quarantined || row.rejected) return false;
-        if (row.superseded) return false;
-        if (lane === "hygiene" && (row.stale || row.disputed)) return false;
-        return true;
-    });
+        if (row.hardHidden || row.contradicted || row.quarantined || row.rejected) continue;
+        if (row.superseded) continue;
+        if (lane === "hygiene" && (row.stale || row.disputed)) continue;
+        eligible.add(id);
+    }
+    return eligible;
 }
 
 /**

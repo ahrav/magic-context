@@ -20,7 +20,10 @@ import {
     normalizeVerificationFiles,
     recordMemoryMapping,
 } from "../memory";
-import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
+import {
+    filterMemoriesForMaintenance,
+    maintenanceEligibleIdSet,
+} from "../memory/storage-claim-visibility";
 import { recordChildInvocation } from "../subagent-token-capture";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
@@ -218,6 +221,22 @@ async function mapOneBatch(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<{ mapped: number; independent: number }> {
+    // The input pool was frozen once at run start; later batches can wait
+    // behind several provider calls, and a memory quarantined, rejected, or
+    // superseded in the meantime must not reach the child-model prompt.
+    const stillEligible = maintenanceEligibleIdSet(
+        args.db,
+        batch.map((input) => input.id),
+        "verification",
+    );
+    const eligibleBatch = batch.filter((input) => stillEligible.has(input.id));
+    if (eligibleBatch.length < batch.length) {
+        log(
+            `[dreamer] map-memories batch dropped ${batch.length - eligibleBatch.length} member(s) hidden since pool selection`,
+        );
+    }
+    if (eligibleBatch.length === 0) return { mapped: 0, independent: 0 };
+    batch = eligibleBatch;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {

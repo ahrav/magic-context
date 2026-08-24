@@ -527,6 +527,13 @@ export function prepareCompartmentInjection(
 
     let memoryBlock: string | undefined;
     let memoryCount = 0;
+    // Epoch stamp for the replay gates: captured BEFORE the memory set is
+    // read/rendered. Cache entries are stamped with this pre-snapshot value,
+    // so an epoch bump that lands mid-build (a memory becoming newly
+    // eligible after the read but before the stamp) leaves the stored entry
+    // stamped with the OLD epoch — the next pass sees the mismatch and
+    // rebuilds instead of serving the stale block indefinitely.
+    const buildProjectMemoryEpoch = getProjectMemoryEpoch(db, projectPath);
     if (projectPath) {
         // Use cached memory block to avoid cache busting on background changes (ctx_memory write, promotion).
         // Cache is cleared by replaceSessionFacts/replaceAllCompartmentState after historian/compressor/recomp.
@@ -619,10 +626,6 @@ export function prepareCompartmentInjection(
             }
         }
     }
-
-    // Epoch stamp for the zero-memory replay gate: captured before the entry
-    // is stored so a concurrent bump forces a rebuild rather than being lost.
-    const buildProjectMemoryEpoch = getProjectMemoryEpoch(db, projectPath);
 
     // Nothing to inject if we have no compartments, no facts, and no memories
     if (compartments.length === 0 && facts.length === 0 && !memoryBlock) {

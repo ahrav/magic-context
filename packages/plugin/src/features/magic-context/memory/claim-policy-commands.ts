@@ -188,8 +188,16 @@ async function runConfirmedClaimMutation<T>(
     args: ConfirmedMutationArgs<T>,
 ): Promise<{ pending: true } | { pending: false; result: T }> {
     const key = `${deps.host}:${deps.sessionId}:${args.command}`;
-    const pendingBefore = pendingByKey.get(key);
     const now = deps.nowMs ?? Date.now();
+    // Opportunistic eviction: an abandoned confirmation (started, never
+    // repeated) is otherwise only removed by a successful repeat, so a
+    // long-lived host would retain an entry per abandoned session forever.
+    // The map stays small (two commands per active session), so a full sweep
+    // on each command invocation is cheap.
+    for (const [staleKey, entry] of pendingByKey) {
+        if (now - entry.timestamp >= CONFIRMATION_WINDOW_MS) pendingByKey.delete(staleKey);
+    }
+    const pendingBefore = pendingByKey.get(key);
     const confirmed =
         pendingBefore != null &&
         now - pendingBefore.timestamp < CONFIRMATION_WINDOW_MS &&

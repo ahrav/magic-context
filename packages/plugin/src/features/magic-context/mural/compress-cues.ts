@@ -353,6 +353,26 @@ async function compressOneChunk(
     sliceMs: number,
     signal: AbortSignal,
 ): Promise<ChunkOutcome> {
+    // The candidate pool was frozen once at run start; later chunks can wait
+    // behind several provider calls, and a memory quarantined, rejected, or
+    // superseded in the meantime must not have its content sent to the
+    // child-model prompt. Re-apply the automatic-surface policy to this
+    // chunk's rows immediately before prompting.
+    const stillEligible = new Set(
+        filterMemoriesByPolicy(
+            args.db,
+            chunk.map((candidate) => candidate.memory),
+            "auto_inject",
+        ).memories.map((memory) => memory.id),
+    );
+    const eligibleChunk = chunk.filter((candidate) => stillEligible.has(candidate.memory.id));
+    if (eligibleChunk.length < chunk.length) {
+        log(
+            `[dreamer] compress-cues chunk dropped ${chunk.length - eligibleChunk.length} member(s) hidden since pool selection`,
+        );
+    }
+    if (eligibleChunk.length === 0) return { compressed: 0, skipped: 0 };
+    chunk = eligibleChunk;
     let agentSessionId: string | null = null;
     const startedAt = Date.now();
     try {

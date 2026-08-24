@@ -436,11 +436,12 @@ export async function runAutoSearchHintForPi(args: {
 		memoryFragments,
 	});
 	if (!outcome.ok) return messages;
-	if (outcome.kind === "already-present") {
-		replayHintIfEligible(outcome.decision);
-	} else if (outcome.decision.decision === "hint") {
-		appendHintToUserMessage(userMsg, outcome.decision.text);
-	}
+	// Both the CAS-winning fresh decision and a concurrently persisted one go
+	// through the same eligibility gate: a contributing memory can be
+	// quarantined, rejected, or rewritten between the search lane's recheck
+	// and this persist, and the current prompt must never receive a fragment
+	// the policy has since hidden.
+	replayHintIfEligible(outcome.decision);
 	sessionLog(
 		sessionId,
 		`auto-search: attached hint to ${userMsgId} (${results.length} fragments, top score ${results[0].score.toFixed(3)})`,

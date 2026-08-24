@@ -26,8 +26,7 @@ import {
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
-import { filterMemoriesForMaintenance } from "../memory/storage-claim-visibility";
-import { getMemoriesByIds } from "../memory/storage-memory";
+import { maintenanceEligibleIdSet } from "../memory/storage-claim-visibility";
 import {
     computeClaimRequestDigest,
     hasMemoryClaimsCompatSchema,
@@ -250,15 +249,10 @@ async function verifyOneBatch(
     // superseded in the meantime must not reach the child-model prompt.
     // Re-apply the maintenance policy to this batch's rows immediately
     // before prompting.
-    const stillInScope = new Set(
-        filterMemoriesForMaintenance(
-            args.db,
-            getMemoriesByIds(
-                args.db,
-                batch.map((memory) => memory.id),
-            ),
-            "verification",
-        ).map((memory) => memory.id),
+    const stillInScope = maintenanceEligibleIdSet(
+        args.db,
+        batch.map((memory) => memory.id),
+        "verification",
     );
     const eligibleBatch = batch.filter((memory) => stillInScope.has(memory.id));
     if (eligibleBatch.length < batch.length) {
@@ -400,13 +394,7 @@ export async function applyVerifyManifest(
     // (or leave the maintenance pool) between the prompt and this apply. An
     // in-flight verification must not verify, rewrite, or archive a row the
     // policy has since hidden — drop its manifest entries instead.
-    const applicableIds = new Set(
-        filterMemoriesForMaintenance(
-            args.db,
-            getMemoriesByIds(args.db, [...batchIds]),
-            "verification",
-        ).map((memory) => memory.id),
-    );
+    const applicableIds = maintenanceEligibleIdSet(args.db, [...batchIds], "verification");
     const droppedIds = [...batchIds].filter((id) => !applicableIds.has(id));
     if (droppedIds.length > 0) {
         log(
