@@ -283,6 +283,13 @@ impl SecondaryComponent for BrocaComponent {
                 "broca could not sweep crash-orphaned process groups: {err}"
             ))
         })?;
+        // Same pass, same reason: a crash skips PrivateDir cleanup, leaving
+        // a run's hidden prompt and transcript on disk (R17/R19).
+        subprocess::group_registry::sweep_orphaned_run_dirs().map_err(|err| {
+            InitError(format!(
+                "broca could not sweep crash-orphaned run directories: {err}"
+            ))
+        })?;
         Ok(())
     }
 }

@@ -4727,14 +4727,16 @@ impl McHandler {
                 // harness, session), so after a cross-harness handoff the
                 // current binding would resolve to `missing` and
                 // abandon-then-refire a run the original harness may still
-                // be executing. States written before this was persisted
-                // fall back to the resuming binding.
+                // be executing. A state written before this field existed
+                // came from the producer factory that hardcoded
+                // `opencode`, so that — not the resuming binding — is the
+                // correct value for a legacy row.
                 let harness = loaded
                     .meta
                     .historian
                     .producer_harness
                     .clone()
-                    .unwrap_or_else(|| binding.harness.clone());
+                    .unwrap_or_else(|| OPENCODE_HARNESS.to_string());
                 let live: Vec<_> = projection
                     .blocks
                     .iter()
@@ -9885,16 +9887,28 @@ impl McHandler {
                 last_error = "classify time budget exhausted during producer startup".to_string();
                 break;
             }
-            let started = producer
-                .start_with_generation(
+            // Bounded by the caller's remaining budget like the await and
+            // redrain: `session.send` is a request with its own 30s timeout
+            // (and a reconnect resend), so an unbounded start could overrun
+            // the promised deadline and eat the transport margin reserved
+            // for `session.delete` — letting the caller's cancel land
+            // during cleanup and leave a billable run alive.
+            let started = match tokio::time::timeout(
+                classify_attempt_timeout(CLASSIFY_AWAIT_TIMEOUT, deadline),
+                producer.start_with_generation(
                     &child_session,
                     CLASSIFY_SYSTEM_PROMPT,
                     prompt_body,
                     model,
                     CLASSIFY_MAX_OUTPUT_TOKENS,
                     CLASSIFY_TEMPERATURE,
-                )
-                .await;
+                ),
+            )
+            .await
+            {
+                Ok(started) => started,
+                Err(_) => Err(HistorianProducerError::TimedOut),
+            };
             let attempt_output = match started {
                 Ok(handle) => match producer
                     .await_output_with_timeout(
@@ -27002,8 +27016,43 @@ mod tests {
         );
     }
 
+    /// Reattach must target the run's OWN Broca identity, which is scoped by
+    /// `(project_root, harness, session)` — not the harness of whatever
+    /// route happens to resume the session. Using the resuming binding after
+    /// a cross-harness handoff queries a different key, observes `missing`,
+    /// and can abandon-then-refire a run the original harness is still
+    /// executing.
     #[tokio::test(flavor = "current_thread")]
-    async fn reattach_connects_producer_with_route_bound_harness() {
+    async fn reattach_connects_producer_with_the_runs_own_harness() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::clone(&producer), default_test_config());
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "pi", "ses"),
+        );
+        let messages = big_messages();
+        // The run was started under opencode; the resuming route is pi.
+        seed_awaiting_with_harness(&store, &messages, Some("opencode"));
+
+        let response = call_transform(&handler, messages).await;
+        assert_eq!(response["historian"]["no_fire"], "reattaching");
+        wait_for_count(&producer.connects, 1).await;
+        wait_for_idle(&store).await;
+
+        assert_eq!(
+            producer.harnesses.lock().unwrap().clone(),
+            vec!["opencode"],
+            "reattach must use the harness the run was started under"
+        );
+    }
+
+    /// A state written before the harness was persisted came from the
+    /// producer factory that hardcoded `opencode`, so that — not the
+    /// resuming route's harness — is the correct recovery target for a
+    /// legacy row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reattach_treats_a_legacy_awaiting_row_as_opencode() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, project) =
             handler_with_store(Arc::clone(&producer), default_test_config());
@@ -27019,7 +27068,7 @@ mod tests {
         wait_for_count(&producer.connects, 1).await;
         wait_for_idle(&store).await;
 
-        assert_eq!(producer.harnesses.lock().unwrap().clone(), vec!["pi"]);
+        assert_eq!(producer.harnesses.lock().unwrap().clone(), vec!["opencode"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -31278,7 +31327,19 @@ mod tests {
         }]
     }
 
+    /// Seeds a legacy `AwaitingProducer` row — one written before the
+    /// producer harness was persisted.
     fn seed_awaiting(store: &McStore, messages: &[CkIngressMessage]) {
+        seed_awaiting_with_harness(store, messages, None);
+    }
+
+    /// Seeds an `AwaitingProducer` row. `producer_harness: None` reproduces a
+    /// state written before that field existed.
+    fn seed_awaiting_with_harness(
+        store: &McStore,
+        messages: &[CkIngressMessage],
+        producer_harness: Option<&str>,
+    ) {
         let canonical_messages = transform_request(messages.to_vec(), 1, 200_000).messages;
         let projection = crate::ck_wire::project_messages(&canonical_messages).unwrap();
         let chunk = historian_chunk::build_historian_chunk(
@@ -31313,7 +31374,7 @@ mod tests {
             selected_range_identities,
             producer_session_id: Some("producer-session".to_string()),
             producer_run_id: Some("run-reattach".to_string()),
-            producer_harness: None,
+            producer_harness: producer_harness.map(str::to_owned),
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: mc_store::CompartmentSetGeneration::default(),

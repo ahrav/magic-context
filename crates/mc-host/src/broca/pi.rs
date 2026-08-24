@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use super::backend::{
-    BackendError, BackendEvent, BackendFuture, BackendRequest, BackendTerminal, ErrorClass,
-    EventSink, FinishReason, LlmExecutionBackend,
+    self, BackendError, BackendEvent, BackendFuture, BackendRequest, BackendTerminal, ErrorClass,
+    EventSink, FinishReason, Harness, LlmExecutionBackend,
 };
 use super::subprocess::{
     self, EnvSnapshot, HarnessName, PrivateDir, SubprocessLimits, SubprocessSpec,
@@ -91,6 +91,13 @@ impl LlmExecutionBackend for PiBackend {
         events: EventSink,
         cancel: CancellationToken,
     ) -> BackendFuture {
+        // A run bound to another harness must fail, not silently execute
+        // under this CLI with this harness's provider aliases and
+        // credentials.
+        if request.harness != Harness::Pi {
+            let terminal = backend::harness_mismatch(Harness::Pi, request.harness);
+            return Box::pin(async move { terminal });
+        }
         let descriptor = self.descriptor.clone();
         let thinking_level = self.thinking_level.clone();
         let limits = self.limits.clone();

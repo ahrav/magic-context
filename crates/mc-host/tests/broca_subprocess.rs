@@ -162,6 +162,10 @@ fn main() {
         ),
         ("merge_cleanup_contract", merge_cleanup_contract),
         (
+            "crash_orphaned_run_dirs_swept_only_for_dead_owners",
+            crash_orphaned_run_dirs_swept_only_for_dead_owners,
+        ),
+        (
             "pi_auto_retry_supersedes_the_failed_attempts_terminal",
             pi_auto_retry_supersedes_the_failed_attempts_terminal,
         ),
@@ -2504,6 +2508,36 @@ fn pi_auto_retry_supersedes_the_failed_attempts_terminal() {
         matches!(terminal, BackendTerminal::Failed(_)),
         "agent_end stays authoritative over provisional message_end: {terminal:?}"
     );
+}
+
+/// A run's private directory holds its hidden prompt and transcript, and a
+/// crash skips both `PrivateDir::cleanup` and its `Drop`. Startup removes
+/// directories whose recorded owner is provably gone, and never a live
+/// host's.
+fn crash_orphaned_run_dirs_swept_only_for_dead_owners() {
+    use mc_host::broca::subprocess::group_registry::{private_run_root, sweep_orphaned_run_dirs};
+
+    // A live owner's directory: this process is alive during the sweep.
+    let mine = PrivateDir::create("mc-broca-test-live").expect("create live");
+    let mine_path = mine.path().to_path_buf();
+
+    // A dead owner's directory: pid 1's start time can never match a
+    // process this test could own, so it stands in for a crashed host.
+    let root = private_run_root().expect("run root");
+    let orphan = root.join("mc-broca-test-orphan-2-1-000000000000dead");
+    fs::create_dir(&orphan).expect("create orphan dir");
+    fs::write(orphan.join("prompt.txt"), b"SENSITIVE-PROMPT").expect("seed orphan");
+
+    assert!(
+        sweep_orphaned_run_dirs().expect("sweep completes") >= 1,
+        "a dead owner's run directory must be removed"
+    );
+    assert!(!orphan.exists(), "the orphaned run directory must be gone");
+    assert!(
+        mine_path.exists(),
+        "a live host's run directory must survive the sweep"
+    );
+    mine.cleanup().expect("cleanup");
 }
 
 fn merge_cleanup_contract() {

@@ -215,3 +215,54 @@ pub trait LlmExecutionBackend: Send + Sync + 'static {
         cancel: CancellationToken,
     ) -> BackendFuture;
 }
+
+/// Routes each run to the adapter for its ROUTE-BOUND harness.
+///
+/// `BackendRequest::harness` comes from the session key, so a host wired
+/// with a single adapter would run every route through that one CLI —
+/// executing a Pi-bound run under `opencode` (different provider aliases,
+/// different credentials, different transcript vocabulary) rather than
+/// failing. The supervisor holds one backend by design, so the dispatch
+/// belongs in a backend that owns both.
+pub struct HarnessDispatchBackend {
+    opencode: Arc<dyn LlmExecutionBackend>,
+    pi: Arc<dyn LlmExecutionBackend>,
+}
+
+impl HarnessDispatchBackend {
+    pub fn new(opencode: Arc<dyn LlmExecutionBackend>, pi: Arc<dyn LlmExecutionBackend>) -> Self {
+        Self { opencode, pi }
+    }
+}
+
+impl LlmExecutionBackend for HarnessDispatchBackend {
+    fn execute(
+        &self,
+        request: BackendRequest,
+        events: EventSink,
+        cancel: CancellationToken,
+    ) -> BackendFuture {
+        let backend = match request.harness {
+            Harness::OpenCode => Arc::clone(&self.opencode),
+            Harness::Pi => Arc::clone(&self.pi),
+        };
+        backend.execute(request, events, cancel)
+    }
+}
+
+/// The terminal for a run whose route-bound harness is not the one this
+/// adapter implements. Wiring that mismatch is a host construction error,
+/// but it must surface as one bounded failed run rather than as a run
+/// executed under the wrong CLI with the wrong credentials (R18/R19).
+pub(crate) fn harness_mismatch(expected: Harness, requested: Harness) -> BackendTerminal {
+    BackendTerminal::Failed(BackendError {
+        class: ErrorClass::Permanent,
+        message: format!(
+            "backend for {} received a run bound to {}",
+            expected.as_str(),
+            requested.as_str()
+        ),
+        retry_after_secs: None,
+        provider_code: None,
+    })
+}

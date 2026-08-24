@@ -517,7 +517,13 @@ pub struct PrivateDir {
 impl PrivateDir {
     pub fn create(prefix: &str) -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        let base = std::env::temp_dir();
+        // Rooted in the crash-swept run root, and named with the creating
+        // host's identity, so a directory holding a run's hidden prompt and
+        // transcript can be proven stale and removed after a crash instead
+        // of persisting until someone clears /tmp (R17/R19).
+        let base = group_registry::private_run_root()?;
+        let owner_pid = std::process::id();
+        let owner_start = group_registry::owner_start_time()?;
         // Requesting 0700 at mkdir(2) closes the window where a permissive
         // umask would briefly leave the fresh directory group/world-visible
         // before the chmod below lands (R17).
@@ -527,7 +533,10 @@ impl PrivateDir {
             let mut nonce = [0u8; 8];
             getrandom::getrandom(&mut nonce)
                 .map_err(|_| io::Error::other("temp-dir nonce generation failed"))?;
-            let candidate = base.join(format!("{prefix}-{:016x}", u64::from_le_bytes(nonce)));
+            let candidate = base.join(format!(
+                "{prefix}-{owner_pid}-{owner_start}-{:016x}",
+                u64::from_le_bytes(nonce)
+            ));
             // `create` fails on any existing entry, including a planted
             // symlink, so success proves the path is fresh and ours.
             match builder.create(&candidate) {
@@ -1280,6 +1289,11 @@ pub mod group_registry {
         let mut killed = 0;
         for file in fs::read_dir(&dir)? {
             let path = file?.path();
+            // Records are files; the sibling `runs/` tree is swept
+            // separately by `sweep_orphaned_run_dirs`.
+            if !path.is_file() {
+                continue;
+            }
             let text = match fs::read_to_string(&path) {
                 Ok(text) => text,
                 // A record removed by its own owner between the listing and
@@ -1336,5 +1350,74 @@ pub mod group_registry {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    /// This host's start time, for tagging the run directories it owns.
+    pub(crate) fn owner_start_time() -> io::Result<u64> {
+        let owner_pid = std::process::id() as i32;
+        proc_start_time(owner_pid)?.ok_or_else(|| io::Error::other("this process has no stat"))
+    }
+
+    /// Root for per-run private directories, inside the same private
+    /// per-uid tree as the crash records so a crashed host's sensitive run
+    /// files can be swept by the same startup pass.
+    pub fn private_run_root() -> io::Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt;
+        let root = registry_dir()?.join("runs");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&root) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+        let meta = fs::symlink_metadata(&root)?;
+        if !meta.file_type().is_dir() || meta.file_type().is_symlink() || meta.mode() & 0o077 != 0 {
+            return Err(io::Error::other("private run root is not private"));
+        }
+        Ok(root)
+    }
+
+    /// Removes per-run private directories left behind by dead hosts, and
+    /// returns how many were removed. A crash skips `PrivateDir`'s cleanup
+    /// and its `Drop`, so a run's hidden prompt and transcript would
+    /// otherwise stay on disk indefinitely and accumulate across crashes
+    /// (R17/R19).
+    ///
+    /// A directory is removed only when its recorded owner is provably gone,
+    /// by the same pid-plus-start-time proof the group sweep uses, so a
+    /// concurrent host's live run directories are never touched. Fails
+    /// closed for the same reason: deleting a live run's private files
+    /// would break the run, and leaving an unverifiable one is a bounded
+    /// disk cost.
+    pub fn sweep_orphaned_run_dirs() -> io::Result<usize> {
+        let root = private_run_root()?;
+        let mut removed = 0;
+        for entry in fs::read_dir(&root)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            // `<prefix>-<owner pid>-<owner start>-<nonce>`: the owner
+            // identity is the last two fields before the nonce.
+            let mut fields = name.rsplitn(4, '-');
+            let (Some(_nonce), Some(start), Some(pid)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let (Ok(pid), Ok(start)) = (pid.parse::<i32>(), start.parse::<u64>()) else {
+                continue;
+            };
+            if proc_start_time(pid)? == Some(start) {
+                continue;
+            }
+            match fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(removed)
     }
 }
