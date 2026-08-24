@@ -337,11 +337,6 @@ async function classifyOneChunk(
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);
     try {
-        const prompt = buildClassifyPrompt({
-            projectPath: args.projectIdentity,
-            memories: chunk.map(toPromptMemory),
-            anchors,
-        });
         if (moduleRoute) {
             const run = await runClassifyThroughModule(
                 args,
@@ -356,6 +351,12 @@ async function classifyOneChunk(
             recordInvocation(args, startedAt, { status: "completed" });
             return run;
         }
+
+        const prompt = buildClassifyPrompt({
+            projectPath: args.projectIdentity,
+            memories: chunk.map(toPromptMemory),
+            anchors,
+        });
 
         const createResponse = await createChildSessionWithFence({
             client: args.client,
