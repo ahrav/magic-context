@@ -236,6 +236,12 @@ fn parse_opencode_transcript(
         match event_type {
             "step_start" | "tool_use" => {}
             "text" => {
+                // A completed or failed run cannot grow its answer: content
+                // after the terminal is transcript corruption, and appending
+                // it would extend what subscribers already saw settled.
+                if terminal.is_some() {
+                    return Err(format!("text event after the terminal at line {line_no}"));
+                }
                 let Some(text) = value
                     .get("part")
                     .and_then(|part| part.get("text"))

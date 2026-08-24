@@ -203,11 +203,12 @@ pub async fn run(
     // stdin is closed (dropped) after delivery so print-mode reads see EOF.
     let mut stdin_pipe = child.stdin.take();
     let prompt = spec.stdin;
-    let stdin_task = tokio::spawn(async move {
-        if let Some(mut stdin) = stdin_pipe.take() {
-            let _ = stdin.write_all(&prompt).await;
-            let _ = stdin.shutdown().await;
-        }
+    let mut stdin_task = tokio::spawn(async move {
+        let Some(mut stdin) = stdin_pipe.take() else {
+            return true;
+        };
+        let written = stdin.write_all(&prompt).await.is_ok();
+        stdin.shutdown().await.is_ok() && written
     });
 
     let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
@@ -296,11 +297,25 @@ pub async fn run(
             }
         }
     };
-    stdin_task.abort();
+    // The whole process group is dead on every path above, so the writer
+    // settles promptly: it either finished long ago or its pipe just broke.
+    // An incomplete write means the child produced its output without the
+    // full prompt; the result records that so parsers can refuse the
+    // transcript. The timeout is a backstop against an inherited stdin fd
+    // surviving the sweep and counts as non-delivery.
+    let prompt_delivered =
+        match tokio::time::timeout(Duration::from_secs(1), &mut stdin_task).await {
+            Ok(joined) => joined.unwrap_or(false),
+            Err(_) => {
+                stdin_task.abort();
+                false
+            }
+        };
     Ok(SubprocessResult {
         stdout,
         stderr,
         end,
+        prompt_delivered,
     })
 }
 
@@ -501,10 +516,16 @@ pub fn merge_cleanup(
 
 /// Maps a spawn failure to the run terminal (missing executables are run
 /// failures, not host failures — plan assumption). The message is
-/// structural only.
+/// structural only. Process-table and memory pressure clear on their own,
+/// so those kinds stay retryable; configuration failures (missing
+/// executable, permissions) are permanent.
 pub(crate) fn spawn_failure(harness: HarnessName, err: &io::Error) -> BackendTerminal {
+    let class = match err.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory => ErrorClass::Transient,
+        _ => ErrorClass::Permanent,
+    };
     BackendTerminal::Failed(BackendError {
-        class: ErrorClass::Permanent,
+        class,
         message: format!(
             "{} backend executable could not be spawned ({})",
             harness.name(),
@@ -695,6 +716,12 @@ pub(crate) fn parse_clean_transcript(
         SubprocessEnd::Exited(0) | SubprocessEnd::DrainKilled
     ) {
         return Err("transcript unavailable".to_owned());
+    }
+    // A syntactically valid transcript from a child that never received the
+    // whole prompt answers a truncated question; refusing it here turns a
+    // silent wrong answer into one bounded failure.
+    if !result.prompt_delivered {
+        return Err("prompt delivery failed before the child closed stdin".to_owned());
     }
     let (parsed_events, terminal) = parse(&result.stdout)?;
     for event in parsed_events {
