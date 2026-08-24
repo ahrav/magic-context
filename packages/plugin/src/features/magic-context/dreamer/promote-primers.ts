@@ -9,7 +9,7 @@ import {
     PRIMER_PROMOTION_THRESHOLD,
     summarizePrimerCluster,
 } from "../primer-clustering";
-import { embedBatchForProject } from "../project-embedding-registry";
+import { embedBatchForProject, getProjectEmbeddingSnapshot } from "../project-embedding-registry";
 import {
     createPrimer,
     getActivePrimers,
@@ -58,6 +58,12 @@ function canonicalQuestionFromCluster(
     return first.endsWith("?") ? first : `${first}?`;
 }
 
+/** Rows re-embedded per provider call. Bounds local inference memory and stays
+ *  under remote batch limits; writes land after every chunk, so an interrupted
+ *  or partially failed run keeps its progress and the next sweep resumes with
+ *  only the remainder. */
+const REEMBED_CHUNK_SIZE = 32;
+
 /** Re-embeds primer candidates and active primers whose vectors are missing or
  *  were produced under a retired provider identity. Search skips any vector
  *  whose model id differs from the query's, so stale rows are semantically
@@ -73,6 +79,12 @@ export async function reembedStalePrimerEmbeddings(
     projectIdentity: string,
     checkpoint?: () => void,
 ): Promise<number> {
+    // Embeddings can be configured off while project maintenance keeps
+    // running; a registration may then still exist and accept work. Semantic
+    // primer search is disabled in that configuration, so re-embedding would
+    // only initialize (or download) a model nobody queries. The snapshot's
+    // memory-lane enablement is the same guard the promote-primers gate uses.
+    if (!getProjectEmbeddingSnapshot(projectIdentity)?.enabled) return 0;
     // The empty-batch call resolves the CURRENT provider identity without
     // running inference.
     const current = await embedBatchForProject(projectIdentity, [], undefined, "passage");
@@ -80,39 +92,43 @@ export async function reembedStalePrimerEmbeddings(
     const isStale = (embedding: Float32Array | null, modelId: string | null): boolean =>
         !embedding || !modelId || modelId !== current.modelId;
 
-    const candidates = getPrimerCandidatesForPromotion(db, projectIdentity).filter((candidate) =>
-        isStale(candidate.questionEmbedding, candidate.questionEmbeddingModelId),
-    );
-    const primers = getActivePrimers(db, projectIdentity).filter((primer) =>
-        isStale(primer.questionEmbedding, primer.questionEmbeddingModelId),
-    );
-    if (candidates.length === 0 && primers.length === 0) return 0;
+    type StaleRow = { kind: "candidate" | "primer"; id: number; question: string };
+    const rows: StaleRow[] = [
+        ...getPrimerCandidatesForPromotion(db, projectIdentity)
+            .filter((c) => isStale(c.questionEmbedding, c.questionEmbeddingModelId))
+            .map((c): StaleRow => ({ kind: "candidate", id: c.id, question: c.question })),
+        ...getActivePrimers(db, projectIdentity)
+            .filter((p) => isStale(p.questionEmbedding, p.questionEmbeddingModelId))
+            .map((p): StaleRow => ({ kind: "primer", id: p.id, question: p.question })),
+    ];
+    if (rows.length === 0) return 0;
 
-    const batch = await embedBatchForProject(
-        projectIdentity,
-        [
-            ...candidates.map((candidate) => candidate.question),
-            ...primers.map((primer) => primer.question),
-        ],
-        undefined,
-        "passage",
-    );
-    checkpoint?.();
-    if (!batch) return 0;
     let written = 0;
-    for (let i = 0; i < candidates.length; i += 1) {
+    for (let offset = 0; offset < rows.length; offset += REEMBED_CHUNK_SIZE) {
+        const chunk = rows.slice(offset, offset + REEMBED_CHUNK_SIZE);
+        const batch = await embedBatchForProject(
+            projectIdentity,
+            chunk.map((row) => row.question),
+            undefined,
+            "passage",
+        );
         checkpoint?.();
-        const vector = batch.vectors[i];
-        if (!vector) continue;
-        updatePrimerCandidateEmbedding(db, candidates[i].id, vector, batch.modelId);
-        written += 1;
-    }
-    for (let i = 0; i < primers.length; i += 1) {
-        checkpoint?.();
-        const vector = batch.vectors[candidates.length + i];
-        if (!vector) continue;
-        updatePrimerQuestionEmbedding(db, primers[i].id, vector, batch.modelId);
-        written += 1;
+        // A failed chunk ends the run rather than hammering a struggling
+        // provider; rows already written stay written, and the next sweep
+        // picks up the remainder.
+        if (!batch) return written;
+        for (let i = 0; i < chunk.length; i += 1) {
+            checkpoint?.();
+            const vector = batch.vectors[i];
+            if (!vector) continue;
+            const row = chunk[i];
+            if (row.kind === "candidate") {
+                updatePrimerCandidateEmbedding(db, row.id, vector, batch.modelId);
+            } else {
+                updatePrimerQuestionEmbedding(db, row.id, vector, batch.modelId);
+            }
+            written += 1;
+        }
     }
     return written;
 }
