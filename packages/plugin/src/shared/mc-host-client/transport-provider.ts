@@ -230,6 +230,16 @@ export function sanitizedCandidateFactory(
         // Wrapped flush() calls settle here on channel close, matching the
         // FrameChannel contract, instead of waiting out their deadlines.
         const flushWaiters = new Set<() => void>();
+        // Single close path: EVERY channel close — provider-reported or
+        // wrapper-detected — drains the flush waiters first, so no pending
+        // flush outlives the close that should have settled it.
+        const closeUpstream = (
+            reason: FrameChannelCloseReason,
+            phase: "channel" | "send",
+        ): void => {
+            for (const settle of [...flushWaiters]) settle();
+            args.handlers.onClosed(reason, sanitizedProviderError(transport, phase));
+        };
         const upstreamDiagnostic = args.handlers.onDiagnostic;
         const handlers: FrameChannelHandlers = {
             onFrame: (frame) => {
@@ -288,24 +298,19 @@ export function sanitizedCandidateFactory(
                         throw new Error("wire-invalid provider frame");
                     }
                 } catch {
-                    args.handlers.onClosed(
-                        "protocol_violation",
-                        sanitizedProviderError(transport, "channel"),
-                    );
+                    closeUpstream("protocol_violation", "channel");
                     return;
                 }
                 args.handlers.onFrame(snapshot);
             },
-            onClosed: (reason, _error) => {
-                for (const settle of [...flushWaiters]) settle();
-                args.handlers.onClosed(
+            onClosed: (reason, _error) =>
+                closeUpstream(
                     // A runtime reason outside the typed vocabulary is
                     // provider-controlled text; the bounded replacement
                     // keeps it out of retirement info and diagnostics.
                     CHANNEL_CLOSE_REASONS.has(reason) ? reason : "protocol_violation",
-                    sanitizedProviderError(transport, "channel"),
-                );
-            },
+                    "channel",
+                ),
             onDiagnostic: upstreamDiagnostic
                 ? (type, meta) => {
                       // Snapshot to bounded primitives: provider-controlled
@@ -393,10 +398,7 @@ export function sanitizedCandidateFactory(
                     // Publication may have begun: ambiguous. Fail the
                     // channel — retirement settles pending work exactly
                     // once — and classify the throw as never replayable.
-                    args.handlers.onClosed(
-                        "write_failed",
-                        sanitizedProviderError(transport, "send"),
-                    );
+                    closeUpstream("write_failed", "send");
                     throw new SubcCallError(
                         "outcome_unknown",
                         `transport provider ${transport} failed during send`,
@@ -431,10 +433,7 @@ export function sanitizedCandidateFactory(
                     // emission failure IS channel failure: surface it as one
                     // close — retirement is idempotent — never an exception
                     // across the frame-delivery callback.
-                    args.handlers.onClosed(
-                        "write_failed",
-                        sanitizedProviderError(transport, "send"),
-                    );
+                    closeUpstream("write_failed", "send");
                 }
             },
             flush: (deadline) =>
