@@ -739,4 +739,11 @@ async fn main() {
         );
         std::process::exit(1);
     }
+    // A run with no successful measured observation is an invalid
+    // operating point regardless of conservation — a window where every
+    // slot missed still conserves — matching the IPC-budget collector.
+    if outcomes.success == 0 {
+        eprintln!("no successful measured observation: aborting with failure status");
+        std::process::exit(1);
+    }
 }

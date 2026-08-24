@@ -154,16 +154,26 @@ impl FrameReceiver {
     }
 }
 
+/// Bound on connection setup (discover, authenticate, open the route):
+/// none of the arm deadlines is armed until setup returns, so an
+/// unbounded control exchange against a live-but-stuck host would hang
+/// the whole run before any liveness check can fire.
+const SETUP_BUDGET: Duration = Duration::from_secs(30);
+
 /// One authenticated connection with one open route to the echo module.
 async fn open_route(publication: &Path, session: &str) -> Result<(TcpStream, u16, u32), String> {
-    let info = raw_client::discover(publication)?;
-    let mut client = RawClient::connect(&info).await?;
-    let (channel, epoch) = client
-        .route_open(MODULE_ID, "/perf", "perf", session)
-        .await?;
-    let stream = client.into_stream();
-    stream.set_nodelay(true).map_err(|err| err.to_string())?;
-    Ok((stream, channel, epoch))
+    tokio::time::timeout(SETUP_BUDGET, async {
+        let info = raw_client::discover(publication)?;
+        let mut client = RawClient::connect(&info).await?;
+        let (channel, epoch) = client
+            .route_open(MODULE_ID, "/perf", "perf", session)
+            .await?;
+        let stream = client.into_stream();
+        stream.set_nodelay(true).map_err(|err| err.to_string())?;
+        Ok((stream, channel, epoch))
+    })
+    .await
+    .map_err(|_| format!("connection setup exceeded {}s", SETUP_BUDGET.as_secs()))?
 }
 
 fn request_frame(channel: u16, epoch: u32, corr: u64) -> Vec<u8> {
@@ -461,11 +471,38 @@ async fn run_open_loop_inner(
         let corr = slot + CORR_BASE;
         let frame = request_frame(channel, epoch, corr);
         let issue_ns = start.elapsed().as_nanos() as u64;
-        if write_half.write_all(&frame).await.is_err() {
-            if measured {
-                state.outcomes.record(Outcome::WriteFailure);
+        // The write is bounded by the arm deadline plus the drain
+        // budget: a host that stops reading fills the TCP window and an
+        // unbounded write_all would park the sender past every deadline.
+        // Expiry abandons the run (truncated), so a partially written
+        // frame cannot corrupt later traffic — there is none.
+        let write_deadline = start + Duration::from_nanos(deadline_ns) + DRAIN_BUDGET;
+        let remaining = write_deadline.saturating_duration_since(Instant::now());
+        let wrote = if remaining.is_zero() {
+            None
+        } else {
+            tokio::time::timeout(remaining, write_half.write_all(&frame))
+                .await
+                .ok()
+        };
+        let write_failed = match wrote {
+            None => {
+                if measured {
+                    state.outcomes.record(Outcome::WriteFailure);
+                }
+                state.fail_pending(Outcome::UnresolvedAtDrain);
+                true
             }
-            state.fail_pending(Outcome::PeerClosed);
+            Some(Err(_)) => {
+                if measured {
+                    state.outcomes.record(Outcome::WriteFailure);
+                }
+                state.fail_pending(Outcome::PeerClosed);
+                true
+            }
+            Some(Ok(())) => false,
+        };
+        if write_failed {
             truncated = true;
             break;
         }

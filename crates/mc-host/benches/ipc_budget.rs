@@ -531,6 +531,15 @@ fn collect_atomic(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), String>
             rejected += 1;
         }
     }
+    // A batch mean beyond the histogram range would be retained in
+    // batches.json yet omitted from every merged percentile; the
+    // attempt fails rather than publishing the faster subset, matching
+    // the TCP arms' overflow gate.
+    if rejected > 0 {
+        return Err(format!(
+            "{rejected} batch mean(s) exceeded the histogram range; the attempt is invalid"
+        ));
+    }
     let raw = serde_json::to_vec_pretty(&output).map_err(|err| err.to_string())?;
     attempt.add_sidecar("batches.json", &raw)?;
     attempt.add_histogram("batch_mean_rtt.hist", &hist)?;
@@ -937,9 +946,19 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         if let Some(file) = hist_file {
             let merged = evidence::merge_arm_histograms(&group_attempts, arm, file)?;
             let total: u64 = merged.len();
-            let headline_ok = complete.iter().all(|a| {
-                a.manifest.recorded_samples.unwrap_or(0) >= perf_measurement::HEADLINE_TAIL_FLOOR
-            });
+            // The headline floor derives from each repetition's verified
+            // histogram, not the manifest's recorded_samples scalar: the
+            // scalar is unprotected by any checksum, and an inflated
+            // value could unlock p99.9 for a repetition that never met
+            // the floor.
+            let mut headline_ok = true;
+            for a in &complete {
+                if evidence::read_histogram(a, file)?.len() < perf_measurement::HEADLINE_TAIL_FLOOR
+                {
+                    headline_ok = false;
+                    break;
+                }
+            }
             entry.insert(
                 "merged".to_owned(),
                 serde_json::json!({
@@ -980,6 +999,21 @@ fn aggregate(run_dir: &Path) -> Result<String, String> {
         // rate suffix matches the plan preview's `arm@class:rN` shape.
         if let Some(rate) = collection.as_ref().and_then(|c| c["rate_per_sec"].as_u64()) {
             key.push_str(&format!(":r{rate}"));
+        }
+        // Two groups can still share a key when they differ only in
+        // non-rate collection settings (a resumed run mixing serial
+        // measured_ops, say); a silent insert would replace one group's
+        // evidence with the other's.
+        if arms_summary.contains_key(&key) {
+            let fingerprint = perf_measurement::sha256_hex(
+                serde_json::to_string(&collection)
+                    .map_err(|err| err.to_string())?
+                    .as_bytes(),
+            );
+            key.push_str(&format!(":cfg-{}", &fingerprint[..8]));
+            if arms_summary.contains_key(&key) {
+                return Err(format!("duplicate summary group {key}"));
+            }
         }
         arms_summary.insert(key, serde_json::Value::Object(entry));
     }
