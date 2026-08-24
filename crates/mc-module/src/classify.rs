@@ -4,7 +4,10 @@
 //! provider-facing role and its fixed generation budget so callers cannot turn
 //! this management surface into a generic arbitrary-prompt producer.
 
+use regex::Regex;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// The only task currently accepted by `dreamer.run_task`.
@@ -66,6 +69,115 @@ pub fn has_manifest_envelope(text: &str) -> bool {
     text.contains("<classify>") && text.contains("</classify>")
 }
 
+/// The scope vocabulary a classify entry may carry, mirroring `SCOPES` in
+/// `classify-prompt.ts`.
+const CLASSIFY_SCOPES: [&str; 3] = ["project", "ecosystem", "universe"];
+
+fn memory_entry_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<memory\b([^>]*)/?>").expect("memory entry pattern"))
+}
+
+fn id_attr_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"\bid\s*=\s*"(\d+)""#).expect("id attribute pattern"))
+}
+
+fn importance_attr_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"\bimportance\s*=\s*"(\d+)""#).expect("importance attribute pattern")
+    })
+}
+
+fn scope_attr_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)\bscope\s*=\s*"([a-z]+)""#).expect("scope attribute pattern")
+    })
+}
+
+fn shareable_attr_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)\bshareable\s*=\s*"(true|false|1|0)""#)
+            .expect("shareable attribute pattern")
+    })
+}
+
+/// The body between the outermost `<classify>` tags, or `None` when the
+/// envelope is absent or unterminated.
+fn classify_body(text: &str) -> Option<&str> {
+    const OPEN: &str = "<classify>";
+    const CLOSE: &str = "</classify>";
+    let start = text.find(OPEN)? + OPEN.len();
+    let rest = &text[start..];
+    let end = rest.find(CLOSE)?;
+    Some(&rest[..end])
+}
+
+/// Whether one attempt's output is an acceptable classify manifest for
+/// `expected` — the memory IDs this attempt actually asked about.
+///
+/// This is the accept predicate for a chain attempt, so it has to live here
+/// rather than only in the TypeScript caller: the module decides whether to
+/// advance to the next model AND whether to write the durable command
+/// response. Accepting on envelope presence alone let an enveloped-but-
+/// invalid manifest end the chain and be ledgered, after which the caller's
+/// own validation threw too late to reach a fallback model and every retry
+/// replayed the same invalid manifest.
+///
+/// The rules mirror `parseClassifyManifest`/`validateClassifyManifest` in
+/// `classify-prompt.ts`, which stays the authority for INTERPRETING and
+/// applying values; both sides are pinned by tests. Diagnostics name IDs and
+/// counts the caller already supplied — never manifest text.
+pub fn validate_classify_manifest(text: &str, expected: &BTreeSet<i64>) -> Result<(), String> {
+    let body = classify_body(text).ok_or("no complete classify envelope")?;
+    let mut seen: BTreeSet<i64> = BTreeSet::new();
+    let mut entries = 0usize;
+    for captures in memory_entry_pattern().captures_iter(body) {
+        entries += 1;
+        let attrs = captures.get(1).map_or("", |group| group.as_str());
+        let id: i64 = id_attr_pattern()
+            .captures(attrs)
+            .and_then(|caps| caps[1].parse().ok())
+            .ok_or("manifest entry is missing a numeric id")?;
+        let importance = importance_attr_pattern()
+            .captures(attrs)
+            .and_then(|caps| caps[1].parse::<u32>().ok());
+        let scope = scope_attr_pattern()
+            .captures(attrs)
+            .map(|caps| caps[1].to_ascii_lowercase());
+        let shareable = shareable_attr_pattern().is_match(attrs);
+        if let Some(scope) = &scope {
+            if !CLASSIFY_SCOPES.contains(&scope.as_str()) {
+                return Err(format!("manifest entry {id} carries an unknown scope"));
+            }
+        }
+        if importance.is_none() && scope.is_none() && !shareable {
+            return Err(format!(
+                "manifest entry {id} carries no classification fields"
+            ));
+        }
+        if !seen.insert(id) {
+            return Err(format!("manifest repeats entry {id}"));
+        }
+    }
+    // Content that parsed to nothing is an unrecognized shape, not an empty
+    // classification.
+    if entries == 0 && !body.trim().is_empty() {
+        return Err("manifest body has no recognizable entries".to_owned());
+    }
+    if &seen != expected {
+        return Err(format!(
+            "manifest covers {} of the {} requested memories",
+            seen.intersection(expected).count(),
+            expected.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Derives the deterministic Broca child session for one classify attempt.
 /// `ledger_session` is part of the identity because the durable ledger
 /// scopes commands to `(ledger_session, command_id)`: two module sessions
@@ -115,6 +227,75 @@ mod tests {
         assert!(has_manifest_envelope(
             "<classify><memory id=\"1\"/></classify>"
         ));
+    }
+
+    #[test]
+    fn manifest_validation_accepts_exact_coverage_and_rejects_every_invalid_shape() {
+        let expected: BTreeSet<i64> = [1, 2].into_iter().collect();
+        let ok = "<classify><memory id=\"1\" importance=\"80\" scope=\"project\"/>\
+                  <memory id=\"2\" shareable=\"false\"/></classify>";
+        assert_eq!(validate_classify_manifest(ok, &expected), Ok(()));
+
+        // An empty request is satisfied only by an empty manifest.
+        assert_eq!(
+            validate_classify_manifest("<classify></classify>", &BTreeSet::new()),
+            Ok(())
+        );
+
+        // Each of these previously ended the chain and got ledgered as this
+        // command's durable response, so the caller's later validation threw
+        // with no fallback model left to try.
+        for (label, text) in [
+            ("no envelope", "All Antigravity endpoints failed"),
+            (
+                "unterminated envelope",
+                "<classify><memory id=\"1\" scope=\"project\"/>",
+            ),
+            (
+                "missing memory",
+                "<classify><memory id=\"1\" scope=\"project\"/></classify>",
+            ),
+            (
+                "extra memory",
+                "<classify><memory id=\"1\" scope=\"project\"/><memory id=\"2\" scope=\"project\"/>\
+                 <memory id=\"3\" scope=\"project\"/></classify>",
+            ),
+            (
+                "duplicate id",
+                "<classify><memory id=\"1\" scope=\"project\"/><memory id=\"1\" scope=\"project\"/>\
+                 <memory id=\"2\" scope=\"project\"/></classify>",
+            ),
+            (
+                "non-numeric id",
+                "<classify><memory id=\"one\" scope=\"project\"/><memory id=\"2\" scope=\"project\"/></classify>",
+            ),
+            (
+                "unknown scope",
+                "<classify><memory id=\"1\" scope=\"galaxy\"/><memory id=\"2\" scope=\"project\"/></classify>",
+            ),
+            (
+                "no classification fields",
+                "<classify><memory id=\"1\"/><memory id=\"2\" scope=\"project\"/></classify>",
+            ),
+            (
+                "unrecognized body",
+                "<classify>I classified them all, trust me.</classify>",
+            ),
+        ] {
+            assert!(
+                validate_classify_manifest(text, &expected).is_err(),
+                "{label} must not be accepted as a successful attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_validation_diagnostics_never_quote_the_manifest() {
+        let expected: BTreeSet<i64> = [7].into_iter().collect();
+        let secret = "POOL-SECRET-SENTINEL";
+        let text = format!("<classify>{secret}</classify>");
+        let detail = validate_classify_manifest(&text, &expected).expect_err("rejected");
+        assert!(!detail.contains(secret), "manifest text leaked: {detail}");
     }
 
     #[test]

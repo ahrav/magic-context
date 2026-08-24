@@ -451,7 +451,7 @@ impl Supervisor {
     /// Exact status vocabulary only (R7): a known run reports its state
     /// verbatim; anything else — foreign incarnation, expired, evicted,
     /// deleted, never existed — is `missing`.
-    pub fn status(&self, run_id: &str) -> Result<&'static str, RequestError> {
+    pub fn status(&self, key: &SessionKey, run_id: &str) -> Result<&'static str, RequestError> {
         let _command = self.command_permit()?;
         let mut released = Released::default();
         let mut index = lock_index(&self.inner);
@@ -460,8 +460,12 @@ impl Supervisor {
         }
         self.sweep_expired(&mut index, &mut released);
         match index.runs.get(run_id) {
-            Some(run) => Ok(lock_run(run).status.as_str()),
-            None => Ok(protocol::STATUS_MISSING),
+            // Run IDs are sequential within an incarnation, so one leaked ID
+            // makes its neighbours guessable: a run outside the caller's
+            // bound session must be indistinguishable from an unknown one,
+            // never a status oracle for another project or session.
+            Some(run) if run.key == *key => Ok(lock_run(run).status.as_str()),
+            _ => Ok(protocol::STATUS_MISSING),
         }
     }
 
@@ -470,7 +474,7 @@ impl Supervisor {
     /// Idempotent: an unknown, expired, or already-terminal run is a
     /// success with no effect, and a committed completion is never
     /// overwritten.
-    pub async fn cancel(&self, run_id: &str) -> Result<(), RequestError> {
+    pub async fn cancel(&self, key: &SessionKey, run_id: &str) -> Result<(), RequestError> {
         let _command = self.command_permit()?;
         let run = {
             let mut released = Released::default();
@@ -479,7 +483,15 @@ impl Supervisor {
                 return Err(closed_error());
             }
             self.sweep_expired(&mut index, &mut released);
-            index.runs.get(run_id).cloned()
+            // Same scoping rule as `status`: a guessed neighbouring run ID
+            // outside the bound session cancels nothing and is reported as
+            // the unknown-run no-op, so one session cannot interrupt
+            // another's billable work.
+            index
+                .runs
+                .get(run_id)
+                .filter(|run| run.key == *key)
+                .cloned()
         };
         let Some(run) = run else { return Ok(()) };
         run.cancel.cancel();

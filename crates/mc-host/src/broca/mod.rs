@@ -192,11 +192,11 @@ impl CompositeComponent for BrocaComponent {
                 Ok(run_id) => respond(&ctx, protocol::send_response_body(&run_id)).await,
                 Err(error) => request_error(error),
             },
-            Request::Status { run_id } => match self.supervisor.status(&run_id) {
+            Request::Status { run_id } => match self.supervisor.status(&key, &run_id) {
                 Ok(state) => respond(&ctx, protocol::status_response_body(&run_id, state)).await,
                 Err(error) => request_error(error),
             },
-            Request::Cancel { run_id } => match self.supervisor.cancel(&run_id).await {
+            Request::Cancel { run_id } => match self.supervisor.cancel(&key, &run_id).await {
                 Ok(()) => respond(&ctx, protocol::ok_response_body()).await,
                 Err(error) => request_error(error),
             },

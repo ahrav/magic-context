@@ -166,7 +166,7 @@ async fn identical_resend_dedups_and_any_byte_difference_conflicts() {
     until(|| backend.starts() == 1, "backend starts once").await;
     gate.add_permits(1);
     until(
-        || supervisor.status(&first) == Ok("completed"),
+        || supervisor.status(&key("s1"), &first) == Ok("completed"),
         "run completes",
     )
     .await;
@@ -207,7 +207,7 @@ async fn racing_identical_sends_converge_on_one_run_and_one_backend_start() {
 
     gate.add_permits(1);
     until(
-        || supervisor.status(&run_ids[0]) == Ok("completed"),
+        || supervisor.status(&key("s1"), &run_ids[0]) == Ok("completed"),
         "the shared run completes",
     )
     .await;
@@ -232,15 +232,18 @@ async fn status_reports_exact_states_without_aliases() {
     // The single backend permit is held, so the second admitted run is
     // deterministically still queued.
     let queued = send(&supervisor, "s-queue", "p2");
-    assert_eq!(supervisor.status(&running), Ok("running"));
-    assert_eq!(supervisor.status(&queued), Ok("queued"));
+    assert_eq!(supervisor.status(&key("s-run"), &running), Ok("running"));
+    assert_eq!(supervisor.status(&key("s-queue"), &queued), Ok("queued"));
 
-    supervisor.cancel(&queued).await.expect("cancel queued run");
-    assert_eq!(supervisor.status(&queued), Ok("cancelled"));
+    supervisor
+        .cancel(&key("s-queue"), &queued)
+        .await
+        .expect("cancel queued run");
+    assert_eq!(supervisor.status(&key("s-queue"), &queued), Ok("cancelled"));
 
     gate.add_permits(1);
     until(
-        || supervisor.status(&running) == Ok("completed"),
+        || supervisor.status(&key("s-run"), &running) == Ok("completed"),
         "gated run completes",
     )
     .await;
@@ -254,7 +257,7 @@ async fn status_reports_exact_states_without_aliases() {
     let fail_supervisor = Supervisor::new(failing as Arc<_>);
     let failed = send(&fail_supervisor, "s-fail", "p3");
     until(
-        || fail_supervisor.status(&failed) == Ok("failed"),
+        || fail_supervisor.status(&key("s-fail"), &failed) == Ok("failed"),
         "failing run fails",
     )
     .await;
@@ -262,8 +265,68 @@ async fn status_reports_exact_states_without_aliases() {
     // Unknown, foreign-incarnation, and alias-shaped IDs are all exactly
     // `missing` — never substring-matched onto a live run.
     for id in ["", "unknown", "broca-deadbeef00-1", "run-1", "active"] {
-        assert_eq!(supervisor.status(id), Ok("missing"), "{id:?}");
+        assert_eq!(
+            supervisor.status(&key("s-run"), id),
+            Ok("missing"),
+            "{id:?}"
+        );
     }
+}
+
+/// Run IDs are sequential within an incarnation, so holding one makes its
+/// neighbours guessable. A caller may only observe and interrupt runs in the
+/// session its own route is bound to: another session's live run must be
+/// indistinguishable from an unknown ID, and cancelling it must be a no-op
+/// rather than a way to kill someone else's billable work.
+#[tokio::test]
+async fn status_and_cancel_are_scoped_to_the_bound_session() {
+    let (backend, gate) = ScriptedBackend::gated("out");
+    let supervisor = Supervisor::new(Arc::clone(&backend) as Arc<_>);
+
+    let victim = send(&supervisor, "s-victim", "p1");
+    until(|| backend.starts() == 1, "victim run starts").await;
+    assert_eq!(supervisor.status(&key("s-victim"), &victim), Ok("running"));
+
+    // A different session on the same project and harness, and a different
+    // project entirely, both see nothing.
+    assert_eq!(
+        supervisor.status(&key("s-attacker"), &victim),
+        Ok("missing"),
+        "another session must not observe this run's state"
+    );
+    let foreign_project = SessionKey {
+        project_root: "/workspace/other".into(),
+        harness: Harness::OpenCode,
+        session: "s-victim".to_owned(),
+    };
+    assert_eq!(
+        supervisor.status(&foreign_project, &victim),
+        Ok("missing"),
+        "another project must not observe this run's state"
+    );
+
+    // The cancel is the unknown-run no-op, and the run keeps running.
+    supervisor
+        .cancel(&key("s-attacker"), &victim)
+        .await
+        .expect("foreign cancel is a no-op");
+    assert_eq!(
+        supervisor.status(&key("s-victim"), &victim),
+        Ok("running"),
+        "another session must not interrupt this run"
+    );
+
+    // The owning session still controls its own run.
+    supervisor
+        .cancel(&key("s-victim"), &victim)
+        .await
+        .expect("owner cancels");
+    assert_eq!(
+        supervisor.status(&key("s-victim"), &victim),
+        Ok("cancelled")
+    );
+    gate.add_permits(1);
+    supervisor.shutdown().await;
 }
 
 /// A panicking backend must still yield exactly one failed terminal: an
@@ -277,7 +340,7 @@ async fn backend_panic_commits_one_failed_terminal() {
     let supervisor = Supervisor::new(backend as Arc<_>);
     let run_id = send(&supervisor, "s-panic", "p1");
     until(
-        || supervisor.status(&run_id) == Ok("failed"),
+        || supervisor.status(&key("s-panic"), &run_id) == Ok("failed"),
         "panicked run fails",
     )
     .await;
@@ -285,7 +348,7 @@ async fn backend_panic_commits_one_failed_terminal() {
     // session still admits and reaches its own terminal.
     let second = send(&supervisor, "s-after-panic", "p2");
     until(
-        || supervisor.status(&second) == Ok("failed"),
+        || supervisor.status(&key("s-after-panic"), &second) == Ok("failed"),
         "post-panic run still executes",
     )
     .await;
@@ -319,7 +382,7 @@ async fn early_and_late_subscribers_replay_byte_identical_units() {
         early_units.push(unit.to_vec());
     }
     until(
-        || supervisor.status(&run_id) == Ok("completed"),
+        || supervisor.status(&key("s-watch"), &run_id) == Ok("completed"),
         "watched run completes",
     )
     .await;
@@ -396,9 +459,9 @@ async fn thirty_two_blocked_commands_admit_and_command_33_fails_fast() {
     for _ in 0..32 {
         let supervisor = Arc::clone(&supervisor);
         let run_id = run_id.clone();
-        blocked.push(tokio::spawn(
-            async move { supervisor.cancel(&run_id).await },
-        ));
+        blocked.push(tokio::spawn(async move {
+            supervisor.cancel(&key("s1"), &run_id).await
+        }));
     }
     until(
         || supervisor.metrics().free_command_permits == 0,
@@ -407,7 +470,7 @@ async fn thirty_two_blocked_commands_admit_and_command_33_fails_fast() {
     .await;
 
     let overflow = supervisor
-        .status(&run_id)
+        .status(&key("s1"), &run_id)
         .expect_err("command 33 fails fast");
     assert_eq!(overflow.code, "queue_full");
 
@@ -421,7 +484,7 @@ async fn thirty_two_blocked_commands_admit_and_command_33_fails_fast() {
     assert_eq!(supervisor.metrics().free_command_permits, 32);
     // The cancellation terminal committed before the backend's late
     // completion, which must not rewrite it.
-    assert_eq!(supervisor.status(&run_id), Ok("cancelled"));
+    assert_eq!(supervisor.status(&key("s1"), &run_id), Ok("cancelled"));
 }
 
 #[tokio::test]
@@ -455,9 +518,9 @@ async fn thirty_two_runs_queue_behind_eight_backends_and_run_33_fails_without_st
     assert_eq!(supervisor.metrics().sessions, 32);
 
     gate.add_permits(32);
-    for run_id in &runs {
+    for (index, run_id) in runs.iter().enumerate() {
         until(
-            || supervisor.status(run_id) == Ok("completed"),
+            || supervisor.status(&key(&format!("s{index}")), run_id) == Ok("completed"),
             "queued run completes after permits release",
         )
         .await;
@@ -485,7 +548,7 @@ async fn dropping_a_subscriber_detaches_only_the_waiter() {
 
     gate.add_permits(1);
     until(
-        || supervisor.status(&run_id) == Ok("completed"),
+        || supervisor.status(&key("s1"), &run_id) == Ok("completed"),
         "run completes after its waiter detached",
     )
     .await;
@@ -511,8 +574,14 @@ async fn cancel_covers_queued_and_running_runs_and_stays_idempotent() {
     until(|| backend.starts() == 1, "first run starts").await;
     let queued = send(&supervisor, "s-queued", "p2");
 
-    supervisor.cancel(&queued).await.expect("cancel queued");
-    assert_eq!(supervisor.status(&queued), Ok("cancelled"));
+    supervisor
+        .cancel(&key("s-queued"), &queued)
+        .await
+        .expect("cancel queued");
+    assert_eq!(
+        supervisor.status(&key("s-queued"), &queued),
+        Ok("cancelled")
+    );
     // A run cancelled while queued still replays a well-formed log: the
     // prepended run_started, then exactly one cancellation terminal.
     let replay = drain_bytes(supervisor.subscribe(&key("s-queued")).expect("subscribe")).await;
@@ -522,18 +591,27 @@ async fn cancel_covers_queued_and_running_runs_and_stays_idempotent() {
     assert_eq!(terminal["unit"]["type"], "error");
     assert_eq!(terminal["unit"]["error"]["class"], "permanent");
 
-    supervisor.cancel(&running).await.expect("cancel running");
-    assert_eq!(supervisor.status(&running), Ok("cancelled"));
+    supervisor
+        .cancel(&key("s-running"), &running)
+        .await
+        .expect("cancel running");
+    assert_eq!(
+        supervisor.status(&key("s-running"), &running),
+        Ok("cancelled")
+    );
     assert_eq!(
         backend.cancels_observed(),
         1,
         "the running backend saw the cancel"
     );
     supervisor
-        .cancel(&running)
+        .cancel(&key("s-running"), &running)
         .await
         .expect("repeated cancel is idempotent");
-    assert_eq!(supervisor.status(&running), Ok("cancelled"));
+    assert_eq!(
+        supervisor.status(&key("s-running"), &running),
+        Ok("cancelled")
+    );
 
     // The queued run never consumed the backend permit it was waiting for,
     // and both terminals returned their active-run slots.
@@ -555,10 +633,10 @@ async fn completion_cannot_overwrite_a_committed_cancellation() {
     let canceller = {
         let supervisor = Arc::clone(&supervisor);
         let run_id = run_id.clone();
-        tokio::spawn(async move { supervisor.cancel(&run_id).await })
+        tokio::spawn(async move { supervisor.cancel(&key("s1"), &run_id).await })
     };
     until(
-        || supervisor.status(&run_id) == Ok("cancelled"),
+        || supervisor.status(&key("s1"), &run_id) == Ok("cancelled"),
         "cancellation terminal commits",
     )
     .await;
@@ -569,7 +647,7 @@ async fn completion_cannot_overwrite_a_committed_cancellation() {
         .await
         .expect("cancel task joins")
         .expect("cancel settles after the backend stops");
-    assert_eq!(supervisor.status(&run_id), Ok("cancelled"));
+    assert_eq!(supervisor.status(&key("s1"), &run_id), Ok("cancelled"));
     let replay = drain_bytes(supervisor.subscribe(&key("s1")).expect("subscribe")).await;
     let last = unit_json(replay.last().expect("terminal unit"));
     assert_eq!(last["unit"]["type"], "error");
@@ -599,7 +677,7 @@ async fn delete_during_running_waits_purges_and_installs_an_idempotent_tombstone
         1,
         "delete must wait for backend cancellation"
     );
-    assert_eq!(supervisor.status(&run_id), Ok("missing"));
+    assert_eq!(supervisor.status(&key("s1"), &run_id), Ok("missing"));
     let metrics = supervisor.metrics();
     assert_eq!(metrics.live_runs, 0);
     assert_eq!(metrics.tombstones, 1);
@@ -652,7 +730,7 @@ async fn delete_racing_a_terminal_cap_eviction_still_installs_a_tombstone() {
     // The cancel-blind backend pins delete in wait_work_done after its
     // terminal committed, which is exactly the window the eviction races.
     until(
-        || supervisor.status(&run_a) == Ok("cancelled"),
+        || supervisor.status(&key("s-del"), &run_a) == Ok("cancelled"),
         "delete commits the cancellation terminal",
     )
     .await;
@@ -662,9 +740,12 @@ async fn delete_racing_a_terminal_cap_eviction_still_installs_a_tombstone() {
     // still parked. The second run stays queued behind the single backend
     // permit, so cancelling it settles promptly.
     let run_b = send(&supervisor, "s-evict", "pb");
-    supervisor.cancel(&run_b).await.expect("cancel the evictor");
+    supervisor
+        .cancel(&key("s-evict"), &run_b)
+        .await
+        .expect("cancel the evictor");
     assert_eq!(
-        supervisor.status(&run_a),
+        supervisor.status(&key("s-del"), &run_a),
         Ok("missing"),
         "the eviction removed the deleted session before delete re-locked"
     );
@@ -695,7 +776,7 @@ async fn terminal_expiry_and_oldest_eviction_enforce_the_session_caps() {
     for index in 0..3 {
         let run_id = send(&supervisor, &format!("s{index}"), &format!("p{index}"));
         until(
-            || supervisor.status(&run_id) == Ok("completed"),
+            || supervisor.status(&key(&format!("s{index}")), &run_id) == Ok("completed"),
             "run completes",
         )
         .await;
@@ -704,16 +785,16 @@ async fn terminal_expiry_and_oldest_eviction_enforce_the_session_caps() {
         tokio::time::advance(Duration::from_secs(1)).await;
     }
     // The third terminal displaced the oldest retained session.
-    assert_eq!(supervisor.status(&runs[0]), Ok("missing"));
-    assert_eq!(supervisor.status(&runs[1]), Ok("completed"));
-    assert_eq!(supervisor.status(&runs[2]), Ok("completed"));
+    assert_eq!(supervisor.status(&key("s0"), &runs[0]), Ok("missing"));
+    assert_eq!(supervisor.status(&key("s1"), &runs[1]), Ok("completed"));
+    assert_eq!(supervisor.status(&key("s2"), &runs[2]), Ok("completed"));
     assert_eq!(supervisor.metrics().sessions, 2);
 
     tokio::time::advance(TERMINAL_RETENTION).await;
     // Any command sweeps first, so both survivors now report missing and
     // their charges are gone.
-    assert_eq!(supervisor.status(&runs[1]), Ok("missing"));
-    assert_eq!(supervisor.status(&runs[2]), Ok("missing"));
+    assert_eq!(supervisor.status(&key("s1"), &runs[1]), Ok("missing"));
+    assert_eq!(supervisor.status(&key("s2"), &runs[2]), Ok("missing"));
     let metrics = supervisor.metrics();
     assert_eq!(metrics.sessions, 0);
     assert_eq!(
@@ -736,7 +817,7 @@ async fn retained_pressure_sweeps_expired_entries_and_retries_admission_once() {
 
     let first = send(&supervisor, "s1", &"x".repeat(12 * 1024));
     until(
-        || supervisor.status(&first) == Ok("completed"),
+        || supervisor.status(&key("s1"), &first) == Ok("completed"),
         "first run completes",
     )
     .await;
@@ -749,7 +830,7 @@ async fn retained_pressure_sweeps_expired_entries_and_retries_admission_once() {
     tokio::time::advance(TERMINAL_RETENTION).await;
     let second = send(&supervisor, "s2", &"y".repeat(12 * 1024));
     until(
-        || supervisor.status(&second) == Ok("completed"),
+        || supervisor.status(&key("s2"), &second) == Ok("completed"),
         "second run completes after the sweep freed the budget",
     )
     .await;
@@ -766,7 +847,7 @@ async fn replay_overflow_commits_one_failed_terminal_and_stops_growth() {
     let supervisor = Supervisor::with_limits(Arc::clone(&backend) as Arc<_>, limits.clone());
     let run_id = send(&supervisor, "s1", "p");
     until(
-        || supervisor.status(&run_id) == Ok("failed"),
+        || supervisor.status(&key("s1"), &run_id) == Ok("failed"),
         "the overflowing run fails",
     )
     .await;
@@ -799,7 +880,7 @@ async fn replay_overflow_commits_one_failed_terminal_and_stops_growth() {
     supervisor.delete(&key("s1")).await.expect("delete settles");
     tokio::time::advance(TERMINAL_RETENTION).await;
     // Commands sweep expired entries; a status probe is the cheapest one.
-    assert_eq!(supervisor.status("gone"), Ok("missing"));
+    assert_eq!(supervisor.status(&key("s1"), "gone"), Ok("missing"));
     assert_baseline(supervisor.metrics(), &limits, 0);
 }
 
@@ -838,18 +919,24 @@ async fn every_path_returns_permits_and_charges_to_baseline() {
     // Natural completion for one run, cancellation race for the other.
     gate.add_permits(2);
     until(
-        || supervisor.status(&run_a) == Ok("completed"),
+        || supervisor.status(&key("a"), &run_a) == Ok("completed"),
         "a completes",
     )
     .await;
-    supervisor.cancel(&run_b).await.expect("cancel b");
-    supervisor.cancel(&run_b).await.expect("idempotent cancel");
+    supervisor
+        .cancel(&key("b"), &run_b)
+        .await
+        .expect("cancel b");
+    supervisor
+        .cancel(&key("b"), &run_b)
+        .await
+        .expect("idempotent cancel");
 
     // Deletion of one terminal session, expiry of the other.
     supervisor.delete(&key("b")).await.expect("delete b");
     tokio::time::advance(TERMINAL_RETENTION).await;
-    assert_eq!(supervisor.status(&run_a), Ok("missing"));
-    assert_eq!(supervisor.status(&run_b), Ok("missing"));
+    assert_eq!(supervisor.status(&key("a"), &run_a), Ok("missing"));
+    assert_eq!(supervisor.status(&key("b"), &run_b), Ok("missing"));
 
     assert_baseline(supervisor.metrics(), &limits, 0);
 
@@ -918,7 +1005,7 @@ async fn shutdown_refuses_new_work_stops_backends_and_wakes_subscribers() {
     );
     assert_eq!(
         supervisor
-            .status("anything")
+            .status(&key("a"), "anything")
             .expect_err("status after shutdown")
             .code,
         "cancelled"

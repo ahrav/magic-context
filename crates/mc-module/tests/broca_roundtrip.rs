@@ -749,6 +749,14 @@ fn classify_rig(connection: &Path, route_root: &Path) -> ClassifyRig {
 }
 
 fn dreamer_request(rig: &ClassifyRig, command_id: &str, items: Value, model_chain: Value) -> Value {
+    // The wire shape TypeScript sends: the module reads `memory_id` to build
+    // the accept predicate for each attempt's manifest.
+    let items: Vec<Value> = items
+        .as_array()
+        .expect("item ids")
+        .iter()
+        .map(|id| json!({ "memory_id": id, "content_hash": "seeded-hash" }))
+        .collect();
     json!({
         "method": "dreamer.run_task",
         "v": 1,

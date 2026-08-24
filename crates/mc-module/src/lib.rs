@@ -94,7 +94,7 @@ use subc_client_rs::{
 
 use boundary::{BoundaryBlock, BoundaryContext, BoundaryMsg, Role, TriggerContext};
 use classify::{
-    attempt_child_session_id, has_manifest_envelope, CLASSIFY_AWAIT_TIMEOUT,
+    attempt_child_session_id, validate_classify_manifest, CLASSIFY_AWAIT_TIMEOUT,
     CLASSIFY_MAX_OUTPUT_TOKENS, CLASSIFY_RECOVERY_TIMEOUT, CLASSIFY_SYSTEM_PROMPT, CLASSIFY_TASK,
     CLASSIFY_TEMPERATURE, MAX_CLASSIFY_MODEL_CHAIN, MAX_CLASSIFY_PROMPT_BYTES,
 };
@@ -9730,8 +9730,17 @@ impl McHandler {
                 message: format!("classify prompt_body exceeds {MAX_CLASSIFY_PROMPT_BYTES} bytes"),
             };
         }
-        if payload.get("items").and_then(Value::as_array).is_none() {
+        let Some(items) = payload.get("items").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires items");
+        };
+        // The requested IDs are the accept predicate's oracle: an attempt is
+        // successful only if its manifest covers exactly these.
+        let mut expected_ids: BTreeSet<i64> = BTreeSet::new();
+        for item in items {
+            let Some(memory_id) = item.get("memory_id").and_then(Value::as_i64) else {
+                return invalid_params_error("classify items require an integer memory_id");
+            };
+            expected_ids.insert(memory_id);
         }
         let Some(models) = payload.get("model_chain").and_then(Value::as_array) else {
             return invalid_params_error("classify payload requires model_chain");
@@ -9896,24 +9905,27 @@ impl McHandler {
             // purging first would let a ledger failure tombstone the run and
             // persist a failure for a command that actually succeeded.
             match attempt_output {
-                // The module checks only for the task-specific envelope. Even if the
-                // output limit truncated a result, this layer accepts it when the
-                // envelope remains; the host parser rejects malformed contents.
-                Ok(result) if has_manifest_envelope(&result.text) => {
-                    output = Some((model.clone(), result, child_session, producer));
-                    break;
-                }
-                Ok(_) => match producer.purge_session(&child_session).await {
+                // Validated against the requested IDs before the attempt is
+                // accepted: an enveloped-but-invalid manifest must advance
+                // the chain, not end it and be ledgered as this command's
+                // durable response. The caller stays the authority for
+                // interpreting the values it applies.
+                Ok(result) => match validate_classify_manifest(&result.text, &expected_ids) {
                     Ok(()) => {
-                        last_error =
-                            "classify producer returned no classify manifest envelope".to_string();
-                    }
-                    Err(cleanup) => {
-                        last_error = format!(
-                            "classify producer returned no classify manifest envelope (session.delete cleanup also failed: {cleanup})"
-                        );
+                        output = Some((model.clone(), result, child_session, producer));
                         break;
                     }
+                    Err(detail) => match producer.purge_session(&child_session).await {
+                        Ok(()) => {
+                            last_error = format!("classify producer returned {detail}");
+                        }
+                        Err(cleanup) => {
+                            last_error = format!(
+                                "classify producer returned {detail} (session.delete cleanup also failed: {cleanup})"
+                            );
+                            break;
+                        }
+                    },
                 },
                 Err(primary) => {
                     // An idempotency conflict means a concurrent command
