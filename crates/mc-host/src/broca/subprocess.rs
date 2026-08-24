@@ -303,14 +303,14 @@ pub async fn run(
     // full prompt; the result records that so parsers can refuse the
     // transcript. The timeout is a backstop against an inherited stdin fd
     // surviving the sweep and counts as non-delivery.
-    let prompt_delivered =
-        match tokio::time::timeout(Duration::from_secs(1), &mut stdin_task).await {
-            Ok(joined) => joined.unwrap_or(false),
-            Err(_) => {
-                stdin_task.abort();
-                false
-            }
-        };
+    let prompt_delivered = match tokio::time::timeout(Duration::from_secs(1), &mut stdin_task).await
+    {
+        Ok(joined) => joined.unwrap_or(false),
+        Err(_) => {
+            stdin_task.abort();
+            false
+        }
+    };
     Ok(SubprocessResult {
         stdout,
         stderr,
