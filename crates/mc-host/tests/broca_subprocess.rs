@@ -1532,6 +1532,18 @@ fn hostile_retry_delays_are_clamped() {
     // A sane delay under the ceiling passes through unclamped.
     let (terminal, _) = run_pi_transcript(&pi_error_lines("overloaded, retry after 45 seconds"));
     assert_eq!(failed(&terminal).retry_after_secs, Some(45));
+
+    // A number that merely follows the word "retry" without an explicit
+    // delay form is a request id or status reference, never a durable
+    // backoff.
+    let (terminal, _) = run_pi_transcript(&pi_error_lines(
+        "temporarily overloaded, please retry. request id 8412345",
+    ));
+    assert_eq!(failed(&terminal).retry_after_secs, None);
+
+    // Units convert: minutes scale to seconds.
+    let (terminal, _) = run_pi_transcript(&pi_error_lines("rate limited, retry in 2 minutes"));
+    assert_eq!(failed(&terminal).retry_after_secs, Some(120));
 }
 
 /// A contract-valid send can carry a `system` prompt whose inline OpenCode

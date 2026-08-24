@@ -115,10 +115,12 @@ enum TerminalOutcome {
 
 struct RunState {
     status: Status,
-    /// Encoded, sequence-addressed replay units (KTD4). `Arc` so subscribers
-    /// copy references, never bytes; the terminal append is the only
-    /// transition that closes this log.
-    replay: Vec<Arc<[u8]>>,
+    /// Encoded, sequence-addressed replay frames (KTD4). `Arc` so
+    /// subscribers copy references, never bytes; the terminal append is the
+    /// only transition that closes this log. Each frame carries its own
+    /// byte charge, so a subscriber-held clone stays accounted even after
+    /// the run is purged.
+    replay: Vec<Arc<ReplayFrame>>,
     /// Charged backend-event bytes only; the `run_started` and terminal
     /// units live inside the pre-charged terminal headroom.
     replay_bytes: usize,
@@ -129,8 +131,9 @@ struct RunState {
     /// Cancel and delete wait on this so no backend work outlives their
     /// completion (R10).
     work_done: bool,
-    /// Removed from both indices; replay and charges are gone. Subscribers
-    /// observing this detach instead of replaying a purged log.
+    /// Removed from both indices. Subscribers observing this detach instead
+    /// of replaying a purged log; a frame a subscriber already holds keeps
+    /// its charge until that holder drops it.
     purged: bool,
     completed_at: Option<Instant>,
     /// Held from admission through terminal commitment (R13's 32-run cap).
@@ -138,8 +141,44 @@ struct RunState {
     /// Immutable request bytes, key metadata, and terminal headroom (R12);
     /// shrunk to the retained remainder at terminal commitment.
     base_charge: ByteCharge,
-    /// One charge per retained backend-event unit.
-    unit_charges: Vec<ByteCharge>,
+}
+
+/// One retained replay frame: the encoded unit plus the byte charge that
+/// keeps it accounted (R12). The charge shares the `Arc` with the bytes,
+/// so purging a run releases only the frames nobody holds — a subscriber
+/// between `Subscription::next()` and its stream write keeps that frame's
+/// bytes charged, and the budget returns exactly when the last holder
+/// drops the frame, never while the bytes are still resident.
+pub struct ReplayFrame {
+    bytes: Box<[u8]>,
+    /// `ByteCharge::none()` for `run_started` and terminal units, which
+    /// live inside the run's pre-charged terminal headroom.
+    _charge: ByteCharge,
+}
+
+impl ReplayFrame {
+    fn uncharged(bytes: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            bytes: bytes.into(),
+            _charge: ByteCharge::none(),
+        })
+    }
+}
+
+impl std::ops::Deref for ReplayFrame {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::fmt::Debug for ReplayFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayFrame")
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 struct Run {
@@ -179,7 +218,7 @@ struct Index {
 struct Released {
     charges: Vec<ByteCharge>,
     permits: Vec<OwnedSemaphorePermit>,
-    replays: Vec<Vec<Arc<[u8]>>>,
+    replays: Vec<Vec<Arc<ReplayFrame>>>,
     tombstones: Vec<Tombstone>,
 }
 
@@ -394,7 +433,6 @@ impl Supervisor {
                 completed_at: None,
                 run_permit: Some(run_permit),
                 base_charge: charge.split_or_take(base_bytes),
-                unit_charges: Vec::new(),
             }),
             notify: Notify::new(),
             cancel: CancellationToken::new(),
@@ -518,7 +556,6 @@ impl Supervisor {
                 &mut state.base_charge,
                 ByteCharge::none(),
             ));
-            released.charges.append(&mut state.unit_charges);
             released.replays.push(std::mem::take(&mut state.replay));
             drop(state);
             index.sessions.insert(
@@ -830,7 +867,9 @@ async fn wait_work_done(run: &Run) {
 /// Queued -> running plus the `run_started` unit (R8). Returns false when a
 /// terminal already won, in which case the backend must not start.
 fn begin_running(run: &Run) -> bool {
-    let unit: Arc<[u8]> = protocol::run_started_unit(&run.run_id).into();
+    // No per-unit charge: run_started lives inside the terminal headroom
+    // reserved with the run's base charge.
+    let unit = ReplayFrame::uncharged(protocol::run_started_unit(&run.run_id));
     {
         let mut state = lock_run(run);
         if state.terminal_appended || state.purged {
@@ -838,8 +877,6 @@ fn begin_running(run: &Run) -> bool {
         }
         state.status = Status::Running;
         state.started_appended = true;
-        // No per-unit charge: run_started lives inside the terminal
-        // headroom reserved with the run's base charge.
         state.replay.push(unit);
     }
     run.notify.notify_waiters();
@@ -854,9 +891,9 @@ fn append_event(inner: &Arc<Inner>, run: &Arc<Run>, event: BackendEvent) -> Sink
         text,
         finish_reason,
     } = event;
-    let unit: Arc<[u8]> =
+    let bytes: Box<[u8]> =
         protocol::assistant_message_unit(&run.run_id, &text, finish_reason).into();
-    let len = unit.len();
+    let len = bytes.len();
     let charge = match inner.retained.try_charge(len) {
         Some(charge) => Some(charge),
         None => {
@@ -890,9 +927,11 @@ fn append_event(inner: &Arc<Inner>, run: &Arc<Run>, event: BackendEvent) -> Sink
                 ErrorClass::Permanent,
             ));
         } else if let Some(charge) = charge {
-            state.replay.push(unit);
+            state.replay.push(Arc::new(ReplayFrame {
+                bytes,
+                _charge: charge,
+            }));
             state.replay_bytes += len;
-            state.unit_charges.push(charge);
             drop(state);
             run.notify.notify_waiters();
             return SinkStatus::Accepted;
@@ -938,7 +977,9 @@ fn finish(inner: &Arc<Inner>, run: &Arc<Run>, outcome: TerminalOutcome) {
         if !state.started_appended {
             state
                 .replay
-                .push(protocol::run_started_unit(&run.run_id).into());
+                .push(ReplayFrame::uncharged(protocol::run_started_unit(
+                    &run.run_id,
+                )));
             state.started_appended = true;
         }
         let (unit, status): (Vec<u8>, Status) = match &outcome {
@@ -962,7 +1003,7 @@ fn finish(inner: &Arc<Inner>, run: &Arc<Run>, outcome: TerminalOutcome) {
                 Status::Cancelled,
             ),
         };
-        state.replay.push(unit.into());
+        state.replay.push(ReplayFrame::uncharged(unit));
         state.terminal_appended = true;
         state.status = status;
         state.completed_at = Some(Instant::now());
@@ -1057,7 +1098,6 @@ fn remove_session(index: &mut Index, key: &SessionKey, released: &mut Released) 
                 &mut state.base_charge,
                 ByteCharge::none(),
             ));
-            released.charges.append(&mut state.unit_charges);
             released.replays.push(std::mem::take(&mut state.replay));
             if let Some(permit) = state.run_permit.take() {
                 released.permits.push(permit);
@@ -1109,10 +1149,12 @@ pub struct Subscription {
 }
 
 impl Subscription {
-    /// The next retained unit in order, or `None` once the in-band terminal
+    /// The next retained frame in order, or `None` once the in-band terminal
     /// has been delivered (R8), the run was purged, or the host is shutting
-    /// down. Waits without polling while the run is still producing.
-    pub async fn next(&mut self) -> Option<Arc<[u8]>> {
+    /// down. Waits without polling while the run is still producing. The
+    /// returned frame carries its own byte charge, so holding it keeps its
+    /// bytes accounted even across a concurrent purge.
+    pub async fn next(&mut self) -> Option<Arc<ReplayFrame>> {
         loop {
             let notified = self.run.notify.notified();
             tokio::pin!(notified);

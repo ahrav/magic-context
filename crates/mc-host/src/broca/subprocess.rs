@@ -251,12 +251,29 @@ pub async fn run(
         .id()
         .and_then(|pid| i32::try_from(pid).ok())
         .and_then(rustix::process::Pid::from_raw);
-    // Crash record for the startup sweep: if this host dies without running
-    // any kill path below, the next incarnation uses this entry to kill the
-    // surviving group. `Drop` removes it, covering every exit of this
-    // function once the group has been reaped in-process.
-    let _group_record =
+    // Crash-ownership registration is a barrier before prompt delivery,
+    // and it fails closed: both harnesses start their billable provider
+    // request only after reading the prompt from stdin, so no billable
+    // work can exist without a durable registry record for the replacement
+    // host to sweep. If the record cannot be written, the group is killed
+    // before any prompt bytes flow — pre-prompt descendants are the only
+    // residue of a crash in this window, and they hold no billable
+    // request. `Drop` removes the record on every exit of this function
+    // once the group has been reaped in-process. (No fsync: the record
+    // only needs to survive a host-process crash — power loss kills the
+    // children with it.)
+    let group_record =
         group.and_then(|g| group_registry::GroupRecord::record(g.as_raw_nonzero().get()));
+    if group_record.is_none() {
+        kill_group(group, rustix::process::Signal::KILL);
+        // Covers the (theoretical) missing-group-id case kill_group skips.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(io::Error::other(
+            "crash-ownership registration failed before prompt delivery",
+        ));
+    }
+    let _group_record = group_record;
 
     // Prompt delivery is concurrent with output draining: a child that
     // fills its stdout pipe before reading stdin must not deadlock us.
@@ -748,22 +765,75 @@ pub(crate) fn classify_failure_text(text: &str) -> ErrorClass {
 /// would persist a durable historian backoff decades into the future.
 pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
 
-/// Extracts a retry delay in seconds from "retry after 45s"-style phrasing:
-/// the first digit run after the word "retry" (R18 retry metadata), clamped
-/// to [`MAX_RETRY_AFTER_SECS`] because the source text is untrusted.
+/// Extracts a retry delay in seconds from provider failure text (R18 retry
+/// metadata), clamped to [`MAX_RETRY_AFTER_SECS`] because the source text
+/// is untrusted. Only an explicit delay form counts — `retry after <n>`,
+/// `retry in <n>`, `retrying after <n>`, `Retry-After: <n>`, or an echoed
+/// `retryAfter` field, with an optional unit — so an unrelated number later
+/// in the message (a request id, a status reference) is never persisted as
+/// a durable backoff.
 pub(crate) fn retry_after_secs_in_text(text: &str) -> Option<u64> {
     let lower = text.to_ascii_lowercase();
-    let after = &lower[lower.find("retry")? + "retry".len()..];
-    let start = after.find(|c: char| c.is_ascii_digit())?;
-    let digits: String = after[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
         .collect();
-    // An over-long digit run overflows u64::from_str; treat it as the cap
-    // rather than dropping the (real) retry signal entirely.
-    Some(digits.parse().map_or(MAX_RETRY_AFTER_SECS, |secs: u64| {
-        secs.min(MAX_RETRY_AFTER_SECS)
-    }))
+    for (index, token) in tokens.iter().enumerate() {
+        // Closed verb vocabulary: prefix matching would also catch
+        // "retrieval after 300 items".
+        if !matches!(
+            *token,
+            "retry" | "retries" | "retried" | "retrying" | "retryafter"
+        ) {
+            continue;
+        }
+        // "retryafter" — a lowered `retryAfter` field echo — carries the
+        // delay keyword glued to the verb.
+        let (number_index, glued) = if *token == "retryafter" {
+            (index + 1, true)
+        } else {
+            (index + 2, false)
+        };
+        if !glued && !matches!(tokens.get(index + 1).copied(), Some("after") | Some("in")) {
+            continue;
+        }
+        let Some(number) = tokens.get(number_index) else {
+            continue;
+        };
+        if let Some(secs) = parse_delay_token(number, tokens.get(number_index + 1).copied()) {
+            return Some(secs);
+        }
+    }
+    None
+}
+
+/// Parses one `<digits>[unit]` token (unit optionally in the next token).
+/// An over-long digit run overflows `u64::from_str`; treat it as the cap
+/// rather than dropping the (real) retry signal entirely.
+fn parse_delay_token(token: &str, next: Option<&str>) -> Option<u64> {
+    let digits_end = token
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(token.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let value: u64 = token[..digits_end].parse().unwrap_or(MAX_RETRY_AFTER_SECS);
+    let unit = if digits_end < token.len() {
+        &token[digits_end..]
+    } else {
+        next.unwrap_or("")
+    };
+    let secs = match unit {
+        // A bare number after an explicit delay keyword means seconds.
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => value,
+        "ms" | "millisecond" | "milliseconds" => value.div_ceil(1000).max(1),
+        "m" | "min" | "mins" | "minute" | "minutes" => value.saturating_mul(60),
+        "h" | "hr" | "hrs" | "hour" | "hours" => value.saturating_mul(3600),
+        // The following token is prose, not a unit; the number still rode
+        // an explicit delay form, so it counts as seconds.
+        _ => value,
+    };
+    Some(secs.min(MAX_RETRY_AFTER_SECS))
 }
 
 /// Admits a provider-supplied error code onto the wire only in short
