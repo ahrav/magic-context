@@ -114,17 +114,19 @@ fn default_limits_and_resource_declaration_match_the_fixed_caps() {
     let resources = component.resources();
     assert_eq!(resources.reserved_pending_requests, 96);
     assert_eq!(resources.reserved_handler_tasks, 96);
-    // The supervisor's 64 MiB budget plus the two retention classes outside
+    // The supervisor's 64 MiB budget plus the retention classes outside
     // it: the route-identity map (1024 routes x (4096-byte root + 256-byte
-    // session + 128-byte key overhead)) and live backend capture
+    // session + 128-byte key overhead)), live backend capture
     // (8 backends x ((4 MiB stdout + 64 KiB stderr) x 5 parse-time copies
     // + one 512 KiB request body retained across the Pi provider
-    // fallback's aliased attempt)).
+    // fallback's aliased attempt)), and the uncharged deletion-tombstone
+    // worst case (256 sessions x the doubled key-meta bound).
     assert_eq!(
         resources.retained_resident_bytes,
         64 * 1024 * 1024
             + 1024 * (4096 + 256 + 128)
             + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024)
+            + 256 * ((4096 + 256) * 2 + 128)
     );
     assert_eq!(resources.route_class, mc_host::RouteClass::Reserved);
 }

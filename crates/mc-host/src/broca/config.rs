@@ -67,13 +67,25 @@ pub const ROUTE_IDENTITY_HEADROOM_BYTES: u64 = (MAX_BOUND_ROUTES as u64) * (4096
 pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 = (MAX_BACKEND_PROCESSES as u64)
     * ((4 * 1024 * 1024 + 64 * 1024) * 5 + MAX_SEND_BODY_BYTES as u64);
 
+/// Worst case for deletion tombstones installed UNCHARGED when the retained
+/// budget is exhausted at the delete/eviction race: every such tombstone
+/// still counts toward [`MAX_TERMINAL_SESSIONS`], so at most that many
+/// session keys (each retained twice plus overhead, the `meta_bytes`
+/// worst case) can sit outside the charged budget until they expire or the
+/// cap evicts them. Declared alongside the retained budget for the same
+/// reason as [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
+    (MAX_TERMINAL_SESSIONS as u64) * ((4096 + 256) * 2 + 128);
+
 /// The complete retained-byte reservation the component declares to the
-/// host: the supervisor's enforced budget plus the two retention classes
-/// that live outside it. The host subtracts this whole amount from ingress,
+/// host: the supervisor's enforced budget plus the retention classes that
+/// live outside it. The host subtracts this whole amount from ingress,
 /// so anything sizing ingress headroom around Broca must use this sum, not
 /// [`MAX_RETAINED_BYTES`] alone.
-pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 =
-    MAX_RETAINED_BYTES + ROUTE_IDENTITY_HEADROOM_BYTES + BACKEND_CAPTURE_HEADROOM_BYTES;
+pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = MAX_RETAINED_BYTES
+    + ROUTE_IDENTITY_HEADROOM_BYTES
+    + BACKEND_CAPTURE_HEADROOM_BYTES
+    + DELETION_TOMBSTONE_HEADROOM_BYTES;
 
 /// Most sessions retained in a terminal or deletion-tombstone state (R12);
 /// beyond it the oldest eligible entry is evicted.

@@ -494,7 +494,8 @@ async fn retained_declaration_raises_the_resident_floor_exactly() {
 async fn the_default_resident_cap_absorbs_the_broca_reservation() {
     const RETAINED: u64 = 64 * 1024 * 1024
         + 1024 * (4096 + 256 + 128)
-        + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024);
+        + 8 * ((4 * 1024 * 1024 + 64 * 1024) * 5 + 512 * 1024)
+        + 256 * ((4096 + 256) * 2 + 128);
     let defaults = HostLimits::default();
     assert_eq!(
         defaults.max_resident_bytes - RETAINED,
