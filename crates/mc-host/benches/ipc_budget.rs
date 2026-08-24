@@ -691,6 +691,21 @@ fn collect_tcp_open(attempt: &mut Attempt, pair: (u32, u32)) -> Result<(), Strin
             result.outcomes
         ));
     }
+    // Drain-time transport failures do not mark the run truncated (the
+    // window itself completed), but a live peer that left measured
+    // requests unanswered or closed during the drain still lost
+    // responses; retaining the attempt would publish latency from only
+    // the successful subset.
+    let transport_failures = result.outcomes.peer_closed
+        + result.outcomes.write_failure
+        + result.outcomes.unresolved_at_drain;
+    if transport_failures > 0 {
+        return Err(format!(
+            "{transport_failures} transport-failure outcome(s) in the measured window \
+             (outcomes: {:?}); the attempt is invalid",
+            result.outcomes
+        ));
+    }
     check_host_and_conservation(&mut host, &result.outcomes, result.scheduled_slots)?;
     if result.outcomes.success == 0 {
         return Err(format!(

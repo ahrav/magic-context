@@ -379,6 +379,23 @@ async fn run_conn(
                 drain_deadline = Some(Instant::now() + DRAIN_BUDGET);
                 None
             }
+            // Absolute backstop, armed from the start: with a peer that
+            // withholds responses, a saturated closed-loop sender parks
+            // on permits and never signals completion, so no
+            // sender-driven drain deadline would ever arm and the run
+            // would wedge on the socket read.
+            () = tokio::time::sleep_until((send_deadline + DRAIN_BUDGET).into()),
+                if !done_wait =>
+            {
+                drain_meta(&mut meta_rx, &mut pending, &mut result.outcomes);
+                for (_, (sched, issue)) in pending.drain() {
+                    if in_window(sched, issue) {
+                        result.outcomes.record(Outcome::UnresolvedAtDrain);
+                    }
+                }
+                result.closed_early = true;
+                break;
+            }
             () = async {
                 match drain_deadline {
                     Some(at) => tokio::time::sleep_until(at.into()).await,

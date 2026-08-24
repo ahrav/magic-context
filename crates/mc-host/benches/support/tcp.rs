@@ -641,6 +641,13 @@ async fn run_throughput_inner(
     if cfg.measure.is_zero() {
         return Err("throughput arm requires a nonzero measurement window".to_owned());
     }
+    if cfg.warmup.is_zero() {
+        // The primed pipeline is issued before `first_measured` can be
+        // set, so with a zero warmup the depth primed requests would sit
+        // inside the measured window yet be excluded from offered and
+        // terminal accounting, underreporting the rate.
+        return Err("throughput arm requires a nonzero warmup window".to_owned());
+    }
     let (mut stream, channel, epoch) = open_route(publication, "budget-throughput").await?;
     let mut body = Vec::new();
     let mut outcomes = OutcomeCounts::default();
