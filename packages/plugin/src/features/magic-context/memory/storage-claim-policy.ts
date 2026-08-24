@@ -462,33 +462,33 @@ export function countIndependentEvidenceGroups(db: Database, revisionId: number)
     // distinct counts reads 2 for (keyA,run1,X), (keyA,run2,Y), (keyB,run1,Y)
     // even though every pair shares a key, a run, or content — promoting a
     // revision to CORROBORATED on evidence that is not independently rooted.
-    // The only consumer threshold is >= 2, so an exact pairwise scan for one
-    // fully-distinct pair decides the count; the row cap only bounds the
-    // quadratic scan and CANNOT under-report the >= 2 answer for realistic
-    // corpora (any fully-distinct pair inside the cap still fires).
-    const rows = db
+    // The only consumer threshold is >= 2, so an existence check for one
+    // fully-distinct pair decides the count. It runs in SQL over the FULL
+    // support set: any application-side row cap could truncate away the one
+    // row that completes a qualifying pair.
+    const row = db
         .prepare(
-            `SELECT o.independence_key AS key, o.extractor_run_id AS run,
-                    o.content_sha256 AS content
-             FROM claim_evidence e
-             JOIN observations o ON o.id = e.observation_id
-             WHERE e.revision_id = ? AND e.relation = 'supports'
-             LIMIT 500`,
+            `SELECT
+                EXISTS (
+                    SELECT 1 FROM claim_evidence e
+                    JOIN observations o ON o.id = e.observation_id
+                    WHERE e.revision_id = ?1 AND e.relation = 'supports'
+                ) AS hasAny,
+                EXISTS (
+                    SELECT 1
+                    FROM claim_evidence e1
+                    JOIN observations o1 ON o1.id = e1.observation_id
+                    JOIN claim_evidence e2 ON e2.revision_id = ?1 AND e2.relation = 'supports'
+                    JOIN observations o2 ON o2.id = e2.observation_id
+                    WHERE e1.revision_id = ?1 AND e1.relation = 'supports'
+                      AND o1.independence_key <> o2.independence_key
+                      AND o1.extractor_run_id <> o2.extractor_run_id
+                      AND o1.content_sha256 <> o2.content_sha256
+                ) AS hasPair`,
         )
-        .all(revisionId) as Array<{ key: string; run: string; content: string }>;
-    if (rows.length === 0) return 0;
-    for (let a = 0; a < rows.length; a += 1) {
-        for (let b = a + 1; b < rows.length; b += 1) {
-            if (
-                rows[a].key !== rows[b].key &&
-                rows[a].run !== rows[b].run &&
-                rows[a].content !== rows[b].content
-            ) {
-                return 2;
-            }
-        }
-    }
-    return 1;
+        .get(revisionId) as { hasAny: number; hasPair: number };
+    if (row.hasPair) return 2;
+    return row.hasAny ? 1 : 0;
 }
 
 /** Exact explicit-user evidence for this revision: a supports observation

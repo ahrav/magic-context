@@ -2575,6 +2575,11 @@ async function executeUnifiedSearch(args: {
                 const surface = options.memoryPolicySurface ?? "explicit_search";
                 const policyRows = readMemoryPolicyRows(db, memoryIds);
                 const digestsNow = exactMemoryContentDigests(db, memoryIds);
+                // Policy again AFTER the digest read (two autocommit
+                // snapshots): a hide committed between them leaves the
+                // digest unchanged, and this is the final publication
+                // boundary for explicit and automatic search alike.
+                const policyRowsAfter = readMemoryPolicyRows(db, memoryIds);
                 // Drop rows the final policy read hides AND refresh every
                 // survivor's trust label from that same read: a memory
                 // marked stale/flagged while the telemetry write waited
@@ -2583,16 +2588,21 @@ async function executeUnifiedSearch(args: {
                 return results.flatMap<(typeof results)[number]>((result) => {
                     if (result.source !== "memory") return [result];
                     const decision = decideMemoryPolicy(policyRows.get(result.memoryId), surface);
+                    const decisionAfter = decideMemoryPolicy(
+                        policyRowsAfter.get(result.memoryId),
+                        surface,
+                    );
                     if (
                         !decision.eligible ||
+                        !decisionAfter.eligible ||
                         (result.contentDigest !== undefined &&
                             digestsNow.get(result.memoryId) !== result.contentDigest)
                     ) {
                         return [];
                     }
                     const { policyLabel: _stale, ...rest } = result;
-                    const refreshed: MemorySearchResult = decision.label
-                        ? { ...rest, policyLabel: decision.label }
+                    const refreshed: MemorySearchResult = decisionAfter.label
+                        ? { ...rest, policyLabel: decisionAfter.label }
                         : rest;
                     return [refreshed];
                 });

@@ -2255,8 +2255,18 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<void> {
             db,
             rows.map((row) => row.id),
         );
+        // Policy again AFTER the digest read (two autocommit snapshots,
+        // mirroring the detailed lane): a hide committed after `eligibleIds`
+        // was read leaves the digest unchanged, and these bytes are about to
+        // reach the embedding provider.
+        const eligibleAfterDrain = memoriesEligibleForEmbedding(
+            db,
+            rows.map((row) => row.id),
+        );
         const boundRows = rows.filter(
-            (row) => digestsAtDrain.get(row.id) === sha256Utf8Hex(row.content),
+            (row) =>
+                digestsAtDrain.get(row.id) === sha256Utf8Hex(row.content) &&
+                eligibleAfterDrain.has(row.id),
         );
         if (boundRows.length === 0) return;
         const vectors = await embedShadowItems(
