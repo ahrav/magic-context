@@ -77,6 +77,20 @@ pub const BACKEND_CAPTURE_HEADROOM_BYTES: u64 = (MAX_BACKEND_PROCESSES as u64)
 pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
     (MAX_TERMINAL_SESSIONS as u64) * ((4096 + 256) * 3 + 128);
 
+/// Worst case for the daemon-startup environment snapshot and the copies a
+/// spawn briefly needs.
+///
+/// The snapshot is captured once and shared behind an `Arc`, so exactly one
+/// copy is retained for the component's lifetime — but it holds whatever
+/// environment the daemon inherited, which on Linux is bounded only by the
+/// total exec argument limit (commonly 2 MiB). Each concurrent spawn adds
+/// two transient copies of that size, the adapter's assembled child
+/// environment and the `Command`'s own map, both freed as soon as the child
+/// exists. Declared alongside the retained budget for the same reason as
+/// [`ROUTE_IDENTITY_HEADROOM_BYTES`].
+pub const ENV_SNAPSHOT_HEADROOM_BYTES: u64 =
+    (1 + 2 * MAX_BACKEND_PROCESSES as u64) * 2 * 1024 * 1024;
+
 /// The complete retained-byte reservation the component declares to the
 /// host: the supervisor's enforced budget plus the retention classes that
 /// live outside it. The host subtracts this whole amount from ingress,
@@ -85,7 +99,8 @@ pub const DELETION_TOMBSTONE_HEADROOM_BYTES: u64 =
 pub const DECLARED_RETAINED_RESIDENT_BYTES: u64 = MAX_RETAINED_BYTES
     + ROUTE_IDENTITY_HEADROOM_BYTES
     + BACKEND_CAPTURE_HEADROOM_BYTES
-    + DELETION_TOMBSTONE_HEADROOM_BYTES;
+    + DELETION_TOMBSTONE_HEADROOM_BYTES
+    + ENV_SNAPSHOT_HEADROOM_BYTES;
 
 /// Most sessions retained in a terminal or deletion-tombstone state (R12);
 /// beyond it the oldest eligible entry is evicted.

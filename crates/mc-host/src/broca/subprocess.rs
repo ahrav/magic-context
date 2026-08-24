@@ -492,7 +492,16 @@ fn kill_group_fenced(
 ) {
     if exit == LeaderExit::ExitedUnfenced {
         let Some(pid) = group else { return };
-        let live = group_registry::group_has_members(pid.as_raw_nonzero().get()).unwrap_or(false);
+        let pgid = pid.as_raw_nonzero().get();
+        // An unverifiable scan must not read as "no members": skipping the
+        // signal there leaks this run's descendants AND the crash record is
+        // removed as this run ends, so nothing would ever sweep them. One
+        // retry, then signal — an unlikely recycled-pgid hit is a bounded
+        // wrong signal, while a missed kill is billable work running with
+        // no recovery path left.
+        let live = group_registry::group_has_members(pgid)
+            .or_else(|_| group_registry::group_has_members(pgid))
+            .unwrap_or(true);
         if !live {
             return;
         }
