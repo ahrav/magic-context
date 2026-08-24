@@ -2038,7 +2038,16 @@ export function resolveMemoriesByIdsForSearch(args: {
     // eligibility (and label) can never lend itself to superseded revision A
     // bytes — including revealing A after a hidden target was rewritten.
     const policyFilter = filterMemoriesByPolicy(args.db, fetched, "explicit_search");
-    const bound = bindMemoriesToCurrentRevision(args.db, policyFilter.memories);
+    // Reapply the policy on the BOUND rows: a quarantine or label transition
+    // committed between the first policy read and the binding must not
+    // publish the hidden row or a stale label — this lane short-circuits
+    // before executeUnifiedSearch's final recheck.
+    const recheck = filterMemoriesByPolicy(
+        args.db,
+        bindMemoriesToCurrentRevision(args.db, policyFilter.memories),
+        "explicit_search",
+    );
+    const bound = recheck.memories;
     const ordered: Memory[] = [];
     for (const memory of bound) {
         if (args.visibleMemoryIds?.has(memory.id)) continue;
@@ -2058,7 +2067,7 @@ export function resolveMemoriesByIdsForSearch(args: {
         }),
     });
     return results.map((result) => {
-        const label = policyFilter.labels.get(result.memoryId);
+        const label = recheck.labels.get(result.memoryId);
         return label ? { ...result, policyLabel: label } : result;
     });
 }

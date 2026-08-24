@@ -2608,11 +2608,24 @@ export function materializeM0(options: M0M1RenderOptions): MaterializeM0Result {
         // dogfood 2026-05-30: AFT showed "Injected 256" against 124 live memories,
         // all 256 ids deleted. Same transaction as the m[0] snapshot so the cached
         // bytes and their id manifest never diverge.
+        // Aligned exact hashes ride the same write: the replay gate proves a
+        // recorded block against current policy AND revision digests, and a
+        // missing or stale hash record reads as unbacked — which would clear
+        // the freshly prepared injection cache on the very next defer pass.
+        // Inside this transaction the rendered bytes ARE the current
+        // revisions (the phase-3 stale check just passed), so the oracle
+        // digests describe exactly what was rendered.
+        const visibleMemoryDigests = exactMemoryContentDigests(options.db, visibleMemoryIds);
         options.db
             .prepare(
-                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ? WHERE session_id = ?",
+                "UPDATE session_meta SET memory_block_count = ?, memory_block_ids = ?, memory_block_hashes = ? WHERE session_id = ?",
             )
-            .run(visibleMemoryIds.length, JSON.stringify(visibleMemoryIds), options.sessionId);
+            .run(
+                visibleMemoryIds.length,
+                JSON.stringify(visibleMemoryIds),
+                JSON.stringify(visibleMemoryIds.map((id) => visibleMemoryDigests.get(id) ?? "")),
+                options.sessionId,
+            );
 
         // Persist the boundary the freshly-rendered m[0]+m[1] cover (the latest
         // compartment's end message id). A cold post-restart pass reads this to
@@ -3145,13 +3158,18 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
         // cached summary covers moves forward with it. Keeping it in sync here is
         // what lets a later cold post-restart defer pass trim correctly.
         const baselineEndMessageId = getLastCompartmentEndMessageId(options.db, options.sessionId);
+        // Same aligned-hash discipline as the materialize write above: the
+        // soft refresh replaces the id manifest, so the hash record must move
+        // with it or the replay gate reads the block as unbacked.
+        const visibleMemoryDigests = exactMemoryContentDigests(options.db, visibleMemoryIds);
         options.db
             .prepare(
                 `UPDATE session_meta
                     SET cached_m1_bytes = ?,
                         cached_m0_last_baseline_end_message_id = ?,
                         memory_block_count = ?,
-                        memory_block_ids = ?
+                        memory_block_ids = ?,
+                        memory_block_hashes = ?
                   WHERE session_id = ?`,
             )
             .run(
@@ -3159,6 +3177,7 @@ function softRefreshCachedM1(options: M0M1RenderOptions): RenderM1Result {
                 baselineEndMessageId,
                 visibleMemoryIds.length,
                 JSON.stringify(visibleMemoryIds),
+                JSON.stringify(visibleMemoryIds.map((id) => visibleMemoryDigests.get(id) ?? "")),
                 options.sessionId,
             );
         options.db.exec("COMMIT");

@@ -214,6 +214,10 @@ export interface ModuleStateSyncPayload {
     };
     watermarks: ModuleWatermarks;
     wireBatches?: ModuleStateSyncPayload[];
+    /** Exact digests of the content-carrying snapshot rows this payload
+     * installs, retained for the post-send recheck. Top-level (not in
+     * `params`), so it never crosses the wire. */
+    memorySnapshotDigests?: ReadonlyMap<number, string>;
 }
 
 /** The subset of sender state needed to serialize a state-sync payload. */
@@ -1735,6 +1739,14 @@ export async function buildModuleStateSyncPayload(args: {
         foreignCoverage !== null && foreignCoverage.reclassifyRows.length > 0
             ? [...memoryRows, ...foreignCoverage.reclassifyRows]
             : memoryRows;
+    // Retained for the post-send recheck: a held-open pre-v86 writer can
+    // rewrite a member while the paged sends are in flight without bumping
+    // the epoch, and the completing-batch epoch/fingerprint comparison
+    // cannot see it. The digests describe exactly the bytes this payload
+    // installs (each row passed the oracle equality above).
+    const memorySnapshotDigests: ReadonlyMap<number, string> = new Map(
+        snapshotRows.map((memory) => [memory.id, sha256Utf8Hex(memory.content)]),
+    );
     const memories = snapshotRows.map((memory) => ({
         id: memory.id,
         project_path: memory.projectPath,
@@ -1976,9 +1988,10 @@ export async function buildModuleStateSyncPayload(args: {
     };
     if (args.force) {
         const wireBatches = buildPagedModuleStateSyncPayloads(payloadArgs);
-        return { ...wireBatches[0], wireBatches };
+        return { ...wireBatches[0], wireBatches, memorySnapshotDigests };
     }
     const livePayload: ModuleStateSyncPayload = {
+        memorySnapshotDigests,
         method: "state_sync",
         params: {
             shadow_generation: args.state.moduleGeneration,
@@ -2304,6 +2317,27 @@ export async function syncModuleState(args: {
                 );
                 force = true;
                 continue;
+            }
+            // Exact snapshot recheck: the epoch/fingerprint comparison above
+            // cannot see a held-open pre-v86 writer's rewrite (it never
+            // bumps the epoch), so re-prove every content-carrying snapshot
+            // row this payload installed against the claim-revision oracle
+            // and rebuild before acking on any mismatch.
+            const sentDigests = payload.memorySnapshotDigests;
+            if (sentDigests !== undefined && sentDigests.size > 0) {
+                const sentIds = [...sentDigests.keys()];
+                const digestsNow = exactMemoryContentDigests(args.pass.db, sentIds);
+                const rewritten = sentIds.filter(
+                    (id) => digestsNow.get(id) !== sentDigests.get(id),
+                );
+                if (rewritten.length > 0) {
+                    sessionLog(
+                        args.pass.sessionId,
+                        `module state sync rebuilding after send: ${rewritten.length} snapshot row(s) rewritten while the sync was in flight`,
+                    );
+                    force = true;
+                    continue;
+                }
             }
         }
         args.state.lastAckedWatermarks = payload.watermarks;
