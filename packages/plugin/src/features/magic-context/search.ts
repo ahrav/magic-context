@@ -925,10 +925,36 @@ async function searchMemories(args: {
               merged.map((result) => result.memoryId),
           )
         : new Map<number, MemoryPolicyRow>();
+    // The recheck must bind to the LOADED bytes, not just the id: a rewrite
+    // committed during the scoring yields makes the unchanged memory id
+    // resolve through the new revision, whose eligibility would otherwise
+    // admit the superseded content this lane loaded. Results whose live
+    // hash no longer matches the loaded hash are dropped.
+    const loadedHashById = new Map(memories.map((memory) => [memory.id, memory.normalizedHash]));
+    const currentHashById =
+        hasPolicy && merged.length > 0
+            ? new Map(
+                  (
+                      args.db
+                          .prepare(
+                              // Interpolation is a compile-time placeholder list, not caller input.
+                              // pi-lens-ignore: sql-injection
+                              `SELECT id, normalized_hash AS hash FROM memories WHERE id IN (${merged.map(() => "?").join(", ")})`,
+                          )
+                          .all(...merged.map((result) => result.memoryId)) as Array<{
+                          id: number;
+                          hash: string;
+                      }>
+                  ).map((row) => [row.id, row.hash] as const),
+              )
+            : new Map<number, string>();
     const rechecked: MemorySearchResult[] = [];
     for (const result of merged) {
         if (!hasPolicy) {
             rechecked.push(result);
+            continue;
+        }
+        if (currentHashById.get(result.memoryId) !== loadedHashById.get(result.memoryId)) {
             continue;
         }
         const decision = decideMemoryPolicy(recheckRows.get(result.memoryId), args.policySurface);

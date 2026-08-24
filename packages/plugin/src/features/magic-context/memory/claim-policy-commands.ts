@@ -373,6 +373,12 @@ function tokenizeCommandArgs(text: string): string[] {
     return tokens;
 }
 
+/** Re-quote a parsed token for a rendered command so copying the generated
+ * confirmation reproduces the same tokenization. */
+function quoteCommandArg(value: string): string {
+    return /\s/.test(value) ? `"${value}"` : value;
+}
+
 /** ponytail: the default evaluator only knows `bun test`; policy/config
  * artifact evaluators plug in through `deps.evaluateArtifact` when needed.
  * The child process runs detached from the event loop so a slow or hanging
@@ -747,7 +753,7 @@ export async function executeClaimEnforceCommand(
     if (outcome.pending) {
         return {
             text: confirmationText(
-                `/ctx-enforce ${memoryId} ${artifactInput}${kind === "test" ? "" : ` --kind ${kind}`}`,
+                `/ctx-enforce ${memoryId} ${quoteCommandArg(artifactInput)}${kind === "test" ? "" : ` --kind ${kind}`}`,
                 "Claim Enforcement",
                 deps,
                 target,

@@ -12,7 +12,6 @@ import {
     getMemoriesByProjects,
     readNewMemoriesForM1Union,
 } from "../../features/magic-context/memory/storage-memory";
-import type { MemoryStatus } from "../../features/magic-context/memory/types";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getCompartments,
@@ -1042,6 +1041,49 @@ function readCompartmentsAfterSequence(
         }));
 }
 
+/**
+ * Id-only coverage query for the explicit-delete lane: every foreign row the
+ * workspace snapshot's visibility scope can see, in ANY status and ignoring
+ * expiry — an archived or expired previously-mirrored row must still be
+ * named for deletion. Own-identity rows are excluded (the replace scope
+ * prunes those wholesale); own ALIASES not listed in `ownIdentities` count
+ * as foreign here, which is correct because the replace scope does not
+ * cover them either. Id-only so a large legacy history never hydrates
+ * content just to compute deletions.
+ */
+function readForeignCoverageMemoryIds(args: {
+    db: ContextDatabase;
+    workspace: ModuleWorkspaceContext;
+}): number[] {
+    const identities = args.workspace.expandedIdentities;
+    if (identities.length === 0) return [];
+    const filter = buildWorkspaceMemorySqlFilter({
+        identities,
+        ownIdentities: args.workspace.ownIdentities,
+        shareCategories: args.workspace.shareCategories,
+        tableName: "m",
+    });
+    const ownIdentities = args.workspace.ownIdentities;
+    const ownClause =
+        ownIdentities.length > 0
+            ? ` AND m.project_path NOT IN (${ownIdentities.map(() => "?").join(", ")})`
+            : "";
+    const placeholders = identities.map(() => "?").join(", ");
+    const rows = args.db
+        .prepare(
+            // Interpolation is a compile-time placeholder list, not caller input.
+            // pi-lens-ignore: sql-injection
+            `SELECT m.id
+               FROM memories AS m
+              WHERE m.project_path IN (${placeholders})
+                ${ownClause}
+                ${filter.clause}
+              ORDER BY m.id ASC`,
+        )
+        .all(...identities, ...ownIdentities, ...filter.params) as Array<{ id?: unknown }>;
+    return rows.flatMap((row) => (typeof row.id === "number" ? [row.id] : []));
+}
+
 function readRenderedMemoryIds(args: {
     db: ContextDatabase;
     projectPath?: string;
@@ -1545,30 +1587,20 @@ export async function buildModuleStateSyncPayload(args: {
     // previously mirrored foreign row that the policy now hides — or that was
     // archived or expired since it was mirrored — would survive in the native
     // store until one of the member's own sessions syncs. Explicit id
-    // deletions close that gap: the coverage query re-runs the snapshot's own
-    // visibility scope with every status and no expiry cutoff, and every
-    // covered row absent from the kept snapshot is named individually. This
-    // prunes stale rows in any member's project without granting this
-    // session a project-wide prune over a foreign member's non-shared rows
-    // (non-shared categories are outside the coverage scope entirely).
+    // deletions close that gap for exactly those rows: an id-only foreign
+    // coverage query (all statuses, no expiry cutoff) minus the kept
+    // snapshot. Own-project rows are never named — the replace scope prunes
+    // them wholesale, and re-listing a large archived history here would
+    // bloat every force or epoch-driven sync for nothing. Non-shared foreign
+    // categories are outside the coverage scope entirely, so the session
+    // still cannot prune a member's non-shared rows.
     const memoriesDeleteIds = (() => {
         if (!(args.force || epochChanged) || omitAuthorityMemorySections) return undefined;
         if (!args.pass.projectPath) return undefined;
+        if (!workspace.workspace) return undefined;
         const keptIds = new Set(memoryRows.map((memory) => memory.id));
-        const allStatuses: MemoryStatus[] = ["active", "permanent", "archived"];
-        const covered = workspace.workspace
-            ? getMemoriesByProjects(
-                  args.pass.db,
-                  workspace.expandedIdentities,
-                  allStatuses,
-                  0,
-                  workspace.ownIdentities,
-                  workspace.shareCategories,
-              )
-            : getMemoriesByProject(args.pass.db, args.pass.projectPath, allStatuses, 0);
-        const hidden = covered
-            .filter((memory) => !keptIds.has(memory.id))
-            .map((memory) => memory.id);
+        const covered = readForeignCoverageMemoryIds({ db: args.pass.db, workspace });
+        const hidden = covered.filter((id) => !keptIds.has(id));
         return hidden.length > 0 ? hidden : undefined;
     })();
     const memories = memoryRows.map((memory) => ({

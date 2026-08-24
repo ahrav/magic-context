@@ -483,7 +483,7 @@ describe("module state sync section deltas", () => {
         expect(incremental).not.toHaveProperty("memories_replace_projects");
     });
 
-    it("a replace snapshot names policy-hidden rows as explicit delete ids", async () => {
+    it("a non-workspace replace snapshot relies on the scope prune, not explicit delete ids", async () => {
         const db = createContextDb();
         const sessionId = "ses-epoch-delete-ids";
         const projectPath = "dir:/tmp/epoch-delete-ids";
@@ -494,10 +494,11 @@ describe("module state sync section deltas", () => {
             sourceType: "user",
         });
         // A raw kernel insert has no claim link, so the policy hides it from
-        // the automatic mirror. The replace scope covers this project's own
-        // rows, but a foreign workspace member's rows would not be covered —
-        // the explicit id list is the lane that prunes those, so the payload
-        // must name every covered row the policy filtered out.
+        // the automatic mirror. For a single-project sync the replace scope
+        // names the whole project and prunes every omitted row — explicit
+        // delete ids would re-list the archived history for nothing, so the
+        // payload must NOT carry them. (Foreign workspace rows, which the
+        // scope cannot cover, are the delete-id lane's only job.)
         runInMemoryClaimsWriteTransaction(db, () => {
             db.prepare(
                 `INSERT INTO memories (project_path, category, content, normalized_hash,
@@ -508,24 +509,6 @@ describe("module state sync section deltas", () => {
         const hiddenId = (
             db
                 .prepare("SELECT id FROM memories WHERE normalized_hash = 'hash-delete-ids-test'")
-                .get() as { id: number }
-        ).id;
-        // An archived row leaves the snapshot's base query entirely, so the
-        // subtraction must derive from the coverage scope (all statuses, no
-        // expiry cutoff) or a previously mirrored row that was archived would
-        // never be named for deletion.
-        runInMemoryClaimsWriteTransaction(db, () => {
-            db.prepare(
-                `INSERT INTO memories (project_path, category, content, normalized_hash,
-                    first_seen_at, created_at, updated_at, last_seen_at, status)
-                 VALUES (?, 'CONSTRAINTS', 'archived mirrored row', 'hash-delete-ids-archived', 1, 1, 1, 1, 'archived')`,
-            ).run(projectPath);
-        });
-        const archivedId = (
-            db
-                .prepare(
-                    "SELECT id FROM memories WHERE normalized_hash = 'hash-delete-ids-archived'",
-                )
                 .get() as { id: number }
         ).id;
         const baseline = loadModuleWatermarks({ db, sessionId, projectPath: projectPath });
@@ -542,10 +525,7 @@ describe("module state sync section deltas", () => {
         const snapshotIds = (params.memories as Array<{ id: number }>).map((row) => row.id);
         expect(snapshotIds).toContain(eligible.id);
         expect(snapshotIds).not.toContain(hiddenId);
-        expect(snapshotIds).not.toContain(archivedId);
-        expect((params.memories_delete_ids as number[]).sort()).toEqual(
-            [hiddenId, archivedId].sort(),
-        );
+        expect(params).not.toHaveProperty("memories_delete_ids");
     });
 
     it("uses omitted sections only after the module advertises the delta capability", async () => {
