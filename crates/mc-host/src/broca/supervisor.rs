@@ -666,11 +666,36 @@ impl Supervisor {
                 );
                 return;
             };
+            // The select above can resolve its permit branch while `closing`
+            // fires concurrently; recheck so shutdown never starts a fresh
+            // harness subprocess that would extend the drain.
+            if inner.closing.is_cancelled() {
+                finish(
+                    &inner,
+                    &run,
+                    TerminalOutcome::Cancelled {
+                        message: "host shutdown",
+                    },
+                );
+                return;
+            }
             if !begin_running(&run) {
                 // Cancelled or deleted while queued: the terminal is already
                 // committed and the backend must never start.
                 return;
             }
+            // The immutable request bytes stay charged for exactly as long
+            // as the backend can observe them: this charge rides the backend
+            // task's scope and drops when the task ends, not at terminal
+            // commitment — a cancelled run's terminal can precede backend
+            // teardown, and releasing early would let replacement sends
+            // consume capacity the old prompt still occupies.
+            let _request_charge = {
+                let mut state = lock_run(&run);
+                state
+                    .base_charge
+                    .split_excess(run.key.meta_bytes().saturating_add(TERMINAL_HEADROOM_BYTES))
+            };
             let sink_inner = Arc::clone(&inner);
             let sink_run = Arc::clone(&run);
             let sink = EventSink::new(Arc::new(move |event| {
@@ -886,7 +911,9 @@ fn finish(inner: &Arc<Inner>, run: &Arc<Run>, outcome: TerminalOutcome) {
         if let Some(permit) = state.run_permit.take() {
             released.permits.push(permit);
         }
-        // The immutable request bytes die with the backend; only key
+        // A started run's immutable request bytes ride the backend task and
+        // drop with it; for a run whose backend never started they are
+        // still in the base charge and release here. Either way only key
         // metadata and the (now spent) terminal headroom stay charged.
         let retained = run.key.meta_bytes().saturating_add(TERMINAL_HEADROOM_BYTES);
         released

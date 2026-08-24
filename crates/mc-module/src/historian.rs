@@ -1449,6 +1449,18 @@ where
     producer.bind_session(&producer_session_id).await?;
     let state = match producer.status(&producer_run_id).await {
         Ok(state) => state,
+        // A protocol violation means the status answer cannot be trusted,
+        // not that the run is gone: abandoning here would authorize a
+        // refire while the original run may still be active. Propagate and
+        // leave the durable awaiting state for the next reattach.
+        Err(err @ HistorianProducerError::Protocol(_)) => {
+            let close_result = producer.close().await;
+            return Err(HistorianDriveError::Producer(attach_cleanup(
+                err,
+                close_result,
+                "close",
+            )));
+        }
         Err(_) => {
             let failure_backoff_at_ms = completion_failure_backoff_at_ms(
                 request.now_ms,
