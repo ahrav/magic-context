@@ -12,7 +12,10 @@ import { SubcCallError } from "./errors";
 import type {
     ByteBudget,
     FrameChannelCloseReason,
+    FrameChannelDiagnosticType,
     FrameChannelHandlers,
+    FrameMeta,
+    FrameSendHooks,
     FrameSendTicket,
     SetupFrameChannel,
 } from "./frame-channel";
@@ -79,11 +82,19 @@ export class ClientTransportRegistry {
         }[];
         try {
             raw = providers.map((provider) => {
+                const transport = provider.transport;
+                const capabilityVersion = provider.capabilityVersion;
+                // Primitive snapshots only: a non-string transport would
+                // defer a provider-owned toString() into the validation
+                // phase, outside this containment.
+                if (typeof transport !== "string" || typeof capabilityVersion !== "number") {
+                    throw new Error("non-primitive provider identity");
+                }
                 const parameters = provider.parameters;
                 const hasParameters = parameters !== undefined;
                 return {
-                    transport: provider.transport,
-                    capabilityVersion: provider.capabilityVersion,
+                    transport,
+                    capabilityVersion,
                     // Presence is tracked separately: a supplied value whose
                     // serialization yields `undefined` (a `toJSON` returning
                     // undefined) is an invalid opaque object, never an
@@ -167,6 +178,13 @@ const CHANNEL_CLOSE_REASONS: ReadonlySet<FrameChannelCloseReason> = new Set([
     "control_capacity_exhausted",
 ]);
 
+/** The closed diagnostic-type vocabulary a provider channel may emit. */
+const CHANNEL_DIAGNOSTIC_TYPES: ReadonlySet<FrameChannelDiagnosticType> = new Set([
+    "write_start",
+    "write_complete",
+    "header",
+]);
+
 /**
  * R14 provider boundary: replace a provider-owned failure with a bounded
  * error carrying only the already-validated transport name and a fixed
@@ -193,30 +211,6 @@ const BOUNDED_CHANNEL_CODES = new Set([
 ]);
 
 /**
- * Sanitize one provider channel-operation failure. The engine's replay and
- * admission logic reads `SubcCallError` kind and code, so those bounded
- * fields survive (code only when it names a known channel outcome); the
- * message, cause chain, and stack are always replaced because provider
- * code may reference descriptors, tokens, or endpoints (R14).
- */
-function sanitizedChannelFailure(
-    transport: string,
-    phase: "send" | "flush",
-    error: unknown,
-): Error {
-    if (error instanceof SubcCallError) {
-        return new SubcCallError(
-            error.kind,
-            `transport provider ${transport} failed during ${phase}`,
-            error.code !== undefined && BOUNDED_CHANNEL_CODES.has(error.code)
-                ? error.code
-                : undefined,
-        );
-    }
-    return sanitizedProviderError(transport, phase);
-}
-
-/**
  * Wrap a provider's candidate construction so every provider-originated
  * error surface — constructor throw, `start()` rejection, channel-detected
  * close errors — is sanitized per R14 before it can enter generation error
@@ -230,17 +224,46 @@ export function sanitizedCandidateFactory(
     descriptor: OpaqueObject,
 ): (args: CandidateChannelArgs) => SetupFrameChannel {
     return (args) => {
+        // Wrapped flush() calls settle here on channel close, matching the
+        // FrameChannel contract, instead of waiting out their deadlines.
+        const flushWaiters = new Set<() => void>();
+        const upstreamDiagnostic = args.handlers.onDiagnostic;
         const handlers: FrameChannelHandlers = {
             onFrame: args.handlers.onFrame,
-            onClosed: (reason, _error) =>
+            onClosed: (reason, _error) => {
+                for (const settle of [...flushWaiters]) settle();
                 args.handlers.onClosed(
                     // A runtime reason outside the typed vocabulary is
                     // provider-controlled text; the bounded replacement
                     // keeps it out of retirement info and diagnostics.
                     CHANNEL_CLOSE_REASONS.has(reason) ? reason : "protocol_violation",
                     sanitizedProviderError(transport, "channel"),
-                ),
-            onDiagnostic: args.handlers.onDiagnostic,
+                );
+            },
+            onDiagnostic: upstreamDiagnostic
+                ? (type, meta) => {
+                      // Snapshot to bounded primitives: provider-controlled
+                      // strings or throwing getters must not reach the
+                      // public diagnostics observer, which the wire doc
+                      // requires to stay free of descriptor and token data.
+                      if (!CHANNEL_DIAGNOSTIC_TYPES.has(type)) return;
+                      let snapshot: FrameMeta;
+                      try {
+                          snapshot = {
+                              ty: Number(meta.ty),
+                              channel: Number(meta.channel),
+                              epoch: Number(meta.epoch),
+                              corr: BigInt(meta.corr),
+                              len: Number(meta.len),
+                          };
+                      } catch {
+                          // Diagnostics are best-effort; a malformed event
+                          // is dropped, never surfaced raw.
+                          return;
+                      }
+                      upstreamDiagnostic(type, snapshot);
+                  }
+                : undefined,
         };
         let channel: SetupFrameChannel;
         try {
@@ -271,11 +294,48 @@ export function sanitizedCandidateFactory(
                 }
             },
             send: (frame, hooks) => {
+                // Publication is tracked HERE, not trusted from the error:
+                // a provider-supplied kind could claim any classification,
+                // and an ordinary Error would otherwise read as `terminal`.
+                let published = false;
+                const trackedHooks: FrameSendHooks = {
+                    onPublish: () => {
+                        published = true;
+                        hooks?.onPublish?.();
+                    },
+                    ...(hooks?.onComplete ? { onComplete: hooks.onComplete } : {}),
+                };
                 let ticket: FrameSendTicket;
                 try {
-                    ticket = channel.send(frame, hooks);
+                    ticket = channel.send(frame, trackedHooks);
                 } catch (error) {
-                    throw sanitizedChannelFailure(transport, "send", error);
+                    const code =
+                        error instanceof SubcCallError &&
+                        error.code !== undefined &&
+                        BOUNDED_CHANNEL_CODES.has(error.code)
+                            ? error.code
+                            : undefined;
+                    if (!published) {
+                        // Proven refusal: nothing was published, so the
+                        // bounded failure is replay-safe `not_sent`.
+                        throw new SubcCallError(
+                            "not_sent",
+                            `transport provider ${transport} failed during send`,
+                            code,
+                        );
+                    }
+                    // Publication may have begun: ambiguous. Fail the
+                    // channel — retirement settles pending work exactly
+                    // once — and classify the throw as never replayable.
+                    args.handlers.onClosed(
+                        "write_failed",
+                        sanitizedProviderError(transport, "send"),
+                    );
+                    throw new SubcCallError(
+                        "outcome_unknown",
+                        `transport provider ${transport} failed during send`,
+                        code,
+                    );
                 }
                 // Built explicitly — never spread from the provider object,
                 // whose enumerable getters could throw mid-construction
@@ -313,15 +373,18 @@ export function sanitizedCandidateFactory(
             },
             flush: (deadline) =>
                 // Best-effort by contract and bounded locally: a provider
-                // that ignores its deadline must not stall teardown, and a
+                // that ignores its deadline must not stall teardown, a
                 // synchronous throw or rejection must not abort the close
-                // path that still has to retire the generation.
+                // path that still has to retire the generation, and channel
+                // close settles the wait immediately.
                 new Promise<void>((resolve) => {
-                    const timer = setTimeout(resolve, deadline.remainingMs());
-                    const settle = (): void => {
+                    const timer = setTimeout(settle, deadline.remainingMs());
+                    function settle(): void {
                         clearTimeout(timer);
+                        flushWaiters.delete(settle);
                         resolve();
-                    };
+                    }
+                    flushWaiters.add(settle);
                     try {
                         void Promise.resolve(channel.flush(deadline)).then(settle, settle);
                     } catch {

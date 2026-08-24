@@ -152,12 +152,20 @@ impl TransportProviders {
     /// snapshot, so a slow or blocking metadata method cannot stall reads
     /// before the setup deadline exists.
     pub fn with_injected(injected: Vec<Arc<dyn InjectedProvider>>) -> Self {
+        // Metadata getters are provider code: the redaction hook must exist
+        // before they run (registration happens before `run` installs it),
+        // and each call executes under the poll guard so a panicking getter
+        // cannot print provider data through the hook. The panic still
+        // fails registration loudly.
+        crate::panic_boundary::install();
         Self {
             injected: injected
                 .into_iter()
                 .map(|provider| ProviderEntry {
-                    transport: provider.transport().into(),
-                    capability_version: provider.capability_version(),
+                    transport: crate::panic_boundary::redact_sync(|| provider.transport().into()),
+                    capability_version: crate::panic_boundary::redact_sync(|| {
+                        provider.capability_version()
+                    }),
                     provider,
                 })
                 .collect(),

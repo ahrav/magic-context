@@ -99,13 +99,64 @@ fn invalid(message: &str) -> ControlAction {
 /// malformed negotiation-family body must reach the authoritative-terminal-
 /// and-close path (§7.7.1), so classification cannot depend on the body
 /// parsing under ANY reader — truncated JSON still names its operation.
-/// The raw scan over-matches (the tag may appear as a value rather than as
-/// `op`), which only retires a connection that already sent an invalid
-/// control body: fail closed. JSON string escapes are not decoded; a
-/// conforming client never escapes this tag.
+/// JSON permits escaped spellings of any string, so a raw miss is retried
+/// against a structure-blind unescape of the bytes. The scan over-matches
+/// (the tag may appear as a value rather than as `op`), which only retires
+/// a connection that already sent an invalid control body: fail closed.
 fn is_negotiation_family(body: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"\"transport.negotiate\"";
-    body.windows(NEEDLE.len()).any(|window| window == NEEDLE)
+    if body.windows(NEEDLE.len()).any(|window| window == NEEDLE) {
+        return true;
+    }
+    if !body.contains(&b'\\') {
+        return false;
+    }
+    let decoded = decode_json_escapes_lossy(body);
+    decoded.windows(NEEDLE.len()).any(|window| window == NEEDLE)
+}
+
+/// Structure-blind decode of JSON string escapes for classification only:
+/// `\uXXXX` (BMP; unpaired surrogates are dropped), the two-character
+/// escapes, and everything else copied through. Never used to build values.
+fn decode_json_escapes_lossy(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut index = 0;
+    while index < body.len() {
+        if body[index] != b'\\' || index + 1 >= body.len() {
+            out.push(body[index]);
+            index += 1;
+            continue;
+        }
+        match body[index + 1] {
+            b'u' if index + 6 <= body.len() => {
+                let hex = std::str::from_utf8(&body[index + 2..index + 6]).ok();
+                let code = hex.and_then(|hex| u16::from_str_radix(hex, 16).ok());
+                if let Some(ch) = code.and_then(|code| char::from_u32(u32::from(code))) {
+                    let mut buffer = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+                }
+                index += 6;
+            }
+            b'"' => {
+                out.push(b'"');
+                index += 2;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                index += 2;
+            }
+            b'/' => {
+                out.push(b'/');
+                index += 2;
+            }
+            other => {
+                out.push(b'\\');
+                out.push(other);
+                index += 2;
+            }
+        }
+    }
+    out
 }
 
 /// The strict negotiation decode for a body already known to be invalid:
@@ -737,7 +788,9 @@ mod tests {
         let dup_root = br#"{"op":"transport.negotiate","negotiation_version":1,"negotiation_version":1,"offers":[]}"#;
         // Syntactically truncated body whose negotiation tag is complete.
         let truncated = br#"{"op":"transport.negotiate","offers":"#;
-        for body in [&dup_nested[..], dup_root, truncated] {
+        // Escaped spelling of the tag: legal JSON, still negotiation-family.
+        let escaped = br#"{"op":"transport.\u006eegotiate","offers":"#;
+        for body in [&dup_nested[..], dup_root, truncated, escaped] {
             let action = parse_control(body, false, &two_target_index());
             assert!(
                 matches!(action, ControlAction::TransportNegotiate(Err(_))),
