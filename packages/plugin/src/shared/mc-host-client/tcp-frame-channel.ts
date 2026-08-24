@@ -296,7 +296,6 @@ export class TcpFrameChannel implements FrameChannel {
         };
         this.enqueueItem(item);
         return {
-            bytes: totalBytes,
             cancel: () => this.cancelQueuedItem(item),
         };
     }

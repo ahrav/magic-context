@@ -19,7 +19,7 @@ import type {
     OutboundFrame,
     SetupFrameChannel,
 } from "../frame-channel";
-import { type EnvelopeHeader, FrameType, HEADER_LEN, PROTOCOL_VERSION } from "../protocol";
+import { type EnvelopeHeader, FrameType, PROTOCOL_VERSION } from "../protocol";
 import type { OpaqueObject } from "../transport-negotiation";
 import type { CandidateChannelArgs, ClientTransportProvider } from "../transport-provider";
 import { FakePeer, type FakePeerOptions } from "./fake-peer";
@@ -269,7 +269,7 @@ class FakeCandidateChannel implements SetupFrameChannel {
         hooks?.onPublish?.();
         this.host.receive({ header: frame.header, body: frame.body });
         hooks?.onComplete?.();
-        return { bytes: HEADER_LEN + frame.body.length, cancel: () => false };
+        return { cancel: () => false };
     }
 
     sendControl(header: EnvelopeHeader): void {

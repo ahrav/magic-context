@@ -73,8 +73,6 @@ export interface FrameSendHooks {
 
 /** Handle for one admitted outbound frame. */
 export interface FrameSendTicket {
-    /** Total accounted bytes (header plus body). */
-    readonly bytes: number;
     /**
      * Remove the frame while it is still queued and unpublished. Returns
      * `false` once publication started or after the channel closed; the

@@ -426,6 +426,13 @@ async fn read_loop<H: McHostHandler, C: FrameReceiver>(
                     return ReadExit::Peer;
                 }
                 watermark = corr;
+                // An over-cap channel-0 Request is still a consumer request:
+                // it commits the generation to TCP, and during candidate
+                // setup it is a protocol failure (protocol §7.7.5), exactly
+                // like the requests that pass the cap.
+                if commit_transport(setup).is_err() {
+                    return ReadExit::Peer;
+                }
                 // Off-reader like the other rejections (contended egress
                 // must not block this reader from a queued Pong), but with a
                 // written-signal: if the transport's body drain on the next
@@ -834,7 +841,14 @@ async fn handle_negotiate<H: McHostHandler>(
     }
     if matches!(setup.state, TransportState::TcpCommitted { .. }) {
         setup.state = TransportState::TcpCommitted { late_used: true };
-        return respond_tcp(shared, gen, corr, Some(FallbackReason::ConnectionInUse)).await;
+        return respond_tcp(
+            shared,
+            gen,
+            corr,
+            request.negotiation_version,
+            Some(FallbackReason::ConnectionInUse),
+        )
+        .await;
     }
     if request.negotiation_version != NEGOTIATION_VERSION {
         // Negotiation itself selected TCP, so the late-negotiation
@@ -844,6 +858,7 @@ async fn handle_negotiate<H: McHostHandler>(
             shared,
             gen,
             corr,
+            request.negotiation_version,
             Some(FallbackReason::NegotiationVersionMismatch),
         )
         .await;
@@ -859,16 +874,35 @@ async fn handle_negotiate<H: McHostHandler>(
             continue;
         }
         non_tcp_offered = true;
-        match shared.providers.find(&offer.transport) {
-            Some(provider) if provider.capability_version() == offer.capability_version => {
+        // Provider identity is `(transport, capability_version)`: a
+        // name-only lookup would hide a serveable provider behind a
+        // mismatched sibling at the same name.
+        match shared
+            .providers
+            .find(&offer.transport, offer.capability_version)
+        {
+            Some(provider) => {
                 let provider = Arc::clone(provider);
                 let selected = SelectedTransport {
                     transport: offer.transport.clone(),
                     capability_version: offer.capability_version,
                 };
-                return grant_candidate(shared, gen, corr, selected, provider, setup).await;
+                return grant_candidate(
+                    shared,
+                    gen,
+                    corr,
+                    request.negotiation_version,
+                    selected,
+                    provider,
+                    setup,
+                )
+                .await;
             }
-            Some(_) => capability_mismatch = true,
+            // Known transport at another version: name the real cause
+            // (§7.7.3) rather than reporting it as unavailable.
+            None if shared.providers.serves_transport(&offer.transport) => {
+                capability_mismatch = true;
+            }
             None => {}
         }
     }
@@ -882,18 +916,22 @@ async fn handle_negotiate<H: McHostHandler>(
     // Negotiation itself selected TCP: the late-negotiation allowance is
     // consumed, so a repeated negotiation is a protocol failure (§7.7.5).
     setup.state = TransportState::TcpCommitted { late_used: true };
-    respond_tcp(shared, gen, corr, reason).await
+    respond_tcp(shared, gen, corr, request.negotiation_version, reason).await
 }
 
 async fn respond_tcp<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
     corr: u64,
+    negotiation_version: u32,
     reason: Option<FallbackReason>,
 ) -> ControlFlow {
-    let body =
-        encode_negotiate_response(&NegotiateResponse::Tcp { reason }, TCP_CAPABILITY_VERSION)
-            .expect("a tcp selection always encodes");
+    let body = encode_negotiate_response(
+        &NegotiateResponse::Tcp { reason },
+        negotiation_version,
+        TCP_CAPABILITY_VERSION,
+    )
+    .expect("a tcp selection always encodes");
     // Emission can wait on the shared egress budget; queue it off the read
     // loop so a contended budget cannot stall Pong reads into a liveness
     // false-kill. Bounded without a pending permit: the setup state machine
@@ -922,6 +960,7 @@ async fn grant_candidate<H: McHostHandler>(
     shared: &Arc<HostShared<H>>,
     gen: &Arc<GenerationCore>,
     corr: u64,
+    negotiation_version: u32,
     selected: SelectedTransport,
     provider: Arc<dyn InjectedProvider>,
     setup: &mut ConnectionSetup,
@@ -958,6 +997,7 @@ async fn grant_candidate<H: McHostHandler>(
             activation_token: token,
             descriptor,
         },
+        negotiation_version,
         TCP_CAPABILITY_VERSION,
     ) {
         Ok(body) => body,

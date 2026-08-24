@@ -385,16 +385,6 @@ fn require_transport_name<'a>(
     Ok(name)
 }
 
-/// Depth of a JSON value: 1 at the subtree root, +1 per nested object/array
-/// level (protocol §7.1 counting).
-fn value_depth(value: &serde_json::Value) -> usize {
-    match value {
-        serde_json::Value::Array(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
-        serde_json::Value::Object(map) => 1 + map.values().map(value_depth).max().unwrap_or(0),
-        _ => 1,
-    }
-}
-
 /// Opaque `parameters`/`descriptor` bounds: a JSON object at most
 /// [`MAX_OPAQUE_BYTES`] compact bytes and [`MAX_OPAQUE_DEPTH`] levels deep.
 /// Duplicate keys inside the value were already rejected by the strict parse.
@@ -412,7 +402,7 @@ fn check_opaque(value: &serde_json::Value, path: &str) -> Result<(), Negotiation
             path,
         ));
     }
-    if value_depth(value) > MAX_OPAQUE_DEPTH {
+    if crate::control::value_depth(value) > MAX_OPAQUE_DEPTH {
         return Err(NegotiationError::new(
             NegotiationErrorCode::OpaqueTooDeep,
             path,
@@ -815,10 +805,22 @@ pub fn encode_negotiate_request(request: &NegotiateRequest) -> Result<Vec<u8>, N
 /// Encodes one compact canonical `transport.negotiate` response. The TCP
 /// selection names the required `tcp` offer entry with `capability_version`
 /// taken from `tcp_capability_version` (the exact offered value).
+///
+/// `negotiation_version` is the *request's* grammar version, echoed per
+/// §7.7.2. Echoing matters for the `negotiation_version_mismatch` fallback:
+/// a peer speaking another version must be able to decode the response and
+/// retain TCP (R8), which it cannot do if the host stamps its own version.
 pub fn encode_negotiate_response(
     response: &NegotiateResponse,
+    negotiation_version: u32,
     tcp_capability_version: u32,
 ) -> Result<Vec<u8>, NegotiationError> {
+    if negotiation_version == 0 {
+        return Err(NegotiationError::new(
+            NegotiationErrorCode::InvalidVersion,
+            "negotiation_version",
+        ));
+    }
     let wire = match response {
         NegotiateResponse::Tcp { reason } => {
             if tcp_capability_version == 0 {
@@ -829,7 +831,7 @@ pub fn encode_negotiate_response(
             }
             WireNegotiateResponse {
                 op: OP_TRANSPORT_NEGOTIATE,
-                negotiation_version: NEGOTIATION_VERSION,
+                negotiation_version,
                 selected: WireSelected {
                     transport: TRANSPORT_TCP,
                     capability_version: tcp_capability_version,
@@ -859,7 +861,7 @@ pub fn encode_negotiate_response(
             check_opaque(descriptor, "descriptor")?;
             WireNegotiateResponse {
                 op: OP_TRANSPORT_NEGOTIATE,
-                negotiation_version: NEGOTIATION_VERSION,
+                negotiation_version,
                 selected: WireSelected {
                     transport: &selected.transport,
                     capability_version: selected.capability_version,
@@ -890,17 +892,34 @@ pub fn encode_activate_request(token: &ActivationToken) -> Vec<u8> {
     .expect("activate request serialization cannot fail")
 }
 
+#[derive(serde::Serialize)]
+struct WireTaggedBody {
+    op: &'static str,
+    negotiation_version: u32,
+}
+
+/// One `{op, negotiation_version}` candidate body. Built from the module
+/// constants rather than a frozen literal so a `NEGOTIATION_VERSION` bump
+/// cannot leave these emitting a version their own decoders reject.
+fn tagged_body(op: &'static str) -> Vec<u8> {
+    serde_json::to_vec(&WireTaggedBody {
+        op,
+        negotiation_version: NEGOTIATION_VERSION,
+    })
+    .expect("tagged negotiation body serialization cannot fail")
+}
+
 /// The tagged candidate `transport.activate` response (correlation 1).
 pub fn activate_response_json() -> Vec<u8> {
-    br#"{"op":"transport.activate","negotiation_version":1}"#.to_vec()
+    tagged_body(OP_TRANSPORT_ACTIVATE)
 }
 
 /// The candidate `transport.commit` request (correlation 2).
 pub fn commit_request_json() -> Vec<u8> {
-    br#"{"op":"transport.commit","negotiation_version":1}"#.to_vec()
+    tagged_body(OP_TRANSPORT_COMMIT)
 }
 
 /// The tagged candidate `transport.commit` response (correlation 2).
 pub fn commit_response_json() -> Vec<u8> {
-    br#"{"op":"transport.commit","negotiation_version":1}"#.to_vec()
+    tagged_body(OP_TRANSPORT_COMMIT)
 }

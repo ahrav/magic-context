@@ -106,10 +106,27 @@ impl TransportProviders {
         Self { injected }
     }
 
-    pub(crate) fn find(&self, transport: &str) -> Option<&Arc<dyn InjectedProvider>> {
+    /// Provider identity is `(transport, capability_version)`: the same
+    /// transport may be installed at several capability versions, so a
+    /// name-only match could return a mismatched sibling and hide a
+    /// serveable provider.
+    pub(crate) fn find(
+        &self,
+        transport: &str,
+        capability_version: u32,
+    ) -> Option<&Arc<dyn InjectedProvider>> {
+        self.injected.iter().find(|provider| {
+            provider.transport() == transport && provider.capability_version() == capability_version
+        })
+    }
+
+    /// True when some provider serves `transport` at any capability version.
+    /// Separates "unknown transport" from "known transport, wrong version"
+    /// so the fallback reason names the real cause (§7.7.3).
+    pub(crate) fn serves_transport(&self, transport: &str) -> bool {
         self.injected
             .iter()
-            .find(|provider| provider.transport() == transport)
+            .any(|provider| provider.transport() == transport)
     }
 }
 
@@ -200,10 +217,6 @@ impl GrantRecord {
             token,
             consumed: AtomicBool::new(false),
         }
-    }
-
-    pub fn binding(&self) -> &GrantBinding {
-        &self.binding
     }
 
     /// Validates and consumes the grant. The token comparison runs in

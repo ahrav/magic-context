@@ -86,7 +86,7 @@ fn tcp_only_offer_and_selection_round_trip() {
     };
     assert_eq!(*reason, None, "a direct selection carries no reason");
     assert_eq!(
-        encode_negotiate_response(&response, 1).expect("re-encode"),
+        encode_negotiate_response(&response, 1, 1).expect("re-encode"),
         RESP_TCP_DIRECT.as_bytes()
     );
 }
@@ -126,7 +126,7 @@ fn ordered_offers_preserve_order_and_selection_must_be_exact() {
     assert_eq!(activation_token.as_str(), VECTOR_TOKEN);
     assert_eq!(descriptor, &serde_json::json!({}));
     assert_eq!(
-        encode_negotiate_response(&response, 1).expect("re-encode"),
+        encode_negotiate_response(&response, 1, 1).expect("re-encode"),
         RESP_GRANT.as_bytes()
     );
 }
@@ -141,7 +141,7 @@ fn version_mismatches_encode_the_documented_tcp_fallback_reasons() {
     };
     assert_eq!(*reason, Some(FallbackReason::CapabilityVersionMismatch));
     assert_eq!(
-        encode_negotiate_response(&response, 1).expect("re-encode"),
+        encode_negotiate_response(&response, 1, 1).expect("re-encode"),
         RESP_TCP_FALLBACK.as_bytes()
     );
 
@@ -684,6 +684,7 @@ fn encoders_refuse_out_of_contract_values() {
                 descriptor: serde_json::json!({}),
             },
             1,
+            1,
         )),
         NegotiationErrorCode::InvalidTransportName
     );
@@ -866,7 +867,11 @@ async fn version_mismatches_select_tcp_with_their_exact_reason() {
     let frame = control_response(&mut client, &body).await;
     assert_eq!(frame.ty, TY_RESPONSE);
     let json = frame.json();
-    assert_eq!(json["negotiation_version"], 1);
+    // The response echoes the request's grammar version (§7.7.2), not the
+    // host's. Stamping the host's version would make this fallback reason
+    // unconsumable: the peer's decoder requires its own version, so it would
+    // reject the response and fail closed instead of retaining TCP (R8).
+    assert_eq!(json["negotiation_version"], 2);
     assert_eq!(json["selected"]["transport"], "tcp");
     assert_eq!(json["reason"], "negotiation_version_mismatch");
     let frame = control_response(&mut client, &serde_json::json!({"op": "catalog.list"})).await;
