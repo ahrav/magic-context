@@ -69,17 +69,23 @@ export class ClientTransportRegistry {
         let raw: {
             transport: string;
             capabilityVersion: number;
+            hasParameters: boolean;
             serializedParameters: string | undefined;
             provider: ClientTransportProvider;
         }[];
         try {
             raw = providers.map((provider) => {
                 const parameters = provider.parameters;
+                const hasParameters = parameters !== undefined;
                 return {
                     transport: provider.transport,
                     capabilityVersion: provider.capabilityVersion,
-                    serializedParameters:
-                        parameters === undefined ? undefined : JSON.stringify(parameters),
+                    // Presence is tracked separately: a supplied value whose
+                    // serialization yields `undefined` (a `toJSON` returning
+                    // undefined) is an invalid opaque object, never an
+                    // absent one.
+                    hasParameters,
+                    serializedParameters: hasParameters ? JSON.stringify(parameters) : undefined,
                     provider,
                 };
             });
@@ -94,15 +100,15 @@ export class ClientTransportRegistry {
             provider: entry.provider,
         }));
         const offers: TransportOffer[] = raw.map((entry) =>
-            entry.serializedParameters === undefined
+            entry.hasParameters
                 ? {
                       transport: entry.transport,
                       capabilityVersion: entry.capabilityVersion,
+                      parameters: checkOpaqueSerialized(entry.serializedParameters, "parameters"),
                   }
                 : {
                       transport: entry.transport,
                       capabilityVersion: entry.capabilityVersion,
-                      parameters: checkOpaqueSerialized(entry.serializedParameters, "parameters"),
                   },
         );
         offers.push({ transport: TRANSPORT_TCP, capabilityVersion: TCP_CAPABILITY_VERSION });
@@ -203,7 +209,11 @@ export function sanitizedCandidateFactory(
         return {
             start: async (deadline) => {
                 try {
-                    return await channel.start(deadline);
+                    const result = await channel.start(deadline);
+                    // Plain snapshot: the provider result's getters must not
+                    // carry deferred provider code past this boundary, where
+                    // a later read would escape unsanitized.
+                    return { daemonVer: String(result.daemonVer) };
                 } catch {
                     throw sanitizedProviderError(transport, "start");
                 }
@@ -232,8 +242,9 @@ export function sanitizedCandidateFactory(
                         } catch {
                             // A throwing provider ticket must not disrupt
                             // pending-entry settlement; `false` is the
-                            // conservative "possibly sent" answer the
-                            // caller already handles.
+                            // "possible send" answer, which the generation
+                            // now honors by settling `outcome_unknown`
+                            // (never replay-eligible `not_sent`).
                             return false;
                         }
                     },

@@ -811,7 +811,39 @@ export function checkOpaqueSerialized(serialized: string | undefined, path: stri
     if (plainDepth(parsed) > MAX_OPAQUE_DEPTH) {
         throw new NegotiationError("opaque_too_deep", path);
     }
+    assertWellFormedStrings(parsed, path);
     return parsed as OpaqueObject;
+}
+
+/** A UTF-16 code unit in the surrogate range without its required partner. */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/**
+ * Rejects strings (values and keys) containing lone surrogates.
+ * `JSON.stringify` escapes them (`\ud800`) rather than failing, but the
+ * host's strict UTF-8 decoder rejects unpaired surrogate escapes — the
+ * client must fail locally instead of burning the authenticated generation
+ * on the host's reject.
+ */
+function assertWellFormedStrings(value: unknown, path: string): void {
+    if (typeof value === "string") {
+        if (LONE_SURROGATE_RE.test(value)) {
+            throw new NegotiationError("invalid_type", path);
+        }
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) assertWellFormedStrings(item, path);
+        return;
+    }
+    if (typeof value === "object" && value !== null) {
+        for (const [key, entry] of Object.entries(value)) {
+            if (LONE_SURROGATE_RE.test(key)) {
+                throw new NegotiationError("invalid_type", path);
+            }
+            assertWellFormedStrings(entry, path);
+        }
+    }
 }
 
 /**

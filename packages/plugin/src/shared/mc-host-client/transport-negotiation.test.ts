@@ -614,6 +614,13 @@ describe("encode-side validation", () => {
         // serializes to, not as the nominal object.
         expectCode(() => encode(new Date(0)), "invalid_type");
         expectCode(() => encode({ toJSON: () => "not-an-object" }), "invalid_type");
+        // A toJSON yielding undefined is an invalid opaque value, not an
+        // absent one.
+        expectCode(() => encode({ toJSON: () => undefined }), "invalid_type");
+        // Lone surrogates survive JSON.stringify as escapes but the host's
+        // strict UTF-8 decoder rejects them; fail locally instead.
+        expectCode(() => encode({ s: "\uD800" }), "invalid_type");
+        expectCode(() => encode({ "\uDC00": 1 }), "invalid_type");
         const error = expectCode(
             () =>
                 encodeNegotiateResponse({

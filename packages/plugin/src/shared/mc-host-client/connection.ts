@@ -753,8 +753,7 @@ export class ConnectionGeneration {
     private handleRouteGoodbye(channel: number, epoch: number): void {
         for (const entry of [...this.pending.values()]) {
             if (entry.channel !== channel || entry.epoch !== epoch) continue;
-            if (!entry.writeInvoked) {
-                this.cancelQueuedFrame(entry);
+            if (!entry.writeInvoked && this.cancelQueuedFrame(entry)) {
                 this.settleCallerReject(
                     entry,
                     new SubcCallError(
@@ -834,18 +833,23 @@ export class ConnectionGeneration {
         ticket.resolve();
     }
 
-    /** Remove the entry's frame from the channel queue while still unpublished. */
-    private cancelQueuedFrame(entry: PendingEntry): void {
+    /**
+     * Remove the entry's frame from the channel queue while still
+     * unpublished. Returns true only when the channel proved the frame was
+     * never published; `false` is a possible send, so the caller must not
+     * settle `not_sent` (the ticket contract) — a replayed "unsent" frame
+     * that later publishes would reach the host twice.
+     */
+    private cancelQueuedFrame(entry: PendingEntry): boolean {
         const ticket = entry.sendTicket;
-        if (!ticket) return;
+        if (!ticket) return false;
         entry.sendTicket = null;
-        ticket.cancel();
+        return ticket.cancel();
     }
 
     private onRequestDeadline(entry: PendingEntry): void {
         if (this.pending.get(entry.key) !== entry || entry.callerSettled) return;
-        if (!entry.writeInvoked) {
-            this.cancelQueuedFrame(entry);
+        if (!entry.writeInvoked && this.cancelQueuedFrame(entry)) {
             this.settleCallerReject(
                 entry,
                 new SubcCallError(
@@ -878,8 +882,7 @@ export class ConnectionGeneration {
         if (this.pending.get(entry.key) !== entry || entry.callerSettled) {
             return { cleanup: entry.ticket ? entry.ticket.promise : Promise.resolve() };
         }
-        if (!entry.writeInvoked) {
-            this.cancelQueuedFrame(entry);
+        if (!entry.writeInvoked && this.cancelQueuedFrame(entry)) {
             this.settleCallerReject(
                 entry,
                 new SubcCallError(
