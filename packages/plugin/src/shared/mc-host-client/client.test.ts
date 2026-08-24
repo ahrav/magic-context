@@ -1845,7 +1845,9 @@ describe("transport negotiation", () => {
             peer,
             diagnostics: (event) => events.push(event),
         });
-        expectCallError(error, "terminal", "internal_error");
+        // The host's raw error body is peer-controlled; the caller sees a
+        // bounded negotiation failure, never the wire message (R14).
+        expectCallError(error, "terminal", "negotiation_failed");
         await waitUntil(() =>
             events.some((e) => e.type === "retired" && e.reason === "negotiation_failed"),
         );
@@ -1875,7 +1877,7 @@ describe("transport negotiation", () => {
                 }),
         });
         const { error } = await connectRejected({ peer });
-        expectCallError(error, "terminal", "unsupported_operation");
+        expectCallError(error, "terminal", "negotiation_failed");
         const conn = peer.connections[0] as FakePeerConnection;
         await conn.closed;
         expect(peer.connections.length).toBe(1);

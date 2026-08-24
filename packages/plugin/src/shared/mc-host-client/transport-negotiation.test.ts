@@ -597,6 +597,11 @@ describe("encode-side validation", () => {
         for (const parameters of [[], 1, "x", null, true]) {
             expectCode(() => encode(parameters), "invalid_type");
         }
+        // JavaScript-only shapes are judged by their serialized form: a
+        // Date or a custom toJSON reaches the wire as whatever it
+        // serializes to, not as the nominal object.
+        expectCode(() => encode(new Date(0)), "invalid_type");
+        expectCode(() => encode({ toJSON: () => "not-an-object" }), "invalid_type");
         const error = expectCode(
             () =>
                 encodeNegotiateResponse({

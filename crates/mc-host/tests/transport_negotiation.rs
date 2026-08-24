@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mc_host::transport_provider::{
-    GrantBinding, GrantRecord, GrantRejection, ProviderFailure, TransportProviders,
+    GrantBinding, GrantRecord, GrantRejection, InjectedProvider, PreparedCandidate,
+    ProviderContext, ProviderFailure, TransportProviders,
 };
 use support::fake_transport::{FakeProvider, RawCandidate, FAKE_TRANSPORT};
 use support::raw_client::{
@@ -947,6 +948,43 @@ async fn repeated_negotiation_after_negotiated_tcp_selection_retires() {
         "negotiation after a negotiated TCP selection is a protocol failure"
     );
 
+    host.shutdown_gracefully().await;
+}
+
+#[tokio::test]
+async fn stalled_provider_prepare_fails_setup_within_the_deadline() {
+    // A provider whose KTD9 attachment gate blocks must not pin the
+    // connection past the configured setup budget: the deadline exists
+    // before any provider code runs and `prepare` executes off the
+    // connection task.
+    struct StallingProvider;
+    impl InjectedProvider for StallingProvider {
+        fn transport(&self) -> &str {
+            FAKE_TRANSPORT
+        }
+        fn capability_version(&self) -> u32 {
+            1
+        }
+        fn prepare(&self, _ctx: &ProviderContext) -> Result<PreparedCandidate, ProviderFailure> {
+            std::thread::sleep(Duration::from_millis(800));
+            Err(ProviderFailure::Unavailable)
+        }
+    }
+    let registry = TransportProviders::with_injected(vec![Arc::new(StallingProvider)]);
+    let host = TestHost::start_with(move |config| {
+        config.transport_providers = registry;
+        config.timing.transport_setup_deadline = Duration::from_millis(100);
+    })
+    .await;
+    let mut client = host.client().await;
+    let _ = client
+        .control(&negotiate_body(fake_and_tcp_offers()))
+        .await
+        .expect("send negotiation");
+    assert!(
+        client.closed_within(HOST_BUDGET).await,
+        "a stalled provider gate fails the setup closed within the deadline"
+    );
     host.shutdown_gracefully().await;
 }
 

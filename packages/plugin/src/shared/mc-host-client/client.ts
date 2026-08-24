@@ -763,21 +763,34 @@ export class SubcClient {
             if (
                 error instanceof SubcCallError &&
                 error.kind === "terminal" &&
-                error.errorTerminal !== undefined &&
-                !flagsBinary(error.errorTerminal.flags) &&
-                isLegacyFallbackTerminalBody(error.errorTerminal.body)
+                error.errorTerminal !== undefined
             ) {
-                // Only the closed set of legacy Error terminals proves the
-                // negotiation was never dispatched (KTD6). A body with extra
-                // fields, a non-string message, a binary flag, or any other
-                // code is malformed negotiation content and fails closed.
-                return {
-                    kind: "tcp",
-                    selected: {
-                        transport: TRANSPORT_TCP,
-                        capabilityVersion: TCP_CAPABILITY_VERSION,
-                    },
-                };
+                if (
+                    !flagsBinary(error.errorTerminal.flags) &&
+                    isLegacyFallbackTerminalBody(error.errorTerminal.body)
+                ) {
+                    // Only the closed set of legacy Error terminals proves
+                    // the negotiation was never dispatched (KTD6). A body
+                    // with extra fields, a non-string message, a binary
+                    // flag, or any other code is malformed negotiation
+                    // content and fails closed.
+                    return {
+                        kind: "tcp",
+                        selected: {
+                            transport: TRANSPORT_TCP,
+                            capabilityVersion: TCP_CAPABILITY_VERSION,
+                        },
+                    };
+                }
+                // Every other Error terminal fails closed with a bounded
+                // error: the raw body is peer-controlled and was consumed
+                // solely by the legacy classification above; its message
+                // must not enter caller-visible error graphs (R14).
+                throw new SubcCallError(
+                    "terminal",
+                    "transport negotiation failed: host error terminal",
+                    "negotiation_failed",
+                );
             }
             throw error;
         }

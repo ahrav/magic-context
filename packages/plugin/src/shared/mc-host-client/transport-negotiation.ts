@@ -763,16 +763,29 @@ function plainDepth(value: unknown): number {
  * compact-size bounds, applied to a provider-supplied value about to be
  * serialized, so a provider cannot push an out-of-contract offer or
  * descriptor onto the wire and burn the generation on the host's reject.
+ * Bounds are checked on the SERIALIZED form: `toJSON`, `Date`, dropped
+ * `undefined` members, and other JavaScript-only shapes all differ from
+ * their pre-serialization value, and only the serialized bytes matter.
  */
 function checkOpaquePlain(value: unknown, path: string): void {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
         throw new NegotiationError("invalid_type", path);
     }
-    if (plainDepth(value) > MAX_OPAQUE_DEPTH) {
-        throw new NegotiationError("opaque_too_deep", path);
-    }
-    if (new TextEncoder().encode(JSON.stringify(value)).length > MAX_OPAQUE_BYTES) {
+    if (new TextEncoder().encode(serialized).length > MAX_OPAQUE_BYTES) {
         throw new NegotiationError("opaque_too_large", path);
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(serialized) as unknown;
+    } catch {
+        throw new NegotiationError("invalid_type", path);
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new NegotiationError("invalid_type", path);
+    }
+    if (plainDepth(parsed) > MAX_OPAQUE_DEPTH) {
+        throw new NegotiationError("opaque_too_deep", path);
     }
 }
 

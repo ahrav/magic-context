@@ -970,16 +970,23 @@ async fn grant_candidate<H: McHostHandler>(
         shared.limits.writer_queue_frames,
         shared.timing.frame_deadline,
     );
-    // KTD9's attachment gate runs inside `prepare`, before a candidate is
-    // yielded. A provider failure is not fallback evidence (§7.7.3): the
-    // setup fails closed with no same-generation TCP continuation.
+    // The setup deadline exists before any provider code runs, and the
+    // KTD9 attachment gate inside `prepare` executes on the blocking pool:
+    // a provider that stalls cannot pin the read loop or hold the
+    // connection permit past the configured setup budget. On timeout the
+    // detached task's eventual result is dropped, releasing the candidate.
+    let deadline = Instant::now() + shared.timing.transport_setup_deadline;
+    let prepare_task = tokio::task::spawn_blocking(move || provider.prepare(&ctx));
+    // A provider failure — including a stalled or panicked gate — is not
+    // fallback evidence (§7.7.3): the setup fails closed with no
+    // same-generation TCP continuation.
     let PreparedCandidate {
         descriptor,
         candidate_id,
         candidate,
-    } = match provider.prepare(&ctx) {
-        Ok(prepared) => prepared,
-        Err(_failure) => return ControlFlow::Close(ReadExit::Peer),
+    } = match timeout_at(deadline, prepare_task).await {
+        Ok(Ok(Ok(prepared))) => prepared,
+        _ => return ControlFlow::Close(ReadExit::Peer),
     };
     let token = fresh_activation_token();
     let binding = GrantBinding {
@@ -1029,7 +1036,6 @@ async fn grant_candidate<H: McHostHandler>(
         promoted: Mutex::new(None),
         io: Mutex::new(Some(io_task)),
     });
-    let deadline = Instant::now() + shared.timing.transport_setup_deadline;
     let shared_task = Arc::clone(shared);
     let gen_task = Arc::clone(gen);
     let handoff_task = Arc::clone(&handoff);
@@ -1100,7 +1106,11 @@ async fn run_candidate_setup<H: McHostHandler>(
         decode_commit_request(&frame.body).map_err(|_| ())?;
         drop(frame);
         // Promotion is gated on this exact frame's local completion — not
-        // queue admission, not an aggregate flush (KTD4).
+        // queue admission, not an aggregate flush (KTD4). The receiver is
+        // deliberately NOT polled while waiting: an un-promoted host never
+        // consumes candidate frames, so a request pipelined ahead of the
+        // commit response stays buffered and is observed only by the
+        // promoted generation, where every setup invariant already holds.
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
         send_candidate_response(
             &shared,

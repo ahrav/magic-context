@@ -8,6 +8,7 @@
  * not exported from `index.ts` (R15: no supported consumer provider hooks).
  */
 
+import { SubcCallError } from "./errors";
 import type { ByteBudget, FrameChannelHandlers, SetupFrameChannel } from "./frame-channel";
 import { type OpaqueObject, TRANSPORT_TCP, type TransportOffer } from "./transport-negotiation";
 
@@ -75,8 +76,47 @@ export class ClientTransportRegistry {
  * phase word. The original message, cause chain, and stack are dropped
  * because provider code may reference descriptors, tokens, or endpoints.
  */
-function sanitizedProviderError(transport: string, phase: "connect" | "start" | "channel"): Error {
+function sanitizedProviderError(
+    transport: string,
+    phase: "connect" | "start" | "channel" | "send" | "flush",
+): Error {
     return new Error(`transport provider ${transport} failed during ${phase}`);
+}
+
+/**
+ * Channel-operation codes the generation engine classifies by. Anything
+ * outside this set is provider-authored and dropped with the message.
+ */
+const BOUNDED_CHANNEL_CODES = new Set([
+    "channel_closed",
+    "writer_queue_full",
+    "memory_cap",
+    "control_capacity_exhausted",
+    "protocol_violation",
+]);
+
+/**
+ * Sanitize one provider channel-operation failure. The engine's replay and
+ * admission logic reads `SubcCallError` kind and code, so those bounded
+ * fields survive (code only when it names a known channel outcome); the
+ * message, cause chain, and stack are always replaced because provider
+ * code may reference descriptors, tokens, or endpoints (R14).
+ */
+function sanitizedChannelFailure(
+    transport: string,
+    phase: "send" | "flush",
+    error: unknown,
+): Error {
+    if (error instanceof SubcCallError) {
+        return new SubcCallError(
+            error.kind,
+            `transport provider ${transport} failed during ${phase}`,
+            error.code !== undefined && BOUNDED_CHANNEL_CODES.has(error.code)
+                ? error.code
+                : undefined,
+        );
+    }
+    return sanitizedProviderError(transport, phase);
 }
 
 /**
@@ -105,9 +145,9 @@ export function sanitizedCandidateFactory(
         } catch {
             throw sanitizedProviderError(provider.transport, "connect");
         }
-        // ponytail: send/flush errors pass through unsanitized — the fake
-        // test provider throws only bounded SubcCallError shapes; wrap them
-        // when a real provider ships (magic-context-ymc.12).
+        // Every provider-reachable failure surface is sanitized: send,
+        // sendControl, and flush forward through the same bounded-error
+        // policy as connect and start.
         return {
             start: async (deadline) => {
                 try {
@@ -117,9 +157,27 @@ export function sanitizedCandidateFactory(
                 }
             },
             beginFrames: () => channel.beginFrames(),
-            send: (frame, hooks) => channel.send(frame, hooks),
-            sendControl: (header) => channel.sendControl(header),
-            flush: (deadline) => channel.flush(deadline),
+            send: (frame, hooks) => {
+                try {
+                    return channel.send(frame, hooks);
+                } catch (error) {
+                    throw sanitizedChannelFailure(provider.transport, "send", error);
+                }
+            },
+            sendControl: (header) => {
+                try {
+                    channel.sendControl(header);
+                } catch (error) {
+                    throw sanitizedChannelFailure(provider.transport, "send", error);
+                }
+            },
+            flush: async (deadline) => {
+                try {
+                    return await channel.flush(deadline);
+                } catch (error) {
+                    throw sanitizedChannelFailure(provider.transport, "flush", error);
+                }
+            },
             close: (error) => channel.close(error),
             isClosed: () => channel.isClosed(),
             stats: () => channel.stats(),
